@@ -133,6 +133,11 @@ impl WorkflowEngine {
     ) -> Result<CommandOutcome, WorkflowError> {
         validate_actor(&actor)?;
         validate_text(operation_id, "operation id")?;
+        // Capture readiness before entering the store, but enforce it only
+        // inside the apply closure. WorkflowStore resolves an existing
+        // idempotent operation before invoking this closure, so a durable
+        // replay remains available while an external dependency is down.
+        let command_readiness = self.require_command_dependencies(&command);
         let operation_digest = canonical_digest(&(actor.clone(), command.clone()))?;
         let digest_for_apply = operation_digest.clone();
         let operation_namespace = actor.idempotency_namespace();
@@ -156,6 +161,7 @@ impl WorkflowEngine {
             &operation_digest,
             now_ms,
             move |tx| {
+                command_readiness?;
                 apply_command(
                     tx,
                     organization_port.as_ref(),
@@ -185,14 +191,54 @@ impl WorkflowEngine {
         Ok(outcome)
     }
 
-    pub fn mutation_readiness(&self) -> DependencyReadiness {
-        if self.execution_port.readiness() == DependencyReadiness::Ready
-            && self.organization_port.readiness() == DependencyReadiness::Ready
-            && self.completion_port.readiness() == DependencyReadiness::Ready
-        {
-            DependencyReadiness::Ready
+    fn require_command_dependencies(&self, command: &WorkflowCommand) -> Result<(), WorkflowError> {
+        match command {
+            WorkflowCommand::AssignWork { .. } => self.require_organization(),
+            WorkflowCommand::ClaimWork { .. } => {
+                self.require_organization()?;
+                self.require_execution()
+            }
+            WorkflowCommand::RequestWorkCompletion { .. } => {
+                self.require_organization()?;
+                self.require_completion()
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn require_organization(&self) -> Result<(), WorkflowError> {
+        if self.organization_port.readiness() == DependencyReadiness::Ready {
+            Ok(())
         } else {
-            DependencyReadiness::Unavailable
+            Err(WorkflowError::new(
+                WorkflowErrorCode::OrganizationUnavailable,
+                true,
+                "organization authority is unavailable",
+            ))
+        }
+    }
+
+    fn require_execution(&self) -> Result<(), WorkflowError> {
+        if self.execution_port.readiness() == DependencyReadiness::Ready {
+            Ok(())
+        } else {
+            Err(WorkflowError::new(
+                WorkflowErrorCode::ExecutionUnavailable,
+                true,
+                "work execution dependency is unavailable",
+            ))
+        }
+    }
+
+    fn require_completion(&self) -> Result<(), WorkflowError> {
+        if self.completion_port.readiness() == DependencyReadiness::Ready {
+            Ok(())
+        } else {
+            Err(WorkflowError::new(
+                WorkflowErrorCode::CompletionUnavailable,
+                true,
+                "completion evidence authority is unavailable",
+            ))
         }
     }
 
@@ -203,6 +249,8 @@ impl WorkflowEngine {
         &self,
         limit: usize,
     ) -> Result<Vec<ExecutionReceipt>, WorkflowError> {
+        self.require_organization()?;
+        self.require_execution()?;
         let pending = self.store.pending_executions(limit)?;
         let mut receipts = Vec::new();
         for request in pending {
@@ -294,6 +342,8 @@ impl WorkflowEngine {
         &self,
         limit: usize,
     ) -> Result<Vec<String>, WorkflowError> {
+        self.require_organization()?;
+        self.require_completion()?;
         let pending = self.store.pending_completion_evidence(limit)?;
         let mut completed = Vec::new();
         let mut first_error = None;
@@ -323,7 +373,11 @@ impl WorkflowEngine {
             ));
         };
         match state.as_str() {
-            "pending" => self.resolve_completion_evidence(&request),
+            "pending" => {
+                self.require_organization()?;
+                self.require_completion()?;
+                self.resolve_completion_evidence(&request)
+            }
             "completed" => Ok(()),
             "failed" => Err(WorkflowError::new(
                 WorkflowErrorCode::DigestConflict,
@@ -358,7 +412,7 @@ impl WorkflowEngine {
                     )
                 })?;
                 return Err(WorkflowError::new(
-                    WorkflowErrorCode::ExecutionUnavailable,
+                    WorkflowErrorCode::CompletionUnavailable,
                     true,
                     "completion evidence authority is unavailable",
                 ));

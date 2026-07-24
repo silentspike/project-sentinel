@@ -82,6 +82,8 @@ pub struct RuntimeHealthSnapshot {
     pub snapshot_build_elapsed_us: u64,
     #[serde(default)]
     pub agents: Vec<RuntimeHealthAgentSnapshot>,
+    #[serde(default)]
+    pub company_workflow: Option<crate::workflow_api::WorkflowHealthSnapshot>,
 }
 
 pub type SharedRuntimeHealthState = Arc<RwLock<RuntimeHealthSnapshot>>;
@@ -353,6 +355,7 @@ fn build_runtime_health_snapshot_with_registry(
         operator_auth_required,
         snapshot_build_elapsed_us: 0,
         agents,
+        company_workflow: previous.and_then(|snapshot| snapshot.company_workflow.clone()),
     };
 
     if let Some(previous) = previous {

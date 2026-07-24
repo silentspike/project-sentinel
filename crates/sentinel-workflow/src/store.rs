@@ -15,12 +15,14 @@ use crate::{
     WorkflowError, WorkflowEvent, WorkflowResponse,
 };
 
+const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 3;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workflow_schema_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO workflow_schema_meta (singleton, schema_version) VALUES (1, 2);
+INSERT OR IGNORE INTO workflow_schema_meta (singleton, schema_version) VALUES (1, 3);
 CREATE TABLE IF NOT EXISTS workflow_entities (
     entity_type TEXT NOT NULL,
     entity_id TEXT NOT NULL,
@@ -51,6 +53,17 @@ CREATE INDEX IF NOT EXISTS idx_workflow_events_aggregate
     ON workflow_events(aggregate_type, aggregate_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_workflow_events_operation
     ON workflow_events(operation_id, sequence);
+CREATE TABLE IF NOT EXISTS workflow_event_outbox (
+    event_id TEXT PRIMARY KEY REFERENCES workflow_events(event_id),
+    event_sequence INTEGER NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'published')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    published_at_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_event_outbox_pending
+    ON workflow_event_outbox(state, event_sequence)
+    WHERE state = 'pending';
 CREATE TABLE IF NOT EXISTS workflow_entity_history (
     mutation_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
@@ -198,6 +211,23 @@ WHERE singleton = 1;"#,
     "UPDATE workflow_schema_meta SET schema_version = 2 WHERE singleton = 1;",
 ];
 
+const MIGRATE_V2_TO_V3_STEPS: &[&str] = &[
+    r#"CREATE TABLE IF NOT EXISTS workflow_event_outbox (
+        event_id TEXT PRIMARY KEY REFERENCES workflow_events(event_id),
+        event_sequence INTEGER NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'published')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        published_at_ms INTEGER
+    );"#,
+    r#"INSERT OR IGNORE INTO workflow_event_outbox (event_id, event_sequence, state)
+       SELECT event_id, sequence, 'pending' FROM workflow_events;"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_workflow_event_outbox_pending
+       ON workflow_event_outbox(state, event_sequence)
+       WHERE state = 'pending';"#,
+    "UPDATE workflow_schema_meta SET schema_version = 3 WHERE singleton = 1;",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectionCheckpoint {
     pub source_event_high_watermark: i64,
@@ -216,8 +246,34 @@ pub struct WorkflowBackupManifest {
     pub operation_count: u64,
     pub execution_outbox_count: u64,
     pub completion_outbox_count: u64,
+    pub event_publication_pending_count: u64,
+    pub event_publication_published_count: u64,
+    pub event_publication_high_watermark: i64,
     pub project_projection_count: u64,
     pub projection_checkpoint: ProjectionCheckpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowBackupImage {
+    pub manifest: WorkflowBackupManifest,
+    pub database: Vec<u8>,
+}
+
+impl WorkflowBackupManifest {
+    fn same_logical_state(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.event_high_watermark == other.event_high_watermark
+            && self.entity_history_high_watermark == other.entity_history_high_watermark
+            && self.entity_count == other.entity_count
+            && self.operation_count == other.operation_count
+            && self.execution_outbox_count == other.execution_outbox_count
+            && self.completion_outbox_count == other.completion_outbox_count
+            && self.event_publication_pending_count == other.event_publication_pending_count
+            && self.event_publication_published_count == other.event_publication_published_count
+            && self.event_publication_high_watermark == other.event_publication_high_watermark
+            && self.project_projection_count == other.project_projection_count
+            && self.projection_checkpoint == other.projection_checkpoint
+    }
 }
 
 pub struct WorkflowStore {
@@ -240,6 +296,14 @@ impl WorkflowStore {
     fn open_with_migration_failpoint(
         path: impl AsRef<Path>,
         fail_after_step: Option<usize>,
+    ) -> Result<Self, WorkflowError> {
+        Self::open_with_migration_failpoints(path, fail_after_step, None)
+    }
+
+    fn open_with_migration_failpoints(
+        path: impl AsRef<Path>,
+        fail_after_v1_step: Option<usize>,
+        fail_after_v2_step: Option<usize>,
     ) -> Result<Self, WorkflowError> {
         let mut connection = Connection::open(path).map_err(|_| WorkflowError::persistence())?;
         connection
@@ -271,10 +335,14 @@ impl WorkflowStore {
             )
             .map_err(|_| WorkflowError::persistence())?;
         if schema_version == 1 {
-            migrate_v1_to_v2(&mut connection, fail_after_step)?;
-            schema_version = crate::WORKFLOW_SCHEMA_VERSION;
+            migrate_v1_to_v2(&mut connection, fail_after_v1_step)?;
+            schema_version = 2;
         }
-        if schema_version != crate::WORKFLOW_SCHEMA_VERSION {
+        if schema_version == 2 {
+            migrate_v2_to_v3(&mut connection, fail_after_v2_step)?;
+            schema_version = WORKFLOW_STORE_SCHEMA_VERSION;
+        }
+        if schema_version != WORKFLOW_STORE_SCHEMA_VERSION {
             return Err(WorkflowError::new(
                 crate::WorkflowErrorCode::PersistenceFailure,
                 false,
@@ -534,6 +602,99 @@ impl WorkflowStore {
         }
     }
 
+    /// Captures a verified portable image while holding the workflow store
+    /// connection lock. The image is suitable for embedding in an
+    /// application-level Time Machine snapshot.
+    pub fn backup_image(&self) -> Result<WorkflowBackupImage, WorkflowError> {
+        let path = std::env::temp_dir().join(format!(
+            "sentinel-workflow-backup-{}.sqlite",
+            uuid::Uuid::now_v7()
+        ));
+        let result = (|| {
+            let manifest = self.backup_to(&path)?;
+            let database = fs::read(&path).map_err(|_| WorkflowError::persistence())?;
+            Ok(WorkflowBackupImage { manifest, database })
+        })();
+        let _ = fs::remove_file(path);
+        result
+    }
+
+    /// Restores a verified image into the live SQLite connection. A verified
+    /// pre-restore copy is retained until the restored image has been read
+    /// back, so any failed restore is rolled back before returning.
+    pub fn restore_image(&self, image: &WorkflowBackupImage) -> Result<(), WorkflowError> {
+        let nonce = uuid::Uuid::now_v7();
+        let source_path =
+            std::env::temp_dir().join(format!("sentinel-workflow-restore-{nonce}.sqlite"));
+        let rollback_path =
+            std::env::temp_dir().join(format!("sentinel-workflow-rollback-{nonce}.sqlite"));
+        let verify_path =
+            std::env::temp_dir().join(format!("sentinel-workflow-verify-{nonce}.sqlite"));
+        let result = (|| {
+            fs::write(&source_path, &image.database).map_err(|_| WorkflowError::persistence())?;
+            File::options()
+                .write(true)
+                .open(&source_path)
+                .and_then(|file| file.sync_all())
+                .map_err(|_| WorkflowError::persistence())?;
+            if inspect_backup(&source_path)? != image.manifest {
+                return Err(WorkflowError::new(
+                    crate::WorkflowErrorCode::BackupVerificationFailed,
+                    false,
+                    "workflow restore image does not match its manifest",
+                ));
+            }
+
+            let mut connection = self
+                .connection
+                .lock()
+                .map_err(|_| WorkflowError::persistence())?;
+            connection
+                .backup(rusqlite::MAIN_DB, &rollback_path, None)
+                .map_err(|_| WorkflowError::persistence())?;
+            let restore_result = (|| {
+                connection
+                    .restore(
+                        rusqlite::MAIN_DB,
+                        &source_path,
+                        None::<fn(rusqlite::backup::Progress)>,
+                    )
+                    .map_err(|_| WorkflowError::persistence())?;
+                connection
+                    .backup(rusqlite::MAIN_DB, &verify_path, None)
+                    .map_err(|_| WorkflowError::persistence())?;
+                // SQLite's online backup API may produce a different page
+                // layout and change-counter while preserving the exact
+                // logical database. The source image SHA above authorizes the
+                // input bytes; the post-restore check must verify every
+                // durable invariant rather than require page identity.
+                if !inspect_backup(&verify_path)?.same_logical_state(&image.manifest) {
+                    return Err(WorkflowError::new(
+                        crate::WorkflowErrorCode::BackupVerificationFailed,
+                        false,
+                        "live workflow restore failed post-restore verification",
+                    ));
+                }
+                Ok(())
+            })();
+            if let Err(error) = restore_result {
+                connection
+                    .restore(
+                        rusqlite::MAIN_DB,
+                        &rollback_path,
+                        None::<fn(rusqlite::backup::Progress)>,
+                    )
+                    .map_err(|_| WorkflowError::persistence())?;
+                return Err(error);
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(rollback_path);
+        let _ = fs::remove_file(verify_path);
+        result
+    }
+
     /// Restores a verified backup into a new, offline destination.
     /// Overwriting an existing or open database is deliberately unsupported.
     pub fn restore_from_backup(
@@ -652,6 +813,121 @@ impl WorkflowStore {
         row.map(|(payload, state)| Ok((serde_json::from_slice(&payload)?, state)))
             .transpose()
     }
+
+    pub fn pending_event_publications(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WorkflowEvent>, WorkflowError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkflowError::persistence())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT events.sequence, events.payload
+                 FROM workflow_event_outbox AS outbox
+                 JOIN workflow_events AS events ON events.event_id = outbox.event_id
+                 WHERE outbox.state = 'pending'
+                 ORDER BY outbox.event_sequence
+                 LIMIT ?1",
+            )
+            .map_err(|_| WorkflowError::persistence())?;
+        let rows = statement
+            .query_map([limit.clamp(1, 1_000) as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|_| WorkflowError::persistence())?;
+        let mut pending = Vec::new();
+        for row in rows {
+            let (sequence, payload) = row.map_err(|_| WorkflowError::persistence())?;
+            let mut event: WorkflowEvent = serde_json::from_slice(&payload)?;
+            event.sequence = sequence;
+            pending.push(event);
+        }
+        Ok(pending)
+    }
+
+    pub fn mark_event_published(
+        &self,
+        event_id: &str,
+        event_sequence: i64,
+        now_ms: u64,
+    ) -> Result<(), WorkflowError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkflowError::persistence())?;
+        let changed = connection
+            .execute(
+                "UPDATE workflow_event_outbox
+                 SET state = 'published', attempts = attempts + 1,
+                     last_error = NULL, published_at_ms = ?1
+                 WHERE event_id = ?2 AND event_sequence = ?3
+                   AND state IN ('pending', 'published')",
+                params![sql_integer(now_ms)?, event_id, event_sequence],
+            )
+            .map_err(|_| WorkflowError::persistence())?;
+        if changed != 1 {
+            return Err(WorkflowError::new(
+                crate::WorkflowErrorCode::PersistenceFailure,
+                false,
+                "workflow event publication identity is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn mark_event_publish_failed(
+        &self,
+        event_id: &str,
+        event_sequence: i64,
+        error: &str,
+    ) -> Result<(), WorkflowError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkflowError::persistence())?;
+        let changed = connection
+            .execute(
+                "UPDATE workflow_event_outbox
+                 SET attempts = attempts + 1, last_error = ?1
+                 WHERE event_id = ?2 AND event_sequence = ?3 AND state = 'pending'",
+                params![bounded_error(error), event_id, event_sequence],
+            )
+            .map_err(|_| WorkflowError::persistence())?;
+        if changed != 1 {
+            return Err(WorkflowError::new(
+                crate::WorkflowErrorCode::PersistenceFailure,
+                false,
+                "workflow event publication identity is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn event_publication_state(&self) -> Result<(u64, i64), WorkflowError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkflowError::persistence())?;
+        let pending = connection
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_event_outbox WHERE state = 'pending'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| WorkflowError::persistence())?
+            .max(0) as u64;
+        let high_watermark = connection
+            .query_row(
+                "SELECT COALESCE(MAX(event_sequence), 0)
+                 FROM workflow_event_outbox WHERE state = 'published'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| WorkflowError::persistence())?;
+        Ok((pending, high_watermark))
+    }
 }
 
 pub(crate) struct WorkflowTransaction<'a> {
@@ -749,6 +1025,14 @@ impl WorkflowTransaction<'_> {
             .map_err(|_| WorkflowError::persistence())?;
         let sequence = self.transaction.last_insert_rowid();
         event.sequence = sequence;
+        self.transaction
+            .execute(
+                "INSERT INTO workflow_event_outbox
+                 (event_id, event_sequence, state)
+                 VALUES (?1, ?2, 'pending')",
+                params![event.event_id, sequence],
+            )
+            .map_err(|_| WorkflowError::persistence())?;
         self.transaction
             .execute(
                 "UPDATE workflow_projection_checkpoint
@@ -1174,6 +1458,30 @@ fn migrate_v1_to_v2(
         .map_err(|_| WorkflowError::persistence())
 }
 
+fn migrate_v2_to_v3(
+    connection: &mut Connection,
+    fail_after_step: Option<usize>,
+) -> Result<(), WorkflowError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| WorkflowError::persistence())?;
+    for (index, step) in MIGRATE_V2_TO_V3_STEPS.iter().enumerate() {
+        transaction
+            .execute_batch(step)
+            .map_err(|_| WorkflowError::persistence())?;
+        if fail_after_step == Some(index) {
+            return Err(WorkflowError::new(
+                crate::WorkflowErrorCode::PersistenceFailure,
+                true,
+                "injected workflow migration interruption",
+            ));
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|_| WorkflowError::persistence())
+}
+
 fn sql_integer(value: u64) -> Result<i64, WorkflowError> {
     i64::try_from(value).map_err(|_| WorkflowError::persistence())
 }
@@ -1221,7 +1529,7 @@ fn inspect_backup(path: &Path) -> Result<WorkflowBackupManifest, WorkflowError> 
             |row| row.get(0),
         )
         .map_err(|_| WorkflowError::persistence())?;
-    if schema_version != crate::WORKFLOW_SCHEMA_VERSION {
+    if schema_version != WORKFLOW_STORE_SCHEMA_VERSION {
         return Err(WorkflowError::new(
             crate::WorkflowErrorCode::BackupVerificationFailed,
             false,
@@ -1251,6 +1559,48 @@ fn inspect_backup(path: &Path) -> Result<WorkflowBackupManifest, WorkflowError> 
         .max(0) as u64;
     let execution_outbox_count = table_count(&connection, "workflow_execution_outbox")?;
     let completion_outbox_count = table_count(&connection, "workflow_completion_outbox")?;
+    let event_publication_pending_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM workflow_event_outbox WHERE state = 'pending'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| WorkflowError::persistence())?
+        .max(0) as u64;
+    let event_publication_published_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM workflow_event_outbox WHERE state = 'published'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| WorkflowError::persistence())?
+        .max(0) as u64;
+    let event_publication_high_watermark = connection
+        .query_row(
+            "SELECT COALESCE(MAX(event_sequence), 0)
+             FROM workflow_event_outbox WHERE state = 'published'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| WorkflowError::persistence())?;
+    let unjournaled_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM workflow_events AS events
+             LEFT JOIN workflow_event_outbox AS outbox
+               ON outbox.event_id = events.event_id
+              AND outbox.event_sequence = events.sequence
+             WHERE outbox.event_id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| WorkflowError::persistence())?;
+    if unjournaled_events != 0 {
+        return Err(WorkflowError::new(
+            crate::WorkflowErrorCode::BackupVerificationFailed,
+            false,
+            "workflow event history is not fully represented in the publication outbox",
+        ));
+    }
     let project_projection_count = table_count(&connection, "workflow_project_projections")?;
     let current_entities_without_history: i64 = connection
         .query_row(
@@ -1293,6 +1643,9 @@ fn inspect_backup(path: &Path) -> Result<WorkflowBackupManifest, WorkflowError> 
         operation_count,
         execution_outbox_count,
         completion_outbox_count,
+        event_publication_pending_count,
+        event_publication_published_count,
+        event_publication_high_watermark,
         project_projection_count,
         projection_checkpoint,
     })
@@ -1310,6 +1663,10 @@ fn table_count(connection: &Connection, table: &str) -> Result<u64, WorkflowErro
         .query_row(sql, [], |row| row.get::<_, i64>(0))
         .map_err(|_| WorkflowError::persistence())
         .map(|count| count.max(0) as u64)
+}
+
+fn bounded_error(error: &str) -> String {
+    error.chars().take(512).collect()
 }
 
 fn file_sha256(path: &Path) -> Result<String, WorkflowError> {
@@ -1443,6 +1800,55 @@ mod tests {
     }
 
     #[test]
+    fn every_version_two_migration_failpoint_rolls_back_and_retries_cleanly() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        for fail_after_step in 0..MIGRATE_V2_TO_V3_STEPS.len() {
+            let database = directory
+                .path()
+                .join(format!("workflow-v2-failpoint-{fail_after_step}.db"));
+            create_version_one_database(&database);
+            {
+                let mut connection = Connection::open(&database).expect("open version 1 database");
+                migrate_v1_to_v2(&mut connection, None).expect("create version 2 database");
+            }
+
+            let error = WorkflowStore::open_with_migration_failpoints(
+                &database,
+                None,
+                Some(fail_after_step),
+            )
+            .expect_err("injected migration interruption must fail");
+            assert_eq!(error.code, WorkflowErrorCode::PersistenceFailure);
+            let connection = Connection::open(&database).expect("inspect rolled back database");
+            let schema_version: u32 = connection
+                .query_row(
+                    "SELECT schema_version FROM workflow_schema_meta WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("version marker");
+            assert_eq!(schema_version, 2, "failpoint {fail_after_step}");
+            let outbox_exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'workflow_event_outbox'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("outbox existence");
+            assert_eq!(outbox_exists, 0, "failpoint {fail_after_step}");
+            drop(connection);
+
+            let recovered =
+                WorkflowStore::open(&database).expect("next startup retries version 3 migration");
+            assert_eq!(
+                recovered.event_publication_state().expect("outbox state"),
+                (1, 0)
+            );
+        }
+    }
+
+    #[test]
     fn version_one_migration_preserves_replay_history_and_backup_watermarks() {
         let directory = tempfile::tempdir().expect("tempdir");
         let database = directory.path().join("workflow-v1.db");
@@ -1532,13 +1938,16 @@ mod tests {
             .expect_err("legacy operation ID remains globally fail closed");
         assert_eq!(conflict.code, WorkflowErrorCode::IdempotencyConflict);
         let manifest = store.backup_to(&backup).expect("backup migrated store");
-        assert_eq!(manifest.schema_version, crate::WORKFLOW_SCHEMA_VERSION);
+        assert_eq!(manifest.schema_version, WORKFLOW_STORE_SCHEMA_VERSION);
         assert_eq!(manifest.event_high_watermark, 1);
         assert_eq!(manifest.entity_history_high_watermark, 1);
         assert_eq!(manifest.entity_count, 1);
         assert_eq!(manifest.operation_count, 1);
         assert_eq!(manifest.execution_outbox_count, 0);
         assert_eq!(manifest.completion_outbox_count, 0);
+        assert_eq!(manifest.event_publication_pending_count, 1);
+        assert_eq!(manifest.event_publication_published_count, 0);
+        assert_eq!(manifest.event_publication_high_watermark, 0);
         assert_eq!(manifest.project_projection_count, 0);
 
         let rejected_backup = directory.path().join("workflow-stale-projection.db");
@@ -1557,5 +1966,45 @@ mod tests {
             .expect_err("backup requires a caught-up projection checkpoint");
         assert_eq!(rejected.code, WorkflowErrorCode::BackupVerificationFailed);
         assert!(!rejected_backup.exists());
+    }
+
+    #[test]
+    fn verified_backup_image_restores_the_live_store_atomically() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("workflow-v1.db");
+        create_version_one_database(&database);
+        let store = WorkflowStore::open(&database).expect("migrated store");
+        let image = store.backup_image().expect("verified image");
+
+        {
+            let connection = store.connection.lock().expect("store connection");
+            connection
+                .execute("DELETE FROM workflow_event_outbox", [])
+                .expect("delete outbox");
+            connection
+                .execute("DELETE FROM workflow_events", [])
+                .expect("delete events");
+            connection
+                .execute("DELETE FROM workflow_entity_history", [])
+                .expect("delete history");
+            connection
+                .execute("DELETE FROM workflow_entities", [])
+                .expect("delete entities");
+        }
+        assert!(store
+            .entity::<serde_json::Value>("request", "request-v1")
+            .expect("read mutated store")
+            .is_none());
+
+        store.restore_image(&image).expect("atomic live restore");
+        assert!(store
+            .entity::<serde_json::Value>("request", "request-v1")
+            .expect("read restored store")
+            .is_some());
+        assert!(store
+            .backup_image()
+            .expect("post-restore image")
+            .manifest
+            .same_logical_state(&image.manifest));
     }
 }

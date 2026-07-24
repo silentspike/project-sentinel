@@ -35,14 +35,17 @@ decisions, handoffs, blockers, approvals, action items, unresolved questions,
 spend, progress, and the last projected event sequence.
 
 All newly written public schemas carry `schema_version = 2`. The version 1 to
-version 2 migration runs under one SQLite `BEGIN IMMEDIATE` transaction. The
+version 2 domain migration runs under one SQLite `BEGIN IMMEDIATE` transaction. The
 schema-version marker is written last. An injected failure after any destructive
 DDL step rolls back the complete transaction, leaves the version 1 image
 readable, and permits the same migration to be retried deterministically. IDs
 are durable UUIDv7-based opaque strings, except the existing validated
 `AgentId` type. Legacy operation IDs become global fail-closed tombstones: their
 principal and tenant cannot be proven, so their stored responses are never
-replayed into a version 2 namespace.
+replayed into a version 2 namespace. The workflow-store schema is version 3:
+its separate version 2 to version 3 migration creates and backfills the
+canonical-event publication outbox atomically, writes the version marker last,
+and retries from an intact version 2 image after every injected crash point.
 
 The workflow is deployment-safe and disabled by default.
 `SENTINEL_COMPANY_WORKFLOW_ENABLED=true` is the only value that enables it.
@@ -207,11 +210,23 @@ event high watermark, projected high watermark, project count, and last rebuild
 time. Every in-process projection update advances both watermarks in the same
 transaction. A backup is refused unless those watermarks agree.
 
+Every workflow event is also inserted into `workflow_event_outbox` in the same
+local SQLite transaction. Publication converts it to the typed
+`company_workflow_event` envelope and uses the workflow event ID as the stable
+operation identity for `sentinel-limbo/events.db`. Limbo atomically appends the
+canonical event and its transport outbox row, after which the existing
+Projection and NATS paths consume it. A crash after the Limbo append but before
+the local acknowledgement replays the same operation identity and cannot add a
+second canonical event or transport row. Canonical publication failure never
+rolls back an already accepted local customer or governance command; Health
+reports the durable backlog as degraded and bounded recovery retries it.
+
 `WorkflowStore::backup_to` creates a transactionally consistent standalone
 SQLite image with `VACUUM INTO` and returns a manifest containing schema
 version, database SHA-256, event and entity-history watermarks, entity,
 operation, execution-outbox, completion-evidence-outbox, and project-projection
-counts, and the projection checkpoint.
+counts, event-publication pending/published counts and watermark, and the
+projection checkpoint.
 The destination must not exist, and a failed creation or verification removes
 the incomplete destination. Restore is an offline operation into another
 non-existent path: it verifies the source image, manifest, SQLite integrity,
@@ -220,6 +235,16 @@ copies and `fsync`s a temporary file, verifies it again, then atomically renames
 and `fsync`s the parent directory. It never overwrites a live database.
 Projection rebuild clears only derived project read models, regenerates them
 from authoritative state, and records the current event watermark.
+
+Application Time Machine snapshots additionally drain the event-publication
+outbox under a workflow mutation fence, embed a verified SQLite image and
+manifest, and bind them to the exact Limbo event cursor in world-snapshot schema
+version 4. Restore rejects a cursor mismatch, restores the workflow store as
+part of the multi-store commit, verifies all logical invariants, and restores
+the pre-restore workflow image if any later store commit fails. Health exposes
+enabled state, readiness/degradation, publication backlog and watermark, and
+the canonical event cursor. Snapshot schemas 1 through 3 remain readable; an
+enabled workflow fails closed when an older snapshot has no workflow image.
 
 ## HTTP surface
 
@@ -243,10 +268,15 @@ principal kind, role, and subject. No credential or credential digest is
 serialized into workflow state. A credential cannot cross customer, operator,
 or agent routes. While the workflow is disabled, every workflow route returns
 typed `503 workflow_unavailable` and the rest of the daemon remains available.
-When enabled and provisioned, mutating routes return typed
-`503 dispatcher_not_ready` until the production #694 dispatcher, authoritative
-organization adapter, and completion evidence authority all report ready;
-read-only authenticated recovery remains available.
+When enabled and provisioned, dependency readiness is evaluated per command.
+Customer intake, clarification, proposal, agreement, and locally durable
+governance commands remain available during Workbench or completion-authority
+outages. Assignment requires Organization authority; claim requires
+Organization and Execution; completion requires Organization and Completion
+authority. Those paths return the corresponding typed
+`organization_unavailable`, `execution_unavailable`, or
+`completion_unavailable` response. Durable idempotent replays do not require a
+currently healthy dependency and cannot repeat an external effect.
 
 ## Verification and deferred boundaries
 
@@ -263,6 +293,11 @@ retry, crash-atomic schema migration from every destructive-DDL failpoint, event
 ordering, projection recovery, verified backup/restore, principal-scoped
 idempotency, cross-project and cross-tenant decision denial, authority spoofing,
 disabled and fully provisioned daemon startup, and chat-only rejection.
+Additional degradation coverage proves that local intake and clarification
+remain writable while Workbench is down, claim and completion fail closed,
+recovery does not duplicate canonical events or transport rows, the existing
+Projection pipeline accepts the typed workflow event, and Time Machine restore
+recovers workflow state and publication checkpoints.
 
 AC-6 is only partially satisfied: claim, durable reservation, deterministic
 port dispatch, completion evidence, and tick-independent state transitions are

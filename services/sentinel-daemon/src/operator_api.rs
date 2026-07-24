@@ -687,6 +687,7 @@ impl ApiError {
 pub async fn start_server(
     config: OperatorApiConfig,
     data_dir: PathBuf,
+    workflow_api: Arc<crate::workflow_api::WorkflowApi>,
     fs_mount: Option<String>,
     fs_layer: Option<Arc<LayerManager>>,
     allowed_rooms: Vec<String>,
@@ -717,13 +718,6 @@ pub async fn start_server(
         .await
         .with_context(|| format!("Operator-API bind fehlgeschlagen: {}", config.bind_addr))?;
     let room_count = allowed_rooms.len();
-    let workflow_api = Arc::new(
-        crate::workflow_api::WorkflowApi::open(
-            data_dir.join("company-workflow.sqlite"),
-            std::env::var_os("SENTINEL_WORKFLOW_PRINCIPALS_FILE").map(PathBuf::from),
-        )
-        .context("Company workflow store could not be opened")?,
-    );
     let state = AppState {
         allowed_rooms: Arc::new(allowed_rooms.into_iter().collect()),
         shared_secret: config.shared_secret,
@@ -843,7 +837,11 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 }
             },
             OPERATOR_RUNTIME_HEALTH_PATH => match state.runtime_health.read() {
-                Ok(snapshot) => json_response(200, snapshot.clone()),
+                Ok(snapshot) => {
+                    let mut snapshot = snapshot.clone();
+                    snapshot.company_workflow = Some(state.workflow_api.health());
+                    json_response(200, snapshot)
+                }
                 Err(_) => {
                     ApiError::ServiceUnavailable("Runtime-Health nicht verfuegbar").to_response()
                 }
@@ -3638,6 +3636,9 @@ mod tests {
                 fs_mount: None,
             },
         )])));
+        let event_store = Arc::new(
+            sentinel_limbo::EventStore::open(":memory:").expect("in-memory EventStore fuer Tests"),
+        );
         let state = AppState {
             allowed_rooms: Arc::new(
                 ["empfang".to_string(), "flur_eg".to_string()]
@@ -3661,10 +3662,7 @@ mod tests {
             config_apply_max_agents: 60,
             config_apply_validation:
                 sentinel_common::agent_config::AgentConfigValidation::with_max_agent_id(60),
-            event_store: Arc::new(
-                sentinel_limbo::EventStore::open(":memory:")
-                    .expect("in-memory EventStore fuer Tests"),
-            ),
+            event_store: Arc::clone(&event_store),
             prune_tx: mpsc::channel().0,
             state_store,
             platform_state: Arc::new(std::sync::RwLock::new(PlatformStateSnapshot {
@@ -3736,6 +3734,7 @@ mod tests {
                         security_runtime_present: true,
                         last_repair_status: Some("stale".to_string()),
                     }],
+                    company_workflow: None,
                 },
             )),
             security_runtime_state,
@@ -3744,7 +3743,7 @@ mod tests {
             cluster_node_alias: None,
             cluster_is_seed: false,
             workflow_api: Arc::new(
-                crate::workflow_api::WorkflowApi::open(":memory:", None)
+                crate::workflow_api::WorkflowApi::open(":memory:", None, Arc::clone(&event_store))
                     .expect("in-memory workflow API"),
             ),
         };
@@ -4833,6 +4832,9 @@ mod tests {
         assert_eq!(payload.stale_runtime_entries, 2);
         assert_eq!(payload.agents.len(), 1);
         assert_eq!(payload.agents[0].agent_id, 7);
+        let workflow = payload.company_workflow.expect("workflow health");
+        assert!(!workflow.enabled);
+        assert_eq!(workflow.status, "disabled");
     }
 
     #[test]

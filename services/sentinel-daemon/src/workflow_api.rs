@@ -5,11 +5,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
+use sentinel_common::{CompanyWorkflowSnapshot, DomainEvent, DomainEventPayload};
+use sentinel_limbo::EventStore;
 use sentinel_workflow::{
-    AuthenticatedPrincipal, CanonicalWorkProfile, CustomerRequestId, DependencyReadiness,
-    PrincipalKind, ProjectId, UnavailableCompletionEvidencePort, UnavailableExecutionPort,
+    AuthenticatedPrincipal, CanonicalWorkProfile, CustomerRequestId, PrincipalKind, ProjectId,
+    UnavailableCompletionEvidencePort, UnavailableExecutionPort,
     UnavailableOrganizationRuntimePort, WorkItemId, WorkflowCommand, WorkflowEngine, WorkflowError,
     WorkflowErrorCode, WorkflowStore,
 };
@@ -152,8 +154,68 @@ pub struct WorkflowHttpResponse {
 
 pub struct WorkflowApi {
     engine: Arc<WorkflowEngine>,
+    store: Arc<WorkflowStore>,
+    event_sink: Arc<dyn WorkflowEventSink>,
     principals: Arc<PrincipalAuthenticator>,
+    mutation_fence: RwLock<()>,
     enabled: bool,
+}
+
+trait WorkflowEventSink: Send + Sync {
+    fn publish(&self, event: &sentinel_workflow::WorkflowEvent) -> Result<(), String>;
+    fn cursor(&self) -> Result<i64, String>;
+}
+
+struct LimboWorkflowEventSink {
+    event_store: Arc<EventStore>,
+}
+
+impl WorkflowEventSink for LimboWorkflowEventSink {
+    fn publish(&self, workflow_event: &sentinel_workflow::WorkflowEvent) -> Result<(), String> {
+        let payload = DomainEventPayload::CompanyWorkflowEvent {
+            workflow_event: serde_json::to_value(workflow_event)
+                .map_err(|_| "workflow event serialization failed".to_owned())?,
+        };
+        let correlation_id = format!(
+            "workflow:{}:{}",
+            workflow_event.tenant_id, workflow_event.operation_id
+        );
+        let operation_id = format!("workflow-event:{}", workflow_event.event_id);
+        let mut event = DomainEvent::new(
+            payload.event_type_str(),
+            &format!(
+                "workflow:{}:{}",
+                workflow_event.aggregate_type, workflow_event.aggregate_id
+            ),
+            &payload.to_json(),
+            &correlation_id,
+            0,
+        )
+        .with_causation(&workflow_event.operation_id)
+        .with_operation_id(&operation_id)
+        .with_schema_version(workflow_event.schema_version);
+        event.event_id = format!("workflow-{}", workflow_event.event_id);
+        event.timestamp_ms = workflow_event.timestamp_ms;
+        self.event_store
+            .append_with_outbox(&event, "sentinel/events/company_workflow_event")
+            .map(|_| ())
+            .map_err(|_| "canonical event store publication failed".to_owned())
+    }
+
+    fn cursor(&self) -> Result<i64, String> {
+        self.event_store
+            .get_latest_event_id()
+            .map_err(|_| "canonical event store cursor is unavailable".to_owned())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowHealthSnapshot {
+    pub enabled: bool,
+    pub status: String,
+    pub publication_pending: u64,
+    pub publication_high_watermark: i64,
+    pub canonical_event_cursor: Option<i64>,
 }
 
 impl std::fmt::Debug for WorkflowApi {
@@ -165,15 +227,28 @@ impl std::fmt::Debug for WorkflowApi {
 }
 
 impl WorkflowApi {
+    #[cfg(test)]
+    pub(crate) fn disabled(event_store: Arc<EventStore>) -> Result<Self, WorkflowError> {
+        Self::open_configured(
+            ":memory:",
+            false,
+            None,
+            None,
+            Arc::new(LimboWorkflowEventSink { event_store }),
+        )
+    }
+
     pub fn open(
         path: impl AsRef<Path>,
         principal_bindings_file: Option<PathBuf>,
+        event_store: Arc<EventStore>,
     ) -> Result<Self, WorkflowError> {
         Self::open_configured(
             path,
             workflow_enabled()?,
             Some(work_profile_path()),
             principal_bindings_file,
+            Arc::new(LimboWorkflowEventSink { event_store }),
         )
     }
 
@@ -182,18 +257,22 @@ impl WorkflowApi {
         enabled: bool,
         profile_file: Option<PathBuf>,
         principal_bindings_file: Option<PathBuf>,
+        event_sink: Arc<dyn WorkflowEventSink>,
     ) -> Result<Self, WorkflowError> {
         if !enabled {
             let store = Arc::new(WorkflowStore::open(":memory:")?);
             return Ok(Self {
                 engine: Arc::new(WorkflowEngine::with_ports(
-                    store,
+                    Arc::clone(&store),
                     Arc::new(UnavailableExecutionPort),
                     Arc::new(UnavailableOrganizationRuntimePort),
                     Arc::new(UnavailableCompletionEvidencePort),
                     Arc::new(CanonicalWorkProfile::embedded()?),
                 )),
+                store,
+                event_sink,
                 principals: Arc::new(PrincipalAuthenticator::default()),
+                mutation_fence: RwLock::new(()),
                 enabled: false,
             });
         }
@@ -202,19 +281,24 @@ impl WorkflowApi {
             principal_bindings_file.ok_or_else(auth_configuration_error)?;
         let profile = Arc::new(CanonicalWorkProfile::load_verified(profile_file)?);
         let store = Arc::new(WorkflowStore::open(path)?);
-        Ok(Self {
+        let api = Self {
             engine: Arc::new(WorkflowEngine::with_ports(
-                store,
+                Arc::clone(&store),
                 Arc::new(UnavailableExecutionPort),
                 Arc::new(UnavailableOrganizationRuntimePort),
                 Arc::new(UnavailableCompletionEvidencePort),
                 profile,
             )),
+            store,
+            event_sink,
             principals: Arc::new(PrincipalAuthenticator::from_file(Some(
                 principal_bindings_file,
             ))?),
+            mutation_fence: RwLock::new(()),
             enabled: true,
-        })
+        };
+        let _ = api.recover_event_publications(1_000);
+        Ok(api)
     }
 
     #[cfg(test)]
@@ -224,17 +308,21 @@ impl WorkflowApi {
         execution_port: Arc<dyn sentinel_workflow::WorkExecutionPort>,
         organization_port: Arc<dyn sentinel_workflow::OrganizationRuntimePort>,
         completion_port: Arc<dyn sentinel_workflow::CompletionEvidencePort>,
+        event_sink: Arc<dyn WorkflowEventSink>,
     ) -> Result<Self, WorkflowError> {
         let store = Arc::new(WorkflowStore::open(path)?);
         Ok(Self {
             engine: Arc::new(WorkflowEngine::with_ports(
-                store,
+                Arc::clone(&store),
                 execution_port,
                 organization_port,
                 completion_port,
                 Arc::new(CanonicalWorkProfile::embedded()?),
             )),
+            store,
+            event_sink,
             principals: Arc::new(principals),
+            mutation_fence: RwLock::new(()),
             enabled: true,
         })
     }
@@ -247,6 +335,14 @@ impl WorkflowApi {
         body: &[u8],
     ) -> Option<WorkflowHttpResponse> {
         let path_only = path.split('?').next().unwrap_or(path);
+        if self.enabled {
+            // Publication participates in the same read/write fence as
+            // mutations. A Time Machine snapshot takes the write side, so no
+            // canonical append can race the captured workflow image/cursor.
+            if let Ok(_publication_guard) = self.mutation_fence.read() {
+                let _ = self.recover_event_publications(1_000);
+            }
+        }
         if !self.enabled && is_workflow_path(path_only) {
             return Some(json_error(
                 503,
@@ -286,9 +382,14 @@ impl WorkflowApi {
         let Some(principal) = self.authenticate_kind(headers, PrincipalKind::Customer) else {
             return self.authentication_failure();
         };
-        if let Some(response) = self.mutation_gate() {
-            return response;
-        }
+        let Ok(_mutation_guard) = self.mutation_fence.read() else {
+            return json_error(
+                503,
+                "workflow_recovery_in_progress",
+                "workflow mutation fence is unavailable",
+                true,
+            );
+        };
         let envelope: CommandEnvelope = match serde_json::from_slice(body) {
             Ok(value) => value,
             Err(_) => {
@@ -304,7 +405,10 @@ impl WorkflowApi {
             .engine
             .execute(principal, &envelope.operation_id, envelope.command)
         {
-            Ok(outcome) => json(200, &outcome),
+            Ok(outcome) => {
+                let _ = self.recover_event_publications(1_000);
+                json(200, &outcome)
+            }
             Err(error) => workflow_error(error),
         }
     }
@@ -318,9 +422,14 @@ impl WorkflowApi {
         let Some(principal) = self.authenticate_kind(headers, kind) else {
             return self.authentication_failure();
         };
-        if let Some(response) = self.mutation_gate() {
-            return response;
-        }
+        let Ok(_mutation_guard) = self.mutation_fence.read() else {
+            return json_error(
+                503,
+                "workflow_recovery_in_progress",
+                "workflow mutation fence is unavailable",
+                true,
+            );
+        };
         let envelope: CommandEnvelope = match serde_json::from_slice(body) {
             Ok(value) => value,
             Err(_) => {
@@ -336,7 +445,10 @@ impl WorkflowApi {
             .engine
             .execute(principal, &envelope.operation_id, envelope.command)
         {
-            Ok(outcome) => json(200, &outcome),
+            Ok(outcome) => {
+                let _ = self.recover_event_publications(1_000);
+                json(200, &outcome)
+            }
             Err(error) => workflow_error(error),
         }
     }
@@ -473,16 +585,155 @@ impl WorkflowApi {
         }
     }
 
-    fn mutation_gate(&self) -> Option<WorkflowHttpResponse> {
-        (self.engine.mutation_readiness() != DependencyReadiness::Ready).then(|| {
-            json_error(
-                503,
-                "dispatcher_not_ready",
-                "workflow mutations are disabled until the production dispatcher is ready",
-                true,
-            )
-        })
+    fn recover_event_publications(&self, limit: usize) -> Result<usize, WorkflowError> {
+        let pending = self.store.pending_event_publications(limit)?;
+        let mut published = 0;
+        for event in pending {
+            match self.event_sink.publish(&event) {
+                Ok(()) => {
+                    self.store.mark_event_published(
+                        &event.event_id,
+                        event.sequence,
+                        current_time_ms(),
+                    )?;
+                    published += 1;
+                }
+                Err(error) => {
+                    self.store.mark_event_publish_failed(
+                        &event.event_id,
+                        event.sequence,
+                        &error,
+                    )?;
+                    return Err(WorkflowError::new(
+                        WorkflowErrorCode::PersistenceFailure,
+                        true,
+                        "canonical workflow event publication is unavailable",
+                    ));
+                }
+            }
+        }
+        Ok(published)
     }
+
+    pub fn health(&self) -> WorkflowHealthSnapshot {
+        if !self.enabled {
+            return WorkflowHealthSnapshot {
+                enabled: false,
+                status: "disabled".to_owned(),
+                publication_pending: 0,
+                publication_high_watermark: 0,
+                canonical_event_cursor: self.event_sink.cursor().ok(),
+            };
+        }
+        let state = self.store.event_publication_state();
+        let cursor = self.event_sink.cursor().ok();
+        match state {
+            Ok((pending, high_watermark)) => WorkflowHealthSnapshot {
+                enabled: true,
+                status: if pending == 0 && cursor.is_some() {
+                    "ready".to_owned()
+                } else {
+                    "degraded".to_owned()
+                },
+                publication_pending: pending,
+                publication_high_watermark: high_watermark,
+                canonical_event_cursor: cursor,
+            },
+            Err(_) => WorkflowHealthSnapshot {
+                enabled: true,
+                status: "unavailable".to_owned(),
+                publication_pending: 0,
+                publication_high_watermark: 0,
+                canonical_event_cursor: cursor,
+            },
+        }
+    }
+
+    pub fn time_machine_snapshot(&self) -> Result<Option<CompanyWorkflowSnapshot>, WorkflowError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let _fence = self
+            .mutation_fence
+            .write()
+            .map_err(|_| workflow_persistence_error("workflow snapshot fence is unavailable"))?;
+        for _ in 0..10 {
+            self.recover_event_publications(1_000)?;
+            if self.store.event_publication_state()?.0 == 0 {
+                let image = self.store.backup_image()?;
+                let limbo_event_cursor = self.event_sink.cursor().map_err(|_| {
+                    WorkflowError::new(
+                        WorkflowErrorCode::PersistenceFailure,
+                        true,
+                        "canonical event store cursor is unavailable",
+                    )
+                })?;
+                return Ok(Some(CompanyWorkflowSnapshot {
+                    database: image.database,
+                    manifest_json: serde_json::to_vec(&image.manifest)?,
+                    limbo_event_cursor,
+                }));
+            }
+        }
+        Err(WorkflowError::new(
+            WorkflowErrorCode::PersistenceFailure,
+            true,
+            "workflow event publication backlog exceeds the bounded snapshot drain",
+        ))
+    }
+
+    pub fn restore_time_machine_snapshot(
+        &self,
+        snapshot: Option<&CompanyWorkflowSnapshot>,
+    ) -> Result<(), WorkflowError> {
+        match (self.enabled, snapshot) {
+            (false, None) => return Ok(()),
+            (false, Some(_)) => {
+                return Err(WorkflowError::new(
+                    WorkflowErrorCode::BackupVerificationFailed,
+                    false,
+                    "workflow snapshot cannot be restored while the workflow is disabled",
+                ))
+            }
+            (true, None) => {
+                return Err(WorkflowError::new(
+                    WorkflowErrorCode::BackupVerificationFailed,
+                    false,
+                    "enabled workflow requires a workflow image in the world snapshot",
+                ))
+            }
+            (true, Some(_)) => {}
+        }
+        let snapshot = snapshot.expect("enabled snapshot checked above");
+        let manifest: sentinel_workflow::WorkflowBackupManifest =
+            serde_json::from_slice(&snapshot.manifest_json).map_err(|_| {
+                WorkflowError::new(
+                    WorkflowErrorCode::BackupVerificationFailed,
+                    false,
+                    "workflow snapshot manifest is invalid",
+                )
+            })?;
+        let _fence = self
+            .mutation_fence
+            .write()
+            .map_err(|_| workflow_persistence_error("workflow restore fence is unavailable"))?;
+        self.store
+            .restore_image(&sentinel_workflow::WorkflowBackupImage {
+                manifest,
+                database: snapshot.database.clone(),
+            })
+    }
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn workflow_persistence_error(message: &str) -> WorkflowError {
+    WorkflowError::new(WorkflowErrorCode::PersistenceFailure, true, message)
 }
 
 pub fn is_workflow_path(path: &str) -> bool {
@@ -550,9 +801,10 @@ fn workflow_error(error: WorkflowError) -> WorkflowHttpResponse {
         WorkflowErrorCode::InvalidInput | WorkflowErrorCode::DagInvalid => (400, "invalid_input"),
         WorkflowErrorCode::NotFound => (404, "not_found"),
         WorkflowErrorCode::Unauthorized => (401, "unauthorized"),
-        WorkflowErrorCode::PersistenceFailure | WorkflowErrorCode::ExecutionUnavailable => {
-            (503, "service_unavailable")
-        }
+        WorkflowErrorCode::OrganizationUnavailable => (503, "organization_unavailable"),
+        WorkflowErrorCode::ExecutionUnavailable => (503, "execution_unavailable"),
+        WorkflowErrorCode::CompletionUnavailable => (503, "completion_unavailable"),
+        WorkflowErrorCode::PersistenceFailure => (503, "service_unavailable"),
         WorkflowErrorCode::DispatcherNotReady => (503, "dispatcher_not_ready"),
         WorkflowErrorCode::BackupVerificationFailed => (409, "backup_verification_failed"),
         WorkflowErrorCode::InvalidTransition
@@ -596,15 +848,54 @@ mod tests {
     use super::*;
     use sentinel_workflow::{
         AgentId, CompletionAuthorityReceipt, CompletionEvidencePort, CompletionReceiptQuery,
-        ExecutionReceipt, OrganizationAgentSnapshot, OrganizationRuntimePort, WorkExecutionError,
-        WorkExecutionPort,
+        DependencyReadiness, ExecutionReceipt, OrganizationAgentSnapshot, OrganizationRuntimePort,
+        WorkExecutionError, WorkExecutionPort,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     const CUSTOMER_A_TOKEN: &str = "customer-a-token-that-is-long-enough";
     const CUSTOMER_B_TOKEN: &str = "customer-b-token-that-is-long-enough";
     const OPERATOR_TOKEN: &str = "operator-token-that-is-long-enough-1";
     const AGENT_TOKEN: &str = "agent-token-that-is-long-enough-0001";
+
+    #[derive(Debug)]
+    struct RecordingEventSink {
+        available: AtomicBool,
+        attempts: AtomicUsize,
+        events: Mutex<BTreeMap<String, sentinel_workflow::WorkflowEvent>>,
+    }
+
+    impl RecordingEventSink {
+        fn available() -> Arc<Self> {
+            Arc::new(Self {
+                available: AtomicBool::new(true),
+                attempts: AtomicUsize::new(0),
+                events: Mutex::new(BTreeMap::new()),
+            })
+        }
+    }
+
+    impl WorkflowEventSink for RecordingEventSink {
+        fn publish(&self, event: &sentinel_workflow::WorkflowEvent) -> Result<(), String> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if !self.available.load(Ordering::SeqCst) {
+                return Err("test event sink unavailable".to_owned());
+            }
+            self.events
+                .lock()
+                .expect("event sink lock")
+                .entry(event.event_id.clone())
+                .or_insert_with(|| event.clone());
+            Ok(())
+        }
+
+        fn cursor(&self) -> Result<i64, String> {
+            Ok(self.events.lock().expect("event sink lock").len() as i64)
+        }
+    }
 
     fn canonical_profile_path() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/work-profiles/web-project-v1.toml")
@@ -716,7 +1007,11 @@ mod tests {
         }
     }
 
-    fn api(execution_ready: bool) -> WorkflowApi {
+    fn api_with_sink(
+        execution_ready: bool,
+        completion_ready: bool,
+        event_sink: Arc<dyn WorkflowEventSink>,
+    ) -> WorkflowApi {
         let principals = PrincipalAuthenticator::new(vec![
             (
                 CUSTOMER_A_TOKEN.into(),
@@ -735,14 +1030,24 @@ mod tests {
         } else {
             Arc::new(UnavailableExecutionPort)
         };
+        let completion: Arc<dyn CompletionEvidencePort> = if completion_ready {
+            Arc::new(ReadyCompletion)
+        } else {
+            Arc::new(UnavailableCompletionEvidencePort)
+        };
         WorkflowApi::with_dependencies(
             ":memory:",
             principals,
             execution,
             Arc::new(ReadyOrganization),
-            Arc::new(ReadyCompletion),
+            completion,
+            event_sink,
         )
         .expect("API")
+    }
+
+    fn api(execution_ready: bool) -> WorkflowApi {
+        api_with_sink(execution_ready, true, RecordingEventSink::available())
     }
 
     #[test]
@@ -757,6 +1062,7 @@ mod tests {
             false,
             Some("/missing/profile.toml".into()),
             Some("/missing/principals.json".into()),
+            RecordingEventSink::available(),
         )
         .expect("disabled workflow must not touch provisioning");
         let response = api
@@ -775,6 +1081,7 @@ mod tests {
             true,
             Some(directory.path().join("missing-profile.toml")),
             Some(directory.path().join("principals.json")),
+            RecordingEventSink::available(),
         )
         .expect_err("enabled workflow requires deployed canonical profile");
         assert!(matches!(
@@ -791,6 +1098,7 @@ mod tests {
             true,
             Some(modified_path),
             Some(directory.path().join("principals.json")),
+            RecordingEventSink::available(),
         )
         .expect_err("modified canonical profile must fail closed");
         assert_eq!(digest_conflict.code, WorkflowErrorCode::DigestConflict);
@@ -800,6 +1108,7 @@ mod tests {
             true,
             Some(canonical_profile_path()),
             None,
+            RecordingEventSink::available(),
         )
         .expect_err("enabled workflow requires principal binding configuration");
         assert_eq!(
@@ -821,6 +1130,7 @@ mod tests {
             true,
             Some(canonical_profile_path()),
             Some(principals),
+            RecordingEventSink::available(),
         );
         std::env::remove_var(env_name);
         let api = result.expect("fully provisioned workflow starts");
@@ -991,10 +1301,10 @@ mod tests {
     }
 
     #[test]
-    fn mutations_fail_closed_until_dispatcher_is_ready() {
+    fn workbench_degradation_preserves_local_commands_and_gates_claim_and_completion() {
         let api = api(false);
-        let body = serde_json::to_vec(&json!({
-            "operation_id": "gated-submit",
+        let submit = serde_json::to_vec(&json!({
+            "operation_id": "degraded-submit",
             "command": {
                 "command": "submit_customer_request",
                 "summary_ref": "ref",
@@ -1008,11 +1318,252 @@ mod tests {
                 "POST",
                 CUSTOMER_COMMAND_PATH,
                 &headers(CUSTOMER_A_TOKEN),
-                &body,
+                &submit,
+            )
+            .expect("workflow response");
+        assert_eq!(response.status, 200);
+        let value: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON");
+        let request_id = value["response"]["value"]["id"]
+            .as_str()
+            .expect("request id");
+        let clarify = serde_json::to_vec(&json!({
+            "operation_id": "degraded-clarification",
+            "command": {
+                "command": "clarify_customer_request",
+                "request_id": request_id,
+                "expected_version": 1,
+                "question_ref": "scope-question",
+                "answer_ref": "scope-answer"
+            }
+        }))
+        .expect("JSON");
+        assert_eq!(
+            api.handle(
+                "POST",
+                CUSTOMER_COMMAND_PATH,
+                &headers(CUSTOMER_A_TOKEN),
+                &clarify,
+            )
+            .expect("workflow response")
+            .status,
+            200
+        );
+
+        let claim = serde_json::to_vec(&json!({
+            "operation_id": "degraded-claim",
+            "command": {
+                "command": "claim_work",
+                "work_item_id": "work-not-resolved-before-readiness",
+                "expected_version": 1,
+                "agent_id": 2,
+                "input_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "deadline_ms": 4000000000000_u64
+            }
+        }))
+        .expect("JSON");
+        let response = api
+            .handle("POST", AGENT_COMMAND_PATH, &headers(AGENT_TOKEN), &claim)
+            .expect("workflow response");
+        assert_eq!(response.status, 503);
+        let value: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON");
+        assert_eq!(value["code"], "execution_unavailable");
+
+        let completion_api = api_with_sink(true, false, RecordingEventSink::available());
+        let completion = serde_json::to_vec(&json!({
+            "operation_id": "degraded-completion",
+            "command": {
+                "command": "request_work_completion",
+                "work_item_id": "work-not-resolved-before-readiness",
+                "expected_version": 1,
+                "assignment_version": 1
+            }
+        }))
+        .expect("JSON");
+        let response = completion_api
+            .handle(
+                "POST",
+                AGENT_COMMAND_PATH,
+                &headers(AGENT_TOKEN),
+                &completion,
             )
             .expect("workflow response");
         assert_eq!(response.status, 503);
         let value: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON");
-        assert_eq!(value["code"], "dispatcher_not_ready");
+        assert_eq!(value["code"], "completion_unavailable");
+    }
+
+    #[test]
+    fn workflow_event_publication_recovers_without_duplicates() {
+        let sink = RecordingEventSink::available();
+        sink.available.store(false, Ordering::SeqCst);
+        let api = api_with_sink(false, false, sink.clone());
+        let submit = serde_json::to_vec(&json!({
+            "operation_id": "publication-recovery",
+            "command": {
+                "command": "submit_customer_request",
+                "summary_ref": "ref",
+                "desired_outcome": "result",
+                "constraints": []
+            }
+        }))
+        .expect("JSON");
+        let created = api
+            .handle(
+                "POST",
+                CUSTOMER_COMMAND_PATH,
+                &headers(CUSTOMER_A_TOKEN),
+                &submit,
+            )
+            .expect("workflow response");
+        assert_eq!(
+            created.status, 200,
+            "local command must survive sink outage"
+        );
+        assert_eq!(api.store.event_publication_state().unwrap().0, 1);
+        assert!(sink.events.lock().unwrap().is_empty());
+
+        sink.available.store(true, Ordering::SeqCst);
+        let value: serde_json::Value = serde_json::from_slice(&created.body).expect("JSON");
+        let request_id = value["response"]["value"]["id"]
+            .as_str()
+            .expect("request id");
+        let read_path = format!("{CUSTOMER_REQUEST_PATH}?request_id={request_id}");
+        assert_eq!(
+            api.handle("GET", &read_path, &headers(CUSTOMER_A_TOKEN), &[],)
+                .expect("workflow response")
+                .status,
+            200
+        );
+        assert_eq!(api.store.event_publication_state().unwrap().0, 0);
+        assert_eq!(sink.events.lock().unwrap().len(), 1);
+
+        let replayed = api
+            .handle(
+                "POST",
+                CUSTOMER_COMMAND_PATH,
+                &headers(CUSTOMER_A_TOKEN),
+                &submit,
+            )
+            .expect("workflow response");
+        assert_eq!(replayed.status, 200);
+        assert_eq!(sink.events.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn workflow_events_enter_limbo_and_its_transport_outbox_idempotently() {
+        let limbo = Arc::new(EventStore::open(":memory:").expect("limbo"));
+        let api = api_with_sink(
+            false,
+            false,
+            Arc::new(LimboWorkflowEventSink {
+                event_store: Arc::clone(&limbo),
+            }),
+        );
+        let submit = serde_json::to_vec(&json!({
+            "operation_id": "limbo-publication",
+            "command": {
+                "command": "submit_customer_request",
+                "summary_ref": "ref",
+                "desired_outcome": "result",
+                "constraints": []
+            }
+        }))
+        .expect("JSON");
+        for _ in 0..2 {
+            assert_eq!(
+                api.handle(
+                    "POST",
+                    CUSTOMER_COMMAND_PATH,
+                    &headers(CUSTOMER_A_TOKEN),
+                    &submit,
+                )
+                .expect("workflow response")
+                .status,
+                200
+            );
+        }
+        let events = limbo.get_all_events().expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "company_workflow_event");
+        assert!(matches!(
+            serde_json::from_str::<DomainEventPayload>(&events[0].payload).expect("payload"),
+            DomainEventPayload::CompanyWorkflowEvent { .. }
+        ));
+        assert_eq!(limbo.poll_outbox(10).expect("transport outbox").len(), 1);
+    }
+
+    #[test]
+    fn time_machine_snapshot_restores_workflow_state_and_publication_checkpoint() {
+        let sink = RecordingEventSink::available();
+        let api = api_with_sink(false, false, sink.clone());
+        let submit = serde_json::to_vec(&json!({
+            "operation_id": "snapshot-submit",
+            "command": {
+                "command": "submit_customer_request",
+                "summary_ref": "ref",
+                "desired_outcome": "result",
+                "constraints": []
+            }
+        }))
+        .expect("JSON");
+        let created = api
+            .handle(
+                "POST",
+                CUSTOMER_COMMAND_PATH,
+                &headers(CUSTOMER_A_TOKEN),
+                &submit,
+            )
+            .expect("workflow response");
+        assert_eq!(created.status, 200);
+        let created_json: serde_json::Value =
+            serde_json::from_slice(&created.body).expect("created JSON");
+        let request_id = created_json["response"]["value"]["id"]
+            .as_str()
+            .expect("request id");
+        let snapshot = api
+            .time_machine_snapshot()
+            .expect("workflow snapshot")
+            .expect("enabled image");
+        assert!(snapshot.database.starts_with(b"SQLite format 3"));
+        assert_eq!(snapshot.limbo_event_cursor, 1);
+
+        let clarify = serde_json::to_vec(&json!({
+            "operation_id": "snapshot-clarification",
+            "command": {
+                "command": "clarify_customer_request",
+                "request_id": request_id,
+                "expected_version": 1,
+                "question_ref": "scope-question",
+                "answer_ref": "scope-answer"
+            }
+        }))
+        .expect("JSON");
+        assert_eq!(
+            api.handle(
+                "POST",
+                CUSTOMER_COMMAND_PATH,
+                &headers(CUSTOMER_A_TOKEN),
+                &clarify,
+            )
+            .expect("clarification")
+            .status,
+            200
+        );
+        api.restore_time_machine_snapshot(Some(&snapshot))
+            .expect("workflow restore");
+
+        let read = api
+            .handle(
+                "GET",
+                &format!("{CUSTOMER_REQUEST_PATH}?request_id={request_id}"),
+                &headers(CUSTOMER_A_TOKEN),
+                &[],
+            )
+            .expect("workflow read");
+        let restored: serde_json::Value =
+            serde_json::from_slice(&read.body).expect("restored JSON");
+        assert_eq!(restored["version"], 1);
+        assert_eq!(api.store.event_publication_state().unwrap(), (0, 1));
+        assert_eq!(sink.events.lock().unwrap().len(), 2);
     }
 }

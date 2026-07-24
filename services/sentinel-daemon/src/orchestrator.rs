@@ -1803,12 +1803,21 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let nightrun_agent_counts = operator_api::NightrunAgentCounts::from_shift_sets(
         all_agents.iter().map(|agent| agent.identity.shift_set),
     );
+    let workflow_api = Arc::new(
+        crate::workflow_api::WorkflowApi::open(
+            data_dir.join("company-workflow.sqlite"),
+            std::env::var_os("SENTINEL_WORKFLOW_PRINCIPALS_FILE").map(std::path::PathBuf::from),
+            Arc::clone(&event_store),
+        )
+        .context("Company workflow store could not be opened")?,
+    );
 
     let operator_api_handle = if config.operator_api.enabled {
         Some(
             operator_api::start_server(
                 config.operator_api.clone(),
                 data_dir.to_path_buf(),
+                Arc::clone(&workflow_api),
                 active_fs_mount.clone(),
                 fs_layer.clone(),
                 operator_room_ids,
@@ -1875,6 +1884,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
     let ecs_fs_mount = active_fs_mount.clone();
     let ecs_projection_db_path = projection_db_path.clone();
+    let ecs_workflow_api = Arc::clone(&workflow_api);
     let ecs_config_dir = config.config_dir.clone();
     let ecs_max_agents = config.max_agents;
     let ecs_handle = std::thread::Builder::new()
@@ -1927,6 +1937,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 ecs_llm_activity_ticks,
                 ecs_security_runtime_state,
                 ecs_projection_db_path,
+                ecs_workflow_api,
                 operator_auth_required,
                 ecs_fs_mount,
                 fs_layer.clone(),
@@ -3555,6 +3566,7 @@ enum RestoreCommitFailurePoint {
     #[default]
     None,
     AfterRedb,
+    AfterWorkflow,
     AfterFs,
     AfterEcs,
     AfterProjection,
@@ -3952,6 +3964,7 @@ fn commit_world_restore_stores(
     exact: bool,
     event_store: &Arc<EventStore>,
     state_store: &Arc<StateStore>,
+    workflow_api: &crate::workflow_api::WorkflowApi,
     fs_layer: Option<&sentinel_fs::layer::LayerManager>,
     projection_db_path: &str,
     failure_point: RestoreCommitFailurePoint,
@@ -3960,6 +3973,11 @@ fn commit_world_restore_stores(
         .restore_all_tables(&snapshot.redb)
         .context("redb Restore fehlgeschlagen")?;
     failure_point.fail_if(RestoreCommitFailurePoint::AfterRedb)?;
+
+    workflow_api
+        .restore_time_machine_snapshot(snapshot.company_workflow.as_ref())
+        .context("Company workflow Restore fehlgeschlagen")?;
+    failure_point.fail_if(RestoreCommitFailurePoint::AfterWorkflow)?;
 
     if let Some(fs_metadata) = &snapshot.fs_metadata {
         let layer = fs_layer.expect("validated above");
@@ -4093,6 +4111,7 @@ fn rollback_world_restore_stores(
     world: &mut bevy_ecs::prelude::World,
     event_store: &Arc<EventStore>,
     state_store: &Arc<StateStore>,
+    workflow_api: &crate::workflow_api::WorkflowApi,
     fs_layer: Option<&sentinel_fs::layer::LayerManager>,
     data_dir: &std::path::Path,
     projection_db_path: &str,
@@ -4108,6 +4127,9 @@ fn rollback_world_restore_stores(
     state_store
         .restore_all_tables(&snapshot.redb)
         .context("Rollback redb Restore fehlgeschlagen")?;
+    workflow_api
+        .restore_time_machine_snapshot(snapshot.company_workflow.as_ref())
+        .context("Rollback company workflow Restore fehlgeschlagen")?;
     if let Some(fs_metadata) = &snapshot.fs_metadata {
         let layer = fs_layer
             .ok_or_else(|| anyhow!("Rollback braucht sentinel-fs Layer, aber keiner ist aktiv"))?;
@@ -4138,6 +4160,7 @@ fn rollback_world_restore_after_commit_failure(
     world: &mut bevy_ecs::prelude::World,
     event_store: &Arc<EventStore>,
     state_store: &Arc<StateStore>,
+    workflow_api: &crate::workflow_api::WorkflowApi,
     fs_layer: Option<&sentinel_fs::layer::LayerManager>,
     data_dir: &std::path::Path,
     projection_db_path: &str,
@@ -4147,6 +4170,7 @@ fn rollback_world_restore_after_commit_failure(
         world,
         event_store,
         state_store,
+        workflow_api,
         fs_layer,
         data_dir,
         projection_db_path,
@@ -4183,6 +4207,7 @@ fn execute_world_restore_transfer(
     security_runtime_state: &operator_api::SharedSecurityRuntimeState,
     event_store: &Arc<EventStore>,
     state_store: &Arc<StateStore>,
+    workflow_api: &crate::workflow_api::WorkflowApi,
     fs_layer: Option<&sentinel_fs::layer::LayerManager>,
     fs_mount: Option<&str>,
     data_dir: &std::path::Path,
@@ -4198,6 +4223,7 @@ fn execute_world_restore_transfer(
             world,
             state_store,
             event_store,
+            workflow_api,
             data_dir,
             fs_layer,
             fs_mount,
@@ -4219,6 +4245,15 @@ fn execute_world_restore_transfer(
         .ok_or_else(|| anyhow!("Snapshot nicht gefunden: {}", resolution.anchor_snapshot_id))?;
     let snapshot = sentinel_common::decode_world_snapshot(&bytes)
         .with_context(|| format!("Snapshot dekodieren: {}", resolution.anchor_snapshot_id))?;
+    if snapshot
+        .company_workflow
+        .as_ref()
+        .is_some_and(|workflow| workflow.limbo_event_cursor != snapshot.last_event_id)
+    {
+        return Err(anyhow!(
+            "workflow snapshot cursor does not match the world snapshot event cursor"
+        ));
+    }
 
     if let Some(fs_metadata) = &snapshot.fs_metadata {
         if fs_layer.is_none() {
@@ -4321,6 +4356,7 @@ fn execute_world_restore_transfer(
         exact,
         event_store,
         state_store,
+        workflow_api,
         fs_layer,
         projection_db_path,
         RestoreCommitFailurePoint::None,
@@ -4343,6 +4379,7 @@ fn execute_world_restore_transfer(
                 world,
                 event_store,
                 state_store,
+                workflow_api,
                 fs_layer,
                 data_dir,
                 projection_db_path,
@@ -4765,6 +4802,7 @@ fn ecs_tick_loop(
     llm_activity_ticks: Arc<Mutex<HashMap<AgentId, u64>>>,
     security_runtime_state: operator_api::SharedSecurityRuntimeState,
     projection_db_path: String,
+    workflow_api: Arc<crate::workflow_api::WorkflowApi>,
     operator_auth_required: bool,
     fs_mount: Option<String>,
     fs_layer: Option<Arc<sentinel_fs::layer::LayerManager>>,
@@ -6944,6 +6982,7 @@ fn ecs_tick_loop(
                         &mut world,
                         &ss,
                         &es,
+                        workflow_api.as_ref(),
                         data_dir,
                         fs_layer.as_deref(),
                         fs_mount.as_deref(),
@@ -6985,6 +7024,7 @@ fn ecs_tick_loop(
                     &mut world,
                     &ss,
                     &es,
+                    workflow_api.as_ref(),
                     data_dir,
                     fs_layer.as_deref(),
                     fs_mount.as_deref(),
@@ -7026,6 +7066,7 @@ fn ecs_tick_loop(
                     &security_runtime_state,
                     &es,
                     &ss,
+                    workflow_api.as_ref(),
                     fs_layer.as_deref(),
                     fs_mount.as_deref(),
                     data_dir,
@@ -7090,6 +7131,7 @@ fn ecs_tick_loop(
                         &mut world,
                         &ss,
                         &es,
+                        workflow_api.as_ref(),
                         data_dir,
                         fs_layer.as_deref(),
                         fs_mount.as_deref(),
@@ -8393,6 +8435,7 @@ mod tests {
             },
             projection_offsets: vec![("sentinel-projection".to_string(), 321)],
             fs_metadata: None,
+            company_workflow: None,
         }
     }
 
@@ -8534,6 +8577,8 @@ mod tests {
         let fs_meta_path = tmp.path().join("fs-meta.redb");
         let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
         let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
+        let workflow_api =
+            crate::workflow_api::WorkflowApi::disabled(Arc::clone(&event_store)).unwrap();
         let projection_store =
             sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap();
         drop(projection_store);
@@ -8601,6 +8646,7 @@ mod tests {
             true,
             &event_store,
             &state_store,
+            &workflow_api,
             Some(&fs_layer),
             projection_path.to_str().unwrap(),
             failure_point,
@@ -8618,6 +8664,7 @@ mod tests {
             &mut world,
             &event_store,
             &state_store,
+            &workflow_api,
             Some(&fs_layer),
             tmp.path(),
             projection_path.to_str().unwrap(),
@@ -8665,6 +8712,7 @@ mod tests {
     fn mid_commit_failures_roll_back_to_pre_snapshot_without_mixed_state() {
         for failure_point in [
             RestoreCommitFailurePoint::AfterRedb,
+            RestoreCommitFailurePoint::AfterWorkflow,
             RestoreCommitFailurePoint::AfterFs,
             RestoreCommitFailurePoint::AfterEcs,
             RestoreCommitFailurePoint::AfterProjection,
@@ -8681,6 +8729,8 @@ mod tests {
         let projection_path = tmp.path().join("projection.db");
         let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
         let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
+        let workflow_api =
+            crate::workflow_api::WorkflowApi::disabled(Arc::clone(&event_store)).unwrap();
         let projection_store =
             sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap();
         drop(projection_store);
@@ -8695,6 +8745,7 @@ mod tests {
             &mut world,
             &event_store,
             &state_store,
+            &workflow_api,
             None,
             tmp.path(),
             projection_path.to_str().unwrap(),
@@ -9415,6 +9466,8 @@ mod tests {
 
         let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
         let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
+        let workflow_api =
+            Arc::new(crate::workflow_api::WorkflowApi::disabled(Arc::clone(&event_store)).unwrap());
 
         let (_tx, rx) = mpsc::channel();
         let (_operator_tx, operator_rx) = mpsc::channel();
@@ -9476,6 +9529,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(RwLock::new(HashMap::new())),
             String::new(),
+            workflow_api,
             false,
             None,
             None,
@@ -9504,6 +9558,8 @@ mod tests {
 
         let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
         let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
+        let workflow_api =
+            Arc::new(crate::workflow_api::WorkflowApi::disabled(Arc::clone(&event_store)).unwrap());
 
         let (_tx, rx) = mpsc::channel();
         let (_operator_tx, operator_rx) = mpsc::channel();
@@ -9569,6 +9625,7 @@ mod tests {
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
+                workflow_api,
                 false,
                 None,
                 None,
@@ -9610,6 +9667,8 @@ mod tests {
 
         let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
         let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
+        let workflow_api =
+            Arc::new(crate::workflow_api::WorkflowApi::disabled(Arc::clone(&event_store)).unwrap());
 
         let (_tx, rx) = mpsc::channel();
         let (_operator_tx, operator_rx) = mpsc::channel();
@@ -9679,6 +9738,7 @@ mod tests {
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
+                workflow_api,
                 false,
                 None,
                 None,
@@ -9721,6 +9781,8 @@ mod tests {
 
         let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
         let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
+        let workflow_api =
+            Arc::new(crate::workflow_api::WorkflowApi::disabled(Arc::clone(&event_store)).unwrap());
         let es_clone = Arc::clone(&event_store);
 
         let (_tx, rx) = mpsc::channel();
@@ -9797,6 +9859,7 @@ mod tests {
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
+                workflow_api,
                 false,
                 None,
                 None,
