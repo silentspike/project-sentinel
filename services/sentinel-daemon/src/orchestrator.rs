@@ -10,6 +10,8 @@
 //! └─────────────────────┘                       └──────────────────┘
 //! ```
 
+mod runtime_lifecycle;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -122,9 +124,9 @@ use crate::runtime_control::{
     RuntimeReconcileRequest, RuntimeReconcileResponse, RuntimeStallRestartTestResponse,
 };
 use crate::runtime_health;
-use crate::runtime_lifecycle::RuntimeAdapterOwner;
 use crate::shift::{agents_for_shift, detect_current_shift, detect_shift_from_sim_hour};
 use crate::signal::wait_for_shutdown;
+use runtime_lifecycle::RuntimeAdapterOwner;
 
 const PERSONALITY_EVOLUTION_PER_AGENT_FIELD_KEEP: i64 = 2000;
 const PERSONALITY_EVOLUTION_GLOBAL_HIGH_WATER: i64 = 499_000;
