@@ -6,7 +6,7 @@ Date: 2026-07-24
 
 - Branch: `feat/issue-695-company-workflow-core`
 - Branch point: `13e87b663cc3b47223a2b0052db1cc6c274e66c8`
-- Merged upstream: `origin/main@16c0e353861e29a9b4d181bebd9a9f4a432a49b3`
+- Merged upstream: `origin/main@85b8bef1f1f4bba758bee7eb04248e2622612392`
 - Evidence revision: the exact pushed PR head recorded in the PR readback
 - Runtime target class: `SINGLE_NODE`
 - Runtime access: not performed
@@ -51,9 +51,11 @@ Every Rust command was dispatched through `cargo remote -c --`; no local Cargo, 
 | Workspace rustdoc | `RUSTDOCFLAGS="-D warnings" cargo remote -c -- doc --workspace --no-deps --document-private-items -j1` | PASS; Cargo emitted the pre-existing Projection lib/bin output-filename collision warning, while rustdoc completed with `-D warnings` |
 | eBPF Clippy | `cargo remote -c -- clippy -p sentinel-daemon --features ebpf -p sentinel-ebpf --all-targets -j1 -- -D warnings` | PASS |
 | eBPF tests | `cargo remote -c -- test -p sentinel-daemon --features ebpf -p sentinel-ebpf -j1` | PASS: 72 tests passed |
-| Release build | `cargo remote -c -- build -p sentinel-daemon --release -j1` | PASS: optimized release profile completed in 37m 29s |
+| Release build | `cargo remote -c -- build -p sentinel-daemon --release -j1` | PASS: the optimized artifact was built in 37m 29s before the final upstream merge and revalidated without recompilation on the merged head because that merge changed only CI, policy, evidence, and changelog files |
 | M0 contract | `python3 scripts/product-acceptance/check_contract.py --check` | PASS |
 | M0 contract tests | `python3 -m unittest discover -s scripts/product-acceptance -p 'test_*.py'` | PASS: 18 passed |
+| Dependency patch registry | `python3 scripts/check-patch-registry.py` | PASS: 0 overrides, 0 registry entries, 4 direct Git dependencies |
+| Dependency patch registry tests | `python3 -m unittest scripts.tests.test_check_patch_registry` | PASS: 15 passed |
 | Typos | `typos .` | PASS |
 | Patch integrity | `git diff --check` | PASS |
 
