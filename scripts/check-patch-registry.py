@@ -7,8 +7,9 @@ The registry covers repository-controlled Cargo source overrides:
 * [replace] entries in Cargo.toml
 * [source.<name>].replace-with entries in repository Cargo config files
 
-Ordinary git dependencies are inventoried but are not patches or forks. A temporary
-fork must use one of the override mechanisms above and have an active registry row.
+Ordinary git dependencies are not patches or forks, but every direct Git source must
+match the bidirectional allowlist in the registry. A temporary fork must use one of
+the override mechanisms above and have an active registry row.
 """
 
 from __future__ import annotations
@@ -50,6 +51,17 @@ REQUIRED_FIELDS = (
 )
 VALID_KINDS = {"PATCH_UPSTREAM", "FORK_TEMPORARY"}
 VALID_STATUSES = {"ACTIVE"}
+GIT_ALLOWLIST_FIELDS = (
+    "id",
+    "dependency_key",
+    "manifest",
+    "table",
+    "dependency",
+    "package",
+    "source",
+    "owner",
+    "reason",
+)
 
 
 @dataclass(frozen=True)
@@ -57,6 +69,16 @@ class Override:
     override_key: str
     mechanism: str
     manifest: str
+    package: str
+    source: str
+
+
+@dataclass(frozen=True)
+class GitDependency:
+    dependency_key: str
+    manifest: str
+    table: str
+    dependency: str
     package: str
     source: str
 
@@ -190,42 +212,78 @@ def discover_overrides(root: Path) -> tuple[Override, ...]:
     return tuple(sorted(overrides, key=lambda item: item.override_key))
 
 
-def _dependency_tables(data: dict[str, Any]) -> list[dict[str, Any]]:
-    tables: list[dict[str, Any]] = []
+def _dependency_tables(data: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    tables: list[tuple[str, dict[str, Any]]] = []
     for name in ("dependencies", "dev-dependencies", "build-dependencies"):
         value = data.get(name)
         if isinstance(value, dict):
-            tables.append(value)
+            tables.append((name, value))
 
     workspace = data.get("workspace")
     if isinstance(workspace, dict):
         value = workspace.get("dependencies")
         if isinstance(value, dict):
-            tables.append(value)
+            tables.append(("workspace.dependencies", value))
 
     targets = data.get("target")
     if isinstance(targets, dict):
-        for target in targets.values():
+        for target_name, target in targets.items():
             if not isinstance(target, dict):
                 continue
             for name in ("dependencies", "dev-dependencies", "build-dependencies"):
                 value = target.get(name)
                 if isinstance(value, dict):
-                    tables.append(value)
+                    tables.append((f"target.{target_name}.{name}", value))
     return tables
 
 
-def count_git_dependencies(root: Path) -> int:
-    count = 0
+def _normalize_git_source(spec: dict[str, Any]) -> str:
+    fields = ("git", "branch", "rev", "tag")
+    return ";".join(f"{field}={spec[field]}" for field in fields if field in spec)
+
+
+def discover_git_dependencies(root: Path) -> tuple[GitDependency, ...]:
+    dependencies: list[GitDependency] = []
     for path in _manifest_paths(root):
         data = _load_toml(path)
-        for table in _dependency_tables(data):
-            count += sum(
-                1
-                for spec in table.values()
-                if isinstance(spec, dict) and isinstance(spec.get("git"), str)
-            )
-    return count
+        relative = _relative(path, root)
+        for table_name, table in _dependency_tables(data):
+            for dependency, spec in sorted(table.items()):
+                if not isinstance(spec, dict) or not isinstance(spec.get("git"), str):
+                    continue
+                dependencies.append(
+                    GitDependency(
+                        dependency_key=(
+                            f"git:{relative}:{table_name}:{dependency}"
+                        ),
+                        manifest=relative,
+                        table=table_name,
+                        dependency=dependency,
+                        package=str(spec.get("package", dependency)),
+                        source=_normalize_git_source(spec),
+                    )
+                )
+    return tuple(
+        sorted(dependencies, key=lambda dependency: dependency.dependency_key)
+    )
+
+
+def _validate_git_allowlist_entry(entry: Any, index: int) -> list[str]:
+    label = f"direct_git_dependencies[{index}]"
+    if not isinstance(entry, dict):
+        return [f"ERROR[INVALID_GIT_ALLOWLIST_ENTRY] {label} must be a TOML table"]
+
+    errors: list[str] = []
+    for field in GIT_ALLOWLIST_FIELDS:
+        if field not in entry:
+            errors.append(f"ERROR[MISSING_GIT_ALLOWLIST_FIELD] {label} missing `{field}`")
+        elif not _non_empty(entry[field]):
+            errors.append(f"ERROR[EMPTY_GIT_ALLOWLIST_FIELD] {label} has empty `{field}`")
+    if isinstance(entry.get("source"), str) and not entry["source"].startswith("git="):
+        errors.append(
+            f"ERROR[INVALID_GIT_ALLOWLIST_SOURCE] {label} source must start with `git=`"
+        )
+    return errors
 
 
 def load_registry(path: Path) -> dict[str, Any]:
@@ -313,15 +371,23 @@ def check_repository(root: Path, registry_path: Path, today: date) -> CheckResul
             git_dependencies=0,
         )
 
-    if registry.get("schema_version") != 1:
-        errors.append("ERROR[SCHEMA_VERSION] `schema_version` must equal 1")
+    if registry.get("schema_version") != 2:
+        errors.append("ERROR[SCHEMA_VERSION] `schema_version` must equal 2")
     entries = registry.get("entries")
     if not isinstance(entries, list):
         errors.append("ERROR[INVALID_REGISTRY] `entries` must be an array")
         entries = []
+    git_allowlist = registry.get("direct_git_dependencies")
+    if not isinstance(git_allowlist, list):
+        errors.append(
+            "ERROR[INVALID_GIT_ALLOWLIST] `direct_git_dependencies` must be an array"
+        )
+        git_allowlist = []
 
     for index, entry in enumerate(entries):
         errors.extend(_validate_entry_shape(entry, index, today))
+    for index, entry in enumerate(git_allowlist):
+        errors.extend(_validate_git_allowlist_entry(entry, index))
 
     ids: set[str] = set()
     keys: set[str] = set()
@@ -341,13 +407,34 @@ def check_repository(root: Path, registry_path: Path, today: date) -> CheckResul
                 )
             keys.add(override_key)
 
+    git_ids: set[str] = set()
+    git_keys: set[str] = set()
+    for entry in git_allowlist:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = entry.get("id")
+        dependency_key = entry.get("dependency_key")
+        if isinstance(entry_id, str):
+            if entry_id in git_ids:
+                errors.append(
+                    f"ERROR[DUPLICATE_GIT_ALLOWLIST_ID] duplicate `{entry_id}`"
+                )
+            git_ids.add(entry_id)
+        if isinstance(dependency_key, str):
+            if dependency_key in git_keys:
+                errors.append(
+                    "ERROR[DUPLICATE_GIT_DEPENDENCY_KEY] "
+                    f"duplicate `{dependency_key}`"
+                )
+            git_keys.add(dependency_key)
+
     try:
         overrides = discover_overrides(root)
-        git_dependencies = count_git_dependencies(root)
+        git_dependencies = discover_git_dependencies(root)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         errors.append(f"ERROR[INVALID_CARGO_TOML] {exc}")
         overrides = ()
-        git_dependencies = 0
+        git_dependencies = ()
 
     entry_by_key = {
         entry["override_key"]: entry
@@ -382,11 +469,50 @@ def check_repository(root: Path, registry_path: Path, today: date) -> CheckResul
                 f"ERROR[STALE_REGISTRY_ROW] `{override_key}` has no active Cargo override"
             )
 
+    git_entry_by_key = {
+        entry["dependency_key"]: entry
+        for entry in git_allowlist
+        if isinstance(entry, dict)
+        and isinstance(entry.get("dependency_key"), str)
+    }
+    git_dependency_by_key = {
+        dependency.dependency_key: dependency for dependency in git_dependencies
+    }
+    for dependency in git_dependencies:
+        entry = git_entry_by_key.get(dependency.dependency_key)
+        if entry is None:
+            errors.append(
+                "ERROR[UNALLOWLISTED_GIT_DEPENDENCY] "
+                f"`{dependency.dependency_key}` ({dependency.source})"
+            )
+            continue
+        comparisons = {
+            "manifest": dependency.manifest,
+            "table": dependency.table,
+            "dependency": dependency.dependency,
+            "package": dependency.package,
+            "source": dependency.source,
+        }
+        for field, expected in comparisons.items():
+            if entry.get(field) != expected:
+                errors.append(
+                    "ERROR[GIT_DEPENDENCY_MISMATCH] "
+                    f"`{dependency.dependency_key}` field `{field}` "
+                    f"allowlisted `{entry.get(field)}` actual `{expected}`"
+                )
+
+    for dependency_key in sorted(git_entry_by_key):
+        if dependency_key not in git_dependency_by_key:
+            errors.append(
+                "ERROR[STALE_GIT_ALLOWLIST_ROW] "
+                f"`{dependency_key}` has no direct Cargo Git dependency"
+            )
+
     return CheckResult(
         errors=tuple(errors),
         overrides=len(overrides),
         registry_entries=len(entries),
-        git_dependencies=git_dependencies,
+        git_dependencies=len(git_dependencies),
     )
 
 

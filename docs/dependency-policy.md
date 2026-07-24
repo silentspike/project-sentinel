@@ -193,9 +193,11 @@ Historical rows do not stay in the active registry. Their removal commit and ups
 or rollback outcome remain in Git history and the implementation issue.
 
 Ordinary dependencies sourced directly from an official upstream Git repository are
-not patch/fork rows. They remain dependencies governed by #705 and #656. A fork must
-be represented through a recognized override mechanism; changing a dependency URL to
-hide a fork is prohibited.
+not patch/fork rows, but every declaration must match the bidirectional direct-Git
+allowlist in the patch registry. New, removed, or changed Git sources fail closed.
+They remain dependencies governed by #705 and #656. A fork must be represented
+through a recognized override mechanism; changing a dependency URL to hide a fork is
+prohibited.
 
 ## 9. Upgrade and Renovate Playbook
 

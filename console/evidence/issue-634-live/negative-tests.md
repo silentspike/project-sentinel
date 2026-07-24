@@ -33,5 +33,48 @@ ERROR[EXPIRED_TEMPORARY_FORK] entry[0] expired on 2026-07-24
 ```
 
 All four failures are asserted by the unit suite. A registered patch with an exact
-source match passes, and an ordinary official-upstream Git dependency remains
-inventory rather than being misclassified as a patch or fork.
+source match passes.
+
+## Direct-Git Allowlist
+
+The official source fixture passes:
+
+```text
+[official-git] exit=0
+```
+
+A source URL change to a fork fails:
+
+```text
+[fork-url] exit=1
+ERROR[GIT_DEPENDENCY_MISMATCH] `git:Cargo.toml:dependencies:demo` field `source` allowlisted `git=https://example.invalid/upstream/demo` actual `git=https://example.invalid/fork/demo`
+```
+
+A new direct Git dependency without an allowlist row fails:
+
+```text
+[new-git] exit=1
+ERROR[UNALLOWLISTED_GIT_DEPENDENCY] `git:Cargo.toml:dependencies:demo` (git=https://example.invalid/upstream/demo)
+```
+
+A stale allowlist row fails:
+
+```text
+[stale-git] exit=1
+ERROR[STALE_GIT_ALLOWLIST_ROW] `git:Cargo.toml:dependencies:demo` has no direct Cargo Git dependency
+```
+
+## Additional Override Mechanisms
+
+Registered `[replace]` and Cargo source-replacement fixtures pass. Their
+unregistered counterparts fail:
+
+```text
+[unregistered-replace] exit=1
+ERROR[UNREGISTERED_OVERRIDE] `replace:Cargo.toml:demo:1.2.3` (git=https://example.invalid/upstream/demo;rev=abc123)
+[unregistered-source] exit=1
+ERROR[UNREGISTERED_OVERRIDE] `source:<CARGO_CONFIG>/config.toml:crates-io` (replace-with=vendored;directory=vendor)
+```
+
+The final source-replacement output is deterministically normalized to the
+repository Cargo-config placeholder required by the public-evidence policy.
