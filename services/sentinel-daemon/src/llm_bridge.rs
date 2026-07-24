@@ -1717,7 +1717,7 @@ pub mod bridge {
         fn circuit_breaker_updates_open_signal() {
             let open_signal = Arc::new(AtomicBool::new(false));
             let mut breaker =
-                CircuitBreaker::new(2, Duration::from_millis(1), Arc::clone(&open_signal));
+                CircuitBreaker::new(2, Duration::from_secs(1), Arc::clone(&open_signal));
 
             assert!(!breaker.is_open());
             assert!(!open_signal.load(Ordering::Relaxed));
@@ -1730,7 +1730,8 @@ pub mod bridge {
             assert!(breaker.is_open());
             assert!(open_signal.load(Ordering::Relaxed));
 
-            breaker.last_failure = Some(Instant::now() - Duration::from_millis(2));
+            // Expire the stored deadline directly so instrumentation cannot race the clock.
+            breaker.last_failure = Some(Instant::now() - breaker.reset_duration);
             assert!(!breaker.is_open());
             assert!(!open_signal.load(Ordering::Relaxed));
 
