@@ -222,6 +222,21 @@ For all modes:
 4. Include exact gates, migration impact, and rollback in the update PR.
 5. Follow the cross-ecosystem `DependencyContract` in #656 when available.
 
+### Duplicate-version resolution
+
+Renovate and manual Cargo updates must run the Bans gate before merge. If an update
+introduces a duplicate version, resolve it in the same PR by aligning the direct
+requirement, feature set, or forcing upstream dependency. The update cannot be split
+into a temporarily red intermediate merge.
+
+If same-PR alignment is proven impossible, the component owner may add one exact
+`crate@version` skip in that update PR. The adjacent comments must state the complete
+forcing chain, why alignment is currently unsafe, an ISO expiry date, and the concrete
+upstream release or graph-removal condition that removes the skip. Broad name-only
+skips and `skip-tree` are prohibited. The PR must update the structural duplicate
+count and cannot use blind auto-merge. At expiry, either remove the duplicate and skip
+or obtain a new explicit maintainer decision with refreshed graph evidence.
+
 Current Renovate defaults do not override this policy. A patch, fork, wrapper,
 security boundary, format-bearing dependency, or owned replacement must not gain
 blind auto-merge merely because its version change is minor or patch-level.

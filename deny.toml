@@ -53,11 +53,214 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 # Crate Bans
 # ──────────────────────────────────────────────
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
+multiple-versions-include-dev = true
 wildcards = "deny"
 highlight = "all"
-# Workspace-interne path dependencies sind wildcards - das ist normal
+# Workspace path dependencies use wildcard requirements by design.
 allow-wildcard-paths = true
+skip = [
+    # Forcing chain: cpufeatures 0.2.17 <- aes@0.8.4, blake3@1.8.3, curve25519-dalek@4.1.3, keccak@0.1.6, sha1@0.10.6, sha2@0.10.9.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.3.0 is the unskipped baseline.
+    # Revisit: remove when every listed parent accepts cpufeatures 0.3.0 or leaves the graph.
+    "cpufeatures@0.2.17",
+    # Forcing chain: embedded-io 0.4.0 <- postcard@1.1.3.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.6.1 is the unskipped baseline.
+    # Revisit: remove when postcard accepts embedded-io 0.6.1 or leaves the graph.
+    "embedded-io@0.4.0",
+    # Forcing chain: fixedbitset 0.4.2 <- petgraph@0.6.5.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.5.7 is the unskipped baseline.
+    # Revisit: remove when petgraph 0.6 accepts fixedbitset 0.5.7 or leaves the graph.
+    "fixedbitset@0.4.2",
+    # Forcing chain: foldhash 0.1.5 <- hashbrown@0.15.5.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.2.0 is the unskipped baseline.
+    # Revisit: remove when hashbrown 0.15 accepts foldhash 0.2.0 or leaves the graph.
+    "foldhash@0.1.5",
+    # Forcing chain: getrandom 0.2.17 <- nanorand@0.7.0, nkeys@0.4.5, rand_core@0.6.4, redox_users@0.4.6/0.5.2, ring@0.17.14, zenoh-keyexpr@1.7.2.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.4.1 is the unskipped baseline.
+    # Revisit: remove when every listed parent accepts getrandom 0.4.1 or leaves the graph.
+    "getrandom@0.2.17",
+    # Forcing chain: getrandom 0.3.4 <- ahash@0.8.12, bolero-generator@0.13.5, fastbloom@0.14.1, jobserver@0.1.34, quinn-proto@0.11.15, rand_core@0.9.5.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.4.1 is the unskipped baseline.
+    # Revisit: remove when every listed parent accepts getrandom 0.4.1 or leaves the graph.
+    "getrandom@0.3.4",
+    # Forcing chain: hashbrown 0.12.3 <- indexmap@1.9.3.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.17.1 is the unskipped baseline.
+    # Revisit: remove when indexmap 1 accepts hashbrown 0.17.1 or leaves the graph.
+    "hashbrown@0.12.3",
+    # Forcing chain: hashbrown 0.14.5 <- keyed-set@1.1.0.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.17.1 is the unskipped baseline.
+    # Revisit: remove when keyed-set accepts hashbrown 0.17.1 or leaves the graph.
+    "hashbrown@0.14.5",
+    # Forcing chain: hashbrown 0.15.5 <- petgraph@0.8.3.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.17.1 is the unskipped baseline.
+    # Revisit: remove when petgraph 0.8 accepts hashbrown 0.17.1 or leaves the graph.
+    "hashbrown@0.15.5",
+    # Forcing chain: hashbrown 0.16.1 <- aya-obj@0.2.2, aya@0.13.2, bevy_platform@0.18.0, gimli@0.33.0, hashlink@0.11.0, object@0.38.1, rsqlite-vfs@0.1.0, zenoh-keyexpr@1.7.2.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.17.1 is the unskipped baseline.
+    # Revisit: remove when every listed parent accepts hashbrown 0.17.1 or leaves the graph.
+    "hashbrown@0.16.1",
+    # Forcing chain: indexmap 1.9.3 <- serde_with@3.17.0.
+    # Reason: #632 decision investigate retained incompatible constraints; 2.14.0 is the unskipped baseline.
+    # Revisit: remove when serde_with accepts indexmap 2.14.0 or leaves the graph.
+    "indexmap@1.9.3",
+    # Forcing chain: itertools 0.13.0 <- criterion@0.8.2 and criterion-plot@0.8.2.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.14.0 is the unskipped baseline.
+    # Revisit: remove when Criterion accepts itertools 0.14.0 or leaves the graph.
+    "itertools@0.13.0",
+    # Forcing chain: nix 0.29.0 <- zenoh-link-unixsock_stream@1.7.2.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.30.1 is the unskipped baseline.
+    # Revisit: remove when Zenoh unix-socket transport accepts nix 0.30.1 or leaves the graph.
+    "nix@0.29.0",
+    # Forcing chain: object 0.38.1 <- aya-obj@0.2.2, aya@0.13.2, sentinel-ebpf@0.1.0.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.39.1 is the unskipped baseline.
+    # Revisit: remove when the Aya/eBPF chain accepts object 0.39.1 or leaves the graph.
+    "object@0.38.1",
+    # Forcing chain: petgraph 0.6.5 <- wasm-compose@0.248.0.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.8.3 is the unskipped baseline.
+    # Revisit: remove when wasm-compose accepts petgraph 0.8.3 or leaves the graph.
+    "petgraph@0.6.5",
+    # Forcing chain: rand 0.8.6 <- async-nats@0.47.0, nkeys@0.4.5, nuid@0.5.0, num-bigint-dig@0.8.6, stabby-macros@72.1.4, tokio-websockets@0.10.1, tungstenite@0.24.0, uhlc@0.8.2, zenoh@1.7.2 and its crypto/keyexpr/transport crates.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.10.1 is the unskipped baseline.
+    # Revisit: remove when every listed parent accepts rand 0.10.1 or leaves the graph.
+    "rand@0.8.6",
+    # Forcing chain: rand 0.9.4 <- bolero@0.13.4, bolero-engine@0.13.4, fastbloom@0.14.1, quinn-proto@0.11.15.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.10.1 is the unskipped baseline.
+    # Revisit: remove when every listed parent accepts rand 0.10.1 or leaves the graph.
+    "rand@0.9.4",
+    # Forcing chain: rand_chacha 0.3.1 <- rand@0.8.6, zenoh-crypto@1.7.2.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.9.0 is the unskipped baseline.
+    # Revisit: remove when both listed parents accept rand_chacha 0.9.0 or leave the graph.
+    "rand_chacha@0.3.1",
+    # Forcing chain: rand_core 0.6.4 <- rand@0.8.6, rand_chacha@0.3.1, rsa@0.9.10, signatory@0.27.1, signature@2.2.0.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.10.1 is the unskipped baseline.
+    # Revisit: remove when every listed parent accepts rand_core 0.10.1 or leaves the graph.
+    "rand_core@0.6.4",
+    # Forcing chain: rand_core 0.9.5 <- bolero-generator@0.13.5, rand@0.9.4, rand_chacha@0.9.0, rand_xoshiro@0.7.0.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.10.1 is the unskipped baseline.
+    # Revisit: remove when every listed parent accepts rand_core 0.10.1 or leaves the graph.
+    "rand_core@0.9.5",
+    # Forcing chain: redox_users 0.4.6 <- dirs-sys-next@0.1.2.
+    # Reason: #632 decision leave retained the legacy directory stack; 0.5.2 is the unskipped baseline.
+    # Revisit: remove when dirs-sys-next accepts redox_users 0.5.2 or leaves the graph.
+    "redox_users@0.4.6",
+    # Forcing chain: schemars 0.9.0 <- serde_with@3.17.0.
+    # Reason: #632 decision investigate retained incompatible constraints; 1.2.1 is the unskipped baseline.
+    # Revisit: remove when serde_with accepts schemars 1.2.1 or leaves the graph.
+    "schemars@0.9.0",
+    # Forcing chain: socket2 0.5.10 <- wtransport@0.6.1, zenoh@1.7.2 and its commons/TCP/TLS/UDP crates.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.6.4 is the unskipped baseline.
+    # Revisit: remove when WTransport and Zenoh accept socket2 0.6.4 or leave the graph.
+    "socket2@0.5.10",
+    # Forcing chain: spin 0.9.9 <- flume@0.11.1, lazy_static@1.5.0.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.10.1 is the unskipped baseline.
+    # Revisit: remove when both listed parents accept spin 0.10.1 or leave the graph.
+    "spin@0.9.9",
+    # Forcing chain: thiserror 1.0.69 <- async-nats@0.47.0, jni@0.21.1, redox_users@0.4.6, tungstenite@0.24.0, witx@0.9.1.
+    # Reason: #632 decision investigate retained incompatible constraints; 2.0.18 is the unskipped baseline.
+    # Revisit: remove when every listed parent accepts thiserror 2.0.18 or leaves the graph.
+    "thiserror@1.0.69",
+    # Forcing chain: thiserror-impl 1.0.69 <- thiserror@1.0.69.
+    # Reason: #632 decision investigate retained the paired macro version; 2.0.18 is the unskipped baseline.
+    # Revisit: remove with thiserror 1.0.69 when its forcing parents accept thiserror 2.0.18.
+    "thiserror-impl@1.0.69",
+    # Forcing chain: toml 0.9.12+spec-1.1.0 <- wasmtime-internal-cache@45.0.3.
+    # Reason: #632 decision investigate retained incompatible constraints; 1.0.6 is the unskipped baseline.
+    # Revisit: remove when Wasmtime cache accepts toml 1.0.6 or leaves the graph.
+    "toml@0.9.12+spec-1.1.0",
+    # Forcing chain: toml_datetime 0.6.3 <- proc-macro-crate@2.0.2, toml_edit@0.20.2.
+    # Reason: #632 decision investigate retained incompatible constraints; 1.0.0 is the unskipped baseline.
+    # Revisit: remove when both listed parents accept toml_datetime 1.0.0 or leave the graph.
+    "toml_datetime@0.6.3",
+    # Forcing chain: toml_datetime 0.7.5+spec-1.1.0 <- toml@0.9.12, toml_edit@0.23.10.
+    # Reason: #632 decision investigate retained incompatible constraints; 1.0.0 is the unskipped baseline.
+    # Revisit: remove when both listed parents accept toml_datetime 1.0.0 or leave the graph.
+    "toml_datetime@0.7.5+spec-1.1.0",
+    # Forcing chain: toml_edit 0.20.2 <- proc-macro-crate@2.0.2.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.23.10 is the unskipped baseline.
+    # Revisit: remove when proc-macro-crate accepts toml_edit 0.23.10 or leaves the graph.
+    "toml_edit@0.20.2",
+    # Forcing chain: wasm-encoder 0.244.0 <- wasm-metadata@0.244.0, wit-component@0.244.0.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.250.0 is the unskipped baseline.
+    # Revisit: remove when both listed parents accept wasm-encoder 0.250.0 or leave the graph.
+    "wasm-encoder@0.244.0",
+    # Forcing chain: wasm-encoder 0.248.0 <- wasm-compose@0.248.0, wasmtime-environ@45.0.3, wasmtime@45.0.3.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.250.0 is the unskipped baseline.
+    # Revisit: remove when every listed parent accepts wasm-encoder 0.250.0 or leaves the graph.
+    "wasm-encoder@0.248.0",
+    # Forcing chain: wasmparser 0.244.0 <- wasm-encoder/metadata@0.244.0, wit-component/parser@0.244.0.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.250.0 is the unskipped baseline.
+    # Revisit: remove when the 0.244 component stack accepts wasmparser 0.250.0 or leaves the graph.
+    "wasmparser@0.244.0",
+    # Forcing chain: wasmparser 0.248.0 <- wasm-compose/encoder/printer@0.248.0, Wasmtime 45, wit-parser@0.248.0.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.250.0 is the unskipped baseline.
+    # Revisit: remove when the 0.248/Wasmtime stack accepts wasmparser 0.250.0 or leaves the graph.
+    "wasmparser@0.248.0",
+    # Forcing chain: wast 35.0.2 <- witx@0.9.1.
+    # Reason: #632 decision investigate retained incompatible constraints; 250.0.0 is the unskipped baseline.
+    # Revisit: remove when witx accepts wast 250.0.0 or leaves the graph.
+    "wast@35.0.2",
+    # Forcing chain: webpki-roots 0.26.11 <- tokio-websockets@0.10.1.
+    # Reason: #632 decision investigate retained incompatible constraints; 1.0.6 is the unskipped baseline.
+    # Revisit: remove when tokio-websockets accepts webpki-roots 1.0.6 or leaves the graph.
+    "webpki-roots@0.26.11",
+    # Forcing chain: windows-sys 0.45.0 <- jni@0.21.1.
+    # Reason: #632 decision leave retained platform compatibility; 0.61.2 is the unskipped baseline.
+    # Revisit: remove when jni accepts windows-sys 0.61.2 or leaves the graph.
+    "windows-sys@0.45.0",
+    # Forcing chain: windows-sys 0.52.0 <- ring@0.17.14, socket2@0.5.10.
+    # Reason: #632 decision leave retained platform compatibility; 0.61.2 is the unskipped baseline.
+    # Revisit: remove when both listed parents accept windows-sys 0.61.2 or leave the graph.
+    "windows-sys@0.52.0",
+    # Forcing chain: windows-sys 0.59.0 <- cap-fs-ext/primitives@3.4.5, console@0.15.11, fs-set-times@0.20.3, io-extras@0.18.4, quinn-udp@0.5.14, winx@0.36.4.
+    # Reason: #632 decision leave retained platform compatibility; 0.61.2 is the unskipped baseline.
+    # Revisit: remove when every listed parent accepts windows-sys 0.61.2 or leaves the graph.
+    "windows-sys@0.59.0",
+    # Forcing chain: windows-targets 0.42.2 <- windows-sys@0.45.0.
+    # Reason: #632 decision leave retained platform compatibility; 0.52.6 is the unskipped baseline.
+    # Revisit: remove with windows-sys 0.45.0 when jni accepts the current Windows stack.
+    "windows-targets@0.42.2",
+    # Forcing chain: windows_aarch64_gnullvm 0.42.2 <- windows-targets@0.42.2.
+    # Reason: #632 decision leave retained the paired platform package; 0.52.6 is the unskipped baseline.
+    # Revisit: remove with windows-targets 0.42.2 when its windows-sys chain is upgraded.
+    "windows_aarch64_gnullvm@0.42.2",
+    # Forcing chain: windows_aarch64_msvc 0.42.2 <- windows-targets@0.42.2.
+    # Reason: #632 decision leave retained the paired platform package; 0.52.6 is the unskipped baseline.
+    # Revisit: remove with windows-targets 0.42.2 when its windows-sys chain is upgraded.
+    "windows_aarch64_msvc@0.42.2",
+    # Forcing chain: windows_i686_gnu 0.42.2 <- windows-targets@0.42.2.
+    # Reason: #632 decision leave retained the paired platform package; 0.52.6 is the unskipped baseline.
+    # Revisit: remove with windows-targets 0.42.2 when its windows-sys chain is upgraded.
+    "windows_i686_gnu@0.42.2",
+    # Forcing chain: windows_i686_msvc 0.42.2 <- windows-targets@0.42.2.
+    # Reason: #632 decision leave retained the paired platform package; 0.52.6 is the unskipped baseline.
+    # Revisit: remove with windows-targets 0.42.2 when its windows-sys chain is upgraded.
+    "windows_i686_msvc@0.42.2",
+    # Forcing chain: windows_x86_64_gnu 0.42.2 <- windows-targets@0.42.2.
+    # Reason: #632 decision leave retained the paired platform package; 0.52.6 is the unskipped baseline.
+    # Revisit: remove with windows-targets 0.42.2 when its windows-sys chain is upgraded.
+    "windows_x86_64_gnu@0.42.2",
+    # Forcing chain: windows_x86_64_gnullvm 0.42.2 <- windows-targets@0.42.2.
+    # Reason: #632 decision leave retained the paired platform package; 0.52.6 is the unskipped baseline.
+    # Revisit: remove with windows-targets 0.42.2 when its windows-sys chain is upgraded.
+    "windows_x86_64_gnullvm@0.42.2",
+    # Forcing chain: windows_x86_64_msvc 0.42.2 <- windows-targets@0.42.2.
+    # Reason: #632 decision leave retained the paired platform package; 0.52.6 is the unskipped baseline.
+    # Revisit: remove with windows-targets 0.42.2 when its windows-sys chain is upgraded.
+    "windows_x86_64_msvc@0.42.2",
+    # Forcing chain: winnow 0.5.40 <- toml_edit@0.20.2.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.7.14 is the unskipped baseline.
+    # Revisit: remove when toml_edit 0.20 accepts winnow 0.7.14 or leaves the graph.
+    "winnow@0.5.40",
+    # Forcing chain: wit-parser 0.244.0 <- wit-bindgen-core@0.51.0, wit-component@0.244.0.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.248.0 is the unskipped baseline.
+    # Revisit: remove when both listed parents accept wit-parser 0.248.0 or leave the graph.
+    "wit-parser@0.244.0",
+    # Forcing chain: x509-parser 0.17.0 <- wtransport@0.6.1.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.18.1 is the unskipped baseline.
+    # Revisit: remove when wtransport accepts x509-parser 0.18.1 or leaves the graph.
+    "x509-parser@0.17.0",
+]
 
 # ──────────────────────────────────────────────
 # Source Control
