@@ -1,5 +1,24 @@
 # Benchmark Results
 
+## Issue 633 - Cargo Duplicate-Version Bans
+
+Date: 2026-07-24
+
+Runtime target class: `NONE`
+
+This CI policy change has no runtime benchmark. Its drift baseline is structural
+and is taken directly from the finished Issue #632 handoff:
+
+| Structural metric | Result |
+| --- | ---: |
+| Duplicate package names | 39 |
+| Version rows across duplicate groups | 89 |
+| Exact lower-version skip entries | 50 |
+| Unskipped highest-version baselines | 39 |
+
+The positive gate uses `cargo-deny 0.19.0` through `cargo remote -c --`. No VM,
+performance measurement, build-server timing, or runtime claim is included.
+
 ## Issue 442 - Gaia Console Readiness And Native Sessions
 
 Date: 2026-07-18
