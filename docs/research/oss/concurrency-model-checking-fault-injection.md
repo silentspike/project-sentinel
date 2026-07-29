@@ -678,8 +678,9 @@ issue is changed until ORC approves the complete package.
 
 ```text
 A0 shared test schemas, validators, vectors, and CI routing
-  -> A1 Rust implementation schedules (Loom and Shuttle only)
-  -> A2 Go implementation schedules (synctest, race, barriers)
+A0 -> A1 Rust implementation schedules (Loom and Shuttle only)
+A0 -> A2 Go implementation schedules (synctest, race, barriers)
+A1 || A2 (parallel after A0)
 ```
 
 A1 and A2 may proceed in parallel only after A0 is merged. Stateright and
