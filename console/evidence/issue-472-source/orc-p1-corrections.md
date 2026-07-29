@@ -2,91 +2,102 @@
 
 Date: 2026-07-29
 
-Scope: source and remote-build validation for the findings in the ORC review of
-PR #700. No runtime service, deployment VM, installed binary, configuration, or
-runtime data was accessed or changed during this correction pass.
+Scope: source and remote-build validation for the bundled adversarial review of
+PR #700 at reviewed head `f028fb6b4f5b2fcc8ee76d5d73b3216ddeff4b8d`.
+No runtime service, deployment VM, installed binary, configuration, snapshot,
+or runtime data was accessed or changed.
 
-Current `origin/main@55ace5371a64d4369dccf7aea13ceb32ae441891` is included
-through merge commit `13475549ea051ab98ca724f1b0ea668770066268`; the feature
-branch was not rebased. The only merge conflict was `CHANGELOG.md`; it was
-resolved additively so that the existing Issue #472 runtime-lifecycle entry and
-main's Issue #633 dependency-policy entry are both retained. Main's
-dependency-policy, Cargo-deny configuration, workflow, benchmark-register, and
-Issue #633 evidence files otherwise match `origin/main` byte-for-byte.
+Current `origin/main@ae31ed303bf039c78b666ed1bf0a29e5ac334a93` is included
+through merge commit `c6ee6b6c9dec2023401e0c1fb88b2ca691440c75`; the branch
+was not rebased or force-pushed. The merge was conflict-free and added only the
+two current-main research documents. The prior current-main merge
+`c764988df2df96c87e09fa759990656c8d30ba18` remains in history. The
+`llm_bridge` one-second circuit-breaker reset and direct stored-deadline
+expiration remain unchanged.
 
-The previously resolved `llm_bridge` contract remains unchanged: the
-one-second circuit-breaker reset and direct stored-deadline expiration from
-main are retained.
+## Finding-to-test map
 
-## Integrated lifecycle audit
-
-The post-merge audit traced all productive spawn, stop, configuration,
-restore, rollback, shutdown, cgroup/eBPF, and abandoned-runtime paths. The
-current-main integration changes no Rust source or Cargo manifest relative to
-the reviewed head. Productive raw adapter ownership remains confined to the
-private `orchestrator::runtime_lifecycle` module. Registry-owned handles are
-included in reconciler liveness, are cleaned only through typed
-`NanoRuntime::stop`, and remain observable after failed cleanup. Cgroup identity
-is captured before adapter stop and eBPF registration is removed only after
-confirmed stop. No new lifecycle semantic defect was found.
-
-## Review finding mapping
-
-| Finding | Correction | Failure and lifecycle coverage |
+| Finding | Source correction | Focused evidence |
 |---|---|---|
-| Default bwrap snapshots | Default bwrap snapshots now persist a compatibility payload containing the bound workload specification and command. Restore creates a fresh runtime incarnation from that binding. It does not claim process, memory, or complete filesystem-state capture. Only the new CAS-manifest mode from #548 remains default-off. | `default_bwrap_snapshot_is_reproducible_recreate_without_cas_manifest_claim` uses isolated temporary CAS/home roots while explicitly retaining the default-off CAS-manifest flag, so it also runs under an unprivileged hosted-runner filesystem; `default_bwrap_compatibility_snapshot_supports_world_restore_without_cas_manifest`; the complete workspace suite exercises manual/periodic world snapshot, pre-restore, and pre-config-apply call sites. |
-| Config-apply safety snapshot | A runtime-changing apply requires its pre-apply safety snapshot. A missing store or failed adapter snapshot aborts before runtime, ECS, or projection mutation. | Functional config-apply tests exercise the staged transition and fail-closed stop/replacement paths. |
-| Persistent config recovery | `runtime_config_recovery` is an owner-fenced SQLite table. The daemon atomically creates a `transitioning` marker before stopping the exact old runtime. Incomplete rollback changes it to `recovery_required`; startup reads and reconciles markers before API/readiness/ECS/runtime publication, and spawn/reconcile reject blocked agents. A marker is cleared only after verified adapter cleanup/reconcile. | `runtime_config_recovery_survives_restart_and_blocks_startup_until_reconciled`; `recovery_block_rejects_spawn_instead_of_reconciler_resurrection`; stop and replacement failure tests. |
-| Adapter-owned cleanup | bwrap and microVM implement typed abandoned-runtime reconciliation. microVM fails closed when only unowned durable sockets remain; it does not kill by an unverified PID or delete unowned state. | `abandoned_reconcile_is_verified_or_fails_closed_on_unowned_socket`; bwrap marker/setup/process failure-injection and retry tests in the workspace suite. |
-| Ownership barrier | The raw registry and concrete adapters are held in the orchestrator's private `runtime_lifecycle` submodule. Productive call sites receive `RuntimeAdapterOwner` and can mutate lifecycle state only through its typed, exact-handle methods. The live `DaemonNanoRuntimeRegistry` is private. Direct PID/cgroup fallback cleanup was removed. | `runtime_lifecycle_visibility` is a compile-fail test proving external production code cannot import either the typed owner or the live daemon registry. Functional startup, shift, config-apply, restore, shutdown, control, reconciler, cgroup/eBPF, and failure-injection tests cover productive call-site classes. `ast_inventory_finds_no_raw_adapter_owner_outside_lifecycle_boundary` remains supplementary AST drift detection, not a compile-time proof. |
-| WASM restore effects | Version-two WASM snapshots persist declarative workload/tool binding plus an already-bound execution result. Restore never executes stored input. A legacy input without a bound result fails closed; any external-effect retry requires a separate durable idempotency key and receipt. | `snapshot_binds_completed_result_without_storing_a_replay_command`; `restore_never_replays_legacy_effectful_last_input` uses the real file-writing component and observes no file effect; `restore_rejects_legacy_effect_without_bound_result` rejects the unreceipted effect before loading the component. |
+| P1-1 adapter health truth | The private `RuntimeAdapterOwner` observes the exact instance-fenced `NanoHandle`, then calls typed `health` and `resources`. Missing or rewritten handles, `Stopped`, `Unavailable`, and observation errors are stale/fail-closed. `Degraded` is classified explicitly and cannot become healthy. Raw adapter ownership remains private. | `adapter_health_observation_fails_closed_for_stopped_and_rewritten_handles`; `healthy_non_bwrap_runtime` exercises ECS-native and WASM with exact observations; missing, mismatched, stopped, unavailable, error, and degraded cases are covered in `runtime_health`. Reconcile consumes the same snapshot truth. |
+| P1-2 microVM guest contract | The repository still has no packaged/versioned guest launcher, canonical rootfs pipeline, or workload-bound guest readiness attestation. Production registration and selection were therefore removed/rejected fail-closed. No productive microVM claim is made. | `microvm_selection_fails_closed_without_guest_attestation_contract`; production selection test proves microVM is absent while ECS-native, bwrap, and feature-enabled WASM remain available. |
+| P1-3 microVM crash recovery | Because durable launch ownership and verified restart reconciliation are not complete, the incomplete adapter is not exposed as a productive runtime. This avoids duplicate/unowned Firecracker instances rather than silently accepting the gap. | The same config and production-registry negatives hold this boundary. AC-1 and AC-4 remain BLOCKED pending the complete launcher/readiness/recovery contract. |
+| P1-4 workload-affecting Config Apply | One canonical `NanoWorkloadSpec` projection compares runtime, name, role, favorite room, shift set, tool capabilities, runtime metadata, and the bound command. Any difference uses the durable exact-handle stop/replace/rollback path; personality/background-only edits remain ECS-only. | Field-by-field positive comparison tests plus `every_workload_affecting_field_fails_closed_when_exact_stop_is_rejected`. |
+| P1-5 transactional Config Apply | An owner-fenced SQLite recovery marker and filesystem journal are persisted before the first stop. Confirmed stops/spawns are tracked; publication and config persistence happen only after successful replacement. Any stop, spawn, room/projection, or persistence failure compensates the full transaction from old config/building and exact runtime snapshots. Failed compensation persists `RecoveryRequired`, fences serving/readiness/spawn, and is reconciled before startup publication. | Stop/replacement negatives, `runtime_config_recovery_survives_restart_and_blocks_startup_until_reconciled`, `recovery_block_rejects_spawn_instead_of_reconciler_resurrection`, and `config_apply_compensation_restores_old_world_runtime_config_and_marker`. |
+| P1-6 lifecycle ownership proof | Concrete adapters and the live registry remain in the private lifecycle module. Productive mutation is available only through typed owner methods; direct PID/cgroup fallback cleanup is absent. Compile-fail visibility is the language-level external bypass barrier; the AST inventory is supplementary only. | `runtime_lifecycle_visibility`; `ast_inventory_finds_no_raw_adapter_owner_outside_lifecycle_boundary`; functional startup, shift, removal, restore, config, rollback, shutdown, control, reconcile, cgroup/eBPF, and failure paths in the daemon suite. |
+| P2-1 TOGAF HTML ownership | The worker-authored HTML delta was removed. The file matches `origin/main` byte-for-byte. DEV-007 and gap Markdown say source candidate and live pending. | `git diff --exit-code origin/main -- docs/architecture/togaf-architecture-guide.html`. |
+| P2-2 temporary paths | New tests use caller-controlled temporary directories or `/work/tmp/project-sentinel`; no newly added retained `/tmp` or `/var/tmp` test path remains in the #472 delta. | Added-line scan over the owned delta, excluding unrelated integrated research documents. |
+
+Additional lifecycle corrections retained from the earlier reviews:
+
+- World Restore tracks every successfully stopped runtime. Any pre-store-commit
+  failure compensates those exact snapshots before releasing the restore fence;
+  a failpoint after the Nth stop proves partial teardown recovery.
+- Default bwrap snapshots persist a compatibility payload containing the bound
+  workload and command. Restore creates a fresh incarnation and makes no
+  process-memory, CRIU, or complete filesystem-state claim. Only the #548
+  CAS-manifest extension remains default-off.
+- WASM schema v2 persists declarative binding plus an already-bound execution
+  result. Restore never invokes stored input; legacy effectful input without a
+  durable result/receipt fails closed before component load.
+- Registry-owned handles participate in liveness and cleanup only through
+  `NanoRuntime::stop`. Cgroup identity is captured before stop and eBPF state is
+  removed only after confirmed stop.
 
 ## Remote Rust gates
 
-All Rust commands ran through `cargo remote -c --` on the configured build
-host and reported `rustc 1.97.1`. Per-command `CARGO_TARGET_DIR` and serialized
-build settings were scoped to this PR; the global cargo-remote configuration
-was not changed. Build duration and host load are not runtime evidence.
+Every Rust command used `cargo remote -c --`, a command-scoped
+`CARGO_TARGET_DIR=/work/tmp/project-sentinel/cdx2-472-final-target`, and
+`rustc 1.97.1`. The global cargo-remote configuration was not changed.
+Build-host durations and load are not runtime evidence.
 
 | Gate | Command | Result |
 |---|---|---|
-| Focused daemon lifecycle suite | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-daemon --lib -j1` | PASS, 362 passed, 1 VM-bound test ignored |
-| Registry routing and AST inventory | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-daemon --test nano_runtime_registry -j1` | PASS, 2 passed |
-| Compile-fail ownership boundary | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-daemon --test runtime_lifecycle_visibility -j1` | PASS, 1 passed |
-| WASM effect replay rejection | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-wasm --features wasm legacy_effect -j1` | PASS, 2 passed |
-| WASM bound snapshot | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-wasm --features wasm snapshot_binds_completed_result_without_storing_a_replay_command -j1` | PASS, 1 passed |
-| Format | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1' -c -- fmt --all -- --check` | PASS |
-| WASM feature check | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1' -c -- check -p sentinel-wasm --features wasm -j1` | PASS |
-| WASM feature tests | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-wasm --features wasm -j1` | PASS, 61 unit, 62 acceptance, 2 conformance |
-| Workspace check | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1' -c -- check --workspace --all-targets -j1` | PASS |
-| Workspace tests | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test --workspace -j1` | PASS |
-| Workspace Clippy | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1' -c -- clippy --workspace --all-targets -j1 -- -D warnings` | PASS |
-| Rustdoc | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1 RUSTDOCFLAGS=-Dwarnings' -c -- doc --workspace --no-deps -j1` | PASS |
-| Release build | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1' -c -- build -p sentinel-daemon --bin sentinel-daemon --release -j1` | PASS |
-| Cargo deny bans | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1' -c -- deny check bans` | PASS |
+| Focused adapter-health tests | `cargo remote -b 'CARGO_TARGET_DIR=/work/tmp/project-sentinel/cdx2-472-final-target CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1' -c -- test -p sentinel-daemon runtime_health::tests -j2 -- --test-threads=1` | PASS, 6 passed; the exact stopped/rewritten-handle negative also passed in the final daemon/workspace run |
+| Daemon lifecycle suite | same scoped environment, `test -p sentinel-daemon --lib -j2 -- --test-threads=1` | PASS, 368 passed, 1 VM-bound test ignored |
+| Registry and AST inventory | same scoped environment, `test -p sentinel-daemon --test nano_runtime_registry -j2 -- --test-threads=1` | PASS, 3 passed |
+| Compile-fail ownership boundary | same scoped environment, `test -p sentinel-daemon --test runtime_lifecycle_visibility -j2 -- --test-threads=1` | PASS, 1 passed |
+| Limbo targeted reproduction | same scoped environment, `test -p sentinel-limbo -j2 -- --test-threads=1` | PASS, 55 unit and 12 acceptance |
+| WASM feature check | `cargo remote -b 'CARGO_TARGET_DIR=/work/tmp/project-sentinel/cdx2-472-final-target CARGO_BUILD_JOBS=2' -c -- check -p sentinel-wasm --features wasm -j2` | PASS |
+| WASM feature tests | same scoped test environment, `test -p sentinel-wasm --features wasm -j2 -- --test-threads=1` | PASS, 61 unit, 62 acceptance, 2 conformance |
+| Format | same scoped build environment, `fmt --all -- --check` | PASS |
+| Workspace check | same scoped build environment, `check --workspace --all-targets -j2` | PASS |
+| Workspace tests | same scoped test environment, `test --workspace -j2 -- --test-threads=1` | PASS, including daemon 368 passed/1 VM-bound ignored, Limbo 55 unit/12 acceptance, registry 3, visibility 1, and WASM 61 unit/62 acceptance/2 conformance |
+| Workspace Clippy | same scoped build environment, `clippy --workspace --all-targets -j2 -- -D warnings` | PASS |
+| Rustdoc | same scoped build environment plus `RUSTDOCFLAGS=-Dwarnings`, `doc --workspace --no-deps -j2` | PASS |
+| Release daemon build | same scoped build environment, `build -p sentinel-daemon --bin sentinel-daemon --release -j2` | PASS; returned binary size 56,712,376 bytes, SHA-256 `491a097ec9a49312ca279b2828a464baf350b7d4dedb005d6c11960c52fd47ee` |
+| Cargo deny | same scoped build environment, `deny check` | PASS (`advisories`, `bans`, `licenses`, and `sources`); existing unmatched-allow/skip warnings only |
 
-## Non-Rust source gates
+## Repository policy gates
 
-| Gate | Command | Result |
-|---|---|---|
-| Diff whitespace | `git diff --check` | PASS |
-| Typos | `typos` | PASS |
-| Fenced writers | `python3 scripts/check-fenced-writers.py` | PASS |
-| Unsafe baseline | `python3 scripts/check-unsafe-baseline.py` | PASS, 26/26 |
-| Dependency patch registry | `python3 scripts/check-patch-registry.py` | PASS, 0 overrides, 0 registry entries, 4 direct Git dependencies |
-| Patch-registry unit tests | `python3 -m unittest scripts.tests.test_check_patch_registry` | PASS, 15 passed |
-| Current-main preservation | `git diff --exit-code 55ace5371a64d4369dccf7aea13ceb32ae441891 -- .github/workflows/ci.yml deny.toml docs/dependency-policy.md docs/benchmarks/BENCHMARK-RESULTS.md console/evidence/issue-633-live` | PASS |
+| Gate | Result |
+|---|---|
+| `python3 scripts/check-fenced-writers.py` | PASS |
+| `python3 scripts/check-unsafe-baseline.py` | PASS, 26/26 |
+| `python3 scripts/check-patch-registry.py` | PASS, 0 overrides, 0 registry entries, 4 direct Git dependencies |
+| `python3 -m unittest scripts.tests.test_check_patch_registry` | PASS, 15 passed |
+| `typos` | PASS |
+| `git diff --check` | PASS |
+| TOGAF HTML matches current main | PASS |
+| New retained `/tmp` and `/var/tmp` scan | PASS |
 
-## Issue acceptance mapping
+## Acceptance mapping
 
 | AC | Status | Evidence |
 |---|---|---|
-| AC-1 | PASS (source) | The production daemon constructs the typed lifecycle owner with all supported adapters and exact per-incarnation handles. |
-| AC-2 | PASS (source) | Productive spawn, stop, config replacement, world restore, reconciliation, rollback, control, and shutdown use typed registry/adapter APIs. A compile-fail visibility test proves external code cannot import the productive owner/live registry; functional failure tests cover every productive call-site class. The AST inventory is supplementary only. |
-| AC-3 | NOT TESTED live | Source tests cover bwrap lifecycle ownership, cgroup/eBPF ordering, retry retention, and stop-before-publication. No VM was accessed. |
-| AC-4 | PASS (source); NOT TESTED live | Default bwrap compatibility snapshot/restore supports the existing World Snapshot, Restore, and Time Machine paths by recreating a fresh bound workload. It makes no process-state claim. The separate CAS-manifest extension remains default-off for #548. |
-| AC-5 | PASS (source) | DEV-007, the TOGAF gap, feature documentation, and the changelog state the typed ownership, non-replaying WASM restore, and #548 boundary without overclaiming. |
-| #698 AC-6 | NOT TESTED live | The required productive lifecycle integration belongs to the post-review single-node validation on `.240`. |
+| AC-1 | BLOCKED | ECS-native, bwrap, and feature-enabled WASM are registered with exact per-incarnation ownership. microVM is intentionally non-selectable until the missing guest launcher/readiness/durable recovery contract exists. |
+| AC-2 | PASS (source) | Compile-fail visibility plus functional lifecycle tests enforce productive mutation through typed ownership; AST inventory is supplementary. |
+| AC-3 | PARTIAL; live NOT TESTED | Source tests cover bwrap lifecycle ownership, cgroup/eBPF ordering, retry retention, transactional apply, and stop-before-publication. |
+| AC-4 | BLOCKED; live NOT TESTED | Default bwrap recreate restore and non-replaying WASM restore are source-tested, but productive microVM spawn/restore/health cannot be claimed. |
+| AC-5 | PASS (source candidate) | DEV-007, gap Markdown, changelog, and this evidence state the implemented boundaries and live-pending status without modifying ORC-owned TOGAF HTML. |
+| #698 AC-6 | NOT TESTED live | Source integration is present; authorized SINGLE_NODE validation on `.240` has not occurred. |
 
-Benchmarks, deployment, and live VM validation are **NOT TESTED**. PR #700 is
-not authorized for merge or deployment in this phase.
+Benchmarks, deployment, snapshots, and live VM validation are **NOT TESTED**.
+PR #700 is not authorized for merge or deployment.
+
+After the release artifact and its matching remote/local SHA-256 were captured,
+only the issue-owned remote target
+`/work/tmp/project-sentinel/cdx2-472-final-target` was removed. It occupied
+11 GiB. Build-host root capacity changed to 169 GiB used and 22 GiB available
+of 190 GiB (89% used), with zero remaining #472 `cargo` or `rustc` processes.
+No foreign target or process was changed.
