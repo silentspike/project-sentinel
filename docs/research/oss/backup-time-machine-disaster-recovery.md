@@ -3,7 +3,9 @@
 - Status: REVIEW_READY candidate
 - Issue: [#722](https://github.com/silentspike/project-sentinel/issues/722)
 - Parent: [#659](https://github.com/silentspike/project-sentinel/issues/659)
-- Baseline: `55ace5371a64d4369dccf7aea13ceb32ae441891`
+- Source-review baseline: `55ace5371a64d4369dccf7aea13ceb32ae441891`
+- Delivery base and current integrated Sentinel baseline:
+  `e85eb67f13beb240b4c4638d3f37d76f219b8463`
 - Research cut: 2026-07-29
 - Runtime evidence: none; this is a source and test audit, not a deployment or
   benchmark
@@ -757,11 +759,10 @@ offline-copy requirements, and drill cadence remain unapproved #650 policy input
 ### 8.2 Bootstrap journal and durable coordinator state
 
 The recovery coordinator exclusively owns
-`/var/lib/sentinel-recovery/control/recovery-journal.sqlite`. The path is compiled
-into the service unit/allowlist, not supplied by a capture or restore request. Its
-parent is mode `0700`, the file is mode `0600`, and the journal uses versioned
-SQLite schema, WAL, `synchronous=FULL`, explicit checkpoint on terminal transitions,
-file sync, and parent-directory sync on first creation.
+`/var/lib/sentinel-recovery/control/recovery-journal.sqlite`. Its parent is mode
+`0700`, the file is mode `0600`, and the journal uses versioned SQLite schema, WAL,
+`synchronous=FULL`, explicit checkpoint on terminal transitions, file sync, and
+parent-directory sync on first creation.
 
 The journal is outside every replaceable product data generation and is never
 included recursively in a RecoveryPoint. It stores only operation metadata:
@@ -1115,10 +1116,26 @@ runtime, release-production, retention, and supervision owners receive narrow
 reciprocal deltas instead of parallel authorities. #650 is downstream acceptance
 and numeric-policy ownership, never a prerequisite for implementing R0-R4.
 
+The implementation program has two distinct target classes:
+
+1. Sentinel product integration, destructive restore, and product benchmarks use the
+   declared `SINGLE_NODE` target `.240`.
+2. Recovery authority/release evidence and offsite copy evidence require auxiliary
+   targets outside `.240`'s host and failure domain. R0 and R2 each own a blocking
+   Gate A that selects the exact endpoint, principals, security/operations owner,
+   custody/durability contract, access, rollback, and test method before any live
+   mutation or durability claim.
+
+Deterministic fakes may prove the versioned ports before Gate A. They cannot prove
+independent durability, offsite survival, or a recoverable product. `.241`, `.242`,
+and Proxmox hosts are forbidden substitutes for an auxiliary recovery target.
+
 ### R0. Independent recovery authority and signed-release retrieval
 
-**Class and target:** `M0_HARDENING`; code/fake gates use `NONE`, final integration
-and benchmarks use `SINGLE_NODE` only after separately authorized runtime work.
+**Class and target:** `M0_HARDENING`; code/fake gates use `NONE`; Sentinel product
+integration and product benchmarks use `SINGLE_NODE` `.240`; authority, escrow,
+release-registry, and live survival evidence use only the exact auxiliary target
+approved by R0 Gate A outside `.240`'s host/failure domain.
 
 **Depends on:** #696's versioned signed-release publication port and an assigned
 security/operations authority. R0 has no dependency on R1-R4, #650 acceptance, a
@@ -1129,6 +1146,13 @@ catalog, dual-control escrow, key ceremony, break-glass/audit, and
 `SignedReleaseRetrievalPortV1`. #696 produces signed releases; R0 retrieves and
 validates them. The versioned port breaks any #696/#722 staging cycle.
 
+**Gate A:** before any live R0 AC, approve the exact recovery-authority endpoint,
+signer/escrow and release-registry locations, principals, security/operations owner,
+custody and access model, durability and failure domain, key ceremony, revocation,
+rollback, allowed/forbidden endpoints, and a non-production test endpoint. Until
+that decision is recorded, only deterministic fake conformance is allowed and no
+independent-durability claim may be made.
+
 **Negative/failure contract:** unknown/revoked/stale signer, rollback catalog,
 missing escrow quorum, lost key/authority, unsigned artifact, wrong SBOM/provenance,
 or incompatible release remains fail-closed. Restart between catalog/escrow/release
@@ -1137,8 +1161,11 @@ steps cannot weaken trust. Fakes are deterministic and hold no production secret
 **Delivery:** default off; token-free conformance first; rollout to read-only trust
 verification before restore authority. Rollback disables retrieval without trusting
 backed-up credentials. Benchmarks measure catalog/release verification on the
-declared target, never build time. TOGAF target delta defines the independent
-recovery authority and release source, but this issue does not edit TOGAF.
+declared targets, never build time. Live verification must make `.240` unavailable
+while the approved independent catalog, release, revocation, and escrow evidence
+remains retrievable and valid. Same-host mocks are insufficient. TOGAF target delta
+defines the independent recovery authority and release source, but this issue does
+not edit TOGAF.
 
 ### R1. Local RecoveryPoint coordinator and immutable seal
 
@@ -1171,8 +1198,10 @@ readiness CAS.
 
 ### R2. Immutable offsite copy transport and verification
 
-**Class and target:** `M0_HARDENING`; `SINGLE_NODE` for final copy/verification
-integration and declared-target measurements.
+**Class and target:** `M0_HARDENING`; Sentinel-side integration and product
+benchmarks use `SINGLE_NODE` `.240`; upload, independent verification, retrieval,
+and survival evidence use only the exact auxiliary repository approved by R2 Gate A
+outside `.240`'s host/failure domain.
 
 **Depends on:** R1 immutable local envelope; #705 exact restic dependency/privilege
 decision; #656 version/update ownership; and R0 authority/key interfaces. It does
@@ -1183,6 +1212,13 @@ upload/delete/verifier principals, append-only signed `RecoveryCopyReceiptV1`,
 retention/immutability evidence, supersession/tombstone chain, and derived recovery
 class.
 
+**Gate A:** after #705 approves the dependency and invocation boundary, approve the
+exact offsite repository/backend and endpoint, credentials and key custody,
+uploader/verifier/delete principals, security/operations owner, retention,
+immutability, failure domain, access, rollback, allowed/forbidden endpoints, and
+test endpoint. Until that decision is recorded, only deterministic backend fakes
+are allowed and neither `VerifiedOffsite` nor a durability claim may be made.
+
 **Negative/failure contract:** live-store input, manifest rewrite, forged/replayed
 receipt, wrong parent envelope, backend/object/key mismatch, same uploader/verifier
 where policy forbids it, corrupt pack, rollback, retention race, lost remote object,
@@ -1192,21 +1228,27 @@ offsite readiness/RPO only; local cryptographic integrity remains valid.
 **Delivery:** local mock -> read-only shadow upload -> independent verify -> policy
 gating only after #650 policy approval. Rollback removes transport while preserving
 local envelopes and append-only loss receipts. Benchmarks measure upload, verify,
-retrieve, dedup, bytes, and sidecars. TOGAF target delta separates immutable local
-seal, immutable copy receipts, and derived class.
+retrieve, dedup, bytes, and sidecars on the declared targets. Live verification must
+make `.240` and its local sealed directory unavailable while the approved offsite
+object and authenticated copy evidence remain retrievable and valid through the
+independent verifier. Same-host mock evidence is insufficient. TOGAF target delta
+separates immutable local seal, immutable copy receipts, and derived class.
 
 ### R3. Whole-product restore runner and disaster drills
 
-**Class and target:** `M0_HARDENING`; `SINGLE_NODE` on an explicitly authorized
-isolated target for destructive restore and drill evidence.
+**Class and target:** `M0_HARDENING`; `SINGLE_NODE` `.240` on an explicitly
+authorized destructive restore/drill window. R0/R2 auxiliary endpoints are
+read-only restore inputs under their approved Gate A contracts.
 
 **Depends on:** R0, R1, and R2 plus complete owner-generation ports from #728/#729,
 #732-#736, #695/#710, #472/#701/#694, and signed releases from #696 through R0.
 
-**Scope:** quarantine, envelope/copy/release verification, staged generation
+**Scope:** quarantine, retrieval of independently surviving R0 authority/release and
+R2 offsite copy evidence, envelope/copy/release verification, staged generation
 restore, JetStream recreation, projection rebuild, credential reissue, runtime
 reconciliation, `ValidationOnly` probes, one Release decision, all ACKs, final
-readiness CAS, signed restore receipt, and drills.
+readiness CAS, signed restore receipt, and drills. A local sealed directory alone is
+not a disaster-recovery source.
 
 **Negative/failure contract:** in-place first mutation, mixed generation, invalid or
 lost copy, stale trust, unsigned/incompatible release, missing CAS/evidence,
@@ -1215,9 +1257,13 @@ or missing/conflicting ACK remains fenced or `ManualRecoveryRequired`.
 
 **Delivery:** dry validation -> staged restore -> authorized full drill. Rollback
 switches only to an intact verified generation and reruns the same release protocol.
-Benchmarks measure quarantine-to-ready, projection rebuild, reconciliation, and
-p50/p95/max with sidecars; proposed RPO/RTO values are not pass thresholds until
-#650 approves them. TOGAF target delta defines restore order and final readiness.
+Live verification first makes `.240`'s product data and local recovery directory
+unavailable, proves the approved R0/R2 evidence still retrievable and valid, and
+restores from that independently surviving evidence. Same-host mock evidence is
+insufficient. Benchmarks measure quarantine-to-ready, projection rebuild,
+reconciliation, and p50/p95/max with sidecars; proposed RPO/RTO values are not pass
+thresholds until #650 approves them. TOGAF target delta defines restore order and
+final readiness.
 
 ### R4. Recovery coverage, retention, and health
 
@@ -1253,7 +1299,12 @@ retention frontier, and policy status.
 5. Require runtime target, ACs, negative/failure criteria, benchmarks, rollout,
    rollback, claim boundary, TOGAF target delta, reciprocal links, final labels, and
    a fresh Issue Quality Gate PASS for every changed/new owner.
-6. #650 records proposed numeric RPO/RTO/offline/drill policy without approving it.
+6. R0 and R2 each block live work on a child-owned Gate A that approves an exact
+   auxiliary target outside `.240`'s host/failure domain, its security/operations
+   owner, principals, custody/durability, allowed/forbidden endpoints, test method,
+   and rollback before mutation.
+7. #650 records proposed numeric RPO/RTO/offline/drill policy without approving it
+   and remains downstream of the concrete R0/R2 target prerequisites.
 
 ### Live materialization readback
 
@@ -1266,11 +1317,11 @@ and runtime evidence are not.
 
 | Node | Ordered dependency | Live body SHA-256 | Fresh Issue Quality Gate |
 |---|---|---|---|
-| [#751 epic](https://github.com/silentspike/project-sentinel/issues/751) | Exactly R0-R4 | `930a0da9ff867e16a17f88b74598e7463b9459e114ea2b3aba1e0823bb9cd862` | [30430032015 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430032015) |
-| [#752 R0](https://github.com/silentspike/project-sentinel/issues/752) | None; versioned #696 port | `27d00b6d1066c81f0f42a0562310171fcbc76751d05a14b2767a33abada2563a` | [30430032328 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430032328) |
+| [#751 epic](https://github.com/silentspike/project-sentinel/issues/751) | Exactly R0-R4 | `f44bcc2b69f33790d2ad70f71dd350dc7c3fa4f6a85f01e9eaa321fc653e0a90` | [30452084119 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30452084119) |
+| [#752 R0](https://github.com/silentspike/project-sentinel/issues/752) | None; versioned #696 port | `48bfe187a50f0a624f4ed0ed11e606f224aad52f83f3805c1937976338f67036` | [30452084833 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30452084833) |
 | [#753 R1](https://github.com/silentspike/project-sentinel/issues/753) | #752 plus owner ports; not R2/#650 | `73cfa0fddee9603380f29eaf45a4ef5701fc6e63ccfc26d346c565b9ff912dcf` | [30430032499 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430032499) |
-| [#754 R2](https://github.com/silentspike/project-sentinel/issues/754) | #752, #753, #705, #656 | `bfe0fd6b521b89223740722e94d90d99a2f94ecd7a6a59b48a8bf4a858ba86d2` | [30430031810 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430031810) |
-| [#755 R3](https://github.com/silentspike/project-sentinel/issues/755) | #752-#754 plus owner ports | `30bce4b97a0f8167928a389876a42554914617c0d7d5e0dfa5f8e0a9bd8f0609` | [30430031953 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430031953) |
+| [#754 R2](https://github.com/silentspike/project-sentinel/issues/754) | #752, #753, #705, #656 | `3eb6dc48b7fceadac8dd0c3adb54666bf9ec86b4eca6bb530fbf0ef7991d8883` | [30452087992 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30452087992) |
+| [#755 R3](https://github.com/silentspike/project-sentinel/issues/755) | #752-#754 plus owner ports | `dfbe532a0faa3a0adf09f35373d011a8e65604b1a7b057a7d764dd3bcd13dac1` | [30452089875 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30452089875) |
 | [#756 R4](https://github.com/silentspike/project-sentinel/issues/756) | #752-#755 plus retention owners | `5a9ea398ca698d30db9355b15af09bff27183cb94d6bb24945f9aa05ee8ac779` | [30430013292 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430013292) |
 
 Existing-owner bodies carry one `<!-- issue-722-recovery-delta -->` section. The
@@ -1282,9 +1333,9 @@ body digest is over the exact UTF-8 GitHub body, without an added newline:
 | [#707](https://github.com/silentspike/project-sentinel/issues/707) | ECS barrier/resource receipt/no early tick | `cafd874ee81a1f87b027132c26665b8148e9ae0212b5360c6c474b125fcb60a9` | [30430213877 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430213877) |
 | [#728](https://github.com/silentspike/project-sentinel/issues/728) | Storage-generation receipt/stage/activation | `4306acce3e8a689febaf45df95a0527196b9ce4197ee495bb659d56865759ad0` | [30430217003 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430217003) |
 | [#729](https://github.com/silentspike/project-sentinel/issues/729) | Exact redb mechanism/failpoints/raw-copy rejection | `4ce70811047117e57bdac6dc5d13e1d513781443359aa760a6c2791303f8fdc1` | [30430217916 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430217916) |
-| [#732](https://github.com/silentspike/project-sentinel/issues/732) | Event envelope/generation/replay identity | `b9c606ffe2b0e4e18c26c88605bfe812857810e32a02b424df56d730c2be1474` | [30430218501 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430218501) |
-| [#733](https://github.com/silentspike/project-sentinel/issues/733) | PubAck/inbox/outcome/fixed-point drain | `b2cb1e157dc577dbae4b27ece4900c33718ce0c406967058e7244a9df063342d` | [30430219641 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430219641) |
-| [#734](https://github.com/silentspike/project-sentinel/issues/734) | Projection generation/ValidationOnly/CAS gate | `3e0b65ab9363237b2f9f249485c508104acc7ad83381e277cc52adccbae6d381` | [30430220995 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430220995) |
+| [#732](https://github.com/silentspike/project-sentinel/issues/732) | Event envelope/generation/replay identity | `9117a9a6bfeffd6fd40ecd0179fcdcf08cc7e02a849c6771cac3caf40e88f381` | [30451840446 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30451840446) |
+| [#733](https://github.com/silentspike/project-sentinel/issues/733) | PubAck/inbox/outcome/fixed-point drain | `8b795485a6fa3647dbe0b4a5ab5041cda57e55b24cd01f698fc9fc00455ce0dd` | [30451884086 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30451884086) |
+| [#734](https://github.com/silentspike/project-sentinel/issues/734) | Projection generation/ValidationOnly/CAS gate | `1fdb1cd2bf2b24fad37933ea83c0f95f216057833c94a218106cb32a16e3a674` | [30451914824 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30451914824) |
 | [#735](https://github.com/silentspike/project-sentinel/issues/735) | Episode durable effect frontier | `0a2e421c10d463ca749fc8aa060887820bc547d6ab47f973ed8a1e591cc6aec9` | [30430222504 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430222504) |
 | [#736](https://github.com/silentspike/project-sentinel/issues/736) | EventTruthGeneration/consumer/retention frontier | `5f1443552affdc42e34af255f927c2a3e57a61e379fa406043303ade03af50c3` | [30430225735 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430225735) |
 | [#695](https://github.com/silentspike/project-sentinel/issues/695) | WorkflowRecoveryPort/fence/authority | `bbdd9e49b3d8225b3cda50365e93f15fbad4c23081dfd5f58727994cd6a20a4a` | [30430226209 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430226209) |
@@ -1296,9 +1347,9 @@ body digest is over the exact UTF-8 GitHub body, without an added newline:
 | [#250](https://github.com/silentspike/project-sentinel/issues/250) | WorldSnapshot local-only receipt boundary | `34feb020dabd54fabfe5d5fe1e4b731200c5ccf8161134e2ebf520c5f90955a2` | [30430234832 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430234832) |
 | [#264](https://github.com/silentspike/project-sentinel/issues/264) | CAS pin/immutability/local-vs-offsite boundary | `3b4dabd31b7fa81aad4d6e7017071f803b894d9281efe18979674db489e67044` | [30430461168 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430461168) |
 | [#481](https://github.com/silentspike/project-sentinel/issues/481) | Product retention/copy/restore/frontier protection | `bf3966feaa022a128ee3a0bc0c3dab88fdcfe35a844c4969e0d6bf4de981ebae` | [30430238604 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430238604) |
-| [#705](https://github.com/silentspike/project-sentinel/issues/705) | Exact restic/privilege decision before R2 | `08f262749881793e061dfccfd3ba2c678b6fea60e7d4eb20674036a08601c7a5` | [30430240530 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430240530) |
+| [#705](https://github.com/silentspike/project-sentinel/issues/705) | Exact restic/privilege decision before R2 | `f59488a1188bd9a35b61a81b5282184172a09de207eacbe9373d3d12653821c1` | [30452081230 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30452081230) |
 | [#656](https://github.com/silentspike/project-sentinel/issues/656) | Accepted dependency upgrade/rollback ownership | `2f3bab8e3c7f6f4d83b6750e2e15c6a3b35328a50b08e10841cb51fdf6b8c117` | [30430241574 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430241574) |
-| [#650](https://github.com/silentspike/project-sentinel/issues/650) | Downstream acceptance; policy explicitly unapproved | `06116f06accb2808afedb6666ff207927a331931e9a65d830e1de732986fff17` | [30430243639 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430243639) |
+| [#650](https://github.com/silentspike/project-sentinel/issues/650) | Downstream acceptance; policy explicitly unapproved | `6b222562debab506b32ff9b4479aefc5fb9b571259175c958d66a0d58d4d525c` | [30452077448 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30452077448) |
 
 ## 12. Acceptance-criteria readback
 
@@ -1326,16 +1377,20 @@ body digest is over the exact UTF-8 GitHub body, without an added newline:
   pause-time, RPO, or RTO measurement.
 - The architecture selects an independently administered encrypted recovery escrow,
   an independently durable signed release registry, and current revocation as
-  authoritative. A security/operations owner still must approve the concrete escrow
-  provider, key ceremony, quorum, custody, audit, and break-glass runbook before
-  implementation.
+  authoritative. R0 Gate A still must approve the exact auxiliary endpoint,
+  security/operations owner, signer/escrow, release registry, principals, key
+  ceremony, quorum, custody, access, durability, revocation, rollback, and
+  machine-loss test before live implementation.
 - The final #695 workflow schema is not on this baseline. Its live
   `WorkflowRecoveryPortV1` delta is an implementation contract, not a claim that the
   port already exists.
 - D5 selects restic behind the immutable sealed-bundle boundary, but does not
   authorize a dependency. #705 must either approve that exact integration and
   privilege/update contract or reject D5 and return the transport choice to ORC; it
-  must not silently substitute another backend.
+  must not silently substitute another backend. After #705, R2 Gate A still must
+  approve the exact auxiliary repository, credentials, principals, retention,
+  immutability, failure domain, access, rollback, and machine-loss test before live
+  use.
 - D1-D11 and the owner-resolution procedure are approved and materialized. This
   does not approve any implementation, runtime result, release, restore, or M0
   acceptance claim.
@@ -1345,11 +1400,11 @@ The remaining policy decisions belong only to #650/product ownership:
 1. whether RPO <= 15 minutes and RTO <= 60 minutes become accepted thresholds;
 2. whether an offline/immutable copy is mandatory before accepting customer work;
 3. which drill cadence becomes mandatory;
-4. which security/operations owner and exact escrow provider/key ceremony satisfy
-   R0;
-5. when complete R0-R4 implementation/runtime evidence is sufficient for product
+4. when complete R0-R4 implementation/runtime evidence is sufficient for product
    acceptance.
 
-Until those decisions and implementation evidence exist, the new issues remain
-blocked and every numeric/offline/drill value remains a proposal, not a readiness
-gate or achieved result.
+The concrete R0/R2 auxiliary targets and their security/operations owners are
+implementation prerequisites owned by #752/#754, not deferred #650 policy. Until
+their Gate A decisions, implementation evidence, and the remaining #650 decisions
+exist, the new issues remain blocked and every numeric/offline/drill value remains a
+proposal, not a readiness gate or achieved result.
