@@ -13,11 +13,12 @@
 use anyhow::{Context, Result};
 use sentinel_common::agent_config::{load_agent_config, AgentConfig};
 use sentinel_common::room::BuildingConfig;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const APPLY_RECOVERY_JOURNAL: &str = ".runtime-config-apply-recovery.json";
+pub(crate) const APPLY_RECOVERY_JOURNAL: &str = ".runtime-config-apply-recovery.json";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ConfigApplyRecoveryJournal {
@@ -63,6 +64,23 @@ pub fn persist_company_config(
     building: &BuildingConfig,
     backup_label: &str,
 ) -> Result<PersistResult> {
+    let mut sync_deleted_dir = sync_dir;
+    persist_company_config_with_delete_sync(
+        config_dir,
+        agents,
+        building,
+        backup_label,
+        &mut sync_deleted_dir,
+    )
+}
+
+fn persist_company_config_with_delete_sync(
+    config_dir: &Path,
+    agents: &[AgentConfig],
+    building: &BuildingConfig,
+    backup_label: &str,
+    sync_after_delete: &mut dyn FnMut(&Path) -> Result<()>,
+) -> Result<PersistResult> {
     let agents_dir = config_dir.join("agents");
     let rooms_path = config_dir.join("rooms.toml");
 
@@ -98,6 +116,10 @@ pub fn persist_company_config(
                 .with_context(|| format!("remove stale agent file {}", path.display()))?;
             agents_removed += 1;
         }
+    }
+    if agents_removed > 0 {
+        sync_after_delete(&agents_dir)
+            .with_context(|| format!("fsync agents dir after delete {}", agents_dir.display()))?;
     }
 
     // 5. rooms.toml atomar schreiben.
@@ -138,6 +160,7 @@ pub fn stage_config_apply_recovery(
         staged_building: staged_building.clone(),
         participant_phase: ConfigApplyParticipantPhase::Prepared,
     };
+    validate_config_apply_journal(&journal)?;
     write_config_apply_journal(config_dir, &journal)
 }
 
@@ -158,7 +181,32 @@ pub fn load_config_apply_recovery(
         "unsupported config apply recovery journal schema {}",
         journal.schema_version
     );
+    validate_config_apply_journal(&journal)?;
     Ok(Some(journal))
+}
+
+pub(crate) fn config_apply_digest(
+    agents: &[AgentConfig],
+    building: &BuildingConfig,
+) -> Result<String> {
+    let mut sorted_agents = agents.to_vec();
+    sorted_agents.sort_by_key(|config| config.identity.id);
+    let payload = serde_json::to_vec(&(sorted_agents, building))
+        .context("serialize canonical config apply digest payload")?;
+    Ok(format!("{:x}", Sha256::digest(payload)))
+}
+
+fn validate_config_apply_journal(journal: &ConfigApplyRecoveryJournal) -> Result<()> {
+    anyhow::ensure!(
+        journal.old_digest == config_apply_digest(&journal.old_agents, &journal.old_building)?,
+        "config apply file participant old payload digest conflict"
+    );
+    anyhow::ensure!(
+        journal.staged_digest
+            == config_apply_digest(&journal.staged_agents, &journal.staged_building)?,
+        "config apply file participant staged payload digest conflict"
+    );
+    Ok(())
 }
 
 pub fn publish_config_apply_participant(
@@ -438,6 +486,32 @@ mod tests {
     }
 
     #[test]
+    fn stale_agent_delete_fsyncs_the_agents_directory_before_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path();
+        let old_agents = vec![agent(1, "Anna", "Dev"), agent(2, "Bob", "PM")];
+        persist_company_config(cfg, &old_agents, &building(), "initial").unwrap();
+
+        let mut synced_dirs = Vec::new();
+        let mut record_and_sync = |path: &Path| {
+            synced_dirs.push(path.to_path_buf());
+            sync_dir(path)
+        };
+        let result = persist_company_config_with_delete_sync(
+            cfg,
+            &old_agents[..1],
+            &building(),
+            "delete",
+            &mut record_and_sync,
+        )
+        .unwrap();
+
+        assert_eq!(result.agents_removed, 1);
+        assert_eq!(synced_dirs, vec![cfg.join("agents")]);
+        assert!(!cfg.join("agents").join("AGENT-02-BOB.toml").exists());
+    }
+
+    #[test]
     fn filesystem_participant_requires_explicit_canonical_direction() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path();
@@ -450,8 +524,8 @@ mod tests {
         stage_config_apply_recovery(
             cfg,
             "op-77",
-            "old-digest",
-            "staged-digest",
+            &config_apply_digest(&old_agents, &old_building).unwrap(),
+            &config_apply_digest(&staged_agents, &staged_building).unwrap(),
             &old_agents,
             &staged_agents,
             &old_building,
@@ -494,8 +568,8 @@ mod tests {
         stage_config_apply_recovery(
             cfg,
             "op-partial",
-            "old-digest",
-            "staged-digest",
+            &config_apply_digest(&old_agents, &old_building).unwrap(),
+            &config_apply_digest(&staged_agents, &staged_building).unwrap(),
             &old_agents,
             &staged_agents,
             &old_building,
@@ -551,5 +625,48 @@ mod tests {
                 .participant_phase,
             ConfigApplyParticipantPhase::PublishedStaged
         );
+    }
+
+    #[test]
+    fn filesystem_participant_rejects_payload_corruption_before_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path();
+        let old_agents = vec![agent(1, "Anna", "Dev")];
+        let old_building = building();
+        let staged_agents = vec![agent(1, "Anna", "Lead")];
+        let mut staged_building = old_building.clone();
+        staged_building.building.name = "Staged".to_string();
+        persist_company_config(cfg, &old_agents, &old_building, "initial").unwrap();
+        stage_config_apply_recovery(
+            cfg,
+            "op-corrupt",
+            &config_apply_digest(&old_agents, &old_building).unwrap(),
+            &config_apply_digest(&staged_agents, &staged_building).unwrap(),
+            &old_agents,
+            &staged_agents,
+            &old_building,
+            &staged_building,
+            79,
+        )
+        .unwrap();
+
+        let journal_path = cfg.join(APPLY_RECOVERY_JOURNAL);
+        let mut corrupted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        corrupted["staged_agents"][0]["identity"]["name"] =
+            serde_json::Value::String("Tampered".to_string());
+        atomic_write(&journal_path, &serde_json::to_vec(&corrupted).unwrap()).unwrap();
+
+        let error = publish_config_apply_participant(cfg, "op-corrupt", true).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("staged payload digest conflict"),
+            "{error:#}"
+        );
+        assert_eq!(load_all_agents(&cfg.join("agents")).unwrap(), old_agents);
+        assert_eq!(
+            BuildingConfig::load(&cfg.join("rooms.toml")).unwrap(),
+            old_building
+        );
+        assert!(journal_path.exists(), "corrupt participant remains fail-closed");
     }
 }
