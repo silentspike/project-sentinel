@@ -100,10 +100,17 @@ Required final reruns:
 ## GitHub contract readback
 
 - Issue #472: OPEN, `status:review`, `quality:ready`; the fresh issue Quality
-  Gate passed after the material body rewrite.
+  Gate run `30473957347` passed after the material body rewrite. Body SHA-256:
+  `4278e8f428c59aed53d27300172760388dadb0b6c2e2869a60fdf54c4424c11c`.
 - Follow-up #775: OPEN, `status:blocked`, `quality:ready`; Quality Gate run
-  `30473925851` passed.
+  `30473925851` passed. Body SHA-256:
+  `22cc4fb1d6a4cf9f422883ec5aad15f2da98a55d6bb4454190e68905e0c45904`.
 - PR #700 closing issue references: empty.
+- The reviewed remote head remains
+  `fed35f0b0e23d0e99db6fd3310da8e3a56823b68`; the correction commit is kept
+  locally at `f59348cf9f08b8eb9ec8dc1578015ad532536ee4`. The branch remains
+  intentionally unfrozen until final main integration and the invalidated
+  remote gates complete.
 - Benchmark register: `/work/company/BENCHMARK-REGISTER.md`.
 - Hard-coded live CPU/RAM claims: none.
 
