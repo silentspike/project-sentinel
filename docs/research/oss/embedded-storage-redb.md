@@ -42,8 +42,9 @@ The accepted direction is:
    committed reference points to missing or corrupt bytes.
 6. Add deterministic filesystem-fault and process-crash tests based on the
    compact mechanisms used by SQLite and RocksDB.
-7. Use redb's integrity, quick-repair, savepoint, and compaction facilities
-   through an explicit per-store policy.
+7. Use redb's integrity, mandatory authority-store two-phase commit,
+   policy-selected quick-repair, savepoint, and compaction facilities through an
+   explicit per-store policy.
 
 No engine replacement is justified by this study. Any future dependency change
 still requires [#705](https://github.com/silentspike/project-sentinel/issues/705)
@@ -99,8 +100,9 @@ comparison belongs to [#709](https://github.com/silentspike/project-sentinel/iss
 
 | Store | Engine and role | Authoritative data | External byte dependency |
 | --- | --- | --- | --- |
-| `StateStore` | redb, fenced agent hot state | Twelve per-agent state tables | None for the rows themselves |
+| `StateStore` | redb, fenced mixed-scope hot state | Twelve total tables: nine agent-scoped state/relationship/personality/evolution/fact tables plus World-scope room/simulation/API-pattern state | None for the rows themselves |
 | `ClusterMetaStore` | redb, control-plane authority | Owner terms, local roles, saga state, snapshot metadata | Cluster RPC outcomes and participant state |
+| `ControlplaneStore` | separate `controlplane.redb`, node-local operational authority | Active config copy, runtime state, pending/executed actions, incidents | ECS observation and action/event outcomes |
 | `ArtifactPlane` | redb metadata plus segment files | Object metadata, manifests, chunk locations, refcounts, sessions, trash | Compressed BLAKE3-128 chunks in segment files |
 | Filesystem metadata | redb | Inodes, directory entries, CAS refcounts, snapshot pins, trash | SHA-256 blob files in `CasStore` |
 | Hippocampus | redb | Goals, episodes, facts, archive, metadata | None |
@@ -108,15 +110,23 @@ comparison belongs to [#709](https://github.com/silentspike/project-sentinel/iss
 | Event store and projections | SQLite through `rusqlite` | Event history, outbox, offsets, projections | WAL/database files managed by SQLite |
 
 The workspace pins `redb = "3.1"`; the baseline lockfile resolves redb 3.1.1.
-SQLite 0.38 with the bundled engine is used by Limbo fallback, projection,
-Nightrun, dashboard, and Gaia-memory paths.
+The Rust binding is `rusqlite` 0.38.0 through `libsqlite3-sys` 0.36.0. Its
+`bundled` feature compiles SQLite 3.51.1 from the amalgamation pinned by the
+`rusqlite` 0.38.0 release. Limbo fallback, projection, Nightrun, dashboard, and
+Gaia-memory paths use that binding; the binding version and SQLite engine
+version are different facts. The immutable release amalgamation declares
+[`SQLITE_VERSION 3.51.1`](https://github.com/rusqlite/rusqlite/blob/35b3be2436a63d21701d1d110661e6392831fea0/libsqlite3-sys/sqlite3/sqlite3.c#L470-L474).
 
 ### redb StateStore
 
-`crates/sentinel-redb/src/lib.rs` defines twelve agent-state tables and opens
-them in one database. `dump_agent_tables()` and `restore_agent_tables()` cover
-all twelve tables; restore uses one redb write transaction. Fenced writes
-recheck owner authority at commit.
+`crates/sentinel-redb/src/lib.rs` defines twelve total StateStore tables and
+opens them in one database. `dump_agent_tables()` reads only one agent's
+agent-keyed rows. It deliberately excludes World-scope `ROOM_STATE`, `SIM_META`,
+and `API_PATTERNS`; there is no code `restore_agent_tables()` implementation.
+That name appears only as an ADR target. Only `dump_all_tables()` and
+`restore_all_tables()` cover all twelve tables, and the latter restores them in
+one fenced redb write transaction. Fenced writes recheck owner authority at
+commit.
 
 This is a sound local transaction boundary. It does not cover ECS state,
 filesystem metadata, CAS bytes, projection offsets, or the event cursor.
@@ -128,6 +138,30 @@ from local owner role and local saga markers. That separation is required for
 cluster recovery, but it also means backup, repair, and migration code must not
 interpret a byte-for-byte database copy as global authority without validating
 node identity and generation.
+
+### Controlplane Store
+
+`services/sentinel-daemon/src/controlplane/store.rs` opens a separate
+`controlplane.redb` with four tables:
+
+- `CONTROL_CONFIG` for the active configuration copy;
+- `CONTROL_RUNTIME_STATE` for cycle counters and cursor state;
+- `CONTROL_ACTION_LOG` for pending/executed action and verification state;
+- `CONTROL_INCIDENTS` for typed operational incidents.
+
+The production orchestrator opens this store from the daemon data directory.
+Each setter uses redb transactions; `write_cycle_batch()` atomically writes one
+controlplane cycle. Startup and periodic GC delete terminal actions and retain
+only the newest configured incident count. The store has process-local
+roundtrip and GC tests but no dump/restore, storage-generation, integrity,
+compaction, schema-envelope, or backup integration.
+
+`CONTROL_CONFIG` is derived from the loaded configuration and is rebuildable.
+Runtime state, non-terminal actions, and incident history are node-local
+operational authority: #728 must classify them in the node-bound storage
+generation and #729 must assign their redb policy. #706 continues to own
+supervision, incident semantics, action behavior, and retention policy; #728
+and #729 do not duplicate that authority.
 
 ### Artifact Plane: BLAKE3 Chunk Store
 
@@ -150,6 +184,11 @@ That transaction is metadata-atomic, but the segment writer is not synchronized
 before the redb commit. A power loss can therefore preserve a manifest and
 location whose bytes never reached stable storage.
 
+The peer chunk path has the same boundary. `store_pulled_chunk()` verifies the
+BLAKE3 identity, appends the raw chunk to the active segment, and commits its
+location/refcount without calling `SegmentStore::sync()`. It is covered by
+S-01; a successful peer pull is not yet a durability receipt.
+
 Concurrent ingests of the same new chunk can both pass the read precheck and
 append duplicate bytes. The later redb write can replace the location, leaving
 dead segment bytes. This is space leakage rather than content corruption when
@@ -168,9 +207,10 @@ two databases.
 
 `CasStore::store()` hashes bytes, writes a temporary file, and renames it into
 the canonical path. It does not synchronize the file or containing directory.
-The distributed pull path is stronger: it verifies content, synchronizes the
-file, renames, and attempts to synchronize the parent directory, although parent
-open/sync failures are currently ignored.
+Only the SHA-256 blob pull path is stronger: `store_pulled_blob()` verifies
+content, synchronizes the file, renames, and attempts to synchronize the parent
+directory, although parent open/sync failures are currently ignored. The
+BLAKE3 chunk pull path remains an unsynchronized segment append.
 
 The same logical CAS therefore has two different publication guarantees.
 
@@ -197,10 +237,18 @@ main.
 | Contract | Current-baseline source |
 | --- | --- |
 | StateStore table set | `crates/sentinel-redb/src/lib.rs:21-40` |
+| Locked rusqlite and libsqlite3-sys versions | `Cargo.lock:2876-2877`, `Cargo.lock:4126-4127` |
+| Bundled SQLite feature declaration | `crates/sentinel-projection/Cargo.toml:17-17` |
 | StateStore open and fenced write entry | `crates/sentinel-redb/src/lib.rs:72-107` |
-| Agent/all-table dump and atomic redb restore | `crates/sentinel-redb/src/lib.rs:723-795` |
+| Agent-filtered dump versus all-table dump/restore | `crates/sentinel-redb/src/lib.rs:723-795` |
 | Owner-fence commit recheck | `crates/sentinel-redb/src/lib.rs:946-986` |
 | Cluster owner, local role/saga, and term-snapshot metadata | `crates/sentinel-redb/src/cluster_meta.rs:1-70` |
+| Controlplane four-table definitions and open | `services/sentinel-daemon/src/controlplane/store.rs:1-52` |
+| Controlplane writes, retention GC, and cycle transaction | `services/sentinel-daemon/src/controlplane/store.rs:54-365` |
+| Controlplane store unit tests | `services/sentinel-daemon/src/controlplane/store.rs:367-542` |
+| Productive ControlplaneStore open | `services/sentinel-daemon/src/orchestrator.rs:1484-1498` |
+| Productive controlplane cycle and periodic incident/action GC | `services/sentinel-daemon/src/controlplane/mod.rs:88-205` |
+| Controlplane incident types and productive observation | `services/sentinel-daemon/src/controlplane/types.rs:29-57`, `services/sentinel-daemon/src/controlplane/observe.rs:44-160` |
 | Artifact object/manifest/chunk/refcount/trash/ref/session tables | `crates/sentinel-fs/src/artifact.rs:41-65` |
 | Artifact dedup precheck, segment append, and metadata commit | `crates/sentinel-fs/src/ingest.rs:121-193` |
 | Batch segment append and metadata commit | `crates/sentinel-fs/src/ingest.rs:269-330` |
@@ -212,6 +260,7 @@ main.
 | Filesystem inode, dirent, SHA-256 refcount, trash, and snapshot-pin tables | `crates/sentinel-fs/src/metadata.rs:20-39` |
 | Blob refcount, trash, and snapshot pin operations | `crates/sentinel-fs/src/metadata.rs:371-540` |
 | Metadata dump/restore and destructive GC | `crates/sentinel-fs/src/metadata.rs:621-723` |
+| Productive operator filesystem-blob GC route and call | `services/sentinel-daemon/src/operator_api.rs:1599-1634`, `2391-2405` |
 | Snapshot cut, persistence, then separate blob pin | `services/sentinel-daemon/src/snapshot.rs:131-204` |
 | Restore preflight and refcount-derived blob validation | `services/sentinel-daemon/src/orchestrator.rs:3604-3629` |
 | Sequential redb/FS/ECS/projection restore and rollback | `services/sentinel-daemon/src/orchestrator.rs:3944-4167` |
@@ -244,11 +293,32 @@ are repeated in
 statements, not proof that every publication, backup, restore, and GC boundary
 already satisfies the target.
 
-Live issue readback established the active ownership graph in this report.
-Runtime incident or host evidence was neither required nor authorized for this
-runtime-target `NONE` study, so no correctness decision relies on an uninspected
-incident feed. The source-proven failure windows are routed to implementation
-owners with deterministic failure tests instead.
+### Repository and Issue Incident Inventory
+
+The incident inventory is reproducible without runtime access:
+
+```text
+rg -n 'control_incidents|log_incident|Incident \{' services console
+find . -type f \( -name '*.redb' -o -name '*incident*.json' -o -name '*incident*.jsonl' \)
+rg -n 'gc_chunks|gc_trash\(' crates services
+for term in redb CAS storage corrupt 'backup restore'; do
+  gh search issues --repo silentspike/project-sentinel --state open -- "$term"
+done
+```
+
+The source scan finds six typed `IncidentType` values and productive detection,
+batch persistence, recent-incident reads, and bounded retention. The current
+observe path emits hunger, energy, stress, bladder, and stress-cluster
+incidents; `AgentStuck` is typed but is not emitted by that path. The repository
+contains no committed `.redb` database or JSON/JSONL incident export, so the
+public source baseline has zero stored incident instances to enumerate. That is
+a proven empty repository set, not a claim that no deployment has incidents.
+
+The issue search finds the source-backed storage defect program: #730 for
+publication/reconciliation, #727 for reachability/deletion, #728 for
+generation-safe backup/restore, and #729 for redb policy/fault testing, under
+#726. Runtime host incident readback remains excluded by target class `NONE`;
+the source and issue inventories are complete for this research scope.
 
 The inventory also found two explicit `Durability::None` uses in
 `crates/sentinel-fs/src/artifact.rs:233-238` and
@@ -260,10 +330,10 @@ durable authority and that startup remains closed until rebuild completes.
 
 | ID | Severity | Finding | Failure outcome | Classification |
 | --- | --- | --- | --- | --- |
-| S-01 | High | Segment bytes are appended but not synchronized before the manifest/location redb commit. | A committed manifest can point to truncated or absent bytes after power loss. | `M0_HARDENING` |
+| S-01 | High | Local ingest and `store_pulled_chunk()` append segment bytes without synchronizing before the manifest/location redb commit. | A committed manifest or pulled-chunk index can point to truncated or absent bytes after power loss. | `M0_HARDENING` |
 | S-02 | High | Normal SHA-256 CAS publication renames without file and directory synchronization. | A committed filesystem reference can survive while its blob does not. | `M0_HARDENING` |
-| S-03 | Critical | Artifact trash deletion does not recheck current refcount and ingest does not cancel a stale trash entry. | A re-referenced chunk can be removed from the index. | `M0_HARDENING`; promote to `BLOCKS_M0` if the active M0 workflow exercises artifact GC |
-| S-04 | Critical | Metadata GC checks refs and pins before unlink, performs physical delete outside redb, then rechecks only refs. | A new snapshot pin or reference can race physical deletion. | `M0_HARDENING`; promote to `BLOCKS_M0` when destructive GC is enabled |
+| S-03 | Critical | Artifact trash deletion does not recheck current refcount and ingest does not cancel a stale trash entry. Current callsite scan finds only unit/integration/home-manifest tests and benchmarks, not a productive daemon caller. | A re-referenced chunk can be removed from the index. | `M0_HARDENING`; ArtifactPlane destructive GC must remain unconnected/disabled until #727 passes |
+| S-04 | Critical | Metadata GC checks refs and pins before unlink, performs physical delete outside redb, then rechecks only refs. The productive operator API invokes it. | A new snapshot pin or reference can race physical deletion. | `BLOCKS_M0` for the filesystem-blob GC capability; `/operator/security/fs-trash-gc` must fail closed or remain disabled until #727 passes |
 | S-05 | High | Snapshot persistence and snapshot-blob pinning are separate operations. | A retained snapshot can be visible but unprotected from GC after a crash. | `M0_HARDENING` |
 | S-06 | High | Restore validates from stored refcounts and commits redb, FS metadata, ECS, and projection in a process-local saga. | A process crash can leave a mixed-generation application state. | `M0_HARDENING` |
 | S-07 | High | Gaia backup reads a live redb file directly; atomic restore uses write plus rename without durable file/directory sync. | Backup may not represent an engine-consistent cut; acknowledged restore may disappear after power loss. | `M0_HARDENING` |
@@ -271,6 +341,8 @@ durable authority and that startup remains closed until rebuild completes.
 | S-09 | High | Hippocampus append paths load in one transaction and overwrite in a later transaction. | Concurrent updates for the same agent can be lost. | `M0_HARDENING` |
 | S-10 | Medium | Schema/version envelopes are inconsistent across raw JSON rows. | Upgrades can decode incompatible rows ambiguously or fail late. | `M0_HARDENING` |
 | S-11 | High | Startup cleanup removes temporary files but does not reconcile all orphan bytes, dangling refs, impossible refcounts, incomplete sessions, or mixed profiles. | Readiness can report healthy while the store is internally inconsistent. | `M0_HARDENING` |
+| S-12 | High | `controlplane.redb` is productive node-local authority but has no generation, backup/restore, integrity, schema, or store-policy registration. | Recovery can omit action/incident/runtime state or reopen with an unclassified store. | `M0_HARDENING`; #728 owns generation classification and #729 owns policy, while #706 retains supervision semantics |
+| S-13 | High | Sentinel redb construction sites do not document whether one-phase commit's non-cryptographic checksum threat boundary is excluded or require two-phase commit. | An adversary with workload, crash, and flush-order control can target redb's documented one-phase checksum limitation. | `M0_HARDENING`; one-phase is forbidden for an authority store without an approved threat-boundary proof |
 
 None of these findings proves that redb itself violated ACID. They are Sentinel
 composition defects or missing operating contracts.
@@ -286,18 +358,96 @@ composition defects or missing operating contracts.
 | Blob CAS dedup | SHA-256 whole-blob namespace | Repeated complete blobs/files | Manifest reachability, snapshot retention, or chunk-level reuse |
 | In-memory existence index proposed by #629 | Exact cache of durable chunk identities | Avoids redb lookup contention | Durability or delete authority; it must rebuild from committed metadata |
 
+### Backend-Specific Durable Publication
+
+One `DurableBlockPublisher` owns admission and returns one versioned receipt
+type, but it dispatches to two physical protocols:
+
+```text
+DurabilityReceiptV1 {
+    receipt_version,
+    operation_id,
+    storage_generation,
+    backend: BlobFile | SegmentExtent,
+    block_ref,
+    encoded_digest,
+    decoded_digest,
+    decoded_size,
+    codec_and_profile,
+    backend_binding,
+    durability_epoch,
+    receipt_digest
+}
+
+BlobFileBinding {
+    canonical_object_id,
+    temp_object_id,
+    file_sync_completed,
+    rename_completed,
+    directory_sync_completed
+}
+
+SegmentExtentBinding {
+    segment_id,
+    segment_generation,
+    frame_version,
+    extent_offset,
+    framed_length,
+    frame_digest,
+    segment_sync_epoch,
+    segment_creation_receipt_if_new
+}
+```
+
+The receipt digest binds every field, including backend kind, content identity,
+generation, codec/profile, location, and durability epoch. A receipt cannot be
+replayed across a block, generation, backend, segment, offset, or profile. The
+metadata transaction validates and stores the receipt with the location and
+manifest. A holder advertisement is allowed only after that transaction commits.
+The invariant order is `validated backend -> durability receipt ->
+metadata/reachability commit -> holder advertisement`.
+
+**Blob-file protocol:**
+
+1. Create a same-filesystem temporary file and stream bytes while hashing.
+2. Verify encoded/decoded digest, size, codec, and `BlockRef`.
+3. Synchronize the temporary file.
+4. Atomically rename it to the canonical content name. An existing destination
+   is accepted only after identity verification.
+5. Synchronize the containing directory and propagate every failure.
+6. Construct `BlobFileBinding`, then commit receipt and reachability metadata.
+
+**Segment-extent protocol:**
+
+1. Encode a versioned framed record containing length, content identity,
+   codec/profile, payload digest, and a trailer/commit marker.
+2. Append the complete frame to the active segment and record its offset.
+3. Synchronize the segment file before constructing `SegmentExtentBinding`.
+4. Commit the receipt, chunk location, refcount delta, and manifest in redb.
+5. On restart, scan valid frames to the last durable boundary. Truncate partial
+   tails; retain post-sync/pre-metadata extents as orphans until reconciliation;
+   reject a metadata location without a matching valid frame/receipt.
+
+A newly created segment first writes and validates its versioned header under a
+temporary name, synchronizes the file, renames it to the canonical segment
+name, and synchronizes the directory. Only then may it accept reachable
+extents. Existing segments do not rename per chunk. No segment metadata commit
+may precede the segment sync.
+
 ### Unified Invariants
 
 The implementation must make these invariants executable:
 
 1. **Durable reachability:** every committed manifest references only bytes that
-   have passed size and digest verification and have completed file plus
-   directory durability barriers.
+   have passed size/digest verification and have a matching backend-specific
+   `DurabilityReceiptV1`.
 2. **Orphans over dangling refs:** a crash may leave unreferenced bytes. It must
    never leave a reachable reference to missing or unverifiable bytes.
-3. **One publication order:**
-   `temp -> stream/hash -> verify -> sync file -> rename -> sync directory ->
-   metadata/reachability commit -> holder advertisement`.
+3. **One logical order, two physical protocols:** validate and synchronize the
+   backend, construct the bound receipt, commit receipt plus reachability, then
+   advertise. Blob files use temp/sync/rename/directory-sync. Segment extents use
+   framed append plus segment sync; only new segment creation uses
+   temp/sync/rename/directory-sync.
 4. **Derived refcounts:** reference counts can accelerate decisions, but the
    canonical count is rebuildable from committed manifests, object refs,
    snapshot refs, and durable active claims.
@@ -363,12 +513,18 @@ distinguish a dead process from a slow live holder.
 
 | Boundary or race | Allowed post-crash state | Required recovery | Forbidden outcome |
 | --- | --- | --- | --- |
-| Before temp creation | No metadata and no bytes | No-op | Reachable metadata |
-| During temp write/hash | Partial temp only | Remove or resume only with verified journal identity | Publish partial bytes |
-| After verification, before file sync | Verified but non-durable temp | Repeat sync and publish | Metadata commit |
-| After file sync, before rename | Durable temp | Idempotent rename | Duplicate reachability |
-| After rename, before directory sync | Canonical name may disappear on power loss | Repeat or quarantine based on durable journal | Metadata commit before name durability |
-| After directory sync, before metadata commit | Durable orphan block | Reconcile and either attach to the same operation or collect after grace | Treat orphan as corruption |
+| Blob: before temp creation | No metadata and no bytes | No-op | Reachable metadata |
+| Blob: during temp write/hash | Partial temp only | Remove or resume only with verified journal identity | Publish partial bytes |
+| Blob: after verification, before file sync | Verified but non-durable temp | Repeat sync and publish | Metadata commit |
+| Blob: after file sync, before rename | Durable temp | Idempotent rename after identity check | Duplicate/conflicting reachability |
+| Blob: after rename, before directory sync | Canonical name may disappear on power loss | Repeat or quarantine based on durable journal | Metadata commit before name durability |
+| Blob: after directory sync, before metadata commit | Durable orphan block | Reconcile and either attach to the same operation or collect after grace | Treat orphan as corruption |
+| New segment: header write before file sync | Incomplete temporary segment only | Remove or rebuild header | Accept extents or publish segment name |
+| New segment: rename before directory sync | Segment name is not durably published | Repeat directory sync or quarantine | Accept a reachable extent |
+| Segment: during framed append | Partial tail after last valid frame | Scan and truncate to durable valid-frame boundary | Index partial frame |
+| Segment: complete append before segment sync | Valid but non-durable frame | Repeat sync; no receipt/metadata yet | Commit location/manifest |
+| Segment: after sync before metadata commit | Durable orphan extent | Reconcile by operation/receipt or retain until safe collection | Treat orphan extent as reachable |
+| Segment: after metadata commit | Valid synchronized extent plus matching receipt/location | Reconcile/advertise idempotently | Location without matching frame/receipt |
 | During metadata/ref/manifest transaction | Old or new complete redb state | redb recovery selects a valid commit | Partial manifest/refcount transaction |
 | After metadata commit, before advertisement | Locally complete object, no remote holder claim | Re-advertise from durable inventory | Remote claims bytes before local durability |
 | Concurrent identical ingest | At least one canonical durable block; duplicate dead bytes allowed temporarily | Single-flight when practical; reconcile dead segment bytes | Two incompatible locations for one identity |
@@ -417,6 +573,13 @@ The source node identity class distinguishes portable business/application state
 from node-local authority such as cluster roles, supervisor budgets, private
 keys, and boot identity. A restore must never clone node-local authority merely
 because it was present in a host backup.
+
+The generation inventory must list `controlplane.redb` explicitly rather than
+assuming that every daemon redb file is portable. Its configuration row is
+rebuildable from the loaded configuration; runtime cursor/state, non-terminal
+actions, and incident history are node-local authority and require an
+authenticated node-bound recovery or an explicit exclusion with the resulting
+operational loss recorded.
 
 ### Backup Cut
 
@@ -514,11 +677,24 @@ recursive tree scan found no repository `SECURITY.md` at that revision.
 | RocksDB | [`checkpoint_impl.cc`](https://github.com/facebook/rocksdb/blob/3b446089141659fad25328c5ea3e7ed283df46e4/utilities/checkpoint/checkpoint_impl.cc), [`fault_injection_fs.cc`](https://github.com/facebook/rocksdb/blob/3b446089141659fad25328c5ea3e7ed283df46e4/utilities/fault_injection_fs.cc) | [`checkpoint_test.cc`](https://github.com/facebook/rocksdb/blob/3b446089141659fad25328c5ea3e7ed283df46e4/utilities/checkpoint/checkpoint_test.cc), [`db/fault_injection_test.cc`](https://github.com/facebook/rocksdb/blob/3b446089141659fad25328c5ea3e7ed283df46e4/db/fault_injection_test.cc) | [`LICENSE.Apache`](https://github.com/facebook/rocksdb/blob/3b446089141659fad25328c5ea3e7ed283df46e4/LICENSE.Apache), [`LICENSE.leveldb`](https://github.com/facebook/rocksdb/blob/3b446089141659fad25328c5ea3e7ed283df46e4/LICENSE.leveldb); security file: Absent |
 | sled | [`README.md`](https://github.com/spacejam/sled/blob/d81865d07f07910133877915b57abf0c52d5756b/README.md) | [`tests/test_crash_recovery.rs`](https://github.com/spacejam/sled/blob/d81865d07f07910133877915b57abf0c52d5756b/tests/test_crash_recovery.rs), [`tests/test_tree_failpoints.rs`](https://github.com/spacejam/sled/blob/d81865d07f07910133877915b57abf0c52d5756b/tests/test_tree_failpoints.rs) | [`LICENSE-MIT`](https://github.com/spacejam/sled/blob/d81865d07f07910133877915b57abf0c52d5756b/LICENSE-MIT), [`LICENSE-APACHE`](https://github.com/spacejam/sled/blob/d81865d07f07910133877915b57abf0c52d5756b/LICENSE-APACHE), [`SECURITY.md`](https://github.com/spacejam/sled/blob/d81865d07f07910133877915b57abf0c52d5756b/SECURITY.md) |
 
+Operational and benchmark harnesses were inventoried at the same immutable
+revisions. They define hypotheses and failure methods only; no upstream result
+is Sentinel evidence.
+
+| Candidate | Pinned operational/failure harness | Pinned benchmark harness | Sentinel use |
+| --- | --- | --- | --- |
+| redb | [`tests/integration_tests.rs`](https://github.com/cberner/redb/blob/fc2b084dc0c8c261693b544942b1c1aa0bc75967/tests/integration_tests.rs), [`tests/multithreading_tests.rs`](https://github.com/cberner/redb/blob/fc2b084dc0c8c261693b544942b1c1aa0bc75967/tests/multithreading_tests.rs) | [`crates/redb-bench/benches/redb_benchmark.rs`](https://github.com/cberner/redb/blob/fc2b084dc0c8c261693b544942b1c1aa0bc75967/crates/redb-bench/benches/redb_benchmark.rs), [`savepoint_benchmark.rs`](https://github.com/cberner/redb/blob/fc2b084dc0c8c261693b544942b1c1aa0bc75967/crates/redb-bench/benches/savepoint_benchmark.rs), [`syscall_benchmark.rs`](https://github.com/cberner/redb/blob/fc2b084dc0c8c261693b544942b1c1aa0bc75967/crates/redb-bench/benches/syscall_benchmark.rs) | Reproduce policy-sensitive operations on the declared Sentinel runtime target; do not reuse timings |
+| heed/LMDB | heed inline environment tests in [`env.rs`](https://github.com/meilisearch/heed/blob/86cd1f681953cd5f6870706f6139b851e975975e/heed/src/envs/env.rs#L755-L1075), LMDB [`mdb_copy.c`](https://github.com/LMDB/lmdb/blob/389e1009a86c37f9d48564c58f8dbfc2858c3a44/libraries/liblmdb/mdb_copy.c), [`mdb_stat.c`](https://github.com/LMDB/lmdb/blob/389e1009a86c37f9d48564c58f8dbfc2858c3a44/libraries/liblmdb/mdb_stat.c), and [`mtest.c`](https://github.com/LMDB/lmdb/blob/389e1009a86c37f9d48564c58f8dbfc2858c3a44/libraries/liblmdb/mtest.c) | N/A: no dedicated heed benchmark target exists at the reviewed pin; LMDB examples are not a Sentinel workload | Port reader-age, copy/compact, and explicit sync contracts only |
+| SQLite | [`test/walcrash.test`](https://github.com/sqlite/sqlite/blob/b524d66cd24e8baef29618b77de126feefa14e57/test/walcrash.test), [`test/backup_ioerr.test`](https://github.com/sqlite/sqlite/blob/b524d66cd24e8baef29618b77de126feefa14e57/test/backup_ioerr.test) | [`test/speedtest1.c`](https://github.com/sqlite/sqlite/blob/b524d66cd24e8baef29618b77de126feefa14e57/test/speedtest1.c) | Port crash/backup method; measure only Sentinel event/projection scenarios |
+| Fjall | [`tests/batch_recovery.rs`](https://github.com/fjall-rs/fjall/blob/6debe706dbc53d6d0eb666aae5057671d5c1370f/tests/batch_recovery.rs), [`tests/recovery_journal_mac.rs`](https://github.com/fjall-rs/fjall/blob/6debe706dbc53d6d0eb666aae5057671d5c1370f/tests/recovery_journal_mac.rs), [`test_fixture/v2_keyspace_corrupt_journal`](https://github.com/fjall-rs/fjall/tree/6debe706dbc53d6d0eb666aae5057671d5c1370f/test_fixture/v2_keyspace_corrupt_journal) | N/A: no benchmark target exists at the reviewed pin | Port poison/recovery and watermark invariants; do not infer LSM performance |
+| RocksDB | [`db/fault_injection_test.cc`](https://github.com/facebook/rocksdb/blob/3b446089141659fad25328c5ea3e7ed283df46e4/db/fault_injection_test.cc), [`utilities/checkpoint/checkpoint_test.cc`](https://github.com/facebook/rocksdb/blob/3b446089141659fad25328c5ea3e7ed283df46e4/utilities/checkpoint/checkpoint_test.cc) | [`tools/db_bench.cc`](https://github.com/facebook/rocksdb/blob/3b446089141659fad25328c5ea3e7ed283df46e4/tools/db_bench.cc), [`tools/benchmark.sh`](https://github.com/facebook/rocksdb/blob/3b446089141659fad25328c5ea3e7ed283df46e4/tools/benchmark.sh) | Port the filesystem fault model and checkpoint ordering only |
+| sled (rejected) | [`tests/test_crash_recovery.rs`](https://github.com/spacejam/sled/blob/d81865d07f07910133877915b57abf0c52d5756b/tests/test_crash_recovery.rs), [`tests/test_tree_failpoints.rs`](https://github.com/spacejam/sled/blob/d81865d07f07910133877915b57abf0c52d5756b/tests/test_tree_failpoints.rs) | [`benchmarks/criterion/benches/sled.rs`](https://github.com/spacejam/sled/blob/d81865d07f07910133877915b57abf0c52d5756b/benchmarks/criterion/benches/sled.rs) | N/A for Sentinel because the engine is rejected before performance comparison |
+
 ### Candidate Fit Matrix
 
 | Candidate | Failure and recovery semantics | Determinism and 1:n fit | Security/runtime boundary | Maintenance and integration cost | Sentinel performance hypothesis | Decision |
 | --- | --- | --- | --- | --- | --- | --- |
-| redb 3.1.1 | CoW commit slots, checksums, optional 2PC/quick-repair, integrity repair, savepoints, compaction | Deterministic local metadata engine; content remains outside, so no conflict with 1:n CAS | Pure Rust; non-cryptographic internal checksums require trusted local-file boundary | Already shipped; lowest migration and upgrade cost | Policy tuning can trade commit cost for crash-open time; must measure per store | Configure and wrap |
+| redb 3.1.1 | CoW commit slots, checksums, 2PC/quick-repair, integrity repair, savepoints, compaction | Deterministic local metadata engine; content remains outside, so no conflict with 1:n CAS | Pure Rust; one-phase commit uses a non-cryptographic checksum and is forbidden for authority without approved adversarial-crash boundary proof | Already shipped; lowest migration and upgrade cost | After the security gate, compare 2PC/quick-repair configurations per store on declared targets | Configure and wrap |
 | heed/LMDB | Mature single-writer MVCC, environment sync/copy/compact, explicit unsafe durability flags | Good local KV behavior but does not solve content identity or cross-store generation | C FFI, unsafe environment-open contract, mmap/map-size operations | New engine, data migration, C toolchain/license/update surface | Point reads may be competitive, but no source-backed reason to improve Sentinel's end-to-end path | Reject dependency; port reader/maintenance contracts |
 | SQLite | WAL/rollback journals, online backup read cut, extensive crash/fault corpus | Deterministic transactional SQL and already used; 1:n content still belongs to CAS | Bundled C boundary already accepted for event/projection stores | No new dependency, but replacing redb would duplicate schema/query semantics | Strong for event/range/query workloads, not proven better for typed hot KV | Keep current split; port backup/fault contracts |
 | Fjall | Journal persistence modes, poison on persist failure, snapshots and GC sequence watermark | Watermark model fits reader-safe reclamation; LSM layout is not application dedup | Pure Rust but adds background storage machinery and newer operational surface | New engine and migration; separate compaction/write-amplification model | Could favor write-heavy workloads but risks extra IO/space on constrained nodes | Reject engine; port poison/watermark contracts |
@@ -551,6 +727,31 @@ Pinned source:
 [savepoints](https://github.com/cberner/redb/blob/fc2b084dc0c8c261693b544942b1c1aa0bc75967/src/transactions.rs#L941-L975),
 [commit and quick-repair](https://github.com/cberner/redb/blob/fc2b084dc0c8c261693b544942b1c1aa0bc75967/src/transactions.rs#L1175-L1257),
 [integrity and compaction](https://github.com/cberner/redb/blob/fc2b084dc0c8c261693b544942b1c1aa0bc75967/src/db.rs#L553-L668).
+
+The one-phase mode is not merely a recovery-time tradeoff. redb documents that
+its xxhash commit checksum is non-cryptographic and that an attacker combining
+arbitrary transaction bytes, database-file knowledge, crash injection during
+`fsync`, and control of page flush order can produce an invalid state with a
+valid checksum. Sentinel accepts agent-, provider-, operator-, and network-
+influenced values into several redb stores. Process crashes and resource/IO
+pressure are also realistic. Sandboxing reduces direct file and flush-order
+control, but current code and tests do not prove that the full adversarial
+conjunction is impossible at every construction site.
+
+Security therefore gates configuration before performance:
+
+- `Authoritative` and `NodeLocalAuthority` stores require two-phase commit;
+  quick-repair is the preferred configuration when bounded crash-open time is
+  also required because enabling it also enables two-phase commit.
+- `DerivedRebuildable` may use one-phase commit only when its policy names the
+  immutable rebuild authority and carries an approved threat-boundary proof
+  showing that malicious transaction content cannot be combined with crash and
+  IO-order control. Missing, stale, or store-mismatched proof fails closed.
+- A runtime benchmark may choose between already safe two-phase/quick-repair
+  configurations. It may not waive the security gate.
+- Two-phase commit still cannot repair dishonest storage firmware. Readiness
+  retains integrity and semantic checks and surfaces an explicit storage-device
+  trust assumption.
 
 **Decision:** `Configure existing dependency` plus `Wrap`. Keep redb. Introduce
 per-store policy for durability, quick-repair, integrity/readiness, savepoint
@@ -640,12 +841,55 @@ Pinned source:
 
 ## Mechanism Comparison
 
-| Mechanism | Sentinel today | Best upstream lesson | Decision and integration boundary |
+Legend: `S` means the pinned candidate directly supports the named engine
+mechanism, `P` means partial support or a contract that still requires
+Sentinel-owned composition, and `N/A` means the mechanism is outside the engine
+or unusable for the required boundary. These are source-review classifications,
+not performance results. The sled column remains present to make the justified
+reject reproducible rather than silently dropping it.
+
+| Mechanism | redb | heed/LMDB | SQLite | Fjall | RocksDB | sled (rejected) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Typed local metadata transaction | `S`: ACID write transaction | `S`: single-writer transaction | `S`: SQL transaction/savepoint | `P`: atomic batch/transaction, different LSM semantics | `P`: WriteBatch; transaction mode is a wider option set | `P`: transactions exist, but maturity blocks use |
+| Blob-file durable publication | `N/A`: external bytes | `N/A`: external bytes | `N/A`: external bytes | `N/A`: external bytes | `P`: checkpoint staging supplies ordering, not CAS identity | `N/A`: external bytes |
+| Segment-extent durable publication | `N/A`: metadata only | `N/A`: metadata only | `P`: WAL framing/crash corpus informs ordering | `S`: framed journal persistence and recovery | `S`: WAL/manifest and unsynced-data fault model | `P`: log/failpoint lesson; rejected engine |
+| MVCC/read lifetime | `S`: transactions/savepoints | `S`: reader table, stale-reader cleanup | `S`: read transactions/WAL snapshots | `S`: snapshot sequence watermark | `S`: snapshots/sequence numbers | `P`: guards exist; maturity blocks reliance |
+| Crash-open recovery | `S`: two commit slots, repair, quick-repair | `S`: LMDB recovery/sync contract | `S`: WAL/rollback recovery | `S`: journal replay and poison state | `S`: WAL/manifest recovery | `P`: tested, but format/reliability remain immature |
+| Integrity and repair | `S`: `check_integrity()` and repair | `P`: page/error checks plus copy; no matching Sentinel semantic repair | `S`: integrity checks and recovery corpus | `P`: journal MAC/corruption rejection | `S`: checksums, repair, verification tools | `P`: crash tests do not satisfy production maturity |
+| Scoped rollback/savepoint | `S`: ephemeral/persistent savepoints | `P`: nested/reader transactions, no cross-store rollback | `S`: savepoints | `P`: snapshot/batch boundary, not equivalent rollback | `P`: snapshot/transaction variants | `P`: transactional rollback, rejected engine |
+| Compaction/space control | `S`: `compact()` | `S`: compact-copy and map sizing | `S`: VACUUM/checkpoint controls | `S`: LSM compaction | `S`: mature compaction controls | `P`: space use is a documented weakness |
+| Engine-consistent online backup | `P`: stable read/savepoint can underpin export; raw file copy is insufficient | `S`: environment copy/compact | `S`: online backup API | `P`: snapshot/export composition required | `S`: checkpoint staging | `P`: export contract is not an adoption basis |
+| Generation reachability/refcounts | `N/A`: application schema | `N/A`: application schema | `N/A`: application schema | `P`: reader watermark informs reclamation only | `P`: snapshots/obsolete-file tracking inform claims only | `N/A`: application schema |
+| Destructive GC/delete claim | `N/A`: application protocol | `N/A`: application protocol | `N/A`: application protocol | `P`: GC watermark, not Sentinel reachability | `P`: deletion disablement/checkpoint lesson, not cluster authority | `N/A`: application protocol |
+| Schema/on-disk evolution | `P`: engine format is managed; row envelopes remain Sentinel-owned | `P`: LMDB format plus application codecs | `S`: schema version/migration mechanisms | `P`: version fixtures; application schema remains external | `P`: compatibility tooling plus application codecs | `N/A`: pre-1.0 format warning rejects use |
+| Deterministic fault injection | `P`: integrity/multithread tests; no full file/dir crash model | `P`: sync flags and examples, limited crash harness | `S`: extensive IO/crash test controls | `S`: recovery tests and corrupt fixtures | `S`: unsynced-file and directory-entry fault filesystem | `S`: failpoint tests, but engine remains rejected |
+| Self-describing content identity/1:n dedup | `N/A`: stores typed metadata only | `N/A`: KV identity is application-defined | `N/A`: row identity is application-defined | `N/A`: LSM keys do not define Sentinel block identity | `N/A`: keys/checksums do not define Sentinel block identity | `N/A`: keys do not define Sentinel block identity |
+
+Every cell is interpreted with the candidate-level delta above:
+
+- **Failure/determinism:** `S` means the mechanism itself exists, not that its
+  crash schedule proves Sentinel's cross-store composition. Sentinel still owns
+  deterministic crashpoints, generation binding, and 1:n reachability.
+- **Security:** redb one-phase remains gated; heed/LMDB, SQLite, and RocksDB add
+  native FFI boundaries; sled maturity is disqualifying; Fjall adds a newer LSM
+  operating surface. Engine checksums never replace boundary authentication.
+- **Maintenance/dependency:** only redb and SQLite are already shipped. Every
+  other engine would add migration, license/advisory, build, and on-disk-policy
+  work, so accepted cells are lessons to port rather than dependencies to add.
+- **Integration/performance hypothesis:** redb best fits typed local metadata,
+  SQLite best fits existing event/query stores, Fjall/RocksDB may favor larger
+  write-heavy LSM workloads, and LMDB may favor point reads. None establishes an
+  end-to-end Sentinel advantage; only target-specific implementation benchmarks
+  may promote a hypothesis.
+
+### Sentinel Integration Decisions
+
+| Mechanism | Sentinel today | Cross-candidate conclusion | Decision and integration boundary |
 | --- | --- | --- | --- |
 | Metadata transactions | redb transactions per logical store | redb already provides the needed ACID boundary | Keep redb; expose a Sentinel policy wrapper |
-| External byte publication | Inconsistent between segment, local CAS, and pull CAS | Fjall sync modes; RocksDB staged checkpoint | Implement one durable publish primitive in `sentinel-fs` |
+| External byte publication | Inconsistent between segment, local CAS, and pull CAS | No metadata engine owns both physical protocols; Fjall/RocksDB supply ordering lessons | Implement one `DurableBlockPublisher` with blob-file and segment-extent backends |
 | MVCC reader lifetime | No application lease/age policy | heed reader guidance; Fjall sequence watermark | Add metrics, owner tags, and bounded read claims |
-| Crash-open recovery | redb default recovery only | redb quick-repair and integrity APIs | Configure by store criticality and size; gate readiness |
+| Crash-open recovery | redb default recovery only | redb two-phase/quick-repair and integrity APIs | Gate by authority and threat boundary, then tune safe configurations |
 | Savepoints | Not used as an operating primitive | redb persistent/ephemeral savepoints | Use only for scoped redb rollback; never claim cross-store atomicity |
 | Compaction | No policy | redb compaction preconditions; LMDB compact copy | Maintenance API with no active readers/savepoints and before/after integrity |
 | Online backup | Live file read in Gaia; sequential app snapshots | SQLite consistent read cut; RocksDB staging | Build generation manifest and scoped admission barrier |
@@ -662,13 +906,14 @@ Pinned source:
 | Decision area | Decision | Rejected alternative |
 | --- | --- | --- |
 | redb dependency | Configure and wrap existing redb 3.1 | Replace with LMDB, Fjall, RocksDB, sled, or SQLite |
-| Authoritative redb writes | `Durability::Immediate`; consider quick-repair per store after benchmark | Global `Durability::None` for authoritative state |
+| Authoritative redb writes | `Durability::Immediate` plus mandatory two-phase commit; use quick-repair when bounded crash-open time is required | One-phase or `Durability::None` for authority; benchmark-based security waiver |
+| Rebuildable redb one-phase | Allowed only with a store-bound, approved threat-boundary proof and named immutable rebuild source | `EngineDefault` or undocumented one-phase |
 | Rebuildable caches | `Durability::None` only with explicit rebuild source, generation, and fail-closed startup rule | Treat eventual cache state as authority |
-| CAS publication | One Sentinel durable publish API with mandatory error propagation | Per-callsite ad hoc write/rename logic |
+| CAS publication | One Sentinel durable publish API with blob-file and segment-extent protocols plus typed receipts | Universal per-chunk rename or per-callsite ad hoc publication |
 | Refcounts | Derived, rebuildable, generation-tagged accelerator | Sole deletion authority |
 | GC | Durable delete claims plus all local/cluster reachability guards | Read-check, unlink, then partial recheck |
 | Savepoints | redb-local rollback and stable read cuts only | Cross-store atomicity claim |
-| Backup | Versioned metadata-plus-CAS generation | Copy live files independently |
+| Backup | Versioned metadata-plus-CAS generation including classified `controlplane.redb` state | Copy live files independently or omit node-local authority silently |
 | Restore | Stage, verify, generation switch, cache rebuild, then readiness | Sequential overwrite of active stores |
 | Compaction | Controlled maintenance with read/savepoint exclusion and integrity checks | Background/unbounded compaction without ownership |
 | Crash testing | Minimal Sentinel fault filesystem inspired by SQLite/RocksDB | Add RocksDB as a test dependency or rely on ordinary error returns |
@@ -684,8 +929,14 @@ RedbStorePolicy {
     logical_name,
     authority_class: Authoritative | DerivedRebuildable | NodeLocalAuthority,
     durability: Immediate | DeferredUntilCheckpoint,
-    quick_repair: Enabled | DisabledWithReason,
-    two_phase_commit: Enabled | EngineDefault,
+    quick_repair: Required | DisabledWithRecoveryReason,
+    two_phase_commit:
+        Required
+        | OnePhaseAllowed {
+            threat_boundary_evidence_id,
+            immutable_rebuild_authority,
+            approved_policy_version,
+        },
     schema_version,
     max_read_lease,
     integrity_on_start: Always | AfterUncleanShutdown | OperatorOnly,
@@ -698,6 +949,13 @@ Rules:
 
 - `DeferredUntilCheckpoint` is legal only for a derived store with a named
   authoritative rebuild source and a tested startup rebuild.
+- `Authoritative` and `NodeLocalAuthority` require two-phase commit. A missing,
+  expired, differently scoped, or unapproved one-phase threat-boundary record
+  fails policy validation before the store becomes ready.
+- Quick-repair is required when the store's declared crash-open objective cannot
+  tolerate full allocator reconstruction. Because quick-repair enables
+  two-phase commit, it cannot be benchmarked against unsafe one-phase as though
+  both were security-equivalent.
 - Node-local authority is included in host disaster recovery but cannot be
   restored to a different node identity without an authenticated rebind.
 - Integrity failure blocks the owning capability. Automatic repair is recorded
@@ -717,6 +975,7 @@ Rules:
 | Cluster uncertainty and destructive delete guard | [#499](https://github.com/silentspike/project-sentinel/issues/499) | Owns remote reference/pin uncertainty; must consume the local delete-claim contract |
 | Migration staging and in-transit pins | [#501](https://github.com/silentspike/project-sentinel/issues/501) | Owns migration claims; must block local and cluster GC |
 | Chunk algorithm and ingest performance | [#620](https://github.com/silentspike/project-sentinel/issues/620), [#627-#630](https://github.com/silentspike/project-sentinel/issues/627) | Own performance/profile rollout, not durability or delete correctness |
+| Control-plane supervision and action/incident semantics | [#706](https://github.com/silentspike/project-sentinel/issues/706) | Keeps supervision behavior, incident meaning, and retention ownership; #728 classifies storage generation and #729 supplies store policy without duplicating supervision |
 | Backup and disaster recovery research history | [#722](https://github.com/silentspike/project-sentinel/issues/722) | Closed and verified research input; it is not an active implementation owner |
 | Whole-product recovery implementation | [#751](https://github.com/silentspike/project-sentinel/issues/751), especially [#753](https://github.com/silentspike/project-sentinel/issues/753) and [#755](https://github.com/silentspike/project-sentinel/issues/755) | Consume the generation manifest for recovery-point sealing and restore; do not duplicate storage publication, reachability, or redb policy ownership |
 | Dependency ownership | [#705](https://github.com/silentspike/project-sentinel/issues/705) | Records the keep-and-wrap redb decision |
@@ -728,6 +987,41 @@ startup reconciliation, and deterministic cross-store fault testing. It is
 owned by [#726](https://github.com/silentspike/project-sentinel/issues/726) and
 its ordered children rather than being appended invisibly to a closed
 distributed-CAS issue or a performance issue.
+
+### ORC Reciprocal-Body Handoff
+
+The required canonical owner state is explicit:
+
+- #726 treats #722 only as closed research input and names #751/#753/#755 as
+  the active recovery consumers. Its implementation graph uses backend-specific
+  durability receipts rather than a universal rename protocol.
+- #728 names #751/#753/#755 in its topline, dependencies, blocker text,
+  out-of-scope boundary, and recovery acceptance criterion. It also classifies
+  all four `ControlplaneStore` tables as portable, node-bound, rebuildable, or
+  excluded and must not silently omit them.
+- #730 owns both `BlobFileBinding` and `SegmentExtentBinding`, including their
+  separate crashpoints and receipt validation. It does not promise a rename for
+  each segment chunk.
+- #729 registers `controlplane.redb`, enforces the one-phase threat-boundary
+  security gate at every redb construction site, and rejects missing or
+  store-mismatched policy evidence.
+
+AC-6 becomes `PASS` only after the final live body, label, reciprocal-link, and
+quality readback confirms that state. The worker does not mutate those issues.
+
+The final correction-round readback confirms the ORC reconciliation:
+
+| Live owner | Canonical body SHA-256 | State/labels | Reciprocal result |
+| --- | --- | --- | --- |
+| #726 | `b41ad622257ec0d6ebe6feae91c1cc93835a6f1ceb0e46d397af9241d0226e7e` | Open; `status:blocked`; `quality:ready` | #722 is closed research input; #751/#753/#755 are active consumers |
+| #728 | `119bb7e05bc2f7826566ba3b7a08bec754e479e2255c64677879087d23085628` | Open; `status:blocked`; `quality:ready` | Topline, dependencies, blocker, out-of-scope, and AC-11 route recovery to #751/#753/#755 |
+| #730 | `942e2bb0ec845972871d8c7043c1f7fc30881aceb3297fb0976bd1cd79703cda` | Open; `status:blocked`; `quality:ready` | Typed receipt plus separate blob-file and segment-extent protocols |
+
+The quality-gate readback remains `PASSED` for all three bodies, with
+`quality:ready` retained by ORC after reconciliation. AC-6 is therefore `PASS`
+at this report revision. #729 remains the implementation target for the
+additional one-phase threat-boundary delta stated above; this worker did not
+rewrite its body.
 
 ## Implementation Slices
 
@@ -741,8 +1035,19 @@ Runtime target class: `BOTH`.
 Scope:
 
 - one `DurableBlockPublisher` for segment chunks and SHA-256 blobs;
-- mandatory file and directory synchronization with propagated failures;
-- segment synchronization before manifest reachability;
+- a typed `DurabilityReceiptV1` whose backend-specific binding includes content
+  identity, verified length, physical locator/range, synchronized object
+  identity, policy version, and operation ID;
+- blob protocol: private temp create, complete write, content/length
+  verification, file sync, atomic final rename, and parent-directory sync;
+- segment protocol: validate and append a framed record, synchronize the segment
+  before any index/manifest commit, and reconcile partial/orphan extents by
+  truncating only beyond the last verified committed boundary;
+- new-segment protocol: write and sync the header under a private temp name,
+  rename and synchronize the parent directory before any extent can be made
+  reachable;
+- mandatory propagation of data-sync, rename, directory-sync, receipt, and
+  metadata-commit failures; no per-chunk rename claim for existing segments;
 - digest/size verification at both write and startup boundaries;
 - per-operation ingest journal/claim;
 - concurrent identical-ingest single-flight or deterministic loser cleanup;
@@ -789,6 +1094,10 @@ Scope:
 
 - canonical `StorageGeneration` and backup manifest;
 - classify portable state versus node-bound authority;
+- classify and include/exclude each `controlplane.redb` table explicitly:
+  config is rebuildable from loaded configuration, while runtime state,
+  non-terminal actions, and incident history are node-local authority unless a
+  versioned migration/rebind contract says otherwise;
 - consistent redb/SQLite/event/projection/CAS cut;
 - staged restore into a non-empty target;
 - complete reachability and digest validation before generation activation;
@@ -813,7 +1122,11 @@ Scope:
 
 - `RedbStorePolicy` on every construction site;
 - explicit durability classification for current `Durability::None` callsites;
-- quick-repair and two-phase-commit decision by store;
+- mandatory two-phase commit for authority and node-local authority;
+- one-phase only for derived/rebuildable stores carrying approved store-bound
+  threat evidence and an immutable rebuild authority;
+- quick-repair required where the declared crash-open objective excludes a full
+  repair scan;
 - integrity/readiness and semantic validation;
 - read/savepoint age observability;
 - controlled compaction and file-growth limits;
@@ -821,6 +1134,11 @@ Scope:
 - fix Hippocampus load-modify-store updates inside one writer transaction;
 - deterministic filesystem fault model for unsynced data and directory entries;
 - process-crash matrix across the three preceding slices.
+
+Required security negatives include agent/provider-influenced payloads combined
+with crash and flush-order fault injection, one-phase on an authority store,
+missing/stale/rebound threat evidence, unsafe engine defaults, and an attempted
+benchmark waiver. Every case must fail policy validation or readiness.
 
 Rollback: policies can return to prior engine defaults only after proving no new
 schema/generation dependency; integrity and reconciliation gates are not
@@ -833,10 +1151,10 @@ silently disabled.
 | AC-1 | Sentinel engine/table/path inventory, current findings, issue ownership, TOGAF delta |
 | AC-2 | Seven-candidate landscape and reproducible rubric |
 | AC-3 | Pinned deep review of redb, heed/LMDB, SQLite, Fjall, and RocksDB; sled rejection evidence |
-| AC-4 | Mechanism comparison including failure, dependency, maintenance, and integration boundaries |
+| AC-4 | Complete mechanism-by-candidate crossmatrix for redb, heed/LMDB, SQLite, Fjall, RocksDB, and rejected sled, plus failure, determinism/1:n, security, dependency, maintenance, integration, and performance-hypothesis deltas |
 | AC-5 | Exact decision table; no upstream number is used as Sentinel evidence |
-| AC-6 | Ordered implementation epic #726 with quality-gated children #727-#730 |
-| AC-7 | S-01 through S-11 classification with explicit promotion conditions |
+| AC-6 | PASS after ORC reciprocal-body reconciliation: final live #726/#728/#730 body, label, reciprocal-link, and quality readback confirms #722 research history, #751/#753/#755 recovery consumers, and backend-specific receipt ownership |
+| AC-7 | S-01 through S-13 classification with explicit promotion conditions and closed destructive-capability gates |
 | AC-8 | This public-safe English/ASCII report; repository validation remains required before merge |
 | AC-9 | Unified redb/CAS/dedup invariants and table/blob inventory |
 | AC-10 | Crash and concurrency matrix with allowed, recovery, and forbidden outcomes |
@@ -861,15 +1179,23 @@ content-addressed design while making the composition contract explicit:
 
 1. redb is the transactional metadata authority; it is not the content-dedup
    mechanism and does not make external bytes durable.
-2. The storage plane publishes verified bytes durably before metadata makes them
-   reachable and advertises only after both are complete.
+2. A single logical `DurableBlockPublisher` exposes two physical protocols.
+   Blob files use private temp write, hash/length verification, file sync,
+   rename, and directory sync. Existing segment files use framed extent append
+   and segment sync before metadata commit; only new segment creation uses
+   temp-header sync, rename, and directory sync before extents become reachable.
+   Both return a backend-bound typed durability receipt, and advertisement
+   follows receipt plus metadata commit.
 3. Refcounts and RAM existence indexes are derived accelerators. Deletion is
    authorized by complete generation-bound reachability plus local and cluster
    uncertainty guards.
 4. Time Machine, migration, backup, and restore share a versioned storage cut
    covering redb metadata, SQLite/event cursor, projections, and the CAS set.
-5. Every redb store declares durability, recovery, integrity, compaction,
-   schema, backup, and node-portability policy.
+5. Every redb store, including `controlplane.redb`, declares authority class,
+   durability, recovery, integrity, compaction, schema, backup, and
+   node-portability policy. Authority and node-local authority use two-phase
+   commit. One-phase is limited to explicitly rebuildable state with approved,
+   store-bound adversarial-crash threat evidence.
 6. The statement that a redb read is simply a memory-mapped pointer with no
    syscall must be reworded as a measured warm point-read property, not an API or
    zero-copy guarantee.
@@ -893,6 +1219,11 @@ that the implementation slices are complete.
 - Digest verification is mandatory at every untrusted or cross-node byte
   boundary. BLAKE3-128 remains a trusted-cluster dedup identity, not an
   adversarial authenticity primitive.
+- redb's one-phase xxhash commit mode is not accepted for authority or
+  node-local authority. Agent/provider-influenced values plus realistic process
+  and IO failures mean Sentinel cannot assume the documented adversarial-crash
+  conjunction away. Derived stores need an approved store-bound proof before
+  one-phase is legal; otherwise two-phase/quick-repair fails closed.
 - Repair and restore never promote unknown defaults into authority state.
 - Backup manifests must be authenticated before restoring node-bound state.
 - Any future dependency change is routed through #705 and #656 with license,
