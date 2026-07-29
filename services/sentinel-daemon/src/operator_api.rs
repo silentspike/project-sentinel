@@ -3732,6 +3732,12 @@ mod tests {
                         tracked_pid_state: Some("Z".to_string()),
                         cgroup_live_pid_count: 0,
                         security_runtime_present: true,
+                        adapter_handle_present: true,
+                        adapter_instance_matches: true,
+                        adapter_health_state: Some(
+                            sentinel_common::nano_runtime::NanoHealthState::Stopped,
+                        ),
+                        adapter_observation_error: None,
                         last_repair_status: Some("stale".to_string()),
                     }],
                 },

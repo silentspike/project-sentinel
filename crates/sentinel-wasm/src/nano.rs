@@ -67,6 +67,8 @@ pub struct WasmtimeNanoRuntime {
     runtime: ToolRuntime,
     workloads: HashMap<String, WasmWorkloadState>,
     suspended: HashSet<String>,
+    #[cfg(test)]
+    test_agent_home: Option<PathBuf>,
 }
 
 impl WasmtimeNanoRuntime {
@@ -75,6 +77,8 @@ impl WasmtimeNanoRuntime {
             runtime: ToolRuntime::new(),
             workloads: HashMap::new(),
             suspended: HashSet::new(),
+            #[cfg(test)]
+            test_agent_home: None,
         }
     }
 
@@ -167,11 +171,20 @@ impl WasmtimeNanoRuntime {
         }
     }
 
-    fn execution_context(state: &WasmWorkloadState) -> ExecutionContext {
+    fn execution_context(&self, state: &WasmWorkloadState) -> ExecutionContext {
         ExecutionContext {
             agent_id: state.workload.agent_name.clone(),
             agent_capabilities: vec![state.tool_name.clone()],
-            sandbox: SandboxConfig::restrictive(),
+            sandbox: {
+                #[cfg(test)]
+                if let Some(path) = &self.test_agent_home {
+                    SandboxConfig::with_paths(vec![path.clone()])
+                } else {
+                    SandboxConfig::restrictive()
+                }
+                #[cfg(not(test))]
+                SandboxConfig::restrictive()
+            },
             correlation_id: format!("nano-runtime-{}", state.workload.workload_id),
             tick: 0,
             agent_snapshot: Some(AgentSnapshot {
@@ -323,7 +336,7 @@ impl NanoRuntime for WasmtimeNanoRuntime {
         } else {
             request.input
         };
-        let ctx = Self::execution_context(&state);
+        let ctx = self.execution_context(&state);
         let result = self.runtime.execute(&state.tool_name, &input, &ctx)?;
 
         if let Some(stored) = self.workloads.get_mut(&handle.workload_id) {
@@ -490,6 +503,17 @@ pub fn wasm_conformance_metadata(wasm_path: PathBuf, tool_name: &str) -> BTreeMa
 mod tests {
     use super::*;
 
+    fn project_tempdir(prefix: &str) -> tempfile::TempDir {
+        let root = std::env::var_os("SENTINEL_TEST_TMP_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/work/tmp/project-sentinel/sentinel-wasm-tests"));
+        std::fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(root)
+            .unwrap()
+    }
+
     fn echo_fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-plugin.wasm")
     }
@@ -651,13 +675,9 @@ mod tests {
 
     #[test]
     fn restore_never_replays_legacy_effectful_last_input() {
-        let temp = tempfile::Builder::new()
-            .prefix("sentinel-wasm-restore-effect-")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let relative_dir = temp.path().strip_prefix("/tmp").unwrap().to_string_lossy();
+        let temp = project_tempdir("sentinel-wasm-restore-effect-");
         let effect_path = temp.path().join("restore-replay.txt");
-        let effect_input = format!("write {relative_dir}/restore-replay.txt replayed");
+        let effect_input = "write restore-replay.txt replayed".to_string();
         let effect_workload = workload_with("wasm-legacy-effect", fs_fixture(), "effectful-fs");
         let payload = serde_json::json!({
             "workload": effect_workload,
@@ -676,6 +696,7 @@ mod tests {
         };
 
         let mut runtime = WasmtimeNanoRuntime::new();
+        runtime.test_agent_home = Some(temp.path().to_path_buf());
         let restored = runtime.restore(snapshot).unwrap();
 
         assert!(
@@ -692,13 +713,9 @@ mod tests {
 
     #[test]
     fn restore_rejects_legacy_effect_without_bound_result() {
-        let temp = tempfile::Builder::new()
-            .prefix("sentinel-wasm-restore-unbound-effect-")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let relative_dir = temp.path().strip_prefix("/tmp").unwrap().to_string_lossy();
+        let temp = project_tempdir("sentinel-wasm-restore-unbound-effect-");
         let effect_path = temp.path().join("restore-replay.txt");
-        let effect_input = format!("write {relative_dir}/restore-replay.txt replayed");
+        let effect_input = "write restore-replay.txt replayed".to_string();
         let effect_workload = workload_with("wasm-unbound-effect", fs_fixture(), "effectful-fs");
         let payload = serde_json::json!({
             "workload": effect_workload,
@@ -716,6 +733,7 @@ mod tests {
         };
 
         let mut runtime = WasmtimeNanoRuntime::new();
+        runtime.test_agent_home = Some(temp.path().to_path_buf());
         let error = runtime.restore(snapshot).unwrap_err();
 
         assert!(

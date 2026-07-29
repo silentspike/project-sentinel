@@ -17,6 +17,16 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+const APPLY_RECOVERY_JOURNAL: &str = ".runtime-config-apply-recovery.json";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ConfigApplyRecoveryJournal {
+    schema_version: u16,
+    started_tick: u64,
+    old_agents: Vec<AgentConfig>,
+    old_building: BuildingConfig,
+}
+
 /// Ergebnis eines Write-Backs (fuer Logging / `ConfigApplied`-Event).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PersistResult {
@@ -84,6 +94,62 @@ pub fn persist_company_config(
         rooms_written: true,
         backup_dir: Some(backup_dir),
     })
+}
+
+pub fn stage_config_apply_recovery(
+    config_dir: &Path,
+    old_agents: &[AgentConfig],
+    old_building: &BuildingConfig,
+    started_tick: u64,
+) -> Result<()> {
+    std::fs::create_dir_all(config_dir)
+        .with_context(|| format!("create config dir {}", config_dir.display()))?;
+    let journal = ConfigApplyRecoveryJournal {
+        schema_version: 1,
+        started_tick,
+        old_agents: old_agents.to_vec(),
+        old_building: old_building.clone(),
+    };
+    let bytes = serde_json::to_vec(&journal).context("serialize config apply recovery journal")?;
+    atomic_write(&config_dir.join(APPLY_RECOVERY_JOURNAL), &bytes)?;
+    sync_dir(config_dir)?;
+    Ok(())
+}
+
+pub fn recover_incomplete_config_apply(config_dir: &Path) -> Result<bool> {
+    let journal_path = config_dir.join(APPLY_RECOVERY_JOURNAL);
+    if !journal_path.exists() {
+        return Ok(false);
+    }
+    let journal: ConfigApplyRecoveryJournal = serde_json::from_slice(
+        &std::fs::read(&journal_path)
+            .with_context(|| format!("read recovery journal {}", journal_path.display()))?,
+    )
+    .context("decode config apply recovery journal")?;
+    anyhow::ensure!(
+        journal.schema_version == 1,
+        "unsupported config apply recovery journal schema {}",
+        journal.schema_version
+    );
+    persist_company_config(
+        config_dir,
+        &journal.old_agents,
+        &journal.old_building,
+        &format!("{}-startup-recovery", journal.started_tick),
+    )
+    .context("restore authoritative config from recovery journal")?;
+    clear_config_apply_recovery(config_dir)?;
+    Ok(true)
+}
+
+pub fn clear_config_apply_recovery(config_dir: &Path) -> Result<()> {
+    let journal_path = config_dir.join(APPLY_RECOVERY_JOURNAL);
+    match std::fs::remove_file(&journal_path) {
+        Ok(()) => sync_dir(config_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("remove recovery journal {}", journal_path.display())),
+    }
 }
 
 /// Dateiname fuer einen neuen Agent: `AGENT-<id:02>-<SLUG>.toml` (Loader matcht auf `AGENT-` Prefix).
@@ -159,7 +225,15 @@ fn atomic_write(target: &Path, bytes: &[u8]) -> Result<()> {
     }
     std::fs::rename(&tmp, target)
         .with_context(|| format!("rename {} -> {}", tmp.display(), target.display()))?;
+    sync_dir(dir)?;
     Ok(())
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    std::fs::File::open(dir)
+        .with_context(|| format!("open directory {} for fsync", dir.display()))?
+        .sync_all()
+        .with_context(|| format!("fsync directory {}", dir.display()))
 }
 
 #[cfg(test)]
@@ -296,5 +370,29 @@ mod tests {
         let reloaded = load_all_agents(&cfg.join("agents")).unwrap();
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded[0].identity.id, 7);
+    }
+
+    #[test]
+    fn startup_recovery_restores_old_config_after_partial_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path();
+        let old_agents = vec![agent(1, "Anna", "Dev"), agent(2, "Bob", "PM")];
+        let old_building = building();
+        persist_company_config(cfg, &old_agents, &old_building, "initial").unwrap();
+        stage_config_apply_recovery(cfg, &old_agents, &old_building, 77).unwrap();
+
+        let mut staged_building = old_building.clone();
+        staged_building.building.name = "Partially Published".to_string();
+        persist_company_config(cfg, &[agent(3, "Cara", "QA")], &staged_building, "partial")
+            .unwrap();
+
+        assert!(recover_incomplete_config_apply(cfg).unwrap());
+        assert_eq!(load_all_agents(&cfg.join("agents")).unwrap(), old_agents);
+        assert_eq!(
+            BuildingConfig::load(&cfg.join("rooms.toml")).unwrap(),
+            old_building
+        );
+        assert!(!cfg.join(APPLY_RECOVERY_JOURNAL).exists());
+        assert!(!recover_incomplete_config_apply(cfg).unwrap());
     }
 }

@@ -15,7 +15,8 @@ pub mod outbox_publisher;
 
 pub use event_store::{
     EventStore, LlmCompletionEntry, MonotonicityError, OutboxEntry, OutboxTransport,
-    RuntimeConfigRecoveryMarker, RuntimeConfigRecoveryPhase, SnapshotRow, IMMUTABLE_SNAPSHOT_MS,
+    RuntimeConfigApplyRecoveryMarker, RuntimeConfigRecoveryMarker, RuntimeConfigRecoveryPhase,
+    SnapshotRow, IMMUTABLE_SNAPSHOT_MS,
 };
 pub use outbox_publisher::{OutboxPublisher, OutboxPublisherConfig, PublishCycleStats};
 

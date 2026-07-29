@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sentinel_common::nano_runtime::{
     NanoRuntimeRegistry, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK, RUNTIME_ECS_NATIVE,
@@ -161,4 +161,82 @@ fn ast_inventory_finds_no_raw_adapter_owner_outside_lifecycle_boundary() {
         violations.is_empty(),
         "raw adapter ownership escaped orchestrator/runtime_lifecycle.rs: {violations:?}"
     );
+}
+
+struct LifecycleCallVisitor {
+    calls: BTreeSet<String>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for LifecycleCallVisitor {
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = node.func.as_ref() {
+            if let Some(segment) = path.path.segments.last() {
+                self.calls.insert(segment.ident.to_string());
+            }
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        self.calls.insert(format!(".{}", node.method));
+        syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+fn function_calls(source: &syn::File, name: &str) -> BTreeSet<String> {
+    let function = source
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == name => Some(function),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("productive lifecycle function '{name}' is missing"));
+    let mut visitor = LifecycleCallVisitor {
+        calls: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_block(&mut visitor, &function.block);
+    visitor.calls
+}
+
+#[test]
+fn productive_lifecycle_classes_reach_the_typed_owner_boundary() {
+    let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/orchestrator.rs");
+    let source = syn::parse_file(&std::fs::read_to_string(source_path).unwrap()).unwrap();
+    let required = [
+        ("spawn_agent_nano_runtime", ".spawn"),
+        ("restore_agent_nano_runtime", ".restore"),
+        ("stop_agent_runtime_layer", ".stop"),
+        ("apply_agent_runtime_control", ".control"),
+        ("reapply_persisted_runtime_suspension", ".control"),
+        ("run_runtime_reconcile", "remove_agent_runtime_fragments"),
+        (
+            "teardown_world_restore_precommit",
+            "teardown_runtime_for_world_restore",
+        ),
+        (
+            "compensate_world_restore_runtime_teardown",
+            "restore_agent_runtime_stack",
+        ),
+        (
+            "apply_runtime_changing_agent_update",
+            "stop_agent_runtime_layer",
+        ),
+        (
+            "compensate_config_apply_transaction",
+            "restore_agent_runtime_stack",
+        ),
+        ("teardown_agent_full", "stop_agent_runtime_layer"),
+        (
+            "stop_all_nano_runtimes_with_retries",
+            "stop_agent_runtime_layer",
+        ),
+    ];
+    for (function, required_call) in required {
+        let calls = function_calls(&source, function);
+        assert!(
+            calls.contains(required_call),
+            "{function} must route through {required_call}; observed {calls:?}"
+        );
+    }
 }

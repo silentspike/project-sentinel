@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 
-use crate::{EcsSnapshot, FsMetadataDump, RedbDump, SnapshotTier, WorldSnapshot};
+use crate::nano_runtime::{NanoSnapshot, NanoSnapshotSemantics};
+use crate::{AgentId, EcsSnapshot, FsMetadataDump, RedbDump, SnapshotTier, WorldSnapshot};
 
 /// Bincode 2 in legacy mode keeps wire compatibility with the historic
 /// `bincode::serialize` / `deserialize` snapshots from bincode 1.x.
@@ -10,7 +11,8 @@ fn legacy_config() -> impl bincode::config::Config {
 }
 
 pub fn encode_world_snapshot(snapshot: &WorldSnapshot) -> anyhow::Result<Vec<u8>> {
-    bincode::serde::encode_to_vec(snapshot, legacy_config()).context("World Snapshot serialisieren")
+    let wire = WorldSnapshotV4::try_from(snapshot)?;
+    bincode::serde::encode_to_vec(wire, legacy_config()).context("World Snapshot serialisieren")
 }
 
 /// Heap-free cursor subset of a world snapshot.
@@ -147,6 +149,104 @@ struct WorldSnapshotV3 {
     fs_metadata: Option<FsMetadataDump>,
 }
 
+/// Schema-v4 wire form. `serde_json::Value` cannot be decoded reliably through
+/// bincode because it requires `deserialize_any`; encode each adapter-owned
+/// payload as explicit JSON bytes instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NanoSnapshotV4 {
+    runtime_key: String,
+    workload_id: String,
+    agent_id: Option<AgentId>,
+    semantics: NanoSnapshotSemantics,
+    payload_json: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorldSnapshotV4 {
+    snapshot_id: String,
+    schema_version: u32,
+    tick: u64,
+    sim_hour: f32,
+    timestamp_ms: u64,
+    tier: SnapshotTier,
+    last_event_id: i64,
+    redb: RedbDump,
+    ecs: EcsSnapshot,
+    projection_offsets: Vec<(String, i64)>,
+    fs_metadata: Option<FsMetadataDump>,
+    nano_runtime_snapshots: Vec<NanoSnapshotV4>,
+}
+
+impl TryFrom<&WorldSnapshot> for WorldSnapshotV4 {
+    type Error = anyhow::Error;
+
+    fn try_from(snapshot: &WorldSnapshot) -> Result<Self, Self::Error> {
+        let nano_runtime_snapshots = snapshot
+            .nano_runtime_snapshots
+            .iter()
+            .map(|nano| {
+                Ok(NanoSnapshotV4 {
+                    runtime_key: nano.runtime_key.clone(),
+                    workload_id: nano.workload_id.clone(),
+                    agent_id: nano.agent_id,
+                    semantics: nano.semantics,
+                    payload_json: serde_json::to_vec(&nano.payload)
+                        .context("NanoRuntime Snapshot-Payload serialisieren")?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            schema_version: snapshot.schema_version,
+            tick: snapshot.tick,
+            sim_hour: snapshot.sim_hour,
+            timestamp_ms: snapshot.timestamp_ms,
+            tier: snapshot.tier,
+            last_event_id: snapshot.last_event_id,
+            redb: snapshot.redb.clone(),
+            ecs: snapshot.ecs.clone(),
+            projection_offsets: snapshot.projection_offsets.clone(),
+            fs_metadata: snapshot.fs_metadata.clone(),
+            nano_runtime_snapshots,
+        })
+    }
+}
+
+impl TryFrom<WorldSnapshotV4> for WorldSnapshot {
+    type Error = anyhow::Error;
+
+    fn try_from(snapshot: WorldSnapshotV4) -> Result<Self, Self::Error> {
+        let nano_runtime_snapshots = snapshot
+            .nano_runtime_snapshots
+            .into_iter()
+            .map(|nano| {
+                Ok(NanoSnapshot {
+                    runtime_key: nano.runtime_key,
+                    workload_id: nano.workload_id,
+                    agent_id: nano.agent_id,
+                    semantics: nano.semantics,
+                    payload: serde_json::from_slice(&nano.payload_json)
+                        .context("NanoRuntime Snapshot-Payload deserialisieren")?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self {
+            snapshot_id: snapshot.snapshot_id,
+            schema_version: snapshot.schema_version,
+            tick: snapshot.tick,
+            sim_hour: snapshot.sim_hour,
+            timestamp_ms: snapshot.timestamp_ms,
+            tier: snapshot.tier,
+            last_event_id: snapshot.last_event_id,
+            redb: snapshot.redb,
+            ecs: snapshot.ecs,
+            projection_offsets: snapshot.projection_offsets,
+            fs_metadata: snapshot.fs_metadata,
+            nano_runtime_snapshots,
+        })
+    }
+}
+
 impl From<WorldSnapshotV3> for WorldSnapshot {
     fn from(snapshot: WorldSnapshotV3) -> Self {
         Self {
@@ -225,10 +325,10 @@ pub fn decode_world_snapshot(bytes: &[u8]) -> anyhow::Result<WorldSnapshot> {
     // incorrectly decoded as v4 through accidental bincode alignment. `schema_version` is
     // in the same position in every version, directly after the leading snapshot id.
     if let Ok((snapshot, consumed)) =
-        bincode::serde::decode_from_slice::<WorldSnapshot, _>(bytes, legacy_config())
+        bincode::serde::decode_from_slice::<WorldSnapshotV4, _>(bytes, legacy_config())
     {
         if consumed == bytes.len() && snapshot.schema_version == WorldSnapshot::SCHEMA_VERSION {
-            return Ok(snapshot);
+            return WorldSnapshot::try_from(snapshot);
         }
     }
 
@@ -442,13 +542,26 @@ mod tests {
 
     #[test]
     fn roundtrip_preserves_v4_fields() {
-        let snapshot = base_snapshot();
+        let mut snapshot = base_snapshot();
+        snapshot.nano_runtime_snapshots.push(NanoSnapshot {
+            runtime_key: crate::nano_runtime::RUNTIME_ECS_NATIVE.to_string(),
+            workload_id: "AGENT-03".to_string(),
+            agent_id: Some(AgentId(3)),
+            semantics: NanoSnapshotSemantics::EcsWorld,
+            payload: serde_json::json!({
+                "nested": {"healthy": true},
+                "sequence": [1, 2, 3]
+            }),
+        });
         let bytes = encode_world_snapshot(&snapshot).unwrap();
         let decoded = decode_world_snapshot(&bytes).unwrap();
         assert_eq!(decoded.schema_version, WorldSnapshot::SCHEMA_VERSION);
         assert_eq!(decoded.ecs.autonomy_cooldowns, vec![(3, 100), (7, 250)]);
         assert_eq!(decoded.ecs.smells_json, b"{\"smells\":{}}".to_vec());
-        assert!(decoded.nano_runtime_snapshots.is_empty());
+        assert_eq!(
+            decoded.nano_runtime_snapshots,
+            snapshot.nano_runtime_snapshots
+        );
     }
 
     #[test]

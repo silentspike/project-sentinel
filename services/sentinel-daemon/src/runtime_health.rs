@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use sentinel_common::agent_config::AgentConfig;
 use sentinel_common::nano_runtime::{
-    RUNTIME_BWRAP_LANDLOCK, RUNTIME_ECS_NATIVE, RUNTIME_MICROVM, RUNTIME_WASM_WASMTIME,
+    NanoHandle, NanoHealth, NanoHealthState, NanoRuntimeResources, RUNTIME_BWRAP_LANDLOCK,
+    RUNTIME_ECS_NATIVE, RUNTIME_WASM_WASMTIME,
 };
 use sentinel_common::{AgentId, LocalResidency, OwnerRegistry, StateTransferScope};
 use sentinel_projection::ReadModelStore;
@@ -46,7 +47,23 @@ pub struct RuntimeHealthAgentSnapshot {
     pub cgroup_live_pid_count: usize,
     pub security_runtime_present: bool,
     #[serde(default)]
+    pub adapter_handle_present: bool,
+    #[serde(default)]
+    pub adapter_instance_matches: bool,
+    #[serde(default)]
+    pub adapter_health_state: Option<NanoHealthState>,
+    #[serde(default)]
+    pub adapter_observation_error: Option<String>,
+    #[serde(default)]
     pub last_repair_status: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AdapterRuntimeObservation {
+    pub handle: NanoHandle,
+    pub health: Option<NanoHealth>,
+    pub resources: Option<NanoRuntimeResources>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,7 +108,7 @@ pub struct RuntimeHealthSnapshot {
 
 pub type SharedRuntimeHealthState = Arc<RwLock<RuntimeHealthSnapshot>>;
 
-pub fn build_runtime_health_snapshot(
+pub(crate) fn build_runtime_health_snapshot(
     all_agents: &[AgentConfig],
     current_shift: u8,
     runtime_orch: &RuntimeOrchestrator,
@@ -102,6 +119,7 @@ pub fn build_runtime_health_snapshot(
     operator_auth_required: bool,
     service_health_state: ServiceHealthWorkerSnapshot,
     previous: Option<&RuntimeHealthSnapshot>,
+    adapter_observations: &HashMap<AgentId, AdapterRuntimeObservation>,
 ) -> RuntimeHealthSnapshot {
     build_runtime_health_snapshot_with_registry(
         all_agents,
@@ -115,6 +133,7 @@ pub fn build_runtime_health_snapshot(
         service_health_state,
         previous,
         OwnerRegistry::global(),
+        adapter_observations,
     )
 }
 
@@ -131,6 +150,7 @@ fn build_runtime_health_snapshot_with_registry(
     service_health_state: ServiceHealthWorkerSnapshot,
     previous: Option<&RuntimeHealthSnapshot>,
     owner_registry: &OwnerRegistry,
+    adapter_observations: &HashMap<AgentId, AdapterRuntimeObservation>,
 ) -> RuntimeHealthSnapshot {
     let snapshot_started = Instant::now();
     let configured_ids = all_agents
@@ -217,6 +237,14 @@ fn build_runtime_health_snapshot_with_registry(
             .entry(*agent_id)
             .or_insert_with(|| (format!("AGENT-{agent_id:02}"), view.name.clone()));
     }
+    for (agent_id, observation) in adapter_observations {
+        agent_catalog.entry(agent_id.0).or_insert_with(|| {
+            (
+                format!("AGENT-{:02}", agent_id.0),
+                observation.handle.workload_id.clone(),
+            )
+        });
+    }
 
     let mut stale_runtime_entries = 0usize;
     let mut zombie_tracked_pids = 0usize;
@@ -228,6 +256,8 @@ fn build_runtime_health_snapshot_with_registry(
         let runtime_present = runtime_orch.agents().contains_key(&AgentId(agent_id));
         let security_snapshot = security_state.get(&agent_id);
         let security_runtime_present = security_snapshot.is_some();
+        let adapter_observation = adapter_observations.get(&AgentId(agent_id));
+        let adapter_handle_present = adapter_observation.is_some();
         let runtime_key = security_snapshot
             .map(|snapshot| snapshot.runtime_key.as_str())
             .filter(|key| !key.is_empty())
@@ -263,22 +293,42 @@ fn build_runtime_health_snapshot_with_registry(
         if projection_drift {
             projection_drift_agents += 1;
         }
-        let runtime_resources_healthy = match runtime_key.as_str() {
+        let legacy_resources_healthy = match runtime_key.as_str() {
             RUNTIME_BWRAP_LANDLOCK => tracked_pid_alive && cgroup_live_pid_count > 0,
-            RUNTIME_MICROVM => tracked_pid_alive,
             RUNTIME_ECS_NATIVE | RUNTIME_WASM_WASMTIME => {
                 tracked_pid.is_none() && cgroup_live_pid_count == 0
             }
             _ => false,
         };
+        let adapter_instance_matches = adapter_observation.is_some_and(|observation| {
+            observation.error.is_none()
+                && observation.handle.agent_id == Some(AgentId(agent_id))
+                && observation.handle.runtime_key == runtime_key
+                && observation.handle.workload_id == aggregate_id
+                && security_snapshot.and_then(|snapshot| snapshot.instance_id)
+                    == Some(observation.handle.instance_id)
+                && observation
+                    .resources
+                    .as_ref()
+                    .and_then(|resources| resources.instance_id)
+                    == Some(observation.handle.instance_id)
+        });
+        let adapter_health_state = adapter_observation
+            .and_then(|observation| observation.health.as_ref().map(|h| h.state));
+        let adapter_health_healthy = matches!(adapter_health_state, Some(NanoHealthState::Healthy));
+        let adapter_observation_error =
+            adapter_observation.and_then(|observation| observation.error.clone());
         let healthy = runtime_present
             && projection_present
             && security_runtime_present
-            && runtime_resources_healthy;
+            && legacy_resources_healthy
+            && adapter_instance_matches
+            && adapter_health_healthy;
         let unexpected_extra = !expected_active
             && (runtime_present
                 || projection_present
                 || security_runtime_present
+                || adapter_handle_present
                 || tracked_pid_alive
                 || cgroup_live_pid_count > 0);
         let stale = if expected_active {
@@ -289,13 +339,20 @@ fn build_runtime_health_snapshot_with_registry(
         if stale {
             stale_runtime_entries += 1;
         }
-        let last_repair_status = Some(if healthy {
-            "healthy".to_string()
-        } else if expected_active {
-            "stale".to_string()
-        } else {
-            "unexpected_runtime".to_string()
-        });
+        let last_repair_status = Some(
+            if healthy {
+                "healthy"
+            } else if expected_active
+                && matches!(adapter_health_state, Some(NanoHealthState::Degraded))
+            {
+                "degraded"
+            } else if expected_active {
+                "stale"
+            } else {
+                "unexpected_runtime"
+            }
+            .to_string(),
+        );
         agents.push(RuntimeHealthAgentSnapshot {
             agent_id,
             aggregate_id,
@@ -308,6 +365,10 @@ fn build_runtime_health_snapshot_with_registry(
             tracked_pid_state,
             cgroup_live_pid_count,
             security_runtime_present,
+            adapter_handle_present,
+            adapter_instance_matches,
+            adapter_health_state,
+            adapter_observation_error,
             last_repair_status,
         });
     }
@@ -423,7 +484,7 @@ fn build_runtime_health_snapshot_with_registry(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn publish_runtime_health_snapshot(
+pub(crate) fn publish_runtime_health_snapshot(
     runtime_health: &SharedRuntimeHealthState,
     all_agents: &[AgentConfig],
     current_shift: u8,
@@ -435,6 +496,7 @@ pub fn publish_runtime_health_snapshot(
     operator_auth_required: bool,
     service_health_state: ServiceHealthWorkerSnapshot,
     analysis_queue_stats: crate::platform_controlplane::AnalysisQueueStats,
+    adapter_observations: &HashMap<AgentId, AdapterRuntimeObservation>,
 ) {
     let previous = runtime_health.read().ok().map(|snapshot| snapshot.clone());
     let mut snapshot = build_runtime_health_snapshot(
@@ -448,6 +510,7 @@ pub fn publish_runtime_health_snapshot(
         operator_auth_required,
         service_health_state,
         previous.as_ref(),
+        adapter_observations,
     );
     snapshot.analysis_queue_depth = analysis_queue_stats.depth;
     snapshot.analysis_queue_dropped_total = analysis_queue_stats.dropped_total;
@@ -618,6 +681,7 @@ mod tests {
             ServiceHealthWorkerSnapshot::default(),
             None,
             &registry,
+            &HashMap::new(),
         );
 
         assert_eq!(snapshot.expected_active_agents, 0);
@@ -660,6 +724,7 @@ mod tests {
             false,
             ServiceHealthWorkerSnapshot::default(),
             None,
+            &HashMap::new(),
         );
 
         assert_eq!(snapshot.expected_active_agents, 1);
@@ -710,6 +775,7 @@ mod tests {
                 "empfang",
             )
             .unwrap();
+        let instance_id = uuid::Uuid::new_v4();
         let security = Arc::new(RwLock::new(HashMap::from([(
             7,
             crate::operator_api::SecurityAgentRuntimeSnapshot {
@@ -717,7 +783,7 @@ mod tests {
                 aggregate_id: "AGENT-07".to_string(),
                 agent_name: "Runtime Agent".to_string(),
                 runtime_key: runtime_key.to_string(),
-                instance_id: Some(uuid::Uuid::new_v4()),
+                instance_id: Some(instance_id),
                 runtime_pid,
                 bwrap_pid: None,
                 home_host_path: "/ram/agents/Runtime Agent".to_string(),
@@ -725,7 +791,97 @@ mod tests {
             },
         )])));
 
+        let observations = HashMap::from([(
+            AgentId(7),
+            AdapterRuntimeObservation {
+                handle: NanoHandle {
+                    instance_id,
+                    runtime_key: runtime_key.to_string(),
+                    workload_id: "AGENT-07".to_string(),
+                    agent_id: Some(AgentId(7)),
+                    pid: runtime_pid,
+                },
+                health: Some(NanoHealth {
+                    runtime_key: runtime_key.to_string(),
+                    workload_id: "AGENT-07".to_string(),
+                    state: NanoHealthState::Healthy,
+                    detail: String::new(),
+                }),
+                resources: Some(NanoRuntimeResources {
+                    instance_id: Some(instance_id),
+                    pid: runtime_pid,
+                    ..NanoRuntimeResources::default()
+                }),
+                error: None,
+            },
+        )]);
         let snapshot = build_runtime_health_snapshot(
+            std::slice::from_ref(&agent),
+            1,
+            &runtime,
+            &HashMap::new(),
+            &HashMap::new(),
+            &security,
+            &projection_path,
+            false,
+            ServiceHealthWorkerSnapshot::default(),
+            None,
+            &observations,
+        );
+        assert_eq!(snapshot.stale_runtime_entries, 0, "{runtime_key}");
+        assert!(!snapshot.projection_drift_detected, "{runtime_key}");
+        assert_eq!(
+            snapshot.agents[0].last_repair_status.as_deref(),
+            Some("healthy")
+        );
+
+        let missing = build_runtime_health_snapshot(
+            std::slice::from_ref(&agent),
+            1,
+            &runtime,
+            &HashMap::new(),
+            &HashMap::new(),
+            &security,
+            &projection_path,
+            false,
+            ServiceHealthWorkerSnapshot::default(),
+            None,
+            &HashMap::new(),
+        );
+        assert_eq!(missing.stale_runtime_entries, 1, "{runtime_key}");
+
+        let mut wrong_instance = observations.clone();
+        wrong_instance
+            .get_mut(&AgentId(7))
+            .unwrap()
+            .resources
+            .as_mut()
+            .unwrap()
+            .instance_id = Some(uuid::Uuid::new_v4());
+        let mismatched = build_runtime_health_snapshot(
+            std::slice::from_ref(&agent),
+            1,
+            &runtime,
+            &HashMap::new(),
+            &HashMap::new(),
+            &security,
+            &projection_path,
+            false,
+            ServiceHealthWorkerSnapshot::default(),
+            None,
+            &wrong_instance,
+        );
+        assert_eq!(mismatched.stale_runtime_entries, 1, "{runtime_key}");
+
+        let mut stopped_observations = observations.clone();
+        stopped_observations
+            .get_mut(&AgentId(7))
+            .unwrap()
+            .health
+            .as_mut()
+            .unwrap()
+            .state = NanoHealthState::Stopped;
+        let stopped = build_runtime_health_snapshot(
             &[agent],
             1,
             &runtime,
@@ -736,24 +892,15 @@ mod tests {
             false,
             ServiceHealthWorkerSnapshot::default(),
             None,
+            &stopped_observations,
         );
-        assert_eq!(snapshot.stale_runtime_entries, 0, "{runtime_key}");
-        assert!(!snapshot.projection_drift_detected, "{runtime_key}");
-        assert_eq!(
-            snapshot.agents[0].last_repair_status.as_deref(),
-            Some("healthy")
-        );
+        assert_eq!(stopped.stale_runtime_entries, 1, "{runtime_key}");
     }
 
     #[test]
     fn pidless_ecs_and_wasm_runtimes_do_not_enter_repair_loops() {
         healthy_non_bwrap_runtime(RUNTIME_ECS_NATIVE, None);
         healthy_non_bwrap_runtime(RUNTIME_WASM_WASMTIME, None);
-    }
-
-    #[test]
-    fn microvm_runtime_does_not_require_a_bwrap_cgroup() {
-        healthy_non_bwrap_runtime(RUNTIME_MICROVM, Some(std::process::id()));
     }
 
     #[test]
@@ -782,6 +929,7 @@ mod tests {
             false,
             ServiceHealthWorkerSnapshot::default(),
             None,
+            &HashMap::new(),
         );
 
         assert_eq!(snapshot.expected_active_agents, 0);
@@ -830,6 +978,7 @@ mod tests {
                 thread_name: "service-health-checker".to_string(),
             },
             Some(&previous),
+            &HashMap::new(),
         );
 
         let worker = snapshot
@@ -866,6 +1015,7 @@ mod tests {
             false,
             ServiceHealthWorkerSnapshot::default(),
             Some(&previous),
+            &HashMap::new(),
         );
 
         assert_eq!(snapshot.reconcile_runs_total, 9);
