@@ -327,8 +327,35 @@ impl DaemonNanoRuntimeRegistry {
         self.recovery_blocked_agents.insert(agent_id);
     }
 
+    fn unblock_after_verified_recovery(&mut self, agent_id: AgentId) {
+        self.recovery_blocked_agents.remove(&agent_id);
+    }
+
     fn is_recovery_blocked(&self, agent_id: AgentId) -> bool {
         self.recovery_blocked_agents.contains(&agent_id)
+    }
+
+    fn validate_handle_for_config(
+        &self,
+        config: &AgentConfig,
+        agent_command: &[String],
+    ) -> Result<()> {
+        let agent_id = AgentId(config.identity.id);
+        let handle = self
+            .handle(agent_id)
+            .ok_or_else(|| anyhow!("NanoRuntime handle missing for {agent_id}"))?;
+        let workload = Self::workload(config, agent_command);
+        anyhow::ensure!(
+            handle.workload_id == workload.workload_id
+                && handle.agent_id == Some(agent_id)
+                && handle.runtime_key
+                    == workload
+                        .runtime_key
+                        .as_deref()
+                        .unwrap_or(RUNTIME_BWRAP_LANDLOCK),
+            "NanoRuntime handle does not match recovered workload for {agent_id}"
+        );
+        Ok(())
     }
 
     fn reconcile_abandoned_config(
@@ -1411,14 +1438,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("data_dir erstellen: {}", data_dir.display()))?;
 
-    if crate::config_persist::recover_incomplete_config_apply(&config.config_dir)
-        .context("startup blocked by unresolved config file publication")?
-    {
-        info!("Incomplete config publication rolled back before roster load");
-    }
     let agents_dir = config.config_dir.join("agents");
     let agent_validation = config.agent_config_validation()?;
-    let all_agents = load_all_agents_with_validation(&agents_dir, agent_validation)
+    let mut all_agents = load_all_agents_with_validation(&agents_dir, agent_validation)
         .with_context(|| format!("Agents laden aus: {}", agents_dir.display()))?;
     #[cfg(feature = "llm")]
     crate::llm_bridge::bridge::replace_agent_routing(&all_agents);
@@ -1850,13 +1872,25 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // A config transition marker is written before the first runtime stop. It
     // must be reconciled before any API, readiness surface, ECS entity, or
     // NanoRuntime spawn can become serving after a process restart.
-    let recovered_config_apply = reconcile_runtime_config_apply_recovery_marker(
+    let startup_config_apply = reconcile_runtime_config_apply_recovery_marker(
         event_store.as_ref(),
+        &state_store,
+        fs_layer.as_deref(),
+        data_dir,
+        &data_dir.join("projection.db").to_string_lossy(),
+        &config.config_dir,
         config.max_agents,
         active_fs_mount.as_deref(),
         &config.agent_command,
+        agent_validation,
     )
     .context("startup blocked by unresolved config apply recovery")?;
+    if startup_config_apply.is_some() {
+        all_agents = load_all_agents_with_validation(&agents_dir, agent_validation)
+            .context("reload authoritative roster after config apply recovery")?;
+        runtime_orch = RuntimeOrchestrator::new(config.max_agents)
+            .with_event_store(Arc::clone(&event_store));
+    }
     let recovered_runtime_configs = reconcile_runtime_config_recovery_markers(
         event_store.as_ref(),
         config.max_agents,
@@ -1870,8 +1904,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             "Durable runtime config recovery reconciled before serving"
         );
     }
-    if recovered_config_apply {
-        info!("Durable config apply recovery reconciled before serving");
+    if let Some(marker) = startup_config_apply.as_ref() {
+        info!(
+            op_id = %marker.op_id,
+            decision = ?marker.decision,
+            "Durable config apply recovery prepared; runtime validation remains fenced"
+        );
     }
 
     // -- Controlplane-Kernel laden --
@@ -2282,6 +2320,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 runtime_rx,
                 perception_tx,
                 all_agents_clone,
+                startup_config_apply,
                 current_shift,
                 tick_rate,
                 time_scale,
@@ -3062,18 +3101,11 @@ fn should_request_projection_rebuild(
 }
 
 fn runtime_agent_is_healthy(agent: &runtime_health::RuntimeHealthAgentSnapshot) -> bool {
-    agent.runtime_present
-        && agent.projection_present
-        && agent.security_runtime_present
-        && agent.adapter_handle_present
-        && agent.adapter_instance_matches
-        && matches!(
-            agent.adapter_health_state,
-            Some(
-                sentinel_common::nano_runtime::NanoHealthState::Healthy
-                    | sentinel_common::nano_runtime::NanoHealthState::Degraded
-            )
-        )
+    matches!(
+        runtime_health::classify_runtime_agent(agent),
+        runtime_health::RuntimeAgentHealthClass::Healthy
+            | runtime_health::RuntimeAgentHealthClass::Suspended
+    )
 }
 
 fn emit_runtime_repair_blocked_event(
@@ -3681,16 +3713,7 @@ fn run_runtime_reconcile(
                     }
                 }
             }
-            let runtime_core_healthy = snapshot.runtime_present
-                && snapshot.adapter_handle_present
-                && snapshot.adapter_instance_matches
-                && matches!(
-                    snapshot.adapter_health_state,
-                    Some(
-                        sentinel_common::nano_runtime::NanoHealthState::Healthy
-                            | sentinel_common::nano_runtime::NanoHealthState::Degraded
-                    )
-                );
+            let runtime_core_healthy = runtime_health::runtime_core_is_healthy(snapshot);
             if runtime_agent_is_healthy(snapshot) {
                 respawn_backoff.record_success(agent_id);
                 continue;
@@ -5604,16 +5627,73 @@ fn reconcile_runtime_config_recovery_markers(
 
 fn reconcile_runtime_config_apply_recovery_marker(
     event_store: &EventStore,
+    state_store: &Arc<StateStore>,
+    fs_layer: Option<&sentinel_fs::layer::LayerManager>,
+    data_dir: &std::path::Path,
+    projection_db_path: &str,
+    config_dir: &std::path::Path,
     max_agents: usize,
     fs_mount: Option<&str>,
     agent_command: &[String],
-) -> Result<bool> {
+    agent_validation: sentinel_common::agent_config::AgentConfigValidation,
+) -> Result<Option<sentinel_limbo::RuntimeConfigApplyRecoveryMarker>> {
     let Some(marker) = event_store.runtime_config_apply_recovery()? else {
-        return Ok(false);
+        if let Some(orphan) = crate::config_persist::load_config_apply_recovery(config_dir)? {
+            anyhow::ensure!(
+                orphan.participant_phase
+                    == crate::config_persist::ConfigApplyParticipantPhase::Prepared,
+                "config apply file participant has no canonical decision authority"
+            );
+            crate::config_persist::clear_config_apply_recovery(config_dir)
+                .context("clear orphan prepared config apply participant")?;
+        }
+        return Ok(None);
     };
+    let old_digest = config_apply_digest(&marker.old_agents, &marker.old_building)?;
+    let staged_digest = config_apply_digest(&marker.staged_agents, &marker.staged_building)?;
+    anyhow::ensure!(
+        marker.schema_version == 2
+            && marker.old_digest == old_digest
+            && marker.staged_digest == staged_digest,
+        "config apply recovery payload digest conflict"
+    );
+
+    match crate::config_persist::load_config_apply_recovery(config_dir)? {
+        Some(participant) => {
+            anyhow::ensure!(
+                participant.op_id == marker.op_id
+                    && participant.old_digest == marker.old_digest
+                    && participant.staged_digest == marker.staged_digest,
+                "config apply filesystem participant conflicts with canonical saga"
+            );
+        }
+        None => crate::config_persist::stage_config_apply_recovery(
+            config_dir,
+            &marker.op_id,
+            &marker.old_digest,
+            &marker.staged_digest,
+            &marker.old_agents,
+            &marker.staged_agents,
+            &marker.old_building,
+            &marker.staged_building,
+            marker.started_tick,
+        )
+        .context("rematerialize config apply filesystem participant")?,
+    }
+
+    if marker.phase == sentinel_limbo::RuntimeConfigApplyPhase::Finalized {
+        crate::config_persist::publish_config_apply_participant(
+            config_dir,
+            &marker.op_id,
+            marker.decision == sentinel_limbo::RuntimeConfigApplyDecision::Forward,
+        )?;
+        crate::config_persist::clear_config_apply_recovery(config_dir)?;
+        return Ok(None);
+    }
+
     let mut runtimes = DaemonNanoRuntimeRegistry::production(max_agents.max(1), fs_mount)?;
-    let mut workloads = marker.old_agents;
-    workloads.extend(marker.staged_agents);
+    let mut workloads = marker.old_agents.clone();
+    workloads.extend(marker.staged_agents.clone());
     workloads.sort_by_key(|config| config.identity.id);
     workloads.dedup_by(|left, right| {
         !DaemonNanoRuntimeRegistry::workload_affecting_change(left, right, agent_command)
@@ -5621,10 +5701,59 @@ fn reconcile_runtime_config_apply_recovery_marker(
     for config in &workloads {
         runtimes.reconcile_abandoned_config(config, agent_command)?;
     }
+
+    if marker.decision == sentinel_limbo::RuntimeConfigApplyDecision::Rollback {
+        let mut recovery_world = create_simulation_world().0;
+        rollback_world_restore_stores(
+            &marker.pre_snapshot_id,
+            &mut recovery_world,
+            &Arc::new(event_store.clone()),
+            state_store,
+            fs_layer,
+            data_dir,
+            projection_db_path,
+        )
+        .context("restore pre-apply files, ECS/redb, and projection before startup")?;
+    }
+    crate::config_persist::publish_config_apply_participant(
+        config_dir,
+        &marker.op_id,
+        marker.decision == sentinel_limbo::RuntimeConfigApplyDecision::Forward,
+    )?;
+
+    let expected_agents = if marker.decision == sentinel_limbo::RuntimeConfigApplyDecision::Forward
+    {
+        &marker.staged_agents
+    } else {
+        &marker.old_agents
+    };
+    let loaded = load_all_agents_with_validation(
+        &config_dir.join("agents"),
+        agent_validation,
+    )
+    .context("reload canonical config apply participant")?;
+    let expected_building =
+        if marker.decision == sentinel_limbo::RuntimeConfigApplyDecision::Forward {
+            &marker.staged_building
+        } else {
+            &marker.old_building
+        };
+    let loaded_building =
+        sentinel_common::room::BuildingConfig::load(&config_dir.join("rooms.toml"))
+            .context("reload canonical config apply building participant")?;
+    anyhow::ensure!(
+        config_apply_digest(&loaded, &loaded_building)?
+            == config_apply_digest(expected_agents, expected_building)?,
+        "config apply filesystem participant readback mismatch"
+    );
+
     event_store
-        .clear_runtime_config_apply_recovery()
-        .context("clear reconciled config apply recovery")?;
-    Ok(true)
+        .mark_runtime_config_apply_recovery_required(
+            &marker.op_id,
+            "startup recovery prepared; serving remains fenced until runtime validation",
+        )
+        .context("persist startup config apply recovery fence")?;
+    Ok(event_store.runtime_config_apply_recovery()?)
 }
 
 fn validate_runtime_ownership_for_config_apply(
@@ -5640,6 +5769,17 @@ fn validate_runtime_ownership_for_config_apply(
         "Config-Apply requires exact lifecycle ownership parity; logical={logical:?}, adapters={adapters:?}"
     );
     Ok(())
+}
+
+fn config_apply_digest(
+    agents: &[AgentConfig],
+    building: &sentinel_common::room::BuildingConfig,
+) -> Result<String> {
+    let mut sorted_agents = agents.to_vec();
+    sorted_agents.sort_by_key(|config| config.identity.id);
+    let payload = serde_json::to_vec(&(sorted_agents, building))
+        .context("serialize canonical config apply digest payload")?;
+    Ok(format!("{:x}", Sha256::digest(payload)))
 }
 
 fn update_runtime_orchestrator_config(
@@ -5876,6 +6016,7 @@ fn apply_runtime_changing_agent_update(
 
 #[allow(clippy::too_many_arguments)]
 fn compensate_config_apply_transaction(
+    op_id: &str,
     pre_snapshot_id: &str,
     pre_runtime_snapshots: &[sentinel_common::nano_runtime::NanoSnapshot],
     old_agents: &[AgentConfig],
@@ -5892,10 +6033,10 @@ fn compensate_config_apply_transaction(
     state_store: &Arc<StateStore>,
     fs_layer: Option<&sentinel_fs::layer::LayerManager>,
     fs_mount: Option<&str>,
+    agent_command: &[String],
     data_dir: &std::path::Path,
     projection_db_path: &str,
     config_dir: &std::path::Path,
-    tick_count: u64,
 ) -> Result<()> {
     let mut current_ids = nano_runtimes.agent_ids();
     current_ids.extend(runtime_orch.agents().keys().copied());
@@ -5965,16 +6106,34 @@ fn compensate_config_apply_transaction(
     }
 
     sentinel_ecs::rebuild_room_maps(world, old_building);
-    crate::config_persist::persist_company_config(
-        config_dir,
-        old_agents,
-        old_building,
-        &format!("{tick_count}-rollback"),
-    )
-    .context("restore authoritative pre-apply config files")?;
+    crate::config_persist::publish_config_apply_participant(config_dir, op_id, false)
+        .context("restore authoritative pre-apply config files")?;
+
+    for config in old_agents {
+        let agent_id = AgentId(config.identity.id);
+        nano_runtimes
+            .validate_handle_for_config(config, agent_command)
+            .with_context(|| format!("validate compensated runtime for {agent_id}"))?;
+        if event_store
+            .list_runtime_config_recoveries()?
+            .iter()
+            .any(|marker| marker.agent_id == agent_id)
+        {
+            event_store
+                .clear_runtime_config_recovery(agent_id)
+                .with_context(|| {
+                    format!("clear compensated per-agent recovery for {agent_id}")
+                })?;
+        }
+        nano_runtimes.unblock_after_verified_recovery(agent_id);
+    }
+
     event_store
-        .clear_runtime_config_apply_recovery()
-        .context("clear compensated config apply recovery marker")?;
+        .finalize_runtime_config_apply(
+            op_id,
+            sentinel_limbo::RuntimeConfigApplyDecision::Rollback,
+        )
+        .context("finalize compensated config apply decision")?;
     crate::config_persist::clear_config_apply_recovery(config_dir)
         .context("clear compensated config file recovery journal")?;
     Ok(())
@@ -6249,6 +6408,7 @@ fn ecs_tick_loop(
     runtime_rx: mpsc::Receiver<RuntimeControlCommand>,
     perception_tx: mpsc::SyncSender<Perception>,
     mut all_agents: Vec<AgentConfig>,
+    startup_config_apply: Option<sentinel_limbo::RuntimeConfigApplyRecoveryMarker>,
     initial_shift: u8,
     tick_rate: Duration,
     time_scale: f32,
@@ -6539,10 +6699,52 @@ fn ecs_tick_loop(
 
     // Active agents: Orchestrator registers (unless restored), ECS creates the entity,
     // Sandbox Setup (cgroup + home dir) bei jedem Spawn (AC-4).
+    let mut startup_runtime_snapshots = HashMap::new();
+    if let Some(marker) = startup_config_apply.as_ref() {
+        let snapshots = if marker.decision == sentinel_limbo::RuntimeConfigApplyDecision::Forward {
+            &marker.applied_runtime_snapshots
+        } else {
+            &marker.pre_runtime_snapshots
+        };
+        for snapshot in snapshots {
+            let agent_id = snapshot.agent_id.ok_or_else(|| {
+                anyhow!(
+                    "startup config apply recovery snapshot {} has no agent id",
+                    snapshot.workload_id
+                )
+            })?;
+            anyhow::ensure!(
+                startup_runtime_snapshots
+                    .insert(agent_id, snapshot.clone())
+                    .is_none(),
+                "startup config apply recovery has duplicate snapshot for {agent_id}"
+            );
+        }
+    }
     for agent_cfg in &shift_agents {
         let agent_id = AgentId(agent_cfg.identity.id);
 
-        if runtime_orch.get_agent_mut(agent_id).is_none() {
+        if startup_config_apply.is_some() {
+            let snapshot = startup_runtime_snapshots.remove(&agent_id).ok_or_else(|| {
+                anyhow!("startup config apply recovery snapshot missing for {agent_id}")
+            })?;
+            restore_agent_runtime_stack(
+                &mut runtime_orch,
+                agent_cfg,
+                snapshot,
+                &sandbox,
+                &mut sandbox_handles,
+                &mut ebpf_collector,
+                &mut agent_processes,
+                &mut nano_runtimes,
+                &security_runtime_state,
+                event_store_for_isolation.as_ref(),
+                fs_mount.as_deref(),
+            )
+            .with_context(|| {
+                format!("restore startup config apply runtime snapshot for {agent_id}")
+            })?;
+        } else if runtime_orch.get_agent_mut(agent_id).is_none() {
             // Nicht im Orchestrator → neu registrieren (emittiert Lifecycle-Events)
             let identity = AgentIdentity {
                 agent_id,
@@ -6564,18 +6766,20 @@ fn ecs_tick_loop(
             }
         }
 
-        if !spawn_agent_nano_runtime(
-            agent_cfg,
-            &mut nano_runtimes,
-            &sandbox,
-            &mut sandbox_handles,
-            &mut ebpf_collector,
-            &mut agent_processes,
-            &agent_command,
-            &security_runtime_state,
-            fs_mount.as_deref(),
-            Some(event_store_for_isolation.as_ref()),
-        ) {
+        if startup_config_apply.is_none()
+            && !spawn_agent_nano_runtime(
+                agent_cfg,
+                &mut nano_runtimes,
+                &sandbox,
+                &mut sandbox_handles,
+                &mut ebpf_collector,
+                &mut agent_processes,
+                &agent_command,
+                &security_runtime_state,
+                fs_mount.as_deref(),
+                Some(event_store_for_isolation.as_ref()),
+            )
+        {
             if let Err(cleanup_error) = runtime_orch.despawn_agent(agent_id) {
                 error!(
                     agent_id = %agent_id,
@@ -6614,6 +6818,70 @@ fn ecs_tick_loop(
         );
         apply_personality(&mut world, entity, &agent_cfg.personality);
         sentinel_ecs::apply_capabilities(&mut world, entity, &agent_cfg.capabilities);
+    }
+    anyhow::ensure!(
+        startup_runtime_snapshots.is_empty(),
+        "startup config apply recovery has {} snapshots outside the resident runtime set",
+        startup_runtime_snapshots.len()
+    );
+
+    if let Some(marker) = startup_config_apply.as_ref() {
+        let expected_snapshots = if marker.decision
+            == sentinel_limbo::RuntimeConfigApplyDecision::Forward
+        {
+            &marker.applied_runtime_snapshots
+        } else {
+            &marker.pre_runtime_snapshots
+        };
+        let expected_snapshot_ids = expected_snapshots
+            .iter()
+            .filter_map(|snapshot| snapshot.agent_id)
+            .collect::<HashSet<_>>();
+        for agent_cfg in &shift_agents {
+            let agent_id = AgentId(agent_cfg.identity.id);
+            nano_runtimes
+                .validate_handle_for_config(agent_cfg, &agent_command)
+                .with_context(|| {
+                    format!(
+                        "startup config apply recovery runtime validation failed for {agent_id}"
+                    )
+                })?;
+            let (handle, resources) = nano_runtimes.observe(agent_id)?;
+            anyhow::ensure!(
+                resources.instance_id == Some(handle.instance_id),
+                "startup config apply recovery instance mismatch for {agent_id}"
+            );
+            if expected_snapshot_ids.contains(&agent_id) {
+                anyhow::ensure!(
+                    expected_snapshots.iter().any(|snapshot| {
+                        snapshot.agent_id == Some(agent_id)
+                            && snapshot.runtime_key == handle.runtime_key
+                            && snapshot.workload_id == handle.workload_id
+                    }),
+                    "startup config apply recovery snapshot binding mismatch for {agent_id}"
+                );
+            }
+            let last_event_id = event_store.get_latest_event_id().unwrap_or_default();
+            upsert_agent_projection_seed(
+                std::path::Path::new(&projection_db_path),
+                agent_cfg,
+                last_event_id,
+            )
+            .with_context(|| {
+                format!("startup config apply recovery projection validation for {agent_id}")
+            })?;
+            nano_runtimes.unblock_after_verified_recovery(agent_id);
+        }
+        crate::config_persist::clear_config_apply_recovery(&config_dir)
+            .context("finalize startup config apply filesystem participant")?;
+        event_store
+            .finalize_runtime_config_apply(&marker.op_id, marker.decision)
+            .context("finalize startup config apply canonical decision")?;
+        info!(
+            op_id = %marker.op_id,
+            decision = ?marker.decision,
+            "Startup config apply recovery fully validated and finalized"
+        );
     }
 
     // GOLF: Default-Goals fuer alle gespawnten Agents erstellen
@@ -8595,10 +8863,34 @@ fn ecs_tick_loop(
                 }
             };
             info!(snapshot_id = %pre_apply_snapshot, "Pre-Apply Safety-Snapshot erstellt");
+            let op_id = uuid::Uuid::now_v7().to_string();
+            let old_digest = match config_apply_digest(&all_agents, &old_building) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    error!(error = %error, "Config-Apply fail-closed: old config digest failed");
+                    continue;
+                }
+            };
+            let staged_digest =
+                match config_apply_digest(&apply_cmd.agents, &apply_cmd.building) {
+                    Ok(digest) => digest,
+                    Err(error) => {
+                        error!(
+                            error = %error,
+                            "Config-Apply fail-closed: staged config digest failed"
+                        );
+                        continue;
+                    }
+                };
             if let Err(error) = crate::config_persist::stage_config_apply_recovery(
                 &config_dir,
+                &op_id,
+                &old_digest,
+                &staged_digest,
                 &all_agents,
+                &apply_cmd.agents,
                 &old_building,
+                &apply_cmd.building,
                 tick_count,
             ) {
                 error!(
@@ -8608,11 +8900,15 @@ fn ecs_tick_loop(
                 continue;
             }
             if let Err(error) = es.begin_runtime_config_apply_recovery(
+                &op_id,
+                &old_digest,
+                &staged_digest,
                 &all_agents,
                 &apply_cmd.agents,
                 &old_building,
                 &apply_cmd.building,
                 &pre_apply_snapshot,
+                &pre_runtime_snapshots,
                 tick_count,
             ) {
                 error!(
@@ -8647,7 +8943,9 @@ fn ecs_tick_loop(
                             &security_runtime_state,
                         ) {
                             Ok(_) => {
-                                if let Err(error) = es.record_runtime_config_apply_stop(agent_id) {
+                                if let Err(error) =
+                                    es.record_runtime_config_apply_stop(&op_id, agent_id)
+                                {
                                     lifecycle_errors.push(format!(
                                         "{agent_id}: durable stop journal failed: {error:#}"
                                     ));
@@ -8678,7 +8976,9 @@ fn ecs_tick_loop(
                                 fs_mount.as_deref(),
                             ) {
                                 let agent_id = AgentId(cfg.identity.id);
-                                if let Err(error) = es.record_runtime_config_apply_spawn(agent_id) {
+                                if let Err(error) =
+                                    es.record_runtime_config_apply_spawn(&op_id, agent_id)
+                                {
                                     lifecycle_errors.push(format!(
                                         "{agent_id}: durable spawn journal failed: {error:#}"
                                     ));
@@ -8716,7 +9016,9 @@ fn ecs_tick_loop(
                                 fs_mount.as_deref(),
                             ) {
                                 let agent_id = AgentId(cfg.identity.id);
-                                if let Err(error) = es.record_runtime_config_apply_spawn(agent_id) {
+                                if let Err(error) =
+                                    es.record_runtime_config_apply_spawn(&op_id, agent_id)
+                                {
                                     lifecycle_errors.push(format!(
                                         "{agent_id}: durable spawn journal failed: {error:#}"
                                     ));
@@ -8793,13 +9095,17 @@ fn ecs_tick_loop(
                             lifecycle_errors
                                 .push(format!("{agent_id}: config update failed: {error:#}"));
                         } else if runtime_replaced {
-                            if let Err(error) = es.record_runtime_config_apply_stop(agent_id) {
+                            if let Err(error) =
+                                es.record_runtime_config_apply_stop(&op_id, agent_id)
+                            {
                                 lifecycle_errors.push(format!(
                                     "{agent_id}: durable replacement-stop journal failed: {error:#}"
                                 ));
                                 break;
                             }
-                            if let Err(error) = es.record_runtime_config_apply_spawn(agent_id) {
+                            if let Err(error) =
+                                es.record_runtime_config_apply_spawn(&op_id, agent_id)
+                            {
                                 lifecycle_errors.push(format!(
                                     "{agent_id}: durable replacement-spawn journal failed: {error:#}"
                                 ));
@@ -8839,7 +9145,9 @@ fn ecs_tick_loop(
                             &security_runtime_state,
                         ) {
                             Ok(_) => {
-                                if let Err(error) = es.record_runtime_config_apply_stop(*agent_id) {
+                            if let Err(error) =
+                                es.record_runtime_config_apply_stop(&op_id, *agent_id)
+                            {
                                     lifecycle_errors.push(format!(
                                         "{agent_id}: durable stop journal failed: {error:#}"
                                     ));
@@ -8856,30 +9164,89 @@ fn ecs_tick_loop(
                 }
             }
 
-            // 3. Publish the staged config only after every runtime mutation
-            // succeeded. Any failure compensates from the durable pre-apply
-            // world plus exact runtime snapshots before the transaction marker
-            // may be cleared.
-            let publication = if lifecycle_errors.is_empty() {
-                crate::config_persist::persist_company_config(
-                    &config_dir,
-                    &apply_cmd.agents,
-                    &apply_cmd.building,
-                    &tick_count.to_string(),
-                )
-                .map_err(|error| anyhow!("config persistence failed: {error:#}"))
-            } else {
-                Err(anyhow!(
+            // 3. The SQLite saga is the sole decision authority. Filesystem
+            // publication is an idempotent participant and may be replayed
+            // forward or backward from the canonical phase after a crash.
+            let transition = (|| -> Result<()> {
+                anyhow::ensure!(
+                    lifecycle_errors.is_empty(),
                     "runtime lifecycle failed: {}",
                     lifecycle_errors.join("; ")
-                ))
-            };
-            if let Err(publication_error) = publication {
+                );
+                let applied_runtime_snapshots = nano_runtimes
+                    .snapshot_all()
+                    .context("snapshot applied runtime set before commit decision")?;
+                es.mark_runtime_config_apply_runtimes_applied(
+                    &op_id,
+                    &applied_runtime_snapshots,
+                )
+                .context("persist RUNTIMES_APPLIED phase")?;
+                crate::config_persist::publish_config_apply_participant(
+                    &config_dir,
+                    &op_id,
+                    true,
+                )
+                .context("publish staged config filesystem participant")?;
+
+                let payload = DomainEventPayload::ConfigApplied {
+                    mode: format!("{mode:?}").to_lowercase(),
+                    spawned,
+                    updated,
+                    despawned,
+                    rooms_changed: apply_cmd.building.rooms.len() as u32,
+                    persisted: true,
+                };
+                let event = DomainEvent::new(
+                    payload.event_type_str(),
+                    "company",
+                    &payload.to_json(),
+                    &op_id,
+                    tick_count,
+                )
+                .with_operation_id(&op_id);
+                es.commit_runtime_config_apply(&op_id, &event, "sentinel.events")
+                    .context("atomically commit config decision and event outbox")?;
+                Ok(())
+            })();
+
+            if let Err(transition_error) = transition {
+                let committed_forward = es
+                    .runtime_config_apply_recovery()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|marker| {
+                        marker.op_id == op_id
+                            && marker.decision
+                                == sentinel_limbo::RuntimeConfigApplyDecision::Forward
+                    });
+                if committed_forward {
+                    let marker = es.mark_runtime_config_apply_recovery_required(
+                        &op_id,
+                        &format!(
+                            "forward decision committed but caller observed an error: {transition_error:#}"
+                        ),
+                    );
+                    fence_config_apply_recovery(
+                        &apply_cmd.agents,
+                        &mut world,
+                        &mut runtime_orch,
+                        &mut nano_runtimes,
+                        &projection_db_path,
+                        &mut restore_fence,
+                    );
+                    error!(
+                        error = %transition_error,
+                        marker = ?marker,
+                        "Config-Apply forward decision is durable; startup must finalize"
+                    );
+                    continue;
+                }
                 error!(
-                    error = %publication_error,
+                    error = %transition_error,
                     "Config-Apply failed; compensating the complete transaction"
                 );
                 let compensation = compensate_config_apply_transaction(
+                    &op_id,
                     &pre_apply_snapshot,
                     &pre_runtime_snapshots,
                     &all_agents,
@@ -8896,15 +9263,17 @@ fn ecs_tick_loop(
                     &ss,
                     fs_layer.as_deref(),
                     fs_mount.as_deref(),
+                    &agent_command,
                     data_dir,
                     &projection_db_path,
                     &config_dir,
-                    tick_count,
                 );
                 if let Err(compensation_error) = compensation {
-                    let reason =
-                        format!("apply={publication_error:#}; compensation={compensation_error:#}");
-                    let marker = es.mark_runtime_config_apply_recovery_required(&reason);
+                    let reason = format!(
+                        "apply={transition_error:#}; compensation={compensation_error:#}"
+                    );
+                    let marker =
+                        es.mark_runtime_config_apply_recovery_required(&op_id, &reason);
                     fence_config_apply_recovery(
                         &all_agents,
                         &mut world,
@@ -8923,10 +9292,24 @@ fn ecs_tick_loop(
             }
 
             sentinel_ecs::rebuild_room_maps(&mut world, &apply_cmd.building);
-            if let Err(error) = es.clear_runtime_config_apply_recovery() {
-                let marker = es.mark_runtime_config_apply_recovery_required(&format!(
-                    "committed config could not clear transaction marker: {error:#}"
-                ));
+            all_agents = apply_cmd.agents.clone();
+            #[cfg(feature = "llm")]
+            crate::llm_bridge::bridge::replace_agent_routing(&all_agents);
+
+            let finalization = crate::config_persist::clear_config_apply_recovery(&config_dir)
+                .context("clear finalized config filesystem participant")
+                .and_then(|()| {
+                    es.finalize_runtime_config_apply(
+                        &op_id,
+                        sentinel_limbo::RuntimeConfigApplyDecision::Forward,
+                    )
+                    .context("persist FINALIZED config apply phase")
+                });
+            if let Err(error) = finalization {
+                let marker = es.mark_runtime_config_apply_recovery_required(
+                    &op_id,
+                    &format!("committed config finalization failed: {error:#}"),
+                );
                 fence_config_apply_recovery(
                     &apply_cmd.agents,
                     &mut world,
@@ -8938,58 +9321,11 @@ fn ecs_tick_loop(
                 error!(
                     error = %error,
                     marker = ?marker,
-                    "Config-Apply committed but recovery marker finalization failed"
-                );
-                continue;
-            }
-            if let Err(error) = crate::config_persist::clear_config_apply_recovery(&config_dir) {
-                fence_config_apply_recovery(
-                    &apply_cmd.agents,
-                    &mut world,
-                    &mut runtime_orch,
-                    &mut nano_runtimes,
-                    &projection_db_path,
-                    &mut restore_fence,
-                );
-                error!(
-                    error = %error,
-                    "Config-Apply committed but config recovery journal finalization failed"
+                    "Config-Apply committed but finalization remains recovery-required"
                 );
                 continue;
             }
             let persisted = true;
-            all_agents = apply_cmd.agents.clone();
-            #[cfg(feature = "llm")]
-            crate::llm_bridge::bridge::replace_agent_routing(&all_agents);
-
-            // 5. ConfigApplied-DomainEvent (Audit + durabler Trigger fuer Gateway-DNA-Reload #440).
-            let payload = DomainEventPayload::ConfigApplied {
-                mode: format!("{mode:?}").to_lowercase(),
-                spawned,
-                updated,
-                despawned,
-                rooms_changed: apply_cmd.building.rooms.len() as u32,
-                persisted,
-            };
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let event = DomainEvent::new(
-                payload.event_type_str(),
-                "company",
-                &payload.to_json(),
-                &format!("config-apply-{now_ms}"),
-                tick_count,
-            );
-            if let Some(es) = world
-                .get_resource::<sentinel_ecs::LimboEventStore>()
-                .map(|e| Arc::clone(&e.0))
-            {
-                if let Err(e) = es.append_event(&event) {
-                    warn!(error = %e, "ConfigApplied-Event konnte nicht persistiert werden");
-                }
-            }
 
             // 6. Gateway-DNA-Cache-Invalidierung triggern (#440). Realer Trigger: fire-and-forget
             //    HTTP-POST an den Gateway-Control-Plane in einem detached Thread, damit der Tick-Loop
@@ -9318,8 +9654,10 @@ mod tests {
             security_runtime_present: true,
             adapter_handle_present: true,
             adapter_instance_matches: true,
+            runtime_resources_healthy: true,
             adapter_health_state: Some(sentinel_common::nano_runtime::NanoHealthState::Healthy),
             adapter_observation_error: None,
+            logical_status: Some(sentinel_runtime::AgentStatus::Active),
             last_repair_status: None,
         }
     }
@@ -9339,13 +9677,27 @@ mod tests {
         missing_adapter.adapter_handle_present = false;
         assert!(!runtime_agent_is_healthy(&missing_adapter));
 
-        let mut suspended = reconcile_health_fixture(RUNTIME_ECS_NATIVE, None, false, 0);
-        suspended.adapter_health_state =
-            Some(sentinel_common::nano_runtime::NanoHealthState::Degraded);
-        assert!(
-            runtime_agent_is_healthy(&suspended),
-            "typed degraded/suspended state is observable but must not be replaced"
-        );
+        for runtime_key in [
+            RUNTIME_ECS_NATIVE,
+            RUNTIME_WASM_WASMTIME,
+            RUNTIME_BWRAP_LANDLOCK,
+        ] {
+            let mut suspended = reconcile_health_fixture(runtime_key, None, false, 0);
+            suspended.adapter_health_state =
+                Some(sentinel_common::nano_runtime::NanoHealthState::Degraded);
+            suspended.logical_status = Some(sentinel_runtime::AgentStatus::Suspended);
+            assert!(
+                runtime_agent_is_healthy(&suspended),
+                "typed degraded/suspended {runtime_key} must not be replaced"
+            );
+
+            let mut active = suspended;
+            active.logical_status = Some(sentinel_runtime::AgentStatus::Active);
+            assert!(
+                !runtime_agent_is_healthy(&active),
+                "active degraded {runtime_key} must enter repair/backoff handling"
+            );
+        }
     }
 
     #[cfg(all(unix, feature = "llm"))]
@@ -11984,11 +12336,12 @@ mod tests {
     }
 
     #[test]
-    fn config_apply_recovery_marker_survives_restart_and_gates_startup_cleanup() {
+    fn config_apply_decision_and_completion_event_survive_restart() {
         use sentinel_common::room::{BuildingConfig, BuildingMeta, RoomConfig, RoomType};
 
         let tmp = tempfile::tempdir().unwrap();
         let events_path = tmp.path().join("events.db");
+        let op_id = "config-apply-op-92";
         let old_agents = vec![test_ecs_agent_config(35, "Apply Old", "Tester", 1)];
         let mut staged_agents = old_agents.clone();
         staged_agents[0].identity.name = "Apply Staged".to_string();
@@ -12012,26 +12365,43 @@ mod tests {
         };
         let mut staged_building = old_building.clone();
         staged_building.building.name = "Staged Building".to_string();
+        let old_digest = config_apply_digest(&old_agents, &old_building).unwrap();
+        let staged_digest = config_apply_digest(&staged_agents, &staged_building).unwrap();
         {
             let event_store = EventStore::open(events_path.to_str().unwrap()).unwrap();
             event_store
                 .begin_runtime_config_apply_recovery(
+                    op_id,
+                    &old_digest,
+                    &staged_digest,
                     &old_agents,
                     &staged_agents,
                     &old_building,
                     &staged_building,
                     "world-snapshot-apply-recovery",
+                    &[],
                     92,
                 )
                 .unwrap();
             event_store
-                .record_runtime_config_apply_stop(AgentId(35))
+                .record_runtime_config_apply_stop(op_id, AgentId(35))
                 .unwrap();
             event_store
-                .record_runtime_config_apply_spawn(AgentId(35))
+                .record_runtime_config_apply_spawn(op_id, AgentId(35))
                 .unwrap();
             event_store
-                .mark_runtime_config_apply_recovery_required("injected crash after nth spawn")
+                .mark_runtime_config_apply_runtimes_applied(op_id, &[])
+                .unwrap();
+            let event = DomainEvent::new(
+                "config_applied",
+                "WORLD",
+                r#"{"agent_count":1}"#,
+                op_id,
+                92,
+            )
+            .with_operation_id(op_id);
+            event_store
+                .commit_runtime_config_apply(op_id, &event, "sentinel.events")
                 .unwrap();
         }
 
@@ -12042,15 +12412,326 @@ mod tests {
             .expect("durable apply marker");
         assert_eq!(
             marker.phase,
-            sentinel_limbo::RuntimeConfigRecoveryPhase::RecoveryRequired
+            sentinel_limbo::RuntimeConfigApplyPhase::CommittedPendingFinalize
         );
+        assert_eq!(
+            marker.decision,
+            sentinel_limbo::RuntimeConfigApplyDecision::Forward
+        );
+        assert_eq!(marker.op_id, op_id);
+        assert_eq!(marker.old_digest, old_digest);
+        assert_eq!(marker.staged_digest, staged_digest);
         assert_eq!(marker.old_agents, old_agents);
         assert_eq!(marker.staged_agents, staged_agents);
         assert_eq!(marker.pre_snapshot_id, "world-snapshot-apply-recovery");
         assert_eq!(marker.stopped_agent_ids, vec![AgentId(35)]);
         assert_eq!(marker.spawned_agent_ids, vec![AgentId(35)]);
-        assert!(reconcile_runtime_config_apply_recovery_marker(&restarted, 4, None, &[]).unwrap());
-        assert!(restarted.runtime_config_apply_recovery().unwrap().is_none());
+        assert!(restarted.has_event_operation_id(op_id).unwrap());
+        assert_eq!(restarted.poll_outbox(10).unwrap().len(), 1);
+        restarted
+            .finalize_runtime_config_apply(
+                op_id,
+                sentinel_limbo::RuntimeConfigApplyDecision::Forward,
+            )
+            .unwrap();
+        assert_eq!(
+            restarted
+                .runtime_config_apply_recovery()
+                .unwrap()
+                .unwrap()
+                .phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::Finalized
+        );
+
+        let conflict_path = tmp.path().join("events-conflict.db");
+        let conflict_store = EventStore::open(conflict_path.to_str().unwrap()).unwrap();
+        let conflict_op = "config-apply-event-conflict";
+        conflict_store
+            .begin_runtime_config_apply_recovery(
+                conflict_op,
+                &old_digest,
+                &staged_digest,
+                &old_agents,
+                &staged_agents,
+                &old_building,
+                &staged_building,
+                "world-snapshot-event-conflict",
+                &[],
+                93,
+            )
+            .unwrap();
+        conflict_store
+            .mark_runtime_config_apply_runtimes_applied(conflict_op, &[])
+            .unwrap();
+        conflict_store
+            .append_event(
+                &DomainEvent::new(
+                    "unrelated",
+                    "WORLD",
+                    r#"{"conflict":true}"#,
+                    conflict_op,
+                    93,
+                )
+                .with_operation_id(conflict_op),
+            )
+            .unwrap();
+        let completion = DomainEvent::new(
+            "config_applied",
+            "WORLD",
+            r#"{"agent_count":1}"#,
+            conflict_op,
+            93,
+        )
+        .with_operation_id(conflict_op);
+        assert!(conflict_store
+            .commit_runtime_config_apply(conflict_op, &completion, "sentinel.events")
+            .is_err());
+        let conflict_marker = conflict_store
+            .runtime_config_apply_recovery()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            conflict_marker.phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::RuntimesApplied
+        );
+        assert_eq!(
+            conflict_marker.decision,
+            sentinel_limbo::RuntimeConfigApplyDecision::Rollback
+        );
+        assert!(conflict_store.poll_outbox(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn config_apply_startup_rolls_back_and_restores_exact_runtime_before_finalizing() {
+        use sentinel_common::nano_runtime::{NanoSnapshot, NanoSnapshotSemantics};
+        use sentinel_common::room::{BuildingConfig, BuildingMeta, RoomConfig, RoomType};
+
+        sentinel_common::feature_flags::RuntimeFlags::init();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let projection_path = tmp.path().join("projection.db");
+        let event_store =
+            Arc::new(EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap());
+        let state_store =
+            Arc::new(StateStore::open(tmp.path().join("state.redb").to_str().unwrap()).unwrap());
+        let old_config = test_ecs_agent_config(38, "Startup Old", "Operator", 1);
+        let mut staged_config = old_config.clone();
+        staged_config.identity.name = "Startup Staged".to_string();
+        let old_building = BuildingConfig {
+            building: BuildingMeta {
+                name: "Startup Old Building".to_string(),
+                address: "Old Street".to_string(),
+                floors: 1,
+            },
+            rooms: vec![RoomConfig {
+                id: "empfang".to_string(),
+                name: "Empfang".to_string(),
+                floor: 0,
+                capacity: 4,
+                room_type: RoomType::Common,
+                adjacent: Vec::new(),
+                department: None,
+                has_coffee_machine: false,
+                has_printer: false,
+            }],
+        };
+        let mut staged_building = old_building.clone();
+        staged_building.building.name = "Startup Staged Building".to_string();
+        crate::config_persist::persist_company_config(
+            &config_dir,
+            std::slice::from_ref(&old_config),
+            &old_building,
+            "startup-old",
+        )
+        .unwrap();
+
+        let mut pre_snapshot = restore_snapshot_for_agent(
+            "config-apply-startup-pre",
+            38,
+            "Startup Old",
+            "empfang",
+            130,
+            0,
+            b"startup-old-state",
+            None,
+        );
+        pre_snapshot.nano_runtime_snapshots = vec![NanoSnapshot {
+            runtime_key: RUNTIME_ECS_NATIVE.to_string(),
+            workload_id: "AGENT-38".to_string(),
+            agent_id: Some(AgentId(38)),
+            semantics: NanoSnapshotSemantics::RuntimeMetadata,
+            payload: serde_json::json!({
+                "external_canonical_world": true,
+                "agent_id": AgentId(38),
+            }),
+        }];
+        state_store.restore_all_tables(&pre_snapshot.redb).unwrap();
+        save_world_snapshot_fixture(event_store.as_ref(), &pre_snapshot);
+        drop(sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap());
+        seed_projection_from_world_snapshot(projection_path.to_str().unwrap(), &pre_snapshot, 0, 1)
+            .unwrap();
+
+        let op_id = "config-apply-startup-rollback";
+        let old_digest =
+            config_apply_digest(std::slice::from_ref(&old_config), &old_building).unwrap();
+        let staged_digest =
+            config_apply_digest(std::slice::from_ref(&staged_config), &staged_building).unwrap();
+        crate::config_persist::stage_config_apply_recovery(
+            &config_dir,
+            op_id,
+            &old_digest,
+            &staged_digest,
+            std::slice::from_ref(&old_config),
+            std::slice::from_ref(&staged_config),
+            &old_building,
+            &staged_building,
+            130,
+        )
+        .unwrap();
+        crate::config_persist::publish_config_apply_participant(&config_dir, op_id, true).unwrap();
+        event_store
+            .begin_runtime_config_apply_recovery(
+                op_id,
+                &old_digest,
+                &staged_digest,
+                std::slice::from_ref(&old_config),
+                std::slice::from_ref(&staged_config),
+                &old_building,
+                &staged_building,
+                &pre_snapshot.snapshot_id,
+                &pre_snapshot.nano_runtime_snapshots,
+                130,
+            )
+            .unwrap();
+        event_store
+            .record_runtime_config_apply_stop(op_id, AgentId(38))
+            .unwrap();
+        event_store
+            .mark_runtime_config_apply_recovery_required(
+                op_id,
+                "injected process crash after staged file publication",
+            )
+            .unwrap();
+
+        let marker = reconcile_runtime_config_apply_recovery_marker(
+            event_store.as_ref(),
+            &state_store,
+            None,
+            tmp.path(),
+            projection_path.to_str().unwrap(),
+            &config_dir,
+            4,
+            None,
+            &[],
+            sentinel_common::agent_config::AgentConfigValidation::default(),
+        )
+        .unwrap()
+        .expect("startup recovery remains fenced until runtime restore");
+        assert_eq!(
+            marker.decision,
+            sentinel_limbo::RuntimeConfigApplyDecision::Rollback
+        );
+        assert_eq!(
+            marker.phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::RecoveryRequired
+        );
+        assert_eq!(
+            sentinel_common::agent_config::load_all_agents(&config_dir.join("agents")).unwrap(),
+            vec![old_config.clone()]
+        );
+        assert_eq!(
+            sentinel_common::room::BuildingConfig::load(&config_dir.join("rooms.toml")).unwrap(),
+            old_building
+        );
+        assert_eq!(
+            state_store.dump_all_tables().unwrap().agent_states,
+            pre_snapshot.redb.agent_states
+        );
+        assert_eq!(
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap())
+                .unwrap()
+                .get_agent(38)
+                .unwrap()
+                .unwrap()
+                .name,
+            "Startup Old"
+        );
+
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let (_tx, rx) = mpsc::channel();
+        let (_operator_tx, operator_rx) = mpsc::channel();
+        let (perception_tx, _perception_rx) = mpsc::sync_channel(8);
+        let (ebpf_collector, ebpf_tx) = test_ebpf();
+        let result = ecs_tick_loop(
+            Arc::clone(&state_store),
+            Arc::clone(&event_store),
+            rx,
+            operator_rx,
+            mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+            mpsc::channel::<RuntimeControlCommand>().1,
+            perception_tx,
+            vec![old_config],
+            Some(marker),
+            1,
+            Duration::from_millis(100),
+            1.0,
+            true,
+            shutdown,
+            test_controlplane(&tmp),
+            RuntimeOrchestrator::new(4).with_event_store(Arc::clone(&event_store)),
+            test_sandbox(),
+            ebpf_collector,
+            ebpf_tx,
+            test_episode_producer(&tmp, &event_store),
+            mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+            None,
+            None,
+            mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorMigrateCommand>().1,
+            config_dir.clone(),
+            4,
+            sentinel_common::agent_config::AgentConfigValidation::default(),
+            mpsc::channel::<i64>().1,
+            crate::config::RetentionConfig::default(),
+            String::new(),
+            Vec::new(),
+            crate::adaptive_tick::AdaptiveConfig::default(),
+            sentinel_ecs::RoomDistanceMap::default(),
+            sentinel_ecs::RoomInfoMap::default(),
+            None,
+            crate::config::ResourceManagerConfig::default(),
+            crate::config::PlatformControlplaneConfig::default(),
+            String::new(),
+            Arc::new(RwLock::new(
+                crate::platform_controlplane::PlatformStateSnapshot::default(),
+            )),
+            Arc::new(RwLock::new(
+                crate::runtime_health::RuntimeHealthSnapshot::default(),
+            )),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            projection_path.to_string_lossy().to_string(),
+            false,
+            None,
+            None,
+            #[cfg(feature = "llm")]
+            crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
+        );
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(
+            event_store
+                .runtime_config_apply_recovery()
+                .unwrap()
+                .unwrap()
+                .phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::Finalized
+        );
+        assert!(crate::config_persist::load_config_apply_recovery(&config_dir)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -12137,18 +12818,31 @@ mod tests {
 
         crate::config_persist::stage_config_apply_recovery(
             &config_dir,
+            "config-apply-compensation",
+            &config_apply_digest(std::slice::from_ref(&old_config), &old_building).unwrap(),
+            &config_apply_digest(std::slice::from_ref(&staged_config), &staged_building).unwrap(),
             std::slice::from_ref(&old_config),
+            std::slice::from_ref(&staged_config),
             &old_building,
+            &staged_building,
             120,
         )
         .unwrap();
         event_store
             .begin_runtime_config_apply_recovery(
+                "config-apply-compensation",
+                &config_apply_digest(std::slice::from_ref(&old_config), &old_building).unwrap(),
+                &config_apply_digest(
+                    std::slice::from_ref(&staged_config),
+                    &staged_building,
+                )
+                .unwrap(),
                 std::slice::from_ref(&old_config),
                 std::slice::from_ref(&staged_config),
                 &old_building,
                 &staged_building,
                 &pre_snapshot.snapshot_id,
+                &pre_runtime_snapshots,
                 120,
             )
             .unwrap();
@@ -12166,7 +12860,7 @@ mod tests {
         )
         .unwrap());
         event_store
-            .record_runtime_config_apply_stop(AgentId(36))
+            .record_runtime_config_apply_stop("config-apply-compensation", AgentId(36))
             .unwrap();
         assert!(spawn_agent_full(
             &mut runtime_orch,
@@ -12183,10 +12877,23 @@ mod tests {
             None,
         ));
         event_store
-            .record_runtime_config_apply_spawn(AgentId(37))
+            .record_runtime_config_apply_spawn("config-apply-compensation", AgentId(37))
             .unwrap();
+        let mut per_agent_staged = old_config.clone();
+        per_agent_staged.identity.name = "Interrupted Replacement".to_string();
+        event_store
+            .begin_runtime_config_recovery(&old_config, &per_agent_staged, 120)
+            .unwrap();
+        event_store
+            .mark_runtime_config_recovery_required(
+                AgentId(36),
+                "injected per-agent replacement interruption",
+            )
+            .unwrap();
+        nano_runtimes.block_for_recovery(AgentId(36));
 
         compensate_config_apply_transaction(
+            "config-apply-compensation",
             &pre_snapshot.snapshot_id,
             &pre_runtime_snapshots,
             std::slice::from_ref(&old_config),
@@ -12203,10 +12910,10 @@ mod tests {
             &state_store,
             None,
             None,
+            &[],
             tmp.path(),
             projection_path.to_str().unwrap(),
             &config_dir,
-            120,
         )
         .unwrap();
 
@@ -12217,12 +12924,34 @@ mod tests {
         assert!(nano_runtimes.handle(AgentId(37)).is_none());
         assert_eq!(
             sentinel_common::agent_config::load_all_agents(&config_dir.join("agents")).unwrap(),
-            vec![old_config]
+            vec![old_config.clone()]
+        );
+        assert_eq!(
+            event_store
+                .runtime_config_apply_recovery()
+                .unwrap()
+                .unwrap()
+                .phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::Finalized
         );
         assert!(event_store
-            .runtime_config_apply_recovery()
+            .list_runtime_config_recoveries()
             .unwrap()
-            .is_none());
+            .is_empty());
+        assert!(!nano_runtimes.is_recovery_blocked(AgentId(36)));
+        assert!(stop_agent_runtime_layer(
+            AgentId(36),
+            &mut nano_runtimes,
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+        )
+        .unwrap());
+        assert!(
+            nano_runtimes.spawn(&old_config, &[]).is_ok(),
+            "verified compensation must permit a later exact spawn"
+        );
     }
 
     #[test]
@@ -12790,6 +13519,7 @@ mod tests {
             mpsc::channel::<RuntimeControlCommand>().1,
             ptx,
             vec![],
+            None,
             1,
             Duration::from_millis(100),
             1.0, // time_scale
@@ -12883,6 +13613,7 @@ mod tests {
                 mpsc::channel::<RuntimeControlCommand>().1,
                 ptx,
                 all_agents,
+                None,
                 1,
                 Duration::from_millis(50),
                 1.0, // time_scale
@@ -12993,6 +13724,7 @@ mod tests {
                 mpsc::channel::<RuntimeControlCommand>().1,
                 ptx,
                 all_agents,
+                None,
                 1,
                 Duration::from_millis(50),
                 1.0, // time_scale
@@ -13111,6 +13843,7 @@ mod tests {
                 mpsc::channel::<RuntimeControlCommand>().1,
                 ptx,
                 all_agents,
+                None,
                 1,
                 Duration::from_millis(50),
                 1.0,
@@ -13275,8 +14008,10 @@ mod tests {
             security_runtime_present: true,
             adapter_handle_present: true,
             adapter_instance_matches: true,
+            runtime_resources_healthy: true,
             adapter_health_state: Some(sentinel_common::nano_runtime::NanoHealthState::Healthy),
             adapter_observation_error: None,
+            logical_status: Some(sentinel_runtime::AgentStatus::Active),
             last_repair_status: Some(repair_status.to_string()),
         }
     }

@@ -8,6 +8,10 @@ by the production daemon and the adapter is not registered there. This document
 defines the contract a future implementation must satisfy; it is not evidence
 that the contract is implemented.
 
+Implementation owner: #775, a SINGLE_NODE follow-up under #650 after the
+Firecracker study #687. Cross-node all-runtime migration remains #553 and deep
+microVM migration remains #554.
+
 The `microvm` NanoRuntime does not treat a successful Firecracker boot as a
 successful workload launch. The configured root filesystem must contain a
 guest launcher that consumes the complete requested `NanoWorkloadSpec` and

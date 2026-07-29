@@ -10,8 +10,8 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use sentinel_common::{
-    agent_config::AgentConfig, room::BuildingConfig, AgentId, DomainEvent, FencedStore,
-    OwnerRegistry, OwnerWriteGuard, StateTransferScope,
+    agent_config::AgentConfig, nano_runtime::NanoSnapshot, room::BuildingConfig, AgentId,
+    DomainEvent, FencedStore, OwnerRegistry, OwnerWriteGuard, StateTransferScope,
 };
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -164,14 +164,27 @@ CREATE TABLE IF NOT EXISTS runtime_config_recovery (
 const CREATE_RUNTIME_CONFIG_APPLY_RECOVERY: &str = "
 CREATE TABLE IF NOT EXISTS runtime_config_apply_recovery (
     singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+    schema_version INTEGER NOT NULL,
+    op_id TEXT NOT NULL,
+    old_digest TEXT NOT NULL,
+    staged_digest TEXT NOT NULL,
     old_agents_json TEXT NOT NULL,
     staged_agents_json TEXT NOT NULL,
     old_building_json TEXT NOT NULL,
     staged_building_json TEXT NOT NULL,
     pre_snapshot_id TEXT NOT NULL,
+    pre_runtime_snapshots_json TEXT NOT NULL DEFAULT '[]',
+    applied_runtime_snapshots_json TEXT NOT NULL DEFAULT '[]',
     stopped_agent_ids_json TEXT NOT NULL DEFAULT '[]',
     spawned_agent_ids_json TEXT NOT NULL DEFAULT '[]',
-    phase TEXT NOT NULL CHECK(phase IN ('transitioning', 'recovery_required')),
+    phase TEXT NOT NULL CHECK(phase IN (
+        'prepared',
+        'runtimes_applied',
+        'committed_pending_finalize',
+        'recovery_required',
+        'finalized'
+    )),
+    decision TEXT NOT NULL CHECK(decision IN ('rollback', 'forward')),
     reason TEXT NOT NULL DEFAULT '',
     started_tick INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
@@ -381,6 +394,61 @@ impl RuntimeConfigRecoveryPhase {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeConfigApplyPhase {
+    Prepared,
+    RuntimesApplied,
+    CommittedPendingFinalize,
+    RecoveryRequired,
+    Finalized,
+}
+
+impl RuntimeConfigApplyPhase {
+    fn from_persisted(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "prepared" => Ok(Self::Prepared),
+            "runtimes_applied" => Ok(Self::RuntimesApplied),
+            "committed_pending_finalize" => Ok(Self::CommittedPendingFinalize),
+            "recovery_required" => Ok(Self::RecoveryRequired),
+            "finalized" => Ok(Self::Finalized),
+            other => anyhow::bail!("unknown runtime config apply phase '{other}'"),
+        }
+    }
+
+    fn as_persisted(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::RuntimesApplied => "runtimes_applied",
+            Self::CommittedPendingFinalize => "committed_pending_finalize",
+            Self::RecoveryRequired => "recovery_required",
+            Self::Finalized => "finalized",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeConfigApplyDecision {
+    Rollback,
+    Forward,
+}
+
+impl RuntimeConfigApplyDecision {
+    fn from_persisted(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "rollback" => Ok(Self::Rollback),
+            "forward" => Ok(Self::Forward),
+            other => anyhow::bail!("unknown runtime config apply decision '{other}'"),
+        }
+    }
+
+    fn as_persisted(self) -> &'static str {
+        match self {
+            Self::Rollback => "rollback",
+            Self::Forward => "forward",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfigRecoveryMarker {
     pub agent_id: AgentId,
@@ -395,14 +463,21 @@ pub struct RuntimeConfigRecoveryMarker {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfigApplyRecoveryMarker {
+    pub schema_version: u16,
+    pub op_id: String,
+    pub old_digest: String,
+    pub staged_digest: String,
     pub old_agents: Vec<AgentConfig>,
     pub staged_agents: Vec<AgentConfig>,
     pub old_building: BuildingConfig,
     pub staged_building: BuildingConfig,
     pub pre_snapshot_id: String,
+    pub pre_runtime_snapshots: Vec<NanoSnapshot>,
+    pub applied_runtime_snapshots: Vec<NanoSnapshot>,
     pub stopped_agent_ids: Vec<AgentId>,
     pub spawned_agent_ids: Vec<AgentId>,
-    pub phase: RuntimeConfigRecoveryPhase,
+    pub phase: RuntimeConfigApplyPhase,
+    pub decision: RuntimeConfigApplyDecision,
     pub reason: String,
     pub started_tick: u64,
 }
@@ -470,6 +545,7 @@ impl EventStore {
         conn.execute_batch(CREATE_SIM_METADATA)?;
         conn.execute_batch(CREATE_RUNTIME_CONFIG_RECOVERY)?;
         conn.execute_batch(CREATE_RUNTIME_CONFIG_APPLY_RECOVERY)?;
+        Self::ensure_runtime_config_apply_migrations(&conn)?;
 
         // Security: Immutable Snapshots — Schutz vor Loeschung junger Snapshots.
         // #250: dieselbe SSOT-Konstante wie der Daemon-Retention-Skip (siehe IMMUTABLE_SNAPSHOT_MS).
@@ -515,6 +591,48 @@ impl EventStore {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    fn ensure_runtime_config_apply_migrations(conn: &Connection) -> anyhow::Result<()> {
+        if Self::table_has_column(
+            conn,
+            "runtime_config_apply_recovery",
+            "schema_version",
+        )? {
+            return Ok(());
+        }
+
+        let transaction = conn.unchecked_transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE runtime_config_apply_recovery
+                 RENAME TO runtime_config_apply_recovery_v1;",
+        )?;
+        transaction.execute_batch(CREATE_RUNTIME_CONFIG_APPLY_RECOVERY)?;
+        transaction.execute(
+            "INSERT INTO runtime_config_apply_recovery (
+                singleton_id, schema_version, op_id, old_digest, staged_digest,
+                old_agents_json, staged_agents_json, old_building_json,
+                staged_building_json, pre_snapshot_id, pre_runtime_snapshots_json,
+                applied_runtime_snapshots_json, stopped_agent_ids_json,
+                spawned_agent_ids_json, phase, decision, reason, started_tick,
+                created_at, updated_at
+             )
+             SELECT singleton_id, 2, 'legacy-' || started_tick, '', '',
+                    old_agents_json, staged_agents_json, old_building_json,
+                    staged_building_json, pre_snapshot_id, '[]', '[]',
+                    stopped_agent_ids_json, spawned_agent_ids_json,
+                    'recovery_required', 'rollback',
+                    CASE
+                        WHEN reason = '' THEN 'legacy config apply requires deterministic rollback'
+                        ELSE reason
+                    END,
+                    started_tick, created_at, updated_at
+             FROM runtime_config_apply_recovery_v1",
+            [],
+        )?;
+        transaction.execute_batch("DROP TABLE runtime_config_apply_recovery_v1;")?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -742,13 +860,22 @@ impl EventStore {
 
     pub fn begin_runtime_config_apply_recovery(
         &self,
+        op_id: &str,
+        old_digest: &str,
+        staged_digest: &str,
         old_agents: &[AgentConfig],
         staged_agents: &[AgentConfig],
         old_building: &BuildingConfig,
         staged_building: &BuildingConfig,
         pre_snapshot_id: &str,
+        pre_runtime_snapshots: &[NanoSnapshot],
         started_tick: u64,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(!op_id.is_empty(), "config apply op_id must not be empty");
+        anyhow::ensure!(
+            !old_digest.is_empty() && !staged_digest.is_empty(),
+            "config apply digests must not be empty"
+        );
         let started_tick = i64::try_from(started_tick)
             .map_err(|_| anyhow::anyhow!("runtime config apply tick exceeds i64"))?;
         let conn =
@@ -757,40 +884,86 @@ impl EventStore {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        let inserted = conn.execute(
-            "INSERT OR IGNORE INTO runtime_config_apply_recovery
-             (singleton_id, old_agents_json, staged_agents_json, old_building_json,
-              staged_building_json, pre_snapshot_id, phase, reason, started_tick,
+        let existing = conn
+            .query_row(
+                "SELECT op_id, phase, old_digest, staged_digest
+                 FROM runtime_config_apply_recovery WHERE singleton_id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((existing_op, phase, existing_old, existing_staged)) = existing {
+            if existing_op == op_id {
+                anyhow::ensure!(
+                    existing_old == old_digest && existing_staged == staged_digest,
+                    "config apply op_id digest conflict"
+                );
+                conn.commit()?;
+                return Ok(());
+            }
+            anyhow::ensure!(
+                phase == RuntimeConfigApplyPhase::Finalized.as_persisted(),
+                "unresolved runtime config apply recovery already exists"
+            );
+            conn.execute(
+                "DELETE FROM runtime_config_apply_recovery
+                 WHERE singleton_id = 1 AND phase = 'finalized'",
+                [],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO runtime_config_apply_recovery
+             (singleton_id, schema_version, op_id, old_digest, staged_digest,
+              old_agents_json, staged_agents_json, old_building_json,
+              staged_building_json, pre_snapshot_id, pre_runtime_snapshots_json,
+              applied_runtime_snapshots_json, phase, decision, reason, started_tick,
               created_at, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, 'transitioning', '', ?6, ?7, ?7)",
+             VALUES (1, 2, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '[]',
+                     'prepared', 'rollback', '', ?10, ?11, ?11)",
             params![
+                op_id,
+                old_digest,
+                staged_digest,
                 serde_json::to_string(old_agents)?,
                 serde_json::to_string(staged_agents)?,
                 serde_json::to_string(old_building)?,
                 serde_json::to_string(staged_building)?,
                 pre_snapshot_id,
+                serde_json::to_string(pre_runtime_snapshots)?,
                 started_tick,
                 now_ms,
             ],
         )?;
-        anyhow::ensure!(
-            inserted == 1,
-            "unresolved runtime config apply recovery already exists"
-        );
         conn.commit()?;
         Ok(())
     }
 
-    pub fn record_runtime_config_apply_stop(&self, agent_id: AgentId) -> anyhow::Result<()> {
-        self.record_runtime_config_apply_agent("stopped_agent_ids_json", agent_id)
+    pub fn record_runtime_config_apply_stop(
+        &self,
+        op_id: &str,
+        agent_id: AgentId,
+    ) -> anyhow::Result<()> {
+        self.record_runtime_config_apply_agent(op_id, "stopped_agent_ids_json", agent_id)
     }
 
-    pub fn record_runtime_config_apply_spawn(&self, agent_id: AgentId) -> anyhow::Result<()> {
-        self.record_runtime_config_apply_agent("spawned_agent_ids_json", agent_id)
+    pub fn record_runtime_config_apply_spawn(
+        &self,
+        op_id: &str,
+        agent_id: AgentId,
+    ) -> anyhow::Result<()> {
+        self.record_runtime_config_apply_agent(op_id, "spawned_agent_ids_json", agent_id)
     }
 
     fn record_runtime_config_apply_agent(
         &self,
+        op_id: &str,
         column: &str,
         agent_id: AgentId,
     ) -> anyhow::Result<()> {
@@ -801,8 +974,12 @@ impl EventStore {
         let conn =
             self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let current: String = conn.query_row(
-            &format!("SELECT {column} FROM runtime_config_apply_recovery WHERE singleton_id = 1"),
-            [],
+            &format!(
+                "SELECT {column} FROM runtime_config_apply_recovery
+                 WHERE singleton_id = 1 AND op_id = ?1
+                   AND phase IN ('prepared', 'runtimes_applied')"
+            ),
+            params![op_id],
             |row| row.get(0),
         )?;
         let mut ids: Vec<AgentId> = serde_json::from_str(&current)?;
@@ -812,9 +989,19 @@ impl EventStore {
         }
         let updated = conn.execute(
             &format!(
-                "UPDATE runtime_config_apply_recovery SET {column} = ?1 WHERE singleton_id = 1"
+                "UPDATE runtime_config_apply_recovery
+                 SET {column} = ?2, updated_at = ?3
+                 WHERE singleton_id = 1 AND op_id = ?1
+                   AND phase IN ('prepared', 'runtimes_applied')"
             ),
-            params![serde_json::to_string(&ids)?],
+            params![
+                op_id,
+                serde_json::to_string(&ids)?,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64
+            ],
         )?;
         anyhow::ensure!(
             updated == 1,
@@ -824,7 +1011,135 @@ impl EventStore {
         Ok(())
     }
 
-    pub fn mark_runtime_config_apply_recovery_required(&self, reason: &str) -> anyhow::Result<()> {
+    pub fn mark_runtime_config_apply_runtimes_applied(
+        &self,
+        op_id: &str,
+        applied_runtime_snapshots: &[NanoSnapshot],
+    ) -> anyhow::Result<()> {
+        let conn =
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let snapshots = serde_json::to_string(applied_runtime_snapshots)?;
+        let updated = conn.execute(
+            "UPDATE runtime_config_apply_recovery
+             SET phase = 'runtimes_applied', applied_runtime_snapshots_json = ?2,
+                 updated_at = ?3
+             WHERE singleton_id = 1 AND op_id = ?1 AND phase = 'prepared'
+               AND decision = 'rollback'",
+            params![op_id, snapshots, now_ms],
+        )?;
+        if updated == 0 {
+            let existing: (String, String) = conn.query_row(
+                "SELECT phase, applied_runtime_snapshots_json
+                 FROM runtime_config_apply_recovery
+                 WHERE singleton_id = 1 AND op_id = ?1",
+                params![op_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            anyhow::ensure!(
+                existing.0 == RuntimeConfigApplyPhase::RuntimesApplied.as_persisted()
+                    && existing.1 == snapshots,
+                "config apply runtimes-applied transition conflict"
+            );
+        }
+        conn.commit()?;
+        Ok(())
+    }
+
+    /// Atomically records the durable forward decision and its completion event/outbox.
+    ///
+    /// Filesystem publication remains an idempotent participant and is finalized
+    /// separately. No cross-store atomicity is claimed.
+    pub fn commit_runtime_config_apply(
+        &self,
+        op_id: &str,
+        event: &DomainEvent,
+        topic: &str,
+    ) -> anyhow::Result<()> {
+        let conn =
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let (phase, decision): (String, String) = conn.query_row(
+            "SELECT phase, decision FROM runtime_config_apply_recovery
+             WHERE singleton_id = 1 AND op_id = ?1",
+            params![op_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if phase == RuntimeConfigApplyPhase::CommittedPendingFinalize.as_persisted()
+            && decision == RuntimeConfigApplyDecision::Forward.as_persisted()
+        {
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT event_id FROM events WHERE operation_id = ?1",
+                    params![op_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            anyhow::ensure!(
+                existing.as_deref() == Some(event.event_id.as_str()),
+                "config apply committed event identity conflict"
+            );
+            conn.commit()?;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            phase == RuntimeConfigApplyPhase::RuntimesApplied.as_persisted()
+                && decision == RuntimeConfigApplyDecision::Rollback.as_persisted(),
+            "config apply cannot commit from phase={phase} decision={decision}"
+        );
+        anyhow::ensure!(
+            event.operation_id == op_id,
+            "config apply event operation_id must equal op_id"
+        );
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO events
+             (event_id, event_type, aggregate_id, payload, correlation_id, causation_id,
+              operation_id, tick, timestamp_ms, schema_version, compensation_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                event.event_id,
+                event.event_type,
+                event.aggregate_id,
+                event.payload,
+                event.correlation_id,
+                event.causation_id,
+                event.operation_id,
+                event.tick as i64,
+                event.timestamp_ms as i64,
+                event.schema_version,
+                event.compensation_type,
+            ],
+        )?;
+        anyhow::ensure!(inserted == 1, "config apply completion event conflict");
+        conn.execute(
+            "INSERT INTO outbox (event_id, topic, payload, status, created_at)
+             VALUES (?1, ?2, ?3, 'pending', ?4)",
+            params![event.event_id, topic, event.payload, now_ms],
+        )?;
+        let updated = conn.execute(
+            "UPDATE runtime_config_apply_recovery
+             SET phase = 'committed_pending_finalize', decision = 'forward',
+                 reason = '', updated_at = ?2
+             WHERE singleton_id = 1 AND op_id = ?1
+               AND phase = 'runtimes_applied' AND decision = 'rollback'",
+            params![op_id, now_ms],
+        )?;
+        anyhow::ensure!(updated == 1, "config apply decision changed concurrently");
+        conn.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_runtime_config_apply_recovery_required(
+        &self,
+        op_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
         let conn =
             self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let now_ms = std::time::SystemTime::now()
@@ -833,26 +1148,55 @@ impl EventStore {
             .as_millis() as i64;
         let updated = conn.execute(
             "UPDATE runtime_config_apply_recovery
-             SET phase = 'recovery_required', reason = ?1, updated_at = ?2
-             WHERE singleton_id = 1",
-            params![reason, now_ms],
+             SET phase = 'recovery_required', reason = ?2, updated_at = ?3
+             WHERE singleton_id = 1 AND op_id = ?1 AND phase != 'finalized'",
+            params![op_id, reason, now_ms],
         )?;
-        anyhow::ensure!(
-            updated == 1,
-            "runtime config apply recovery marker is missing"
-        );
+        anyhow::ensure!(updated == 1, "runtime config apply recovery marker is missing");
         conn.commit()?;
         Ok(())
     }
 
-    pub fn clear_runtime_config_apply_recovery(&self) -> anyhow::Result<()> {
+    pub fn finalize_runtime_config_apply(
+        &self,
+        op_id: &str,
+        decision: RuntimeConfigApplyDecision,
+    ) -> anyhow::Result<()> {
         let conn =
             self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
-        let deleted = conn.execute(
-            "DELETE FROM runtime_config_apply_recovery WHERE singleton_id = 1",
-            [],
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let allowed_phase = match decision {
+            RuntimeConfigApplyDecision::Rollback => {
+                "('prepared', 'runtimes_applied', 'recovery_required')"
+            }
+            RuntimeConfigApplyDecision::Forward => {
+                "('committed_pending_finalize', 'recovery_required')"
+            }
+        };
+        let updated = conn.execute(
+            &format!(
+                "UPDATE runtime_config_apply_recovery
+                 SET phase = 'finalized', reason = '', updated_at = ?3
+                 WHERE singleton_id = 1 AND op_id = ?1 AND decision = ?2
+                   AND phase IN {allowed_phase}"
+            ),
+            params![op_id, decision.as_persisted(), now_ms],
         )?;
-        anyhow::ensure!(deleted == 1, "missing runtime config apply recovery marker");
+        if updated == 0 {
+            let phase: String = conn.query_row(
+                "SELECT phase FROM runtime_config_apply_recovery
+                 WHERE singleton_id = 1 AND op_id = ?1 AND decision = ?2",
+                params![op_id, decision.as_persisted()],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                phase == RuntimeConfigApplyPhase::Finalized.as_persisted(),
+                "config apply finalize phase conflict"
+            );
+        }
         conn.commit()?;
         Ok(())
     }
@@ -866,14 +1210,16 @@ impl EventStore {
             .map_err(|error| anyhow::anyhow!("Lock poisoned: {error}"))?;
         let row = conn
             .query_row(
-                "SELECT old_agents_json, staged_agents_json, old_building_json,
-                        staged_building_json, pre_snapshot_id, stopped_agent_ids_json,
-                        spawned_agent_ids_json, phase, reason, started_tick
+                "SELECT schema_version, op_id, old_digest, staged_digest,
+                        old_agents_json, staged_agents_json, old_building_json,
+                        staged_building_json, pre_snapshot_id, pre_runtime_snapshots_json,
+                        applied_runtime_snapshots_json, stopped_agent_ids_json,
+                        spawned_agent_ids_json, phase, decision, reason, started_tick
                  FROM runtime_config_apply_recovery WHERE singleton_id = 1",
                 [],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
@@ -882,33 +1228,61 @@ impl EventStore {
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
                         row.get::<_, String>(8)?,
-                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, String>(14)?,
+                        row.get::<_, String>(15)?,
+                        row.get::<_, i64>(16)?,
                     ))
                 },
             )
             .optional()?;
         row.map(
             |(
+                schema_version,
+                op_id,
+                old_digest,
+                staged_digest,
                 old_agents,
                 staged_agents,
                 old_building,
                 staged_building,
                 pre_snapshot_id,
+                pre_runtime_snapshots,
+                applied_runtime_snapshots,
                 stopped_agent_ids,
                 spawned_agent_ids,
                 phase,
+                decision,
                 reason,
                 started_tick,
             )| {
+                let schema_version = u16::try_from(schema_version)?;
+                anyhow::ensure!(
+                    schema_version == 2,
+                    "unsupported runtime config apply schema {schema_version}"
+                );
                 Ok(RuntimeConfigApplyRecoveryMarker {
+                    schema_version,
+                    op_id,
+                    old_digest,
+                    staged_digest,
                     old_agents: serde_json::from_str(&old_agents)?,
                     staged_agents: serde_json::from_str(&staged_agents)?,
                     old_building: serde_json::from_str(&old_building)?,
                     staged_building: serde_json::from_str(&staged_building)?,
                     pre_snapshot_id,
+                    pre_runtime_snapshots: serde_json::from_str(&pre_runtime_snapshots)?,
+                    applied_runtime_snapshots: serde_json::from_str(
+                        &applied_runtime_snapshots,
+                    )?,
                     stopped_agent_ids: serde_json::from_str(&stopped_agent_ids)?,
                     spawned_agent_ids: serde_json::from_str(&spawned_agent_ids)?,
-                    phase: RuntimeConfigRecoveryPhase::from_persisted(&phase)?,
+                    phase: RuntimeConfigApplyPhase::from_persisted(&phase)?,
+                    decision: RuntimeConfigApplyDecision::from_persisted(&decision)?,
                     reason,
                     started_tick: u64::try_from(started_tick)?,
                 })
