@@ -1,15 +1,34 @@
 # Issue #472 ORC lifecycle correction evidence
 
-Date: 2026-07-24
+Date: 2026-07-29
 
 Scope: source and remote-build validation for the findings in the ORC review of
 PR #700. No runtime service, deployment VM, installed binary, configuration, or
 runtime data was accessed or changed during this correction pass.
 
-Current `origin/main@85b8bef1f1f4bba758bee7eb04248e2622612392` is included
-through merge commit `b6a5289`; the feature branch was not rebased. The
-`llm_bridge` conflict retains main's one-second circuit-breaker reset and
-expires the stored deadline directly without a scheduler-dependent sleep.
+Current `origin/main@55ace5371a64d4369dccf7aea13ceb32ae441891` is included
+through merge commit `13475549ea051ab98ca724f1b0ea668770066268`; the feature
+branch was not rebased. The only merge conflict was `CHANGELOG.md`; it was
+resolved additively so that the existing Issue #472 runtime-lifecycle entry and
+main's Issue #633 dependency-policy entry are both retained. Main's
+dependency-policy, Cargo-deny configuration, workflow, benchmark-register, and
+Issue #633 evidence files otherwise match `origin/main` byte-for-byte.
+
+The previously resolved `llm_bridge` contract remains unchanged: the
+one-second circuit-breaker reset and direct stored-deadline expiration from
+main are retained.
+
+## Integrated lifecycle audit
+
+The post-merge audit traced all productive spawn, stop, configuration,
+restore, rollback, shutdown, cgroup/eBPF, and abandoned-runtime paths. The
+current-main integration changes no Rust source or Cargo manifest relative to
+the reviewed head. Productive raw adapter ownership remains confined to the
+private `orchestrator::runtime_lifecycle` module. Registry-owned handles are
+included in reconciler liveness, are cleaned only through typed
+`NanoRuntime::stop`, and remain observable after failed cleanup. Cgroup identity
+is captured before adapter stop and eBPF registration is removed only after
+confirmed stop. No new lifecycle semantic defect was found.
 
 ## Review finding mapping
 
@@ -31,17 +50,20 @@ was not changed. Build duration and host load are not runtime evidence.
 
 | Gate | Command | Result |
 |---|---|---|
-| Format | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472-final CARGO_BUILD_JOBS=1' -c -- fmt --all -- --check` | PASS |
-| WASM effect replay rejection | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472-final CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-wasm --features wasm legacy_effect -j1` | PASS, 2 passed |
-| WASM bound snapshot | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472-final CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-wasm --features wasm snapshot_binds_completed_result_without_storing_a_replay_command -j1` | PASS, 1 passed |
-| Compile-fail ownership boundary | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472-final CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-daemon --test runtime_lifecycle_visibility -j1` | PASS, 1 passed |
-| WASM feature check | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472-final CARGO_BUILD_JOBS=1' -c -- check -p sentinel-wasm --features wasm -j1` | PASS |
-| WASM feature tests | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472-final CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-wasm --features wasm -j1` | PASS, 61 unit, 62 acceptance, 2 conformance |
-| Workspace check | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472-final CARGO_BUILD_JOBS=1' -c -- check --workspace --all-targets -j1` | PASS |
-| Workspace tests | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472-final CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test --workspace -j1` | PASS |
-| Workspace Clippy | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472-final CARGO_BUILD_JOBS=1' -c -- clippy --workspace --all-targets -j1 -- -D warnings` | PASS |
-| Rustdoc | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472-final CARGO_BUILD_JOBS=1 RUSTDOCFLAGS=-Dwarnings' -c -- doc --workspace --no-deps -j1` | PASS |
-| Release build | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472-final CARGO_BUILD_JOBS=1' -c -- build -p sentinel-daemon --bin sentinel-daemon --release -j1` | PASS |
+| Focused daemon lifecycle suite | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-daemon --lib -j1` | PASS, 362 passed, 1 VM-bound test ignored |
+| Registry routing and AST inventory | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-daemon --test nano_runtime_registry -j1` | PASS, 2 passed |
+| Compile-fail ownership boundary | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-daemon --test runtime_lifecycle_visibility -j1` | PASS, 1 passed |
+| WASM effect replay rejection | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-wasm --features wasm legacy_effect -j1` | PASS, 2 passed |
+| WASM bound snapshot | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-wasm --features wasm snapshot_binds_completed_result_without_storing_a_replay_command -j1` | PASS, 1 passed |
+| Format | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1' -c -- fmt --all -- --check` | PASS |
+| WASM feature check | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1' -c -- check -p sentinel-wasm --features wasm -j1` | PASS |
+| WASM feature tests | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-wasm --features wasm -j1` | PASS, 61 unit, 62 acceptance, 2 conformance |
+| Workspace check | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1' -c -- check --workspace --all-targets -j1` | PASS |
+| Workspace tests | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test --workspace -j1` | PASS |
+| Workspace Clippy | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1' -c -- clippy --workspace --all-targets -j1 -- -D warnings` | PASS |
+| Rustdoc | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1 RUSTDOCFLAGS=-Dwarnings' -c -- doc --workspace --no-deps -j1` | PASS |
+| Release build | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1' -c -- build -p sentinel-daemon --bin sentinel-daemon --release -j1` | PASS |
+| Cargo deny bans | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx2-target-472-current CARGO_BUILD_JOBS=1' -c -- deny check bans` | PASS |
 
 ## Non-Rust source gates
 
@@ -53,6 +75,7 @@ was not changed. Build duration and host load are not runtime evidence.
 | Unsafe baseline | `python3 scripts/check-unsafe-baseline.py` | PASS, 26/26 |
 | Dependency patch registry | `python3 scripts/check-patch-registry.py` | PASS, 0 overrides, 0 registry entries, 4 direct Git dependencies |
 | Patch-registry unit tests | `python3 -m unittest scripts.tests.test_check_patch_registry` | PASS, 15 passed |
+| Current-main preservation | `git diff --exit-code 55ace5371a64d4369dccf7aea13ceb32ae441891 -- .github/workflows/ci.yml deny.toml docs/dependency-policy.md docs/benchmarks/BENCHMARK-RESULTS.md console/evidence/issue-633-live` | PASS |
 
 ## Issue acceptance mapping
 
