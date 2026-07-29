@@ -667,12 +667,15 @@ must reclassify that defect based on the counterexample.
 
 ## Proposed implementation-owner contracts
 
-These contracts are proposals only. No issue body, label, comment, or child
-issue is changed until ORC approves the complete package.
+ORC approved D1-D11 and materialization after reviewing the complete package.
+The live implementation epic is #766 under #659, with exactly A0 #767, A1 #768,
+and A2 #769 as native children. Existing-owner routes are materialized below;
+no implementation, runtime, dependency, or TOGAF HTML mutation occurred.
 
 ### Contract A: ordered deterministic-concurrency evidence epic
 
-**Proposed parent:** #659. **Classification:** `M0_HARDENING`.
+**Materialized issue:** #766. **Parent:** #659. **Classification:**
+`M0_HARDENING`.
 
 **Ordered scope and collision boundary**
 
@@ -715,6 +718,8 @@ never a simulator as runtime architecture.
 
 #### Child A0: shared schemas, validators, vectors, and CI routing
 
+**Materialized issue:** #767.
+
 **Scope and dependencies.** Own only versioned `FailureScheduleV1`,
 `OperationHistoryV1`, public-safe golden vectors, fail-closed validators, and
 path-aware T0/T1 CI routing. Depend on #710's terminal taxonomy and #656's
@@ -755,6 +760,8 @@ evidence; do not add a runtime data plane.
 
 #### Child A1: Rust Loom and Shuttle implementation schedules
 
+**Materialized issue:** #768.
+
 **Scope and dependencies.** Own small Rust concurrency kernels, the existing
 Loom lane, test-only Shuttle adapters, S1/S2 and Rust portions of S3/S4/S7/S13,
 and exact replay evidence. Depend on A0, #705 before Shuttle manifest mutation,
@@ -793,6 +800,8 @@ synchronization or delete a regression schedule.
 and explicit limits; neither result becomes business/runtime authority.
 
 #### Child A2: Go Gateway synctest, race, and barrier schedules
+
+**Materialized issue:** #769.
 
 **Scope and dependencies.** Own only Gateway test hooks/barriers and tests for
 S5/S6 plus tick-buffer enable/disable and shutdown. Use the existing Go 1.26.5
@@ -943,6 +952,48 @@ explicitly that neither mechanism enumerates all Go schedules.
   receipts and terminal outcomes without creating a second workflow/effect
   authority.
 
+### Live materialization readback
+
+The native GitHub graph is #659 -> #766, with exactly #767/#768/#769 as #766
+children. The dependency graph is #767 -> #768 and #767 -> #769; A1 and A2 have
+no dependency edge. Body digests cover exact UTF-8 GitHub bodies without an
+added newline.
+
+| New node | Materialized contract | Final labels | Body SHA-256 | Fresh Issue Quality Gate |
+|---|---|---|---|---|
+| [#766](https://github.com/silentspike/project-sentinel/issues/766) | Coordination epic and exact fan-out | `type:epic`, `status:blocked`, `prio:high`, `size:XL`, `scope:full`, `quality:ready`, `comp:daemon`, `comp:runtime` | `b4b49c95fe4ee9f16ab850f179b63ed4c2d1ea334f297797ae5ceb4cae69fb54` | [30459411600 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459411600) |
+| [#767](https://github.com/silentspike/project-sentinel/issues/767) | A0 schemas, validators, vectors, and CI | `type:feature`, `status:blocked`, `prio:high`, `size:L`, `scope:full`, `quality:ready`, `comp:daemon`, `comp:runtime` | `4585a8ef394c6656b985443b9f8649915a2bcdbc0a219c6609572173cced3cb5` | [30459418756 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459418756) |
+| [#768](https://github.com/silentspike/project-sentinel/issues/768) | A1 Rust Loom/Shuttle schedules | `type:feature`, `status:blocked`, `prio:high`, `size:XL`, `scope:full`, `quality:ready`, `comp:daemon`, `comp:runtime` | `394cd9d065984598d97beef6be5616ebf03052906118e0111bf8172d42047abf` | [30459416193 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459416193) |
+| [#769](https://github.com/silentspike/project-sentinel/issues/769) | A2 Go synctest/race/barrier schedules | `type:feature`, `status:blocked`, `prio:high`, `size:L`, `scope:full`, `quality:ready`, `comp:cortex` | `496552d624e7baacb54a559877c31f4f031d4bf8b763742e64353f90eaade6ac` | [30459417332 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459417332) |
+
+Each open owner body contains one
+`<!-- issue-719-concurrency-route -->` section. Existing status, runtime,
+benchmark, and authority contracts remain unchanged.
+
+| Existing open owner | Accepted route | Body SHA-256 | Fresh Issue Quality Gate |
+|---|---|---|---|
+| [#501](https://github.com/silentspike/project-sentinel/issues/501) | S10 migration state/actions and bounded Stateright/Turmoil evidence | `9477186c91f8f084ebcbf9bf52137a1b4d3a9a6266f96e7c174b1cd4752eb9c8` | [30459579882 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459579882) |
+| [#556](https://github.com/silentspike/project-sentinel/issues/556) | S11/S14 cluster models and Jepsen-style histories | `5094a44f34a3ecc1f9a42f35f100c75ea6cdd58d6328cf1498f403e9b73ff3a5` | [30459583579 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459583579) |
+| [#653](https://github.com/silentspike/project-sentinel/issues/653) | Canonical replica state/action vocabulary | `2579e7159b5d646a5b67eaf5096905f30021d83102d32ebb3dce92db2fa743b7` | [30459581581 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459581581) |
+| [#710](https://github.com/silentspike/project-sentinel/issues/710) | S3/S4/S7/S13 execution/effect semantics | `69a150dc7bfc842dc4d48edc4df26fd371a569676ab806093f83048a7a578421` | [30459601464 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459601464) |
+| [#729](https://github.com/silentspike/project-sentinel/issues/729) | S12 engine-specific deterministic storage faults | `cb8f7b7450f926e8fc7aa08869fee74562177ff8ebe6a09538b84aa3b5af7ed3` | [30459586755 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459586755) |
+| [#751](https://github.com/silentspike/project-sentinel/issues/751) | Recovery routing to #753/#755 plus #729 semantics | `985f4b05327a3a4962b5d612e306a5b185676e6fc0c9027b2c957c8f5a09d9ce` | [30459591387 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459591387) |
+| [#753](https://github.com/silentspike/project-sentinel/issues/753) | Capture/seal model and durability barriers | `cf9f18c19df015f78338b3354062317e67d362ea0e6c7caf8e5a5638d0c4447a` | [30459596688 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459596688) |
+| [#755](https://github.com/silentspike/project-sentinel/issues/755) | Restore/reconciliation model and final history | `0ad0809e63736ffd2cf6533a6641dba8c3a35ad57a0bf51f7bdb4a27f98bdd25` | [30459596952 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459596952) |
+| [#659](https://github.com/silentspike/project-sentinel/issues/659) | Native parent and exact #766 package | `10f2edb85c08f8a9d78ee8afceb24a863ee612f1aa67f80753178b5c036d85c7` | [30459633400 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459633400) |
+| [#705](https://github.com/silentspike/project-sentinel/issues/705) | Shuttle/Stateright/Turmoil necessity decision | `238c8f2bbf845e1f84f123d218adcdea49ec489c2d49b09df7dc5c4ad733715f` | [30459637177 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459637177) |
+| [#656](https://github.com/silentspike/project-sentinel/issues/656) | Approved test-dependency pins and upgrades | `8bd019a4487c1100c902661a6daef575f165ecda45b41de2b1ff61182474e660` | [30459626928 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459626928) |
+
+Closed #393, #498, and #693 were not rewritten or relabeled. Their public
+follow-up comments record [Kani scope](https://github.com/silentspike/project-sentinel/issues/393#issuecomment-5118916800),
+[CAS ownership](https://github.com/silentspike/project-sentinel/issues/498#issuecomment-5118917093),
+and [work-execution ownership](https://github.com/silentspike/project-sentinel/issues/693#issuecomment-5118917371).
+
+The source issue [#719](https://github.com/silentspike/project-sentinel/issues/719)
+contains the reciprocal decision/owner matrix, body SHA-256
+`3bac15ae3ba19012427cd921557adb9bc3b7230d42b6b4f9475ee4b6dbf165aa`,
+and fresh [30459880721 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30459880721).
+
 ### POST_M0 decision gate: symbolic specifications and trace-derived schedules
 
 After #653/#556 stabilizes its state/action vocabulary, compare the maintenance
@@ -968,15 +1019,15 @@ and explicit operator promotion into regression fixtures.
 | AC-2 landscape | PASS | Eight candidates, ten-factor rubric, scores, shortlist, and rejection reasons. |
 | AC-3 pinned deep reviews | PASS | Five shortlisted systems plus the required pinned Go 1.26.5 language-lane review cover implementation, tests, failures/limits, security/license, and operations. |
 | AC-4 mechanism matrix | PASS | Mechanism and dependency/resource matrices cover correctness, failures, determinism, 1:n, security, maintenance, dependency, and boundary. |
-| AC-5 one decision per mechanism | PENDING ORC APPROVAL | D1-D11 each has one decision and rejected alternatives; the Go proof boundary and absence of upstream timing claims are explicit. |
-| AC-6 implementation owners | PENDING ORC APPROVAL | Collision-safe epic A with complete A0/A1/A2 children and deltas B-F exists, but no GitHub mutation is permitted before approval. |
-| AC-7 classification | PENDING OWNER ACKNOWLEDGEMENT | Every finding is classified; owner routing is proposed but not yet acknowledged/materialized. |
-| AC-8 public study | PASS candidate | One English/ASCII file; focused public-safety, link, render, typo, and diff gates are listed below. |
+| AC-5 one decision per mechanism | PASS | Maintainer review approved D1-D11, their rejected alternatives, the Go proof boundary, and the absence of upstream timing claims. |
+| AC-6 implementation owners | PASS | Quality-ready #766 with native children #767/#768/#769 and the exact A0 fan-out is live; every existing open owner delta has a fresh PASS and closed owners have provenance-only comments. |
+| AC-7 classification | PASS | Every finding retains its approved M0 class and exact live owner. No new `BLOCKS_M0` defect is asserted. |
+| AC-8 public study | PASS | One English/ASCII file; focused public-safety, link, render, typo, and diff gates are listed below. |
 | AC-N1 dependency popularity | PASS | Adoption is mechanism-specific and dependency-gated by #705. |
 | AC-N2 provenance/security/maintenance | PASS | Every deep review records pin, license, policy state, failure limits, and maintenance boundary. |
 | AC-N3 old status as proof | PASS | Closed #393/#498/#693 are explicitly historical; current source boundaries remain stated. |
 | AC-N4 runtime/timing | PASS | No runtime, VM, Rust/Cargo, deployment, or benchmark action occurred. |
-| AC-N5 accepted gap owner | PENDING ORC APPROVAL | No accepted gap is claimed closed; complete owner contracts await materialization approval. |
+| AC-N5 accepted gap owner | PASS | Every accepted gap has an open quality-ready implementation owner; no research or closed historical issue is implementation authority. |
 
 ## Reproduction and verification
 
@@ -1035,6 +1086,7 @@ Negative fixtures must reject:
 - a Rust claim about Go without a matching shared vector and Go implementation
   history, an unclassified productive task start, or a missing cancellation,
   join/error, durable-cut, or owner field;
+- a serial dependency between A1 and A2 in either direction;
 - non-ASCII text, private infrastructure, absolute paths, host/user fields,
   copied source blocks, or a closing keyword.
 
@@ -1046,7 +1098,7 @@ Negative fixtures must reject:
   implementations. Their live contracts and #710 define schedule inputs; this
   study does not claim those paths are implemented.
 - No schedule in this document was run. They are implementation-ready contracts
-  awaiting owner approval.
+  materialized in quality-ready owners, awaiting implementation evidence.
 - Turmoil filesystem and barrier APIs are unstable at the reviewed pin.
 - Stateright liveness properties require careful bounded/cycle semantics.
 - Shuttle passes are probabilistic unless an exhaustive scheduler completes
@@ -1058,5 +1110,6 @@ Negative fixtures must reject:
   network/system-call blocking; `go test -race` reports only races observed in
   executed tests. Shared vectors bind specification and implementation evidence
   but do not turn one into the other.
-- No maintainer decision, owner acknowledgement, dependency approval, TOGAF
-  mutation, or implementation issue is implied by REVIEW_READY.
+- Maintainer decisions and owner materialization are complete. Dependency
+  approval remains with #705/#656, and no TOGAF mutation or implementation is
+  implied by this research delivery.
