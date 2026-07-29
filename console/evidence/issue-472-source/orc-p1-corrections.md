@@ -26,7 +26,7 @@ expiration remain unchanged.
 | P1-5 transactional Config Apply | An owner-fenced SQLite recovery marker and filesystem journal are persisted before the first stop. Confirmed stops/spawns are tracked; publication and config persistence happen only after successful replacement. Any stop, spawn, room/projection, or persistence failure compensates the full transaction from old config/building and exact runtime snapshots. Failed compensation persists `RecoveryRequired`, fences serving/readiness/spawn, and is reconciled before startup publication. | Stop/replacement negatives, `runtime_config_recovery_survives_restart_and_blocks_startup_until_reconciled`, `recovery_block_rejects_spawn_instead_of_reconciler_resurrection`, and `config_apply_compensation_restores_old_world_runtime_config_and_marker`. |
 | P1-6 lifecycle ownership proof | Concrete adapters and the live registry remain in the private lifecycle module. Productive mutation is available only through typed owner methods; direct PID/cgroup fallback cleanup is absent. Compile-fail visibility is the language-level external bypass barrier; the AST inventory is supplementary only. | `runtime_lifecycle_visibility`; `ast_inventory_finds_no_raw_adapter_owner_outside_lifecycle_boundary`; functional startup, shift, removal, restore, config, rollback, shutdown, control, reconcile, cgroup/eBPF, and failure paths in the daemon suite. |
 | P2-1 TOGAF HTML ownership | The worker-authored HTML delta was removed. The file matches `origin/main` byte-for-byte. DEV-007 and gap Markdown say source candidate and live pending. | `git diff --exit-code origin/main -- docs/architecture/togaf-architecture-guide.html`. |
-| P2-2 temporary paths | New tests use caller-controlled temporary directories or `/work/tmp/project-sentinel`; no newly added retained `/tmp` or `/var/tmp` test path remains in the #472 delta. | Added-line scan over the owned delta, excluding unrelated integrated research documents. |
+| P2-2 temporary paths | New tests use `SENTINEL_TEST_TMP_ROOT` when supplied (the project convention is `/work/tmp/project-sentinel`) and otherwise use a writable checkout-local `target/test-tmp` fallback. No newly added retained `/tmp` or `/var/tmp` test path remains in the #472 delta. | Added-line scan over the owned delta, excluding unrelated integrated research documents; the GitHub-hosted-runner regression was fixed after its non-writable `/work/tmp` failure and the two WASM legacy-effect tests passed remotely with the fallback. |
 
 Additional lifecycle corrections retained from the earlier reviews:
 
@@ -60,6 +60,7 @@ Build-host durations and load are not runtime evidence.
 | Limbo targeted reproduction | same scoped environment, `test -p sentinel-limbo -j2 -- --test-threads=1` | PASS, 55 unit and 12 acceptance |
 | WASM feature check | `cargo remote -b 'CARGO_TARGET_DIR=/work/tmp/project-sentinel/cdx2-472-final-target CARGO_BUILD_JOBS=2' -c -- check -p sentinel-wasm --features wasm -j2` | PASS |
 | WASM feature tests | same scoped test environment, `test -p sentinel-wasm --features wasm -j2 -- --test-threads=1` | PASS, 61 unit, 62 acceptance, 2 conformance |
+| Hosted-runner temp-root regression | `cargo remote -b 'CARGO_TARGET_DIR=/work/tmp/project-sentinel/cdx2-472-ci-fix-target CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1' -c -- test -p sentinel-wasm --features wasm --lib legacy_effect -j2 -- --test-threads=1` | PASS, 2 passed, 59 filtered; no `SENTINEL_TEST_TMP_ROOT` override, exercising the checkout-local fallback |
 | Format | same scoped build environment, `fmt --all -- --check` | PASS |
 | Workspace check | same scoped build environment, `check --workspace --all-targets -j2` | PASS |
 | Workspace tests | same scoped test environment, `test --workspace -j2 -- --test-threads=1` | PASS, including daemon 368 passed/1 VM-bound ignored, Limbo 55 unit/12 acceptance, registry 3, visibility 1, and WASM 61 unit/62 acceptance/2 conformance |
@@ -101,3 +102,10 @@ only the issue-owned remote target
 11 GiB. Build-host root capacity changed to 169 GiB used and 22 GiB available
 of 190 GiB (89% used), with zero remaining #472 `cargo` or `rustc` processes.
 No foreign target or process was changed.
+
+The focused hosted-runner correction used a separate issue-owned remote target,
+`/work/tmp/project-sentinel/cdx2-472-ci-fix-target`. It was removed after the
+two feature-enabled WASM tests passed and occupied 851 MiB. Zero #472 `cargo`
+or `rustc` processes remained. Subsequent foreign build activity reduced
+build-host free capacity to 6.5 GiB; no foreign process or target was inspected,
+signaled, or removed.

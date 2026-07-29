@@ -506,7 +506,10 @@ mod tests {
     fn project_tempdir(prefix: &str) -> tempfile::TempDir {
         let root = std::env::var_os("SENTINEL_TEST_TMP_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/work/tmp/project-sentinel/sentinel-wasm-tests"));
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/test-tmp/sentinel-wasm")
+            });
         std::fs::create_dir_all(&root).unwrap();
         tempfile::Builder::new()
             .prefix(prefix)
