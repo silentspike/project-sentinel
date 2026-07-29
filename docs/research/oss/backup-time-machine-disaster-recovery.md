@@ -146,7 +146,7 @@ be reconciled rather than cloned onto a disaster host.
 | Gaia Loop `alerts.jsonl`, `state.json`, and session tree | The loop persists event scan state and alert dedupe data ([source](../../../services/sentinel-gaia-loop/src/storage.rs#L15-L83)); session index and per-session records live below the same private tree ([source](../../../services/sentinel-gaia-loop/src/config.rs#L110-L128)). | alerts/state `derived`; completed session audit records `authoritative`; active lock/process files `ephemeral` | Rebuild alerts/state from `events.db` and verify the cursor. Capture allowlisted completed session audit records encrypted and redact content policy; discard active locks. Unknown files fail registry validation rather than being copied recursively. |
 | `projection.db` and dashboard event-log CAS plane | CQRS rows are rebuilt from events; the current worker updates the external event-store offset after view work ([source](../../../crates/sentinel-projection/src/worker.rs#L118-L147)). | `derived` | #734 owns blue-green projection generations and local atomic frontiers; #736 binds the active generation to `EventTruthGeneration`. Rebuild and validate before reads; do not restore the current file as authority. |
 | `cluster_meta.redb` | Node/owner route, term, and fence state when cluster mode is enabled. | `node_local_authority` | #556 owns cluster recovery. Single-node manifests record it absent/local-only. Disaster restore never promotes stale terms, node identity, or certificates. |
-| Company workflow journal | #695 owns customer/agreement/project/work state and an execution outbox; the final durable-execution boundary is refined by #710. | `authoritative` when enabled | #695/#710 expose one digest-bound workflow-generation receipt with authority generation, operation/event/outbox/evidence frontiers, and terminal/unknown effects. P4 is an integration contract, not a second journal. |
+| Company workflow journal | #695 owns customer/agreement/project/work state and an execution outbox; the final durable-execution boundary is refined by #710. | `authoritative` when enabled | #695/#710 expose one digest-bound workflow-generation receipt with authority generation, operation/event/outbox/evidence frontiers, and terminal/unknown effects. R1 consumes that port and creates no second journal. |
 | Workbench/runtime intent | #694 owns invocation reservation, results, receipts, and restart recovery; #472/#701 own selected runtime/channel lifecycle. | durable intent `authoritative`; PIDs, pipes, cgroups, sockets, and leases `ephemeral` | Capture only invocation/effect receipts and desired intent. Kill old process trees, invalidate leases, and reconcile normally; never restore handles or process memory. |
 | `provision-ops.json` and other node-local saga markers | The daemon opens a separate provisioning journal ([source](../../../services/sentinel-daemon/src/provision_exec.rs#L72-L101)). | `node_local_authority` | Record terminal audit digest and unresolved-operation count, but do not activate old node-local operations on a disaster host. Unresolved operations require outcome probing/manual resolution. |
 | Configuration and policy | Agent definitions, topology, model catalog, work/tool profiles, service configuration, and feature enablement are outside WorldSnapshot. | `authoritative desired state` | Capture only allowlisted canonical config bytes with source commit, schema, and semantic digests. Unknown files or incompatible binary/config pairs fail closed. |
@@ -216,18 +216,18 @@ Live issue state was read on 2026-07-29.
 | [#264](https://github.com/silentspike/project-sentinel/issues/264) | Closed, verified | CAS trash/pins, immutable snapshots, ransomware recovery | Reuse immutability and CAS integrity; offline independent copies remain uncovered. |
 | [#481](https://github.com/silentspike/project-sentinel/issues/481) | Closed, verified | System-wide retention and growth controls | Reuse retention bounds; recovery retention must protect in-flight and last-known-good points. |
 | [#486](https://github.com/silentspike/project-sentinel/issues/486) | Closed, verified | Snapshot coverage documentation drift | Historical warning that a documented "complete" snapshot can omit state. |
-| [#706](https://github.com/silentspike/project-sentinel/issues/706) | Open, in progress | Supervision, dependency-aware readiness, restart budgets, quarantine | Supplies participant crash/restart and readiness semantics; P1 does not create a second supervisor. |
+| [#706](https://github.com/silentspike/project-sentinel/issues/706) | Open, in progress | Supervision, dependency-aware readiness, restart budgets, quarantine | Supplies participant crash/restart and readiness semantics; R1 does not create a second supervisor. |
 | [#707](https://github.com/silentspike/project-sentinel/issues/707) | Open, in progress | ECS schedule, deterministic barriers, snapshot/replay ordering | Owns the ECS freeze barrier and registered-resource completeness used by the product cut. |
 | [#708](https://github.com/silentspike/project-sentinel/issues/708) / [#726](https://github.com/silentspike/project-sentinel/issues/726) | Open, in progress / blocked | Accepted redb/CAS operating design and generation-safe storage epic | Supplies storage-generation vocabulary; #722 coordinates but does not redefine engine backup. |
-| [#728](https://github.com/silentspike/project-sentinel/issues/728) | Open, blocked | Versioned metadata-plus-CAS generations, staging, backup/restore, activation | Sole owner of `SealedStoreGenerationReceipt`, engine-consistent storage generations, and activation. P1 consumes its receipt. |
+| [#728](https://github.com/silentspike/project-sentinel/issues/728) | Open, blocked | Versioned metadata-plus-CAS generations, staging, backup/restore, activation | Sole owner of `SealedStoreGenerationReceipt`, engine-consistent storage generations, and activation. R1 consumes its receipt. |
 | [#729](https://github.com/silentspike/project-sentinel/issues/729) | Open, blocked | redb policies, integrity, transactions, compaction, deterministic fault harness | Sole owner of redb mechanism choice and proof. Raw open-file copying remains forbidden unless this owner proves it. |
 | [#709](https://github.com/silentspike/project-sentinel/issues/709) / [#731](https://github.com/silentspike/project-sentinel/issues/731) | Open, in progress / blocked | Accepted event truth, delivery, CQRS, and generation-safe epic | Supplies `EventTruthGeneration`; #722 consumes it as part of the whole-product manifest. |
-| [#732](https://github.com/silentspike/project-sentinel/issues/732) | Open, blocked | Canonical event envelope, append gateway, durability, schema authority | Owns event identity, generation, and durability fields; P1 does not create another event envelope. |
+| [#732](https://github.com/silentspike/project-sentinel/issues/732) | Open, blocked | Canonical event envelope, append gateway, durability, schema authority | Owns event identity, generation, and durability fields; R1 does not create another event envelope. |
 | [#733](https://github.com/silentspike/project-sentinel/issues/733) | Open, blocked | JetStream PubAck outbox and permanent consumer inbox/outcomes | Resolves authoritative in-flight stream state and effect-idempotency gaps required before a rebuild-only NATS contract is valid. |
 | [#734](https://github.com/silentspike/project-sentinel/issues/734) | Open, blocked | Projection catalog, poison lane, blue-green generations | Owns projection generation/rebuild/activation and readiness. |
 | [#735](https://github.com/silentspike/project-sentinel/issues/735) | Open, blocked | Idempotent durable EpisodeProducer projection | Owns the event-to-Hippocampus effect frontier. |
-| [#736](https://github.com/silentspike/project-sentinel/issues/736) | Open, blocked | Consumer catalog, retention frontiers, `EventTruthGeneration`, backup/recovery | Sole owner of WAL-aware event/projection cut and event-retention claims; P1 consumes the receipt. |
-| [#710](https://github.com/silentspike/project-sentinel/issues/710) | Open, in progress | Cross-store durable execution, external-effect outcomes, workflow journaling | Owns durable-execution cut/effect semantics. P4 refines #695 through this contract and never becomes another workflow engine. |
+| [#736](https://github.com/silentspike/project-sentinel/issues/736) | Open, blocked | Consumer catalog, retention frontiers, `EventTruthGeneration`, backup/recovery | Sole owner of WAL-aware event/projection cut and event-retention claims; R1 consumes the receipt. |
+| [#710](https://github.com/silentspike/project-sentinel/issues/710) | Open, in progress | Cross-store durable execution, external-effect outcomes, workflow journaling | Owns durable-execution cut/effect semantics. R1 consumes the #695/#710 port and never becomes another workflow engine. |
 | [#472](https://github.com/silentspike/project-sentinel/issues/472) / [#701](https://github.com/silentspike/project-sentinel/issues/701) / [#694](https://github.com/silentspike/project-sentinel/issues/694) | Open, review / blocked / in progress | Runtime selection, cancellable channel, durable Workbench intent and receipts | Restore consumes durable intent/outcomes, rejects raw handles, and reconciles through their production lifecycle. |
 | [#556](https://github.com/silentspike/project-sentinel/issues/556) | Open, ready | Cluster GA, backup, stale identity/term rejection | Owns cluster cold recovery and N-node claims, not single-node M0 recovery. |
 | [#650](https://github.com/silentspike/project-sentinel/issues/650) | Open, blocked | Single-node M0 product acceptance | Owns final runtime acceptance and must acknowledge the M0 recovery class. |
@@ -237,7 +237,7 @@ Live issue state was read on 2026-07-29.
 | [#705](https://github.com/silentspike/project-sentinel/issues/705) | Open, blocked | Dependency necessity/ownership | Mandatory gate before restic or any other dependency is introduced. |
 | [#656](https://github.com/silentspike/project-sentinel/issues/656) | Open, backlog | Upgrade ownership | Owns future version/pin/update policy for accepted dependencies. |
 
-The ownership split is binding for the proposed work below: P1 owns only product
+The ownership split is binding for the proposed work below: R1 owns only product
 coordination, coverage, participant receipts, and manifest/envelope authority.
 Engine-consistent redb/CAS generations come from #728/#729; event, NATS, consumer,
 projection, and frontier generations come from #732-#736; workflow/effect
@@ -535,15 +535,15 @@ avoid silently combining incompatible approaches.
 
 | ID | Sentinel mechanism | Decision | Rationale | Rejected alternatives |
 |---|---|---|---|---|
-| D1 | Whole-product application-consistent cut and validity | **Reimplement minimal** | P1 owns the coordinator, signed coverage/participant registry, prepare/drain receipts, and publish-last envelope. It consumes owner-supplied generations rather than implementing engines. | restic/Velero/ZFS as cut authority; one in-process mutex; filesystem copy while live |
+| D1 | Whole-product application-consistent cut and validity | **Reimplement minimal** | R1 owns the coordinator, signed coverage/participant registry, prepare/drain receipts, and publish-last envelope. It consumes owner-supplied generations rather than implementing engines. | restic/Velero/ZFS as cut authority; one in-process mutex; filesystem copy while live |
 | D2 | Existing world Time Machine and bounded replay | **Keep Sentinel** | It already models domain state, dead branches, projection seed, and runtime reconciliation. | Replace with generic file rollback or CRIU |
-| D3 | SQLite event/projection generation | **Port algorithm/contract** | #736 owns the WAL-aware `EventTruthGeneration`; it may port Litestream continuity, gap, temp-file, fsync, and failure invariants. P1 consumes the sealed receipt and cannot create a competing SQLite activation authority. | Direct live-file copy; one Litestream daemon per DB; P1-owned SQLite adapter |
-| D4 | redb/CAS store generation | **Keep Sentinel** | #728/#729 exclusively decide and prove the redb mechanism and emit `SealedStoreGenerationReceipt`. P1 records the receipt. Raw copying of an open redb file is forbidden unless the pinned redb contract proves that exact operation. | A vague "short transaction" promise; P1-owned redb adapter; filesystem snapshot as logical consistency |
+| D3 | SQLite event/projection generation | **Port algorithm/contract** | #736 owns the WAL-aware `EventTruthGeneration`; it may port Litestream continuity, gap, temp-file, fsync, and failure invariants. R1 consumes the sealed receipt and cannot create a competing SQLite activation authority. | Direct live-file copy; one Litestream daemon per DB; R1-owned SQLite adapter |
+| D4 | redb/CAS store generation | **Keep Sentinel** | #728/#729 exclusively decide and prove the redb mechanism and emit `SealedStoreGenerationReceipt`. R1 records the receipt. Raw copying of an open redb file is forbidden unless the pinned redb contract proves that exact operation. | A vague "short transaction" promise; R1-owned redb adapter; filesystem snapshot as logical consistency |
 | D5 | Sealed bundle remote/offline transport | **Integrate** | restic has the best external boundary for encryption, dedup, check, retention, and backend diversity. #705 must approve the dependency and privilege model first. | Embed restic code; make Borg/Kopia simultaneous dependencies |
 | D6 | Recovery lifecycle, finalization, partial failure, and ordered resources | **Port algorithm/contract** | Velero's durable phase and ordering model maps well without Kubernetes. | Boolean success flag; unbounded shell hooks; Velero dependency |
 | D7 | Host filesystem snapshots | **Reject** | They are neither portable nor application-consistent and cannot be an M0 prerequisite. | Require OpenZFS/btrfs; call a VM snapshot a product backup |
 | D8 | Runtime process checkpoint | **Reject** | Old PIDs, sockets, leases, process memory, and credentials must not regain authority after disaster restore. | CRIU restore or microVM-memory restore as canonical state |
-| D9 | Projections and NATS delivery state | **Keep Sentinel** | #733/#734/#736 own PubAck, inbox/outcome, consumer, projection-generation, replay, and frontier contracts. P1 restores their receipts, recreates streams, rebuilds projections, and verifies watermarks. | Restore `projection.db` or broker ACK cursors as authority; skip to `MAX(id)` |
+| D9 | Projections and NATS delivery state | **Keep Sentinel** | #733/#734/#736 own PubAck, inbox/outcome, consumer, projection-generation, replay, and frontier contracts. R1/R3 consume their receipts, recreate streams, rebuild projections, and verify watermarks. | Restore `projection.db` or broker ACK cursors as authority; skip to `MAX(id)` |
 | D10 | Release, credentials, and recovery trust | **Reimplement minimal** | Use one independent trust plane: an encrypted dual-control recovery escrow plus an independently durable Ed25519-signed release registry. The data bundle contains immutable references only; current revocation and anti-rollback catalog win. | Secret bytes in the data bundle; unsigned binaries by digest alone; stale backed-up trust; optional "secret bundle or references" fork |
 | D11 | Recovery drills and evidence | **Reimplement minimal** | Sentinel-specific cut, corruption, restore, restart, and business invariants need a first-party harness. | Claim RPO/RTO from upstream or build-server timings |
 
@@ -566,7 +566,6 @@ RecoveryPointManifestV1 {
   recovery_point_id
   recovery_sequence
   scope                         // single_node | cluster
-  state                         // sealed_local | verified_offsite
   created_at_utc
   coverage_catalog_digest
   participant_catalog_digest
@@ -666,12 +665,6 @@ RecoveryPointManifestV1 {
     secret_bytes_absent
   }
 
-  transport {
-    bundle_format
-    repository_id
-    encryption_key_reference
-  }
-
   bundle_sha256
 }
 
@@ -692,6 +685,35 @@ RecoveryPointEnvelopeV1 {
     signed_at_utc
     signature
   }
+}
+
+RecoveryCopyReceiptV1 {
+  domain_separator             // "project-sentinel/recovery-copy-receipt/v1"
+  schema_version
+  receipt_id
+  recovery_point_id
+  recovery_envelope_sha256
+  repository_id
+  backend_type
+  object_id
+  object_version
+  encryption_key_reference
+  uploader_principal
+  upload_outcome
+  uploaded_at_utc
+  verifier_principal
+  verification_outcome
+  verified_at_utc
+  logical_bytes
+  stored_bytes
+  content_root
+  retention_policy_id
+  immutability_evidence
+  previous_receipt_sha256
+  supersedes_receipt_id
+  authority_generation
+  signer_key_id
+  signature
 }
 ```
 
@@ -715,6 +737,22 @@ The signed release registry is the only binary source. A restore fetches the
 referenced release set and verifies its Ed25519 manifest, product commit, artifact
 hashes, SBOM, provenance, and compatibility profile. Binaries are not assumed
 available merely because their digests occur in a data manifest.
+
+`RecoveryPointManifestV1` and `RecoveryPointEnvelopeV1` form one immutable local
+seal. They never contain mutable transport state and are never rewritten after
+publication. R2 appends independently authenticated `RecoveryCopyReceiptV1`
+children. Each receipt signature covers every field above, including the parent
+envelope digest, object/version, key reference, principals, outcomes, byte counts,
+content root, retention evidence, authority generation, and receipt chain.
+Conflicting receipts or an invalid supersession chain are rejected.
+
+Recovery class is a derived view over immutable evidence and current policy:
+`SealedLocal` requires a valid local envelope; `VerifiedOffsite` additionally
+requires a current successful copy receipt whose repository, key, retention,
+immutability, verifier separation, and authority generation satisfy policy. A later
+loss/tombstone receipt removes the offsite class and offsite readiness/RPO claim but
+does not change the local envelope or its cryptographic integrity. Numeric RPO/RTO,
+offline-copy requirements, and drill cadence remain unapproved #650 policy inputs.
 
 ### 8.2 Bootstrap journal and durable coordinator state
 
@@ -753,13 +791,24 @@ Idle
   -> Validating
   -> Sealing
   -> SealedLocal
-  -> Releasing
-  -> Exporting
-  -> VerifyingOffsite
-  -> Restorable
+  -> ReleaseDecided
+  -> ValidationOnly
+  -> ReleaseAcknowledged
+  -> ReadinessCASCommitted
+  -> Ready
 
 Any pre-seal phase -> Aborting -> Aborted | ManualRecoveryRequired
 Any post-seal validation failure -> Quarantined
+Any missing/conflicting release acknowledgement -> ManualRecoveryRequired
+
+CopyIdle
+  -> Uploading
+  -> Uploaded
+  -> IndependentlyVerifying
+  -> CopyReceiptAppended
+  -> CopyClassRecomputed
+
+Any copy failure/loss -> CopyFailureReceiptAppended -> CopyClassRecomputed
 ```
 
 On total host loss, an authenticated recovery operator may create a new empty
@@ -811,7 +860,7 @@ The required participant and dependency registry is:
 
 | Order and participant | Current writer/source evidence | Prepare and drain responsibility | Prepared receipt dependency |
 |---|---|---|---|
-| 0. `recovery-coordinator` | New P1 owner; no product-wide coordinator exists today. | Persist request, validate signed catalogs, assign generation, collect receipts, authorize capture, and alone release/abort. | Journal durable before any participant message. |
+| 0. `recovery-coordinator` | New R1 owner; no product-wide coordinator exists today. | Persist request, validate signed catalogs, assign generation, collect receipts, authorize capture, and alone release/abort. | Journal durable before any participant message. |
 | 1. `gateway-admission` | Provider calls start in the Gateway pipeline ([source](../../../cmd/cortex-gateway/internal/proxy/pipeline.go#L685-L700)); in-flight tracking is configured separately ([source](../../../cmd/cortex-gateway/main.go#L244-L255)). | Reject new billable/provider work, drain admitted calls to durable result/outcome, and freeze Observatory writes. | Coordinator prepared; receipt includes active call count, outcome frontier, and Observatory cursor. |
 | 1. `workflow-api-dispatcher` | #695 owns customer/governance mutations and execution outbox; #710 owns cross-store effects. | Reject new mutations/dispatch, finish current local transaction, and durably classify pending/unknown effects. | Coordinator prepared; #695/#710 generation available. |
 | 1. `workbench-runtime-dispatcher` | #694 owns invocation reservation/results; #472/#701 own runtime launch/channel. | Stop new launches, cancel or durably classify executing invocations, preserve receipts, and expose no raw handle. | Workflow admission closed; durable intent/effect frontier available. |
@@ -836,10 +885,20 @@ and maximum waves bound the process; non-convergence aborts rather than producin
 cut.
 
 Release is dependency-reversed after `SealedLocal` or a durable abort. Store
-adapters and projections reopen first for validation, then consumers/publishers,
-daemon/runtime dispatchers, workflow, and finally customer/provider admission.
-Every participant must acknowledge the same release digest before product readiness
-turns green.
+adapters and projections may enter only `ValidationOnly`: read-only opens, integrity
+checks, generation probes, and projection comparison are allowed under the same
+fence, but normal writers remain closed. No tick, store mutation, outbox publish,
+consumer effect, runtime launch, workflow mutation, customer request, or provider
+call reopens in stages.
+
+The coordinator first commits one durable `ReleaseV1` decision for the fence
+generation. Every required participant must persist and acknowledge that exact
+decision digest while remaining fenced. After all generation/probe results and ACKs
+match, the coordinator performs one final compare-and-swap from
+`ReleaseAcknowledged` to `ReadinessCASCommitted`. That CAS is the sole permission
+for participants to reopen normal admission. A crash resumes the same fenced
+decision. Missing, stale, or conflicting ACKs remain fail-closed and move to
+`ManualRecoveryRequired`; no partial release is inferred from process liveness.
 
 ### 8.4 Application-consistent capture
 
@@ -861,7 +920,7 @@ The cut is a bounded fenced saga, not distributed 2PC:
 6. Create WorldSnapshot under the #707 ECS barrier and verify its CAS pins before
    using its ID.
 7. Ask #728/#729 owners for sealed storage-generation receipts and #736 for the
-   WAL-aware `EventTruthGeneration` receipt. P1 never reads an open redb/SQLite file
+   WAL-aware `EventTruthGeneration` receipt. R1 never reads an open redb/SQLite file
    as a shortcut.
 8. Ask #695/#710 for the workflow/effect generation and #694 for durable runtime
    intent. Verify no external effect can be replayed merely by restoring local state.
@@ -880,10 +939,14 @@ The cut is a bounded fenced saga, not distributed 2PC:
 13. Encode `RecoveryPointManifestV1`, then write/sign
     `RecoveryPointEnvelopeV1` through temporary file, file sync, rename, and parent
     sync. The authenticated envelope is the publish-last marker.
-14. Record `SealedLocal`, issue dependency-reversed `ReleaseV1`, and require all
-    acknowledgements before readiness. Export only the immutable sealed directory.
-15. Verify transport repository data and a staged restore before setting
-    `VerifiedOffsite`; transport success alone cannot upgrade recovery validity.
+14. Record the immutable local seal, commit one dependency-reversed `ReleaseV1`,
+    admit only `ValidationOnly`, collect every matching durable ACK, validate all
+    generations/probes, and commit the final readiness CAS before any normal writer
+    reopens.
+15. R2 may later export only the immutable sealed directory. Upload and independent
+    verification append `RecoveryCopyReceiptV1`; they never edit the local manifest.
+    Recovery class and offsite readiness are recomputed from valid receipts and
+    current policy.
 
 If any pre-seal step fails, no recovery point is advertised. Immutable partial
 artifacts are journaled for later bounded cleanup. A pin leak or undeleted staging
@@ -926,13 +989,16 @@ A disaster restore never mutates the only remaining source bundle:
 11. Kill any surviving old process tree. Reconcile desired runtime intent through
     #472/#701/#694, reissue all service/provider/TLS credentials from current trust,
     and reject stale leases or caller tokens.
-12. Run participant readiness in dependency order: stores, projections, consumers,
-    publishers, daemon/runtime, workflow, then customer/provider admission. Positive
-    and negative business probes must match the manifest generation.
+12. Enter `ValidationOnly` for staged stores and projections while every normal
+    writer, tick, publisher, effect consumer, runtime, workflow, customer, and
+    provider admission remains fenced. Positive and negative probes must match the
+    manifest generation without producing normal effects.
 13. Record and sign a restore receipt with envelope/release IDs, activated
     generations, consumer/projection frontiers, credential generation, unresolved
-    manual work, and invariant results. Advance the independent anti-rollback
-    catalog only after verification, then release admission.
+    manual work, and invariant results. Commit one durable release decision, collect
+    the same decision ACK from every participant, and then perform one final
+    readiness CAS. Only that CAS reopens normal admission. Advance the independent
+    anti-rollback catalog only after this verification.
 
 On failure, stop and keep the fence. If the old local generation is intact, the
 journal may switch back only to that complete verified generation and rerun all
@@ -949,7 +1015,7 @@ the named owner accepts them:
 | Class | Purpose | Required recovery point | Proposed RPO | Proposed RTO | Approval state and M0 class |
 |---|---|---|---|---|---|
 | `TM_LOCAL` | Operator Time Machine rollback on an intact host | Valid WorldSnapshot and CAS pins | Snapshot interval; no disk-loss claim | Existing in-process target only after current-head measurement | Unapproved measurement target; `M0_HARDENING` mechanics owned by #250/#264 |
-| `M0_SINGLE_NODE_DR` | Loss/corruption of the product data directory holding authoritative customer work | `VerifiedOffsite` signed whole-product envelope plus independent release/trust inputs | At most 15 minutes | At most 60 minutes | Unapproved policy proposal; #650/product owner must decide separately from D1-D11 |
+| `M0_SINGLE_NODE_DR` | Loss/corruption of the product data directory holding authoritative customer work | Immutable signed local envelope plus a current valid `RecoveryCopyReceiptV1` and independent release/trust inputs | At most 15 minutes | At most 60 minutes | Unapproved policy proposal; #650/product owner must decide separately from D1-D11 |
 | `OFFLINE_SECURITY` | Ransomware/operator credential compromise | Independently administered immutable/offline copy plus surviving escrow/catalog | At most 24 hours | At most 4 hours | Unapproved policy proposal; `M0_HARDENING` mechanism for production customer work |
 | `CLUSTER_RECOVERY` | Node loss, quorum recovery, geo recovery | Quorum-accepted RecoveryPoint and stale-term/cert rejection | Defined by #556 | Defined by #556 | Not decided here; `POST_M0` for the single-node product |
 
@@ -957,7 +1023,7 @@ Approving D1-D11 does not approve `15 min`, `60 min`, or any schedule above. A
 lower RPO increases capture frequency, remote bandwidth, retained objects, signing
 operations, and restore-plan complexity.
 
-Required drills:
+Proposed drill inputs for separate #650/product-owner approval:
 
 - every RecoveryPoint: canonical manifest, all file hashes, all CAS references,
   engine open/integrity checks, cursor coherence;
@@ -991,7 +1057,12 @@ Failure-injection matrix:
 | JetStream stream/consumer data lost | Recreate from `EventTruthGeneration` and permanent outcomes; if an authoritative in-flight Judge effect lacks them, the point is not restorable. |
 | Workflow evidence/assignment authority mismatch | Item remains blocked; no completion or duplicate action. |
 | Runtime crash during restore | Old process tree is killed/reaped; desired intent is reconciled once by idempotency key. |
+| Crash after durable Release but before all participant ACKs | Restart remains fenced, resumes the same decision digest, and cannot reopen any normal writer. |
+| One participant ACKs another Release digest or generation | Coordinator enters `ManualRecoveryRequired`; every participant remains fenced and the final readiness CAS fails. |
+| Crash immediately before or after final readiness CAS | CAS is idempotent and generation-bound; before it no normal admission opens, after it all participants observe the same committed generation. |
 | Envelope/digest pair replaced with an older valid bundle | Independent catalog rejects recovery sequence, predecessor, authority, or release generation rollback. |
+| Copy receipt forged, replayed, cross-parent, or signed by a stale authority | Derived offsite class remains false; the immutable local envelope is unchanged. |
+| Remote object is lost after a valid copy receipt | An authenticated append-only loss/supersession receipt removes offsite readiness/RPO without rewriting or invalidating the local seal. |
 | Release registry unavailable, artifact unsigned, or SBOM/provenance mismatch | Restore stays fenced; a digest-only local binary is not accepted. |
 | Recovery escrow missing, unlock material lost, or backed-up principal revoked | Restore stays fenced; trust owner must recover the independent escrow/catalog and reissue credentials. |
 | Remote repository unavailable | `SealedLocal` can remain valid locally but does not satisfy an offsite RPO class. |
@@ -1007,13 +1078,13 @@ the declared runtime target. This research defines no benchmark result.
 |---|---|---|
 | WorldSnapshot is not a whole-product recovery point | `M0_HARDENING` | Cross-store table above; proposed coordinator contract, final acceptance #650 |
 | CAS references are retained but blob bytes have no complete sealed/offsite bundle | `M0_HARDENING` | `FsMetadataDump` contains references only; #264 plus proposed bundle contract |
-| Control-plane, memory, evolution, nightrun, Observatory, Gaia Loop audit, config, and trust are outside Time Machine | `M0_HARDENING` | Complete section 3.2 registry; P1/P2 plus existing engine owners |
+| Control-plane, memory, evolution, nightrun, Observatory, Gaia Loop audit, config, and trust are outside Time Machine | `M0_HARDENING` | Complete section 3.2 registry; R0/R1 plus existing engine owners |
 | `SENTINEL_JUDGE` can hold the only in-flight effect and current delivery lacks permanent PubAck/inbox outcomes | `M0_HARDENING` | Current bridge/consumer source; #733/#736 |
-| No executable multi-process prepare/drain/release protocol exists | `M0_HARDENING` | Current writers span Gateway, daemon, projection, NATS, Judge, Nightrun, and future workflow; P1 composes #706/#707/#710 |
-| Workflow journal/effect cut needs recovery integration | `M0_HARDENING` | #695 owns the journal and #710 owns cross-store effects; P4 refines them instead of creating a journal |
-| Engine-consistent redb/CAS/SQLite generations are not P1 work | `M0_HARDENING` | Accepted #726/#728/#729 and #731/#736 contracts; P1 waits for sealed receipts |
+| No executable multi-process prepare/drain/release protocol exists | `M0_HARDENING` | Current writers span Gateway, daemon, projection, NATS, Judge, Nightrun, and future workflow; R1 composes #706/#707/#710 |
+| Workflow journal/effect cut needs recovery integration | `M0_HARDENING` | #695 owns the journal and #710 owns cross-store effects; R1 consumes their port instead of creating a journal |
+| Engine-consistent redb/CAS/SQLite generations are not R1 work | `M0_HARDENING` | Accepted #726/#728/#729 and #731/#736 contracts; R1 waits for sealed receipts |
 | Projection file should remain derived and generation-bound | `M0_HARDENING` | Current worker offset boundary; #734/#736 own local frontier and activation |
-| Manifest authentication, release availability, and anti-rollback need independent authorities | `M0_HARDENING` | Current binary manifest is digest-only; D10/P2 define signed registry plus encrypted recovery escrow |
+| Manifest authentication, release availability, and anti-rollback need independent authorities | `M0_HARDENING` | Current binary manifest is digest-only; D10/R0 define signed registry plus encrypted recovery escrow |
 | Stale runtime handles and credentials must not be restored | `M0_HARDENING` | Existing teardown/respawn and CRIU negative review; #472/#701/#694 and D10 |
 | Numeric `15 min`/`60 min` targets | `M0_HARDENING` policy proposal, not approved | Measurement proposal only; #650/product-owner decision is separate from mechanism approval |
 | Mandatory ZFS/btrfs substrate | `POST_M0` | Optional defense only; product portability wins |
@@ -1025,194 +1096,209 @@ lacks. The listed hardening contracts must be owned and proved before a whole-pr
 DR claim. #650 must separately decide whether the proposed
 `M0_SINGLE_NODE_DR` numbers become binding before production acceptance.
 
-## 11. Proposed implementation issue contracts
+## 11. Ordered implementation issue contracts
 
-Per the research issue, these contracts are proposals for ORC review. They are not
-live issues and must not be materialized before the synthesis is approved.
+ORC approved D1-D11 and authorized one acyclic M0 whole-product-recovery epic.
+The implementation order is strict:
 
-### P1. M0 RecoveryPoint coordinator and coverage registry
+```text
+R0 independent recovery authority and signed-release retrieval
+  -> R1 local RecoveryPoint coordinator and immutable seal
+  -> R2 immutable offsite copy transport and verification
+  -> R3 whole-product restore runner and drills
+  -> R4 coverage, retention, and health
+  -> #650 product acceptance and separate policy decisions
+```
 
-**Class:** `M0_HARDENING`
+R0-R4 are the only new implementation children. Existing engine, event, workflow,
+runtime, release-production, retention, and supervision owners receive narrow
+reciprocal deltas instead of parallel authorities. #650 is downstream acceptance
+and numeric-policy ownership, never a prerequisite for implementing R0-R4.
 
-**Depends on:** #706 supervision/readiness protocol; #707 ECS barrier; #728/#729
-storage-generation receipts; #732-#736 event/delivery/projection receipts; #695/#710
-workflow/effect receipt; #472/#701/#694 runtime intent; #696 signed release set; P2
-recovery trust/transport; #650 product acceptance.
+### R0. Independent recovery authority and signed-release retrieval
 
-**Scope:** only whole-product coordination: signed coverage/participant catalogs,
-fixed bootstrap journal, `PrepareCaptureV1`/`DrainV1`/`PreparedReceiptV1`/
-`ReleaseV1`, receipt composition, manifest/envelope authority, publish-last seal,
-and readiness. P1 does not implement redb/SQLite/CAS adapters, event/projection
-activation, workflow journaling, runtime lifecycle, release production, or a secret
-store.
+**Class and target:** `M0_HARDENING`; code/fake gates use `NONE`, final integration
+and benchmarks use `SINGLE_NODE` only after separately authorized runtime work.
 
-**Acceptance contract:**
+**Depends on:** #696's versioned signed-release publication port and an assigned
+security/operations authority. R0 has no dependency on R1-R4, #650 acceptance, a
+product-data bundle, or the restic decision.
 
-- every enabled service, store, stream, and consumer is registered exactly once;
-  unknown/uncovered declarations fail capture and DR readiness;
-- participant protocol closes the real process admission boundary, performs bounded
-  fixed-point drain, rejects stale/digest-conflicting generations, and releases only
-  by coordinator authority;
-- coordinator and participant crash, timeout, missing abort ACK, and restart at
-  every transition resume, abort, or enter manual recovery without a false point or
-  automatic admission reopen;
-- the fixed bootstrap journal meets path/schema/permissions/WAL/FULL/fsync,
-  non-recursive backup, and total-host-loss bootstrap contracts from section 8.2;
-- #728/#729, #736, #695/#710, and #694 receipts are consumed through narrow
-  conformance ports and cannot be replaced by direct file access;
-- `RecoveryPointEnvelopeV1` Ed25519 golden vectors bind payload, sequence, chain,
-  release floor, and authority generation; tamper, signer revocation, catalog
-  rollback, and bundle-plus-digest replacement fail;
-- request-id/digest retries are idempotent and conflicts are typed;
-- no arbitrary paths, secret bytes, derived projection authority, or live runtime
-  handles enter the manifest;
-- automated tests cover participant order, fixed-point non-convergence, owner
-  receipt mismatch, CAS pin window, disk full, fsync/rename, schema mismatch, and
-  signed-envelope publication;
-- target-runtime tests and benchmarks are token-free and issue-specific;
-- rollout is default-off and observe-only until every required owner receipt exists,
-  then shadow prepare/abort, local seal-only, and finally offsite-required;
-- rollback disables new capture while preserving old verified points;
-- TOGAF delta distinguishes WorldSnapshot, owner generations, participant cut,
-  signed RecoveryPoint, and independently surviving recovery authorities.
+**Scope:** `RecoveryAuthorityPortV1`, current signer/revocation/anti-rollback
+catalog, dual-control escrow, key ceremony, break-glass/audit, and
+`SignedReleaseRetrievalPortV1`. #696 produces signed releases; R0 retrieves and
+validates them. The versioned port breaks any #696/#722 staging cycle.
 
-### P2. Independent bundle transport, recovery escrow, and release retrieval
+**Negative/failure contract:** unknown/revoked/stale signer, rollback catalog,
+missing escrow quorum, lost key/authority, unsigned artifact, wrong SBOM/provenance,
+or incompatible release remains fail-closed. Restart between catalog/escrow/release
+steps cannot weaken trust. Fakes are deterministic and hold no production secret.
 
-**Class:** `M0_HARDENING`
+**Delivery:** default off; token-free conformance first; rollout to read-only trust
+verification before restore authority. Rollback disables retrieval without trusting
+backed-up credentials. Benchmarks measure catalog/release verification on the
+declared target, never build time. TOGAF target delta defines the independent
+recovery authority and release source, but this issue does not edit TOGAF.
 
-**Depends on:** P1; #696 signed release publication; a #705 transport/crypto
-dependency decision; #656 upgrades; an ORC-assigned security/operations owner for
-the encrypted recovery escrow.
+### R1. Local RecoveryPoint coordinator and immutable seal
 
-**Scope:** external sealed-bundle transport, evaluated restic integration,
-independent immutable/offline copy, separately administered encrypted recovery
-escrow/catalog, signed-release registry retrieval, privilege separation,
-verification, retention, prune safety, and restore-to-quarantine. It does not sign
-releases for #696 or store product secrets in the data repository.
+**Class and target:** `M0_HARDENING`; `SINGLE_NODE` for final capture/protocol
+validation and pause/seal benchmarks.
 
-**Acceptance contract:**
+**Depends on:** R0 interfaces; #706 supervision; #707 ECS barrier; #728/#729 storage
+generation; #732-#736 event/delivery/projection generation; #695/#710
+workflow/effect receipt; and #472/#701/#694 runtime intent. It does not depend on R2
+transport or #650 acceptance.
 
-- transport receives only a read-only sealed directory and expected manifest digest;
-- backup and prune/delete principals are separated where the backend permits;
-- recovery escrow uses dual control, separate keys/principals/retention/audit, and
-  provides current revocation plus anti-rollback catalog; no escrow secret appears
-  in a RecoveryPoint;
-- lost data key, lost escrow unlock material, lost authority catalog, revoked signer,
-  compromised delete credential, backend rollback, corrupt pack, and retention race
-  all have fail-closed runbooks and tests;
-- signed release retrieval verifies Ed25519 manifest, product commit, artifacts,
-  SBOM, provenance, and compatibility; a digest-only binary is rejected;
-- a second operator restores and verifies the bundle, release, and trust inputs
-  without access to the creator's live credentials;
-- benchmarks measure product bundle sizes and target runtime, not upstream claims;
-- rollback removes the transport adapter while preserving local signed envelopes;
-  it cannot weaken escrow, signature, or anti-rollback policy.
+**Scope:** coverage/participant catalogs, fixed bootstrap journal,
+`PrepareCaptureV1`/`DrainV1`/`PreparedReceiptV1`, immutable
+`RecoveryPointManifestV1`/`RecoveryPointEnvelopeV1`, one durable Release/Abort
+decision, `ValidationOnly`, participant ACK collection, and final readiness CAS.
+R1 consumes owner ports and never selects engine copy/activation mechanisms.
 
-### P3. Whole-product restore runner and disaster drills
+**Negative/failure contract:** uncovered plane, arbitrary path, secret byte, stale
+generation, receipt mismatch, one-process mutex, fixed-point non-convergence,
+disk/fsync/rename failure, coordinator/participant crash, missing/conflicting
+Release ACK, or restart during release stays fenced. No normal writer, tick, effect,
+runtime, workflow, customer, or provider admission opens before the final CAS.
 
-**Class:** `M0_HARDENING`
+**Delivery:** default off -> catalog observation -> shadow prepare/abort -> local
+seal -> authorized scheduling. Rollback disables new captures and durably
+aborts/releases the active generation while retaining prior points. Benchmarks
+measure pause/seal, participant drain, bytes, and CPU/IO sidecars. TOGAF target delta
+defines WorldSnapshot versus owner generations, product cut, local envelope, and
+readiness CAS.
 
-**Depends on:** P1, P2, #728/#729 complete storage generations, #732-#736 complete
-event/delivery/projection generations, #695/#710 workflow/effect generation,
-#472/#701/#694 durable runtime intent, and #696 signed release/delivery lineage.
+### R2. Immutable offsite copy transport and verification
 
-**Scope:** quarantine, compatibility validation, staged restore, generation swap,
-JetStream recreation, projection rebuild, trust refresh/rotation, runtime
-reconciliation, business probes, signed restore receipt, and scheduled drills.
+**Class and target:** `M0_HARDENING`; `SINGLE_NODE` for final copy/verification
+integration and declared-target measurements.
 
-**Acceptance contract:**
+**Depends on:** R1 immutable local envelope; #705 exact restic dependency/privilege
+decision; #656 version/update ownership; and R0 authority/key interfaces. It does
+not mutate R1 artifacts.
 
-- exact restore order in section 8.5 is encoded as a versioned state machine;
-- failpoints before/after every store replacement and projection/runtime transition
-  prove restart recovery;
-- wrong tenant/owner generation, revoked signer/principal, rollback sequence,
-  missing release/SBOM/provenance, missing evidence artifact/CAS blob, stale runtime
-  lease, corrupt envelope, incompatible schema, and missing owner receipt fail closed;
-- JetStream definitions are recreated from `EventTruthGeneration`, durable consumers
-  start from local outcome frontiers, eBPF starts empty, and no unbacked Judge effect
-  can disappear or repeat;
-- successful drill proves customer agreement/project/work state, event/outbox
-  PubAck/inbox/outcome idempotency, artifact ownership, Gaia pair, Observatory,
-  projections, runtime restart, and no duplicate external action through
-  deterministic fakes;
-- rollout runs first in an isolated authorized target; rollback retains the prior
-  local generation and verified source point;
-- RPO/RTO measurements include sidecars and exact envelope/release/generation
-  identities but do not claim the proposed values are approved.
+**Scope:** read-only sealed-directory upload, independent verification, separated
+upload/delete/verifier principals, append-only signed `RecoveryCopyReceiptV1`,
+retention/immutability evidence, supersession/tombstone chain, and derived recovery
+class.
 
-### P4. Workflow and durable-execution recovery integration
+**Negative/failure contract:** live-store input, manifest rewrite, forged/replayed
+receipt, wrong parent envelope, backend/object/key mismatch, same uploader/verifier
+where policy forbids it, corrupt pack, rollback, retention race, lost remote object,
+or delete-credential compromise cannot yield `VerifiedOffsite`. Remote loss removes
+offsite readiness/RPO only; local cryptographic integrity remains valid.
 
-**Class:** `M0_HARDENING`
+**Delivery:** local mock -> read-only shadow upload -> independent verify -> policy
+gating only after #650 policy approval. Rollback removes transport while preserving
+local envelopes and append-only loss receipts. Benchmarks measure upload, verify,
+retrieve, dedup, bytes, and sidecars. TOGAF target delta separates immutable local
+seal, immutable copy receipts, and derived class.
 
-**Owner:** refine #695 and #710; do not create a second workflow-journal issue.
+### R3. Whole-product restore runner and disaster drills
 
-**Scope:** a narrow `WorkflowRecoveryPort` from the existing owner returning schema,
-transaction/event/operation cursor, authority generation, execution/effect frontier,
-outbox/evidence state, digest, and restore/reopen receipt.
+**Class and target:** `M0_HARDENING`; `SINGLE_NODE` on an explicitly authorized
+isolated target for destructive restore and drill evidence.
 
-**Acceptance contract:**
+**Depends on:** R0, R1, and R2 plus complete owner-generation ports from #728/#729,
+#732-#736, #695/#710, #472/#701/#694, and signed releases from #696 through R0.
 
-- capture is invoked only under the product fence and never accepts caller authority;
-- completion-evidence requests, authority conflicts, claimed actions, and pending
-  outbox rows remain recoverable without replaying a completed external effect;
-- restore rejects cross-tenant/project/assignment receipt replay and stale
-  organization generation;
-- unknown external outcomes are durably blocked or probed, never inferred/retried;
-- migration crash points, #695 restart tests, and #710 cross-store cut/effect tests
-  remain valid after bundle restore;
-- P4 emits a receipt and owns no activation, backup scheduler, or second journal.
+**Scope:** quarantine, envelope/copy/release verification, staged generation
+restore, JetStream recreation, projection rebuild, credential reissue, runtime
+reconciliation, `ValidationOnly` probes, one Release decision, all ACKs, final
+readiness CAS, signed restore receipt, and drills.
 
-### P5. Recovery coverage, retention, and operator health
+**Negative/failure contract:** in-place first mutation, mixed generation, invalid or
+lost copy, stale trust, unsigned/incompatible release, missing CAS/evidence,
+frontier rewind, stale runtime handle, duplicate effect, crash at every transition,
+or missing/conflicting ACK remains fenced or `ManualRecoveryRequired`.
 
-**Class:** `M0_HARDENING`
+**Delivery:** dry validation -> staged restore -> authorized full drill. Rollback
+switches only to an intact verified generation and reruns the same release protocol.
+Benchmarks measure quarantine-to-ready, projection rebuild, reconciliation, and
+p50/p95/max with sidecars; proposed RPO/RTO values are not pass thresholds until
+#650 approves them. TOGAF target delta defines restore order and final readiness.
 
-**Owner overlap:** refine #250, #264, #481, #650, and #736; materialize a new owner
-only for uncovered whole-product health aggregation.
+### R4. Recovery coverage, retention, and health
 
-**Scope:** coverage inventory, last-sealed/last-offsite age, restore-test age,
-participant health, consumer/frontier blockers, retention protection, pin leaks,
-repository/release/escrow health, typed operator status, and alerts.
+**Class and target:** `M0_HARDENING`; `SINGLE_NODE` for final health/retention soak.
 
-**Acceptance contract:**
+**Depends on:** R0-R3 as applicable and owner deltas in #250/#264/#481/#736.
+#650 supplies downstream policy values but does not block structural health work.
 
-- health names the exact uncovered/stale participant, store, stream, consumer,
-  receipt, release, or trust catalog without paths/secrets;
-- retention never removes the last verified point for each required RPO class or a
-  point referenced by an in-progress drill/restore;
-- pin leaks, disk pressure, repository check failures, and missed RPO targets are
-  observable and bounded;
-- #736's minimum safe event frontier includes every retained RecoveryPoint;
-- negative tests prove health cannot be forged by transport success, stale
-  participant receipts, digest-only binaries, or absent escrow/catalog.
+**Scope:** exact durable-plane coverage, local-seal/copy-receipt/drill age,
+participant/frontier health, retention and pin protection, repository/release/escrow
+health, derived recovery class, typed operator status, and alerts.
 
-### Owner-resolution rule
+**Negative/failure contract:** transport success alone, stale/forged receipt,
+unregistered plane, unknown consumer, missing trust/release authority, lost remote
+copy, pin leak, disk pressure, or missed proposed target cannot report green. A
+policy change recomputes class/readiness without rewriting evidence.
 
-After ORC approves the synthesis:
+**Delivery:** observe-only -> alert -> readiness policy after owner acceptance.
+Rollback returns to observe-only without deleting immutable evidence. Benchmarks
+measure health cost, retention/prune, disk growth, and outage detection on the
+declared target. TOGAF target delta defines coverage, receipt-derived class,
+retention frontier, and policy status.
 
-1. ask #706, #707, #708/#726/#728/#729, #709/#731/#732-#736, #710, #472/#701/#694,
-   #695, #696, #705, #656, #250, #264, #481, and #650 owners to accept the exact
-   deltas above;
-2. update an existing issue when it owns the complete acceptance contract;
-3. bind P4 to #695/#710, signed release production to #696, engine generations to
-   #728/#729/#736, and runtime intent to #472/#701/#694;
-4. materialize only genuinely uncovered P1 coordinator, P2 external recovery
-   authorities/transport, P3 restore runner, or P5 aggregator contracts in dependency
-   order;
-5. require reciprocal links, `quality:ready`, target runtime, benchmarks, rollout,
-   rollback, negative criteria, and TOGAF delta before implementation;
-6. keep AC-6 and AC-N5 open until that live owner readback and fresh quality gate
-   exist.
+### Approved owner-resolution and materialization rule
 
-The following delivery envelope is mandatory if ORC materializes or merges any of
-P1-P5 into an existing owner:
+1. Create one recovery epic with exactly R0-R4 as ordered children.
+2. Add reciprocal, versioned-port deltas to #706/#707, #728/#729, #732-#736,
+   #695/#710, #472/#701/#694, #696, #250/#264/#481, #705/#656, and #650.
+3. Stage #696 release production and R0 retrieval through
+   `SignedReleaseRetrievalPortV1`; neither implementation waits on the other.
+4. Keep engine generation/activation in #728/#729/#736, workflow/effects in
+   #695/#710, runtime lifecycle in #472/#701/#694, and release production in #696.
+5. Require runtime target, ACs, negative/failure criteria, benchmarks, rollout,
+   rollback, claim boundary, TOGAF target delta, reciprocal links, final labels, and
+   a fresh Issue Quality Gate PASS for every changed/new owner.
+6. #650 records proposed numeric RPO/RTO/offline/drill policy without approving it.
 
-| Contract | Dependencies | Negative criteria | Target-runtime tests and benchmarks | Rollout | Rollback | TOGAF delta |
-|---|---|---|---|---|---|---|
-| P1 coordinator | All owner receipts above; P2 trust; #650 acceptance | No uncovered plane, one-process mutex claim, arbitrary path, false seal, unsigned envelope, stale generation, secret byte, live handle, or competing engine activation | Authorized single-node target: participant prepare/drain/release, pause/seal duration, bytes, CPU/IO sidecars, crash/timeout/fixed-point matrix, exact signed-envelope readback | Default off -> observe catalogs -> shadow prepare/abort -> local seal -> scheduled seal | Disable coordinator; participants durably abort/release; old WorldSnapshot and prior verified points remain readable | Define WorldSnapshot, owner generations, participant cut, signed RecoveryPoint, and bootstrap journal |
-| P2 independent recovery inputs | P1, #696, #705, #656, security/operations owner | No live-store input, shared data/escrow key, unsigned release, all-powerful credential, rollback catalog bypass, or prune of last-known-good | Local mock stores first, then authorized independent storage/escrow/registry: upload/verify/retrieve/restore latency, dedup, lost-key and revoked-signer drills | Read-only shadow export -> independent verification -> offsite-required policy | Remove transport while preserving local signed envelopes; never weaken escrow/signature policy | Define independent data, release, and trust authorities |
-| P3 restore/drills | P1/P2 plus #728/#729, #732-#736, #695/#710, #472/#701/#694, #696 | No in-place first mutation, mixed generations, broker ACK authority, stale trust, unsigned binary, raw handle restore, effect rewind, or readiness before frontiers/probes | Authorized isolated single-node restore: quarantine through readiness, p50/p95/max over issue fixtures, sidecars, stream/consumer corruption and restart matrix | Dry validation -> staged restore -> scheduled full drill -> incident runbook | Journal switches only to intact verified generation/allowed envelope; fence remains on failure | Encode release/trust verification, store/event activation, stream replay, projection rebuild, runtime reconciliation, and signed receipt |
-| P4 workflow integration | #695 and #710, then P1 conformance | No caller authority, second journal, cross-tenant receipt, duplicate effect, unknown-outcome retry, busy loop, or non-terminal evidence loss | Deterministic fake plus final single-node integration: receipt latency/size, restart, migration, unknown-effect and bundle-restore failpoints | Existing workflow remains default-off until owner receipt and coordinator catalog accept its schema | Disable DR registration; workflow may run only while DR readiness reports uncovered authority | Add workflow/effect generation receipt to RecoveryPoint without moving journal authority |
-| P5 health/retention | P1-P3, #250/#264/#481/#736, #650 policy | No green health from transport-only success, stale receipt/drill, unknown consumer, pin leak, missed proposed target, unsigned release, or missing trust authority | Authorized single-node soak: health cost, retention/prune duration, disk growth, participant outage, missed schedule, repository/release/escrow failures | Observe-only -> alert -> readiness gate after stable evidence and approved SLO | Return to observe-only; never weaken immutable retention or required frontiers | Add coverage, participant, offsite, release/trust, drill, and policy-approval status |
+### Live materialization readback
+
+ORC authorized materialization in review
+`522e0a77-b99e-4f24-9438-2d549d150468`. The native GitHub sub-issue readback for
+epic [#751](https://github.com/silentspike/project-sentinel/issues/751) is exactly
+`[#752, #753, #754, #755, #756]`. Every issue is `quality:ready`; the new epic and
+children are `status:blocked` because specification is complete but implementation
+and runtime evidence are not.
+
+| Node | Ordered dependency | Live body SHA-256 | Fresh Issue Quality Gate |
+|---|---|---|---|
+| [#751 epic](https://github.com/silentspike/project-sentinel/issues/751) | Exactly R0-R4 | `930a0da9ff867e16a17f88b74598e7463b9459e114ea2b3aba1e0823bb9cd862` | [30430032015 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430032015) |
+| [#752 R0](https://github.com/silentspike/project-sentinel/issues/752) | None; versioned #696 port | `27d00b6d1066c81f0f42a0562310171fcbc76751d05a14b2767a33abada2563a` | [30430032328 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430032328) |
+| [#753 R1](https://github.com/silentspike/project-sentinel/issues/753) | #752 plus owner ports; not R2/#650 | `73cfa0fddee9603380f29eaf45a4ef5701fc6e63ccfc26d346c565b9ff912dcf` | [30430032499 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430032499) |
+| [#754 R2](https://github.com/silentspike/project-sentinel/issues/754) | #752, #753, #705, #656 | `bfe0fd6b521b89223740722e94d90d99a2f94ecd7a6a59b48a8bf4a858ba86d2` | [30430031810 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430031810) |
+| [#755 R3](https://github.com/silentspike/project-sentinel/issues/755) | #752-#754 plus owner ports | `30bce4b97a0f8167928a389876a42554914617c0d7d5e0dfa5f8e0a9bd8f0609` | [30430031953 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430031953) |
+| [#756 R4](https://github.com/silentspike/project-sentinel/issues/756) | #752-#755 plus retention owners | `5a9ea398ca698d30db9355b15af09bff27183cb94d6bb24945f9aa05ee8ac779` | [30430013292 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430013292) |
+
+Existing-owner bodies carry one `<!-- issue-722-recovery-delta -->` section. The
+body digest is over the exact UTF-8 GitHub body, without an added newline:
+
+| Existing owner | Accepted delta | Live body SHA-256 | Fresh Issue Quality Gate |
+|---|---|---|---|
+| [#706](https://github.com/silentspike/project-sentinel/issues/706) | Supervision, restart fencing, ACK/readiness CAS | `64bf4b7fd6f31393c8f83fc9ccecd21d1c4e430b4f0f033c1ba745f0bc7813ea` | [30430211270 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430211270) |
+| [#707](https://github.com/silentspike/project-sentinel/issues/707) | ECS barrier/resource receipt/no early tick | `cafd874ee81a1f87b027132c26665b8148e9ae0212b5360c6c474b125fcb60a9` | [30430213877 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430213877) |
+| [#728](https://github.com/silentspike/project-sentinel/issues/728) | Storage-generation receipt/stage/activation | `4306acce3e8a689febaf45df95a0527196b9ce4197ee495bb659d56865759ad0` | [30430217003 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430217003) |
+| [#729](https://github.com/silentspike/project-sentinel/issues/729) | Exact redb mechanism/failpoints/raw-copy rejection | `4ce70811047117e57bdac6dc5d13e1d513781443359aa760a6c2791303f8fdc1` | [30430217916 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430217916) |
+| [#732](https://github.com/silentspike/project-sentinel/issues/732) | Event envelope/generation/replay identity | `b9c606ffe2b0e4e18c26c88605bfe812857810e32a02b424df56d730c2be1474` | [30430218501 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430218501) |
+| [#733](https://github.com/silentspike/project-sentinel/issues/733) | PubAck/inbox/outcome/fixed-point drain | `b2cb1e157dc577dbae4b27ece4900c33718ce0c406967058e7244a9df063342d` | [30430219641 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430219641) |
+| [#734](https://github.com/silentspike/project-sentinel/issues/734) | Projection generation/ValidationOnly/CAS gate | `3e0b65ab9363237b2f9f249485c508104acc7ad83381e277cc52adccbae6d381` | [30430220995 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430220995) |
+| [#735](https://github.com/silentspike/project-sentinel/issues/735) | Episode durable effect frontier | `0a2e421c10d463ca749fc8aa060887820bc547d6ab47f973ed8a1e591cc6aec9` | [30430222504 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430222504) |
+| [#736](https://github.com/silentspike/project-sentinel/issues/736) | EventTruthGeneration/consumer/retention frontier | `5f1443552affdc42e34af255f927c2a3e57a61e379fa406043303ade03af50c3` | [30430225735 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430225735) |
+| [#695](https://github.com/silentspike/project-sentinel/issues/695) | WorkflowRecoveryPort/fence/authority | `bbdd9e49b3d8225b3cda50365e93f15fbad4c23081dfd5f58727994cd6a20a4a` | [30430226209 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430226209) |
+| [#710](https://github.com/silentspike/project-sentinel/issues/710) | Durable operation/effect generation | `ab8475f1936b70320e00e23984390d35224b23d0ec80c7e39bfc34ac27e2e7a4` | [30430227725 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430227725) |
+| [#472](https://github.com/silentspike/project-sentinel/issues/472) | Runtime profile as intent/no raw handles | `af919cd219d44c1364ebb460e61a1fc4bca173913f8c0b34e1c9ab5465036813` | [30430228494 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430228494) |
+| [#701](https://github.com/silentspike/project-sentinel/issues/701) | Channel/process-tree cancel and fence | `4694d2bf3a6ffb5b9479181b913b203608adf78cc7dd821af35f32bc9f3fc963` | [30430232251 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430232251) |
+| [#694](https://github.com/silentspike/project-sentinel/issues/694) | Workbench intent/outcome recovery port | `eeac3beb5fe2f627e858e5c4eacfe597b40baecb572772278e7f975fb9af7698` | [30430232308 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430232308) |
+| [#696](https://github.com/silentspike/project-sentinel/issues/696) | Versioned signed-release publication port | `960f21cfb227f7800bcf312c0e4f5b2cf691357ff77d195f9ea5a39a07fa8362` | [30430234672 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430234672) |
+| [#250](https://github.com/silentspike/project-sentinel/issues/250) | WorldSnapshot local-only receipt boundary | `34feb020dabd54fabfe5d5fe1e4b731200c5ccf8161134e2ebf520c5f90955a2` | [30430234832 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430234832) |
+| [#264](https://github.com/silentspike/project-sentinel/issues/264) | CAS pin/immutability/local-vs-offsite boundary | `3b4dabd31b7fa81aad4d6e7017071f803b894d9281efe18979674db489e67044` | [30430461168 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430461168) |
+| [#481](https://github.com/silentspike/project-sentinel/issues/481) | Product retention/copy/restore/frontier protection | `bf3966feaa022a128ee3a0bc0c3dab88fdcfe35a844c4969e0d6bf4de981ebae` | [30430238604 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430238604) |
+| [#705](https://github.com/silentspike/project-sentinel/issues/705) | Exact restic/privilege decision before R2 | `08f262749881793e061dfccfd3ba2c678b6fea60e7d4eb20674036a08601c7a5` | [30430240530 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430240530) |
+| [#656](https://github.com/silentspike/project-sentinel/issues/656) | Accepted dependency upgrade/rollback ownership | `2f3bab8e3c7f6f4d83b6750e2e15c6a3b35328a50b08e10841cb51fdf6b8c117` | [30430241574 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430241574) |
+| [#650](https://github.com/silentspike/project-sentinel/issues/650) | Downstream acceptance; policy explicitly unapproved | `06116f06accb2808afedb6666ff207927a331931e9a65d830e1de732986fff17` | [30430243639 PASS](https://github.com/silentspike/project-sentinel/actions/runs/30430243639) |
 
 ## 12. Acceptance-criteria readback
 
@@ -1222,17 +1308,17 @@ P1-P5 into an existing owner:
 | AC-2 | Section 4 evaluates eight candidates with a 10-factor rubric and explicit shortlist/rejection reasons. | PASS |
 | AC-3 | Section 5 reviews five pinned systems through source, tests, failures, security, license, and operations. | PASS |
 | AC-4 | Section 6 covers every listed mechanism and all five shortlisted systems; the non-functional matrix covers correctness boundaries, failures, 1:n/determinism, security, maintenance, dependency cost, and integration. | PASS |
-| AC-5 | Section 7 assigns exactly one decision to each Sentinel mechanism and records rejected alternatives. Maintainer approval remains an ORC action. | REVIEW_PENDING |
-| AC-6 | Section 11 supplies implementation-ready proposed contracts without violating the no-materialization instruction. Live quality-ready issues intentionally await ORC synthesis approval. | REVIEW_PENDING |
+| AC-5 | Section 7 assigns exactly one decision to each Sentinel mechanism and records rejected alternatives. ORC approved D1-D11 in review `522e0a77-b99e-4f24-9438-2d549d150468`. | PASS |
+| AC-6 | Section 11 records the acyclic R0-R4 epic, native sub-issue graph, exact existing-owner deltas, live body digests, final labels, and fresh quality runs. | PASS |
 | AC-7 | Section 10 classifies every finding and identifies the M0 acknowledgement owner. | PASS |
 | AC-8 | This file is the sole repository change and is English/ASCII/public-safe. URL, link, typo, sanitization, and diff gates passed before the review head was frozen and are recorded in the PR evidence. | PASS |
 | AC-N1 | No dependency is added; restic is gated by #705. | PASS |
 | AC-N2 | Every deep review records provenance, license, security, maintenance, and boundary. No code is copied. | PASS |
 | AC-N3 | Current tests are treated as local invariant evidence, not optimality or whole-product proof. | PASS |
 | AC-N4 | No runtime, VM, provider, Rust build, or performance benchmark is used. | PASS |
-| AC-N5 | No gap is declared closed. Proposed owners and the post-approval resolution procedure are explicit. | REVIEW_PENDING: live owner acceptance and reciprocal issue contracts remain required |
+| AC-N5 | Every gap has an explicit existing or new implementation owner and reciprocal contract; all remain open/blocked until implementation evidence exists. No gap is declared implemented. | PASS |
 
-## 13. Limitations and review questions
+## 13. Limitations and pending policy
 
 - This source audit did not run upstream test suites. The reviewed tests demonstrate
   upstream intent and adversarial coverage, not compatibility with Sentinel.
@@ -1243,36 +1329,27 @@ P1-P5 into an existing owner:
   authoritative. A security/operations owner still must approve the concrete escrow
   provider, key ceremony, quorum, custody, audit, and break-glass runbook before
   implementation.
-- The final #695 workflow schema is not on this baseline. P4 is a required adapter
-  contract, not a claim about code that does not exist here.
+- The final #695 workflow schema is not on this baseline. Its live
+  `WorkflowRecoveryPortV1` delta is an implementation contract, not a claim that the
+  port already exists.
 - D5 selects restic behind the immutable sealed-bundle boundary, but does not
   authorize a dependency. #705 must either approve that exact integration and
   privilege/update contract or reject D5 and return the transport choice to ORC; it
   must not silently substitute another backend.
-- ORC must decide whether to approve D1-D11, independently decide the proposed
-  numeric recovery policy, and approve the owner-resolution procedure. Until then
-  AC-5, AC-6, and AC-N5 are not final.
+- D1-D11 and the owner-resolution procedure are approved and materialized. This
+  does not approve any implementation, runtime result, release, restore, or M0
+  acceptance claim.
 
-Review should answer:
+The remaining policy decisions belong only to #650/product ownership:
 
-1. Does ORC approve D1-D11 as the mechanism decisions, independently of any numeric
-   RPO/RTO target?
-2. Does ORC approve the owner-resolution procedure: update the named existing
-   owners first, bind P4 to #695/#710, and materialize only uncovered P1, P2, P3,
-   or P5 contracts?
-3. Which security/operations owner accepts the independent recovery escrow,
-   authority catalog, key ceremony, dual-control, revocation, anti-rollback, and
-   disaster-access contract?
-4. Does #696 accept production and independent publication of the signed release
-   set, including artifacts, SBOM, provenance, compatibility, and release manifest?
-5. Do #706/#707, #728/#729, #732-#736, #695/#710, and #472/#701/#694 accept their
-   participant/generation receipt deltas and the product-fence lifecycle?
-6. Separately, does #650/product ownership approve the proposed RPO <= 15 minutes,
-   RTO <= 60 minutes, offline-copy requirement, and drill cadence?
+1. whether RPO <= 15 minutes and RTO <= 60 minutes become accepted thresholds;
+2. whether an offline/immutable copy is mandatory before accepting customer work;
+3. which drill cadence becomes mandatory;
+4. which security/operations owner and exact escrow provider/key ceremony satisfy
+   R0;
+5. when complete R0-R4 implementation/runtime evidence is sufficient for product
+   acceptance.
 
-The exact remaining AC-6 action is therefore: after ORC approves this synthesis,
-obtain the named owners' live acceptance, update their issue bodies with the exact
-receipt/dependency deltas, materialize only still-unowned P1/P2/P3/P5 contracts,
-add reciprocal links and required runtime/rollback/negative criteria, and run a
-fresh quality gate for every changed or new issue. No implementation starts before
-that readback.
+Until those decisions and implementation evidence exist, the new issues remain
+blocked and every numeric/offline/drill value remains a proposal, not a readiness
+gate or achieved result.
