@@ -1,0 +1,415 @@
+use std::path::Path;
+
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::{
+    digest::ContentDigest,
+    error::DeliveryError,
+    ports::{PublicationReceiptV1, PublicationRequestV1},
+    state::DeliveryAggregateV1,
+};
+
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_meta");
+const AGGREGATES: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_aggregates");
+const JOURNAL: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_journal");
+const IDEMPOTENCY: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_idempotency");
+const OUTBOX: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_outbox");
+const SCHEMA_KEY: &str = "schema_version";
+const SCHEMA_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryJournalEntryV1 {
+    pub schema_version: u16,
+    pub tenant_id: String,
+    pub project_id: String,
+    pub project_revision: u64,
+    pub operation_id: String,
+    pub event_type: String,
+    pub command_digest: ContentDigest,
+    pub event_digest: ContentDigest,
+    pub payload: Value,
+    pub committed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryCommitReceiptV1 {
+    pub operation_id: String,
+    pub project_revision: u64,
+    pub event_digest: ContentDigest,
+    pub duplicate: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryCommitRequestV1 {
+    pub tenant_id: String,
+    pub project_id: String,
+    pub expected_revision: u64,
+    pub principal_id: String,
+    pub command_kind: String,
+    pub idempotency_key: String,
+    pub command_digest: ContentDigest,
+    pub aggregate: DeliveryAggregateV1,
+    pub event_type: String,
+    pub event_payload: Value,
+    pub committed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct IdempotencyRecordV1 {
+    command_digest: ContentDigest,
+    receipt: DeliveryCommitReceiptV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryOutboxEntryV1 {
+    pub request: PublicationRequestV1,
+    pub project_revision: u64,
+    pub published_receipt: Option<PublicationReceiptV1>,
+}
+
+pub struct DeliveryStore {
+    db: Database,
+}
+
+impl DeliveryStore {
+    pub fn open(path: &Path) -> Result<Self, DeliveryError> {
+        let db = Database::create(path)?;
+        let write = db.begin_write()?;
+        {
+            let _ = write.open_table(META)?;
+            let _ = write.open_table(AGGREGATES)?;
+            let _ = write.open_table(JOURNAL)?;
+            let _ = write.open_table(IDEMPOTENCY)?;
+            let _ = write.open_table(OUTBOX)?;
+        }
+        write.commit()?;
+        let store = Self { db };
+        store.initialize_schema()?;
+        Ok(store)
+    }
+
+    fn initialize_schema(&self) -> Result<(), DeliveryError> {
+        let existing = {
+            let read = self.db.begin_read()?;
+            let table = read.open_table(META)?;
+            table.get(SCHEMA_KEY)?.map(|value| value.value().to_vec())
+        };
+        match existing {
+            Some(bytes) => {
+                let version: u16 = serde_json::from_slice(&bytes)
+                    .map_err(|error| DeliveryError::CorruptStore(error.to_string()))?;
+                if version != SCHEMA_VERSION {
+                    return Err(DeliveryError::CorruptStore(format!(
+                        "unsupported delivery schema {version}, expected {SCHEMA_VERSION}"
+                    )));
+                }
+            }
+            None => {
+                let encoded = serde_json::to_vec(&SCHEMA_VERSION)?;
+                let write = self.db.begin_write()?;
+                {
+                    let mut table = write.open_table(META)?;
+                    table.insert(SCHEMA_KEY, encoded.as_slice())?;
+                }
+                write.commit()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Result<Option<DeliveryAggregateV1>, DeliveryError> {
+        let key = aggregate_key(tenant_id, project_id)?;
+        let read = self.db.begin_read()?;
+        let table = read.open_table(AGGREGATES)?;
+        let Some(value) = table.get(key.as_str())? else {
+            return Ok(None);
+        };
+        decode(value.value(), "aggregate").map(Some)
+    }
+
+    pub fn lookup_idempotency(
+        &self,
+        tenant_id: &str,
+        principal_id: &str,
+        command_kind: &str,
+        idempotency_key: &str,
+        command_digest: &ContentDigest,
+    ) -> Result<Option<DeliveryCommitReceiptV1>, DeliveryError> {
+        for (name, value) in [
+            ("tenant_id", tenant_id),
+            ("principal_id", principal_id),
+            ("command_kind", command_kind),
+            ("idempotency_key", idempotency_key),
+        ] {
+            validate_component(name, value)?;
+        }
+        let key = format!("{tenant_id}:{principal_id}:{command_kind}:{idempotency_key}");
+        let read = self.db.begin_read()?;
+        let table = read.open_table(IDEMPOTENCY)?;
+        let Some(existing) = table.get(key.as_str())? else {
+            return Ok(None);
+        };
+        let record: IdempotencyRecordV1 = decode(existing.value(), "idempotency")?;
+        if &record.command_digest != command_digest {
+            return Err(DeliveryError::IdempotencyConflict { key });
+        }
+        let mut receipt = record.receipt;
+        receipt.duplicate = true;
+        Ok(Some(receipt))
+    }
+
+    pub fn commit(
+        &self,
+        request: &DeliveryCommitRequestV1,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        validate_component("tenant_id", &request.tenant_id)?;
+        validate_component("project_id", &request.project_id)?;
+        validate_component("principal_id", &request.principal_id)?;
+        validate_component("command_kind", &request.command_kind)?;
+        validate_component("idempotency_key", &request.idempotency_key)?;
+        validate_component("event_type", &request.event_type)?;
+        if request.aggregate.tenant_id != request.tenant_id
+            || request.aggregate.project_id != request.project_id
+        {
+            return Err(DeliveryError::Validation(
+                "aggregate authority does not match commit authority".to_string(),
+            ));
+        }
+
+        let aggregate_key = aggregate_key(&request.tenant_id, &request.project_id)?;
+        let idempotency_key = format!(
+            "{}:{}:{}:{}",
+            request.tenant_id, request.principal_id, request.command_kind, request.idempotency_key
+        );
+        let write = self.db.begin_write()?;
+
+        {
+            let table = write.open_table(IDEMPOTENCY)?;
+            let existing = table.get(idempotency_key.as_str())?;
+            if let Some(existing) = existing {
+                let record: IdempotencyRecordV1 = decode(existing.value(), "idempotency")?;
+                if record.command_digest != request.command_digest {
+                    return Err(DeliveryError::IdempotencyConflict {
+                        key: idempotency_key,
+                    });
+                }
+                let mut receipt = record.receipt;
+                receipt.duplicate = true;
+                return Ok(receipt);
+            }
+        }
+
+        let actual_revision = {
+            let table = write.open_table(AGGREGATES)?;
+            let existing = table.get(aggregate_key.as_str())?;
+            match existing {
+                Some(existing) => {
+                    let aggregate: DeliveryAggregateV1 = decode(existing.value(), "aggregate")?;
+                    aggregate.revision
+                }
+                None => 0,
+            }
+        };
+        if actual_revision != request.expected_revision {
+            return Err(DeliveryError::RevisionConflict {
+                expected: request.expected_revision,
+                actual: actual_revision,
+            });
+        }
+        if request.aggregate.revision != actual_revision + 1 {
+            return Err(DeliveryError::Validation(format!(
+                "aggregate revision {} must be {}",
+                request.aggregate.revision,
+                actual_revision + 1
+            )));
+        }
+
+        let operation_id = format!(
+            "delivery:{}:{}:{:020}:{}",
+            request.tenant_id, request.project_id, request.aggregate.revision, request.event_type
+        );
+        let event_digest = ContentDigest::of(&request.event_payload)?;
+        let journal = DeliveryJournalEntryV1 {
+            schema_version: SCHEMA_VERSION,
+            tenant_id: request.tenant_id.clone(),
+            project_id: request.project_id.clone(),
+            project_revision: request.aggregate.revision,
+            operation_id: operation_id.clone(),
+            event_type: request.event_type.clone(),
+            command_digest: request.command_digest.clone(),
+            event_digest: event_digest.clone(),
+            payload: request.event_payload.clone(),
+            committed_at_ms: request.committed_at_ms,
+        };
+        let journal_bytes = serde_json::to_vec(&journal)?;
+        let aggregate_bytes = serde_json::to_vec(&request.aggregate)?;
+        let publication = PublicationRequestV1 {
+            operation_id: operation_id.clone(),
+            event_type: request.event_type.clone(),
+            aggregate_id: aggregate_key.clone(),
+            payload_digest: event_digest.clone(),
+            payload: journal_bytes.clone(),
+        };
+        let outbox = DeliveryOutboxEntryV1 {
+            request: publication,
+            project_revision: request.aggregate.revision,
+            published_receipt: None,
+        };
+        let outbox_bytes = serde_json::to_vec(&outbox)?;
+        let receipt = DeliveryCommitReceiptV1 {
+            operation_id: operation_id.clone(),
+            project_revision: request.aggregate.revision,
+            event_digest,
+            duplicate: false,
+        };
+        let idempotency = IdempotencyRecordV1 {
+            command_digest: request.command_digest.clone(),
+            receipt: receipt.clone(),
+        };
+        let idempotency_bytes = serde_json::to_vec(&idempotency)?;
+
+        {
+            let mut table = write.open_table(AGGREGATES)?;
+            table.insert(aggregate_key.as_str(), aggregate_bytes.as_slice())?;
+        }
+        {
+            let mut table = write.open_table(JOURNAL)?;
+            table.insert(operation_id.as_str(), journal_bytes.as_slice())?;
+        }
+        {
+            let mut table = write.open_table(OUTBOX)?;
+            table.insert(operation_id.as_str(), outbox_bytes.as_slice())?;
+        }
+        {
+            let mut table = write.open_table(IDEMPOTENCY)?;
+            table.insert(idempotency_key.as_str(), idempotency_bytes.as_slice())?;
+        }
+        write.commit()?;
+        Ok(receipt)
+    }
+
+    pub fn journal(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Result<Vec<DeliveryJournalEntryV1>, DeliveryError> {
+        let prefix = format!("delivery:{tenant_id}:{project_id}:");
+        let read = self.db.begin_read()?;
+        let table = read.open_table(JOURNAL)?;
+        let mut entries = Vec::new();
+        for row in table.iter()? {
+            let (key, value) = row?;
+            if key.value().starts_with(&prefix) {
+                entries.push(decode(value.value(), "journal")?);
+            }
+        }
+        entries.sort_by_key(|entry: &DeliveryJournalEntryV1| entry.project_revision);
+        Ok(entries)
+    }
+
+    pub fn pending_publications(&self) -> Result<Vec<DeliveryOutboxEntryV1>, DeliveryError> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(OUTBOX)?;
+        let mut entries = Vec::new();
+        for row in table.iter()? {
+            let (_, value) = row?;
+            let entry: DeliveryOutboxEntryV1 = decode(value.value(), "outbox")?;
+            if entry.published_receipt.is_none() {
+                entries.push(entry);
+            }
+        }
+        entries.sort_by_key(|entry| entry.project_revision);
+        Ok(entries)
+    }
+
+    pub fn mark_published(
+        &self,
+        expected_digest: &ContentDigest,
+        receipt: PublicationReceiptV1,
+    ) -> Result<(), DeliveryError> {
+        let write = self.db.begin_write()?;
+        let updated = {
+            let mut table = write.open_table(OUTBOX)?;
+            let Some(existing) = table.get(receipt.operation_id.as_str())? else {
+                return Err(DeliveryError::NotFound(format!(
+                    "outbox {}",
+                    receipt.operation_id
+                )));
+            };
+            let mut entry: DeliveryOutboxEntryV1 = decode(existing.value(), "outbox")?;
+            if &entry.request.payload_digest != expected_digest
+                || receipt.payload_digest != *expected_digest
+            {
+                return Err(DeliveryError::Conflict(format!(
+                    "publication receipt digest mismatch for {}",
+                    receipt.operation_id
+                )));
+            }
+            if let Some(previous) = &entry.published_receipt {
+                if previous != &receipt {
+                    return Err(DeliveryError::Conflict(format!(
+                        "publication receipt changed for {}",
+                        receipt.operation_id
+                    )));
+                }
+                false
+            } else {
+                entry.published_receipt = Some(receipt.clone());
+                let bytes = serde_json::to_vec(&entry)?;
+                drop(existing);
+                table.insert(receipt.operation_id.as_str(), bytes.as_slice())?;
+                true
+            }
+        };
+        if updated {
+            write.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn health(&self) -> Result<(), DeliveryError> {
+        self.initialize_schema()?;
+        let read = self.db.begin_read()?;
+        for table in [AGGREGATES, JOURNAL, IDEMPOTENCY, OUTBOX] {
+            let opened = read.open_table(table)?;
+            for row in opened.iter()? {
+                let _ = row?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn aggregate_key(tenant_id: &str, project_id: &str) -> Result<String, DeliveryError> {
+    validate_component("tenant_id", tenant_id)?;
+    validate_component("project_id", project_id)?;
+    Ok(format!("{tenant_id}:{project_id}"))
+}
+
+fn validate_component(name: &str, value: &str) -> Result<(), DeliveryError> {
+    if value.is_empty()
+        || value.len() > 160
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(DeliveryError::Validation(format!(
+            "{name} is not a canonical identifier"
+        )));
+    }
+    Ok(())
+}
+
+fn decode<T: for<'de> Deserialize<'de>>(
+    bytes: &[u8],
+    record_type: &str,
+) -> Result<T, DeliveryError> {
+    serde_json::from_slice(bytes)
+        .map_err(|error| DeliveryError::CorruptStore(format!("{record_type}: {error}")))
+}
