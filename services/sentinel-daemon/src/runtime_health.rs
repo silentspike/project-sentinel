@@ -66,6 +66,11 @@ pub(crate) struct AdapterRuntimeObservation {
     pub error: Option<String>,
 }
 
+pub(crate) struct RuntimeHealthObservationSet<'a> {
+    pub previous: Option<&'a RuntimeHealthSnapshot>,
+    pub adapter: &'a HashMap<AgentId, AdapterRuntimeObservation>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeHealthSnapshot {
     pub current_shift: u8,
@@ -118,8 +123,7 @@ pub(crate) fn build_runtime_health_snapshot(
     projection_db_path: &Path,
     operator_auth_required: bool,
     service_health_state: ServiceHealthWorkerSnapshot,
-    previous: Option<&RuntimeHealthSnapshot>,
-    adapter_observations: &HashMap<AgentId, AdapterRuntimeObservation>,
+    observations: RuntimeHealthObservationSet<'_>,
 ) -> RuntimeHealthSnapshot {
     build_runtime_health_snapshot_with_registry(
         all_agents,
@@ -131,9 +135,9 @@ pub(crate) fn build_runtime_health_snapshot(
         projection_db_path,
         operator_auth_required,
         service_health_state,
-        previous,
+        observations.previous,
         OwnerRegistry::global(),
-        adapter_observations,
+        observations.adapter,
     )
 }
 
@@ -509,8 +513,10 @@ pub(crate) fn publish_runtime_health_snapshot(
         projection_db_path,
         operator_auth_required,
         service_health_state,
-        previous.as_ref(),
-        adapter_observations,
+        RuntimeHealthObservationSet {
+            previous: previous.as_ref(),
+            adapter: adapter_observations,
+        },
     );
     snapshot.analysis_queue_depth = analysis_queue_stats.depth;
     snapshot.analysis_queue_dropped_total = analysis_queue_stats.dropped_total;
@@ -723,8 +729,10 @@ mod tests {
             &tmp.path().join("projection.db"),
             false,
             ServiceHealthWorkerSnapshot::default(),
-            None,
-            &HashMap::new(),
+            RuntimeHealthObservationSet {
+                previous: None,
+                adapter: &HashMap::new(),
+            },
         );
 
         assert_eq!(snapshot.expected_active_agents, 1);
@@ -825,8 +833,10 @@ mod tests {
             &projection_path,
             false,
             ServiceHealthWorkerSnapshot::default(),
-            None,
-            &observations,
+            RuntimeHealthObservationSet {
+                previous: None,
+                adapter: &observations,
+            },
         );
         assert_eq!(snapshot.stale_runtime_entries, 0, "{runtime_key}");
         assert!(!snapshot.projection_drift_detected, "{runtime_key}");
@@ -845,8 +855,10 @@ mod tests {
             &projection_path,
             false,
             ServiceHealthWorkerSnapshot::default(),
-            None,
-            &HashMap::new(),
+            RuntimeHealthObservationSet {
+                previous: None,
+                adapter: &HashMap::new(),
+            },
         );
         assert_eq!(missing.stale_runtime_entries, 1, "{runtime_key}");
 
@@ -868,8 +880,10 @@ mod tests {
             &projection_path,
             false,
             ServiceHealthWorkerSnapshot::default(),
-            None,
-            &wrong_instance,
+            RuntimeHealthObservationSet {
+                previous: None,
+                adapter: &wrong_instance,
+            },
         );
         assert_eq!(mismatched.stale_runtime_entries, 1, "{runtime_key}");
 
@@ -891,8 +905,10 @@ mod tests {
             &projection_path,
             false,
             ServiceHealthWorkerSnapshot::default(),
-            None,
-            &stopped_observations,
+            RuntimeHealthObservationSet {
+                previous: None,
+                adapter: &stopped_observations,
+            },
         );
         assert_eq!(stopped.stale_runtime_entries, 1, "{runtime_key}");
     }
@@ -928,8 +944,10 @@ mod tests {
             &projection_path,
             false,
             ServiceHealthWorkerSnapshot::default(),
-            None,
-            &HashMap::new(),
+            RuntimeHealthObservationSet {
+                previous: None,
+                adapter: &HashMap::new(),
+            },
         );
 
         assert_eq!(snapshot.expected_active_agents, 0);
@@ -977,8 +995,10 @@ mod tests {
                 last_error: Some("panic-test requested for service_health".to_string()),
                 thread_name: "service-health-checker".to_string(),
             },
-            Some(&previous),
-            &HashMap::new(),
+            RuntimeHealthObservationSet {
+                previous: Some(&previous),
+                adapter: &HashMap::new(),
+            },
         );
 
         let worker = snapshot
@@ -1014,8 +1034,10 @@ mod tests {
             &tmp.path().join("projection.db"),
             false,
             ServiceHealthWorkerSnapshot::default(),
-            Some(&previous),
-            &HashMap::new(),
+            RuntimeHealthObservationSet {
+                previous: Some(&previous),
+                adapter: &HashMap::new(),
+            },
         );
 
         assert_eq!(snapshot.reconcile_runs_total, 9);
