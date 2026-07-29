@@ -19,7 +19,8 @@ engines already in the product:
 1. one versioned event envelope and one authoritative append gateway;
 2. explicit acknowledgement and durability classes;
 3. stream-revision compare-and-append for concurrent writers;
-4. a durable outbox that completes only after a JetStream `PubAck`;
+4. a durable outbox that records JetStream broker acceptance through `PubAck`
+   and evaluates transport durability against the effective server policy;
 5. durable consumer inbox and outcome receipts for side effects;
 6. independent, local projection frontiers committed with each read-model
    transaction;
@@ -28,14 +29,20 @@ engines already in the product:
 8. poison-event quarantine instead of advancing past malformed relevant data;
 9. a mandatory consumer catalog that controls retention and initial cursor
    policy;
-10. one event-truth generation integrated with the storage generation defined
-    by [#708](https://github.com/silentspike/project-sentinel/issues/708).
+10. an immutable event-truth generation descriptor, a monotonic event-truth
+    head, and sealed cut receipts referenced one-way by the storage generation
+    defined by [#708](https://github.com/silentspike/project-sentinel/issues/708).
 
 SQLite WAL provides the required local transaction primitive. JetStream
-provides durable at-least-once delivery and bounded producer deduplication.
-Neither engine alone provides end-to-end exactly-once business effects. That
-property comes from a stable operation identity, transactional claims, durable
-outcomes, and an outcome probe at every side-effect boundary.
+provides broker acceptance, at-least-once redelivery, and bounded producer
+deduplication under its configured storage, replication, and sync policy. A
+`PubAck` alone does not prove stable-media survival under OS or power loss.
+Neither engine alone provides end-to-end exactly-once business effects. A local
+effect can produce one durable business outcome through an atomic claim and
+mutation. An external effect can do so only when the external system honors a
+bound idempotency key or exposes an authoritative outcome probe. Otherwise an
+indeterminate attempt is quarantined for manual resolution and is never
+automatically retried.
 
 The highest-priority defect is the current episode producer. It advances its
 source cursor before the episode is durably written. A failed Hippocampus write
@@ -56,7 +63,8 @@ The target contract is therefore:
 - write a fact once under a stable operation identity;
 - acknowledge it only at the declared durability boundary;
 - deliver it one or more times using the same identity;
-- let every consumer prove whether its effect already happened;
+- let every local consumer prove whether its effect already happened and keep
+  unverifiable external uncertainty quarantined;
 - advance each consumer's frontier only in the transaction that made the
   effect durable;
 - rebuild a new report beside the old report, validate it, then switch readers
@@ -65,8 +73,10 @@ The target contract is therefore:
   recovery cut is uncertain.
 
 "Exactly once" is an outcome property, not a transport checkbox. JetStream may
-redeliver. Sentinel remains correct because the second delivery observes the
-first durable outcome and returns it without repeating the effect.
+redeliver. A local second delivery observes the first atomic durable outcome.
+An external second delivery may avoid another call only when a bound upstream
+idempotency key or authoritative outcome probe proves the prior result;
+otherwise uncertainty remains quarantined rather than being guessed away.
 
 ## Method
 
@@ -145,9 +155,11 @@ appends can therefore create facts that never enter the delivery path.
 
 The LLM completion path is stronger. It reserves a stable request before the
 provider call, persists the provider result, appends usage with retries, and
-claims downstream action. This is the correct Sentinel pattern to generalize:
-intent, stable external request identity, durable result, and idempotent effect
-claim.
+claims downstream action. This is the correct Sentinel pattern to generalize
+only where the provider binds that request identity or supports an
+authoritative result probe: intent, stable external request identity, durable
+result, and idempotent effect claim. Without either upstream capability,
+timeout remains indeterminate and cannot be converted into an automatic retry.
 
 ### Outbox and JetStream Bridge
 
@@ -157,7 +169,9 @@ correct at-least-once behavior.
 
 The Go bridge sets `Nats-Msg-Id`, but publishes through core NATS and marks the
 row published without requiring a JetStream publish acknowledgement. It can
-therefore record success before the stream proves durable storage. After five
+therefore record success before the stream proves broker acceptance. Even a
+future `PubAck` would establish stream acceptance and sequence assignment, not
+by itself stable-media survival under the declared crash model. After five
 failures it marks a row `failed`; the row then leaves the normal pending path
 without a durable poison-lane workflow, operator resolution, or readiness
 effect.
@@ -337,8 +351,8 @@ Current tests prove narrower properties than the target contract:
 | Test source | What it proves | What it does not prove |
 | --- | --- | --- |
 | [`sentinel-limbo/tests/acceptance.rs:162-425`](../../../crates/sentinel-limbo/tests/acceptance.rs#L162-L425) and [`event_store.rs:2569-3139`](../../../crates/sentinel-limbo/src/event_store.rs#L2569-L3139) | Append-only API shape, event+outbox transaction, operation-ID replay, monotonic offsets, WAL mode, and local outbox flow | Expected stream revision, conflicting replay digest, power-loss durable ack, PubAck, or permanent effects |
-| [`outbox_publisher.rs:245-418`](../../../crates/sentinel-limbo/src/outbox_publisher.rs#L245-L418) | Transport failure remains pending and later retries; batching and shutdown drain | Broker persistence, indeterminate PubAck, claim leases, poison lane, concurrent publishers |
-| [`sentinel-nats-bridge/bridge_test.go:1-78`](../../../services/sentinel-nats-bridge/bridge_test.go#L1-L78) | Stable operation ID maps to stable `Nats-Msg-Id` | JetStream publish API, PubAck, crash between publish/mark, permanent business idempotency |
+| [`outbox_publisher.rs:245-418`](../../../crates/sentinel-limbo/src/outbox_publisher.rs#L245-L418) | Transport failure remains pending and later retries; batching and shutdown drain | Broker acceptance, effective storage/replica/sync policy, indeterminate PubAck, claim leases, poison lane, concurrent publishers |
+| [`sentinel-nats-bridge/bridge_test.go:1-78`](../../../services/sentinel-nats-bridge/bridge_test.go#L1-L78) | Stable operation ID maps to stable `Nats-Msg-Id` | JetStream publish API, PubAck, power-loss boundary, crash between publish/mark, permanent business idempotency |
 | [`sentinel-projection/tests/acceptance.rs:113-738`](../../../crates/sentinel-projection/tests/acceptance.rs#L113-L738) | Rebuild equivalence, restart continuation, several idempotent handlers, hierarchy catch-up, and rejection of a malformed known v2 cost event | Blue-green activation, all-handler replay safety, poison resolution, or catalog/local-frontier crash reconciliation |
 | [`episode_producer.rs:373-588`](../../../services/sentinel-daemon/src/episode_producer.rs#L373-L588) | Event-to-episode mapping, scheduling, process-local ID increment, and agent registration | First-start policy, redb write failure, crash ordering, source receipt, atomic frontier, or concurrent producers |
 | [`orchestrator.rs:8504-8760`](../../../services/sentinel-daemon/src/orchestrator.rs#L8504-L8760) | Selected restore validation, rollback, and projection-seed behavior | One sealed event/projection/redb/CAS generation or no-offset-jump recovery |
@@ -348,7 +362,7 @@ Current tests prove narrower properties than the target contract:
 | ID | Severity | Finding | Failure outcome | Classification |
 | --- | --- | --- | --- | --- |
 | E-01 | Critical | EpisodeProducer advances its event cursor before a durable Hippocampus write. | Agent memory permanently omits a relevant fact after write failure or restart. | `BLOCKS_M0` |
-| E-02 | Critical | NATS bridge marks delivery without JetStream `PubAck`. | A row can be recorded published before durable stream acceptance. | `M0_HARDENING` |
+| E-02 | Critical | NATS bridge marks delivery without JetStream `PubAck`, and no effective transport-durability policy is recorded. | A row can be recorded published before broker acceptance; even accepted data has an unproven power-loss boundary. | `M0_HARDENING` |
 | E-03 | Critical | Judge and other side-effect consumers lack durable inbox/outcome receipts. | Redelivery after crash can duplicate business effects. | `M0_HARDENING` |
 | E-04 | High | General projections skip malformed relevant events and advance the frontier. | Read model silently diverges from event truth. | `M0_HARDENING` |
 | E-05 | High | Projection rebuild clears the active database in place. | Users observe empty or partial company state during rebuild or crash. | `M0_HARDENING` |
@@ -376,25 +390,28 @@ failpoint; sleeping and killing at a guessed time is not evidence.
 | F-03 append transaction | After event insert, before outbox/effect-intent insert | Transaction rolls back completely | Event exists without its required intents | #732 |
 | F-04 durable ack | After SQLite commit record but before required sync/ack return | Caller receives no success; retry returns the prior operation outcome or a typed indeterminate result | Success is returned for data lost by the declared crash model | #732 |
 | F-05 outbox publish | Before broker acceptance | Row remains retryable under the same message/operation ID | Row becomes complete | #733 |
-| F-06 PubAck gap | Broker stored message, publisher lost `PubAck` | Republish/probe with the same ID; duplicate broker storage is bounded, business identity unchanged | New operation ID or silent completion from socket write | #733 |
-| F-07 publish then mark | `PubAck` received, before local completion commit | Redelivery is permitted; local permanent state still proves one business operation | Duplicate business effect is treated as acceptable transport behavior | #733 |
+| F-06 PubAck gap | Broker accepted the message, publisher lost `PubAck` | Republish/probe with the same ID; duplicate broker storage is bounded, business identity unchanged | New operation ID, silent completion from socket write, or a stable-media claim inferred from acceptance | #733 |
+| F-07 publish then mark | `PubAck` received, before local completion commit or before the configured server sync boundary | Redelivery is permitted; broker acceptance is recorded separately from transport durability; power-loss recovery matches the declared storage/replica/sync policy | `PubAck` is treated as proof of stable media or duplicate business effect is accepted as transport behavior | #733/#679 |
 | F-08 local consumer effect | After local view/effect mutation, before inbox outcome/ack | Local mutation and inbox outcome either both commit or both roll back | Mutation commits without a durable outcome identity | #733/#734 |
-| F-09 external effect | After request dispatch with no terminal response | Stable request is `Executing`/indeterminate and is probed or quarantined | Blind automatic retry under a new identity | #733/#710 |
+| F-09 external effect | After request dispatch with no terminal response | Bound upstream idempotency key or authoritative probe resolves the same request; without either capability the attempt stays indeterminate/quarantined for manual resolution | Blind automatic retry, whether under the same or a new identity | #733/#710 |
 | F-10 malformed relevant event | Decode/upcast/handler validation fails | Source position and digest enter quarantine; frontier does not pass it | Ack/skip plus frontier advance | #733/#734 |
 | F-11 projection commit | After view+local-frontier commit, before catalog offset commit | Restart reconciles catalog from the local frontier; replay is harmless | Catalog guesses completion beyond local frontier | #734 |
 | F-12 projection rebuild | During build, catch-up, validation, or activation | Old generation remains live until one atomic validated pointer switch | Readers see empty, mixed, or partial generations | #734 |
 | F-13 episode write | Before, during, or after Hippocampus transaction | Episode, source receipt, and per-agent frontier commit together or not at all | Source frontier advances without episode/receipt | #735/#729 |
 | F-14 first episode start | Consumer catalog has no frontier | Required consumer blocks readiness/prune until an explicit start policy is committed | Implicit jump to current max row | #735/#736 |
 | F-15 retention | Any required frontier, outcome, backup cut, or generation is missing/unknown | Delete is denied and uncertainty is observable | History below an inferred frontier is removed | #736 |
-| F-16 online backup | Before/during/after SQLite backup cut or generation seal | Candidate remains `Building`/`Quarantined`; current live generation stays active | Mixed event/projection/redb/CAS generation activates | #728/#736 |
+| F-16 online backup | Before/during SQLite cut, before cut-receipt seal, or after seal but before top-level manifest activation | Normal appends advance only `EventTruthHead`; an incomplete cut is discarded/quarantined; a sealed `EventTruthCutReceipt` is referenced one-way by the top-level recovery manifest | Receipt embeds the final parent-manifest digest, mixed constituents activate, or a normal append churns `StorageGeneration` | #728/#736 |
 | F-17 restore | After each sequential redb/fs/ECS/projection/event step | Restore fence stays closed until rollback or full validated activation | Partial restore is declared ready or offsets jump over unapplied effects | #728/#736 and recovery owners |
 | F-18 offline compaction | Before copy, before/after checkpoint, or before operator replacement | Original file remains authoritative; candidate fails validation or atomically replaces it while stopped | Live writer races the copy or partial output replaces authority | #732/#736 |
 | F-19 disk full/I/O fault | SQLite write, WAL sync/checkpoint, projection write, outbox/outcome write | Typed failure; no success ack; readiness reflects unresolved authority | Error is logged while cursor/outcome advances | #732-#736 |
 | F-20 process/OS loss | At every F-02 through F-19 boundary | Recovery matches the declared `EventDurability` class and generation manifest | Process-restart-only evidence is generalized to power-loss durability | #732/#736 |
 
-The matrix proves safety properties, not exactly-once transport. End-to-end
-effect idempotency exists only when the stable operation, inbox/outcome, local
-state or external receipt, and retry/probe rules all agree.
+The matrix proves safety properties, not exactly-once transport. A local
+exactly-one business outcome requires the stable operation, inbox/outcome, and
+local state to share an atomic authority. An external exactly-one outcome also
+requires a bound idempotency key honored by the external system or an
+authoritative outcome probe. Without that capability, uncertainty is
+quarantined and manual; no exactly-once claim is made.
 
 ## Durability and Acknowledgement Contract
 
@@ -500,7 +517,7 @@ has no delivery contract. It must not be an alternate unreviewed API.
 ```text
 Pending
   -> Claimed { boot_id, attempt, lease_until }
-  -> PubAcked { stream, sequence, duplicate }
+  -> BrokerAccepted { stream, sequence, duplicate, acceptance_digest }
   -> Completed
   | Retryable { next_attempt, error_class }
   | Quarantined { reason, evidence }
@@ -511,6 +528,40 @@ publish keeps the same message ID, probes when possible, or republishes. It
 never marks completion from a successful socket write alone. Exhausted retry
 enters a visible quarantine with operator resolve/retry/discard policy; it does
 not disappear into a terminal `failed` row.
+
+`PubAck` creates a typed acceptance record, not a universal durability proof:
+
+```text
+BrokerAcceptance {
+    message_id,
+    stream,
+    sequence,
+    duplicate,
+    accepted_at_ms,
+    acceptance_digest,
+}
+
+TransportDurability {
+    acceptance_digest,
+    storage_kind: Memory | File,
+    replica_count,
+    sync_always,
+    sync_interval_ms,
+    server_config_digest,
+    declared_crash_model: Process | Server | OS | PowerLoss,
+    assessment: Accepted | StableWithinDeclaredModel | Indeterminate,
+}
+```
+
+The publisher reads and verifies the effective stream/server configuration,
+not an intended configuration file. NATS FileStore defaults to asynchronous
+background sync; the pinned implementation sets
+`defaultSyncInterval = 2 * time.Minute` unless configuration overrides it, and
+`SyncAlways` changes the write boundary. Therefore a `PubAck` proves broker
+acceptance and sequence assignment. Stable-media or power-loss durability is
+claimed only when the recorded storage kind, replica count, effective sync
+policy, and tested crash model support it. A policy mismatch keeps readiness
+closed or marks transport durability indeterminate.
 
 ### Consumer Inbox and Outcome
 
@@ -526,9 +577,20 @@ Unseen -> Executing { boot_id, attempt, request_digest }
 
 The inbox claim and local business state commit in one transaction whenever
 they share an engine. For an external effect, Sentinel reserves a stable
-request identity before the call, persists the provider result, then completes
-the local outcome. A crash after an uncertain effect runs an outcome probe; it
-does not blindly invoke again.
+request identity before the call and records one of two explicit capability
+contracts:
+
+- `BoundIdempotencyKey`: the external system commits to treating that identity
+  as the same operation across retries;
+- `AuthoritativeOutcomeProbe`: the external system can return the terminal
+  result for that exact identity without issuing the effect again.
+
+Only those capabilities permit automated reconciliation and an exactly-one
+business-outcome target. If neither is supported, Sentinel may dispatch once,
+but timeout or connection loss is `IndeterminateExternalEffect`; it is
+quarantined for operator resolution and never automatically retried. A stable
+Sentinel request ID and local receipt alone cannot prevent the external system
+from executing twice.
 
 JetStream `Nats-Msg-Id`, duplicate detection, and durable consumer ack floors
 are transport optimizations. The inbox is the business idempotency authority.
@@ -623,39 +685,63 @@ A required consumer with no frontier blocks pruning and product readiness. An
 optional retired consumer is removed by a durable catalog transition, not by
 deleting its offset row.
 
-### EventTruthGeneration
+### Event Truth Generation, Head, and Cut
 
 ```text
-EventTruthGeneration {
+EventTruthGenerationDescriptor {
     generation_id,
-    storage_generation_id,
-    storage_manifest_digest,
+    parent_generation_id,
     sqlite_engine_fingerprint,
     schema_manifest_digest,
     event_codec_digest,
+    producer_catalog_digest,
     lower_position,
+    created_by_operation_id,
+    descriptor_digest,
+}
+
+EventTruthHead {
+    generation_id,
+    head_version,
+    durable_upper,
+    previous_head_digest,
+    head_digest,
+}
+
+EventTruthCutReceipt {
+    capture_operation_id,
+    generation_id,
+    parent_storage_generation_id: Option<GenerationId>,
+    event_truth_head_digest,
     durable_upper,
     required_consumer_frontiers,
     projection_generations,
     outbox_frontier,
     inbox_outcome_frontier,
     snapshot_recovery_cut,
-    status: Building | Live | Retired | Quarantined,
+    cut_digest,
 }
 ```
 
-`EventTruthGeneration` is a signed/digested component referenced by #728's
-`StorageGeneration`; it is not a second activation authority. Conversely, its
-`storage_generation_id` and manifest digest bind it to the redb-metadata/CAS
-generation. `EventTruthGeneration` advances when event schema/codec, durable
-upper, projection set, or consumer/outcome frontier changes.
-`StorageGeneration` advances when any constituent event, projection, redb,
-filesystem/CAS, or recovery-point generation changes. A backup or restore
-cannot activate until both manifests bind each other and event rows,
-WAL/backup cut, projection generations, outbox/inbox outcomes, redb state, and
-CAS reachability agree on that composition. There is one activation decision
-owned by #728 and the active whole-product recovery flow, not two cross-store
-commits pretending to be atomic.
+`EventTruthGenerationDescriptor` is immutable lineage for compatibility. A new
+descriptor is created only when the SQLite engine contract, schema manifest,
+event codec, or producer catalog requires a new compatibility generation.
+Normal event appends do not create a descriptor and do not advance
+`StorageGeneration`; they monotonically advance `EventTruthHead` within the
+current generation.
+
+Backup, restore, and migration capture a specific head and seal one immutable
+`EventTruthCutReceipt`. The receipt binds its capture operation, generation,
+durable upper, all mandatory consumer frontiers, active projection generations,
+unresolved outbox/inbox outcomes, and the snapshot recovery cut. It may name
+the prior storage generation for lineage, but it MUST NOT contain the final
+parent `StorageGeneration` or `RecoveryPoint` manifest digest.
+
+The top-level #728 `StorageGeneration`/`RecoveryPoint` manifest references the
+sealed event cut digest one-way together with redb, filesystem, and CAS
+constituent receipts. One final canonical top-level digest/signature owns
+validation and activation. There is no reciprocal digest, no two-store atomic
+activation claim, and no per-event whole-product generation churn.
 
 ### Retention Rule
 
@@ -731,9 +817,9 @@ files were re-read on 2026-07-29.
 | --- | --- | --- | --- | --- |
 | [SQLite `ef893b1d`](https://github.com/sqlite/sqlite/tree/ef893b1d66fa281d30b6d2165c398e1f08ffc801) | WAL sync in [`src/wal.c`](https://github.com/sqlite/sqlite/blob/ef893b1d66fa281d30b6d2165c398e1f08ffc801/src/wal.c#L4195-L4213), NORMAL/FULL distinction in [`src/pager.c`](https://github.com/sqlite/sqlite/blob/ef893b1d66fa281d30b6d2165c398e1f08ffc801/src/pager.c#L604-L625), backup in [`src/backup.c`](https://github.com/sqlite/sqlite/blob/ef893b1d66fa281d30b6d2165c398e1f08ffc801/src/backup.c), crash/I/O tests in [`test/walcrash2.test`](https://github.com/sqlite/sqlite/blob/ef893b1d66fa281d30b6d2165c398e1f08ffc801/test/walcrash2.test) and [`test/backup_ioerr.test`](https://github.com/sqlite/sqlite/blob/ef893b1d66fa281d30b6d2165c398e1f08ffc801/test/backup_ioerr.test) | [Public-domain scope](https://github.com/sqlite/sqlite/blob/ef893b1d66fa281d30b6d2165c398e1f08ffc801/LICENSE.md); no root `SECURITY` file at the pin, so Sentinel keeps its own advisory/version gate | `speedtest1` and fault corpus are useful methods only; no number transfers | Keep bundled SQLite; formalize sync, backup, and fault contracts |
 | [Turso `7ce8778f`](https://github.com/tursodatabase/turso/tree/7ce8778fe8befaa89fd50c9ec07b49cbc7f4925e) | Recovery cases in [`RECOVERY_SEMANTICS.md`](https://github.com/tursodatabase/turso/blob/7ce8778fe8befaa89fd50c9ec07b49cbc7f4925e/docs/internals/mvcc/RECOVERY_SEMANTICS.md#L39-L85), ordered checkpoint states in [`checkpoint_state_machine.rs`](https://github.com/tursodatabase/turso/blob/7ce8778fe8befaa89fd50c9ec07b49cbc7f4925e/core/mvcc/database/checkpoint_state_machine.rs#L53-L100), deterministic faults in [`testing/concurrent-simulator`](https://github.com/tursodatabase/turso/tree/7ce8778fe8befaa89fd50c9ec07b49cbc7f4925e/testing/concurrent-simulator) | [MIT](https://github.com/tursodatabase/turso/blob/7ce8778fe8befaa89fd50c9ec07b49cbc7f4925e/LICENSE.md); no root `SECURITY` file at the pin; upstream calls the engine production-used but pre-1.0 and recommends independent backups | MVCC recovery and throughput harnesses exist; methods are hypotheses only | Port recovery vocabulary/failpoints; no replacement |
-| [Materialize `7f6c5277`](https://github.com/MaterializeInc/materialize/tree/7f6c52776d27c34cb24210bc07a926c4cb6a7d5f) | Idempotent compare-and-append in [`machine.rs`](https://github.com/MaterializeInc/materialize/blob/7f6c52776d27c34cb24210bc07a926c4cb6a7d5f/src/persist-client/src/internal/machine.rs#L321-L449), compaction/GC in [`compact.rs`](https://github.com/MaterializeInc/materialize/blob/7f6c52776d27c34cb24210bc07a926c4cb6a7d5f/src/persist-client/src/internal/compact.rs) and [`gc.rs`](https://github.com/MaterializeInc/materialize/blob/7f6c52776d27c34cb24210bc07a926c4cb6a7d5f/src/persist-client/src/internal/gc.rs), data-driven tests including [`caa_idempotent`](https://github.com/MaterializeInc/materialize/blob/7f6c52776d27c34cb24210bc07a926c4cb6a7d5f/src/persist-client/tests/machine/caa_idempotent) | [Business Source License 1.1](https://github.com/MaterializeInc/materialize/blob/7f6c52776d27c34cb24210bc07a926c4cb6a7d5f/LICENSE); no root `SECURITY` file at the pin; mechanism study only | Persist/compute benches and arrangements exist but require a distributed product topology | Clean-room port upper/since/generation ideas only |
-| [EventStoreDB/Kurrent `be4eb435`](https://github.com/EventStore/EventStore/tree/be4eb435a73ba90e1cf1480d8c7995a2000d7137) | Expected-revision API/tests in [`WhenExpectingRevision.cs`](https://github.com/EventStore/EventStore/blob/be4eb435a73ba90e1cf1480d8c7995a2000d7137/src/KurrentDB.Api.V2.Tests/Modules/Streams/AppendRecords/WriteOnly/WhenExpectingRevision.cs), durable checkpoint/parker implementations in [`PersistentSubscriptionCheckpointWriter.cs`](https://github.com/EventStore/EventStore/blob/be4eb435a73ba90e1cf1480d8c7995a2000d7137/src/KurrentDB.Core/Services/PersistentSubscription/PersistentSubscriptionCheckpointWriter.cs) and [`PersistentSubscriptionMessageParker.cs`](https://github.com/EventStore/EventStore/blob/be4eb435a73ba90e1cf1480d8c7995a2000d7137/src/KurrentDB.Core/Services/PersistentSubscription/PersistentSubscriptionMessageParker.cs), tests in [`PersistentSubscriptionMessageParkerTests.cs`](https://github.com/EventStore/EventStore/blob/be4eb435a73ba90e1cf1480d8c7995a2000d7137/src/KurrentDB.Core.Tests/Services/PersistentSubscription/PersistentSubscriptionMessageParkerTests.cs) | [Kurrent License v1](https://github.com/EventStore/EventStore/blob/be4eb435a73ba90e1cf1480d8c7995a2000d7137/LICENSE.md); upstream [security-reporting pointer](https://github.com/EventStore/EventStore/blob/be4eb435a73ba90e1cf1480d8c7995a2000d7137/SECURITY.md); behavior study only | Scavenge, persistent-subscription, and crash tests show operations burden that Sentinel should not import | Clean-room port expected-revision/parking behavior only |
-| [NATS Server `40359273`](https://github.com/nats-io/nats-server/tree/40359273926ae1b238b8b50270a867fa742bb13e) | Stream storage/duplicate handling in [`jetstream.go`](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/server/jetstream.go), file sync in [`filestore.go`](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/server/filestore.go), ack floor/redelivery in [`consumer.go`](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/server/consumer.go), tests in [`jetstream_test.go`](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/server/jetstream_test.go) and [`jetstream_consumer_test.go`](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/server/jetstream_consumer_test.go) | [Apache-2.0](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/LICENSE); no root `SECURITY` file at the pin; existing dependency remains behind Sentinel auth/config | JetStream benchmark tests exist; no upstream throughput/latency number is Sentinel evidence | Use JetStream API with `PubAck`; retain Sentinel outcome authority |
+| [Materialize `7f6c5277`](https://github.com/MaterializeInc/materialize/tree/7f6c52776d27c34cb24210bc07a926c4cb6a7d5f) | Idempotent compare-and-append in [`machine.rs`](https://github.com/MaterializeInc/materialize/blob/7f6c52776d27c34cb24210bc07a926c4cb6a7d5f/src/persist-client/src/internal/machine.rs#L321-L449), compaction/GC in [`compact.rs`](https://github.com/MaterializeInc/materialize/blob/7f6c52776d27c34cb24210bc07a926c4cb6a7d5f/src/persist-client/src/internal/compact.rs) and [`gc.rs`](https://github.com/MaterializeInc/materialize/blob/7f6c52776d27c34cb24210bc07a926c4cb6a7d5f/src/persist-client/src/internal/gc.rs), data-driven tests including [`caa_idempotent`](https://github.com/MaterializeInc/materialize/blob/7f6c52776d27c34cb24210bc07a926c4cb6a7d5f/src/persist-client/tests/machine/caa_idempotent) | [Business Source License 1.1](https://github.com/MaterializeInc/materialize/blob/7f6c52776d27c34cb24210bc07a926c4cb6a7d5f/LICENSE); no root `SECURITY` file at the pin; mechanism study only | Persist/compute benches and arrangements exist but require a distributed product topology | Independent Sentinel implementation of the documented upper/since/generation behavioral contract; no copied, transliterated, or structurally derived source |
+| [EventStoreDB/Kurrent `be4eb435`](https://github.com/EventStore/EventStore/tree/be4eb435a73ba90e1cf1480d8c7995a2000d7137) | Expected-revision API/tests in [`WhenExpectingRevision.cs`](https://github.com/EventStore/EventStore/blob/be4eb435a73ba90e1cf1480d8c7995a2000d7137/src/KurrentDB.Api.V2.Tests/Modules/Streams/AppendRecords/WriteOnly/WhenExpectingRevision.cs), durable checkpoint/parker implementations in [`PersistentSubscriptionCheckpointWriter.cs`](https://github.com/EventStore/EventStore/blob/be4eb435a73ba90e1cf1480d8c7995a2000d7137/src/KurrentDB.Core/Services/PersistentSubscription/PersistentSubscriptionCheckpointWriter.cs) and [`PersistentSubscriptionMessageParker.cs`](https://github.com/EventStore/EventStore/blob/be4eb435a73ba90e1cf1480d8c7995a2000d7137/src/KurrentDB.Core/Services/PersistentSubscription/PersistentSubscriptionMessageParker.cs), tests in [`PersistentSubscriptionMessageParkerTests.cs`](https://github.com/EventStore/EventStore/blob/be4eb435a73ba90e1cf1480d8c7995a2000d7137/src/KurrentDB.Core.Tests/Services/PersistentSubscription/PersistentSubscriptionMessageParkerTests.cs) | [Kurrent License v1](https://github.com/EventStore/EventStore/blob/be4eb435a73ba90e1cf1480d8c7995a2000d7137/LICENSE.md); upstream [security-reporting pointer](https://github.com/EventStore/EventStore/blob/be4eb435a73ba90e1cf1480d8c7995a2000d7137/SECURITY.md); behavior study only | Scavenge, persistent-subscription, and crash tests show operations burden that Sentinel should not import | Independent Sentinel implementation of the documented expected-revision/parking behavioral contract; no copied, transliterated, or structurally derived source |
+| [NATS Server `40359273`](https://github.com/nats-io/nats-server/tree/40359273926ae1b238b8b50270a867fa742bb13e) | Stream storage/duplicate handling in [`jetstream.go`](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/server/jetstream.go), sync configuration and the two-minute default in [`filestore.go:61-69`](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/server/filestore.go#L61-L69) and [`filestore.go:327-333`](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/server/filestore.go#L327-L333), ack floor/redelivery in [`consumer.go`](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/server/consumer.go), tests in [`jetstream_test.go`](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/server/jetstream_test.go) and [`jetstream_consumer_test.go`](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/server/jetstream_consumer_test.go) | [Apache-2.0](https://github.com/nats-io/nats-server/blob/40359273926ae1b238b8b50270a867fa742bb13e/LICENSE); no root `SECURITY` file at the pin; existing dependency remains behind Sentinel auth/config | JetStream benchmark tests exist; no upstream throughput/latency number is Sentinel evidence | Use JetStream `PubAck` as broker acceptance; separately verify effective transport durability and retain Sentinel outcome authority |
 
 ### Candidate Fit Matrix
 
@@ -746,7 +832,7 @@ support, not an adoption recommendation.
 | Local authoritative ledger | S: embedded ACID/WAL | S: embedded SQL/WAL, pre-1.0 caveat | P: durable persist, distributed | S: dedicated event service | N/A: transport |
 | Stable event/operation identity | P: constraints only | P: constraints only | P: idempotent command token | S: event/stream identity | P: message ID within dedup window |
 | Expected-revision append | P: implement in transaction | P: implement in transaction | S: compare upper-and-append | S: expected stream revision | N/A |
-| Typed durability/ack | S: sync/commit modes | S: explicit WAL/log phases | S: durable shard command | S: server write result | S: `PubAck`, transport only |
+| Typed durability/ack | S: sync/commit modes | S: explicit WAL/log phases | S: durable shard command | S: server write result | P: `PubAck` proves acceptance; stable-media boundary depends on storage/replicas/sync policy |
 | Producer outbox | P: atomic local rows | P: atomic local rows | P: durable command log | P: subscription/connector patterns | S: publish target, not source transaction |
 | Permanent effect outcome | P: inbox tables | P: inbox tables | P: durable state machine | P: persistent subscriptions | N/A: ack floor is not business outcome |
 | Poison quarantine | P: local table/state | P: local table/state | P: error/state collections | S: parked messages | P: max-delivery/advisory, needs Sentinel policy |
@@ -767,7 +853,7 @@ Cross-cutting differences:
 | Turso | Strong deterministic simulator and explicit recovery phases; pre-1.0 evolution increases format/API risk | MIT; no pinned root security policy; independent backups explicitly prudent | Engine replacement, file compatibility, SQL/PRAGMA and binding migration are high risk | Simulator and MVCC designs are hypotheses, not a reason to replace |
 | Materialize | Indeterminate compare-and-append and frontier tests are strong; distributed failures differ from local SQLite | BSL restricts reuse; large, fast-moving distributed maintenance surface | New distributed dataflow/storage plane violates low-resource 1:n | Shared arrangements may reduce repeated computation only after a Sentinel workload proves need |
 | Kurrent | Expected revision, parking, checkpoint, and scavenging are mature service patterns | Kurrent License limits product use; separate auth/TLS/service patching | Adds a database service, network boundary, operations and migration | Dedicated event service may scale writes, but M0 has no evidence that SQLite is limiting |
-| NATS | File/cluster/consumer tests support transport durability; redelivery is expected | Apache-2.0; existing server still needs auth, limits, advisories and bounded cardinality | Existing dependency; change is API/config plus Sentinel outcome tables | Async fan-out may reduce coupling; `PubAck` and replicas add cost that target tests must measure |
+| NATS | File/cluster/consumer tests expose configurable transport-durability boundaries; FileStore defaults to asynchronous two-minute sync and redelivery is expected | Apache-2.0; existing server still needs auth, limits, advisories and bounded cardinality | Existing dependency; change is API/config plus Sentinel acceptance, durability, and outcome records | Async fan-out may reduce coupling; sync policy and replicas add cost that target tests must measure |
 
 ### Source-Level Mechanisms
 
@@ -808,15 +894,19 @@ Persistent subscriptions checkpoint progress and park repeatedly failing
 messages for explicit resolution.
 
 These contracts map directly to Sentinel's append gateway and poison lane.
-The current Kurrent License means implementation must be original and based on
-the public behavioral contract, not copied source or a new service dependency.
+The current Kurrent License requires an independent Sentinel implementation of
+the documented behavioral contract, with no copied, transliterated, or
+structurally derived source and no new service dependency.
 
 #### NATS JetStream
 
-JetStream stores producer message IDs for a configured duplicate window,
-returns a `PubAck` with stream sequence, and persists durable consumer ack
-state. Redelivery remains normal. Sentinel should use those guarantees exactly
-as specified and retain its own permanent inbox/outcome authority.
+JetStream stores producer message IDs for a configured duplicate window and
+returns a `PubAck` with stream sequence. FileStore defaults to background sync
+at a two-minute interval unless `SyncAlways` or another interval changes the
+boundary. Redelivery remains normal. Sentinel should record broker acceptance
+and separately evaluate transport durability from effective storage,
+replication, sync policy, and crash model while retaining its own permanent
+inbox/outcome authority.
 
 ## Mechanism Comparison and Decisions
 
@@ -826,21 +916,25 @@ as specified and retain its own permanent inbox/outcome authority.
 | WAL recovery tests | Unit/restart tests, limited power-loss model | SQLite/Turso model torn and missing durable artifacts | `Port algorithm/contract` | Deterministic failpoints around current engine |
 | Event identity | UUIDv4 plus often-random operation ID | Event stores separate event ID, stream revision, operation replay | `Reimplement minimal` | Stable replay, provenance, and concurrency contract |
 | Concurrent append | Unique operation ID, no stream expected revision | EventStore compare expected revision | `Reimplement minimal` | Prevent lost logical updates per aggregate |
-| Producer delivery | Publish then mark; no required PubAck | JetStream PubAck and duplicate result | `Configure existing dependency` | Do not claim delivery before stream durability |
-| Consumer idempotency | Ack/redelivery without durable inbox | Durable inbox/outcome and parked poison patterns | `Reimplement minimal` | Exactly-once business outcome under redelivery |
+| Producer delivery | Publish then mark; no required PubAck | JetStream PubAck plus explicit storage/replica/sync policy | `Configure existing dependency` | Record broker acceptance; claim transport durability only for the verified crash model |
+| Consumer idempotency | Ack/redelivery without durable inbox | Durable inbox/outcome and parked poison patterns | `Reimplement minimal` | Exactly-one local outcome; external outcome only with bound upstream idempotency/probe |
 | Projection frontier | Split DB/offset commits | Materialize upper/since; Turso atomic persistent cursor | `Reimplement minimal` | Replay-safe local truth and retention proof |
 | Projection rebuild | Clear active DB and replay | Generation/frontier activation | `Reimplement minimal` | Readers never see empty or partial rebuild |
 | Poison events | Skip/ack or terminal failed row | Persistent message parking/quarantine | `Reimplement minimal` | No silent loss and explicit operator resolution |
 | Incremental views | Handwritten per projection | Materialize arrangements share maintained indexes | `Keep Sentinel` for M0 | Add only targeted shared arrangements after measurement |
 | Schema authority | Rust and Go DDL/migrations | Immutable ordered manifest and compatibility gates | `Reimplement minimal` | One writer, deterministic upgrades |
 | Retention | Minimum existing offset plus outbox | Read/since frontiers and mandatory consumers | `Reimplement minimal` | No delete under missing-consumer uncertainty |
-| Online backup | Cross-store sequential snapshot | SQLite backup plus generation cut | `Integrate` with #728 | One recoverable event/projection/storage generation |
+| Online backup | Cross-store sequential snapshot | SQLite backup plus a sealed one-way cut receipt | `Integrate` with #728 | Top-level recovery manifest owns one activation digest without per-append churn |
 | Turso replacement | Historical incomplete Limbo evaluation | Improved recovery/simulator, current maturity caveat | `Reject` now | Observe through #705/#656; avoid migration risk |
 | Materialize/EventStore service | Not present | Rich mechanisms but heavy/restrictive integration | `Reject` | Concepts only; preserve low-resource 1:n design |
 
-In the consumer-idempotency row, "exactly-once business outcome" is the target
-result of Sentinel's stable identity plus durable receipt/effect protocol. It
-is not a claim about NATS, SQLite, a local transaction, or the current code.
+In the consumer-idempotency row, an exactly-one local business outcome is the
+target result of Sentinel's stable identity plus one atomic local
+receipt/effect protocol. For an external effect, the same target is allowed
+only with an upstream-bound idempotency key or authoritative outcome probe.
+Otherwise indeterminate is quarantined/manual and never automatically retried.
+No claim is made about NATS, SQLite, or the current code providing universal
+exactly-once behavior.
 
 ## Dependency and Security Impact
 
@@ -850,8 +944,9 @@ is not a claim about NATS, SQLite, a local transaction, or the current code.
   and [#656](https://github.com/silentspike/project-sentinel/issues/656)
   upgrade conformance.
 - Materialize and EventStoreDB/Kurrent were reviewed only for behavioral
-  mechanisms because their current licenses are not suitable foundations for
-  copied implementation code.
+  mechanisms. Any follow-up is an independent Sentinel implementation of the
+  documented behavioral contract; no copied, transliterated, or structurally
+  derived source is permitted.
 - Payload digest, producer identity, owner term, schema version, and source
   generation are validated before a fact or effect becomes authoritative.
 - Quarantine content is access-controlled and redacted; it can contain customer
@@ -865,9 +960,9 @@ is not a claim about NATS, SQLite, a local transaction, or the current code.
 
 | Concern | Existing owner | Boundary after this study |
 | --- | --- | --- |
-| Cross-store storage generation and restore | [#728](https://github.com/silentspike/project-sentinel/issues/728), active recovery [#751](https://github.com/silentspike/project-sentinel/issues/751)/[#753](https://github.com/silentspike/project-sentinel/issues/753)/[#755](https://github.com/silentspike/project-sentinel/issues/755) | #728 owns storage-generation composition; recovery owners seal and activate whole-product cuts; #709 adds no second restore authority |
+| Cross-store storage generation and restore | [#728](https://github.com/silentspike/project-sentinel/issues/728), active recovery [#751](https://github.com/silentspike/project-sentinel/issues/751)/[#753](https://github.com/silentspike/project-sentinel/issues/753)/[#755](https://github.com/silentspike/project-sentinel/issues/755) | #728 owns the top-level generation/recovery manifest and its sole canonical activation digest; it references a sealed event cut receipt one-way. Recovery owners activate whole-product cuts; #709 adds no second restore authority |
 | Hippocampus transaction/fault policy | [#729](https://github.com/silentspike/project-sentinel/issues/729) | Owns redb atomic write primitive; episode producer owns source receipt/frontier |
-| NATS internals | [#679](https://github.com/silentspike/project-sentinel/issues/679) | Owns NATS-specific topology; event delivery owns PubAck/outbox/inbox semantics |
+| NATS internals | [#679](https://github.com/silentspike/project-sentinel/issues/679) | Owns NATS topology and effective storage/replication/sync configuration; #733 verifies it and owns broker-acceptance, transport-durability, outbox, inbox, and outcome semantics |
 | Durable company workflow | [#695](https://github.com/silentspike/project-sentinel/issues/695), [#696](https://github.com/silentspike/project-sentinel/issues/696), [#710](https://github.com/silentspike/project-sentinel/issues/710) | Consume the event/effect contract; do not invent another ledger |
 | Cross-node inbound and side effects | [#552](https://github.com/silentspike/project-sentinel/issues/552) | Consumes the same envelope and inbox identity; owns cluster queuing |
 | Projection host provisioning | [#644](https://github.com/silentspike/project-sentinel/issues/644) | Owns service materialization, not read-model correctness |
@@ -933,9 +1028,16 @@ contract through #552 later.
 Scope:
 
 - claim/retry/quarantine outbox state machine;
-- JetStream publish API and required `PubAck`;
+- JetStream publish API and required `PubAck` as `BrokerAcceptance`;
+- `TransportDurability` bound to effective storage kind, replica count, server
+  sync policy, configuration digest, and declared crash model;
+- configuration/readiness and process/server/OS/power-loss tests proving that a
+  `PubAck` alone is insufficient for stable-media claims;
 - indeterminate publish reconciliation with stable message ID;
 - durable inbox and outcome receipts for Judge and all effecting consumers;
+- external-effect capability contract requiring a bound upstream idempotency
+  key or authoritative outcome probe for automated reconciliation; otherwise
+  indeterminate is quarantined/manual and never auto-retried;
 - crash after publish, effect, outcome commit, and ack;
 - operator quarantine resolution and readiness/metrics.
 
@@ -980,7 +1082,7 @@ Scope:
 This slice is the only `BLOCKS_M0` child and may proceed as the first compatible
 part after the report contract is accepted.
 
-### Slice 5: Retention, EventTruthGeneration, Backup, and Fault Matrix
+### Slice 5: Retention, Event Truth Head/Cut, Backup, and Fault Matrix
 
 Implementation owner:
 [#736](https://github.com/silentspike/project-sentinel/issues/736).
@@ -991,7 +1093,12 @@ Scope:
 
 - mandatory consumer catalog and explicit start/retire policies;
 - conservative frontier-based pruning;
-- `EventTruthGeneration` integrated into #728;
+- immutable `EventTruthGenerationDescriptor`, monotonic `EventTruthHead`, and
+  sealed `EventTruthCutReceipt`;
+- one-way integration in which #728's top-level recovery manifest references
+  the cut digest and owns the sole canonical activation digest/signature;
+- negative fixtures for per-append `StorageGeneration` churn, reciprocal digest
+  cycles, unsealed cuts, constituent mismatch, and stale-head capture;
 - SQLite online backup and projection cut;
 - restore without offset jumps;
 - process, OS, disk-full, I/O, WAL, checkpoint, backup, and schema rollback
@@ -1007,9 +1114,9 @@ Scope:
 | AC-3 | PASS | Five immutable upstream commits with implementation, tests, failures, license/security, and operations evidence |
 | AC-4 | PASS | Fifteen-row mechanism-by-five-candidate matrix, cross-cut matrix, Sentinel findings, and deterministic failure schedules |
 | AC-5 | PASS | One exact action per mechanism; no upstream/build/CI number is Sentinel runtime evidence |
-| AC-6 | PASS | Live, quality-ready ordered epic #731 and disjoint implementation children #732-#736 with current body hashes and existing-owner boundaries |
+| AC-6 | PENDING ORC OWNER INTEGRATION | Live ordered epic #731 and disjoint children #732-#736 exist, but #733/#736/#728 require the exact acceptance/durability and acyclic cut addenda from this corrected report |
 | AC-7 | PASS | E-01 through E-15 classified as `BLOCKS_M0`, `M0_HARDENING`, or `POST_M0`; only source-proven E-01 blocks M0 |
-| AC-8 | PASS after final gates | This sole public English/ASCII report; local/external link, GFM, public-safety, typo, and diff gates are required at the frozen head |
+| AC-8 | PASS | This sole public English/ASCII report passes local/external link, GFM, public-safety, typo, and diff gates at the frozen head |
 | AC-9 | PENDING ORC INTEGRATION | The exact semantic delta below is ready; this worker is forbidden to edit either TOGAF language copy or claim issue completion |
 
 Negative-criteria readback:
@@ -1021,7 +1128,7 @@ Negative-criteria readback:
 | AC-N3 | PASS: current code and stored incident evidence, not labels/tests alone, determine findings |
 | AC-N4 | PASS: runtime target `NONE`; no VM, provider, Rust/Cargo, build-server timing, or performance run |
 | AC-N5 | PASS: each accepted gap maps to #732-#736 and existing #728/#729/#679/#552/#695/#696/#710 owners |
-| AC-N6 | PASS: the report explicitly separates SQLite durability, JetStream at-least-once delivery, bounded dedup, and permanent business-effect outcomes |
+| AC-N6 | PASS: the report separates SQLite durability, JetStream broker acceptance, policy-bound transport durability, bounded dedup, local permanent outcomes, and capability-gated external outcomes |
 
 ## TOGAF Delta
 
@@ -1059,11 +1166,16 @@ Apply this exact semantic target as one coherent event-truth subsection:
    only at their declared SQLite durable-commit boundary. Rebuildable telemetry
    names its durable source and startup gate. `synchronous=NORMAL` is not
    described as power-loss durable.
-5. **Delivery versus outcome.** NATS JetStream is durable at-least-once
-   transport. `PubAck` proves stream acceptance, and message-ID dedup is
-   bounded. Permanent Sentinel inbox/outcome receipts plus stable external
-   request identities prevent duplicate business effects; transport never
-   claims end-to-end exactly-once.
+5. **Delivery versus outcome.** A JetStream `PubAck` proves broker acceptance
+   and sequence assignment, not universal stable-media survival.
+   `BrokerAcceptance` is distinct from `TransportDurability`, which binds the
+   effective storage kind, replica count, server sync policy/configuration
+   digest, and declared process/server/OS/power-loss model. Message-ID dedup is
+   bounded. A local durable inbox/outcome can own one atomic local business
+   result. An external exactly-one outcome is claimed only when the external
+   system honors a bound idempotency key or exposes an authoritative outcome
+   probe; otherwise timeout/indeterminate is quarantined/manual and never
+   automatically retried.
 6. **Poison and uncertainty.** Malformed relevant events, exhausted delivery,
    and ambiguous effects enter typed quarantine with evidence and operator
    resolution. No relevant cursor/frontier advances past unresolved authority.
@@ -1079,17 +1191,23 @@ Apply this exact semantic target as one coherent event-truth subsection:
    across every mandatory consumer, live projection generation, unresolved
    delivery/effect outcome, backup/snapshot recovery cut, legal/audit rule,
    migration, and transfer. Missing or unknown proof retains data.
-10. **Recovery composition.** `EventTruthGeneration` binds event schema/codec,
-    durable upper, required frontiers, projection generations, outcomes, and
-    recovery cut to #728's `StorageGeneration`. Whole-product recovery
-    activates one mutually bound event/redb/filesystem/CAS generation through
-    the active recovery owners; it never infers completion by setting offsets
-    to the current maximum.
+10. **Recovery composition.** An immutable
+    `EventTruthGenerationDescriptor` defines engine/schema/codec/producer
+    compatibility lineage. Normal appends advance a monotonic
+    `EventTruthHead`, not `StorageGeneration`. Backup, restore, or migration
+    seals an `EventTruthCutReceipt` over the captured head, durable upper,
+    mandatory frontiers, projection generations, outcomes, and recovery cut.
+    The receipt never embeds the final parent-manifest digest. #728's top-level
+    `StorageGeneration`/`RecoveryPoint` manifest references the cut digest
+    one-way with redb/filesystem/CAS receipts and owns the sole canonical
+    activation digest/signature. Recovery never infers completion by setting
+    offsets to the current maximum.
 11. **Source boundaries.** SQLite and NATS are retained. Turso contributes
     recovery/fault-test ideas under MIT but is not adopted. Materialize and
-    Kurrent contribute clean-room frontier/expected-revision/parking concepts
-    only under their restrictive license boundaries. No second event store,
-    dataflow platform, or workflow authority is introduced.
+    Kurrent inform documented behavioral contracts only. Any Sentinel
+    implementation is independent, with no copied, transliterated, or
+    structurally derived source. No second event store, dataflow platform, or
+    workflow authority is introduced.
 
 The public English guide and canonical German guide describe the same target
 architecture independently in their own language and preserve the numbered
