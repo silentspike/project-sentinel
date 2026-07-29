@@ -3734,10 +3734,12 @@ mod tests {
                         security_runtime_present: true,
                         adapter_handle_present: true,
                         adapter_instance_matches: true,
+                        runtime_resources_healthy: false,
                         adapter_health_state: Some(
                             sentinel_common::nano_runtime::NanoHealthState::Stopped,
                         ),
                         adapter_observation_error: None,
+                        logical_status: Some(sentinel_runtime::AgentStatus::Errored),
                         last_repair_status: Some("stale".to_string()),
                     }],
                 },

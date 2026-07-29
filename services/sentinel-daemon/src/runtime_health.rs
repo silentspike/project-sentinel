@@ -10,7 +10,7 @@ use sentinel_common::nano_runtime::{
 };
 use sentinel_common::{AgentId, LocalResidency, OwnerRegistry, StateTransferScope};
 use sentinel_projection::ReadModelStore;
-use sentinel_runtime::RuntimeOrchestrator;
+use sentinel_runtime::{AgentStatus, RuntimeOrchestrator};
 use sentinel_sandbox::cgroups::list_pids_in_cgroup;
 use sentinel_sandbox::{AgentProcess, SandboxHandle};
 use serde::{Deserialize, Serialize};
@@ -51,9 +51,13 @@ pub struct RuntimeHealthAgentSnapshot {
     #[serde(default)]
     pub adapter_instance_matches: bool,
     #[serde(default)]
+    pub runtime_resources_healthy: bool,
+    #[serde(default)]
     pub adapter_health_state: Option<NanoHealthState>,
     #[serde(default)]
     pub adapter_observation_error: Option<String>,
+    #[serde(default)]
+    pub logical_status: Option<AgentStatus>,
     #[serde(default)]
     pub last_repair_status: Option<String>,
 }
@@ -69,6 +73,68 @@ pub(crate) struct AdapterRuntimeObservation {
 pub(crate) struct RuntimeHealthObservationSet<'a> {
     pub previous: Option<&'a RuntimeHealthSnapshot>,
     pub adapter: &'a HashMap<AgentId, AdapterRuntimeObservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeAgentHealthClass {
+    Healthy,
+    Suspended,
+    Degraded,
+    Stale,
+}
+
+pub(crate) fn classify_runtime_agent(
+    agent: &RuntimeHealthAgentSnapshot,
+) -> RuntimeAgentHealthClass {
+    let complete = agent.projection_present && runtime_core_is_healthy(agent);
+    if !complete {
+        return if adapter_state_is_degraded(agent) {
+            RuntimeAgentHealthClass::Degraded
+        } else {
+            RuntimeAgentHealthClass::Stale
+        };
+    }
+    match (agent.logical_status, agent.adapter_health_state) {
+        (Some(AgentStatus::Suspended), Some(NanoHealthState::Degraded)) => {
+            RuntimeAgentHealthClass::Suspended
+        }
+        _ => RuntimeAgentHealthClass::Healthy,
+    }
+}
+
+pub(crate) fn runtime_core_is_healthy(agent: &RuntimeHealthAgentSnapshot) -> bool {
+    agent.runtime_present
+        && agent.security_runtime_present
+        && agent.adapter_handle_present
+        && agent.adapter_instance_matches
+        && agent.runtime_resources_healthy
+        && agent.adapter_observation_error.is_none()
+        && matches!(
+            (agent.logical_status, agent.adapter_health_state),
+            (
+                Some(AgentStatus::Active | AgentStatus::Sleeping),
+                Some(NanoHealthState::Healthy)
+            ) | (
+                Some(AgentStatus::Suspended),
+                Some(NanoHealthState::Degraded)
+            )
+        )
+}
+
+fn adapter_state_is_degraded(agent: &RuntimeHealthAgentSnapshot) -> bool {
+    agent.runtime_present
+        && agent.security_runtime_present
+        && agent.adapter_handle_present
+        && agent.adapter_instance_matches
+        && agent.runtime_resources_healthy
+        && agent.adapter_observation_error.is_none()
+        && matches!(
+            (agent.logical_status, agent.adapter_health_state),
+            (
+                Some(AgentStatus::Active | AgentStatus::Sleeping | AgentStatus::Errored),
+                Some(NanoHealthState::Degraded)
+            )
+        )
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -319,15 +385,37 @@ fn build_runtime_health_snapshot_with_registry(
         });
         let adapter_health_state = adapter_observation
             .and_then(|observation| observation.health.as_ref().map(|h| h.state));
-        let adapter_health_healthy = matches!(adapter_health_state, Some(NanoHealthState::Healthy));
         let adapter_observation_error =
             adapter_observation.and_then(|observation| observation.error.clone());
-        let healthy = runtime_present
-            && projection_present
-            && security_runtime_present
-            && legacy_resources_healthy
-            && adapter_instance_matches
-            && adapter_health_healthy;
+        let logical_status = runtime_orch
+            .agents()
+            .get(&AgentId(agent_id))
+            .map(|handle| handle.status);
+        let mut agent = RuntimeHealthAgentSnapshot {
+            agent_id,
+            aggregate_id,
+            name,
+            runtime_key,
+            runtime_present,
+            projection_present,
+            tracked_pid,
+            tracked_pid_alive,
+            tracked_pid_state,
+            cgroup_live_pid_count,
+            security_runtime_present,
+            adapter_handle_present,
+            adapter_instance_matches,
+            runtime_resources_healthy: legacy_resources_healthy,
+            adapter_health_state,
+            adapter_observation_error,
+            logical_status,
+            last_repair_status: None,
+        };
+        let health_class = classify_runtime_agent(&agent);
+        let healthy = matches!(
+            health_class,
+            RuntimeAgentHealthClass::Healthy | RuntimeAgentHealthClass::Suspended
+        );
         let unexpected_extra = !expected_active
             && (runtime_present
                 || projection_present
@@ -343,38 +431,20 @@ fn build_runtime_health_snapshot_with_registry(
         if stale {
             stale_runtime_entries += 1;
         }
-        let last_repair_status = Some(
-            if healthy {
-                "healthy"
-            } else if expected_active
-                && matches!(adapter_health_state, Some(NanoHealthState::Degraded))
-            {
-                "degraded"
-            } else if expected_active {
-                "stale"
-            } else {
+        agent.last_repair_status = Some(
+            if !expected_active {
                 "unexpected_runtime"
+            } else {
+                match health_class {
+                    RuntimeAgentHealthClass::Healthy => "healthy",
+                    RuntimeAgentHealthClass::Suspended => "suspended",
+                    RuntimeAgentHealthClass::Degraded => "degraded",
+                    RuntimeAgentHealthClass::Stale => "stale",
+                }
             }
             .to_string(),
         );
-        agents.push(RuntimeHealthAgentSnapshot {
-            agent_id,
-            aggregate_id,
-            name,
-            runtime_key,
-            runtime_present,
-            projection_present,
-            tracked_pid,
-            tracked_pid_alive,
-            tracked_pid_state,
-            cgroup_live_pid_count,
-            security_runtime_present,
-            adapter_handle_present,
-            adapter_instance_matches,
-            adapter_health_state,
-            adapter_observation_error,
-            last_repair_status,
-        });
+        agents.push(agent);
     }
 
     let runtime_agent_names = runtime_orch
@@ -917,6 +987,51 @@ mod tests {
     fn pidless_ecs_and_wasm_runtimes_do_not_enter_repair_loops() {
         healthy_non_bwrap_runtime(RUNTIME_ECS_NATIVE, None);
         healthy_non_bwrap_runtime(RUNTIME_WASM_WASMTIME, None);
+    }
+
+    #[test]
+    fn degraded_adapter_semantics_are_runtime_independent_and_status_bound() {
+        for runtime_key in [
+            RUNTIME_ECS_NATIVE,
+            RUNTIME_WASM_WASMTIME,
+            RUNTIME_BWRAP_LANDLOCK,
+        ] {
+            let base = RuntimeHealthAgentSnapshot {
+                agent_id: 7,
+                aggregate_id: "AGENT-07".to_string(),
+                name: "Runtime Agent".to_string(),
+                runtime_key: runtime_key.to_string(),
+                runtime_present: true,
+                projection_present: true,
+                tracked_pid: None,
+                tracked_pid_alive: false,
+                tracked_pid_state: None,
+                cgroup_live_pid_count: 0,
+                security_runtime_present: true,
+                adapter_handle_present: true,
+                adapter_instance_matches: true,
+                runtime_resources_healthy: true,
+                adapter_health_state: Some(NanoHealthState::Degraded),
+                adapter_observation_error: None,
+                logical_status: Some(AgentStatus::Suspended),
+                last_repair_status: None,
+            };
+            assert_eq!(
+                classify_runtime_agent(&base),
+                RuntimeAgentHealthClass::Suspended,
+                "{runtime_key}"
+            );
+            assert!(runtime_core_is_healthy(&base), "{runtime_key}");
+
+            let mut active = base;
+            active.logical_status = Some(AgentStatus::Active);
+            assert_eq!(
+                classify_runtime_agent(&active),
+                RuntimeAgentHealthClass::Degraded,
+                "{runtime_key}"
+            );
+            assert!(!runtime_core_is_healthy(&active), "{runtime_key}");
+        }
     }
 
     #[test]

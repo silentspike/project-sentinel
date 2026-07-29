@@ -1,111 +1,123 @@
-# Issue #472 ORC lifecycle correction evidence
+# Issue #472 lifecycle and Config Apply correction evidence
 
 Date: 2026-07-29
 
-Scope: source and remote-build validation for the bundled adversarial review of
-PR #700 at reviewed head `f028fb6b4f5b2fcc8ee76d5d73b3216ddeff4b8d`.
-No runtime service, deployment VM, installed binary, configuration, snapshot,
-or runtime data was accessed or changed.
+Scope: source validation for PR #700 after the bundled ORC review at
+`fed35f0b0e23d0e99db6fd3310da8e3a56823b68`.
 
-Current `origin/main@ae31ed303bf039c78b666ed1bf0a29e5ac334a93` is included
-through merge commit `c6ee6b6c9dec2023401e0c1fb88b2ca691440c75`; the branch
-was not rebased or force-pushed. The merge was conflict-free and added only the
-two current-main research documents. The prior current-main merge
-`c764988df2df96c87e09fa759990656c8d30ba18` remains in history. The
-`llm_bridge` one-second circuit-breaker reset and direct stored-deadline
-expiration remain unchanged.
+No daemon, deployment VM, installed binary, configuration, snapshot, runtime
+data, or benchmark target was accessed or changed. Live acceptance on `.240`
+and every deployment claim remain **NOT TESTED**. `.241` and `.242` remain
+forbidden for this issue.
+
+## Product boundary
+
+The productive daemon runtime set delivered by #472 is:
+
+- ECS-native;
+- bwrap plus Landlock;
+- WASM/Wasmtime when the daemon is built with the `wasm` feature.
+
+The daemon does not register `sentinel-microvm`. Explicit `microvm` selection
+fails closed because the repository does not yet package a versioned guest
+launcher and canonical rootfs, attest the requested agent identity inside the
+guest, or durably reconcile Firecracker launch ownership after a crash.
+SINGLE_NODE productization is tracked only by
+[#775](https://github.com/silentspike/project-sentinel/issues/775) under #650
+after #687. Cross-node and deep microVM migration remain owned by #553 and
+#554.
 
 ## Finding-to-test map
 
 | Finding | Source correction | Focused evidence |
 |---|---|---|
-| P1-1 adapter health truth | The private `RuntimeAdapterOwner` observes the exact instance-fenced `NanoHandle`, then calls typed `health` and `resources`. Missing or rewritten handles, `Stopped`, `Unavailable`, and observation errors are stale/fail-closed. `Degraded` is classified explicitly and cannot become healthy. Raw adapter ownership remains private. | `adapter_health_observation_fails_closed_for_stopped_and_rewritten_handles`; `healthy_non_bwrap_runtime` exercises ECS-native and WASM with exact observations; missing, mismatched, stopped, unavailable, error, and degraded cases are covered in `runtime_health`. Reconcile consumes the same snapshot truth. |
-| P1-2 microVM guest contract | The repository still has no packaged/versioned guest launcher, canonical rootfs pipeline, or workload-bound guest readiness attestation. Production registration and selection were therefore removed/rejected fail-closed. No productive microVM claim is made. | `microvm_selection_fails_closed_without_guest_attestation_contract`; production selection test proves microVM is absent while ECS-native, bwrap, and feature-enabled WASM remain available. |
-| P1-3 microVM crash recovery | Because durable launch ownership and verified restart reconciliation are not complete, the incomplete adapter is not exposed as a productive runtime. This avoids duplicate/unowned Firecracker instances rather than silently accepting the gap. | The same config and production-registry negatives hold this boundary. AC-1 and AC-4 remain BLOCKED pending the complete launcher/readiness/recovery contract. |
-| P1-4 workload-affecting Config Apply | One canonical `NanoWorkloadSpec` projection compares runtime, name, role, favorite room, shift set, tool capabilities, runtime metadata, and the bound command. Any difference uses the durable exact-handle stop/replace/rollback path; personality/background-only edits remain ECS-only. | Field-by-field positive comparison tests plus `every_workload_affecting_field_fails_closed_when_exact_stop_is_rejected`. |
-| P1-5 transactional Config Apply | An owner-fenced SQLite recovery marker and filesystem journal are persisted before the first stop. Confirmed stops/spawns are tracked; publication and config persistence happen only after successful replacement. Any stop, spawn, room/projection, or persistence failure compensates the full transaction from old config/building and exact runtime snapshots. Failed compensation persists `RecoveryRequired`, fences serving/readiness/spawn, and is reconciled before startup publication. | Stop/replacement negatives, `runtime_config_recovery_survives_restart_and_blocks_startup_until_reconciled`, `recovery_block_rejects_spawn_instead_of_reconciler_resurrection`, and `config_apply_compensation_restores_old_world_runtime_config_and_marker`. |
-| P1-6 lifecycle ownership proof | Concrete adapters and the live registry remain in the private lifecycle module. Productive mutation is available only through typed owner methods; direct PID/cgroup fallback cleanup is absent. Compile-fail visibility is the language-level external bypass barrier; the AST inventory is supplementary only. | `runtime_lifecycle_visibility`; `ast_inventory_finds_no_raw_adapter_owner_outside_lifecycle_boundary`; functional startup, shift, removal, restore, config, rollback, shutdown, control, reconcile, cgroup/eBPF, and failure paths in the daemon suite. |
-| P2-1 TOGAF HTML ownership | The worker-authored HTML delta was removed. The file matches `origin/main` byte-for-byte. DEV-007 and gap Markdown say source candidate and live pending. | `git diff --exit-code origin/main -- docs/architecture/togaf-architecture-guide.html`. |
-| P2-2 temporary paths | New tests use `SENTINEL_TEST_TMP_ROOT` when supplied (the project convention is `/work/tmp/project-sentinel`) and otherwise use a writable checkout-local `target/test-tmp` fallback. No newly added retained `/tmp` or `/var/tmp` test path remains in the #472 delta. | Added-line scan over the owned delta, excluding unrelated integrated research documents; the GitHub-hosted-runner regression was fixed after its non-writable `/work/tmp` failure and the two WASM legacy-effect tests passed remotely with the fallback. |
+| P0-1 canonical Config Apply decision | SQLite is the only durable decision authority. A schema-v2 marker binds `op_id`, old/staged digests, both configurations/buildings, the pre-apply snapshot, exact runtime snapshots, confirmed stops/spawns, phase, and rollback/forward decision. The phases are `Prepared`, `RuntimesApplied`, `CommittedPendingFinalize`, `RecoveryRequired`, and `Finalized`. The completion event, outbox row, and forward decision commit in one SQLite transaction. The filesystem journal is an idempotent participant; no cross-store atomicity is claimed. | `config_apply_decision_and_completion_event_survive_restart` covers phase transitions, restart readback, idempotent finalization, and an injected event-identity conflict that leaves the rollback decision and omits the outbox row. `filesystem_participant_replays_partial_publication_from_canonical_direction` simulates crash residue after a rename, stale-file deletion, and incomplete temp write, then proves rollback and forward replay converge from the canonical decision. |
+| P0-2 startup recovery | Startup validates the schema, digests, and participant binding before any serving. Before the forward decision it restores the pre-apply World snapshot, ECS/redb rows, projection, old files, and exact pre-runtime snapshots. After the decision it publishes staged files and restores the recorded applied runtime snapshots. Ordinary spawn/readiness stays fenced until exact handle, resource incarnation, configuration, building, and projection validation completes. A marker is never cleared merely after process cleanup. | `config_apply_startup_rolls_back_and_restores_exact_runtime_before_finalizing` injects a crash after staged file publication and proves old file/redb/projection readback, a retained recovery fence, exact runtime restore, and final marker/participant completion. `config_apply_decision_and_completion_event_survive_restart` proves the durable forward decision and event/outbox survive restart. |
+| P1-1 per-agent recovery obligations | Full compensation validates restored World, files, projection, logical runtime ownership, exact adapter handles, and instance resources before deleting the exact per-agent recovery rows and in-memory latches. Partial compensation leaves both durable and fail-closed. | `config_apply_compensation_restores_old_world_runtime_config_and_marker` creates a per-agent durable marker and latch, compensates, proves both are cleared only after validation, and proves a later exact spawn succeeds. `runtime_config_recovery_survives_restart_and_blocks_startup_until_reconciled` proves failed recovery remains blocked across restart. |
+| P1-2 status-bound `Degraded` | One classifier consumes durable/logical runtime status and exact adapter observation. Only `Suspended` plus adapter `Degraded` is the expected healthy suspended state. `Active` plus `Degraded` is typed non-serving and enters repair/backoff. Snapshot counters, last status, and reconcile use the same classifier. | `degraded_adapter_semantics_are_runtime_independent_and_status_bound` covers ECS-native, WASM, and bwrap. Reconcile negatives prove suspended agents are not replaced and active degraded agents are not accepted as healthy. |
+| P1-3 honest microVM boundary | The unused daemon dependency on `sentinel-microvm` is removed. Production registration contains three supported adapters and rejects microVM. Issue #472, CHANGELOG, DEV-007, gap Markdown, PR text, and this evidence use the same boundary. | Production registry/config negatives plus issue #775 and its Quality Gate. No microVM live claim is made. |
+| P2-1 claim correction | Source documents describe the versioned saga and three-adapter phase without saying “all four adapters”, “complete transactional”, or claiming productive microVM/live completion. | Added-line claim scan, issue/PR body readback, and AC mapping below. |
 
 Additional lifecycle corrections retained from the earlier reviews:
 
-- World Restore tracks every successfully stopped runtime. Any pre-store-commit
-  failure compensates those exact snapshots before releasing the restore fence;
-  a failpoint after the Nth stop proves partial teardown recovery.
-- Default bwrap snapshots persist a compatibility payload containing the bound
-  workload and command. Restore creates a fresh incarnation and makes no
-  process-memory, CRIU, or complete filesystem-state claim. Only the #548
-  CAS-manifest extension remains default-off.
-- WASM schema v2 persists declarative binding plus an already-bound execution
-  result. Restore never invokes stored input; legacy effectful input without a
-  durable result/receipt fails closed before component load.
-- Registry-owned handles participate in liveness and cleanup only through
-  `NanoRuntime::stop`. Cgroup identity is captured before stop and eBPF state is
-  removed only after confirmed stop.
+- Adapter health is observed through the private lifecycle owner using the
+  exact `NanoHandle` and typed adapter health/resources. Missing, rewritten,
+  stopped, unavailable, and observation-error states fail closed.
+- World Restore retains every confirmed runtime stop and compensates the exact
+  pre-restore runtime snapshots before releasing its fence.
+- One canonical workload projection decides Config Apply replacement for
+  runtime, name, role, favorite room, shift, tool capabilities, runtime
+  metadata, and the bound command.
+- Default bwrap restore creates a fresh incarnation from its bound workload
+  specification. It does not claim CRIU, process-memory, or complete
+  filesystem-state capture. Only #548 CAS-manifest behavior is default-off.
+- WASM restore binds declarative state and already-bound results. It never
+  replays stored input; external effects require a separate durable receipt
+  contract.
+- Registry-owned resources are cleaned only through typed `NanoRuntime::stop`.
+  Cgroup identity is captured before stop and eBPF deregistration occurs only
+  after confirmed stop.
+- Compile-fail visibility is the language-level external ownership barrier.
+  The AST inventory is supplementary drift detection, not a compile-time
+  proof.
 
-## Remote Rust gates
+## Remote Rust evidence
 
-Every Rust command used `cargo remote -c --`, a command-scoped
-`CARGO_TARGET_DIR=/work/tmp/project-sentinel/cdx2-472-final-target`, and
-`rustc 1.97.1`. The global cargo-remote configuration was not changed.
-Build-host durations and load are not runtime evidence.
+All successful Rust results predating this bundled correction were run through
+`cargo remote -c --` with Rust `1.97.1`; local Cargo/Rust was not used and the
+global cargo-remote configuration was not changed.
 
-| Gate | Command | Result |
-|---|---|---|
-| Focused adapter-health tests | `cargo remote -b 'CARGO_TARGET_DIR=/work/tmp/project-sentinel/cdx2-472-final-target CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1' -c -- test -p sentinel-daemon runtime_health::tests -j2 -- --test-threads=1` | PASS, 6 passed; the exact stopped/rewritten-handle negative also passed in the final daemon/workspace run |
-| Daemon lifecycle suite | same scoped environment, `test -p sentinel-daemon --lib -j2 -- --test-threads=1` | PASS, 368 passed, 1 VM-bound test ignored |
-| Registry and AST inventory | same scoped environment, `test -p sentinel-daemon --test nano_runtime_registry -j2 -- --test-threads=1` | PASS, 3 passed |
-| Compile-fail ownership boundary | same scoped environment, `test -p sentinel-daemon --test runtime_lifecycle_visibility -j2 -- --test-threads=1` | PASS, 1 passed |
-| Limbo targeted reproduction | same scoped environment, `test -p sentinel-limbo -j2 -- --test-threads=1` | PASS, 55 unit and 12 acceptance |
-| WASM feature check | `cargo remote -b 'CARGO_TARGET_DIR=/work/tmp/project-sentinel/cdx2-472-final-target CARGO_BUILD_JOBS=2' -c -- check -p sentinel-wasm --features wasm -j2` | PASS |
-| WASM feature tests | same scoped test environment, `test -p sentinel-wasm --features wasm -j2 -- --test-threads=1` | PASS, 61 unit, 62 acceptance, 2 conformance |
-| Hosted-runner temp-root regression | `cargo remote -b 'CARGO_TARGET_DIR=/work/tmp/project-sentinel/cdx2-472-ci-fix-target CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1' -c -- test -p sentinel-wasm --features wasm --lib legacy_effect -j2 -- --test-threads=1` | PASS, 2 passed, 59 filtered; no `SENTINEL_TEST_TMP_ROOT` override, exercising the checkout-local fallback |
-| Format | same scoped build environment, `fmt --all -- --check` | PASS |
-| Workspace check | same scoped build environment, `check --workspace --all-targets -j2` | PASS |
-| Workspace tests | same scoped test environment, `test --workspace -j2 -- --test-threads=1` | PASS, including daemon 368 passed/1 VM-bound ignored, Limbo 55 unit/12 acceptance, registry 3, visibility 1, and WASM 61 unit/62 acceptance/2 conformance |
-| Workspace Clippy | same scoped build environment, `clippy --workspace --all-targets -j2 -- -D warnings` | PASS |
-| Rustdoc | same scoped build environment plus `RUSTDOCFLAGS=-Dwarnings`, `doc --workspace --no-deps -j2` | PASS |
-| Release daemon build | same scoped build environment, `build -p sentinel-daemon --bin sentinel-daemon --release -j2` | PASS; returned binary size 56,712,376 bytes, SHA-256 `491a097ec9a49312ca279b2828a464baf350b7d4dedb005d6c11960c52fd47ee` |
-| Cargo deny | same scoped build environment, `deny check` | PASS (`advisories`, `bans`, `licenses`, and `sources`); existing unmatched-allow/skip warnings only |
+The new saga/health delta invalidates those earlier final-gate claims. The first
+focused rerun reached two test-code compile errors before executing tests:
 
-## Repository policy gates
+```text
+error[E0599]: no method named `append` found for `EventStore`
+error[E0382]: borrow of moved value: `old_config`
+```
 
-| Gate | Result |
-|---|---|
-| `python3 scripts/check-fenced-writers.py` | PASS |
-| `python3 scripts/check-unsafe-baseline.py` | PASS, 26/26 |
-| `python3 scripts/check-patch-registry.py` | PASS, 0 overrides, 0 registry entries, 4 direct Git dependencies |
-| `python3 -m unittest scripts.tests.test_check_patch_registry` | PASS, 15 passed |
-| `typos` | PASS |
-| `git diff --check` | PASS |
-| TOGAF HTML matches current main | PASS |
-| New retained `/tmp` and `/var/tmp` scan | PASS |
+Both test-only defects were corrected to use the public `append_event` API and
+retain the later config value. A second focused rerun was stopped before tests
+when the build-host capacity window was reassigned. Therefore the current
+focused and final remote gates are **PENDING**, not PASS, until they execute on
+the final main-integrated head.
+
+The issue-owned target
+`/work/tmp/project-sentinel/cdx2-472-saga-focused` was then removed locally and
+from the build host. It occupied 1.3 GiB remotely. Build-host readback:
+190 GiB total, 168 GiB used, 23 GiB available, with zero matching #472
+Cargo/Rust processes. No foreign target or process was changed.
+
+Required final reruns:
+
+- focused Config Apply phase/failure/restart and three-runtime health tests;
+- remote format and workspace check/tests;
+- separate feature-enabled WASM check/tests;
+- workspace Clippy with warnings denied and rustdoc with warnings denied;
+- release daemon build;
+- fenced-writer, unsafe-baseline, patch-registry, cargo-deny, typos,
+  diff/scope, and exact-head GitHub checks.
+
+## GitHub contract readback
+
+- Issue #472: OPEN, `status:review`, `quality:ready`; the fresh issue Quality
+  Gate passed after the material body rewrite.
+- Follow-up #775: OPEN, `status:blocked`, `quality:ready`; Quality Gate run
+  `30473925851` passed.
+- PR #700 closing issue references: empty.
+- Benchmark register: `/work/company/BENCHMARK-REGISTER.md`.
+- Hard-coded live CPU/RAM claims: none.
 
 ## Acceptance mapping
 
 | AC | Status | Evidence |
 |---|---|---|
-| AC-1 | BLOCKED | ECS-native, bwrap, and feature-enabled WASM are registered with exact per-incarnation ownership. microVM is intentionally non-selectable until the missing guest launcher/readiness/durable recovery contract exists. |
-| AC-2 | PASS (source) | Compile-fail visibility plus functional lifecycle tests enforce productive mutation through typed ownership; AST inventory is supplementary. |
-| AC-3 | PARTIAL; live NOT TESTED | Source tests cover bwrap lifecycle ownership, cgroup/eBPF ordering, retry retention, transactional apply, and stop-before-publication. |
-| AC-4 | BLOCKED; live NOT TESTED | Default bwrap recreate restore and non-replaying WASM restore are source-tested, but productive microVM spawn/restore/health cannot be claimed. |
-| AC-5 | PASS (source candidate) | DEV-007, gap Markdown, changelog, and this evidence state the implemented boundaries and live-pending status without modifying ORC-owned TOGAF HTML. |
-| #698 AC-6 | NOT TESTED live | Source integration is present; authorized SINGLE_NODE validation on `.240` has not occurred. |
+| AC-1 | PASS (source candidate); final gates pending | The production registry contains ECS-native, bwrap, and feature-enabled WASM; microVM is absent and fails closed. |
+| AC-2 | PASS (source candidate); final gates pending | Private typed ownership, compile-fail visibility, functional lifecycle tests, and supplementary AST inventory cover productive mutation classes. |
+| AC-3 | PARTIAL; live NOT TESTED | Source covers bwrap selection, cgroup/eBPF ordering, retry cleanup, shutdown, and recreate-style snapshot/restore. `.240` is still required. |
+| AC-4 | PARTIAL; live NOT TESTED | Source covers non-bwrap daemon lifecycle without a Firecracker or process-memory claim. Real `.240` spawn/snapshot/restore/health/stop is still required. |
+| AC-5 | PASS (source candidate); final gates pending | The canonical saga, rollback/forward startup recovery, exact runtime snapshots, event/outbox decision, projection, participant, and per-agent obligations have focused tests. |
+| AC-6 | PARTIAL; live NOT TESTED | The merged #698 instance/stale-handle/retry contract is integrated; authorized SINGLE_NODE live evidence is still required. |
+| AC-7 | PASS (source candidate) | Issue, CHANGELOG, DEV-007, gap Markdown, PR text, and evidence use the same three-adapter/fail-closed-microVM boundary. TOGAF HTML is not modified in this correction. |
 
-Benchmarks, deployment, snapshots, and live VM validation are **NOT TESTED**.
+Deployment, snapshots, live VM validation, and benchmarks are **NOT TESTED**.
 PR #700 is not authorized for merge or deployment.
-
-After the release artifact and its matching remote/local SHA-256 were captured,
-only the issue-owned remote target
-`/work/tmp/project-sentinel/cdx2-472-final-target` was removed. It occupied
-11 GiB. Build-host root capacity changed to 169 GiB used and 22 GiB available
-of 190 GiB (89% used), with zero remaining #472 `cargo` or `rustc` processes.
-No foreign target or process was changed.
-
-The focused hosted-runner correction used a separate issue-owned remote target,
-`/work/tmp/project-sentinel/cdx2-472-ci-fix-target`. It was removed after the
-two feature-enabled WASM tests passed and occupied 851 MiB. Zero #472 `cargo`
-or `rustc` processes remained. Subsequent foreign build activity reduced
-build-host free capacity to 6.5 GiB; no foreign process or target was inspected,
-signaled, or removed.
