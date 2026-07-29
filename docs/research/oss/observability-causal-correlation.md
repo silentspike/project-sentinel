@@ -1,6 +1,6 @@
 # OSS Observability, Tracing, and Causal-Correlation Study
 
-Status: source-backed synthesis and proposed implementation contracts ready for ORC review
+Status: source-backed synthesis accepted and implementation ownership materialized
 Issue: [#718](https://github.com/silentspike/project-sentinel/issues/718)
 Parent: [#659](https://github.com/silentspike/project-sentinel/issues/659)
 Sentinel baseline: `e85eb67f13beb240b4c4638d3f37d76f219b8463`
@@ -22,15 +22,15 @@ The recommended direction is:
 2. **Configure existing dependency** `tracing` for bounded, structured spans at
    material service, effect, and state-transition boundaries. Do not emit one
    span per entity or routine simulation tick.
-3. **Wrap** W3C Trace Context propagation using OpenTelemetry Rust and
-   `tracing-opentelemetry` only after dependency review under
+3. **Reimplement minimal** W3C Trace Context handling as a Sentinel-owned
+   boundary adapter limited to a valid optional `traceparent` diagnostic
+   reference. It rejects `tracestate` and baggage in M0. OTel SDK/bridge use and
+   broader interoperability remain POST_M0 decisions under
    [#705](https://github.com/silentspike/project-sentinel/issues/705).
-   `traceparent` is an interoperable diagnostic reference, never an authority
-   or idempotency key.
-4. **Integrate** a tightly constrained, node-local OpenTelemetry Collector only
-   as an optional M0-hardening export path. It must be loopback-bound,
-   local-first, source-redacted, bounded, and unable to block or advance
-   company work.
+4. **Keep Sentinel** structured logs, existing `tracing`, and atomic
+   histogram/counter metrics as the M0 observability path. Span export remains
+   debug-only. Do not add a Collector, OTLP queue, external backend, or second
+   telemetry buffer/store for M0.
 5. **Reject** Tempo, Jaeger, OpenObserve, SigNoz, and Vector as M0 runtime
    additions. They add useful mechanisms, but a second query/store/control
    plane would violate the current one-authority and 1:n fit. Vector remains a
@@ -138,7 +138,7 @@ event causation rather than pretending that one temporal parent owns every
 child. Retries retain the stable operation/request identity and use a distinct
 attempt and span identity.
 
-### Proposed `CausalContextV1`
+### Accepted `CausalContextV1`
 
 This is a propagation record, not a copy of the business aggregates:
 
@@ -178,14 +178,16 @@ trigger causation
 The proposed TOGAF delta is therefore narrow:
 
 1. Keep `tracing`, atomic metrics, and the authoritative event store.
-2. Replace the categorical OTel rejection with an optional, loopback,
-   local-first collector profile for material boundaries only.
-3. State explicitly that W3C trace IDs and sampled spans are derived evidence,
+2. Preserve the M0 rejection of an OTel SDK/bridge/Collector, external backend,
+   and second telemetry buffer/store.
+3. Allow only a minimal Sentinel-owned `traceparent` boundary adapter in M0;
+   broader W3C interoperability is POST_M0 and decision-gated.
+4. State explicitly that diagnostic trace/span IDs are derived references,
    while Sentinel IDs, digests, events, artifacts, and generations remain
    authority.
-4. Add bounded context, redaction, cardinality, retention, queue-drop, and
-   telemetry-failure rules.
-5. Keep per-agent/tick hot-path span export disabled by default.
+5. Add bounded source context, redaction, cardinality, sampling, retention, and
+   typed telemetry-loss counters.
+6. Keep SpanExport debug-only and per-agent/tick hot-path spans disabled.
 
 This study does not edit TOGAF. The main-session owner must review and apply
 any accepted target change after implementation ownership is approved.
@@ -212,7 +214,8 @@ any accepted target change after implementation ownership is approved.
 | [#733](https://github.com/silentspike/project-sentinel/issues/733) | Outbox/inbox and publish outcomes. | Owns context preservation and typed delivery/drop outcomes across NATS/Zenoh. |
 | [#734](https://github.com/silentspike/project-sentinel/issues/734) | Projection catalog and generations. | Owns source-event/generation lineage in read models. |
 | [#736](https://github.com/silentspike/project-sentinel/issues/736) | Retention, frontiers, and recovery. | Owns durable causal-event retention; trace retention cannot weaken it. |
-| [#705](https://github.com/silentspike/project-sentinel/issues/705) | Dependency necessity and ownership. | Must approve any OTel crate or collector addition. |
+| [#758](https://github.com/silentspike/project-sentinel/issues/758) | Bounded Sentinel-native causal observability and reconstruction. | Owns source policy, material spans, atomic loss counters, minimal boundary adapter, and read-only reconstruction without OTel/Collector in M0. |
+| [#705](https://github.com/silentspike/project-sentinel/issues/705) | Dependency necessity and ownership. | Records that any OTel SDK/bridge/Collector, broader W3C interop, or external backend remains a separate POST_M0 necessity decision; nothing is preapproved. |
 | [#656](https://github.com/silentspike/project-sentinel/issues/656) | Dependency upgrade operations. | Owns upgrades only after dependency approval. |
 
 ## OSS landscape
@@ -227,12 +230,12 @@ tests, failures, security/license material, and operations were reviewed below.
 | Candidate | Pin | License | Pin date | Latest release at review | Score / 24 | Deep | Disposition |
 |---|---|---|---:|---|---:|---:|---|
 | [Rust `tracing`](https://github.com/tokio-rs/tracing/tree/d9d4c542de10f5d3a711b7a45ffe450fd0666437) | `d9d4c542de10f5d3a711b7a45ffe450fd0666437` | MIT | 2026-05-30 | `tracing-appender-0.2.5` | 19 | No | Keep existing in-process instrumentation; it is not a propagation protocol or trace store. |
-| [OpenTelemetry Rust](https://github.com/open-telemetry/opentelemetry-rust/tree/0e78170d712e5046b8ed93b6f99b2b003af15cd7) + [`tracing-opentelemetry`](https://github.com/tokio-rs/tracing-opentelemetry/tree/1d5422f1f37932fd65e434da618b305d4c94ee9c) | `0e78170...` / `1d5422f...` | Apache-2.0 / MIT | 2026-07-22 / 2026-05-19 | `opentelemetry-semantic-conventions-0.32.1` / `v0.33.0` | 18 | Yes | Wrap W3C propagation and bridge material `tracing` spans after #705. |
-| [OpenTelemetry Collector](https://github.com/open-telemetry/opentelemetry-collector/tree/259f177f8c1aea6f1a98c0a23ef1817c88afeb92) + [Contrib](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/baf8c2342f650d0b36bbd5dec5ba7fb763e65391) | `259f177...` / `baf8c23...` | Apache-2.0 | 2026-07-28 | `v0.157.0` | 21 | Yes | Optional constrained node-local export profile; not business authority. |
+| [OpenTelemetry Rust](https://github.com/open-telemetry/opentelemetry-rust/tree/0e78170d712e5046b8ed93b6f99b2b003af15cd7) + [`tracing-opentelemetry`](https://github.com/tokio-rs/tracing-opentelemetry/tree/1d5422f1f37932fd65e434da618b305d4c94ee9c) | `0e78170...` / `1d5422f...` | Apache-2.0 / MIT | 2026-07-22 / 2026-05-19 | `opentelemetry-semantic-conventions-0.32.1` / `v0.33.0` | 18 | Yes | Source reference only; SDK/bridge adoption is POST_M0 and decision-gated. |
+| [OpenTelemetry Collector](https://github.com/open-telemetry/opentelemetry-collector/tree/259f177f8c1aea6f1a98c0a23ef1817c88afeb92) + [Contrib](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/baf8c2342f650d0b36bbd5dec5ba7fb763e65391) | `259f177...` / `baf8c23...` | Apache-2.0 | 2026-07-28 | `v0.157.0` | 21 | Yes | Source reference for explicit loss/resource contracts; reject M0 integration. |
 | [Grafana Tempo](https://github.com/grafana/tempo/tree/bb8b3766272f75b4d09481b86d38c8d8b4b2e3f2) | `bb8b376...` | AGPL-3.0 | 2026-07-28 | `v3.0.2` | 14 | Yes | Reject M0 store/runtime addition. |
 | [Vector](https://github.com/vectordotdev/vector/tree/f54459dbf288badc902d291c66e5a8a06fa92b6b) | `f54459d...` | MPL-2.0 | 2026-07-28 | `vdev-v0.3.9` reported by latest endpoint | 19 | Yes | Reject runtime addition; port explicit buffer/cardinality contract ideas. |
 | [OpenObserve](https://github.com/openobserve/openobserve/tree/17ef03b8d6cf4e0764d593e8acd8381e90203719) | `17ef03b...` | AGPL-3.0 | 2026-07-29 | `v0.91.4` | 14 | Yes | Reject integrated backend and second data authority. |
-| [Jaeger](https://github.com/jaegertracing/jaeger/tree/fc6d11f19d2ef2624163562b7e765b2265f68f6d) | `fc6d11f...` | Apache-2.0 | 2026-07-28 | `v2.20.0` | 16 | No | Mature backend, but duplicates the selected Collector plus store/query boundary. |
+| [Jaeger](https://github.com/jaegertracing/jaeger/tree/fc6d11f19d2ef2624163562b7e765b2265f68f6d) | `fc6d11f...` | Apache-2.0 | 2026-07-28 | `v2.20.0` | 16 | No | Mature backend, but duplicates an external collection/store/query boundary rejected for M0. |
 | [SigNoz](https://github.com/SigNoz/signoz/tree/bca23708621a1a7008ddbf75a9e473b428bd05dc) | `bca2370...` | MIT core, separate enterprise license | 2026-07-29 | `v0.134.0` | 14 | No | Broad ClickHouse-backed platform; reject M0 operational and authority overlap. |
 
 Score detail:
@@ -340,10 +343,11 @@ routes vulnerability reports to private GitHub advisories
 Their process overhead is smaller than a backend but still adds crates,
 configuration, propagation adapters, sampling policy, and exporter lifecycle.
 
-**Sentinel decision.** Wrap only W3C propagation and the `tracing` bridge at
-material boundaries after #705. Keep `CausalContextV1` authoritative and
-measure overhead on the implementation target. Reject OTel trace IDs as
-operation IDs, event causation, or release evidence.
+**Sentinel decision.** Do not add the OTel SDK or `tracing-opentelemetry` in
+M0. Reimplement only a minimal bounded `traceparent` boundary adapter under
+#758, keep `CausalContextV1` authoritative, and reject `tracestate`, baggage,
+and trace IDs as operation IDs, event causation, or release evidence. Any
+broader interoperability is POST_M0 and requires a fresh #705 decision.
 
 ### 2. OpenTelemetry Collector core and Contrib
 
@@ -388,11 +392,11 @@ for approved remote export, but its auth-context caveat requires
 authentication at the destination rather than assuming queued request
 identity survives.
 
-**Sentinel decision.** Integrate only a minimal optional node-local profile:
-loopback OTLP input, allowlisted attributes, memory limiter, bounded queue,
-explicit drop metrics, no tail-sampling correctness gate, and export disabled
-by default. Do not place it in the business write path or use it as a trace
-authority.
+**Sentinel decision.** Reject Collector integration for M0. Its explicit
+refusal, queue, resource, and loss semantics inform Sentinel-owned source
+policy and counters, but M0 adds no second process, listener, OTLP queue,
+persistent telemetry buffer, or export lifecycle. Any future Collector
+proposal is POST_M0 and requires a fresh #705 necessity decision.
 
 ### 3. Grafana Tempo
 
@@ -446,10 +450,10 @@ and upgrade surface. Its transformation power is not a substitute for
 source-side data minimization.
 
 **Sentinel decision.** Reject runtime integration for M0. Port the explicit
-buffer outcome vocabulary and per-key cardinality-budget contract into the
-proposed Sentinel observability profile. Reconsider Vector only if a future
-multi-source telemetry routing requirement exceeds the approved Collector
-profile.
+source outcome vocabulary and per-key cardinality-budget contract into the
+Sentinel-native #758 observability profile. Reconsider Vector only if a future
+POST_M0 multi-source telemetry-routing requirement passes the #705 decision
+gate.
 
 ### 5. OpenObserve
 
@@ -497,28 +501,28 @@ Collector, `T` is Tempo, `V` is Vector, and `O2` is OpenObserve.
 
 | Mechanism | S | OR | OC | T | V | O2 | 1:n and deterministic fit | Security / failure / integration boundary |
 |---|---|---|---|---|---|---|---|---|
-| Span/log/metric context | Local `tracing`; prototype context unused | W3C parent/link propagation | OTLP routing and processors | Full trace ingestion/query | OTLP routing/transforms | Full integrated backend | Good only when IDs reference authoritative records | Reject untrusted context as authority; wrap at HTTP/NATS/Zenoh boundaries |
+| Span/log/metric context | Local `tracing`; prototype context unused | W3C parent/link propagation | OTLP routing and processors | Full trace ingestion/query | OTLP routing/transforms | Full integrated backend | Good only when IDs reference authoritative records | Reject untrusted context as authority; use owned envelope and minimal boundary adapters |
 | Stable business IDs | Event/correlation/causation/operation plus request digest on provider leg | Trace/span IDs only | Transports telemetry IDs | Trace IDs | Event fields/tags | Trace and platform IDs | External IDs cannot replace Sentinel aggregates | `CausalContextV1` remains owned, canonical, and bounded |
 | Async queue/retry/restart links | Outbox plus uneven headers; durable provider reservation | Span links available; SDK queue volatile | Bounded/persistent queue, retries, restart | Ingestion/WAL/store | Disk buffer and explicit overflow | WAL with skip-on-corruption replay | Causation and operation attempts stay in event truth | Telemetry drops are typed and observable, never business failure |
 | Sampling | No repository-wide span policy | Parent/trace-ratio head sampling | Tail/head processors | Backend ingestion controls | Route/filter transforms | Backend controls | Deterministic head policy is reproducible; tail state is not authority | Always retain material errors locally within bounded policy; no per-tick flood |
 | Cardinality | Prometheus labels vary by producer; no shared budget | Arbitrary span attributes possible | Attribute/filter processors | Limits and discarded-span metrics | Per-key limits and drop modes | Backend schema/stream controls | IDs belong in spans/logs, not metric labels | Owned attribute allowlist plus per-key budgets; defense in depth downstream |
-| Redaction | Gateway history exists; no trace-wide attribute policy | Propagators do not sanitize app attributes | Exact-key delete/hash and OTTL possible | Operator configuration required | VRL transforms possible | Trace redaction is optional enterprise-coupled and fail-open | Source minimization preserves one clean source | Never emit secrets/private payloads; collector filtering is secondary |
-| Retention/aggregation | Events/projections have separate owners; traces absent | Process queue only | Queue storage, no query retention by itself | Block compaction/retention | Buffer retention/routing | WAL/query/retention platform | Durable event retention and short trace retention remain separate | Trace deletion must not destroy audit/release evidence |
-| Backpressure | Outbox/provider paths explicit; telemetry export incomplete | SDK drops on full queue | Reject, block, retry, or persist by config | Rejects over rate/burst | Block/drop/overflow explicit | WAL and ingest limits | Business path must not wait for telemetry | Drop counters and queue health required; telemetry cannot fail readiness after startup |
-| Local-first export | Metrics/logs local; no active trace export | Exporter-neutral | Can run node-local and export nowhere | Adds local/remote trace store | Can buffer locally | Adds local backend | Optional collector can remain derived and local | Loopback bind, no token, no cloud endpoint by default |
+| Redaction | Gateway history exists; no trace-wide attribute policy | Propagators do not sanitize app attributes | Exact-key delete/hash and OTTL possible | Operator configuration required | VRL transforms possible | Trace redaction is optional enterprise-coupled and fail-open | Source minimization preserves one clean source | Never emit secrets/private payloads; downstream filtering cannot repair source leakage |
+| Retention/aggregation | Events/projections have separate owners; traces absent | Process queue only | Queue storage, no query retention by itself | Block compaction/retention | Buffer retention/routing | WAL/query/retention platform | Durable event retention and bounded structured-log retention remain separate | Diagnostic deletion must not destroy audit/release evidence |
+| Backpressure | Outbox/provider paths explicit; telemetry export incomplete | SDK drops on full queue | Reject, block, retry, or persist by config | Rejects over rate/burst | Block/drop/overflow explicit | WAL and ingest limits | Business path must not wait for telemetry | Source loss counters are required; diagnostic sinks cannot fail business readiness |
+| Local-first export | Metrics/logs local; no active trace export | Exporter-neutral | Can run node-local and export nowhere | Adds local/remote trace store | Can buffer locally | Adds local backend | M0 keeps local logs/atomic metrics and no export process | No listener, token, cloud endpoint, or second buffer/store in M0 |
 | Incident reconstruction | Event store and digests strongest; views incomplete | Diagnostic graph only | Diagnostic routing only | Trace query | Routed telemetry | Integrated query | Event/project/artifact/release chain is authoritative | Console joins by stable refs; sampled traces supplement but never prove completion |
 
 ### Cross-cutting constraint matrix
 
 | Concern | Correctness rule | Failure semantics | Performance hypothesis | Maintenance and dependency impact |
 |---|---|---|---|---|
-| Propagation | Validate canonical version, request digest pair, direct causation, and size before mutation. | Invalid context is a typed command/transport error; read-only diagnostics may drop invalid trace context. | Fixed-size parsing at material boundaries should be small; must be measured on target. | Owned envelope plus optional OTel adapters; #732/#733 and #705. |
-| Instrumentation | Spans reference committed facts and cannot advance state. | Span creation/export failure leaves business result unchanged and increments loss/error telemetry. | Material-boundary spans should avoid tick-budget impact; no per-entity spans. | Existing `tracing`; optional OTel bridge. |
-| Queue/export | Every queue mode and limit is explicit. | Reject/drop/persist outcomes are observable; no unbounded memory or disk. | Bounded queue protects runtime but can lose diagnostics under stress. | Optional collector process/config/storage owner. |
+| Propagation | Validate canonical version, request digest pair, direct causation, and size before mutation. | Invalid business context is typed and fail-closed; the minimal diagnostic adapter rejects invalid `traceparent`. | Fixed-size parsing at material boundaries should be small; must be measured on target. | Owned envelope plus minimal Sentinel boundary adapter; #732/#733/#758. |
+| Instrumentation | Spans reference committed facts and cannot advance state. | Span/log failure leaves business result unchanged and increments bounded source loss/error counters. | Material-boundary spans should avoid tick-budget impact; no per-entity spans. | Existing `tracing` only for M0; any OTel bridge is POST_M0. |
+| Queue/export | M0 adds no telemetry queue or exporter. | Sink/drop/refusal outcomes are counted at source; no unbounded memory or disk and no business backpressure. | Avoiding a second buffer/process minimizes M0 runtime overhead; validate native instrumentation on target. | #758 owns native policy; Collector/export remains POST_M0 under #705. |
 | Sampling | Sampling never decides whether durable evidence is retained. | Required error/retry/rollback diagnostic records use deterministic policy; tail sampler loss is tolerated. | Head sampling controls hot volume; tail sampling adds memory and delay. | Owned policy; no backend dependency required. |
 | Cardinality | Metric labels come from a fixed low-cardinality schema. | Unknown/high-cardinality labels are rejected or converted to non-metric attributes. | Prevents memory and query amplification; exact limits need target tests. | CI schema/checker plus runtime counters under proposed owner. |
-| Redaction | Source allowlist excludes content/secrets before serialization. | Invalid policy fails startup; per-record redaction failure drops the telemetry record, not the business operation. | Pattern scanning of arbitrary content is avoided by not emitting content. | Security owner review; collector exact-key cleanup is secondary. |
-| Retention | Events/artifacts follow #736; traces use a shorter independent bound. | Trace pruning cannot cross an event/artifact/release frontier because it is never that frontier. | Bounded local retention limits disk; storage sizing needs target evidence. | #736 plus optional collector owner; no trace backup requirement by default. |
+| Redaction | Source allowlist excludes content/secrets before serialization. | Invalid policy fails startup; per-record redaction failure drops the diagnostic record, not the business operation. | Pattern scanning of arbitrary content is avoided by not emitting content. | #758 source policy; no downstream Collector is required for M0. |
+| Retention | Events/artifacts follow #736; structured diagnostic logs use existing bounded local retention. | Diagnostic pruning cannot cross an event/artifact/release frontier because it is never that frontier. | Existing bounded retention limits disk; exact sizing needs target evidence. | #736 authoritative frontier plus #758 policy; no trace store or trace backup. |
 | Reconstruction | One query starts from request/project/release and joins immutable references. | Missing telemetry is shown as missing; it is never interpreted as no operation or success. | Indexed IDs should make targeted reconstruction cheap; validate in owner issue. | #734 read models and Console owner, no second authority. |
 
 ## Decisions
@@ -529,15 +533,15 @@ Every row has exactly one decision. Alternatives are rejected explicitly.
 |---|---|---|---|
 | Authoritative causal identity | **Port algorithm/contract** | Add bounded `CausalContextV1` to the canonical Sentinel envelope while retaining aggregate/event/artifact ownership. | Reject OTel trace IDs as authority; reject backend-generated identity; reject copying aggregate state into traces. |
 | In-process spans/logs | **Configure existing dependency** | `tracing` is already present and supports structured material-boundary instrumentation. | Reject replacing it with another logger; reject per-agent/per-tick exported spans. |
-| W3C HTTP propagation | **Wrap** | OTel Rust validates and interoperates with `traceparent`; the bridge connects existing spans. | Reject custom `traceparent` parsing; reject arbitrary baggage; reject using trace ID for idempotency. |
+| W3C HTTP propagation | **Reimplement minimal** | A Sentinel-owned boundary adapter accepts only a bounded valid optional `traceparent` reference; broader W3C behavior is POST_M0. | Reject OTel SDK/bridge in M0; reject `tracestate`, baggage, and trace ID as idempotency or causation. |
 | NATS/Zenoh/outbox context | **Reimplement minimal** | One owned envelope adapter can remove current Rust/Go/Zenoh asymmetry without another broker or truth store. | Reject ad hoc headers per publisher; reject relying on payload coincidence; reject a telemetry side channel as causal transport. |
-| Node-local collection/export | **Integrate** | A constrained optional OTel Collector profile provides standard OTLP, bounded queues, processors, and future export isolation. | Reject Collector in the write path; reject Vector for the same M0 role; reject cloud export by default. |
+| Node-local collection/export | **Keep Sentinel** | Existing structured logs, `tracing`, and atomic metrics provide the M0 diagnostic path without a second process, listener, buffer, or store. | Reject Collector, OTLP queue, Vector, and cloud export for M0; reconsider only through the POST_M0 gate. |
 | Trace storage/query | **Reject** | Event, projection, artifact, QA, and release records already own incident truth; M0 does not justify another store. | Reject Tempo, Jaeger, OpenObserve, and SigNoz for M0; reconsider only through the POST_M0 gate. |
 | Sampling | **Reimplement minimal** | Owned deterministic policy can keep material failures and sample only non-critical diagnostics without correctness coupling. | Reject in-memory tail sampling as an evidence gate; reject always-on hot tick/entity spans. |
 | Cardinality control | **Port algorithm/contract** | Vector's explicit tracked/dropped/untracked and per-key limits map well to an owned attribute/metric schema. | Reject unrestricted IDs as metric labels; reject downstream-only cleanup. |
 | Redaction and baggage | **Keep Sentinel** | Extend the existing source-side redaction/data-minimization boundary; do not emit private content. | Reject regex-only downstream redaction; reject OpenObserve's enterprise-coupled fail-open path; reject secrets in baggage. |
-| Backpressure/restart | **Port algorithm/contract** | Explicit `block`, `drop`, `persist`, `overflow`, queue size, and loss counters make overload behavior testable. | Reject implicit defaults and unbounded queues; reject telemetry backpressure on company operations. |
-| Retention/local-first | **Reimplement minimal** | Short bounded local telemetry with export disabled preserves privacy and operations fit while #736 owns durable truth. | Reject trace-store retention as event retention; reject default remote export; reject backing up derived traces by default. |
+| Backpressure/restart | **Port algorithm/contract** | Explicit source `accept`, `sample`, `drop`, `refuse`, and sink-failure counters make overload behavior testable without a second telemetry queue. | Reject implicit defaults, unbounded queues, and telemetry backpressure on company operations. |
+| Retention/local-first | **Keep Sentinel** | Existing bounded structured-log retention and atomic metrics preserve privacy and operations fit while #736 owns durable truth. | Reject trace-store retention as event retention, a persistent telemetry buffer, default remote export, and derived-trace backup. |
 | Incident reconstruction UI/API | **Integrate** | Extend authoritative projections to expose links and optional trace references; keep Console a read model. | Reject querying a trace backend for business completion; reject screenshots as evidence; reject duplicate workflow indexes. |
 
 ## M0 classification and owner routing
@@ -548,21 +552,24 @@ Every row has exactly one decision. Alternatives are rejected explicitly.
 | Rust outbox, Go NATS, and selected Zenoh paths preserve different identity sets. | `BLOCKS_M0` | A required async hop can lose direct causation or all envelope metadata, preventing reliable reconstruction. | #733, #732 |
 | Current projections do not expose source generation and complete causal references. | `BLOCKS_M0` | Console/API cannot reconstruct authoritative M0 work solely from current views. | #734, #695, #696 |
 | Provider request ID/digest and restart behavior are strong but not generalized. | `BLOCKS_M0` | The proven conflict/recovery pattern is required at customer, workbench, artifact, QA, release, and delivery effects. | #695, #694, #696 |
-| No shared telemetry attribute, baggage, redaction, or cardinality policy exists. | `M0_HARDENING` | Unbounded/private telemetry can create operational or security failure, but source records can be corrected without external infrastructure. | Proposed contract below, #296, #706 |
-| Material service/effect spans and queue-loss counters are incomplete. | `M0_HARDENING` | Diagnosis is weaker, but correctness remains in events and artifacts. | Proposed contract below, #694, #695, #696 |
-| Optional node-local OTel export is absent. | `M0_HARDENING` | Useful for operational acceptance only after the authoritative chain works; no external backend required. | Proposed contract below, #705 |
+| No shared telemetry attribute, baggage, redaction, or cardinality policy exists. | `M0_HARDENING` | Unbounded/private telemetry can create operational or security failure, but source records can be corrected without external infrastructure. | #758, #296, #706 |
+| Material service/effect spans and source loss counters are incomplete. | `M0_HARDENING` | Diagnosis is weaker, but correctness remains in events and artifacts. | #758, #694, #695, #696 |
+| OTel SDK/bridge/Collector and broader W3C interoperability are absent. | `POST_M0` | The TOGAF target intentionally uses native logs/metrics and debug-only spans; external interoperability is not required for M0 correctness or acceptance. | #705 decision gate; no approved implementation owner |
 | External trace store/query backend is absent. | `POST_M0` | M0 single-node reconstruction can use event/projection/artifact lineage; a second store is not justified. | #556 or future approved owner |
 | Cross-node trace federation and tail sampling are absent. | `POST_M0` | Cluster-only scale/diagnostic optimizations cannot expand M0. | #556 |
 
-## Proposed implementation contracts
+## Materialized implementation contracts
 
-Per the assignment, these are implementation-ready proposals for bundled ORC
-review. They are not live issue mutations. Materialization, reciprocal links,
-and quality-gate readback occur only after ORC accepts the synthesis.
+Bundled ORC review accepted these contracts. The canonical bodies of
+[#732](https://github.com/silentspike/project-sentinel/issues/732),
+[#733](https://github.com/silentspike/project-sentinel/issues/733), and
+[#734](https://github.com/silentspike/project-sentinel/issues/734) now contain
+their reciprocal owner deltas; uncovered work is the quality-ready
+[#758](https://github.com/silentspike/project-sentinel/issues/758) contract.
 
 ### Existing-owner delta A: canonical causal context
 
-**Proposed owners:** #732 primary; #695, #694, and #696 producer/consumer
+**Accepted owners:** #732 primary; #695, #694, and #696 producer/consumer
 subcontracts; #733 transport.
 
 **Dependencies:** #693 contract; ordered #732 before #733/#734 consumers;
@@ -615,7 +622,7 @@ transport invariants, and root/direct-causation rules.
 
 ### Existing-owner delta B: transport and projection lineage
 
-**Proposed owners:** #733 transport/outcome; #734 projection/generation.
+**Accepted owners:** #733 transport/outcome; #734 projection/generation.
 
 **Dependencies:** accepted delta A and current event-truth ordering under #731.
 
@@ -653,32 +660,34 @@ rebuild, poison-envelope negative tests, and #650 single-node reconstruction.
 versioned envelope compatibility; rollback consumers before writers; add the
 transport/outcome and projection-generation contract to TOGAF.
 
-### New uncovered contract: bounded causal observability profile
+### New uncovered contract: #758 bounded Sentinel-native causal observability
 
-**Proposed title:** `runtime: add bounded local causal-observability profile`
+**Materialized owner:** [#758](https://github.com/silentspike/project-sentinel/issues/758),
+child contract under #659. It owns native material-boundary instrumentation,
+source policy and counters, the minimal `traceparent` boundary adapter, and the
+read-only reconstruction surface.
 
-**Proposed parent/owners:** parent #659; runtime owner for instrumentation and
-collector profile; #296 security review; #706 startup-policy integration;
-#705 dependency gate; #656 future upgrades.
-
-**Dependencies:** accepted deltas A and B; #705 before any OTel dependency or
-collector artifact; current `tracing` remains the instrumentation base.
+**Dependencies:** accepted #732/#733/#734 deltas plus #694/#695/#696 producer
+and authority schemas. #706 owns readiness/quarantine and #736 owns durable
+evidence retention. #705 is only a POST_M0 dependency decision gate; #758 has
+no new OTel/Collector dependency.
 
 **Data and state:**
 
-- Versioned `ObservabilityPolicyV1` with span-boundary allowlist, attribute
-  allowlist, per-key byte/value/cardinality bounds, sampling rules, queue mode
-  and size, local retention/disk budget, redaction denylist, and export
-  destination policy.
-- `TelemetryOutcomeV1` counters for accepted, sampled, dropped by reason,
-  refused, retrying, persisted, corrupt, and exported records.
+- Versioned `ObservabilityPolicyV1` with material-boundary and attribute
+  allowlists, per-key byte/value/cardinality bounds, deterministic sampling,
+  source redaction, existing local log-retention limits, and typed loss reasons.
+- `TelemetryOutcomeV1` atomic counters for accepted, sampled, policy-dropped,
+  redaction-dropped, cardinality-refused, sink-failed, and restart-reset
+  diagnostics without customer-payload labels.
 - Optional derived `trace_id`/`span_id` references attached to authoritative
-  read models; no span payload is copied into them.
-- Default profile: structured local logs and metrics, material spans only,
-  remote export disabled, no cloud token, no trace backend.
-- Optional Collector profile: loopback OTLP, memory limiter, exact-key cleanup,
-  bounded queue, explicit drop metrics, least privilege, private data
-  directory, and no business readiness dependency after valid startup.
+  read models; no span payload or mutable business state is copied into them.
+- `CausalReconstructionV1` joins authoritative event, projection-generation,
+  artifact, QA, release, and delivery references and labels missing diagnostics
+  explicitly.
+- Existing structured logs, `tracing`, and atomic metrics are the M0 path.
+  SpanExport is debug-only. There is no Collector, OTLP queue, trace store, or
+  second telemetry buffer/control plane.
 
 **Acceptance criteria:**
 
@@ -686,76 +695,95 @@ collector artifact; current `tracing` remains the instrumentation base.
    and external effect, gateway/provider attempt, event/outbox publish,
    projection update, artifact commit, QA, release, and delivery at material
    boundaries.
-2. Every span carries only allowlisted bounded references and optional W3C
-   context; IDs never become Prometheus labels.
-3. Invalid policy, unknown required field, forbidden attribute, cloud endpoint
-   without explicit approval, and unbounded queue fail startup closed.
-4. Queue saturation, exporter outage, collector restart, corrupt persistent
-   queue entry, disk full, and process restart leave business operations and
-   authoritative evidence correct while exposing typed telemetry loss.
-5. Source-side secret/private-content fixtures produce zero leaked bytes in
-   logs, spans, collector storage, and exported fixtures. A downstream
-   redaction failure drops that telemetry record and increments a reasoned
-   counter.
-6. Deterministic sampling always retains configured material error, retry,
-   compensation, rollback, and release-failure boundaries within the declared
-   disk budget; routine tick/entity spans stay disabled.
-7. Local retention enforces the configured byte/time bound and does not alter
-   #736 event/artifact frontiers or backup.
-8. Reconstruction API starts from request/project/release identity, returns
-   authoritative links plus optional trace references, and labels missing
-   telemetry honestly.
+2. Every diagnostic record carries only allowlisted bounded references; IDs
+   never become Prometheus labels and routine tick/entity spans stay disabled.
+3. Invalid policy, unknown required field, forbidden attribute, oversized
+   value, or unbounded cardinality fails closed before emission.
+4. Sink failure, scrape absence, log backpressure, counter saturation, and
+   process restart leave business operations and authoritative evidence correct
+   while exposing typed source loss counters.
+5. Secret/private-content fixtures produce zero leaked bytes in logs, spans,
+   metrics, and public evidence.
+6. Deterministic sampling retains configured material error, retry,
+   compensation, rollback, and release-failure diagnostics within declared
+   bounds.
+7. The minimal boundary adapter accepts only supported valid optional
+   `traceparent`; `tracestate`, baggage, malformed IDs, and authority confusion
+   fail closed.
+8. Reconstruction starts from request/project/release identity, returns
+   authoritative links, and labels missing telemetry honestly before and after
+   projection rebuild.
+9. Dependency/config/process/listener/storage scans prove M0 has no OTel
+   SDK/bridge/Collector, OTLP queue, external backend, persistent telemetry
+   buffer, or duplicate business index.
+10. The issue-declared single-node target proves customer-work correctness,
+    1 Hz stability, bounded resources, restart, reconstruction, and rollback.
 
-**Negative criteria:**
+**Negative criteria:** no OTel SDK/bridge/Collector or broader W3C interop in
+M0; no trace backend or second telemetry buffer/store; no telemetry authority;
+no prompt, customer text, tool payload, artifact content, credential, arbitrary
+baggage, or unbounded label/value/cardinality; no missing-telemetry success; no
+per-agent/per-tick export; no build-server/upstream benchmark evidence.
 
-- no Tempo, Jaeger, Vector, OpenObserve, SigNoz, or cloud backend in M0;
-- no tail-sampling correctness gate;
-- no telemetry queue blocking a company-work operation;
-- no auth token, prompt, customer text, tool payload, artifact content, or
-  arbitrary baggage in telemetry;
-- no unbounded labels, queue, disk, retry, or retention;
-- no per-agent/per-tick export by default;
-- no telemetry-derived customer acceptance, QA approval, or release authority.
+**Target-runtime tests and benchmarks:** unit/property/config, source-redaction,
+cardinality, sampling, minimal `traceparent`, sink-failure, restart, projection
+rebuild, and full-chain reconstruction tests precede a snapshot-scoped
+single-node enabled/disabled matrix. On that declared product target, compare
+tick and customer-work latency, CPU, RSS, log bytes, metric-series count,
+reconstruction latency, source drops, and restart recovery. Correctness,
+privacy, one-authority reconstruction, and bounded resources gate adoption.
 
-**Target-runtime tests:** unit/property/config tests without runtime mutation;
-then issue-declared single-node product tests for queue saturation, exporter
-outage, restart, disk budget, redaction canaries, reconstruction, 1 Hz tick
-stability, and exact resource overhead. Cluster tests are POST_M0 and require a
-separate owner.
+**Rollout and rollback:** ship schemas and deterministic tests, then native
+material-boundary instrumentation behind one immutable policy generation, then
+the read-only reconstruction surface. Roll back to the prior policy,
+binaries, and configuration while retaining additive causal fields and every
+authoritative record. Any OTel/Collector/backend experiment is a separate
+POST_M0 issue and decision.
 
-**Issue-specific benchmarks:** measure disabled, local structured-only, local
-span, and optional collector profiles on the declared product VM with full M0
-sidecars. Report tick p50/p95/p99, request/workbench latency, CPU, RSS, disk
-write/retention, queue depth, and drops. Define budgets before measurement.
-Never use build-server duration or upstream results as Sentinel evidence.
+**TOGAF delta:** add `CausalContextV1`, bounded source-side
+attribute/redaction/cardinality/sampling policy, typed loss counters, existing
+`tracing` plus atomic metrics as the M0 path, SpanExport as debug-only,
+authoritative reconstruction references, and the prohibition on a second
+telemetry buffer/store. Keep OTel SDK/bridge/Collector, broader W3C
+interoperability, and external backends POST_M0.
 
-**Rollout:** ship policy/schema and local instrumentation first; prove privacy,
-loss behavior, and overhead; add collector only after #705 and security review;
-keep remote export off until a separate data-flow approval.
-
-**Rollback:** disable collector/export profile, restore prior policy
-generation, remove only derived trace storage, and retain all authoritative
-events, artifacts, releases, and telemetry loss records required by policy.
-
-**TOGAF delta:** revise the absolute OTel rejection into this bounded optional
-profile, document source redaction, context/authority separation, queue/drop
-semantics, cardinality, retention, local-first default, and no per-tick spans.
-
-### POST_M0 trace-backend decision gate
+### POST_M0 interoperability and backend decision gate
 
 Do not create an implementation issue unless all conditions are met:
 
-1. #556 or another live owner demonstrates a reconstruction/query need that
-   authoritative projections plus bounded local telemetry cannot satisfy.
+1. #556 or another live owner demonstrates an interoperability, export, or
+   reconstruction/query need that #732/#733/#734/#758 cannot satisfy.
 2. #705 approves the dependency/runtime necessity and #656 owns upgrades.
 3. Security approves listener/authentication, tenant isolation, private-data
    flow, and disclosure policy.
 4. Operations owns storage, compaction, retention, backup exclusion/inclusion,
    resource budget, upgrades, and rollback.
-5. A comparative target test evaluates at least Tempo and Jaeger and treats
-   upstream benchmarks only as hypotheses.
-6. The accepted backend remains derived and cannot advance workflow, QA,
-   release, delivery, or customer acceptance.
+5. A dependency proposal compares the exact OTel SDK/bridge/Collector or
+   backend surface against the minimal owned boundary; a backend comparison
+   evaluates at least Tempo and Jaeger. Upstream benchmarks remain hypotheses.
+6. The accepted adapter/export/backend remains derived and cannot advance
+   workflow, QA, release, delivery, or customer acceptance.
+
+## Live materialization and owner acknowledgement
+
+The owner-body marker plus a fresh successful Issue Quality Gate is the
+reciprocal acknowledgement for each accepted contract. #705 is a necessity
+input only, not an adoption approval.
+
+| Issue | Materialized contract | Live labels | Body SHA-256 | Fresh quality gate |
+|---|---|---|---|---|
+| [#718](https://github.com/silentspike/project-sentinel/issues/718) | Accepted decision, reciprocal routing, and AC-5/6/7 owner acknowledgement | `status:in-progress`, `quality:ready`, `type:docs`, `prio:high`, `size:XL`, `scope:full`, `comp:daemon`, `comp:runtime` | `ff45c1eb2433834c2f99ffed1a39901ddcef9fad6cea2bede94231b8e4bbb499` | [PASS run 30451959427](https://github.com/silentspike/project-sentinel/actions/runs/30451959427) |
+| [#732](https://github.com/silentspike/project-sentinel/issues/732) | `CausalContextV1`, event-envelope producer validation, and authority rules | `status:blocked`, `quality:ready`, `type:feature`, `prio:high`, `size:XL`, `scope:full`, `comp:daemon`, `comp:runtime` | `ad4c8992a274111103f01d56769de97aa566404b3bab0ed45d17d34aeb434e58` | [PASS run 30451840446](https://github.com/silentspike/project-sentinel/actions/runs/30451840446) |
+| [#733](https://github.com/silentspike/project-sentinel/issues/733) | Lossless context transport and typed delivery outcomes | `status:blocked`, `quality:ready`, `type:bug`, `prio:high`, `size:XL`, `scope:full`, `comp:daemon`, `comp:runtime` | `bf4bf1bc5290a690cdf5f2badb3a249ff7130d423a84a2961c408d108e38f1cd` | [PASS run 30451884086](https://github.com/silentspike/project-sentinel/actions/runs/30451884086) |
+| [#734](https://github.com/silentspike/project-sentinel/issues/734) | Source-event/generation causal reconstruction fields | `status:blocked`, `quality:ready`, `type:feature`, `prio:high`, `size:XL`, `scope:full`, `comp:daemon`, `comp:dashboard` | `08caa021b8b4263ec6d1ac9236205c92040d59b12fe47db673a25ee36a826a8a` | [PASS run 30451914824](https://github.com/silentspike/project-sentinel/actions/runs/30451914824) |
+| [#758](https://github.com/silentspike/project-sentinel/issues/758) | Bounded Sentinel-native policy, source counters, minimal adapter, and reconstruction API | `status:blocked`, `quality:ready`, `type:feature`, `prio:high`, `size:XL`, `scope:full`, `comp:daemon`, `comp:runtime` | `c9aaab0e9fb90bf3c769caf46a0f3c7aad41f536cd02b22eb069f4113ac0207b` | [PASS run 30451803253](https://github.com/silentspike/project-sentinel/actions/runs/30451803253) |
+| [#705](https://github.com/silentspike/project-sentinel/issues/705) | POST_M0 necessity gate; no dependency or runtime adoption preapproved | `status:blocked`, `quality:ready`, `type:deps`, `prio:high`, `size:XL`, `scope:full`, `dependencies` | `0810f0b36891bacdff9aadbbc3dd99fe5052cf6967c593b4ab3b6cb2d1325f9f` | [PASS run 30452081230](https://github.com/silentspike/project-sentinel/actions/runs/30452081230) |
+
+Hashes above use the reproducible live-body command:
+
+```text
+gh issue view ISSUE --json body --jq .body | sha256sum
+```
 
 ## Acceptance-criteria mapping
 
@@ -765,15 +793,15 @@ Do not create an implementation issue unless all conditions are met:
 | AC-2 | Eight pinned candidates, eight-factor rubric, scores, shortlist rationale, and source-backed exclusions. | Satisfied. |
 | AC-3 | Five pinned deep reviews cover source, tests, failures, persistence/recovery, security, license, and operations. | Satisfied. |
 | AC-4 | Mechanism and cross-cutting matrices cover correctness, failure, deterministic/1:n fit, performance hypotheses, security, maintenance, dependency, and boundary. | Satisfied. |
-| AC-5 | Decision table has exactly one decision for each of twelve mechanisms and explicit rejected alternatives. | Satisfied, pending maintainer approval. |
-| AC-6 | Two existing-owner deltas and one uncovered quality-ready contract include dependencies, ACs, negatives, targets, benchmarks, rollout, rollback, and TOGAF delta. | Proposed contracts complete; live issue materialization intentionally waits for bundled ORC approval. |
-| AC-7 | Every accepted finding is classified and mapped to an owner. | Satisfied, pending owner acknowledgement. |
-| AC-8 | This one English/ASCII, public-safe repository document contains provenance and verification below. | Satisfied when final gates and exact-head CI are green. |
+| AC-5 | Decision table has exactly one decision for each of twelve mechanisms and explicit rejected alternatives; bundled ORC review accepted the Sentinel-native M0 direction. | Satisfied. |
+| AC-6 | #732/#733/#734 contain complete reciprocal deltas; uncovered work is quality-ready #758; #705 records POST_M0 necessity input only. Live hashes, labels, and fresh PASS runs are above. | Satisfied. |
+| AC-7 | Every accepted finding is classified and acknowledged by a canonical owner body; OTel/Collector/backend absence is explicitly POST_M0. | Satisfied. |
+| AC-8 | This one English/ASCII, public-safe repository document contains provenance and verification below; focused outputs and exact-head CI are recorded in the PR. | Satisfied. |
 | AC-N1 | No dependency is proposed from popularity or upstream use; #705 is mandatory. | Satisfied. |
 | AC-N2 | Every reviewed mechanism includes license, provenance, security, and maintenance boundaries; no source is copied. | Satisfied. |
 | AC-N3 | Closed issue status and tests are treated as history/evidence, not optimality proof. | Satisfied. |
 | AC-N4 | No runtime, VM, build-server timing, deployment, or benchmark was used. | Satisfied. |
-| AC-N5 | Every accepted gap maps to live owners or the proposed owned contract. | Satisfied for review; no gap may close before ownership is materialized. |
+| AC-N5 | Every accepted gap maps to live quality-ready owners #732/#733/#734/#758; #705 is a decision gate, not a speculative implementation owner. | Satisfied. |
 
 ## Reproduction and verification
 
@@ -841,8 +869,8 @@ paths, credentials, and forbidden infrastructure details.
   paths but cannot run the future end-to-end reconstruction.
 - No runtime overhead or capacity result exists. Every number must come from
   the implementation issue's declared product target.
-- Collector integration is a conditional recommendation. #705 may reject it
-  if owned `tracing` plus local logs/metrics satisfy the approved M0 evidence
-  contract at lower cost.
-- Live issue materialization and TOGAF edits are deliberately withheld until
-  ORC reviews this bundled synthesis.
+- OTel SDK/bridge/Collector, broader W3C interoperability, and an external
+  trace backend are not approved for M0. They require a future POST_M0 need and
+  fresh #705 decision.
+- Owner contracts are materialized in #732/#733/#734/#758 and acknowledged in
+  #718. TOGAF edits remain main-session-only after verified implementation.
