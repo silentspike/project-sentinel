@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ const SCHEMA_KEY: &str = "schema_version";
 const SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryJournalEntryV1 {
     pub schema_version: u16,
     pub tenant_id: String,
@@ -34,6 +35,7 @@ pub struct DeliveryJournalEntryV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryCommitReceiptV1 {
     pub operation_id: String,
     pub project_revision: u64,
@@ -42,6 +44,7 @@ pub struct DeliveryCommitReceiptV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryCommitRequestV1 {
     pub tenant_id: String,
     pub project_id: String,
@@ -57,24 +60,80 @@ pub struct DeliveryCommitRequestV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IdempotencyRecordV1 {
     command_digest: ContentDigest,
     receipt: DeliveryCommitReceiptV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryOutboxEntryV1 {
     pub request: PublicationRequestV1,
     pub project_revision: u64,
     pub published_receipt: Option<PublicationReceiptV1>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryEventEnvelopeV1 {
+    schema_version: u16,
+    record_type: String,
+    tenant_id: String,
+    project_id: String,
+    project_revision: u64,
+    operation_id: String,
+    event_type: String,
+    command_digest: ContentDigest,
+    payload: Value,
+    committed_at_ms: u64,
+}
+
+/// Narrow persistence seam. Productive wiring is owned by #732 and must
+/// implement this contract with the canonical trajectory authority.
+pub trait DeliveryAggregateStorePort: Send + Sync {
+    fn load(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Result<Option<DeliveryAggregateV1>, DeliveryError>;
+
+    fn lookup_idempotency(
+        &self,
+        tenant_id: &str,
+        principal_id: &str,
+        command_kind: &str,
+        idempotency_key: &str,
+        command_digest: &ContentDigest,
+    ) -> Result<Option<DeliveryCommitReceiptV1>, DeliveryError>;
+
+    fn commit(
+        &self,
+        request: &DeliveryCommitRequestV1,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError>;
+}
+
+/// Publication-state seam owned by #733. Productive implementations read and
+/// acknowledge only the outbox rows created by the canonical #732 append.
+pub trait DeliveryPublicationStatePort: Send + Sync {
+    fn pending_publications(&self) -> Result<Vec<DeliveryOutboxEntryV1>, DeliveryError>;
+
+    fn mark_published(
+        &self,
+        expected_request_digest: &ContentDigest,
+        receipt: PublicationReceiptV1,
+    ) -> Result<(), DeliveryError>;
+}
+
+/// Deterministic redb adapter used by dependency-independent core tests only.
+/// It is not the productive #732 trajectory or #733 publication authority.
 pub struct DeliveryStore {
     db: Database,
 }
 
 impl DeliveryStore {
-    pub fn open(path: &Path) -> Result<Self, DeliveryError> {
+    #[doc(hidden)]
+    pub fn open_test_only(path: &Path) -> Result<Self, DeliveryError> {
         let db = Database::create(path)?;
         let write = db.begin_write()?;
         {
@@ -234,7 +293,24 @@ impl DeliveryStore {
             "delivery:{}:{}:{:020}:{}",
             request.tenant_id, request.project_id, request.aggregate.revision, request.event_type
         );
-        let event_digest = ContentDigest::of(&request.event_payload)?;
+        let envelope = DeliveryEventEnvelopeV1 {
+            schema_version: SCHEMA_VERSION,
+            record_type: "delivery-event-envelope".to_string(),
+            tenant_id: request.tenant_id.clone(),
+            project_id: request.project_id.clone(),
+            project_revision: request.aggregate.revision,
+            operation_id: operation_id.clone(),
+            event_type: request.event_type.clone(),
+            command_digest: request.command_digest.clone(),
+            payload: request.event_payload.clone(),
+            committed_at_ms: request.committed_at_ms,
+        };
+        let envelope_bytes = ContentDigest::canonical_bytes(&envelope)?;
+        let event_digest = ContentDigest::of_bytes_domain(
+            "delivery-event-envelope",
+            SCHEMA_VERSION,
+            &envelope_bytes,
+        )?;
         let journal = DeliveryJournalEntryV1 {
             schema_version: SCHEMA_VERSION,
             tenant_id: request.tenant_id.clone(),
@@ -247,15 +323,20 @@ impl DeliveryStore {
             payload: request.event_payload.clone(),
             committed_at_ms: request.committed_at_ms,
         };
-        let journal_bytes = serde_json::to_vec(&journal)?;
-        let aggregate_bytes = serde_json::to_vec(&request.aggregate)?;
+        let journal_bytes = ContentDigest::canonical_bytes(&journal)?;
+        let aggregate_bytes = ContentDigest::canonical_bytes(&request.aggregate)?;
+        let row_identity = format!("delivery-journal:{operation_id}");
         let publication = PublicationRequestV1 {
+            schema_version: SCHEMA_VERSION,
             operation_id: operation_id.clone(),
             event_type: request.event_type.clone(),
             aggregate_id: aggregate_key.clone(),
+            row_identity,
             payload_digest: event_digest.clone(),
-            payload: journal_bytes.clone(),
-        };
+            payload: envelope_bytes,
+            request_digest: ContentDigest::zero(),
+        }
+        .seal()?;
         let outbox = DeliveryOutboxEntryV1 {
             request: publication,
             project_revision: request.aggregate.revision,
@@ -330,7 +411,7 @@ impl DeliveryStore {
 
     pub fn mark_published(
         &self,
-        expected_digest: &ContentDigest,
+        expected_request_digest: &ContentDigest,
         receipt: PublicationReceiptV1,
     ) -> Result<(), DeliveryError> {
         let write = self.db.begin_write()?;
@@ -343,8 +424,12 @@ impl DeliveryStore {
                 )));
             };
             let mut entry: DeliveryOutboxEntryV1 = decode(existing.value(), "outbox")?;
-            if &entry.request.payload_digest != expected_digest
-                || receipt.payload_digest != *expected_digest
+            if &entry.request.request_digest != expected_request_digest
+                || receipt.request_digest != *expected_request_digest
+                || receipt.operation_id != entry.request.operation_id
+                || receipt.aggregate_id != entry.request.aggregate_id
+                || receipt.row_identity != entry.request.row_identity
+                || receipt.payload_digest != entry.request.payload_digest
             {
                 return Err(DeliveryError::Conflict(format!(
                     "publication receipt digest mismatch for {}",
@@ -376,13 +461,220 @@ impl DeliveryStore {
     pub fn health(&self) -> Result<(), DeliveryError> {
         self.initialize_schema()?;
         let read = self.db.begin_read()?;
-        for table in [AGGREGATES, JOURNAL, IDEMPOTENCY, OUTBOX] {
-            let opened = read.open_table(table)?;
-            for row in opened.iter()? {
-                let _ = row?;
+        let mut aggregate_revisions = BTreeMap::new();
+        let aggregates = read.open_table(AGGREGATES)?;
+        for row in aggregates.iter()? {
+            let (key, value) = row?;
+            let aggregate: DeliveryAggregateV1 = decode(value.value(), "aggregate")?;
+            if aggregate.schema_version != SCHEMA_VERSION
+                || key.value() != aggregate_key(&aggregate.tenant_id, &aggregate.project_id)?
+            {
+                return Err(DeliveryError::CorruptStore(
+                    "aggregate key or schema mismatch".to_string(),
+                ));
+            }
+            aggregate_revisions.insert(key.value().to_string(), aggregate.revision);
+        }
+        drop(aggregates);
+
+        let mut journal_by_operation = BTreeMap::new();
+        let mut revisions_by_aggregate: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        let journal = read.open_table(JOURNAL)?;
+        for row in journal.iter()? {
+            let (key, value) = row?;
+            let entry: DeliveryJournalEntryV1 = decode(value.value(), "journal")?;
+            let aggregate_id = aggregate_key(&entry.tenant_id, &entry.project_id)?;
+            if key.value() != entry.operation_id
+                || entry.schema_version != SCHEMA_VERSION
+                || entry.operation_id
+                    != format!(
+                        "delivery:{}:{}:{:020}:{}",
+                        entry.tenant_id, entry.project_id, entry.project_revision, entry.event_type
+                    )
+            {
+                return Err(DeliveryError::CorruptStore(
+                    "journal key, schema, or operation identity is invalid".to_string(),
+                ));
+            }
+            let envelope = envelope_from_journal(&entry);
+            let bytes = ContentDigest::canonical_bytes(&envelope)?;
+            let digest =
+                ContentDigest::of_bytes_domain("delivery-event-envelope", SCHEMA_VERSION, &bytes)?;
+            if digest != entry.event_digest {
+                return Err(DeliveryError::CorruptStore(
+                    "journal envelope digest mismatch".to_string(),
+                ));
+            }
+            revisions_by_aggregate
+                .entry(aggregate_id)
+                .or_default()
+                .push(entry.project_revision);
+            if journal_by_operation
+                .insert(entry.operation_id.clone(), entry)
+                .is_some()
+            {
+                return Err(DeliveryError::CorruptStore(
+                    "duplicate journal operation identity".to_string(),
+                ));
+            }
+        }
+        drop(journal);
+        for (aggregate_id, revision) in &aggregate_revisions {
+            let mut revisions = revisions_by_aggregate
+                .remove(aggregate_id)
+                .unwrap_or_default();
+            revisions.sort_unstable();
+            if revisions.len() as u64 != *revision
+                || revisions
+                    .iter()
+                    .enumerate()
+                    .any(|(index, value)| *value != index as u64 + 1)
+            {
+                return Err(DeliveryError::CorruptStore(
+                    "journal continuity does not match aggregate revision".to_string(),
+                ));
+            }
+        }
+        if !revisions_by_aggregate.is_empty() {
+            return Err(DeliveryError::CorruptStore(
+                "journal exists without an aggregate".to_string(),
+            ));
+        }
+        let outbox = read.open_table(OUTBOX)?;
+        for row in outbox.iter()? {
+            let (key, value) = row?;
+            let entry: DeliveryOutboxEntryV1 = decode(value.value(), "outbox")?;
+            let journal = journal_by_operation
+                .get(&entry.request.operation_id)
+                .ok_or_else(|| {
+                    DeliveryError::CorruptStore(
+                        "outbox exists without matching journal row".to_string(),
+                    )
+                })?;
+            if key.value() != entry.request.operation_id
+                || entry.request.request_digest != entry.request.computed_digest()?
+                || entry.request.schema_version != SCHEMA_VERSION
+                || entry.request.aggregate_id
+                    != aggregate_key(&journal.tenant_id, &journal.project_id)?
+                || entry.request.row_identity
+                    != format!("delivery-journal:{}", journal.operation_id)
+                || entry.request.event_type != journal.event_type
+                || entry.project_revision != journal.project_revision
+                || entry.request.payload_digest != journal.event_digest
+                || entry.request.payload
+                    != ContentDigest::canonical_bytes(&envelope_from_journal(journal))?
+                || entry.request.payload_digest
+                    != ContentDigest::of_bytes_domain(
+                        "delivery-event-envelope",
+                        SCHEMA_VERSION,
+                        &entry.request.payload,
+                    )?
+            {
+                return Err(DeliveryError::CorruptStore(
+                    "outbox request binding is invalid".to_string(),
+                ));
+            }
+            if let Some(receipt) = &entry.published_receipt {
+                if receipt.operation_id != entry.request.operation_id
+                    || receipt.aggregate_id != entry.request.aggregate_id
+                    || receipt.row_identity != entry.request.row_identity
+                    || receipt.payload_digest != entry.request.payload_digest
+                    || receipt.request_digest != entry.request.request_digest
+                {
+                    return Err(DeliveryError::CorruptStore(
+                        "published receipt binding is invalid".to_string(),
+                    ));
+                }
+            }
+        }
+        let idempotency = read.open_table(IDEMPOTENCY)?;
+        for row in idempotency.iter()? {
+            let (_, value) = row?;
+            let record: IdempotencyRecordV1 = decode(value.value(), "idempotency")?;
+            let journal = journal_by_operation
+                .get(&record.receipt.operation_id)
+                .ok_or_else(|| {
+                    DeliveryError::CorruptStore(
+                        "idempotency receipt exists without journal row".to_string(),
+                    )
+                })?;
+            if record.command_digest == ContentDigest::zero()
+                || record.receipt.event_digest == ContentDigest::zero()
+                || record.receipt.duplicate
+                || record.command_digest != journal.command_digest
+                || record.receipt.event_digest != journal.event_digest
+                || record.receipt.project_revision != journal.project_revision
+            {
+                return Err(DeliveryError::CorruptStore(
+                    "idempotency record has an empty digest".to_string(),
+                ));
             }
         }
         Ok(())
+    }
+}
+
+impl DeliveryAggregateStorePort for DeliveryStore {
+    fn load(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Result<Option<DeliveryAggregateV1>, DeliveryError> {
+        DeliveryStore::load(self, tenant_id, project_id)
+    }
+
+    fn lookup_idempotency(
+        &self,
+        tenant_id: &str,
+        principal_id: &str,
+        command_kind: &str,
+        idempotency_key: &str,
+        command_digest: &ContentDigest,
+    ) -> Result<Option<DeliveryCommitReceiptV1>, DeliveryError> {
+        DeliveryStore::lookup_idempotency(
+            self,
+            tenant_id,
+            principal_id,
+            command_kind,
+            idempotency_key,
+            command_digest,
+        )
+    }
+
+    fn commit(
+        &self,
+        request: &DeliveryCommitRequestV1,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        DeliveryStore::commit(self, request)
+    }
+}
+
+impl DeliveryPublicationStatePort for DeliveryStore {
+    fn pending_publications(&self) -> Result<Vec<DeliveryOutboxEntryV1>, DeliveryError> {
+        DeliveryStore::pending_publications(self)
+    }
+
+    fn mark_published(
+        &self,
+        expected_request_digest: &ContentDigest,
+        receipt: PublicationReceiptV1,
+    ) -> Result<(), DeliveryError> {
+        DeliveryStore::mark_published(self, expected_request_digest, receipt)
+    }
+}
+
+fn envelope_from_journal(entry: &DeliveryJournalEntryV1) -> DeliveryEventEnvelopeV1 {
+    DeliveryEventEnvelopeV1 {
+        schema_version: entry.schema_version,
+        record_type: "delivery-event-envelope".to_string(),
+        tenant_id: entry.tenant_id.clone(),
+        project_id: entry.project_id.clone(),
+        project_revision: entry.project_revision,
+        operation_id: entry.operation_id.clone(),
+        event_type: entry.event_type.clone(),
+        command_digest: entry.command_digest.clone(),
+        payload: entry.payload.clone(),
+        committed_at_ms: entry.committed_at_ms,
     }
 }
 

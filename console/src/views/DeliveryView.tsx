@@ -1,13 +1,12 @@
 import { For, Show, type JSX } from "solid-js";
 import {
-  publicLineage,
   shortDigest,
   validateLineage,
-  type DeliveryLineageSnapshot,
+  type PublicDeliveryLineageDto,
 } from "./delivery/lineage";
 
 export interface DeliveryViewProps {
-  snapshot?: DeliveryLineageSnapshot;
+  snapshot?: PublicDeliveryLineageDto;
 }
 
 const STAGE_LABELS: Record<string, string> = {
@@ -21,8 +20,7 @@ const STAGE_LABELS: Record<string, string> = {
 };
 
 export function DeliveryView(props: DeliveryViewProps): JSX.Element {
-  const snapshot = () =>
-    props.snapshot?.adapterReady ? publicLineage(props.snapshot) : undefined;
+  const snapshot = () => (props.snapshot?.adapterReady ? props.snapshot : undefined);
   const failures = () => (snapshot() ? validateLineage(snapshot()!) : []);
 
   return (
@@ -70,7 +68,7 @@ export function DeliveryView(props: DeliveryViewProps): JSX.Element {
                     gap: "8px",
                   }}
                 >
-                  <span data-testid="delivery-project">Project {safe().projectId}</span>
+                  <span data-testid="delivery-project">Project {safe().projectLabel}</span>
                   <span>Revision {safe().revision}</span>
                   <span>{safe().nodes.length} lineage records</span>
                 </div>

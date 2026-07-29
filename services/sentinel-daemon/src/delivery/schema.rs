@@ -7,6 +7,7 @@ use super::digest::ContentDigest;
 pub const DELIVERY_SCHEMA_V1: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VersionedRefV1 {
     pub id: String,
     pub generation: u64,
@@ -25,6 +26,7 @@ pub enum AuthorityRole {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrincipalV1 {
     pub tenant_id: String,
     pub principal_id: String,
@@ -39,6 +41,7 @@ impl PrincipalV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataControlV1 {
     pub classification: String,
     pub encryption_key_owner: String,
@@ -49,6 +52,7 @@ pub struct DataControlV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceTupleV1 {
     pub owner: String,
     pub source_type: String,
@@ -58,6 +62,7 @@ pub struct SourceTupleV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactRefV1 {
     pub artifact_id: String,
     pub generation: u64,
@@ -67,6 +72,7 @@ pub struct ArtifactRefV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CostRefV1 {
     pub ledger_id: String,
     pub generation: u64,
@@ -85,6 +91,7 @@ pub enum DatasetSplit {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QaEvaluationPlanV1 {
     pub schema_version: u16,
     pub plan_id: String,
@@ -115,6 +122,7 @@ pub struct QaEvaluationPlanV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QaDatasetCaseV1 {
     pub schema_version: u16,
     pub case_id: String,
@@ -149,6 +157,23 @@ pub enum QaRunState {
     Quarantined,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QaHarnessOutcome {
+    Pass,
+    Fail,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QaAggregateOutcomesV1 {
+    pub required_cases_complete: bool,
+    pub contaminated: bool,
+    pub needs_human_review: bool,
+    pub flaky_unresolved: bool,
+}
+
 impl QaRunState {
     pub fn is_terminal(self) -> bool {
         matches!(
@@ -164,6 +189,7 @@ impl QaRunState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QaEvaluationRunReceiptV1 {
     pub schema_version: u16,
     pub run_id: String,
@@ -178,9 +204,9 @@ pub struct QaEvaluationRunReceiptV1 {
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
     pub attempts: u16,
-    pub harness_outcome: Option<String>,
+    pub harness_outcome: Option<QaHarnessOutcome>,
     pub cleanup_receipt: Option<VersionedRefV1>,
-    pub aggregate_outcomes: BTreeMap<String, String>,
+    pub aggregate_outcomes: Option<QaAggregateOutcomesV1>,
     pub gate_receipt: Option<VersionedRefV1>,
 }
 
@@ -196,7 +222,20 @@ pub enum QaCaseOutcome {
     FlakyUnresolved,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QaCaseReasonCode {
+    Verified,
+    AssertionFailed,
+    HarnessError,
+    ModelRejected,
+    SkippedByPolicy,
+    NeedsHumanReview,
+    FlakyUnresolved,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QaCaseResultV1 {
     pub schema_version: u16,
     pub result_id: String,
@@ -205,7 +244,7 @@ pub struct QaCaseResultV1 {
     pub case_ref: VersionedRefV1,
     pub outcome: QaCaseOutcome,
     pub required: bool,
-    pub reason_code: String,
+    pub reason_code: QaCaseReasonCode,
     pub sources: Vec<SourceTupleV1>,
     pub assertion_refs: Vec<VersionedRefV1>,
     pub grader_refs: Vec<VersionedRefV1>,
@@ -215,6 +254,7 @@ pub struct QaCaseResultV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QaDeterministicAssertionResultV1 {
     pub schema_version: u16,
     pub assertion_id: String,
@@ -229,7 +269,8 @@ pub struct QaDeterministicAssertionResultV1 {
     pub passed: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QaModelGradeEvidenceV1 {
     pub schema_version: u16,
     pub evidence_id: String,
@@ -239,7 +280,7 @@ pub struct QaModelGradeEvidenceV1 {
     pub requested_model_id: String,
     pub reported_model_id: Option<String>,
     pub model_fingerprint: Option<String>,
-    pub model_identity_status: String,
+    pub model_identity_status: QaModelIdentityStatus,
     pub model_family: String,
     pub model_version: String,
     pub system_digest: ContentDigest,
@@ -251,23 +292,66 @@ pub struct QaModelGradeEvidenceV1 {
     pub request_id: String,
     pub response_id: Option<String>,
     pub raw_output_digest: ContentDigest,
-    pub parse_outcome: String,
-    pub verdict: String,
+    pub parse_outcome: QaModelParseOutcome,
+    pub verdict: QaModelVerdict,
     pub attempts: u16,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost: Option<CostRefV1>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QaModelIdentityStatus {
+    Verified,
+    Unverified,
+    Mismatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QaModelParseOutcome {
+    Valid,
+    InvalidSchema,
+    Truncated,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QaModelVerdict {
+    Pass,
+    Fail,
+    NeedsHumanReview,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QaFlakeClassification {
+    Infrastructure,
+    ModelVariance,
+    TestHarness,
+    ProductDefect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QaFlakeReason {
+    RetryPassed,
+    KnownInfrastructure,
+    EvaluatorVariance,
+    Unresolved,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QaFlakeDispositionV1 {
     pub schema_version: u16,
     pub disposition_id: String,
     pub generation: u64,
     pub result: VersionedRefV1,
     pub owner: PrincipalV1,
-    pub classification: String,
-    pub reason: String,
+    pub classification: QaFlakeClassification,
+    pub reason: QaFlakeReason,
     pub policy_revision: u64,
     pub expires_at_ms: u64,
     pub defect_ref: VersionedRefV1,
@@ -275,6 +359,21 @@ pub struct QaFlakeDispositionV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QaEvidenceGraphV1 {
+    pub schema_version: u16,
+    pub run: VersionedRefV1,
+    pub workbench_receipt: VersionedRefV1,
+    pub dataset_cases: Vec<QaDatasetCaseV1>,
+    pub case_results: Vec<QaCaseResultV1>,
+    pub deterministic_results: Vec<QaDeterministicAssertionResultV1>,
+    pub model_results: Vec<QaModelGradeEvidenceV1>,
+    pub flake_dispositions: Vec<QaFlakeDispositionV1>,
+    pub graph_digest: ContentDigest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QaReleaseGateReceiptV1 {
     pub schema_version: u16,
     pub gate_id: String,
@@ -308,6 +407,7 @@ pub enum CandidateState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseCandidateV1 {
     pub schema_version: u16,
     pub candidate_id: String,
@@ -329,6 +429,7 @@ pub struct ReleaseCandidateV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewV1 {
     pub schema_version: u16,
     pub review_id: String,
@@ -341,6 +442,7 @@ pub struct ReviewV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestRunV1 {
     pub schema_version: u16,
     pub test_run_id: String,
@@ -354,19 +456,41 @@ pub struct TestRunV1 {
     pub passed: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingClassification {
+    Correctness,
+    Security,
+    Reliability,
+    Performance,
+    Accessibility,
+    Compliance,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FindingV1 {
     pub schema_version: u16,
     pub finding_id: String,
     pub generation: u64,
     pub candidate: VersionedRefV1,
-    pub severity: String,
-    pub classification: String,
+    pub severity: FindingSeverity,
+    pub classification: FindingClassification,
     pub evidence: Vec<SourceTupleV1>,
     pub resolved_by: Option<VersionedRefV1>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalV1 {
     pub schema_version: u16,
     pub approval_id: String,
@@ -379,6 +503,7 @@ pub struct ApprovalV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseManifestV1 {
     pub schema_version: u16,
     pub manifest_id: String,
@@ -414,6 +539,7 @@ pub enum ReleaseState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseV1 {
     pub schema_version: u16,
     pub release_id: String,
@@ -421,6 +547,7 @@ pub struct ReleaseV1 {
     pub manifest: VersionedRefV1,
     pub state: ReleaseState,
     pub activated_at_ms: Option<u64>,
+    pub rollout_receipt: Option<VersionedRefV1>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,6 +562,7 @@ pub enum DeliveryState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryReceiptV1 {
     pub schema_version: u16,
     pub delivery_id: String,
@@ -458,6 +586,7 @@ pub enum CustomerAction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustomerFeedbackV1 {
     pub schema_version: u16,
     pub feedback_id: String,
@@ -471,6 +600,7 @@ pub struct CustomerFeedbackV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcceptanceV1 {
     pub schema_version: u16,
     pub acceptance_id: String,
@@ -483,6 +613,7 @@ pub struct AcceptanceV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackV1 {
     pub schema_version: u16,
     pub rollback_id: String,
@@ -491,11 +622,12 @@ pub struct RollbackV1 {
     pub to_release: VersionedRefV1,
     pub actor: PrincipalV1,
     pub reason_digest: ContentDigest,
-    pub effect_receipt: VersionedRefV1,
+    pub effect_receipt: Option<VersionedRefV1>,
     pub created_at_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectCloseoutV1 {
     pub schema_version: u16,
     pub closeout_id: String,
@@ -513,6 +645,7 @@ pub struct ProjectCloseoutV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignedReleasePublicationV1 {
     pub schema_version: u16,
     pub release: VersionedRefV1,
@@ -530,7 +663,7 @@ impl QaEvaluationPlanV1 {
     pub fn computed_digest(&self) -> Result<ContentDigest, super::error::DeliveryError> {
         let mut unsigned = self.clone();
         unsigned.plan_digest = ContentDigest::zero();
-        ContentDigest::of(&unsigned)
+        ContentDigest::of_domain("qa-evaluation-plan", DELIVERY_SCHEMA_V1, &unsigned)
     }
 
     pub fn seal(mut self) -> Result<Self, super::error::DeliveryError> {
@@ -543,7 +676,7 @@ impl ReleaseCandidateV1 {
     pub fn computed_digest(&self) -> Result<ContentDigest, super::error::DeliveryError> {
         let mut unsigned = self.clone();
         unsigned.candidate_digest = ContentDigest::zero();
-        ContentDigest::of(&unsigned)
+        ContentDigest::of_domain("release-candidate", DELIVERY_SCHEMA_V1, &unsigned)
     }
 
     pub fn seal(mut self) -> Result<Self, super::error::DeliveryError> {
@@ -557,13 +690,13 @@ impl ReleaseManifestV1 {
         let mut input = self.clone();
         input.manifest_digest = ContentDigest::zero();
         input.qa_gate.digest = ContentDigest::zero();
-        ContentDigest::of(&input)
+        ContentDigest::of_domain("release-manifest-gate-input", DELIVERY_SCHEMA_V1, &input)
     }
 
     pub fn computed_digest(&self) -> Result<ContentDigest, super::error::DeliveryError> {
         let mut unsigned = self.clone();
         unsigned.manifest_digest = ContentDigest::zero();
-        ContentDigest::of(&unsigned)
+        ContentDigest::of_domain("release-manifest", DELIVERY_SCHEMA_V1, &unsigned)
     }
 
     pub fn seal(mut self) -> Result<Self, super::error::DeliveryError> {
@@ -576,7 +709,7 @@ impl DeliveryReceiptV1 {
     pub fn computed_digest(&self) -> Result<ContentDigest, super::error::DeliveryError> {
         let mut unsigned = self.clone();
         unsigned.receipt_digest = ContentDigest::zero();
-        ContentDigest::of(&unsigned)
+        ContentDigest::of_domain("delivery-receipt", DELIVERY_SCHEMA_V1, &unsigned)
     }
 
     pub fn seal(mut self) -> Result<Self, super::error::DeliveryError> {
@@ -589,7 +722,7 @@ impl CustomerFeedbackV1 {
     pub fn computed_digest(&self) -> Result<ContentDigest, super::error::DeliveryError> {
         let mut unsigned = self.clone();
         unsigned.feedback_digest = ContentDigest::zero();
-        ContentDigest::of(&unsigned)
+        ContentDigest::of_domain("customer-feedback", DELIVERY_SCHEMA_V1, &unsigned)
     }
 
     pub fn seal(mut self) -> Result<Self, super::error::DeliveryError> {
@@ -602,11 +735,24 @@ impl AcceptanceV1 {
     pub fn computed_digest(&self) -> Result<ContentDigest, super::error::DeliveryError> {
         let mut unsigned = self.clone();
         unsigned.acceptance_digest = ContentDigest::zero();
-        ContentDigest::of(&unsigned)
+        ContentDigest::of_domain("customer-acceptance", DELIVERY_SCHEMA_V1, &unsigned)
     }
 
     pub fn seal(mut self) -> Result<Self, super::error::DeliveryError> {
         self.acceptance_digest = self.computed_digest()?;
+        Ok(self)
+    }
+}
+
+impl QaEvidenceGraphV1 {
+    pub fn computed_digest(&self) -> Result<ContentDigest, super::error::DeliveryError> {
+        let mut unsigned = self.clone();
+        unsigned.graph_digest = ContentDigest::zero();
+        ContentDigest::of_domain("qa-evidence-graph", DELIVERY_SCHEMA_V1, &unsigned)
+    }
+
+    pub fn seal(mut self) -> Result<Self, super::error::DeliveryError> {
+        self.graph_digest = self.computed_digest()?;
         Ok(self)
     }
 }

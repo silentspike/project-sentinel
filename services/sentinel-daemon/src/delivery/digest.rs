@@ -28,16 +28,65 @@ impl ContentDigest {
         Ok(Self(value))
     }
 
-    pub fn of<T: Serialize>(value: &T) -> Result<Self, DeliveryError> {
+    /// Hashes a value in an explicit record and schema domain.
+    ///
+    /// Delivery wire and persisted records must use this method rather than a
+    /// bare JSON hash. The domain prefix prevents the same JSON shape from
+    /// being replayed as another record type or schema version.
+    pub fn of_domain<T: Serialize>(
+        record_type: &str,
+        schema_version: u16,
+        value: &T,
+    ) -> Result<Self, DeliveryError> {
+        validate_domain(record_type)?;
+        let bytes = Self::canonical_bytes(value)?;
+        Self::of_bytes_domain(record_type, schema_version, &bytes)
+    }
+
+    pub fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, DeliveryError> {
         let value = serde_json::to_value(value)?;
-        let bytes = serde_json::to_vec(&canonicalize(value))?;
-        let hash = Sha256::digest(bytes);
+        serde_json::to_vec(&canonicalize(value)).map_err(DeliveryError::from)
+    }
+
+    pub fn of_bytes_domain(
+        record_type: &str,
+        schema_version: u16,
+        bytes: &[u8],
+    ) -> Result<Self, DeliveryError> {
+        validate_domain(record_type)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"sentinel.delivery.digest\0");
+        hasher.update(schema_version.to_be_bytes());
+        hasher.update((record_type.len() as u32).to_be_bytes());
+        hasher.update(record_type.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+        let hash = hasher.finalize();
         Ok(Self(lower_hex(&hash)))
+    }
+
+    /// Non-wire helper retained for opaque test values only.
+    pub fn of<T: Serialize>(value: &T) -> Result<Self, DeliveryError> {
+        Self::of_domain("opaque-test-value", 1, value)
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn validate_domain(record_type: &str) -> Result<(), DeliveryError> {
+    if record_type.is_empty()
+        || record_type.len() > 96
+        || !record_type
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(DeliveryError::Validation(
+            "digest record type is not canonical".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl fmt::Display for ContentDigest {
@@ -99,6 +148,24 @@ mod tests {
         assert_eq!(
             ContentDigest::of(&left).unwrap(),
             ContentDigest::of(&right).unwrap()
+        );
+    }
+
+    #[test]
+    fn domain_and_schema_change_the_golden_digest() {
+        let value = json!({"a": 1, "b": ["x", "y"]});
+        let first = ContentDigest::of_domain("qa-plan", 1, &value).unwrap();
+        assert_eq!(
+            first.as_str(),
+            "fa68b8a7096f0867a5223eff0cae25339bc50f5f110ea78584e43897989956a5"
+        );
+        assert_ne!(
+            first,
+            ContentDigest::of_domain("qa-plan", 2, &value).unwrap()
+        );
+        assert_ne!(
+            first,
+            ContentDigest::of_domain("qa-run", 1, &value).unwrap()
         );
     }
 

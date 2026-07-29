@@ -2,18 +2,17 @@ import { describe, expect, it } from "vitest";
 import { render } from "@solidjs/testing-library";
 import { DeliveryView } from "../src/views/DeliveryView";
 import {
-  publicLineage,
   validateLineage,
-  type DeliveryLineageSnapshot,
+  type PublicDeliveryLineageDto,
 } from "../src/views/delivery/lineage";
 
 const DIGEST = "a".repeat(64);
 
-function snapshot(): DeliveryLineageSnapshot {
+function snapshot(): PublicDeliveryLineageDto {
   return {
     schemaVersion: 1,
-    tenantId: "tenant-private",
-    projectId: "project-42",
+    serverRedacted: true,
+    projectLabel: "project-42",
     revision: 9,
     nodes: [
       {
@@ -56,10 +55,10 @@ function snapshot(): DeliveryLineageSnapshot {
 }
 
 describe("delivery lineage model", () => {
-  it("validates digest-bound nodes and redacts tenant authority", () => {
+  it("validates the server-redacted digest-bound DTO", () => {
     const value = snapshot();
     expect(validateLineage(value)).toEqual([]);
-    expect(publicLineage(value).tenantId).toBe("redacted");
+    expect("tenantId" in value).toBe(false);
 
     value.edges.push({ from: "release-1", to: "missing" });
     expect(validateLineage(value)).toContain("dangling edge: release-1->missing");
@@ -109,19 +108,17 @@ describe("DeliveryView", () => {
     expect(queryByTestId("delivery-lineage")).toBeNull();
   });
 
-  it("redacts credential-shaped values, internal addresses and local paths", () => {
+  it("rejects DTOs containing credential-shaped values or internal identifiers", () => {
     const value = snapshot();
-    value.projectId = "secret=project-key";
+    value.projectLabel = "secret=project-key";
     value.nodes[0].label = "token=abc123 from 10.0.0.240";
     value.blockers = ["read /work/company/private.txt"];
-    const { container } = render(() => DeliveryView({ snapshot: value }));
-    const rendered = container.textContent ?? "";
-    expect(rendered).not.toContain("project-key");
-    expect(rendered).not.toContain("abc123");
-    expect(rendered).not.toContain("10.0.0.240");
-    expect(rendered).not.toContain("/work/company/private.txt");
-    expect(rendered).toContain("[redacted]");
-    expect(rendered).toContain("[internal-address]");
-    expect(rendered).toContain("[internal-path]");
+    const { getByTestId, queryByTestId } = render(() =>
+      DeliveryView({ snapshot: value }),
+    );
+    expect(getByTestId("delivery-invalid").textContent).toContain(
+      "forbidden sensitive or internal text",
+    );
+    expect(queryByTestId("delivery-lineage")).toBeNull();
   });
 });

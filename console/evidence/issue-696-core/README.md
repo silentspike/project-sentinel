@@ -10,60 +10,51 @@ deployment.
 - Deploy, read-only, and benchmark targets for this phase: none.
 - No VM, Proxmox, provider, customer-delivery, or runtime mutation occurred.
 - Productive #694 workbench and #695 workflow/memory adapters remain gated.
-- The Console view is a disjoint injected-snapshot surface; it is not connected
-  to an authenticated API route in this phase.
+- The Console view is an isolated public-DTO scaffold; it is neither reachable
+  from `App` nor connected to an authenticated API route.
 
 ## Implemented proof surface
 
 | Area | Dependency-independent evidence |
 | --- | --- |
-| Schemas | Versioned QA, candidate, review, finding, approval, manifest, release, delivery, feedback, acceptance, rollback, closeout, recovery-publication records |
+| Schemas | Unknown-field-rejecting, domain-separated versioned QA, candidate, review, finding, approval, manifest, release, delivery, feedback, acceptance, rollback and closeout records |
 | State | Legal candidate, QA-run, release, and delivery transitions reject shortcuts and terminal reopen |
-| Authority | Tenant/principal/role checks and developer/QA/release/customer separation |
-| Currentness | Exact candidate, plan, evidence, gate, manifest, release, delivery, acceptance, and closeout bindings |
-| Durability | redb aggregate, journal, namespaced idempotency and digest-bound outbox in one local commit |
-| Recovery | Restart readback for candidate, QA lineage, outbox, rollback, and closeout |
-| Effects | Stable QA request and deterministic fake; productive #694 exactly-once adapter remains deferred |
-| Console | Fail-closed lineage validation, shortened digests, cost rendering, and public redaction |
+| Authority | Opaque current-authority receipt, exact principal/role/generation checks, TOCTOU revalidation and developer/QA/release/customer separation |
+| Currentness | Exact candidate, run, assignment, invocation, evidence graph, gate, manifest, release, delivery, acceptance and closeout bindings |
+| Durability | Test-only redb fixture behind separate #732 aggregate/append and #733 publication-state contracts; no productive store claim |
+| Recovery | Test-fixture restart readback for candidate, QA lineage, publication, rollback and closeout |
+| Effects | Stable QA/effect requests and sealed deterministic fakes; productive #694/#695/effect adapters remain deferred |
+| Console | Unreachable public-DTO scaffold with fail-closed validation; no product-surface or browser-security claim |
 
 ## Acceptance boundary
 
-AC-1, the dependency-independent portions of AC-2, AC-4, AC-5, AC-6, AC-8,
-AC-9, AC-10, AC-12, and the schema/contract portions of AC-14 through AC-20 are
-implemented. AC-3 productive execution, AC-7 authoritative work-item creation,
-AC-9 authenticated API/live browser proof, AC-10 NMDA publication, AC-11 Gaia
-observation, AC-13 `.240` acceptance, and all productive adapter/effect/recovery
-claims remain open.
+AC-1 and dependency-independent portions of AC-2, AC-4, AC-5, AC-6, AC-7,
+AC-8, AC-10, AC-12, AC-14, AC-15, AC-17, AC-18, and AC-20 are implemented.
+AC-3 productive execution, AC-6 authenticated API/browser, AC-7 productive #695
+work-item creation, AC-9 product Console, AC-10 NMDA publication, AC-11 Gaia,
+AC-13 `.240`, AC-16 productive capability enforcement, AC-19 recovery
+integration, and all productive CQRS/effect claims remain open.
 
 No screenshot alone is claimed as AC-N5 evidence. No build-server timing is
 reported as benchmark evidence.
 
-## Pre-integration checks
+## Current correction checks
 
-The following checks passed before the required final `origin/main` merge:
+The following focused results were observed before the required final
+`origin/main` merge:
 
 ```text
-bun run test -- tests/delivery-view.test.ts
-  6 passed
-bun run test
-  76 passed before the sixth delivery-specific adapter-readiness case was added
-bun run typecheck
+remote compile-only focused delivery_core
   PASS
-bun run build
-  PASS
-cargo remote -c .rustc_info.json -- fmt --all -- --check
-  PASS before the final negative-test additions
-cargo remote -c .rustc_info.json -- check -p sentinel-daemon --lib --tests
-  PASS before the final negative-test additions
-cargo remote -c .rustc_info.json -- test -p sentinel-daemon --test delivery_core
-  10 passed before the final negative-test additions
+remote delivery_core
+  PASS 20/20 before final receipt and crash-boundary fixture additions
+remote digest golden-vector probe
+  correctly found one stale expected vector; reproduced value applied, rerun pending
 ```
 
-One later focused Rust attempt ended with the remote builder error
-`Disk quota exceeded (os error 122)` and is not a passed gate. After scoped
-cache cleanup, the retry reached two test-fixture ownership compile errors and
-is also not a passed gate. Both must be corrected and the canonical remote Rust
-matrix rerun on the final integrated head.
+Earlier quota and fixture compile failures are historical diagnostics and are not
+counted as passed gates. Final evidence replaces this section only after the
+current main merge and the complete exact-head matrix.
 
 ## Final evidence
 
