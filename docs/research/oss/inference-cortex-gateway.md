@@ -189,17 +189,17 @@ execution and ephemeral engine cache.
 | `cmd/cortex-gateway/internal/proxy/provider.go:21-109` | Provider ABI | Usage/cost fields plus optional inventory, streaming, and status interfaces | Cortex Gateway |
 | `cmd/cortex-gateway/internal/proxy/catalog.go:28-75` | Provider catalog | Routing semantics have a stable digest; endpoints and credentials are deliberately outside it | #395 historical contract |
 | `cmd/cortex-gateway/internal/proxy/catalog.go:240-364` | Model policy | Hierarchy resolution and activation fail closed against allowlisted models | #395, #650 |
-| `cmd/cortex-gateway/internal/capability/detection.go:5-103` | Capability map | Capabilities are mutable, hand-maintained process state and are not bound to the catalog digest | Proposed #732 schema delta |
+| `cmd/cortex-gateway/internal/capability/detection.go:5-103` | Capability map | Capabilities are mutable, hand-maintained process state and are not bound to the catalog digest | Materialized #732 schema delta |
 | `cmd/cortex-gateway/internal/forwardqueue/manager.go:37-96` | Admission | Concurrency is bounded, but the waiter slice has no capacity limit; cancellation/grant race is handled | #764 pressure; #769 schedules |
-| `cmd/cortex-gateway/internal/proxy/queued_provider.go:10-53` | Queue wrapper | Preserves inventory only; it drops `StreamingProvider` and `ProviderStatusReporter` | Proposed G1 |
-| `cmd/cortex-gateway/internal/proxy/provider_test.go:49-67` | Wrapper test | Proves inventory preservation only | Proposed G1; #769 |
-| `cmd/cortex-gateway/internal/proxy/pipeline.go:420-449` | Circuit-open response | Uses `ProviderStatusReporter` for Claude-Code typed 429/503 status; the productive wrapper hides it | Proposed G1 |
-| `cmd/cortex-gateway/internal/proxy/pipeline_test.go:482-529` | Stream test | Registers an unwrapped mock, so productive queue composition is not covered | Proposed G1; #769 |
+| `cmd/cortex-gateway/internal/proxy/queued_provider.go:10-53` | Queue wrapper | Preserves inventory only; it drops `StreamingProvider` and `ProviderStatusReporter` | [#773](https://github.com/silentspike/project-sentinel/issues/773) |
+| `cmd/cortex-gateway/internal/proxy/provider_test.go:49-67` | Wrapper test | Proves inventory preservation only | #773; #769 |
+| `cmd/cortex-gateway/internal/proxy/pipeline.go:420-449` | Circuit-open response | Uses `ProviderStatusReporter` for Claude-Code typed 429/503 status; the productive wrapper hides it | #773 |
+| `cmd/cortex-gateway/internal/proxy/pipeline_test.go:482-529` | Stream test | Registers an unwrapped mock, so productive queue composition is not covered | #773; #769 |
 | `cmd/cortex-gateway/internal/proxy/pipeline.go:1082-1103` | Budget fallback | Budget exhaustion may switch providers before dispatch; there is no general provider retry loop | #695 |
 | `cmd/cortex-gateway/internal/proxy/pipeline.go:1454-1531` | Response sink | Non-stream terminal usage/cost has a single process-local sink | #695, #758 |
-| `cmd/cortex-gateway/internal/proxy/pipeline.go:1689-1747` | Streaming | Requires an optional interface and records latency/count only; it does not parse terminal usage or enter the response sink | Proposed G1 plus #695/#732 |
+| `cmd/cortex-gateway/internal/proxy/pipeline.go:1689-1747` | Streaming | Requires an optional interface and records latency/count only; it does not parse terminal usage or enter the response sink | #773 plus #695/#732 |
 | `cmd/cortex-gateway/internal/proxy/claude.go:120-206` | Anthropic non-stream | Context deadline, response bound, provider usage and cache-token split | Cortex Gateway |
-| `cmd/cortex-gateway/internal/proxy/claude.go:247-334` | Anthropic stream | Relays raw SSE and propagates write/read error; no terminal usage reconciliation | Proposed G1 plus #695/#732 |
+| `cmd/cortex-gateway/internal/proxy/claude.go:247-334` | Anthropic stream | Relays raw SSE and propagates write/read error; no terminal usage reconciliation | #773 plus #695/#732 |
 | `cmd/cortex-gateway/internal/proxy/claude_code.go:103-195` | Claude CLI adapter | Separate internal semaphore plus per-request subprocess and stderr drain | Cortex Gateway |
 | `cmd/cortex-gateway/internal/proxy/ollama.go:85-225` | Ollama adapter | Non-stream HTTP generation and token-free inventory | Cortex Gateway |
 | `cmd/cortex-gateway/internal/proxy/local_loop.go:20-237` | Deterministic fixture | Token-free, no network/subprocess, stable scenario digest, supports synthetic SSE | #650 test path |
@@ -311,7 +311,7 @@ No TOGAF file is changed by this worker.
 | Issue | Live role | #714 routing rule |
 |---|---|---|
 | [#395](https://github.com/silentspike/project-sentinel/issues/395) | Closed, verified hierarchy/catalog history | Preserve the contract; do not reopen or assign new work to a closed issue. |
-| [#650](https://github.com/silentspike/project-sentinel/issues/650) | M0 product-acceptance epic | Proposed parent for M0 Gateway hardening after approval. |
+| [#650](https://github.com/silentspike/project-sentinel/issues/650) | M0 product-acceptance epic | Native parent of the approved G1 child #773. |
 | [#695](https://github.com/silentspike/project-sentinel/issues/695) | M0 workflow and cost-ceiling behavior | Owns cost-ceiling acceptance and authoritative action schema, not queue implementation. |
 | [#696](https://github.com/silentspike/project-sentinel/issues/696) | QA/release/lineage | Consumes final inference evidence; no Gateway implementation ownership. |
 | [#705](https://github.com/silentspike/project-sentinel/issues/705) | Dependency necessity/ownership audit | Must approve any engine/library dependency and disposition of `sentinel-inference`. |
@@ -1299,34 +1299,35 @@ decision from Gateway memory or an external projection.
 
 ## M0 classification and owner routing
 
-| Finding | Class | Rationale | Proposed owner |
+| Finding | Class | Rationale | Owner |
 |---|---|---|---|
-| Concurrent budget check/record can bypass cost ceiling | `BLOCKS_M0` pending #695 acknowledgement | #695 explicitly requires cost ceiling under concurrency | Precise #695 delta or successor |
-| Productive queue wrapper drops streaming and status interfaces | `M0_HARDENING` | Compatibility streaming breaks and Claude-Code typed cooldown status is hidden | Proposed G1, tests #769 |
-| Go waiter queue has no capacity bound | `M0_HARDENING` | External/internal pressure can exhaust memory; no current runtime evidence was taken | #764 policy, proposed G1 |
-| Stream terminal usage/cost absent | `M0_HARDENING` | Streaming can incur cost outside the single sink | Proposed G1 plus #695/#732 |
+| Concurrent budget check/record can bypass cost ceiling | `BLOCKS_M0` routed to #695 | #695 explicitly requires cost ceiling under concurrency | Materialized #695 C0 addendum |
+| Productive queue wrapper drops streaming and status interfaces | `M0_HARDENING` | Compatibility streaming breaks and Claude-Code typed cooldown status is hidden | #773, tests #769 |
+| Go waiter queue has no capacity bound | `M0_HARDENING` | External/internal pressure can exhaust memory; no current runtime evidence was taken | #764 policy, #773 |
+| Stream terminal usage/cost absent | `M0_HARDENING` | Streaming can incur cost outside the single sink | #773 plus #695/#732 |
 | Blind post-dispatch failover must remain forbidden | `M0_HARDENING` | Prevents future target drift from creating duplicate charge | #695/#732 |
-| Capability map not bound to catalog digest | `M0_HARDENING` | Mutable source map can disagree with productive wrapper capability | #732 schema delta plus G1 |
+| Capability map not bound to catalog digest | `M0_HARDENING` | Mutable source map can disagree with productive wrapper capability | #732 schema delta plus #773 |
 | vLLM/SGLang/llama.cpp engine selection | `POST_M0` | Requires target hardware, security, dependency, and rollback evidence | #705/#656 decision gate |
 | Prefix/KV reuse, Multi-LoRA, speculative decode, grammar engine | `POST_M0` | Performance/engine mechanisms do not block product semantics | #705 and later engine owner |
 | `sentinel-inference` prototype disposition | `POST_M0` | No productive path; audit before retain/rewrite/remove | #705 |
 | Provider-independent catalog/tiering | `M0_HARDENING`, delivered | Existing verified contract should remain unchanged | #395 history, #650 |
 | Durable request/effect/usage completion | `BLOCKS_M0`, implemented | Load-bearing no-duplicate authority; regression protection continues | #732/#733/#695 |
 
-`AC-5`, `AC-6`, and `AC-7` remain pending maintainer approval, live
-materialization, and owner acknowledgement. The classifications above are the
-research recommendation, not owner acceptance.
+ORC approved the twelve decisions and this classification/owner split. Live
+materialization routes S0 to #732, C0 to #695, the sole uncovered Go
+implementation to #773, and narrow release consumption to #696. This approval
+does not authorize implementation outside those issue contracts.
 
-## Proposed implementation-owner contracts
+## Approved implementation-owner contracts
 
-Materialization is forbidden until ORC approval. There is no new coordination
-epic and no duplicate durable-budget child. Existing owners receive precise
-deltas; only G1 is genuinely uncovered Go implementation work.
+ORC approved materialization without a new coordination epic or duplicate
+durable-budget child. Existing owners received precise deltas; #773 is the only
+new issue because G1 is the only genuinely uncovered Go implementation work.
 
 ```text
 #732 schema/append delta S0
   +-> #695 final-admission/cost/attempt delta C0
-  +-> proposed G1 Go Gateway edge/proposal implementation
+  +-> #773 G1 Go Gateway edge/proposal implementation
 
 #733 consumes S0 events and owns outbox/consumer outcomes.
 #764 supplies pressure policy to G1.
@@ -1404,15 +1405,15 @@ deterministic fixtures only. Rollback owner is the S0 implementer by PR revert.
 rollback stops V1 production without deleting records.
 **Evidence:** exact vector hashes, validator outputs, CI paths, one-authority
 matrix.
-**TOGAF target delta:** once approved, immediately add the versioned
-admission/attempt/usage authority target to both language copies.
+**TOGAF target delta:** the main-session owner immediately adds the approved
+versioned admission/attempt/usage authority target to both language copies.
 
-### Proposed new child G1: Go Gateway bounded admission and streaming
+### Materialized child G1: #773 Go Gateway bounded admission and streaming
 
 **Owned write scope:** `cmd/cortex-gateway` queue, provider wrappers, stream
 adapter, Gateway metrics/config/tests only. No Rust, event store, projection, or
 TOGAF file.
-**Parent/dependencies:** new child under #650; research #714; S0 schema port;
+**Parent/dependencies:** native child #773 under #650; research #714; S0 schema port;
 #764 pressure policy; #769 deterministic Go schedules. Implementation may run in
 parallel with C0, but billable activation depends on C0's live authoritative
 inference-authority port.
@@ -1492,9 +1493,10 @@ quarantined attempts during rollback.
 **Evidence:** local schedule/race tests; `.240` snapshot/deploy/rollback commands;
 token-free queue/cancel/stream/status/restart outputs; p50/p95/max and resource/
 cardinality data; zero provider calls in reject paths; S0/C0 readback.
-**TOGAF target delta:** once approved, immediately add bounded admission,
-deterministic route/deadline proposal, status/retry-after, and stream-terminal
-targets to both language copies; C0 remains final admission authority.
+**TOGAF target delta:** the main-session owner immediately adds the approved
+bounded admission, deterministic route/deadline proposal, status/retry-after,
+and stream-terminal targets to both language copies; C0 remains final admission
+authority.
 
 ### Existing-owner delta C0: #695 durable budget and attempt reconciliation
 
@@ -1599,12 +1601,12 @@ refund ambiguous records automatically.
 **Evidence:** `.240` snapshot/deploy/rollback commands; token-free state
 transitions; store/event/projection readbacks; restart/redelivery histories;
 p50/p95/max plus resources/cardinality; zero duplicate provider/effect/usage.
-**TOGAF target delta:** once approved, immediately add durable integer-unit
-multi-scope reservation, final hierarchy/policy route and deadline admission,
-complete mutation-port ordering, append-only attempt/reservation transitions,
-and safe-failover targets to both language copies.
+**TOGAF target delta:** the main-session owner immediately adds the approved
+durable integer-unit multi-scope reservation, final hierarchy/policy route and
+deadline admission, complete mutation-port ordering, append-only attempt/
+reservation transitions, and safe-failover targets to both language copies.
 
-### Existing-owner deltas after approval
+### Materialized existing-owner deltas
 
 - **#695:** own C0 governance receipt validation, derived-scope/conservative-cost
   immutable `BudgetReservationV1`, append-only
@@ -1617,7 +1619,7 @@ and safe-failover targets to both language copies.
   durable-before-provider-I/O, transaction-failpoint, idempotency-replay,
   cancellation, restart, and ambiguous-dispatch negative ACs. If timing requires
   follow-up, create a successor after #695 rather than parallel authority.
-- **#696:** consume exact S0/C0/G1 release evidence and preserve model/catalog/
+- **#696:** consume exact S0/C0/#773 release evidence and preserve model/catalog/
   request lineage in delivery records.
 - **#705:** decide retain/rewrite/remove for `sentinel-inference`; separately
   decide any vLLM/SGLang/llama.cpp adapter dependency with license, security,
@@ -1632,20 +1634,38 @@ and safe-failover targets to both language copies.
   events, not provider retry.
 - **#758:** consume bounded queue/attempt/reservation counters and causal IDs;
   never become a second business-state store.
-- **#764:** define pressure tiers and admission policy inputs consumed by G1.
+- **#764:** define pressure tiers and admission policy inputs consumed by #773.
 - **#769:** add wrapper inventory/stream/status combinations, ingress/waiter
   capacity, grant/cancel, timeout, retry-after, and disconnect schedules. It
   remains test ownership, not production implementation.
 
-Closed #395 receives a follow-up link only if materialization is approved; its
-historical body and status must not be rewritten.
+Closed #395 remains unchanged; its historical body and status are not rewritten.
+
+### Live materialization readback
+
+| Issue | Materialized role | Body SHA-256 | Fresh Quality run |
+|---|---|---|---|
+| [#714](https://github.com/silentspike/project-sentinel/issues/714) | Approved research decisions, graph, and evidence | `e3f23fc8d6fc74f76b857b8a8cf8c4f55636877d171dfbd3188b4c647f7b86c2` | `30472084574` PASS |
+| [#732](https://github.com/silentspike/project-sentinel/issues/732) | S0 schema/codec/vector/append addendum | `84a2ca63ee470368518738edf463c1c9b0bea2935ea4b4196c8e6b6f2a167cdc` | `30471794097` PASS |
+| [#695](https://github.com/silentspike/project-sentinel/issues/695) | C0 final-admission/budget/attempt addendum | `67e161fa68207c3b6a9a90e351cd5e58cf91ace90554442c5a45cb6886445f79` | `30471808296` PASS |
+| [#696](https://github.com/silentspike/project-sentinel/issues/696) | Narrow QA/release lineage consumer addendum | `766be5692c219a0bc672d65119a02dee67bf2ff94cd05555d7b74a01f6d9d100` | `30471805866` PASS |
+| [#773](https://github.com/silentspike/project-sentinel/issues/773) | Sole new G1 child, natively under #650 | `aa1990dd381d02b4d7e6d7fa138feea14ba06e888f0c72353926c3a2d397c2cc` | `30471703481` PASS |
+
+Every row has `quality:ready`. Reciprocal non-authority routes are live on
+[#650](https://github.com/silentspike/project-sentinel/issues/650#issuecomment-5120799531),
+[#705](https://github.com/silentspike/project-sentinel/issues/705#issuecomment-5120799820),
+[#656](https://github.com/silentspike/project-sentinel/issues/656#issuecomment-5120800112),
+[#733](https://github.com/silentspike/project-sentinel/issues/733#issuecomment-5120800430),
+[#758](https://github.com/silentspike/project-sentinel/issues/758#issuecomment-5120800688),
+[#764](https://github.com/silentspike/project-sentinel/issues/764#issuecomment-5120800966),
+and [#769](https://github.com/silentspike/project-sentinel/issues/769#issuecomment-5120801253).
 
 ## Rollout, rollback, and benchmark decision gates
 
 ### M0 hardening rollout
 
-1. After architecture/owner approval, update both TOGAF target-language copies;
-   do not wait for implementation evidence.
+1. Hand the approved target delta to the main-session owner for both TOGAF
+   language copies; do not wait for implementation evidence.
 2. Land S0 readers, deterministic-CBOR golden vectors, acyclic intent/reserve/
    finalize vectors, immutable reservation-transition and port-method/CAS invalid
    fixtures, append validation, and CI paths.
@@ -1694,10 +1714,10 @@ upstream claims are not acceptance evidence.
 | AC-2 ecosystem scan | `PASS` | Ten immutable candidates, screening rubric, shortlist/rejections |
 | AC-3 deep reviews | `PASS` | Five pinned reviews covering source, tests, failures, security, license, operations |
 | AC-4 complete mechanism matrix | `PASS` | Mechanism, dependency/security/operations, butterfly, schema, and failure matrices |
-| AC-5 explicit decision per mechanism | `PENDING_MAINTAINER_APPROVAL` | Twelve executive decisions and mechanism matrix await ORC decision |
-| AC-6 accepted gap has live quality owner | `PENDING_MATERIALIZATION` | Complete #732 S0, #695 C0, and sole new G1 contracts exist only in this study |
-| AC-7 M0 classification and acknowledgement | `PENDING_OWNER_ACK` | Every finding classified; live owners have not yet acknowledged deltas |
-| AC-8 public-safe study | `PASS` after final gates | One English ASCII document, no secrets, provider calls, copied code, or runtime data |
+| AC-5 explicit decision per mechanism | `PASS` | ORC approved all twelve executive decisions and the S0/C0/G1 authority model |
+| AC-6 accepted gap has live quality owner | `PASS` | #732 S0, #695 C0, #696 consumer, and sole new #773 G1 contracts are live and quality-ready |
+| AC-7 M0 classification and acknowledgement | `PASS` | Every finding is classified; ORC-approved routes and reciprocal live links preserve one authority |
+| AC-8 public-safe study | `PASS` | One English ASCII document, no secrets, provider calls, copied code, or runtime data; final gates are recorded below |
 | AC-N1 no popularity dependency | `PASS` | Rubric and #705 gate; no dependency mutation |
 | AC-N2 provenance/license/security | `PASS` | Immutable pins and governance evidence for every deep review |
 | AC-N3 tests/status not proof | `PASS` | Limits and source-backed composition findings are explicit |
@@ -1738,7 +1758,7 @@ LC_ALL=C grep -nP '[^\x00-\x7F]' \
 
 # Local source and line anchors, immutable upstream objects, external URLs,
 # GFM rendering, required sections/counts, and negative fixtures
-python3 <private-verifier> --all \
+python3 <private-verifier> --all --doc \
   docs/research/oss/inference-cortex-gateway.md
 
 typos docs/research/oss/inference-cortex-gateway.md
@@ -1759,7 +1779,8 @@ Negative structure fixtures must reject:
 - automatic retry/failover from `AMBIGUOUS`;
 - an unbounded accepted queue;
 - engine/upstream/build-server timing presented as Sentinel evidence;
-- a live materialization claim while AC-5/AC-6/AC-7 remain pending;
+- a live materialization claim without exact issue, hash, quality-run, and
+  reciprocal-link readback;
 - a new coordination epic or parallel durable-budget owner beside #650/#695;
 - a cyclic S0/C0/G1 owner graph or billable G1 activation before C0;
 - an intent/reservation/final-admission digest cycle, rebound authority record,
@@ -1802,5 +1823,5 @@ Negative structure fixtures must reject:
   provider-specific evidence; HTTP status alone is insufficient.
 - No target hardware/model mix was authorized, so vLLM, SGLang, and llama.cpp
   remain candidates rather than a ranking.
-- AC-5, AC-6, and AC-7 are intentionally not claimed complete before ORC
-  approval, live issue materialization, and owner acknowledgement.
+- The approved TOGAF target delta is a main-session handoff; this worker did not
+  edit either language copy.
