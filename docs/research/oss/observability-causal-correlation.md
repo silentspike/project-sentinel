@@ -4,6 +4,9 @@ Status: source-backed synthesis accepted and implementation ownership materializ
 Issue: [#718](https://github.com/silentspike/project-sentinel/issues/718)
 Parent: [#659](https://github.com/silentspike/project-sentinel/issues/659)
 Sentinel baseline: `e85eb67f13beb240b4c4638d3f37d76f219b8463`
+Final integration base: `1ea2c6b9d9290150737d4bee0b31b4af30cf3c25`;
+the intervening main delta adds only the disjoint #722 recovery study and
+changes no source, target-architecture, or issue input reviewed here.
 Research date: 2026-07-29
 
 ## Executive decision
