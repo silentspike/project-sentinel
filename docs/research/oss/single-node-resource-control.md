@@ -1030,7 +1030,7 @@ This research issue does not edit the TOGAF HTML.
 | AC-5 | Section 7 assigns exactly one explicit decision to every mechanism and records rejected alternatives. | PENDING ORC APPROVAL |
 | AC-6 | Section 12 provides implementation-ready RC0-RC3 and exact existing-owner deltas, but live materialization is explicitly forbidden until ORC approval. | PENDING ORC APPROVAL/MATERIALIZATION |
 | AC-7 | Section 11 classifies every finding and limits `BLOCKS_M0` to the source-proved missed-shift defect. | PENDING M0 OWNER ACKNOWLEDGEMENT |
-| AC-8 | This document is intended as the sole repository change; final ASCII/public-safety, typo, link, provenance, render, scope, and diff gates run on the frozen head. | PENDING FINAL GATES |
+| AC-8 | This document is the sole repository change; final ASCII/public-safety, typo, local/external link, provenance, render, scope, and diff gates pass on the frozen delivery head. | PASS |
 | AC-N1 | No dependency is added or recommended merely because another project uses it. | PASS |
 | AC-N2 | Every deep review records license, security, provenance, maintenance/operations, and integration boundary; no code is copied. | PASS |
 | AC-N3 | Closed labels and unit tests are treated as bounded historical evidence, not current optimality proof. | PASS |
