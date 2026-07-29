@@ -30,9 +30,12 @@ The accepted decisions are:
    effect, usage, atomic budget-reservation, and canonical attempt authority.
 3. **REIMPLEMENT** bounded Gateway admission in Sentinel Go: a finite queue,
    typed overload outcome, cancellation-safe FIFO grant, per-class limits, and
-   observable pressure. Go owns edge admission, provider/model selection, and
-   provider-execution deadlines. Port only channel/semaphore ideas from SGLang
-   and fail-fast overload semantics from TGI; neither proves bounded ingress.
+   observable pressure. Go owns edge queuing and deterministically proposes a
+   provider/model route and bounded execution deadline. C0 is final admission
+   authority: it independently validates hierarchy/policy routing, allowed
+   capability/catalog/pricing generations, token ceilings, and a policy-clamped
+   maximum deadline. Port only channel/semaphore ideas from SGLang and fail-fast
+   overload semantics from TGI; neither proves bounded ingress.
 4. **REIMPLEMENT** capability-preserving provider wrappers. The current queue
    wrapper preserves model inventory but drops both streaming and provider-status
    reporting when the wrapped provider implements them.
@@ -266,9 +269,14 @@ and future SGLang/KVFlow/Multi-LoRA mechanisms
 
 Target-only delta proposed for the main-session owner:
 
-1. Define Cortex Gateway as the edge-admission, provider/model-selection, and
-   provider-execution-deadline authority. Caller deadlines remain end-to-end
-   policy; there is no Gateway-owned global deadline.
+1. Define Cortex Gateway as the edge-queue authority and deterministic proposer
+   of provider/model route and bounded provider-execution deadline. Define C0 as
+   final admission authority: it independently validates the exact hierarchy/
+   policy-to-provider/model mapping, allowed capability/catalog/pricing
+   generations, token ceilings, and policy-clamped maximum deadline. A stale or
+   compromised Gateway cannot select a merely existing but disallowed/expensive
+   model or extend the deadline. Caller deadlines remain end-to-end policy;
+   there is no Gateway-owned global deadline.
 2. Define engines as replaceable execution adapters. Engine queue/KV cache state
    is ephemeral and cannot become event, budget, request, or ownership authority.
 3. Define Rust/EventStore as the durable request/effect/usage, atomic
@@ -566,7 +574,7 @@ stronger Sentinel-owned contracts, not LiteLLM behavior.
 
 | Mechanism | Sentinel now | Strongest reviewed source | Decision | Authority after decision |
 |---|---|---|---|---|
-| Provider/model policy | Immutable catalog and hierarchy mapping | LiteLLM router is broader | `KEEP` | Cortex Gateway |
+| Provider/model policy | Immutable catalog and hierarchy mapping | LiteLLM router is broader | `KEEP`; Gateway proposes, C0 final-validates | #395 policy plus C0 admission |
 | Token-free readiness | Inventory/Gate B/local-loop | Engines expose health/model routes | `KEEP` | Cortex Gateway |
 | Active-call limit | Go semaphore-like manager; Rust semaphore | TGI fail-fast; SGLang channel/semaphore | `REIMPLEMENT` finite policy | Gateway plus #764 policy |
 | Waiting queue | Unbounded Go waiter slice | TGI immediate reject; SGLang bounded channel but unbounded submit futures | `PORT` primitives plus hard ingress cap | Cortex Gateway |
@@ -608,13 +616,66 @@ stronger Sentinel-owned contracts, not LiteLLM behavior.
 | Finite Gateway queue | `forwardqueue`, composition config, metrics | External callers receive overload; Rust urgent/normal policy sees typed outcomes | Versioned defaults, class-specific policy, no silent drop |
 | Preserve optional interfaces | `queued_provider`, provider capability tests | Anthropic stream and Claude-Code typed cooldown/retry status survive wrapping | Test all inventory/stream/status combinations without invented capabilities |
 | Parse terminal stream usage | Claude adapter and response sink | Cost projection and budget reconciliation change; partial streams become billable outcomes | Raw chunks are not durable effects; usage binds stable attempt plus terminal outcome and reservation/exemption |
-| Durable budget reservation | #695 plus shared event/schema and Gateway port | Concurrent cost admission, restart recovery, projection, operator diagnostics | Acyclic intent/reserve/finalize; governance-derived scopes/cost; exactly-once release/reconcile/quarantine |
+| Final route/deadline admission | Gateway proposal plus #395/#695 policy and C0 | Stale/compromised Gateway, expensive route, deadline and token bounds | C0 independently resolves policy mapping and clamps final fields |
+| Durable budget reservation | #695 plus shared event/schema and authority port | Concurrent cost admission, restart recovery, projection, operator diagnostics | Immutable create plus append-only transitions in one C0 SQLite transaction |
+| Complete mutation port | Go Gateway to C0 | Every provider-call, outcome, usage, retry and crash boundary | Six authenticated/versioned methods; fresh durable dispatch ACK before I/O |
 | Typed attempt outcome | Go response and Rust bridge/event | Retry/failover, circuit breaker, outbox, observability | Stable attempt binding; separate dispatch/terminal operations; predecessor CAS |
 | Engine adapter | provider catalog/config/deployment | Model inventory, readiness, image/license/CVE, cache metrics | #705 decision, target benchmark, rollback to prior provider |
 | Capability digest | catalog/capability schema | Readiness and routing reject drift | Bind to semantic catalog digest; no mutable undocumented capability |
 | Remove/reclassify prototypes | workspace/dependency audit only | Build graph and future architecture docs | #705 owns; no pruning in #714 |
 
 ## Accepted API, schema, and state-machine proposals
+
+### S0 canonical digest codec
+
+Rust and Go must hash identical bytes, not merely equivalent JSON. S0 therefore
+uses [RFC 8949 deterministic CBOR](https://www.rfc-editor.org/rfc/rfc8949.html#section-4.2)
+with this exact preimage:
+
+```text
+ASCII "sentinel.inference.control"
+0x00
+u16be(record_type_ascii_byte_length)
+record_type_ascii_bytes
+u16be(schema_version)
+u32be(deterministic_cbor_payload_byte_length)
+deterministic_cbor_payload
+```
+
+`record_type` is the exact V1 type name, including `V1`; it and
+`schema_version` provide cross-record and cross-version domain separation. The
+payload is a definite-length CBOR map whose keys are the exact ASCII field names
+shown in the schema. RFC 8949 core deterministic map ordering applies. The
+record's own digest field is omitted from its hash payload; every referenced
+record/operation digest remains included. SHA-256 over the complete preimage is
+stored as exactly 32 bytes and rendered as lowercase 64-character hex only at
+text/API boundaries.
+
+The value rules are closed:
+
+- strings are valid UTF-8 in Unicode NFC; validators reject non-NFC input rather
+  than silently normalizing it;
+- authority IDs and enum symbols are non-empty ASCII and at most 128 bytes;
+  provider request IDs are NFC UTF-8 and at most 512 bytes;
+- optional fields are represented only by absence; CBOR `null` is forbidden;
+- unsigned values use shortest-form CBOR `uint64`; negative integers, bignums,
+  tags, floating values, NaN, and infinity are forbidden;
+- timestamps are Unix milliseconds encoded as `uint64`;
+- booleans are CBOR booleans, never integer or string aliases;
+- byte digests are exactly 32 bytes;
+- scope arrays are sorted by `(scope_kind, scope_id, scope_generation_u64,
+  window_kind, window_start_unix_ms, window_end_unix_ms_optional)` and reject
+  duplicate or out-of-order rows; other arrays preserve schema-defined semantic
+  order;
+- unknown, duplicate, or case-variant fields are rejected before hashing.
+
+S0 owns strict Rust/Go encoders, decoders, and golden vectors containing the
+record type, version, canonical CBOR hex, and SHA-256 for every record,
+reservation transition, and port request/response. Required mutation vectors
+cover cross-record type confusion, omitted-versus-null ambiguity, reordered
+scopes, non-NFC Unicode, `uint64` overflow, unknown/duplicate fields, float
+injection, and self-digest inclusion. Either language accepting a byte sequence
+the other rejects blocks production.
 
 ### `AdmissionIntentV1`
 
@@ -638,13 +699,13 @@ governance_receipt_digest
 governance_generation_u64
 provider_id_proposal
 model_id_proposal
-catalog_digest
-capability_digest
-pricing_digest
+catalog_digest_proposal
+capability_digest_proposal
+pricing_digest_proposal
 hierarchy_tier_optional
 requested_max_input_tokens_optional_u64
 requested_max_output_tokens_u64
-provider_execution_deadline_unix_ms
+provider_execution_deadline_proposal_unix_ms
 queue_policy_id
 ```
 
@@ -653,11 +714,13 @@ required-scope list, or caller-selected maximum cost. Provider, model, and token
 limits are untrusted proposals. The governance receipt is the authoritative
 #695 binding for tenant, project, work item, agreement, customer, policy
 generation, and applicable budget policy. C0 validates all claimed identities
-against that receipt. `admission_intent_digest` is SHA-256 over every canonical
-field above. Validation rejects unknown version/field, a missing or stale
+against that receipt. `admission_intent_digest` uses the domain-separated S0
+codec above and excludes only its own digest field. Validation rejects unknown
+version/field, a missing or stale
 governance receipt, receipt/identity mismatch, unauthorized caller, unrecognized
-provider/model/catalog/pricing/capability combination, expired deadline, and
-invalid token limits.
+or policy-disallowed provider/model route, stale catalog/pricing/capability
+generation, token ceiling above policy, and deadline above the policy-clamped
+maximum.
 
 ### `BudgetReservationV1`
 
@@ -674,11 +737,14 @@ governance_receipt_digest
 governance_generation_u64
 provider_id
 model_id
+hierarchy_policy_digest
+routing_policy_generation_u64
 catalog_digest
 capability_digest
 pricing_digest
 effective_max_input_tokens_u64
 effective_max_output_tokens_u64
+effective_provider_execution_deadline_unix_ms
 scopes[]:
   scope_kind: TENANT | PROJECT | WORK_ITEM | AGREEMENT | CUSTOMER | PROVIDER
   scope_id
@@ -688,15 +754,7 @@ scopes[]:
   window_end_unix_ms_optional
 reserved_microusd_u64
 estimated_input_microusd_u64
-status:
-  RESERVED | PRE_DISPATCH_RELEASED |
-  DEFINITIVE_NON_BILLABLE_RELEASED | RECONCILED | QUARANTINED
-status_operation_id
-status_payload_digest
-predecessor_status_operation_id_optional
 expires_at_unix_ms
-reconciled_usage_operation_id_optional
-quarantine_reason_optional
 ```
 
 C0 derives every mandatory scope from the authoritative governance receipt and
@@ -708,12 +766,58 @@ submit a scope list or maximum-cost override. Reserve and compare are one atomic
 store operation across all applicable scopes.
 
 The immutable `reservation_digest` binds the intent, governance receipt,
-validated execution selection, effective token ceilings, complete derived
-scope/window set, and reserved amount. Status changes are separate CAS
-operations: each has a stable `status_operation_id`, canonical
-`status_payload_digest`, and expected predecessor. Repeating the same operation
-and payload is idempotent; the same operation ID with a different payload,
-wrong predecessor, or illegal state edge is rejected.
+independently validated hierarchy/routing policy and generations, execution
+selection, effective token/deadline ceilings, complete derived scope/window set,
+reserved amount, and expiry. It contains no mutable status, reconciliation, or
+quarantine field.
+
+### `BudgetReservationTransitionV1`
+
+```text
+version
+transition_operation_id
+transition_payload_digest
+reservation_id
+reservation_digest
+expected_predecessor_operation_id
+expected_predecessor_state: RESERVED
+from_state: RESERVED
+to_state:
+  PRE_DISPATCH_RELEASED | DEFINITIVE_NON_BILLABLE_RELEASED |
+  RECONCILED | QUARANTINED
+transition_reason:
+  QUEUE_FULL_BEFORE_DISPATCH | CLIENT_CANCEL_BEFORE_DISPATCH |
+  DEADLINE_BEFORE_DISPATCH | PROVIDER_DEFINITIVE_NON_BILLABLE |
+  PROVIDER_USAGE_RECONCILED | CLIENT_CANCEL_AFTER_DISPATCH |
+  DEADLINE_AFTER_DISPATCH | TRANSPORT_LOST |
+  INVALID_PROVIDER_RESPONSE | GATEWAY_LOST_AFTER_DISPATCH_COMMIT |
+  EXPIRED_WITH_UNKNOWN_OUTCOME
+authority_evidence_digest_optional
+occurred_at_unix_ms
+```
+
+The creation record is immutable and represents initial `RESERVED`; its
+`reservation_id` is the predecessor identity for the first transition. Every
+later status is an immutable append-only transition. C0 appends the transition
+and updates the reservation aggregate/projection in the same EventStore SQLite
+transaction; no event row is updated or deleted. Repeating the same operation
+and payload is idempotent. Reusing its ID with a different payload, naming a
+wrong predecessor, or taking an illegal edge is rejected. The optional evidence
+is a fixed 32-byte digest of bounded diagnostics or authority proof and cannot
+change the typed decision.
+
+Reservation state/reason is a closed legal matrix:
+
+| From | To | Allowed transition reason |
+|---|---|---|
+| `RESERVED` | `PRE_DISPATCH_RELEASED` | `QUEUE_FULL_BEFORE_DISPATCH`, `CLIENT_CANCEL_BEFORE_DISPATCH`, `DEADLINE_BEFORE_DISPATCH` |
+| `RESERVED` | `DEFINITIVE_NON_BILLABLE_RELEASED` | `PROVIDER_DEFINITIVE_NON_BILLABLE` |
+| `RESERVED` | `RECONCILED` | `PROVIDER_USAGE_RECONCILED` |
+| `RESERVED` | `QUARANTINED` | `CLIENT_CANCEL_AFTER_DISPATCH`, `DEADLINE_AFTER_DISPATCH`, `TRANSPORT_LOST`, `INVALID_PROVIDER_RESPONSE`, `GATEWAY_LOST_AFTER_DISPATCH_COMMIT`, `EXPIRED_WITH_UNKNOWN_OUTCOME` |
+
+All four destination states are terminal for automatic processing. Any other
+state/reason combination requires a separately approved operator-recovery
+contract and is rejected by V1.
 
 ### `BudgetExemptionV1`
 
@@ -750,9 +854,13 @@ request_id
 request_digest
 provider_id
 model_id
+hierarchy_policy_digest
+routing_policy_generation_u64
 catalog_digest
 capability_digest
 pricing_digest
+effective_max_input_tokens_u64
+effective_max_output_tokens_u64
 provider_execution_deadline_unix_ms
 queue_policy_id
 budget_reservation_id_optional
@@ -769,7 +877,11 @@ final admission digest. This ordering is constructible and acyclic:
 `AdmissionIntentV1 -> BudgetReservationV1 or BudgetExemptionV1 ->
 InferenceAdmissionV1`. Rebinding an intent, reservation, or exemption to a
 different admission is rejected. A billable admission without a reservation
-fails closed.
+fails closed. C0 finalization independently resolves the exact #395 hierarchy/
+policy route, checks provider/model allowlisting and every catalog, capability,
+pricing, and routing generation, applies policy token ceilings, and clamps the
+deadline to the caller, Gateway proposal, and policy maximum. The resulting
+fields are authoritative; the intent proposals are not.
 
 ### `AdmissionDispositionV1`
 
@@ -783,7 +895,10 @@ expected_predecessor_state: FINAL_ADMITTED
 disposition:
   PRE_DISPATCH_REJECTED | PRE_DISPATCH_CANCELLED |
   PRE_DISPATCH_DEADLINE_EXCEEDED
-reason
+disposition_reason:
+  QUEUE_FULL | AUTHORITY_DENIED | CLIENT_CANCELLED |
+  EXECUTION_DEADLINE_EXPIRED
+diagnostic_digest_optional
 budget_reservation_id_optional
 budget_reservation_digest_optional
 budget_exemption_id_optional
@@ -794,33 +909,88 @@ occurred_at_unix_ms
 This terminal operation covers the race after final admission but before
 provider dispatch. It competes by CAS with `ProviderDispatchReceiptV1` for the
 same `FINAL_ADMITTED` predecessor, so release and dispatch cannot both win. A
-reservation-backed disposition atomically applies
-`PRE_DISPATCH_RELEASED`; an exempt disposition records no budget mutation.
+reservation-backed disposition is coupled to a
+`BudgetReservationTransitionV1` to `PRE_DISPATCH_RELEASED`; an exempt
+disposition records no budget mutation. `disposition_reason` is a closed enum.
+The optional diagnostic is a fixed 32-byte digest of bounded non-authoritative
+details, never free text.
 
-### `BudgetAuthorityPortV1`
+### `InferenceAuthorityPortV1`
 
 ```text
 version
-method: RESERVE_OR_EXEMPT
+authority_request_digest
+method:
+  RESERVE_OR_EXEMPT | FINALIZE_ADMISSION |
+  WIN_PRE_DISPATCH_DISPOSITION | BEGIN_DISPATCH |
+  COMMIT_ATTEMPT_OUTCOME | RECONCILE_USAGE
 caller_service_identity
 authenticated_principal_digest
 idempotency_key
-admission_intent
-admission_intent_digest
+record_type
+record_id
+record_payload_digest
+expected_predecessor_operation_id_optional
+expected_predecessor_state_optional
+typed_payload
 ```
 
-The Go Gateway calls a versioned port backed by #695's Rust/EventStore authority
-before dispatching any billable external or internal request. The reserve call
-carries the canonical `AdmissionIntentV1`, authenticated caller/service identity,
-and a caller-generated idempotency key. C0 authorizes the service identity,
-validates the governance receipt, derives all scopes and the conservative maximum
-cost, and returns a bound `BudgetReservationV1`, a typed deny, or an authorized
-`BudgetExemptionV1`. The idempotency identity binds service, port method, key,
-and intent digest; replay with the same digest returns the same result, while the
-same key with a different digest is a typed conflict. Port timeout/unavailability
-rejects billable admission. Gateway memory may cache neither balance nor
-authorization. This solves external compatibility routes without moving durable
-authority into Go or trusting Go proposals as budget policy.
+The Go Gateway uses one authenticated, versioned C0 mutation port backed by
+#695's Rust/EventStore authority. Every request binds service identity, method,
+idempotency key, record type/ID, canonical payload digest, and any required
+predecessor. `authority_request_digest` uses the S0 codec over the complete
+envelope except itself, so caller, method, key, record/payload digest, and
+predecessor cannot be rebound independently. Unknown port or record versions and
+unknown methods are rejected. The idempotency lookup key is
+`(service, method, key, record_type, record_id)`. Same key plus the same
+authority-request digest returns the original typed result; a different digest
+returns `IDEMPOTENCY_CONFLICT`; stale predecessor returns `STALE_PREDECESSOR`.
+
+Typed responses are:
+
+```text
+version
+result:
+  COMMITTED | REPLAYED_READBACK | DENIED | IDEMPOTENCY_CONFLICT |
+  STALE_PREDECESSOR | ILLEGAL_TRANSITION | UNKNOWN_VERSION |
+  UNKNOWN_METHOD | UNAUTHORIZED | UNAVAILABLE
+committed_operation_id_optional
+committed_payload_digest_optional
+aggregate_state_optional
+provider_io_authorized: bool
+```
+
+Only a fresh `COMMITTED` response to `BEGIN_DISPATCH` may set
+`provider_io_authorized=true`. `REPLAYED_READBACK` is evidence of durable state
+but never authorizes another provider call.
+
+| Port method | Input record | C0 durable result |
+|---|---|---|
+| `RESERVE_OR_EXEMPT` | `AdmissionIntentV1` | Validate caller, governance, route proposals, generations, token/deadline bounds; append `BudgetReservationV1` or `BudgetExemptionV1`, or deny |
+| `FINALIZE_ADMISSION` | intent plus reservation/exemption identities and finalization request | Independently resolve and validate route/policy; append authoritative `InferenceAdmissionV1` |
+| `WIN_PRE_DISPATCH_DISPOSITION` | `AdmissionDispositionV1` | Win CAS against `FINAL_ADMITTED`; append disposition and, when reserved, release transition in one transaction |
+| `BEGIN_DISPATCH` | `ProviderDispatchReceiptV1` | Win CAS against `FINAL_ADMITTED`; append dispatch receipt and aggregate update in one transaction |
+| `COMMIT_ATTEMPT_OUTCOME` | `ProviderAttemptOutcomeV1` | Win CAS against `DISPATCHED`; append terminal outcome plus required release/quarantine transition and aggregate update in one transaction |
+| `RECONCILE_USAGE` | `UsageOutcomeV1` | Validate `COMPLETED`; append usage plus reservation reconciliation transition and aggregate/outbox rows in one transaction, or validate exemption |
+
+The exact network order is:
+
+1. G1 wins its bounded edge queue and sends `RESERVE_OR_EXEMPT`.
+2. After its commit ACK, G1 sends `FINALIZE_ADMISSION` and waits for commit ACK.
+3. Before provider I/O, G1 sends exactly one of
+   `WIN_PRE_DISPATCH_DISPOSITION` or `BEGIN_DISPATCH`.
+4. G1 may open the provider connection or write provider bytes only after a
+   fresh `BEGIN_DISPATCH` `COMMITTED` ACK with
+   `provider_io_authorized=true`. Provider I/O before that ACK is forbidden.
+5. A provider response is followed by `COMMIT_ATTEMPT_OUTCOME`; only a committed
+   `COMPLETED` outcome may be followed by `RECONCILE_USAGE`.
+
+If `BEGIN_DISPATCH` commits but its ACK is lost, a replay can read back the
+commit but cannot authorize I/O. If the Gateway crashes after durable dispatch
+and before or during the provider call, recovery cannot distinguish those
+boundaries: C0 records `AMBIGUOUS` plus `QUARANTINED`, and no component
+automatically retries. Port timeout/unavailability otherwise fails closed.
+Gateway memory may cache neither balance nor authorization.
 
 ### `ProviderDispatchReceiptV1`
 
@@ -878,9 +1048,12 @@ budget_exemption_digest_optional
 terminal_state:
   DEFINITIVE_REJECT | COMPLETED | AMBIGUOUS
 terminal_reason:
-  PROVIDER_REJECT | PROVIDER_SUCCESS | CLIENT_CANCEL_AFTER_DISPATCH |
-  DEADLINE_AFTER_DISPATCH | TRANSPORT_LOST | INVALID_RESPONSE
+  PROVIDER_DEFINITIVE_NON_BILLABLE_REJECT | PROVIDER_SUCCESS |
+  CLIENT_CANCEL_AFTER_DISPATCH | DEADLINE_AFTER_DISPATCH |
+  TRANSPORT_LOST | INVALID_RESPONSE |
+  GATEWAY_LOST_AFTER_DISPATCH_COMMIT
 provider_request_id_optional
+authority_evidence_digest_optional
 occurred_at_unix_ms
 ```
 
@@ -892,6 +1065,17 @@ the referenced dispatch operation and `DISPATCHED` predecessor. Duplicate
 operation plus identical payload is idempotent; different payload, stale
 predecessor, a second terminal outcome, or an outcome before dispatch is
 rejected.
+
+Terminal state/reason is a closed legal matrix:
+
+| Terminal state | Allowed reason |
+|---|---|
+| `DEFINITIVE_REJECT` | `PROVIDER_DEFINITIVE_NON_BILLABLE_REJECT` |
+| `COMPLETED` | `PROVIDER_SUCCESS` |
+| `AMBIGUOUS` | `CLIENT_CANCEL_AFTER_DISPATCH`, `DEADLINE_AFTER_DISPATCH`, `TRANSPORT_LOST`, `INVALID_RESPONSE`, or `GATEWAY_LOST_AFTER_DISPATCH_COMMIT` |
+
+Every other state/reason pair is invalid. The optional authority evidence is a
+fixed 32-byte digest, not free text.
 
 No component may convert `AMBIGUOUS` to a retry-safe state. A fallback attempt
 is allowed only before a dispatch receipt exists or after a provider-specific
@@ -973,17 +1157,17 @@ a capability.
 
 | From | Event/guard | To | Durable action | Retry/fallback |
 |---|---|---|---|---|
-| `RECEIVED` | intent/schema/catalog/capability/governance valid | `INTENT_VALIDATED` | append `AdmissionIntentV1` | none |
+| `RECEIVED` | intent/schema/catalog/capability/governance valid | `INTENT_VALIDATED` | `RESERVE_OR_EXEMPT` validates `AdmissionIntentV1` | none |
 | `INTENT_VALIDATED` | authoritative non-billable exemption succeeds | `EXEMPT_AUTHORIZED` | append `BudgetExemptionV1` | no reservation needed |
-| `INTENT_VALIDATED` | billable atomic reserve succeeds | `RESERVED` | append `BudgetReservationV1` with all derived scope/window generations | none |
+| `INTENT_VALIDATED` | billable atomic reserve succeeds | `RESERVED` | append immutable `BudgetReservationV1` and aggregate initial state | none |
 | `INTENT_VALIDATED` | caller/governance invalid, billable deny, or port unavailable | `REJECTED` | typed deny; no final admission/provider call | no |
-| `EXEMPT_AUTHORIZED` or `RESERVED` | final binding validates | `FINAL_ADMITTED` | append `InferenceAdmissionV1` bound to exactly one authority record | none |
-| `FINAL_ADMITTED` | queue full, deadline, or cancel before dispatch wins CAS | `PRE_DISPATCH_REJECTED` | append `AdmissionDispositionV1`; release reservation by CAS when present | a new intent may retry |
-| `FINAL_ADMITTED` | provider dispatch starts | `DISPATCHED` | append `ProviderDispatchReceiptV1` by CAS | no automatic retry |
-| `DISPATCHED` | proven non-billable provider reject | `DEFINITIVE_REJECT` | append terminal outcome; release reservation by CAS | policy may create a new intent |
-| `DISPATCHED` | terminal provider result | `COMPLETED` | append one terminal outcome by CAS | no |
-| `DISPATCHED` | timeout, disconnect, lost/invalid terminal state | `AMBIGUOUS` | append terminal outcome; quarantine reservation by CAS | never automatic |
-| `COMPLETED` | durable usage validates | `USAGE_RECONCILED` | append `UsageOutcomeV1`; reconcile reservation by CAS or validate exemption | no |
+| `EXEMPT_AUTHORIZED` or `RESERVED` | C0 route/policy finalization validates | `FINAL_ADMITTED` | `FINALIZE_ADMISSION` appends authoritative `InferenceAdmissionV1` | none |
+| `FINAL_ADMITTED` | queue full, deadline, or cancel wins CAS | `PRE_DISPATCH_REJECTED` | `WIN_PRE_DISPATCH_DISPOSITION` appends disposition plus release transition atomically when reserved | a new intent may retry |
+| `FINAL_ADMITTED` | `BEGIN_DISPATCH` wins CAS and commit ACK reaches live handler | `DISPATCHED` | append dispatch receipt and aggregate; only fresh commit ACK authorizes provider I/O | no automatic retry |
+| `DISPATCHED` | proven non-billable provider reject | `DEFINITIVE_REJECT` | `COMMIT_ATTEMPT_OUTCOME` appends outcome plus release transition atomically | policy may create a new intent |
+| `DISPATCHED` | terminal provider success | `COMPLETED` | `COMMIT_ATTEMPT_OUTCOME` appends one terminal outcome by CAS | no |
+| `DISPATCHED` | timeout, disconnect, crash, lost/invalid terminal state | `AMBIGUOUS` | `COMMIT_ATTEMPT_OUTCOME` appends outcome plus quarantine transition atomically | never automatic |
+| `COMPLETED` | durable usage validates | `USAGE_RECONCILED` | `RECONCILE_USAGE` appends usage plus reconcile transition and outbox atomically, or validates exemption | no |
 | `USAGE_RECONCILED` | action claim succeeds | `EFFECT_RECOVERED` | one durable action/effect claim | no |
 
 `AMBIGUOUS` has no transition to usage or effect without explicit authoritative
@@ -1001,7 +1185,7 @@ Persistence identity is one-to-one with the state machine:
 | `BudgetExemptionV1` create | `exemption_id` | `exemption_digest`; validated intent and authorized caller |
 | `InferenceAdmissionV1` finalize | `admission_id` | `admission_digest`; exactly one prior reservation or exemption |
 | `AdmissionDispositionV1` | `disposition_operation_id` | `disposition_payload_digest`; `FINAL_ADMITTED`, mutually exclusive with dispatch |
-| `BudgetReservationV1` status | `status_operation_id` | `status_payload_digest`; CAS from named predecessor status operation |
+| `BudgetReservationTransitionV1` | `transition_operation_id` | `transition_payload_digest`; CAS from named predecessor operation/state |
 | `ProviderDispatchReceiptV1` | `dispatch_operation_id` | `dispatch_payload_digest`; `FINAL_ADMITTED` |
 | `ProviderAttemptOutcomeV1` | `outcome_operation_id` | `outcome_payload_digest`; matching dispatch in `DISPATCHED` |
 | `UsageOutcomeV1` | `usage_operation_id` | `usage_payload_digest`; matching `COMPLETED` outcome |
@@ -1011,11 +1195,57 @@ result. Reusing an identity with a different digest is a typed conflict. A stale
 predecessor, skipped phase, or second terminal transition is rejected without a
 provider call, budget mutation, usage append, or effect recovery.
 
+### C0 transaction and recovery boundary
+
+C0 is the sole mutation owner. It extends the canonical `sentinel-limbo`
+append-only SQLite EventStore gateway; S0 owns codec/schema/append validation,
+not transactions or business decisions. Each port method executes one fenced
+SQLite transaction containing all of its applicable control records,
+reservation aggregate update, attempt/admission aggregate update, canonical
+domain event, and pending outbox row. Commit is the port ACK point. There is no
+cross-database or cross-store atomicity claim.
+
+The coupled writes are:
+
+| Method | One C0 SQLite/EventStore transaction |
+|---|---|
+| `RESERVE_OR_EXEMPT` | immutable reservation or exemption, initial aggregate state, canonical event, pending outbox |
+| `FINALIZE_ADMISSION` | final admission, admission aggregate CAS, canonical event, pending outbox |
+| `WIN_PRE_DISPATCH_DISPOSITION` | disposition, reservation release transition when present, admission and reservation aggregate CAS, canonical event, pending outbox |
+| `BEGIN_DISPATCH` | dispatch receipt, attempt/admission aggregate CAS, canonical event, pending outbox |
+| `COMMIT_ATTEMPT_OUTCOME` | terminal outcome, release or quarantine transition when required, attempt and reservation aggregate CAS, canonical event, pending outbox |
+| `RECONCILE_USAGE` | usage, reconciliation transition when billable, usage/reservation aggregate CAS, canonical event, pending outbox |
+
+Append-only events and transitions are never updated. The authoritative
+aggregate rows are transactionally advanced projections of that history.
+External projections and transport publication occur after commit. Their
+consumers use operation ID plus payload digest, so replay is safe; they cannot
+authorize provider I/O or change the C0 aggregate.
+
+Required failpoints and recovery are:
+
+| Failpoint | Durable observation after restart | Recovery |
+|---|---|---|
+| Before transaction begin | no new record or aggregate state | caller may submit the same operation |
+| After one append but before aggregate/outbox insert | transaction rolls back completely | same operation may retry |
+| After aggregate update but before commit | transaction rolls back completely | same operation may retry |
+| After commit but before port ACK | complete records, aggregate, event, and pending outbox exist | same request returns `REPLAYED_READBACK`; `BEGIN_DISPATCH` readback does not authorize provider I/O |
+| After dispatch commit ACK and before/during provider I/O | durable `DISPATCHED`, provider execution unknown | append `AMBIGUOUS` plus quarantine in one outcome transaction; never auto-retry |
+| After provider response but before outcome commit | durable `DISPATCHED`, response not authoritative | recover as `AMBIGUOUS`; never infer success or retry |
+| After outcome commit but before usage reconciliation | durable terminal outcome | retry `RECONCILE_USAGE` only for `COMPLETED` with the same IDs/digests |
+| After commit but before outbox publication | pending outbox row exists | publisher retries; consumer deduplicates |
+| After outbox publication but before published marker | duplicate transport delivery possible | consumer absorbs same operation/digest; conflicting digest rejects |
+| Before or after external projection apply | canonical EventStore state remains authoritative | projection resumes from its durable offset |
+
+Failpoint tests must cover every row. No recovery path reconstructs an authority
+decision from Gateway memory or an external projection.
+
 ## Negative and failure matrix
 
 | Schedule/failure | Required outcome | Forbidden outcome |
 |---|---|---|
 | Queue at capacity | Typed 429/overload with bounded metadata | Append unbounded waiter or silent drop |
+| Required C0 mutation port method missing/unknown | Readiness and request fail closed with `UNKNOWN_METHOD` | Fall back to direct store write or provider call |
 | Waiter context cancels before grant | Remove waiter and never call provider | Consume a permit or dispatch later |
 | Grant races cancellation | Exactly one grant/release outcome | Permit leak or duplicate dispatch |
 | Streaming wrapper around streaming provider | Capability preserved and permit held until terminal | 502 due to wrapper type loss |
@@ -1026,12 +1256,16 @@ provider call, budget mutation, usage append, or effect recovery.
 | Unauthorized local caller or foreign tenant/project | Reject before reservation/exemption | Trust process locality or caller claims |
 | Missing/additional/stale governance scope generation | Derive and compare all receipt-required scopes; typed reject | Omit agreement/customer scope or spend against stale policy |
 | Provider/model/catalog/pricing/token proposal mismatch | C0 validates selection and computes conservative maximum | Reserve caller-proposed lower amount |
+| Existing but hierarchy/policy-disallowed or expensive route | C0 denies final admission | Trust Gateway proposal because model exists |
+| Gateway deadline exceeds caller/policy maximum | C0 clamps or denies final admission | Persist arbitrary long provider deadline |
 | Port idempotency key replay with different intent digest | Typed conflict | Return the prior reservation for new intent |
 | Non-billable exemption | C0-issued exemption, caller identity, governance generation, and intent digest agree | Caller-defined free route |
 | Intent/reservation/admission digest cycle | Reject vector; reservation binds intent and final admission binds reservation | Require a not-yet-constructible digest |
 | Reservation or exemption rebound to another final admission | Typed conflict | Torn phase or cross-request authority reuse |
 | Final admission has both/neither reservation and exemption | Reject before dispatch | Ambiguous budget authority |
 | Pre-dispatch disposition races dispatch receipt | Exactly one CAS winner; release only when disposition wins | Provider call after release or leaked reservation |
+| Provider I/O before fresh `BEGIN_DISPATCH` commit ACK | Test barrier proves zero provider calls | Send headers/body on request submission or readback |
+| `BEGIN_DISPATCH` commits but ACK times out | Readback cannot authorize I/O; quarantine as ambiguous | Treat replay as permission to call provider |
 | Budget scope generation/window mismatch | Reject reservation operation | Spend against stale scope |
 | Client disconnect before dispatch | No provider call; reservation released | Billable attempt or retry |
 | Client disconnect after dispatch | Cancel upstream, persist terminal/ambiguous outcome, reconcile incurred cost | Full refund or blind retry |
@@ -1040,8 +1274,13 @@ provider call, budget mutation, usage append, or effect recovery.
 | SSE ends without terminal usage | Quarantine conservative reservation | Record zero cost |
 | Duplicate dispatch/outcome/usage operation, same payload | Idempotent original result | Second state change or charge |
 | Duplicate operation ID, different payload | Typed digest conflict | Last-write-wins mutation |
+| Reservation transition mutates creation event | Append immutable transition and atomically advance aggregate | Update/delete prior event row |
+| Coupled record/transition failpoint before commit | Entire C0 transaction rolls back | Partial disposition/release, outcome/quarantine, or usage/reconcile |
+| Crash after commit before outbox/projection publication | Pending outbox and canonical aggregate recover | Cross-store compensation or lost event |
 | Terminal outcome with stale predecessor or before dispatch | CAS reject | Out-of-order terminal append |
 | Second terminal outcome | CAS reject after first terminal state | Rewrite `COMPLETED` as `AMBIGUOUS` or vice versa |
+| Invalid terminal state/reason pair | Closed matrix rejects record | `COMPLETED` with timeout/reject reason |
+| Free-text authority reason or oversized diagnostic | Reject schema; accept only enum plus 32-byte digest | Persist unbounded text in authority decision |
 | Exempt usage with reservation or wrong exemption | Reject usage | Bill or launder authority across routes |
 | Billable usage without reservation | Reject usage and quarantine attempt | Append unbound cost/effect |
 | Gateway restart after dispatch | Rust bridge remains fail closed on `provider_in_flight` | Repeat provider call |
@@ -1050,6 +1289,10 @@ provider call, budget mutation, usage append, or effect recovery.
 | Budget store unavailable | Reject cost-bearing request | In-memory fail-open |
 | Concurrent near-limit requests | Atomic reservations keep total within ceiling | All requests pass stale balance |
 | Fractional/NaN/overflow cost | Canonical checked micro-USD integer rejects input | Float coercion or wraparound |
+| Cross-record digest type/version confusion | Domain-separated digest mismatch | Accept identical payload bytes under another record type/version |
+| Omitted optional versus CBOR null | Omitted form only; null rejects | Hash both as equivalent |
+| Reordered/duplicate scopes | Reject non-canonical array | Compute a language-dependent digest |
+| Non-NFC Unicode, uint64 overflow, unknown/duplicate field, or float | Both codecs reject identically | Normalize silently, wrap, ignore, or coerce |
 | Outbox publish then crash | Duplicate delivery absorbed by stable operation ID | Duplicate usage/effect |
 | Engine cache eviction/restart | Recompute prompt/KV only | Change durable request/effect identity |
 | Provider/model removed | Token-free readiness or catalog validation fails | Send to uncataloged model |
@@ -1082,8 +1325,8 @@ deltas; only G1 is genuinely uncovered Go implementation work.
 
 ```text
 #732 schema/append delta S0
-  +-> #695 cost/attempt delta C0
-  +-> proposed G1 Go Gateway implementation
+  +-> #695 final-admission/cost/attempt delta C0
+  +-> proposed G1 Go Gateway edge/proposal implementation
 
 #733 consumes S0 events and owns outbox/consumer outcomes.
 #764 supplies pressure policy to G1.
@@ -1093,10 +1336,11 @@ C0 and G1 implementation may proceed in parallel after S0.
 Billable G1 activation depends on the authoritative C0 port being live.
 ```
 
-This graph is acyclic. S0 is schema authority, C0 is durable budget/attempt
-authority, and G1 is edge implementation. G1 may be built against fake S0/C0
-ports in parallel, but its billable producer flag cannot activate before C0.
-Cross-language behavior is bound by versioned vectors, not shared implementation.
+This graph is acyclic. S0 is codec/schema authority, C0 is final-admission and
+durable budget/attempt/transaction authority, and G1 is edge queue plus
+route/deadline proposer. G1 may be built against fake S0/C0 ports in parallel,
+but its billable producer flag cannot activate before C0. Cross-language
+behavior is bound by versioned vectors, not shared implementation.
 
 ### Existing-owner delta S0: #732 schemas, validators, and append
 
@@ -1106,41 +1350,51 @@ bridge orchestration, outbox, or projection implementation.
 **Dependencies:** #732 canonical envelope/append authority; #705 only if a new
 dependency is proposed. S0 blocks C0/G1 production of V1 records.
 **Deliverables:** versioned `AdmissionIntentV1`, `BudgetReservationV1`,
-`BudgetExemptionV1`, `InferenceAdmissionV1`, `AdmissionDispositionV1`,
-`ProviderDispatchReceiptV1`, `ProviderAttemptOutcomeV1`, `UsageOutcomeV1`, and
-`ProviderCapabilitiesV1`; canonical JSON vectors and invalid fixtures; unknown
-version/field policy; schema digest.
+`BudgetReservationTransitionV1`, `BudgetExemptionV1`,
+`InferenceAdmissionV1`, `AdmissionDispositionV1`,
+`InferenceAuthorityPortV1`, `ProviderDispatchReceiptV1`,
+`ProviderAttemptOutcomeV1`, `UsageOutcomeV1`, and `ProviderCapabilitiesV1`;
+strict deterministic-CBOR Rust/Go codecs, canonical-byte/digest golden vectors,
+invalid fixtures, unknown-version/field policy, and schema digest.
 
 **Acceptance:**
 
-1. Rust and Go accept every valid vector and reject every invalid vector with a
+1. Rust and Go produce byte-identical deterministic CBOR and SHA-256 for every
+   record/transition/port golden vector and reject every invalid vector with a
    typed reason.
 2. The phase order is acyclic: intent has no reservation, reservation or
    exemption binds intent, and final admission binds exactly one authority
    record.
-3. Request, governance receipt, catalog, pricing, provider, model, admission,
-   stable attempt, reservation/exemption, transition, and usage identities are
-   bound and validated.
+3. Request, governance receipt, hierarchy/routing policy, catalog, pricing,
+   provider, model, admission, stable attempt, reservation/exemption,
+   transition, port, and usage identities are bound and validated.
 4. Every V1 record requires `version`; every time is typed as Unix milliseconds.
 5. Pre-dispatch disposition, dispatch, and terminal outcome are separate durable
    operations with canonical payload digests, stable idempotency identities, and
    legal-predecessor CAS; disposition and dispatch compete for the same final-
    admission predecessor.
-6. `AMBIGUOUS` cannot be transformed to a retry-safe state.
-7. Capability digest includes stream usage and definitive-rejection semantics.
-8. CI path routing runs both language validators for schema/vector changes.
+6. Reservation creation is immutable; every status change is an append-only
+   `BudgetReservationTransitionV1` with a closed legal edge.
+7. Authority reasons are closed enums plus optional fixed 32-byte evidence/
+   diagnostic digests; terminal state/reason uses the closed legal matrix.
+8. `AMBIGUOUS` cannot be transformed to a retry-safe state.
+9. Capability digest includes stream usage and definitive-rejection semantics.
+10. CI path routing runs both language validators for schema/vector changes.
 
 **Negative tests:** unknown/missing version, enum, or field; untyped/non-Unix-ms
 time; missing digest; cyclic intent/reservation/admission vector; torn phase;
 reservation or exemption rebound to another request/admission; both/neither
 reservation and exemption; admission, stable attempt, transition payload,
-governance, pricing, catalog, or capability digest mismatch; duplicate operation
+governance, routing policy, pricing, catalog, or capability digest mismatch;
+cross-record/type/version confusion; omitted versus null; reordered or duplicate
+scopes; non-NFC Unicode; unknown/duplicate/case-variant field; integer overflow,
+negative/bignum/tag/float/NaN value; self-digest inclusion; duplicate operation
 with same payload and with different payload; stale predecessor; outcome before
 dispatch; disposition/dispatch race; second/out-of-order terminal outcome;
 exempt usage with a reservation or wrong exemption; billable usage without
-reservation; negative/overflow
-integer cost; invented wrapper capability; ambiguous marked non-billable;
-float/NaN cost representation.
+reservation; mutable reservation event; illegal reservation edge; invalid
+terminal state/reason; free-text authority reason; invented wrapper capability;
+ambiguous marked non-billable.
 
 **Runtime target block:** `NONE`; deploy, read-only, and benchmark targets none;
 `.155`, `.240`, `.241`, `.242`, providers, and Proxmox are forbidden. Local
@@ -1161,12 +1415,13 @@ TOGAF file.
 **Parent/dependencies:** new child under #650; research #714; S0 schema port;
 #764 pressure policy; #769 deterministic Go schedules. Implementation may run in
 parallel with C0, but billable activation depends on C0's live authoritative
-reservation port.
+inference-authority port.
 **Deliverables:** finite queue capacity and class limits; typed overload and
 retry-after metadata; cancellation-safe grant; exact optional-interface wrapper
 matrix; stream terminal parser/outcome; untrusted `AdmissionIntentV1` proposal
-and authenticated, digest/idempotency-bound C0 port client; final admission only
-from a C0 reservation or exemption.
+and authenticated, digest/idempotency/predecessor-bound
+`InferenceAuthorityPortV1` client for all six methods; final admission and
+provider-I/O authorization only from C0 commit ACKs.
 
 **Acceptance:**
 
@@ -1182,11 +1437,19 @@ from a C0 reservation or exemption.
 7. Readiness remains token-free.
 8. Every billable route obtains a bound C0 reservation before dispatch or fails
    closed. Only digest-bound local-loop/fake-provider exemptions bypass it.
-9. Go supplies no authoritative scope list or maximum cost; it propagates the
-   #695 governance receipt and treats every provider/model/token field as a
-   proposal that C0 must validate.
+9. Go supplies no authoritative scope list, maximum cost, route, token ceiling,
+   or deadline. It propagates the #695 governance receipt and treats provider,
+   model, catalog/capability/pricing generations, token limits, and deadline as
+   proposals that C0 independently resolves, validates, and clamps.
 10. The port authenticates the Gateway service identity and never treats local
     process access as authorization.
+11. G1 calls reserve/exempt, finalize, and exactly one disposition-or-dispatch
+    mutation in order. It performs zero provider I/O until a fresh
+    `BEGIN_DISPATCH` commit ACK authorizes it; replay readback never authorizes
+    I/O.
+12. Provider response is followed by outcome commit and, for `COMPLETED`, usage
+    reconciliation. Crash/timeout after dispatch commit is ambiguous,
+    quarantined, and never auto-retried.
 
 **Negative tests:** full ingress and full waiter cap; cancel-before-grant;
 grant/cancel race; timeout while waiting; all optional-interface combinations;
@@ -1196,7 +1459,10 @@ non-billable contract; queue-config overflow; C0 deny/timeout/unavailable;
 unrecognized exemption; caller attempts to submit scopes or maximum cost;
 missing/stale/foreign governance receipt; unauthorized local caller; port
 idempotency key replay with a different intent digest; reservation/exemption
-rebound during finalization; readiness attempts provider generation. Use Go
+rebound during finalization; missing/unknown port method/version; stale
+predecessor; provider call barrier before dispatch commit ACK; replay readback
+attempts provider call; timeout/crash after dispatch commit; disallowed/expensive
+route or overlong deadline proposal; readiness attempts provider generation. Use Go
 `testing/synctest`, race detector, and deterministic barriers under #769; no
 sleeps as proof.
 
@@ -1204,7 +1470,7 @@ sleeps as proof.
 read-only target `.240`; forbidden `.155`, `.241`, and `.242`; no real provider call.
 Create an issue-specific `.240` snapshot before deployment. Use token-free
 `local-loop` and fake HTTP providers for queue, stream, status, cancellation,
-reservation-port, and restart probes.
+all authority-port methods, durable-before-I/O ordering, and restart probes.
 
 **Benchmark contract:** on `.240`, report issue-specific p50/p95/max for queue
 wait, Gateway handler completion, and cancel propagation; maximum queue/waiter
@@ -1227,8 +1493,8 @@ quarantined attempts during rollback.
 token-free queue/cancel/stream/status/restart outputs; p50/p95/max and resource/
 cardinality data; zero provider calls in reject paths; S0/C0 readback.
 **TOGAF target delta:** once approved, immediately add bounded admission,
-provider-execution deadline, status/retry-after, and stream-terminal targets to
-both language copies.
+deterministic route/deadline proposal, status/retry-after, and stream-terminal
+targets to both language copies; C0 remains final admission authority.
 
 ### Existing-owner delta C0: #695 durable budget and attempt reconciliation
 
@@ -1240,39 +1506,52 @@ finishes before the delta can land, create an explicit successor linked after
 #695 rather than a parallel child. S0 precedes V1 production; #733 remains the
 outbox/consumer authority. C0 and G1 implementation may run in parallel after
 S0, but C0 blocks billable G1 activation.
-**Deliverables:** authenticated and replay-bound `BudgetAuthorityPortV1`;
-governance-derived atomic budget reservation; stable attempt binding plus
-separate dispatch/terminal transition persistence; idempotent terminal usage
-reconciliation; cancellation and restart recovery; typed bridge response
-handling.
+**Deliverables:** authenticated, versioned, replay/predecessor-bound
+`InferenceAuthorityPortV1` with all six methods; governance- and policy-derived
+atomic budget reservation; immutable reservation plus append-only transitions;
+stable attempt binding plus separate disposition/dispatch/terminal persistence;
+one fenced SQLite/EventStore transaction gateway for every coupled mutation;
+idempotent terminal usage reconciliation; failpoints, cancellation/restart
+recovery, and typed bridge responses.
 
 **Acceptance:**
 
 1. Concurrent reservations cannot exceed an accepted budget scope.
-2. C0 authenticates and authorizes the caller/service identity; idempotency binds
-   service, method, key, and intent digest.
+2. C0 authenticates and authorizes caller/service identity. Idempotency binds
+   service, method, key, record type/ID, payload digest, and expected
+   predecessor; unknown method/version and replay rebinding reject.
 3. C0 validates the versioned governance receipt and derives every mandatory
    tenant/project/work-item/agreement/customer/provider scope and generation.
 4. C0 computes the conservative integer micro-USD maximum from validated
    provider/model, catalog/pricing digests, and effective policy token ceilings;
    no caller amount or scope list is authoritative.
-5. Reservation is durable before final admission/provider dispatch and binds the
+5. C0 independently validates the exact hierarchy/policy route, allowed
+   provider/model and catalog/capability/pricing generations, effective token
+   ceilings, and policy-clamped deadline. Gateway values are proposals only.
+6. Reservation is durable before final admission/provider dispatch and binds the
    intent without a cyclic final-admission dependency.
-6. Every scope kind, generation, and time window is part of one atomic integer
+7. Every scope kind, generation, and time window is part of one atomic integer
    micro-USD comparison/reservation.
-7. Pre-dispatch disposition, dispatch receipt, and terminal outcome use separate
+8. Reservation creation is immutable; status history consists only of legal
+   append-only `BudgetReservationTransitionV1` records.
+9. Pre-dispatch disposition, dispatch receipt, and terminal outcome use separate
    stable operation IDs, canonical payload digests, and legal-predecessor CAS;
    disposition and dispatch cannot both win.
-8. Definitive completion reconciles exactly once to provider-reported or catalog
+10. Every coupled record, transition, authoritative aggregate update, event, and
+    outbox insert commits in one fenced C0 SQLite/EventStore transaction. S0 and
+    external projections are not transaction owners.
+11. Only a fresh durable `BEGIN_DISPATCH` commit ACK authorizes provider I/O.
+    Commit readback, timeout, or recovery never authorizes a second call.
+12. Definitive completion reconciles exactly once to provider-reported or catalog
    cost; exempt local-loop/fake usage binds only its C0 exemption and costs zero.
-9. Pre-dispatch cancellation releases exactly once; post-dispatch cancellation
+13. Pre-dispatch cancellation releases exactly once; post-dispatch cancellation
    retains incurred input or conservative cost.
-10. Ambiguous dispatch remains quarantined across restart and cannot retry,
+14. Ambiguous dispatch remains quarantined across restart and cannot retry,
     reconcile usage, or recover effects without authoritative evidence.
-11. Completion recovery produces exactly one usage event and one action claim.
-12. Outbox redelivery is absorbed by stable operation IDs and same-payload
+15. Completion recovery produces exactly one usage event and one action claim.
+16. Outbox redelivery is absorbed by stable operation IDs and same-payload
     replay; different-payload reuse is rejected.
-13. Port/store/governance authority unavailable fails closed for every billable
+17. Port/store/governance authority unavailable fails closed for every billable
     route.
 
 **Negative tests:** concurrent last-budget race; crash before/after reservation;
@@ -1282,12 +1561,18 @@ foreign tenant/project, mismatched work item/agreement/customer, old governance
 receipt generation; caller-supplied wrong maximum; unauthorized local caller;
 same idempotency key with different intent digest; duplicate same-payload
 disposition/dispatch/outcome/usage; duplicate different-payload operation;
-disposition/dispatch race; stale predecessor; out-of-order or second terminal
-outcome; mismatched request/intent/admission/
+missing/unknown port method/version; disposition/dispatch race; provider call
+before fresh dispatch commit ACK; dispatch commit ACK timeout/readback; stale
+predecessor; out-of-order or second terminal outcome; invalid terminal
+state/reason; mismatched request/intent/admission/
 attempt digest; exempt usage with a reservation or wrong exemption; billable
-usage without reservation; duplicate outbox; projection restart; expired
-ambiguous reservation; float, negative, overflow, or malformed micro-USD;
-provider cost outside catalog sanity bounds; arbitrary exemption reason.
+usage without reservation; mutable reservation row/event; illegal reservation
+edge; failpoints before/after append, aggregate update, commit, outbox publish,
+and external projection apply; duplicate outbox; projection restart; expired
+ambiguous reservation; disallowed/expensive route, stale routing generation, or
+overlong deadline; float, negative, overflow, or malformed micro-USD; provider
+cost outside catalog sanity bounds; free-text authority reason or oversized
+evidence digest.
 
 **Runtime target block:** `SINGLE_NODE`; deploy and benchmark target `.240`;
 read-only target `.240`; forbidden `.155`, `.241`, and `.242`; no real provider call.
@@ -1295,7 +1580,7 @@ Create an issue-specific snapshot, deploy the complete affected daemon/Gateway/
 store/projection set, and use local-loop/fake-provider journeys for concurrent
 reserve, cancel, crash, restart, outbox replay, and projection readback.
 
-**Benchmark contract:** on `.240`, report p50/p95/max reservation-port and
+**Benchmark contract:** on `.240`, report p50/p95/max authority-port and
 reconciliation latency; maximum outstanding reservation/attempt rows, recovery
 batch, RSS, task/thread count, and event/projection cardinality; exact workload,
 sample count, warm-up, and raw normalized output. Prove totals remain equal
@@ -1315,19 +1600,23 @@ refund ambiguous records automatically.
 transitions; store/event/projection readbacks; restart/redelivery histories;
 p50/p95/max plus resources/cardinality; zero duplicate provider/effect/usage.
 **TOGAF target delta:** once approved, immediately add durable integer-unit
-multi-scope reservation, attempt transition, and safe-failover targets to both
-language copies.
+multi-scope reservation, final hierarchy/policy route and deadline admission,
+complete mutation-port ordering, append-only attempt/reservation transitions,
+and safe-failover targets to both language copies.
 
 ### Existing-owner deltas after approval
 
 - **#695:** own C0 governance receipt validation, derived-scope/conservative-cost
-  `BudgetReservationV1`, authenticated `BudgetAuthorityPortV1`, stable attempt
-  binding, transition CAS, and canonical reconciliation as its existing
-  provider/project cost-ceiling implementation; require schema-validated actions
-  and add concurrent reserve, caller authorization, receipt-generation,
-  idempotency-replay, cancellation, restart, and ambiguous-dispatch negative ACs.
-  If timing requires follow-up, create a successor after #695 rather than
-  parallel authority.
+  immutable `BudgetReservationV1`, append-only
+  `BudgetReservationTransitionV1`, complete authenticated
+  `InferenceAuthorityPortV1`, final route/deadline admission, fenced
+  SQLite/EventStore transaction gateway, stable attempt binding, transition CAS,
+  and canonical reconciliation as its existing provider/project cost-ceiling
+  implementation; require schema-validated actions and add concurrent reserve,
+  caller authorization, receipt/routing-generation, all-method port,
+  durable-before-provider-I/O, transaction-failpoint, idempotency-replay,
+  cancellation, restart, and ambiguous-dispatch negative ACs. If timing requires
+  follow-up, create a successor after #695 rather than parallel authority.
 - **#696:** consume exact S0/C0/G1 release evidence and preserve model/catalog/
   request lineage in delivery records.
 - **#705:** decide retain/rewrite/remove for `sentinel-inference`; separately
@@ -1336,8 +1625,9 @@ language copies.
 - **#656:** only after #705 accepts a dependency, own update cadence and
   compatibility matrices.
 - **#732:** own S0 canonical intent/reservation/exemption/final-admission,
-  pre-dispatch disposition, dispatch/terminal/usage schema and append/CAS
-  validation, not provider or budget policy.
+  reservation-transition, pre-dispatch disposition, authority-port,
+  dispatch/terminal/usage schema, deterministic-CBOR codec/golden vectors, and
+  append/CAS validation, not provider or budget policy.
 - **#733:** own durable delivery, retry outcome, and consumer idempotency for new
   events, not provider retry.
 - **#758:** consume bounded queue/attempt/reservation counters and causal IDs;
@@ -1356,8 +1646,9 @@ historical body and status must not be rewritten.
 
 1. After architecture/owner approval, update both TOGAF target-language copies;
    do not wait for implementation evidence.
-2. Land S0 readers, acyclic intent/reserve/finalize vectors, transition-CAS
-   invalid fixtures, append validation, and CI paths.
+2. Land S0 readers, deterministic-CBOR golden vectors, acyclic intent/reserve/
+   finalize vectors, immutable reservation-transition and port-method/CAS invalid
+   fixtures, append validation, and CI paths.
 3. Build C0 and G1 in parallel behind independent producer flags. G1 may exercise
    only non-billable local-loop/fake-provider paths until C0 is live.
 4. Compare old scope derivation, reservation totals, and usage totals with C0 V1
@@ -1365,8 +1656,9 @@ historical body and status must not be rewritten.
    unexplained difference blocks enforcement.
 5. Snapshot `.240`, deploy complete affected sets, and pass C0/G1 live,
    restart, rollback, p50/p95/max, and resource/cardinality contracts.
-6. Enable C0 authoritative governance validation, scope/cost derivation, and
-   reservation after existing pending completions reconcile.
+6. Enable C0 authoritative governance/route/deadline validation, scope/cost
+   derivation, full mutation port, and fenced transaction gateway after existing
+   pending completions reconcile.
 7. Enable G1 billable admission only after successful C0 port/readback.
 8. Enable streaming terminal accounting only after wrapper composition and
    disconnect schedules pass; #696 consumes the complete release evidence.
@@ -1473,14 +1765,30 @@ Negative structure fixtures must reject:
 - an intent/reservation/final-admission digest cycle, rebound authority record,
   or torn phase;
 - a Gateway-supplied authoritative scope set or maximum cost;
+- a Gateway-owned final provider/model/deadline decision rather than a C0-
+  validated proposal;
 - missing/stale/foreign governance scope generation, unauthorized caller, or
   idempotency-key replay with a different intent digest;
+- a missing authority-port method, unknown version/method acceptance, or a port
+  request not bound to caller, method, key, record/payload digest, and
+  predecessor;
+- provider I/O before a fresh durable `BEGIN_DISPATCH` commit ACK, or provider
+  I/O authorized by replay readback;
+- mutable reservation status inside `BudgetReservationV1`, event mutation, or
+  an illegal/rebound `BudgetReservationTransitionV1`;
+- a coupled disposition/release, outcome/quarantine, or usage/reconcile claim
+  outside one C0 SQLite/EventStore transaction;
 - an attempt digest that includes mutable outcome state, or a dispatch/outcome/
   usage transition without stable operation ID, payload digest, and predecessor
   CAS;
 - duplicate same/different-payload, stale predecessor, out-of-order terminal,
   exempt-usage-with-reservation, or billable-usage-without-reservation vectors;
 - a V1 record without `version` or a time field not typed as Unix milliseconds;
+- a digest codec without record/version domain separation, deterministic CBOR,
+  absent-only optionals, NFC rule, sorted scopes, strict `uint64`, unknown-field
+  rejection, or a no-float rule;
+- free-text authority reasons, oversized diagnostics, or an invalid terminal
+  state/reason pair;
 - a repository file outside this document.
 
 ## Known limits
