@@ -4,6 +4,8 @@
 - Issue: [#720](https://github.com/silentspike/project-sentinel/issues/720)
 - Parent: [#659](https://github.com/silentspike/project-sentinel/issues/659)
 - Source-review baseline: `1ea2c6b9d9290150737d4bee0b31b4af30cf3c25`
+- Delivery base and current integrated Sentinel baseline:
+  `cbd7c25d2bb57df99462d4a180aae5ab00eaf651`
 - Research cut: 2026-07-29
 - Runtime evidence: none; this is a source and test audit, not a deployment or
   performance benchmark
@@ -452,6 +454,11 @@ No numeric benefit or overhead is accepted by this study.
 ## 7. Decisions
 
 Each row has exactly one decision from the issue vocabulary.
+No row selects `Adopt dependency` or `Patch upstream`: the accepted M0 path uses
+existing operating-system contracts, Sentinel-owned minimal state machines, or
+mechanism-only ports. The remaining available vocabulary is
+`Configure existing dependency`, `Wrap`, `Integrate`, `Port algorithm/contract`,
+`Reimplement minimal`, `Keep Sentinel`, and `Reject`.
 
 | ID | Mechanism | Decision | Rationale and rejected alternatives |
 |---|---|---|---|
