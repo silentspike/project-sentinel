@@ -3397,8 +3397,10 @@ fn run_runtime_reconcile(
         ctx.projection_db_path,
         ctx.operator_auth_required,
         ctx.service_health_state.clone(),
-        previous.as_ref(),
-        &adapter_observations,
+        runtime_health::RuntimeHealthObservationSet {
+            previous: previous.as_ref(),
+            adapter: &adapter_observations,
+        },
     );
     let expected_agents = agents_for_local_residency(ctx.all_agents, ctx.current_shift);
     let expected_ids = expected_agents
@@ -3851,8 +3853,10 @@ fn run_runtime_reconcile(
         ctx.projection_db_path,
         ctx.operator_auth_required,
         ctx.service_health_state.clone(),
-        Some(&before),
-        &adapter_observations,
+        runtime_health::RuntimeHealthObservationSet {
+            previous: Some(&before),
+            adapter: &adapter_observations,
+        },
     );
     after.reconcile_runs_total = before.reconcile_runs_total.saturating_add(1);
     if source.is_periodic() {
