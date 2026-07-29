@@ -1,12 +1,13 @@
 # OSS single-node resource-control study
 
-- Status: ORC decision candidate
+- Status: ORC-approved study and materialized owner graph
 - Issue: [#720](https://github.com/silentspike/project-sentinel/issues/720)
 - Parent: [#659](https://github.com/silentspike/project-sentinel/issues/659)
 - Source-review baseline: `1ea2c6b9d9290150737d4bee0b31b4af30cf3c25`
 - Delivery base and current integrated Sentinel baseline:
   `cbd7c25d2bb57df99462d4a180aae5ab00eaf651`
 - Research cut: 2026-07-29
+- Runtime target class: `NONE`
 - Runtime evidence: none; this is a source and test audit, not a deployment or
   performance benchmark
 
@@ -18,7 +19,7 @@ adopt a cluster scheduler or replace the Linux scheduler for M0. The current cod
 already has useful cgroup, PSI, adaptive-tick, activity-profile, and restart
 building blocks, but they are not one recoverable resource-control contract.
 
-The proposed decisions are:
+The approved decisions are:
 
 1. **Configure existing dependency:** define one coherent systemd slice policy for
    Sentinel services using weights, soft memory protection/pressure limits, hard
@@ -27,7 +28,8 @@ The proposed decisions are:
    sole resource authority and introduce a versioned `ResourceContractV1` with
    desired and verified-applied generations, mandatory-controller capability
    checks, ordered writes, readback, compensating rollback, reconciliation, and a
-   local idempotent event outbox. Exactly one delegated
+   local outbox plus namespaced digest-bound EventStore publication receipts.
+   Exactly one delegated
    `sentinel-resource-controller.service` writes per-agent cgroups. Production
    limits must include `pids.max`.
 3. **Reimplement minimal:** replace independent PSI reactions with a bounded node
@@ -62,8 +64,9 @@ roster/predicate unchanged while blocked; it does not wait for the broader
 resource store or governor. The remaining accepted gaps are `M0_HARDENING`;
 topology and scheduler replacement are `POST_M0`.
 
-This document is a decision package. It does not authorize dependency additions,
-issue materialization, runtime mutation, or the proposed numeric policy values.
+This document records the approved decision package and live owner
+materialization. It does not authorize dependency additions, runtime mutation, or
+the still-unapproved numeric policy values.
 
 ## 2. Method and reproducibility
 
@@ -506,10 +509,11 @@ mechanism-only ports. The remaining available vocabulary is
 | D15 | Cross-subsystem priority inheritance | **Reject** | Reject a synthetic resource "priority inheritance" layer: cgroup weights, OS scheduling, simulation authority, and mutex PI are distinct. Use protected capacity and only lock-specific kernel PI after a measured blocking path. |
 | D16 | Thread-pool sizing/work conservation | **Reimplement minimal** | Add aggregate, admission-controlled concurrency budgets around existing semaphores while preserving idle-capacity work conservation. Reject static per-agent threads and reject Tokio defaults as a node resource policy. |
 
-## 8. Proposed Sentinel resource-control contract
+## 8. Approved Sentinel resource-control target contract
 
-This section specifies the decision package for ORC approval. Names are proposed
-wire/domain names, not claims that types exist.
+This section specifies the ORC-approved target contract. Names are materialized
+wire/domain targets in #761 and its children, not claims that the implementation
+types already exist.
 
 ### 8.1 `ResourceContractV1`
 
@@ -795,7 +799,7 @@ sentinel.slice
       `- agents/agent-<canonical-id>/
 ```
 
-`sentinel-resource-controller.service` is a proposed narrow internal effect adapter,
+`sentinel-resource-controller.service` is the target narrow internal effect adapter,
 not a second authority: `controlplane.redb` remains authoritative and sends an
 authenticated, digest-bound operation over a root-owned Unix socket. The adapter
 has no policy API and only accepts canonical catalog targets plus expected
@@ -1018,16 +1022,23 @@ No other source finding is labeled `BLOCKS_M0`. In particular, the absence of
 sched_ext, exclusive CPU allocation, or advanced NUMA policy is not an M0
 correctness defect.
 
-## 12. Proposed implementation-owner package
+## 12. Materialized implementation-owner package
 
-No issue in this section has been created or mutated. Materialization requires ORC
-approval of D1-D16 and the owner graph.
+ORC approved D1-D16 and the owner graph after review of PR #760. The native
+implementation epic is [#761](https://github.com/silentspike/project-sentinel/issues/761)
+with exactly five children. Every new or body-changed open issue passed a fresh
+Issue Quality Gate before final readiness labels were applied.
 
-### 12.1 Proposed epic: M0 single-node resource-control hardening
+### 12.1 Epic #761: M0 single-node resource-control hardening
 
 The epic is `M0_HARDENING` with one `BLOCKS_M0` child finding. It is downstream of
 no new dependency. Its ordered children are
-RC-B0 -> RC0 -> RC1 -> RC2 -> RC3. No core child may wait on a later child.
+[#762](https://github.com/silentspike/project-sentinel/issues/762) RC-B0 ->
+[#763](https://github.com/silentspike/project-sentinel/issues/763) RC0 ->
+[#764](https://github.com/silentspike/project-sentinel/issues/764) RC1 ->
+[#765](https://github.com/silentspike/project-sentinel/issues/765) RC2 ->
+[#770](https://github.com/silentspike/project-sentinel/issues/770) RC3.
+No core child may wait on a later child.
 Independent #655/#690/#691 research may proceed in parallel, but it cannot change
 this M0 chain. Within the chain, token-free test preparation may overlap only after
 the predecessor's versioned port is frozen; merge, cutover, and live evidence stay
@@ -1038,7 +1049,7 @@ RC0-RC3 evidence may block a particular #650 criterion only if its own live AC
 proves a concrete correctness, security, or stability failure; the classification
 cannot be promoted merely because hardening remains incomplete.
 
-### RC-B0. Pressure-safe shift transition ordering
+### RC-B0 #762. Pressure-safe shift transition ordering
 
 **Class/target:** `BLOCKS_M0`; no RC0, store, dependency, systemd, or runtime-policy
 prerequisite. Token-free focused tests run first; a later explicitly assigned
@@ -1091,7 +1102,7 @@ source-proved missed-work path.
 that admission precedes every destructive roster effect and transition predicates
 remain unconsumed while blocked.
 
-### RC0. Durable resource contract, capability, and reconciliation
+### RC0 #763. Durable resource contract, capability, and reconciliation
 
 **Class/target:** `M0_HARDENING`; implementation tests token-free; live target
 `SINGLE_NODE` only after an exact target assignment and issue-specific snapshot.
@@ -1143,7 +1154,7 @@ implementation status, the final target defines the controlplane authority,
 single-writer delegated hierarchy, desired/applied generation, controller
 capability, PID, readback, publication, and recovery contracts.
 
-### RC1. Pressure governor, admission, and shift correctness
+### RC1 #764. Pressure governor, admission, and shift correctness
 
 **Class/target:** `M0_HARDENING`; immediate source correctness is already owned by
 RC-B0. Future live target `SINGLE_NODE` is assigned by the runtime owner.
@@ -1180,7 +1191,7 @@ last-known-good policy; it never marks required work complete to clear pressure.
 implementation status, the final target defines pressure state, freshness,
 exactly-once shift intent, degradation order, protected work, and recovery.
 
-### RC2. Sentinel service slices, OOM policy, and restart budgets
+### RC2 #765. Sentinel service slices, OOM policy, and restart budgets
 
 **Class/target:** `M0_HARDENING`; future live target `SINGLE_NODE` assigned by the
 runtime owner.
@@ -1223,7 +1234,7 @@ implementation status, the final target defines the exact service hierarchy,
 aggregate host reserve, systemd-oomd observability-only boundary, Sentinel-only
 destructive victim/restart-token authority, and command-specific readiness.
 
-### RC3. Final single-node resource acceptance and fault matrix
+### RC3 #770. Final single-node resource acceptance and fault matrix
 
 **Class/target:** `M0_HARDENING`; `SINGLE_NODE` on the exact target assigned by the
 runtime owner.
@@ -1251,37 +1262,64 @@ optimizations remain optional.
 
 ### 12.2 Exact existing-owner deltas
 
-| Existing owner | Proposed reciprocal delta after ORC approval |
+| Existing owner | Materialized reciprocal delta |
 |---|---|
-| #74/#196 | Resource governor publishes a freshness-bound pressure view; biological projection is a consumer, never resource authority. |
-| #147 | Add a historical correction linking immediate RC-B0 for the consumed shift transition and RC1 for unused IO batching/richer admission. Do not rewrite past delivery evidence as if either were complete. |
-| #227 | Require RC-B0/RC0/RC1/RC2 cycle budgets and measured control-plane latency; a slow resource controller cannot run unbounded in the tick. |
-| #265 | Mark Heavy/Suspended and transactional resize as superseded target claims owned by RC0/RC1; preserve the closed issue as delivery history. |
-| #624 | Define a versioned supervision-outcome input to RC2 restart tokens and keep panic-strategy authority in #624. |
-| #650 | Add only RC-B0 as the source-proved downstream acceptance blocker. RC0-RC3 remain parallel/later `M0_HARDENING`, and incomplete hardening does not pause active M0 or make performance optimization mandatory. A specific RC0-RC3 result may block only the exact #650 criterion whose live evidence proves a concrete correctness, security, or stability failure. #650 still owns approved numeric product policy. |
-| #690/#691 | Record Slurm/Flux adoption rejected for M0 here; their research may propose later mechanism-only work without changing RC-B0 through RC3. |
-| #705 | Record no mandatory new M0 dependency. Any conditional systemd-oomd package/unit/config/privilege delta and any future scx/oomd/cluster-scheduler integration require an exact dependency, license, security, ownership, update, and rollback decision. |
-| #656 | Own upgrades only for dependencies approved by #705; kernel/systemd compatibility claims stay in the deployment/RC owners unless represented as repository dependencies. |
-| #502 | Add read-only topology/load/resource-generation telemetry needed by #655 and RC read models; no mutating scheduler authority. |
-| #655 | Own topology and optional sched_ext experiment, explicitly `POST_M0`, capability-gated, reversible, and unable to block M0 startup. |
-| #729/#751 | #729 owns engine-consistent `controlplane.redb` schema migration/backup/restore failpoints; #751 owns whole-product coverage and generation binding. Neither owns kernel effects or resource policy. |
-| #659 | Register this study and, after approval, the single RC-B0-through-RC3 epic as its only new implementation graph. |
+| [#74](https://github.com/silentspike/project-sentinel/issues/74) / [#196](https://github.com/silentspike/project-sentinel/issues/196) | Closed-history follow-ups bind biology to a freshness-bound pressure view as consumer only, never resource authority. |
+| [#147](https://github.com/silentspike/project-sentinel/issues/147) | Closed-history follow-up links #762 for the consumed shift predicate and #764 for real IO/richer admission without rewriting delivery. |
+| [#227](https://github.com/silentspike/project-sentinel/issues/227) | Closed-history follow-up requires bounded #762-#765 cycle evidence without moving their state machines. |
+| [#265](https://github.com/silentspike/project-sentinel/issues/265) | Closed-history follow-up routes desired/applied cgroups to #763, profiles/admission to #764, and budgets to #765. |
+| [#624](https://github.com/silentspike/project-sentinel/issues/624) | Body delta defines the versioned supervision-outcome input to #765 and retains panic-strategy authority. |
+| [#650](https://github.com/silentspike/project-sentinel/issues/650) | Body delta adds only #762 as the source-proved blocker. #763-#770 remain hardening and can affect only an exact criterion after concrete live failure evidence. |
+| [#690](https://github.com/silentspike/project-sentinel/issues/690) / [#691](https://github.com/silentspike/project-sentinel/issues/691) | Body deltas retain independent mechanism research while rejecting Slurm/Flux adoption for M0 and any implicit blocker edge. |
+| [#705](https://github.com/silentspike/project-sentinel/issues/705) | Body delta records no mandatory new dependency and requires an exact gate for optional oomd/scx; oomd remains permanently dry-run. |
+| [#656](https://github.com/silentspike/project-sentinel/issues/656) | Body delta owns upgrades only after #705 approval and preserves dry-run/default-scheduler rollback contracts. |
+| [#502](https://github.com/silentspike/project-sentinel/issues/502) | Body delta adds read-only topology/load/resource-generation telemetry with no mutating authority. |
+| [#655](https://github.com/silentspike/project-sentinel/issues/655) | Body delta retains topology/scx as capability-gated `POST_M0`, unable to block the portable path. |
+| #729/#751 | Existing #722 recovery contracts already own engine-consistent `controlplane.redb` backup/schema failpoints and whole-product generation coverage. The authorized #720 owner list did not mutate them. |
+| [#659](https://github.com/silentspike/project-sentinel/issues/659) | Body delta registers exactly epic #761 and children #762/#763/#764/#765/#770. |
 
-### 12.3 Materialization gate
+### 12.3 Live materialization readback
 
-Before any GitHub body or child mutation:
+ORC authorized materialization after reviewing exact study head
+`c249d4d6c13aa4555783cce03f9bf1b67562ea94`. Native GraphQL readback for epic
+#761 returns exactly `[#762, #763, #764, #765, #770]` in order. The body digest is
+SHA-256 over the exact UTF-8 GitHub body without an added newline.
 
-1. ORC approves or changes D1-D16.
-2. ORC approves the RC-B0 -> RC0 -> RC1 -> RC2 -> RC3 implementation order, the
-   separate RC-B0 -> #650 blocker edge, and the exact existing-owner deltas.
-3. Each new/changed body receives runtime target, complete ACs, negative criteria,
-   benchmarks, rollout, rollback, TOGAF delta, dependencies, and reciprocal links.
-4. Labels are normalized without preserving contradictory history labels on new
-   work.
-5. Every new/changed owner receives a fresh Issue Quality Gate PASS and exact body
-   SHA-256 readback.
-6. #720 AC-6/AC-N5 become PASS only after that live graph exists. Until then they
-   remain pending by design, not waived.
+| Node | Dependency/class | Final labels | Live body SHA-256 | Fresh quality gate |
+|---|---|---|---|---|
+| [#761 epic](https://github.com/silentspike/project-sentinel/issues/761) | Exactly five children | `status:blocked`, `quality:ready`, `type:epic`, `prio:high`, `size:XL`, `scope:full`, `comp:daemon`, `comp:runtime`, `comp:sandbox` | `d36e71ec29227b905f201c5e31a6290aa020d84f9f3ad17d1a19be0b4cf959a8` | [PASS 30459465841](https://github.com/silentspike/project-sentinel/actions/runs/30459465841) |
+| [#762 RC-B0](https://github.com/silentspike/project-sentinel/issues/762) | None; only `BLOCKS_M0` edge to #650 | `status:ready`, `quality:ready`, `type:bug`, `prio:high`, `size:L`, `scope:full`, `comp:daemon`, `comp:runtime`, `comp:ecs` | `1cbde0a3d7f9f372c41cf16e86206aec6259a3adb673d2018a777b00decfe1a1` | [PASS 30459465361](https://github.com/silentspike/project-sentinel/actions/runs/30459465361) |
+| [#763 RC0](https://github.com/silentspike/project-sentinel/issues/763) | #762; `M0_HARDENING` | `status:blocked`, `quality:ready`, `type:feature`, `prio:high`, `size:XL`, `scope:full`, `comp:daemon`, `comp:runtime`, `comp:sandbox` | `75ffb290164f190aae76b899dd2f16d85470c412de8fe5dd02f7bc5d69e4e259` | [PASS 30459467595](https://github.com/silentspike/project-sentinel/actions/runs/30459467595) |
+| [#764 RC1](https://github.com/silentspike/project-sentinel/issues/764) | #762/#763; `M0_HARDENING` | `status:blocked`, `quality:ready`, `type:feature`, `prio:high`, `size:XL`, `scope:full`, `comp:daemon`, `comp:runtime`, `comp:inference`, `comp:ecs` | `46e598700a1899e16929b2f3bf5cb2889f34cd368585c33a855b1f218c1b6613` | [PASS 30459470095](https://github.com/silentspike/project-sentinel/actions/runs/30459470095) |
+| [#765 RC2](https://github.com/silentspike/project-sentinel/issues/765) | #762-#764; `M0_HARDENING` | `status:blocked`, `quality:ready`, `type:feature`, `prio:high`, `size:XL`, `scope:full`, `comp:daemon`, `comp:runtime`, `comp:sandbox` | `eb201161c347022cf103b77454f1e5600c84b09f08f23df2f1f16de8e28e8519` | [PASS 30459473177](https://github.com/silentspike/project-sentinel/actions/runs/30459473177) |
+| [#770 RC3](https://github.com/silentspike/project-sentinel/issues/770) | #762-#765 plus exact #650 measurement policy; `M0_HARDENING` | `status:blocked`, `quality:ready`, `type:feature`, `prio:high`, `size:XL`, `scope:full`, `comp:daemon`, `comp:runtime`, `comp:sandbox`, `comp:ecs` | `da264f713efd3e65c36cb34d04d4351a6d342ace8ff0f4432188bfe70f916367` | [PASS 30459430240](https://github.com/silentspike/project-sentinel/actions/runs/30459430240) |
+
+Open owner bodies carry one
+`<!-- issue-720-resource-control-delta -->` section. Their existing workflow
+status and authority remain intact:
+
+| Owner | Live body SHA-256 | Fresh quality gate |
+|---|---|---|
+| [#502](https://github.com/silentspike/project-sentinel/issues/502) | `b905999e3e6f002bac9d59a26723a24d2a3458040a2c8da596447e938f388102` | [PASS 30459616938](https://github.com/silentspike/project-sentinel/actions/runs/30459616938) |
+| [#624](https://github.com/silentspike/project-sentinel/issues/624) | `6262824e4c75978fb453146464cbc0cb220f30f6383068eaf14fae0abd4610df` | [PASS 30459614666](https://github.com/silentspike/project-sentinel/actions/runs/30459614666) |
+| [#650](https://github.com/silentspike/project-sentinel/issues/650) | `86301c92ed90ab9084fdb5b7a77d6bc0b43be820b0db745140f054e2c5c8eff9` | [PASS 30459618239](https://github.com/silentspike/project-sentinel/actions/runs/30459618239) |
+| [#655](https://github.com/silentspike/project-sentinel/issues/655) | `8b5a538952d50f07f770c84b64976717ec00c44b5a6de645f0bc49bf615a261c` | [PASS 30459627657](https://github.com/silentspike/project-sentinel/actions/runs/30459627657) |
+| [#656](https://github.com/silentspike/project-sentinel/issues/656) | `8bd019a4487c1100c902661a6daef575f165ecda45b41de2b1ff61182474e660` | [PASS 30459626928](https://github.com/silentspike/project-sentinel/actions/runs/30459626928) |
+| [#659](https://github.com/silentspike/project-sentinel/issues/659) | `10f2edb85c08f8a9d78ee8afceb24a863ee612f1aa67f80753178b5c036d85c7` | [PASS 30459633400](https://github.com/silentspike/project-sentinel/actions/runs/30459633400) |
+| [#690](https://github.com/silentspike/project-sentinel/issues/690) | `d6560421c1f2bf94fe76fe443fea707f71041fc1c2d585a6efbb267f6927996d` | [PASS 30459628344](https://github.com/silentspike/project-sentinel/actions/runs/30459628344) |
+| [#691](https://github.com/silentspike/project-sentinel/issues/691) | `2373014c67de540703cf85b0805add6332aba3b5919782772e679559714cf408` | [PASS 30459636617](https://github.com/silentspike/project-sentinel/actions/runs/30459636617) |
+| [#705](https://github.com/silentspike/project-sentinel/issues/705) | `238c8f2bbf845e1f84f123d218adcdea49ec489c2d49b09df7dc5c4ad733715f` | [PASS 30459637177](https://github.com/silentspike/project-sentinel/actions/runs/30459637177) |
+
+Closed delivery owners were not relabeled or body-edited. Each received one
+traceable `<!-- issue-720-resource-control-followup -->` comment:
+
+| Closed owner | Follow-up comment | Comment SHA-256 |
+|---|---|---|
+| #74 | [comment 5118920545](https://github.com/silentspike/project-sentinel/issues/74#issuecomment-5118920545) | `208c344b58c08292410cb02ede2e6bb2cee819a34190a1af3401f4ac0988b37d` |
+| #147 | [comment 5118920904](https://github.com/silentspike/project-sentinel/issues/147#issuecomment-5118920904) | `b4b4f1707f263a4c3b9feb325b2475f7c2e8fc481285d992c2de110db6fbee8e` |
+| #196 | [comment 5118921215](https://github.com/silentspike/project-sentinel/issues/196#issuecomment-5118921215) | `0677313c88c00a687e1af4f919dfea19ceedd26ad650611e15a5e824cb515121` |
+| #227 | [comment 5118921528](https://github.com/silentspike/project-sentinel/issues/227#issuecomment-5118921528) | `14dc58da98ad6f5b4e75c5724b36bb8160ed815e0d5bb0368af64e2ba38449d9` |
+| #265 | [comment 5118921755](https://github.com/silentspike/project-sentinel/issues/265#issuecomment-5118921755) | `936a4142e9d3b6f83cb2cf38e2c749c596cf0e34d5e85e0b7681ef1ee299afc3` |
 
 ## 13. Rollout, rollback, and evidence policy
 
@@ -1376,21 +1414,21 @@ This research issue does not edit the TOGAF HTML.
 
 ## 15. Acceptance-criteria status
 
-| Criterion | Study evidence | Status before ORC decision |
+| Criterion | Study evidence | Final research status |
 |---|---|---|
 | AC-1 | Sections 3.1-3.4 map current source, tests, runtime contracts, claim drift, incidents, TOGAF targets, and all named owners. | PASS |
 | AC-2 | Section 4 evaluates eight candidate families with a reproducible ten-factor rubric and explicit rejection reasons. | PASS |
 | AC-3 | Section 5 reviews five pinned systems through source, tests, failures, security, license, and operations. | PASS |
 | AC-4 | Section 6 covers every requested mechanism and all five deep-review systems, including correctness, failure semantics, 1:n/determinism, security, maintenance, dependency cost, and integration boundary. | PASS |
-| AC-5 | Section 7 assigns exactly one explicit decision to every mechanism and records rejected alternatives. | PENDING ORC APPROVAL |
-| AC-6 | Section 12 provides implementation-ready RC-B0 through RC3 plus exact existing-owner deltas, but live materialization is explicitly forbidden until ORC approval. | PENDING ORC APPROVAL/MATERIALIZATION |
-| AC-7 | Section 11 classifies every finding and limits `BLOCKS_M0` to the source-proved missed-shift defect. | PENDING M0 OWNER ACKNOWLEDGEMENT |
+| AC-5 | Section 7 assigns exactly one explicit decision to every mechanism, records rejected alternatives, and ORC approved D1-D16 before materialization. | PASS |
+| AC-6 | Section 12 records quality-ready epic #761, exactly five native children, complete implementation contracts, body digests, run IDs, and reciprocal owner deltas. | PASS |
+| AC-7 | Section 11 limits `BLOCKS_M0` to #762; #650 now records only that hard edge while #763-#770 remain conditional hardening. | PASS |
 | AC-8 | This document is the sole repository change; final ASCII/public-safety, typo, local/external link, provenance, render, scope, and diff gates pass on the frozen delivery head. | PASS |
 | AC-N1 | No dependency is added or recommended merely because another project uses it. | PASS |
 | AC-N2 | Every deep review records license, security, provenance, maintenance/operations, and integration boundary; no code is copied. | PASS |
 | AC-N3 | Closed labels and unit tests are treated as bounded historical evidence, not current optimality proof. | PASS |
 | AC-N4 | Runtime target is NONE; no VM, deployment, Cargo/Rust, provider, or performance benchmark was used. | PASS |
-| AC-N5 | Every accepted gap has an exact proposed owner; live ownership remains pending because pre-approval GitHub mutation is forbidden. | PENDING MATERIALIZATION |
+| AC-N5 | Every accepted gap has a live owner under #761; the native graph, reciprocal deltas/comments, exact hashes, labels, and fresh quality runs are recorded in section 12.3. | PASS |
 
 ## 16. Limitations and pending decisions
 
@@ -1414,6 +1452,7 @@ This research issue does not edit the TOGAF HTML.
 - Slurm and Flux source mechanisms are intentionally left to #690/#691 for deep
   study; this document rejects product adoption, not future independent mechanism
   proposals.
-- D1-D16, RC-B0 through RC3, issue deltas, and the M0 blocker classification require ORC
-  review before any GitHub materialization. Until that decision, AC-5, AC-6,
-  AC-7, and AC-N5 are not claimed complete.
+- ORC approved D1-D16, #761/#762/#763/#764/#765/#770, the reciprocal owner
+  deltas, and #762 as the only predeclared blocker. Implementation and live
+  product acceptance remain open in those owners; this research issue claims only
+  the completed source study and governance materialization.
