@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -5,38 +7,60 @@ use super::{
     digest::ContentDigest,
     error::DeliveryError,
     ports::{
-        AdapterReadiness, CandidateAuthorityQueryV1, DeliveryIntegrationPort,
+        expected_integration_contract_digest, AdapterReadiness, AuthorityReceiptV1,
+        AuthorityValidationRequestV1, CandidateAuthorityQueryV1, DeliveryEffectKind,
+        DeliveryEffectPort, DeliveryEffectRequestV1, DeliveryIntegrationPort,
         DeliveryPublicationPort, WorkbenchEvidenceReceiptV1, WorkbenchEvidenceRequestV1,
     },
     schema::{
         AcceptanceV1, ApprovalV1, AuthorityRole, CandidateState, CustomerAction,
         CustomerFeedbackV1, DeliveryReceiptV1, DeliveryState, FindingV1, PrincipalV1,
-        ProjectCloseoutV1, QaEvaluationPlanV1, QaEvaluationRunReceiptV1, QaReleaseGateReceiptV1,
+        ProjectCloseoutV1, QaAggregateOutcomesV1, QaCaseOutcome, QaEvaluationPlanV1,
+        QaEvaluationRunReceiptV1, QaEvidenceGraphV1, QaHarnessOutcome, QaReleaseGateReceiptV1,
         QaRunState, ReleaseCandidateV1, ReleaseManifestV1, ReleaseState, ReleaseV1, ReviewV1,
-        RollbackV1, TestRunV1, VersionedRefV1,
+        RollbackV1, TestRunV1, VersionedRefV1, DELIVERY_SCHEMA_V1,
     },
     state::{
         transition_candidate, transition_delivery, transition_qa_run, transition_release,
         DeliveryAggregateV1,
     },
-    store::{DeliveryCommitReceiptV1, DeliveryCommitRequestV1, DeliveryStore},
+    store::{
+        DeliveryAggregateStorePort, DeliveryCommitReceiptV1, DeliveryCommitRequestV1,
+        DeliveryPublicationStatePort, DeliveryStore,
+    },
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandContextV1 {
     pub principal: PrincipalV1,
     pub idempotency_key: String,
     pub now_ms: u64,
 }
 
-pub struct DeliveryCore<I> {
-    store: DeliveryStore,
+pub struct DeliveryCore<I, S = DeliveryStore, E = super::ports::UnavailableDeliveryEffects> {
+    store: S,
     integration: I,
+    effects: E,
 }
 
-impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
-    pub fn new(store: DeliveryStore, integration: I) -> Self {
-        Self { store, integration }
+impl<I, S, E> DeliveryCore<I, S, E>
+where
+    I: DeliveryIntegrationPort,
+    S: DeliveryAggregateStorePort + DeliveryPublicationStatePort,
+    E: DeliveryEffectPort,
+{
+    /// Deterministic constructor for the dependency-independent core.
+    ///
+    /// Productive construction remains unavailable until #732 and #733 provide
+    /// the canonical trajectory and publication adapters.
+    #[doc(hidden)]
+    pub fn new_test_only(store: S, integration: I, effects: E) -> Self {
+        Self {
+            store,
+            integration,
+            effects,
+        }
     }
 
     pub fn readiness(&self) -> AdapterReadiness {
@@ -56,8 +80,12 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         context: &CommandContextV1,
         candidate: ReleaseCandidateV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
-        require_role(context, AuthorityRole::Developer)?;
-        require_tenant(context, &candidate.tenant_id)?;
+        self.require_current_authority(
+            context,
+            &candidate.tenant_id,
+            AuthorityRole::Developer,
+            "register_candidate",
+        )?;
         if candidate.schema_version != super::schema::DELIVERY_SCHEMA_V1
             || candidate.state != CandidateState::Draft
             || candidate.candidate_digest != candidate.computed_digest()?
@@ -75,7 +103,6 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         )? {
             return Ok(receipt);
         }
-        self.require_integration()?;
         let authority = self
             .integration
             .candidate_authority(&CandidateAuthorityQueryV1 {
@@ -136,18 +163,29 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         project_id: &str,
         candidate_id: &str,
         plan: QaEvaluationPlanV1,
-        run: QaEvaluationRunReceiptV1,
+        mut run: QaEvaluationRunReceiptV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
-        require_role(context, AuthorityRole::ReleaseManager)?;
-        require_tenant(context, tenant_id)?;
+        self.require_current_authority(
+            context,
+            tenant_id,
+            AuthorityRole::ReleaseManager,
+            "assign_qa",
+        )?;
         let command_digest =
             command_digest(context, &(tenant_id, project_id, candidate_id, &plan, &run))?;
         if let Some(receipt) = self.existing(context, "assign_qa", tenant_id, &command_digest)? {
             return Ok(receipt);
         }
-        self.require_integration()?;
         if run.state != QaRunState::Planned
             || run.actors.len() != 1
+            || run.started_at_ms.is_some()
+            || run.finished_at_ms.is_some()
+            || run.attempts != 0
+            || run.harness_outcome.is_some()
+            || run.cleanup_receipt.is_some()
+            || run.aggregate_outcomes.is_some()
+            || run.gate_receipt.is_some()
+            || run.durable_event_generation != 0
             || plan.candidate.id != candidate_id
             || run.plan.id != plan.plan_id
             || run.plan.generation != plan.generation
@@ -158,9 +196,21 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
                 "QA assignment requires one planned QA actor".to_string(),
             ));
         }
-        let qa = &run.actors[0];
-        require_principal_role(qa, AuthorityRole::Qa)?;
-        require_same_tenant(&context.principal, qa)?;
+        let qa = run.actors[0].clone();
+        require_principal_role(&qa, AuthorityRole::Qa)?;
+        require_same_tenant(&context.principal, &qa)?;
+        let qa_authority = self.current_authority_for(
+            &qa,
+            tenant_id,
+            AuthorityRole::Qa,
+            "qa_assignment",
+            context.now_ms,
+        )?;
+        if qa_authority.principal != qa {
+            return Err(DeliveryError::StaleEvidence(
+                "assigned QA principal is not the current authenticated authority".to_string(),
+            ));
+        }
         if qa.principal_id == context.principal.principal_id {
             return Err(DeliveryError::AuthorityDenied(
                 "release manager cannot assign itself as QA".to_string(),
@@ -195,6 +245,7 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         }
         transition_candidate(candidate.state, CandidateState::QaAssigned)?;
         candidate.state = CandidateState::QaAssigned;
+        run.durable_event_generation = aggregate.revision + 1;
         if aggregate
             .qa_plans
             .insert(plan.plan_id.clone(), plan.clone())
@@ -243,8 +294,8 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         run_id: &str,
         next: QaRunState,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
-        require_role(context, AuthorityRole::Qa)?;
-        require_tenant(context, tenant_id)?;
+        let current_authority =
+            self.require_current_authority(context, tenant_id, AuthorityRole::Qa, "transition_qa")?;
         let command_digest = command_digest(context, &(tenant_id, project_id, run_id, next))?;
         if let Some(receipt) =
             self.existing(context, "transition_qa", tenant_id, &command_digest)?
@@ -256,33 +307,50 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
             .qa_runs
             .get_mut(run_id)
             .ok_or_else(|| DeliveryError::NotFound(format!("QA run {run_id}")))?;
-        if !run
-            .actors
-            .iter()
-            .any(|actor| actor.principal_id == context.principal.principal_id)
-        {
+        if run.actors.as_slice() != [current_authority.principal.clone()] {
             return Err(DeliveryError::AuthorityDenied(
-                "only the assigned QA principal may transition the run".to_string(),
+                "only the exact assigned QA authority may transition the run".to_string(),
             ));
         }
         transition_qa_run(run.state, next)?;
-        if next == QaRunState::CompletedPass
-            && (run.harness_outcome.as_deref() != Some("pass")
-                || run.cleanup_receipt.is_none()
-                || run
-                    .aggregate_outcomes
-                    .get("required_cases_complete")
-                    .map(String::as_str)
-                    != Some("true")
-                || ["contaminated", "needs_human_review", "flaky_unresolved"]
-                    .iter()
-                    .any(|key| {
-                        run.aggregate_outcomes.get(*key).map(String::as_str) != Some("false")
-                    }))
-        {
-            return Err(DeliveryError::MissingEvidence(
-                "completed-pass requires exact clean workbench evidence".to_string(),
-            ));
+        let outcomes = run.aggregate_outcomes.as_ref();
+        match next {
+            QaRunState::CompletedPass
+                if run.harness_outcome != Some(QaHarnessOutcome::Pass)
+                    || run.cleanup_receipt.is_none()
+                    || !matches!(
+                        outcomes,
+                        Some(QaAggregateOutcomesV1 {
+                            required_cases_complete: true,
+                            contaminated: false,
+                            needs_human_review: false,
+                            flaky_unresolved: false,
+                        })
+                    ) =>
+            {
+                return Err(DeliveryError::MissingEvidence(
+                    "completed-pass requires exact clean workbench evidence".to_string(),
+                ));
+            }
+            QaRunState::CompletedFail
+                if run.harness_outcome != Some(QaHarnessOutcome::Fail)
+                    || run.cleanup_receipt.is_none()
+                    || outcomes.is_none() =>
+            {
+                return Err(DeliveryError::MissingEvidence(
+                    "completed-fail requires an exact failed workbench receipt".to_string(),
+                ));
+            }
+            QaRunState::HarnessError
+                if run.harness_outcome != Some(QaHarnessOutcome::Error)
+                    || run.cleanup_receipt.is_none() =>
+            {
+                return Err(DeliveryError::MissingEvidence(
+                    "harness-error requires an exact workbench error and cleanup receipt"
+                        .to_string(),
+                ));
+            }
+            _ => {}
         }
         run.state = next;
         if next == QaRunState::Running {
@@ -325,8 +393,8 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         project_id: &str,
         run_id: &str,
     ) -> Result<(DeliveryCommitReceiptV1, WorkbenchEvidenceReceiptV1), DeliveryError> {
-        require_role(context, AuthorityRole::Qa)?;
-        require_tenant(context, tenant_id)?;
+        let authority_before =
+            self.require_current_authority(context, tenant_id, AuthorityRole::Qa, "execute_qa")?;
         let mut aggregate = self.required_aggregate(tenant_id, project_id)?;
         let run = aggregate
             .qa_runs
@@ -334,13 +402,10 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
             .ok_or_else(|| DeliveryError::NotFound(format!("QA run {run_id}")))?
             .clone();
         if run.state != QaRunState::Running
-            || !run
-                .actors
-                .iter()
-                .any(|actor| actor.principal_id == context.principal.principal_id)
+            || run.actors.as_slice() != [authority_before.principal.clone()]
         {
             return Err(DeliveryError::AuthorityDenied(
-                "only assigned QA may execute a running plan".to_string(),
+                "only the exact assigned QA authority may execute a running plan".to_string(),
             ));
         }
         let plan = aggregate
@@ -348,11 +413,35 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
             .get(&run.plan.id)
             .ok_or_else(|| DeliveryError::CorruptStore("QA plan missing".to_string()))?
             .clone();
+        let run_ref = VersionedRefV1 {
+            id: run.run_id.clone(),
+            generation: run.generation,
+            digest: run.request_digest.clone(),
+        };
+        let invocation = VersionedRefV1 {
+            id: format!("qa:{}:{}:{}", tenant_id, project_id, run.run_id),
+            generation: run.generation,
+            digest: ContentDigest::of_domain(
+                "workbench-invocation",
+                DELIVERY_SCHEMA_V1,
+                &(
+                    tenant_id,
+                    project_id,
+                    &run_ref,
+                    &authority_before.receipt_digest,
+                ),
+            )?,
+        };
         let request = WorkbenchEvidenceRequestV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
             tenant_id: tenant_id.to_string(),
             project: plan.project.clone(),
             candidate: plan.candidate.clone(),
             qa_plan: run.plan.clone(),
+            qa_run: run_ref.clone(),
+            assigned_qa: authority_before.principal.clone(),
+            authority_receipt_digest: authority_before.receipt_digest.clone(),
+            invocation,
             request_digest: ContentDigest::zero(),
         }
         .seal()?;
@@ -361,7 +450,11 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
             let receipt = aggregate
                 .workbench_receipts
                 .values()
-                .find(|receipt| receipt.input_digest == request.request_digest)
+                .find(|receipt| {
+                    receipt.input_digest == request.request_digest
+                        && receipt.qa_run == request.qa_run
+                        && receipt.invocation == request.invocation
+                })
                 .cloned()
                 .ok_or_else(|| {
                     DeliveryError::CorruptStore(
@@ -370,13 +463,23 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
                 })?;
             return Ok((existing, receipt));
         }
-        self.require_integration()?;
-
         // The external effect occurs only after the durable running state exists and
         // no database writer is held.
         let receipt = self.integration.execute_qa(&request)?;
+        let authority_after =
+            self.require_current_authority(context, tenant_id, AuthorityRole::Qa, "execute_qa")?;
+        if authority_after != authority_before {
+            return Err(DeliveryError::StaleEvidence(
+                "QA authority changed between workbench request and evidence adoption".to_string(),
+            ));
+        }
         if receipt.receipt_digest != receipt.computed_digest()?
             || receipt.input_digest != request.request_digest
+            || receipt.invocation != request.invocation
+            || receipt.assignment != request.qa_run
+            || receipt.qa_run != request.qa_run
+            || receipt.assigned_qa != request.assigned_qa
+            || receipt.authority_receipt_digest != request.authority_receipt_digest
             || receipt.output_digest == ContentDigest::zero()
             || receipt.result_inventory_digest == ContentDigest::zero()
             || receipt.logs_digest == ContentDigest::zero()
@@ -402,26 +505,13 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
             .ok_or_else(|| DeliveryError::CorruptStore("QA run disappeared".to_string()))?;
         run_mut.attempts = run_mut.attempts.saturating_add(1);
         run_mut.cleanup_receipt = Some(receipt.cleanup_receipt.clone());
-        run_mut.harness_outcome = Some(if receipt.passed {
-            "pass".to_string()
-        } else {
-            "fail".to_string()
+        run_mut.harness_outcome = Some(receipt.harness_outcome);
+        run_mut.aggregate_outcomes = Some(QaAggregateOutcomesV1 {
+            required_cases_complete: receipt.required_cases_complete,
+            contaminated: receipt.contaminated,
+            needs_human_review: receipt.needs_human_review,
+            flaky_unresolved: receipt.flaky_unresolved,
         });
-        run_mut.aggregate_outcomes.insert(
-            "required_cases_complete".to_string(),
-            receipt.required_cases_complete.to_string(),
-        );
-        run_mut
-            .aggregate_outcomes
-            .insert("contaminated".to_string(), receipt.contaminated.to_string());
-        run_mut.aggregate_outcomes.insert(
-            "needs_human_review".to_string(),
-            receipt.needs_human_review.to_string(),
-        );
-        run_mut.aggregate_outcomes.insert(
-            "flaky_unresolved".to_string(),
-            receipt.flaky_unresolved.to_string(),
-        );
         let expected_revision = aggregate.revision;
         aggregate.revision += 1;
         let commit = self.commit(
@@ -441,6 +531,97 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         Ok((commit, receipt))
     }
 
+    pub fn import_evidence_graph(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        run_id: &str,
+        graph: QaEvidenceGraphV1,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        let authority = self.require_current_authority(
+            context,
+            tenant_id,
+            AuthorityRole::Qa,
+            "import_evidence_graph",
+        )?;
+        let command_digest = command_digest(context, &(tenant_id, project_id, run_id, &graph))?;
+        if let Some(receipt) =
+            self.existing(context, "import_evidence_graph", tenant_id, &command_digest)?
+        {
+            return Ok(receipt);
+        }
+        let mut aggregate = self.required_aggregate(tenant_id, project_id)?;
+        let run = aggregate
+            .qa_runs
+            .get(run_id)
+            .ok_or_else(|| DeliveryError::NotFound(format!("QA run {run_id}")))?
+            .clone();
+        if run.state != QaRunState::Running
+            || run.actors.as_slice() != [authority.principal.clone()]
+            || graph.schema_version != DELIVERY_SCHEMA_V1
+            || graph.graph_digest != graph.computed_digest()?
+        {
+            return Err(DeliveryError::StaleEvidence(
+                "evidence graph is not bound to the exact running QA authority".to_string(),
+            ));
+        }
+        let run_ref = VersionedRefV1 {
+            id: run.run_id.clone(),
+            generation: run.generation,
+            digest: run.request_digest.clone(),
+        };
+        if graph.run != run_ref {
+            return Err(DeliveryError::StaleEvidence(
+                "evidence graph references another QA run".to_string(),
+            ));
+        }
+        let workbench = aggregate
+            .workbench_receipts
+            .get(&graph.workbench_receipt.id)
+            .ok_or_else(|| DeliveryError::MissingEvidence("workbench receipt".to_string()))?;
+        if graph.workbench_receipt.generation != workbench.invocation.generation
+            || graph.workbench_receipt.digest != workbench.receipt_digest
+            || workbench.qa_run != run_ref
+            || workbench.assigned_qa != authority.principal
+            || workbench.result_inventory_digest != qa_evidence_inventory_digest(&graph)?
+        {
+            return Err(DeliveryError::StaleEvidence(
+                "evidence inventory is not bound to the exact workbench receipt".to_string(),
+            ));
+        }
+        let plan = aggregate
+            .qa_plans
+            .get(&run.plan.id)
+            .ok_or_else(|| DeliveryError::CorruptStore("QA plan missing".to_string()))?;
+        validate_evidence_graph(plan, &run_ref, &graph)?;
+        validate_evidence_outcome(workbench, &graph)?;
+        if aggregate
+            .evidence_graphs
+            .insert(run_id.to_string(), graph.clone())
+            .is_some()
+        {
+            return Err(DeliveryError::Conflict(format!(
+                "evidence graph for run {run_id} already exists"
+            )));
+        }
+        let expected_revision = aggregate.revision;
+        aggregate.revision += 1;
+        self.commit(
+            context,
+            "import_evidence_graph",
+            command_digest,
+            aggregate,
+            "qa_evidence_graph_imported_v1",
+            json!({
+                "run_id": run_id,
+                "graph_digest": graph.graph_digest,
+                "workbench_receipt": graph.workbench_receipt,
+            }),
+            expected_revision,
+        )
+    }
+
     pub fn record_gate(
         &self,
         context: &CommandContextV1,
@@ -449,14 +630,13 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         run_id: &str,
         gate: QaReleaseGateReceiptV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
-        require_role(context, AuthorityRole::Qa)?;
-        require_tenant(context, tenant_id)?;
+        let gate_authority =
+            self.require_current_authority(context, tenant_id, AuthorityRole::Qa, "record_gate")?;
         let command_digest = command_digest(context, &(tenant_id, project_id, run_id, &gate))?;
         if let Some(receipt) = self.existing(context, "record_gate", tenant_id, &command_digest)? {
             return Ok(receipt);
         }
-        if gate.actor.principal_id != context.principal.principal_id
-            || gate.actor.authority_generation != context.principal.authority_generation
+        if gate.actor != gate_authority.principal
             || gate.issued_at_ms > context.now_ms
             || gate.expires_at_ms <= context.now_ms
         {
@@ -469,51 +649,74 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
             .qa_runs
             .get(run_id)
             .ok_or_else(|| DeliveryError::NotFound(format!("QA run {run_id}")))?;
-        if run.state != QaRunState::CompletedPass || run.plan != gate.plan {
+        if run.plan != gate.plan {
             return Err(DeliveryError::MissingEvidence(
-                "gate requires the exact completed-pass QA plan".to_string(),
+                "gate requires the exact terminal QA plan".to_string(),
             ));
         }
-        if run.harness_outcome.as_deref() != Some("pass")
+        let legal_outcome = matches!(
+            (gate.passed, run.state, run.harness_outcome),
+            (
+                true,
+                QaRunState::CompletedPass,
+                Some(QaHarnessOutcome::Pass)
+            ) | (
+                false,
+                QaRunState::CompletedFail,
+                Some(QaHarnessOutcome::Fail)
+            ) | (
+                false,
+                QaRunState::HarnessError,
+                Some(QaHarnessOutcome::Error)
+            )
+        );
+        let graph = aggregate
+            .evidence_graphs
+            .get(run_id)
+            .ok_or_else(|| DeliveryError::MissingEvidence("QA evidence graph".to_string()))?;
+        let plan = aggregate
+            .qa_plans
+            .get(&run.plan.id)
+            .ok_or_else(|| DeliveryError::CorruptStore("QA plan missing".to_string()))?;
+        if !legal_outcome
             || run.cleanup_receipt.is_none()
-            || run
-                .aggregate_outcomes
-                .get("required_cases_complete")
-                .map(String::as_str)
-                != Some("true")
-            || ["contaminated", "needs_human_review", "flaky_unresolved"]
-                .iter()
-                .any(|key| run.aggregate_outcomes.get(*key).map(String::as_str) != Some("false"))
-            || gate.case_inventory_digest == ContentDigest::zero()
-            || gate.deterministic_evidence_digest == ContentDigest::zero()
-            || gate.calibration_digest == ContentDigest::zero()
-            || gate.source_evidence_digest == ContentDigest::zero()
+            || (gate.passed
+                && !matches!(
+                    run.aggregate_outcomes.as_ref(),
+                    Some(QaAggregateOutcomesV1 {
+                        required_cases_complete: true,
+                        contaminated: false,
+                        needs_human_review: false,
+                        flaky_unresolved: false,
+                    })
+                ))
+            || gate.case_inventory_digest != qa_case_inventory_digest(graph)?
+            || gate.deterministic_evidence_digest != qa_deterministic_evidence_digest(graph)?
+            || gate.model_evidence_digest != qa_model_evidence_digest(graph)?
+            || gate.flake_disposition_digest != qa_flake_disposition_digest(graph)?
+            || gate.calibration_digest != plan.aggregation_policy_digest
+            || gate.source_evidence_digest != qa_source_evidence_digest(graph)?
+            || gate.policy_digest != plan.release_policy_digest
         {
             return Err(DeliveryError::MissingEvidence(
-                "gate rejects incomplete, contaminated, review-required, flaky, or empty evidence"
-                    .to_string(),
+                "gate outcome or evidence graph does not match the exact terminal run".to_string(),
             ));
         }
-        let gate_digest = ContentDigest::of(&gate)?;
-        let approval = aggregate
-            .approvals
-            .values()
-            .find(|approval| {
-                approval.candidate == gate.candidate
-                    && approval.gate.id == gate.gate_id
-                    && approval.gate.generation == gate.generation
-                    && approval.gate.digest == gate_digest
-                    && approval.policy_digest == gate.policy_digest
-                    && approval.approver.principal_id == context.principal.principal_id
-                    && approval.approver.authority_generation
-                        == context.principal.authority_generation
-            })
-            .ok_or_else(|| {
-                DeliveryError::MissingEvidence(
-                    "gate requires an exact independent approval".to_string(),
-                )
-            })?;
-        if approval.approved_at_ms > gate.issued_at_ms {
+        let gate_digest = ContentDigest::of_domain("qa-release-gate", DELIVERY_SCHEMA_V1, &gate)?;
+        let approval = aggregate.approvals.values().find(|approval| {
+            approval.candidate == gate.candidate
+                && approval.gate.id == gate.gate_id
+                && approval.gate.generation == gate.generation
+                && approval.gate.digest == gate_digest
+                && approval.policy_digest == gate.policy_digest
+                && approval.approver == gate_authority.principal
+        });
+        if gate.passed && approval.is_none() {
+            return Err(DeliveryError::MissingEvidence(
+                "passing gate requires an exact independent approval".to_string(),
+            ));
+        }
+        if approval.is_some_and(|value| value.approved_at_ms > gate.issued_at_ms) {
             return Err(DeliveryError::StaleEvidence(
                 "approval was issued after the release gate".to_string(),
             ));
@@ -540,6 +743,15 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         };
         transition_candidate(candidate.state, next)?;
         candidate.state = next;
+        aggregate
+            .qa_runs
+            .get_mut(run_id)
+            .ok_or_else(|| DeliveryError::CorruptStore("QA run disappeared".to_string()))?
+            .gate_receipt = Some(VersionedRefV1 {
+            id: gate.gate_id.clone(),
+            generation: gate.generation,
+            digest: gate_digest,
+        });
         if aggregate
             .gates
             .insert(gate.gate_id.clone(), gate.clone())
@@ -579,8 +791,12 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         findings: Vec<FindingV1>,
         approval: Option<ApprovalV1>,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
-        require_role(context, AuthorityRole::Qa)?;
-        require_tenant(context, tenant_id)?;
+        let review_authority = self.require_current_authority(
+            context,
+            tenant_id,
+            AuthorityRole::Qa,
+            "record_review_bundle",
+        )?;
         let command_digest = command_digest(
             context,
             &(
@@ -592,9 +808,7 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         {
             return Ok(receipt);
         }
-        if review.reviewer.principal_id != context.principal.principal_id
-            || review.reviewer.authority_generation != context.principal.authority_generation
-        {
+        if review.reviewer != review_authority.principal {
             return Err(DeliveryError::AuthorityDenied(
                 "reviewer is not the authenticated QA authority".to_string(),
             ));
@@ -612,16 +826,41 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
             .candidates
             .get(&plan.candidate.id)
             .ok_or_else(|| DeliveryError::CorruptStore("candidate missing".to_string()))?;
+        let graph = aggregate
+            .evidence_graphs
+            .get(run_id)
+            .ok_or_else(|| DeliveryError::MissingEvidence("QA evidence graph".to_string()))?;
+        let workbench = aggregate
+            .workbench_receipts
+            .get(&graph.workbench_receipt.id)
+            .ok_or_else(|| DeliveryError::MissingEvidence("workbench receipt".to_string()))?;
+        let terminal_pass = run.state == QaRunState::CompletedPass
+            && run.harness_outcome == Some(QaHarnessOutcome::Pass);
+        let terminal_fail = matches!(
+            (run.state, run.harness_outcome),
+            (QaRunState::CompletedFail, Some(QaHarnessOutcome::Fail))
+                | (QaRunState::HarnessError, Some(QaHarnessOutcome::Error))
+        );
         if candidate
             .implementer_principal_ids
             .contains(&context.principal.principal_id)
+            || (!terminal_pass && !terminal_fail)
             || review.candidate != plan.candidate
             || test_run.candidate != plan.candidate
             || test_run.qa_plan != run.plan
+            || test_run.runner_receipt.id != workbench.invocation.id
+            || test_run.runner_receipt.generation != workbench.invocation.generation
+            || test_run.runner_receipt.digest != workbench.receipt_digest
+            || test_run.result_inventory_digest != workbench.result_inventory_digest
+            || test_run.logs_digest != workbench.logs_digest
+            || test_run.screenshots_digest != workbench.screenshots_digest
             || findings
                 .iter()
                 .any(|finding| finding.candidate != plan.candidate)
-            || review.approved != test_run.passed
+            || review.findings_digest
+                != ContentDigest::of_domain("qa-findings", DELIVERY_SCHEMA_V1, &findings)?
+            || review.approved != terminal_pass
+            || test_run.passed != terminal_pass
         {
             return Err(DeliveryError::StaleEvidence(
                 "review bundle is self-authored, inconsistent, or bound to another candidate"
@@ -629,15 +868,18 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
             ));
         }
         if let Some(approval) = &approval {
-            if !review.approved
+            if !terminal_pass
                 || approval.candidate != plan.candidate
-                || approval.approver.principal_id != context.principal.principal_id
-                || approval.approver.authority_generation != context.principal.authority_generation
+                || approval.approver != review_authority.principal
             {
                 return Err(DeliveryError::AuthorityDenied(
                     "approval is not an independent exact-candidate QA approval".to_string(),
                 ));
             }
+        } else if terminal_pass {
+            return Err(DeliveryError::MissingEvidence(
+                "passing review requires an independent approval".to_string(),
+            ));
         }
         if aggregate
             .reviews
@@ -707,8 +949,12 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         manifest: ReleaseManifestV1,
         mut release: ReleaseV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
-        require_role(context, AuthorityRole::ReleaseManager)?;
-        require_tenant(context, tenant_id)?;
+        let release_authority = self.require_current_authority(
+            context,
+            tenant_id,
+            AuthorityRole::ReleaseManager,
+            "promote",
+        )?;
         let command_digest = command_digest(
             context,
             &(tenant_id, project_id, candidate_id, &manifest, &release),
@@ -716,7 +962,6 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         if let Some(receipt) = self.existing(context, "promote", tenant_id, &command_digest)? {
             return Ok(receipt);
         }
-        self.require_integration()?;
         let mut aggregate = self.required_aggregate(tenant_id, project_id)?;
         let candidate = aggregate
             .candidates
@@ -731,8 +976,7 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
             || manifest.candidate.id != candidate.candidate_id
             || manifest.candidate.generation != candidate.generation
             || manifest.candidate.digest != candidate.candidate_digest
-            || manifest.release_actor.principal_id != context.principal.principal_id
-            || manifest.release_actor.authority_generation != context.principal.authority_generation
+            || manifest.release_actor != release_authority.principal
         {
             return Err(DeliveryError::StaleEvidence(
                 "manifest or release authority is stale, self-authored, or differently digested"
@@ -773,14 +1017,66 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
             || release.manifest.generation != manifest.generation
             || release.manifest.digest != manifest.manifest_digest
             || release.state != ReleaseState::Approved
+            || release.rollout_receipt.is_some()
         {
             return Err(DeliveryError::Validation(
                 "release does not reference the immutable approved manifest".to_string(),
             ));
         }
+        if aggregate.manifests.contains_key(&manifest.manifest_id)
+            || aggregate.releases.contains_key(&release.release_id)
+        {
+            return Err(DeliveryError::Conflict(
+                "manifest and release IDs are immutable and cannot be reused".to_string(),
+            ));
+        }
+        let effect_request = DeliveryEffectRequestV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            kind: DeliveryEffectKind::Rollout,
+            tenant_id: tenant_id.to_string(),
+            project: candidate.project.clone(),
+            candidate: Some(manifest.candidate.clone()),
+            subject: release.manifest.clone(),
+            actor_authority_receipt_digest: release_authority.receipt_digest.clone(),
+            request_digest: ContentDigest::zero(),
+        }
+        .seal()?;
+        let effect_receipt = self.effects.apply(&effect_request)?;
+        validate_effect_receipt(
+            &effect_request,
+            &effect_receipt,
+            &release_authority,
+            context.now_ms,
+        )?;
+        let authority_after = self.require_current_authority(
+            context,
+            tenant_id,
+            AuthorityRole::ReleaseManager,
+            "promote",
+        )?;
+        if authority_after != release_authority {
+            return Err(DeliveryError::StaleEvidence(
+                "release authority changed between rollout and local adoption".to_string(),
+            ));
+        }
+        let authority_after_effect =
+            self.integration
+                .candidate_authority(&CandidateAuthorityQueryV1 {
+                    tenant_id: tenant_id.to_string(),
+                    agreement: candidate.agreement.clone(),
+                    project: candidate.project.clone(),
+                    work_items_digest: candidate.work_items_digest.clone(),
+                    candidate_digest: candidate.candidate_digest.clone(),
+                })?;
+        if authority_after_effect != authority {
+            return Err(DeliveryError::StaleEvidence(
+                "candidate authority changed between rollout and local adoption".to_string(),
+            ));
+        }
         transition_release(release.state, ReleaseState::Active)?;
         release.state = ReleaseState::Active;
         release.activated_at_ms = Some(context.now_ms);
+        release.rollout_receipt = Some(effect_receipt.effect_ref);
         if let Some(previous_id) = aggregate.active_release_id.clone() {
             let previous = aggregate
                 .releases
@@ -826,8 +1122,12 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         project_id: &str,
         mut receipt: DeliveryReceiptV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
-        require_role(context, AuthorityRole::ReleaseManager)?;
-        require_tenant(context, &receipt.tenant_id)?;
+        self.require_current_authority(
+            context,
+            &receipt.tenant_id,
+            AuthorityRole::ReleaseManager,
+            "issue_delivery",
+        )?;
         let command_digest = command_digest(context, &(project_id, &receipt))?;
         if let Some(existing) = self.existing(
             context,
@@ -852,7 +1152,8 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
             .ok_or_else(|| DeliveryError::NotFound(format!("release {}", receipt.release.id)))?;
         if release.state != ReleaseState::Active
             || release.generation != receipt.release.generation
-            || receipt.release.digest != ContentDigest::of(release)?
+            || receipt.release.digest
+                != ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, release)?
         {
             return Err(DeliveryError::StaleEvidence(
                 "delivery is not bound to the active release".to_string(),
@@ -894,11 +1195,15 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         context: &CommandContextV1,
         tenant_id: &str,
         project_id: &str,
-        feedback: CustomerFeedbackV1,
+        mut feedback: CustomerFeedbackV1,
         acceptance: Option<AcceptanceV1>,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
-        require_role(context, AuthorityRole::Customer)?;
-        require_tenant(context, tenant_id)?;
+        let customer_authority = self.require_current_authority(
+            context,
+            tenant_id,
+            AuthorityRole::Customer,
+            "customer_action",
+        )?;
         let command_digest =
             command_digest(context, &(tenant_id, project_id, &feedback, &acceptance))?;
         if let Some(existing) =
@@ -906,8 +1211,7 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         {
             return Ok(existing);
         }
-        if feedback.customer.principal_id != context.principal.principal_id
-            || feedback.customer.authority_generation != context.principal.authority_generation
+        if feedback.customer != customer_authority.principal
             || feedback.schema_version != super::schema::DELIVERY_SCHEMA_V1
             || feedback.created_at_ms != context.now_ms
             || feedback.feedback_digest != feedback.computed_digest()?
@@ -917,25 +1221,75 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
             ));
         }
         let mut aggregate = self.required_aggregate(tenant_id, project_id)?;
-        let delivery = aggregate
+        let delivery_snapshot = aggregate
             .deliveries
-            .get_mut(&feedback.delivery.id)
-            .ok_or_else(|| DeliveryError::NotFound(format!("delivery {}", feedback.delivery.id)))?;
-        if delivery.customer_principal_id != context.principal.principal_id
-            || delivery.generation != feedback.delivery.generation
-            || delivery.receipt_digest != feedback.delivery.digest
-            || delivery.expires_at_ms <= context.now_ms
-            || delivery.state != DeliveryState::Delivered
+            .get(&feedback.delivery.id)
+            .ok_or_else(|| DeliveryError::NotFound(format!("delivery {}", feedback.delivery.id)))?
+            .clone();
+        if delivery_snapshot.customer_principal_id != context.principal.principal_id
+            || delivery_snapshot.generation != feedback.delivery.generation
+            || delivery_snapshot.receipt_digest != feedback.delivery.digest
+            || delivery_snapshot.expires_at_ms <= context.now_ms
+            || delivery_snapshot.state != DeliveryState::Delivered
         {
             return Err(DeliveryError::AuthorityDenied(
                 "delivery is expired, already terminal, or belongs to another customer".to_string(),
             ));
+        }
+        if feedback.action == CustomerAction::RequestChanges {
+            if !feedback.requested_work_item_refs.is_empty() {
+                return Err(DeliveryError::Validation(
+                    "caller may not supply governed rework authority data".to_string(),
+                ));
+            }
+            let release = aggregate
+                .releases
+                .get(&delivery_snapshot.release.id)
+                .ok_or_else(|| {
+                    DeliveryError::CorruptStore("delivery release missing".to_string())
+                })?;
+            let manifest = aggregate
+                .manifests
+                .get(&release.manifest.id)
+                .ok_or_else(|| {
+                    DeliveryError::CorruptStore("release manifest missing".to_string())
+                })?;
+            let request = DeliveryEffectRequestV1 {
+                schema_version: DELIVERY_SCHEMA_V1,
+                kind: DeliveryEffectKind::GovernedRework,
+                tenant_id: tenant_id.to_string(),
+                project: manifest.project.clone(),
+                candidate: Some(manifest.candidate.clone()),
+                subject: feedback.delivery.clone(),
+                actor_authority_receipt_digest: customer_authority.receipt_digest.clone(),
+                request_digest: ContentDigest::zero(),
+            }
+            .seal()?;
+            let receipt = self.effects.apply(&request)?;
+            validate_effect_receipt(&request, &receipt, &customer_authority, context.now_ms)?;
+            let authority_after = self.require_current_authority(
+                context,
+                tenant_id,
+                AuthorityRole::Customer,
+                "customer_action",
+            )?;
+            if authority_after != customer_authority {
+                return Err(DeliveryError::StaleEvidence(
+                    "customer authority changed between rework effect and adoption".to_string(),
+                ));
+            }
+            feedback.requested_work_item_refs = vec![receipt.effect_ref];
+            feedback = feedback.seal()?;
         }
         let next = match feedback.action {
             CustomerAction::Accept => DeliveryState::Accepted,
             CustomerAction::Reject => DeliveryState::Rejected,
             CustomerAction::RequestChanges => DeliveryState::ChangesRequested,
         };
+        let delivery = aggregate
+            .deliveries
+            .get_mut(&feedback.delivery.id)
+            .ok_or_else(|| DeliveryError::NotFound(format!("delivery {}", feedback.delivery.id)))?;
         transition_delivery(delivery.state, next)?;
         delivery.state = next;
         match feedback.action {
@@ -944,9 +1298,7 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
                     DeliveryError::MissingEvidence("explicit customer acceptance".to_string())
                 })?;
                 if acceptance.schema_version != super::schema::DELIVERY_SCHEMA_V1
-                    || acceptance.customer.principal_id != context.principal.principal_id
-                    || acceptance.customer.authority_generation
-                        != context.principal.authority_generation
+                    || acceptance.customer != customer_authority.principal
                     || acceptance.delivery != feedback.delivery
                     || acceptance.release.id != delivery.release.id
                     || acceptance.accepted_at_ms != context.now_ms
@@ -965,11 +1317,6 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
                         "acceptance ID already exists".to_string(),
                     ));
                 }
-            }
-            CustomerAction::RequestChanges if feedback.requested_work_item_refs.is_empty() => {
-                return Err(DeliveryError::MissingEvidence(
-                    "request changes requires authoritative linked work items".to_string(),
-                ));
             }
             _ if acceptance.is_some() => {
                 return Err(DeliveryError::Validation(
@@ -1011,22 +1358,25 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         context: &CommandContextV1,
         tenant_id: &str,
         project_id: &str,
-        rollback: RollbackV1,
+        mut rollback: RollbackV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
-        require_role(context, AuthorityRole::ReleaseManager)?;
-        require_tenant(context, tenant_id)?;
+        let rollback_authority = self.require_current_authority(
+            context,
+            tenant_id,
+            AuthorityRole::ReleaseManager,
+            "rollback",
+        )?;
         let command_digest = command_digest(context, &(tenant_id, project_id, &rollback))?;
         if let Some(existing) = self.existing(context, "rollback", tenant_id, &command_digest)? {
             return Ok(existing);
         }
-        if rollback.actor.principal_id != context.principal.principal_id
-            || rollback.actor.authority_generation != context.principal.authority_generation
+        if rollback.actor != rollback_authority.principal
             || rollback.schema_version != super::schema::DELIVERY_SCHEMA_V1
             || rollback.from_release.id == rollback.to_release.id
             || rollback.from_release.digest == ContentDigest::zero()
             || rollback.to_release.digest == ContentDigest::zero()
             || rollback.reason_digest == ContentDigest::zero()
-            || rollback.effect_receipt.digest == ContentDigest::zero()
+            || rollback.effect_receipt.is_some()
             || rollback.created_at_ms != context.now_ms
         {
             return Err(DeliveryError::AuthorityDenied(
@@ -1039,12 +1389,67 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
                 "rollback source is not the active release".to_string(),
             ));
         }
+        let from_snapshot = aggregate
+            .releases
+            .get(&rollback.from_release.id)
+            .ok_or_else(|| DeliveryError::NotFound("rollback source release".to_string()))?;
+        let to_snapshot = aggregate
+            .releases
+            .get(&rollback.to_release.id)
+            .ok_or_else(|| DeliveryError::NotFound("rollback target release".to_string()))?;
+        if ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, from_snapshot)?
+            != rollback.from_release.digest
+            || ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, to_snapshot)?
+                != rollback.to_release.digest
+        {
+            return Err(DeliveryError::StaleEvidence(
+                "rollback release digest mismatch".to_string(),
+            ));
+        }
+        let from_manifest = aggregate
+            .manifests
+            .get(&from_snapshot.manifest.id)
+            .ok_or_else(|| {
+                DeliveryError::MissingEvidence("rollback source manifest".to_string())
+            })?;
+        let effect_request = DeliveryEffectRequestV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            kind: DeliveryEffectKind::Rollback,
+            tenant_id: tenant_id.to_string(),
+            project: from_manifest.project.clone(),
+            candidate: Some(from_manifest.candidate.clone()),
+            subject: rollback.from_release.clone(),
+            actor_authority_receipt_digest: rollback_authority.receipt_digest.clone(),
+            request_digest: ContentDigest::zero(),
+        }
+        .seal()?;
+        let effect_receipt = self.effects.apply(&effect_request)?;
+        validate_effect_receipt(
+            &effect_request,
+            &effect_receipt,
+            &rollback_authority,
+            context.now_ms,
+        )?;
+        let authority_after = self.require_current_authority(
+            context,
+            tenant_id,
+            AuthorityRole::ReleaseManager,
+            "rollback",
+        )?;
+        if authority_after != rollback_authority {
+            return Err(DeliveryError::StaleEvidence(
+                "release authority changed between rollback effect and adoption".to_string(),
+            ));
+        }
+        rollback.effect_receipt = Some(effect_receipt.effect_ref);
         {
             let from = aggregate
                 .releases
                 .get_mut(&rollback.from_release.id)
                 .ok_or_else(|| DeliveryError::NotFound("rollback source release".to_string()))?;
-            if ContentDigest::of(&*from)? != rollback.from_release.digest {
+            if ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, &*from)?
+                != rollback.from_release.digest
+            {
                 return Err(DeliveryError::StaleEvidence(
                     "rollback source digest mismatch".to_string(),
                 ));
@@ -1057,7 +1462,9 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
                 .releases
                 .get_mut(&rollback.to_release.id)
                 .ok_or_else(|| DeliveryError::NotFound("rollback target release".to_string()))?;
-            if ContentDigest::of(&*to)? != rollback.to_release.digest {
+            if ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, &*to)?
+                != rollback.to_release.digest
+            {
                 return Err(DeliveryError::StaleEvidence(
                     "rollback target digest mismatch".to_string(),
                 ));
@@ -1100,33 +1507,32 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         context: &CommandContextV1,
         tenant_id: &str,
         project_id: &str,
-        closeout: ProjectCloseoutV1,
+        mut closeout: ProjectCloseoutV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
-        require_role(context, AuthorityRole::ReleaseManager)?;
-        require_tenant(context, tenant_id)?;
+        let closeout_authority = self.require_current_authority(
+            context,
+            tenant_id,
+            AuthorityRole::ReleaseManager,
+            "closeout",
+        )?;
         let command_digest = command_digest(context, &(tenant_id, project_id, &closeout))?;
         if let Some(existing) = self.existing(context, "closeout", tenant_id, &command_digest)? {
             return Ok(existing);
         }
         if closeout.schema_version != super::schema::DELIVERY_SCHEMA_V1
             || closeout.project.id != project_id
-            || closeout.closed_by.principal_id != context.principal.principal_id
-            || closeout.closed_by.authority_generation != context.principal.authority_generation
+            || closeout.closed_by != closeout_authority.principal
             || closeout.created_at_ms != context.now_ms
             || closeout.decisions_digest == ContentDigest::zero()
             || closeout.artifact_inventory_digest == ContentDigest::zero()
             || closeout.failures_digest == ContentDigest::zero()
             || closeout.lessons_digest == ContentDigest::zero()
-            || closeout
-                .memory_publication
-                .as_ref()
-                .is_none_or(|receipt| receipt.digest == ContentDigest::zero())
+            || closeout.memory_publication.is_some()
         {
-            return Err(DeliveryError::AdapterUnavailable {
-                dependency: "closeout_memory",
-                reason: "a current authoritative #695/NMDA publication receipt is required"
+            return Err(DeliveryError::Validation(
+                "closeout input must be complete and may not self-attest memory publication"
                     .to_string(),
-            });
+            ));
         }
         let mut aggregate = self.required_aggregate(tenant_id, project_id)?;
         let acceptance = aggregate
@@ -1141,6 +1547,44 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
                 "closeout acceptance is stale or differently digested".to_string(),
             ));
         }
+        let accepted_release = aggregate
+            .releases
+            .get(&closeout.accepted_release.id)
+            .ok_or_else(|| DeliveryError::MissingEvidence("accepted release".to_string()))?;
+        let manifest = aggregate
+            .manifests
+            .get(&accepted_release.manifest.id)
+            .ok_or_else(|| DeliveryError::MissingEvidence("accepted manifest".to_string()))?;
+        let effect_request = DeliveryEffectRequestV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            kind: DeliveryEffectKind::MemoryPublication,
+            tenant_id: tenant_id.to_string(),
+            project: closeout.project.clone(),
+            candidate: Some(manifest.candidate.clone()),
+            subject: closeout.accepted_release.clone(),
+            actor_authority_receipt_digest: closeout_authority.receipt_digest.clone(),
+            request_digest: ContentDigest::zero(),
+        }
+        .seal()?;
+        let effect_receipt = self.effects.apply(&effect_request)?;
+        validate_effect_receipt(
+            &effect_request,
+            &effect_receipt,
+            &closeout_authority,
+            context.now_ms,
+        )?;
+        let authority_after = self.require_current_authority(
+            context,
+            tenant_id,
+            AuthorityRole::ReleaseManager,
+            "closeout",
+        )?;
+        if authority_after != closeout_authority {
+            return Err(DeliveryError::StaleEvidence(
+                "release authority changed between memory publication and closeout".to_string(),
+            ));
+        }
+        closeout.memory_publication = Some(effect_receipt.effect_ref);
         if aggregate
             .closeouts
             .insert(closeout.closeout_id.clone(), closeout.clone())
@@ -1178,24 +1622,104 @@ impl<I: DeliveryIntegrationPort> DeliveryCore<I> {
         for entry in pending {
             let receipt = publisher.publish(&entry.request)?;
             self.store
-                .mark_published(&entry.request.payload_digest, receipt)?;
+                .mark_published(&entry.request.request_digest, receipt)?;
             published += 1;
         }
         Ok(published)
     }
 
-    pub fn store(&self) -> &DeliveryStore {
+    pub fn store(&self) -> &S {
         &self.store
     }
 
-    fn require_integration(&self) -> Result<(), DeliveryError> {
+    fn require_integration(&self) -> Result<(u16, u64, ContentDigest), DeliveryError> {
         match self.integration.readiness() {
-            AdapterReadiness::Ready { .. } => Ok(()),
+            AdapterReadiness::Ready {
+                contract_version,
+                authority_generation,
+                contract_digest,
+            } if contract_version == DELIVERY_SCHEMA_V1
+                && authority_generation > 0
+                && contract_digest == expected_integration_contract_digest() =>
+            {
+                Ok((contract_version, authority_generation, contract_digest))
+            }
+            AdapterReadiness::Ready { .. } => Err(DeliveryError::StaleEvidence(
+                "integration adapter contract version, generation, or digest is not current"
+                    .to_string(),
+            )),
             AdapterReadiness::Unavailable { reason } => Err(DeliveryError::AdapterUnavailable {
                 dependency: "delivery_integration",
                 reason,
             }),
         }
+    }
+
+    fn require_current_authority(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        role: AuthorityRole,
+        operation: &str,
+    ) -> Result<AuthorityReceiptV1, DeliveryError> {
+        require_tenant(context, tenant_id)?;
+        require_role(context, role.clone())?;
+        self.current_authority_for(
+            &context.principal,
+            tenant_id,
+            role,
+            operation,
+            context.now_ms,
+        )
+    }
+
+    fn current_authority_for(
+        &self,
+        principal: &PrincipalV1,
+        tenant_id: &str,
+        role: AuthorityRole,
+        operation: &str,
+        now_ms: u64,
+    ) -> Result<AuthorityReceiptV1, DeliveryError> {
+        require_principal_role(principal, role.clone())?;
+        if principal.tenant_id != tenant_id {
+            return Err(DeliveryError::AuthorityDenied(
+                "cross-tenant authority denied".to_string(),
+            ));
+        }
+        let (contract_version, contract_authority_generation, contract_digest) =
+            self.require_integration()?;
+        let request = AuthorityValidationRequestV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            tenant_id: tenant_id.to_string(),
+            principal_id: principal.principal_id.clone(),
+            claimed_authority_generation: principal.authority_generation,
+            required_role: role.clone(),
+            operation: operation.to_string(),
+            contract_version,
+            contract_digest: contract_digest.clone(),
+            request_digest: ContentDigest::zero(),
+        }
+        .seal()?;
+        let receipt = self.integration.authorize(&request)?;
+        if receipt.schema_version != DELIVERY_SCHEMA_V1
+            || receipt.receipt_digest != receipt.computed_digest()?
+            || receipt.request_digest != request.request_digest
+            || receipt.principal != *principal
+            || !receipt.principal.has_role(role)
+            || receipt.contract_version != contract_version
+            || receipt.contract_authority_generation != contract_authority_generation
+            || receipt.contract_digest != contract_digest
+            || receipt.issued_at_ms > now_ms
+            || receipt.expires_at_ms <= now_ms
+            || receipt.issuer.is_empty()
+        {
+            return Err(DeliveryError::StaleEvidence(
+                "authenticated authority receipt is missing, stale, revoked, or mismatched"
+                    .to_string(),
+            ));
+        }
+        Ok(receipt)
     }
 
     fn required_aggregate(
@@ -1255,12 +1779,16 @@ fn command_digest<T: Serialize>(
     context: &CommandContextV1,
     payload: &T,
 ) -> Result<ContentDigest, DeliveryError> {
-    ContentDigest::of(&(
-        &context.principal.tenant_id,
-        &context.principal.principal_id,
-        context.principal.authority_generation,
-        payload,
-    ))
+    ContentDigest::of_domain(
+        "delivery-command",
+        DELIVERY_SCHEMA_V1,
+        &(
+            &context.principal.tenant_id,
+            &context.principal.principal_id,
+            context.principal.authority_generation,
+            payload,
+        ),
+    )
 }
 
 fn require_tenant(context: &CommandContextV1, tenant_id: &str) -> Result<(), DeliveryError> {
@@ -1306,6 +1834,266 @@ pub fn versioned_ref<T: Serialize>(
     Ok(VersionedRefV1 {
         id: id.into(),
         generation,
-        digest: ContentDigest::of(value)?,
+        digest: ContentDigest::of_domain("versioned-ref", DELIVERY_SCHEMA_V1, value)?,
     })
+}
+
+pub fn qa_evidence_inventory_digest(
+    graph: &QaEvidenceGraphV1,
+) -> Result<ContentDigest, DeliveryError> {
+    ContentDigest::of_domain(
+        "qa-evidence-inventory",
+        DELIVERY_SCHEMA_V1,
+        &(
+            &graph.dataset_cases,
+            &graph.case_results,
+            &graph.deterministic_results,
+            &graph.model_results,
+            &graph.flake_dispositions,
+        ),
+    )
+}
+
+pub fn qa_case_inventory_digest(graph: &QaEvidenceGraphV1) -> Result<ContentDigest, DeliveryError> {
+    ContentDigest::of_domain(
+        "qa-case-inventory",
+        DELIVERY_SCHEMA_V1,
+        &(&graph.dataset_cases, &graph.case_results),
+    )
+}
+
+pub fn qa_deterministic_evidence_digest(
+    graph: &QaEvidenceGraphV1,
+) -> Result<ContentDigest, DeliveryError> {
+    ContentDigest::of_domain(
+        "qa-deterministic-evidence",
+        DELIVERY_SCHEMA_V1,
+        &graph.deterministic_results,
+    )
+}
+
+pub fn qa_model_evidence_digest(
+    graph: &QaEvidenceGraphV1,
+) -> Result<Option<ContentDigest>, DeliveryError> {
+    if graph.model_results.is_empty() {
+        Ok(None)
+    } else {
+        ContentDigest::of_domain(
+            "qa-model-evidence-inventory",
+            DELIVERY_SCHEMA_V1,
+            &graph.model_results,
+        )
+        .map(Some)
+    }
+}
+
+pub fn qa_flake_disposition_digest(
+    graph: &QaEvidenceGraphV1,
+) -> Result<Option<ContentDigest>, DeliveryError> {
+    if graph.flake_dispositions.is_empty() {
+        Ok(None)
+    } else {
+        ContentDigest::of_domain(
+            "qa-flake-disposition-inventory",
+            DELIVERY_SCHEMA_V1,
+            &graph.flake_dispositions,
+        )
+        .map(Some)
+    }
+}
+
+pub fn qa_source_evidence_digest(
+    graph: &QaEvidenceGraphV1,
+) -> Result<ContentDigest, DeliveryError> {
+    let sources: Vec<_> = graph
+        .dataset_cases
+        .iter()
+        .flat_map(|case| case.provenance.iter())
+        .chain(
+            graph
+                .case_results
+                .iter()
+                .flat_map(|result| result.sources.iter()),
+        )
+        .collect();
+    ContentDigest::of_domain("qa-source-evidence", DELIVERY_SCHEMA_V1, &sources)
+}
+
+fn validate_evidence_graph(
+    plan: &QaEvaluationPlanV1,
+    run_ref: &VersionedRefV1,
+    graph: &QaEvidenceGraphV1,
+) -> Result<(), DeliveryError> {
+    let case_ids: BTreeSet<_> = graph
+        .dataset_cases
+        .iter()
+        .map(|case| case.case_id.as_str())
+        .collect();
+    if plan
+        .required_case_ids
+        .iter()
+        .any(|case_id| !case_ids.contains(case_id.as_str()))
+        || graph.dataset_cases.iter().any(|case| {
+            case.schema_version != DELIVERY_SCHEMA_V1
+                || (!plan.required_case_ids.contains(&case.case_id)
+                    && !plan.optional_case_ids.contains(&case.case_id))
+                || case.required != plan.required_case_ids.contains(&case.case_id)
+        })
+    {
+        return Err(DeliveryError::MissingEvidence(
+            "dataset inventory does not cover the exact QA plan".to_string(),
+        ));
+    }
+    let result_case_ids: BTreeSet<_> = graph
+        .case_results
+        .iter()
+        .map(|result| result.case_ref.id.as_str())
+        .collect();
+    if plan
+        .required_case_ids
+        .iter()
+        .any(|case_id| !result_case_ids.contains(case_id.as_str()))
+    {
+        return Err(DeliveryError::MissingEvidence(
+            "required QA case result is missing".to_string(),
+        ));
+    }
+    for result in &graph.case_results {
+        let case = graph
+            .dataset_cases
+            .iter()
+            .find(|case| case.case_id == result.case_ref.id)
+            .ok_or_else(|| DeliveryError::MissingEvidence("dataset case".to_string()))?;
+        let case_digest = ContentDigest::of_domain("qa-dataset-case", DELIVERY_SCHEMA_V1, case)?;
+        if result.schema_version != DELIVERY_SCHEMA_V1
+            || result.run != *run_ref
+            || result.case_ref.generation != case.generation
+            || result.case_ref.digest != case_digest
+            || result.required != case.required
+        {
+            return Err(DeliveryError::StaleEvidence(
+                "case result is bound to another run or dataset case".to_string(),
+            ));
+        }
+        for assertion_ref in &result.assertion_refs {
+            let assertion = graph
+                .deterministic_results
+                .iter()
+                .find(|value| value.assertion_id == assertion_ref.id)
+                .ok_or_else(|| {
+                    DeliveryError::MissingEvidence("deterministic assertion".to_string())
+                })?;
+            if assertion_ref.generation != assertion.generation
+                || assertion_ref.digest
+                    != ContentDigest::of_domain(
+                        "qa-deterministic-result",
+                        DELIVERY_SCHEMA_V1,
+                        assertion,
+                    )?
+            {
+                return Err(DeliveryError::StaleEvidence(
+                    "deterministic assertion reference is stale".to_string(),
+                ));
+            }
+        }
+        for grader_ref in &result.grader_refs {
+            let grader = graph
+                .model_results
+                .iter()
+                .find(|value| value.evidence_id == grader_ref.id)
+                .ok_or_else(|| DeliveryError::MissingEvidence("model grader".to_string()))?;
+            if grader_ref.generation != grader.generation
+                || grader_ref.digest
+                    != ContentDigest::of_domain("qa-model-evidence", DELIVERY_SCHEMA_V1, grader)?
+            {
+                return Err(DeliveryError::StaleEvidence(
+                    "model grader reference is stale".to_string(),
+                ));
+            }
+        }
+    }
+    for disposition in &graph.flake_dispositions {
+        let result = graph
+            .case_results
+            .iter()
+            .find(|value| value.result_id == disposition.result.id)
+            .ok_or_else(|| DeliveryError::MissingEvidence("flake result".to_string()))?;
+        if disposition.result.generation != result.generation
+            || disposition.result.digest
+                != ContentDigest::of_domain("qa-case-result", DELIVERY_SCHEMA_V1, result)?
+        {
+            return Err(DeliveryError::StaleEvidence(
+                "flake disposition references another result".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_evidence_outcome(
+    receipt: &WorkbenchEvidenceReceiptV1,
+    graph: &QaEvidenceGraphV1,
+) -> Result<(), DeliveryError> {
+    let required: Vec<_> = graph
+        .case_results
+        .iter()
+        .filter(|result| result.required)
+        .collect();
+    let legal = match receipt.harness_outcome {
+        QaHarnessOutcome::Pass => {
+            receipt.required_cases_complete
+                && !receipt.contaminated
+                && !receipt.needs_human_review
+                && !receipt.flaky_unresolved
+                && required
+                    .iter()
+                    .all(|result| result.outcome == QaCaseOutcome::Pass)
+        }
+        QaHarnessOutcome::Fail => {
+            receipt.required_cases_complete
+                && required.iter().any(|result| {
+                    matches!(
+                        result.outcome,
+                        QaCaseOutcome::Fail
+                            | QaCaseOutcome::NeedsHumanReview
+                            | QaCaseOutcome::FlakyUnresolved
+                    )
+                })
+        }
+        QaHarnessOutcome::Error => required
+            .iter()
+            .any(|result| result.outcome == QaCaseOutcome::Error),
+    };
+    if !legal {
+        return Err(DeliveryError::MissingEvidence(
+            "workbench summary and persisted case-result graph are inconsistent".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_effect_receipt(
+    request: &DeliveryEffectRequestV1,
+    receipt: &super::ports::DeliveryEffectReceiptV1,
+    authority: &AuthorityReceiptV1,
+    now_ms: u64,
+) -> Result<(), DeliveryError> {
+    if receipt.schema_version != DELIVERY_SCHEMA_V1
+        || receipt.receipt_digest != receipt.computed_digest()?
+        || receipt.kind != request.kind
+        || receipt.tenant_id != request.tenant_id
+        || receipt.project != request.project
+        || receipt.candidate != request.candidate
+        || receipt.request_digest != request.request_digest
+        || receipt.actor_authority_receipt_digest != authority.receipt_digest
+        || receipt.effect_ref.digest == ContentDigest::zero()
+        || receipt.effect_ref.generation == 0
+        || receipt.issuer.is_empty()
+        || receipt.issued_at_ms > now_ms
+    {
+        return Err(DeliveryError::StaleEvidence(
+            "external effect receipt is absent, stale, ambiguous, or differently bound".to_string(),
+        ));
+    }
+    Ok(())
 }

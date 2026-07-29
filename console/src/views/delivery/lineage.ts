@@ -23,10 +23,18 @@ export interface DeliveryLineageEdge {
   to: string;
 }
 
-export interface DeliveryLineageSnapshot {
+/**
+ * Public DTO for the isolated #696 scaffold.
+ *
+ * The future authenticated server adapter must construct this DTO after
+ * tenant authorization and redaction. Raw aggregate snapshots, tenant IDs,
+ * prompts, credentials, private artifact content and infrastructure
+ * identifiers are deliberately not representable here.
+ */
+export interface PublicDeliveryLineageDto {
   schemaVersion: 1;
-  tenantId: string;
-  projectId: string;
+  serverRedacted: true;
+  projectLabel: string;
   revision: number;
   nodes: DeliveryLineageNode[];
   edges: DeliveryLineageEdge[];
@@ -36,14 +44,15 @@ export interface DeliveryLineageSnapshot {
 }
 
 const SHA256 = /^[a-f0-9]{64}$/;
-const SENSITIVE_ASSIGNMENT = /\b(secret|token|password|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi;
-const INTERNAL_ADDRESS = /\b10\.(?:\d{1,3}\.){2}\d{1,3}\b/g;
-const INTERNAL_PATH = /\/(?:home|work|tmp)\/[^\s,;]+/g;
+const FORBIDDEN_PUBLIC_TEXT =
+  /\b(secret|token|password|api[_-]?key)\s*[:=]|\b10\.(?:\d{1,3}\.){2}\d{1,3}\b|\/(?:home|work|tmp)\//i;
 
-export function validateLineage(snapshot: DeliveryLineageSnapshot): string[] {
+export function validateLineage(snapshot: PublicDeliveryLineageDto): string[] {
   const failures: string[] = [];
   if (snapshot.schemaVersion !== 1) failures.push("unsupported schema");
-  if (!snapshot.tenantId || !snapshot.projectId) failures.push("missing authority scope");
+  if (snapshot.serverRedacted !== true || !snapshot.projectLabel) {
+    failures.push("missing server-redacted DTO marker");
+  }
   if (!Number.isSafeInteger(snapshot.revision) || snapshot.revision < 0) {
     failures.push("invalid revision");
   }
@@ -66,32 +75,17 @@ export function validateLineage(snapshot: DeliveryLineageSnapshot): string[] {
       failures.push(`dangling edge: ${edge.from}->${edge.to}`);
     }
   }
+  const publicText = [
+    snapshot.projectLabel,
+    ...snapshot.nodes.flatMap((node) => [node.label, node.state, node.actorRole]),
+    ...snapshot.blockers,
+  ];
+  if (publicText.some((value) => FORBIDDEN_PUBLIC_TEXT.test(value))) {
+    failures.push("forbidden sensitive or internal text");
+  }
   return failures;
 }
 
 export function shortDigest(value: string): string {
   return SHA256.test(value) ? `${value.slice(0, 10)}...${value.slice(-6)}` : "invalid";
-}
-
-export function publicLineage(snapshot: DeliveryLineageSnapshot): DeliveryLineageSnapshot {
-  return {
-    ...snapshot,
-    tenantId: "redacted",
-    projectId: scrubPublicText(snapshot.projectId),
-    nodes: snapshot.nodes.map((node) => ({
-      ...node,
-      label: scrubPublicText(node.label),
-      state: scrubPublicText(node.state),
-      actorRole: scrubPublicText(node.actorRole),
-    })),
-    blockers: snapshot.blockers.map(scrubPublicText),
-  };
-}
-
-function scrubPublicText(value: string): string {
-  return value
-    .trim()
-    .replace(SENSITIVE_ASSIGNMENT, "$1=[redacted]")
-    .replace(INTERNAL_ADDRESS, "[internal-address]")
-    .replace(INTERNAL_PATH, "[internal-path]");
 }

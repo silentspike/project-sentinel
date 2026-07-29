@@ -17,9 +17,11 @@ claim as QA evidence, or let one principal span implementation, QA, release, and
 customer authority.
 
 Every durable record is tenant- and project-scoped, versioned, generation-bound,
-and digest-bound. A caller supplies an authenticated `PrincipalV1`; the
-productive API adapter must derive it from its authenticated server-side
-principal. The core never accepts a free-form role string as authority.
+and digest-bound. The dependency-independent tests supply `PrincipalV1`, but
+productive callers may not: the future authenticated API adapter must derive the
+principal and roles server-side, then obtain an opaque current-authority receipt
+immediately before every sensitive command. The core rejects receipt, adapter
+contract, tenant, role, actor, generation, digest, and validity mismatches.
 
 The dependency-independent module lives under
 `services/sentinel-daemon/src/delivery`. It deliberately does not modify the
@@ -39,15 +41,20 @@ API ownership surfaces.
   and rollback plan exist.
 
 The daemon library remains startable when productive integration is absent.
-`UnavailableDeliveryIntegration` reports typed unavailable readiness and rejects
-candidate registration or external QA execution before any delivery aggregate is
-created. Local store health and readback remain usable.
+There is no productive `DeliveryCore` constructor or runtime wiring in this
+phase. `UnavailableDeliveryIntegration` and `UnavailableDeliveryEffects` report
+typed unavailability and reject authority- or effect-dependent commands before
+local state adoption. The test-only store can still start and report health.
 
 ## 3. Canonical data contract
 
 `DELIVERY_SCHEMA_V1` identifies the first wire and persistence schema. A
-`ContentDigest` is a lowercase SHA-256 value over recursively key-sorted JSON.
-Digest fields are cleared before a record computes its own digest.
+`ContentDigest` is a lowercase SHA-256 value over recursively key-sorted JSON,
+framed with the explicit record type, schema version, and canonical-byte length.
+Persisted and wire structs reject unknown fields; lifecycle outcomes,
+case/model/flake classifications, findings, and authority roles are closed
+enums. Golden vectors prove that record or schema substitution changes the
+digest. Digest fields are cleared before a record computes its own digest.
 
 The core defines the following record families:
 
@@ -151,10 +158,12 @@ Tenant checks precede mutation. Idempotency keys are namespaced by tenant,
 principal, command kind, and caller key, preventing cross-principal and
 cross-tenant replay.
 
-## 6. Durable store and event publication
+## 6. Test persistence and productive append/publication boundary
 
-`DeliveryStore` is a dedicated redb file owned by the delivery module. It uses
-five tables:
+`DeliveryStore::open_test_only` is a deterministic redb fixture, not a
+productive trajectory, event, or publication authority. It proves the core's
+restart, CAS, idempotency, envelope, and receipt contracts without competing
+with #732 or #733. It uses five tables:
 
 | Table | Key and purpose |
 | --- | --- |
@@ -164,10 +173,17 @@ five tables:
 | `delivery_idempotency` | `tenant:principal:command:key` request/receipt binding |
 | `delivery_outbox` | event-digest keyed canonical publication request and receipt |
 
-One redb write transaction checks the expected aggregate revision and writes the
-new aggregate, journal entry, idempotency record, and outbox row. A duplicate
+One fixture write transaction checks the expected aggregate revision and writes
+the aggregate, journal entry, idempotency record, and outbox row. A duplicate
 request with the same command digest receives the original operation receipt
-with `duplicate=true`. Reusing a key with different content is a typed conflict.
+with `duplicate=true`; different content under the same
+tenant/principal/command/key namespace is a typed conflict.
+
+Productive construction stays unavailable until #732 supplies the canonical
+aggregate/expected-revision append adapter and #733 supplies the canonical
+publication-state adapter. The two narrow traits are separate even though the
+test fixture implements both. This PR makes no productive CQRS, journal, outbox,
+or event-store claim.
 
 The outbox uses a stable namespaced operation ID:
 
@@ -175,22 +191,27 @@ The outbox uses a stable namespaced operation ID:
 delivery:<tenant>:<project>:<revision>:<event-type>
 ```
 
-The publication request binds operation ID, topic, event type, canonical payload,
-and payload digest. The publisher returns operation ID, event ID, row identity,
-and payload digest. The delivery store marks only an exactly matching receipt
-published. A crash before marking leaves the row pending; the downstream
-publisher must atomically insert or read back the same digest-bound event. A
-wrong receipt never advances the local outbox.
+The publication request binds operation ID, event type, aggregate and row
+identity, exact canonical envelope bytes, envelope digest, and request digest.
+The publisher returns operation ID, event ID, aggregate/row identity, payload
+digest, and request digest. Only an exact receipt marks the matching fixture row
+published. Crash-before-publication, crash-after-publication-before-local-ACK,
+duplicate ACK, wrong-row/wrong-digest receipt, and idempotency collision remain
+recoverable or fail closed.
 
-The current module proves its local side of this contract with a deterministic
-fake. Connecting it to the repository's existing event/CQRS chain requires the
-later owned adapter and cannot be claimed by this phase.
+The test fixture's `health()` decodes every table and validates schema, aggregate
+key/revision, contiguous journal history, domain-separated envelope digest,
+journal/outbox linkage, canonical payload bytes, publication receipt, and
+idempotency receipt. Connecting this to Sentinel's event/CQRS chain is deferred
+to #732/#733.
 
 ## 7. Narrow integration port
 
 `DeliveryIntegrationPort` exposes only:
 
-- readiness with contract version, authority generation, and contract digest;
+- readiness with exact contract version, authority generation, and immutable
+  contract digest;
+- opaque principal/role current-authority validation;
 - a read-only workflow authority/currentness snapshot; and
 - execution of one stable QA workbench evidence request.
 
@@ -198,18 +219,40 @@ The authority snapshot binds agreement, project, work-item digest, current
 candidate generation/digest, participant principals, and snapshot digest.
 Promotion resolves it again so a stale candidate cannot pass on old evidence.
 
-The QA request is called outside any redb writer transaction. It binds the
-tenant, project, candidate, QA plan, and stable request digest. The receipt is
-opaque evidence from the future #694 authority and binds invocation, assignment,
-input/output, artifact ownership and cleanup.
+The QA request is called outside any writer transaction. It binds tenant,
+project, exact candidate, plan, run ID and generation, assigned QA principal and
+authority generation, current-authority receipt, stable invocation, and request
+digest. The opaque #694 receipt binds all of those plus input/output, artifact
+ownership, structured result inventory, logs, screenshots, failure summary,
+harness outcome, and cleanup. A second authority check after the effect prevents
+TOCTOU adoption after revocation or actor replacement.
 
-The productive adapter must deduplicate a request digest across process restart.
-If a crash occurs after an external result but before the local commit, replaying
-the same stable request must return the same effective receipt without rerunning
-the effect. The deterministic fake validates this boundary; productive
-exactly-once evidence remains gated on #694.
+The receipt is imported as a persisted `QaEvidenceGraphV1`: exact dataset cases,
+case results, deterministic assertions, model evidence, and flake dispositions
+are reference- and digest-validated against the terminal run. The gate derives
+its inventories from that graph; caller-supplied nonzero digest flags are not
+sufficient.
 
-## 8. QA addendum and negative contract
+The productive adapter must deduplicate the stable invocation/request across
+restart. The deterministic fake proves same-process retry and cross-run replay
+rejection only; productive crash-safe exactly-once execution remains gated on
+#694.
+
+## 8. External-effect sagas
+
+Rollout/rollback, governed #695 rework creation, and closeout memory publication
+are behind `DeliveryEffectPort`, unavailable by default. Each request binds
+tenant, project, candidate/subject, current actor-authority receipt, operation
+kind, and request digest. The trusted receipt returns an opaque effect reference
+and exact request/authority bindings.
+
+The effect happens outside the local transaction. The core then revalidates
+current authority and performs local CAS adoption. Missing, stale, cross-tenant,
+wrong-kind, wrong-project, wrong-candidate, wrong-authority, or ambiguous
+receipts cause no state transition. This is explicitly a restartable saga, not
+an atomic cross-system effect claim.
+
+## 9. QA addendum and negative contract
 
 The #717 addendum is represented in the canonical schemas. Productive evaluators
 must additionally enforce:
@@ -226,43 +269,45 @@ must additionally enforce:
 - retention/pruning cannot pass the required effect frontier;
 - restored generations must match before readiness.
 
-This core stores those bindings but intentionally does not implement a test
-runner, provider, sandbox, retention job, or #709/#710 effect engine.
+This core stores and validates the imported graph and legal pass/fail/harness
+gate matrices, but intentionally does not implement a productive runner,
+provider, sandbox, retention job, or #709/#710 effect engine.
 
-## 9. Console lineage surface
+## 10. Console lineage scaffold
 
-`DeliveryView` is a disjoint component that renders an injected
-`DeliveryLineageSnapshot`. It is not wired to a productive route in this phase
-because the authenticated API/projection seam is outside the owned scope.
+`DeliveryView` is an isolated, unreachable scaffold. It is not a product Console
+surface, is not wired into `App`, and has no API/projection adapter. Therefore
+this phase makes no AC-9 product, authentication, authorization, or browser
+security claim.
 
-Before rendering records, the component validates:
+It accepts only a narrow `PublicDeliveryLineageDto` whose type deliberately has
+no tenant ID, prompts, credentials, private artifacts, or infrastructure fields.
+The future authenticated server adapter must enforce tenant authorization and
+redact before sending this DTO; browser code is not a redaction boundary.
+Defense-in-depth validation rejects:
 
 - schema version;
-- authority scope and monotonic revision shape;
+- a missing server-redacted marker and invalid revision shape;
 - unique non-empty node IDs;
 - valid SHA-256 digests;
 - positive generations;
 - non-empty actor roles; and
 - finite non-negative costs when present; and
-- non-dangling lineage edges.
+- non-dangling lineage edges;
+- credential-shaped text, internal addresses, and local paths.
 
-Invalid snapshots fail closed instead of rendering partial authority data. The
-public view redacts the tenant identifier, credential-shaped values, internal
-addresses, and local filesystem paths. It shows only shortened digests and
-bounded per-stage cost values. It does not accept prompt text, credentials, raw
-private artifacts, or internal infrastructure identifiers.
+## 11. Recovery, backup, and retention
 
-## 10. Recovery, backup, and retention
-
-The #722 whole-product contract applies. The delivery redb store, journal,
+The #722 whole-product contract applies to the future productive #732/#733
+authority, not to the test-only redb fixture. Its canonical aggregate, journal,
 idempotency records, outbox frontier, published receipts, QA evidence
 generations, manifests, releases, deliveries, acceptances, rollback history, and
-closeouts are one recovery participant.
+closeouts form one recovery participant.
 
 Before productive activation, recovery integration must:
 
 1. fence all delivery writers;
-2. flush and record the redb generation and outbox frontier;
+2. flush and record the canonical store generation and outbox frontier;
 3. bind the delivery participant into the immutable local recovery envelope;
 4. restore the file before projection/readiness;
 5. verify schema, journal continuity, aggregate revisions, digest references,
@@ -276,7 +321,7 @@ Corrupt or unsupported schema data is fail-closed. Retention cannot delete
 evidence referenced by an active/recoverable release, delivery, acceptance,
 rollback, closeout, unpublished outbox row, or recovery frontier.
 
-## 11. Verification matrix
+## 12. Verification matrix
 
 | Criterion | Dependency-independent status |
 | --- | --- |
@@ -284,31 +329,32 @@ rollback, closeout, unpublished outbox row, or recovery frontier.
 | AC-2 independent authority | Implemented; live probes deferred |
 | AC-3 productive #694 suite | Port and fake only; productive execution deferred |
 | AC-4 missing/stale/different gate | Core negative tests cover missing approval, expiry, plan-digest substitution and incomplete evidence; broader runner matrix deferred |
-| AC-5 immutable manifest | Implemented; existing event-store adapter deferred |
-| AC-6 customer flow | Core records/transitions implemented; authenticated API/browser deferred |
-| AC-7 rework history | Linked-work-item precondition implemented; productive #695 creation deferred |
-| AC-8 rollback | Atomic, idempotent, restart-safe aggregate transition tested; productive effect rehearsal deferred |
-| AC-9 Console lineage | Disjoint validated and redacted component with bounded cost readback implemented; API/live screenshot deferred |
-| AC-10 memory closeout | Fail-closed receipt requirement and restart readback tested; productive memory path deferred |
+| AC-5 immutable manifest | Core rejects ID reuse and binds exact gate/candidate/authority; canonical #732 append deferred |
+| AC-6 customer flow | Core records/transitions implemented; authenticated API/browser and productive delivery effect deferred |
+| AC-7 rework history | Governed-rework request/receipt saga implemented with fake; productive #695 effect deferred |
+| AC-8 rollback | Receipt-gated, idempotent, restart-safe local adoption tested; productive rollout/rollback effect deferred |
+| AC-9 Console lineage | Isolated public-DTO scaffold only; product/API/live criterion OPEN |
+| AC-10 memory closeout | Receipt-gated saga and restart readback tested with fake; productive memory path deferred |
 | AC-11 Gaia oversight | No bypass surface added; productive observation deferred |
-| AC-12 restart/idempotency | Local store/outbox boundaries covered; productive adapter crash matrix deferred |
+| AC-12 restart/idempotency | Test-only store, QA retry, outbox, rollback and closeout boundaries covered; productive adapter crash matrix deferred |
 | AC-13 `.240` journey | Not authorized in this phase |
-| AC-14 canonical QA schemas | Implemented |
-| AC-15 deterministic/probabilistic split | Represented in schema; evaluator proof deferred |
+| AC-14 canonical QA schemas | Versioned closed schemas and persisted validated graph implemented; complete productive import lane deferred |
+| AC-15 deterministic/probabilistic split | Domain-separated schema and graph bindings implemented; repeated productive evaluator proof deferred |
 | AC-16 sandbox/capability enforcement | Contract fields only; #694 implementation deferred |
-| AC-17 retry/flake append-only history | Schema/lifecycle represented; productive evaluator deferred |
-| AC-18 #709/#710 effects | Stable request boundary only; integration deferred |
+| AC-17 retry/flake append-only history | Typed schema/lifecycle and exact references implemented; productive evaluator/property/restart proof deferred |
+| AC-18 #709/#710 effects | Stable effect/request/receipt and local adoption boundaries only; productive integration deferred |
 | AC-19 #722 recovery | Participant contract documented; recovery integration deferred |
-| AC-20 complete gate negative matrix | Core stale/self/missing checks; full evidence evaluator deferred |
+| AC-20 complete gate negative matrix | Core validates exact persisted graph and legal pass/fail/harness outcomes; productive evaluator/retention negatives deferred |
 
 Negative criteria AC-N1 through AC-N4 are enforced by the state machine and
 authority boundary. AC-N5 requires later matching API/event/artifact readback.
-AC-N6 is enforced for the disjoint Console surface and repository evidence.
+AC-N6 is enforced for repository evidence; the scaffold rejects sensitive-shaped
+DTO text but is not claimed as the productive server security boundary.
 AC-N7 remains a release rule: build-server time is never runtime benchmark
 evidence. AC-N8 through AC-N12 remain mandatory for the productive evaluator,
 effect, retention, and recovery integrations.
 
-## 12. Final integration sequence
+## 13. Final integration sequence
 
 1. Merge the productive #694 workbench dispatcher and its opaque,
    request-deduplicated evidence receipt.

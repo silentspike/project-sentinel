@@ -8,12 +8,14 @@ use super::{
     schema::{
         AcceptanceV1, ApprovalV1, CandidateState, CustomerFeedbackV1, DeliveryReceiptV1,
         DeliveryState, FindingV1, ProjectCloseoutV1, QaEvaluationPlanV1, QaEvaluationRunReceiptV1,
-        QaReleaseGateReceiptV1, QaRunState, ReleaseCandidateV1, ReleaseManifestV1, ReleaseState,
-        ReleaseV1, ReviewV1, RollbackV1, TestRunV1, DELIVERY_SCHEMA_V1,
+        QaEvidenceGraphV1, QaReleaseGateReceiptV1, QaRunState, ReleaseCandidateV1,
+        ReleaseManifestV1, ReleaseState, ReleaseV1, ReviewV1, RollbackV1, TestRunV1,
+        DELIVERY_SCHEMA_V1,
     },
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryAggregateV1 {
     pub schema_version: u16,
     pub tenant_id: String,
@@ -23,6 +25,7 @@ pub struct DeliveryAggregateV1 {
     pub qa_plans: BTreeMap<String, QaEvaluationPlanV1>,
     pub qa_runs: BTreeMap<String, QaEvaluationRunReceiptV1>,
     pub workbench_receipts: BTreeMap<String, WorkbenchEvidenceReceiptV1>,
+    pub evidence_graphs: BTreeMap<String, QaEvidenceGraphV1>,
     pub reviews: BTreeMap<String, ReviewV1>,
     pub test_runs: BTreeMap<String, TestRunV1>,
     pub findings: BTreeMap<String, FindingV1>,
@@ -49,6 +52,7 @@ impl DeliveryAggregateV1 {
             qa_plans: BTreeMap::new(),
             qa_runs: BTreeMap::new(),
             workbench_receipts: BTreeMap::new(),
+            evidence_graphs: BTreeMap::new(),
             reviews: BTreeMap::new(),
             test_runs: BTreeMap::new(),
             findings: BTreeMap::new(),
