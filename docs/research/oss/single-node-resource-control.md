@@ -37,11 +37,12 @@ The proposed decisions are:
 4. **Port algorithm/contract:** take Kubernetes' checkpointed allocation,
    hint-before-allocation, threshold grace, reclaim-before-evict, remeasurement, and
    victim-ranking contracts. Do not add Kubernetes.
-5. **Configure existing dependency:** treat systemd-oomd as a conditional
-   operating-system component, not as a current repository capability. Its exact
-   package/unit/config/privilege and update ownership must pass #705/#656 where
-   applicable; activation also requires RC2 capability, protected/eligible sets,
-   sustained pressure, dry-run evidence, and restart budgets. Do not add Meta oomd.
+5. **Configure existing dependency:** treat systemd-oomd as a conditional,
+   permanently dry-run operating-system observer, not as a current repository
+   capability or destructive authority. Its exact package/unit/config/privilege
+   and update ownership must pass #705/#656 where applicable. Every destructive
+   agent kill remains a Sentinel effect-worker operation under a durable token.
+   Do not add Meta oomd.
 6. **Keep Sentinel:** preserve deterministic ECS schedule order. Resource pressure
    may change admission and wall-clock pacing, but not reorder the simulation or
    silently skip required shift work.
@@ -309,6 +310,18 @@ candidates with preference/avoid metadata, and protects its own control boundary
 The manager kills at most one selected high-pressure cgroup before delaying the
 next action
 ([source](https://github.com/systemd/systemd/blob/08ca33fddebdb029ef84b97bb645d9325b783838/src/oom/oomd-manager.c#L572-L637)).
+Its real dry-run branch reports the selected target without invoking the kill
+path
+([dry-run](https://github.com/systemd/systemd/blob/08ca33fddebdb029ef84b97bb645d9325b783838/src/oom/oomd-util.c#L497-L513)).
+In active mode the prekill hook is only a bounded notification/delay: hook
+completion or error removes a wait link and the final callback invokes the kill;
+it is not a durable veto
+([prekill path](https://github.com/systemd/systemd/blob/08ca33fddebdb029ef84b97bb645d9325b783838/src/oom/oomd-util.c#L353-L390),
+[hook setup](https://github.com/systemd/systemd/blob/08ca33fddebdb029ef84b97bb645d9325b783838/src/oom/oomd-util.c#L452-L494)).
+The `Killed` signal is emitted only after the cgroup kill attempt
+([kill/receipt path](https://github.com/systemd/systemd/blob/08ca33fddebdb029ef84b97bb645d9325b783838/src/oom/oomd-util.c#L252-L321)).
+Therefore Sentinel cannot use active systemd-oomd as a token-gated exactly-once
+effect worker.
 
 **Tests and failures.** Integration suites cover cgroup properties and delegation,
 sustained OOM pressure and preferences, and pressure-watch behavior
@@ -322,8 +335,10 @@ such a skip into a false enforcement claim.
 repository contains no systemd-oomd package provisioning or `ManagedOOM`
 configuration. Service-slice configuration adds no embedded scheduler; any
 systemd-oomd package/unit/config/privilege or update delta is conditional work
-through #705/#656. Sentinel still needs its own desired/applied generation,
-per-agent semantics, domain admission, and audit events.
+through #705/#656. If configured for Sentinel, it remains permanently dry-run and
+observability-only. Sentinel still needs its own desired/applied generation,
+per-agent semantics, domain admission, destructive effect authority, and audit
+events.
 
 ### 5.3 sched_ext/scx
 
@@ -478,8 +493,8 @@ mechanism-only ports. The remaining available vocabulary is
 | D2 | Service-level CPU/memory/IO/PID hierarchy | **Configure existing dependency** | Use PID 1-owned `sentinel-*.slice` units and service properties, while exactly one delegated Sentinel controller owns per-agent children. Reject a second supervisor, dual writers/trees, and independent per-unit maxima without aggregate policy. |
 | D3 | Node pressure and degradation | **Reimplement minimal** | Persist `PressureGovernorV1` and admissions in the same `controlplane.redb` authority while preserving tick/work semantics and authority classes. Reject independent threshold callbacks, another store, and an external product as domain admission authority. |
 | D4 | Allocation/admission/checkpoint ordering | **Port algorithm/contract** | Port Kubernetes' hint/validate-before-allocate and desired-state restore patterns without Kubernetes types or dependency. |
-| D5 | Reclaim and victim sequence | **Port algorithm/contract** | Port sustained window -> reversible reclaim -> remeasure -> rank one eligible victim -> verify -> cooldown. Reject immediate kill and unverified "attempt means success". |
-| D6 | OOM daemon | **Configure existing dependency** | Treat systemd-oomd as a conditional operating-system component, not a current capability. #705/#656 own any package/unit/config/privilege and update decision; RC2 owns capability proof, dry-run, protected/eligible sets, activation, and rollback. Reject Meta oomd due duplicate privileged daemon/maintenance surface. |
+| D5 | Reclaim and victim sequence | **Port algorithm/contract** | Port sustained window -> reversible reclaim -> remeasure -> rank one eligible victim -> consume one durable token -> execute and read back through the Sentinel effect worker -> cooldown. Reject immediate kill, a second destructive authority, and unverified "attempt means success". |
+| D6 | OOM daemon | **Configure existing dependency** | Treat systemd-oomd as a conditional, permanently dry-run operating-system observer, not a current capability or destructive authority. #705/#656 own any package/unit/config/privilege and update decision; RC2 proves dry-run plus protected/eligible observation. Every destructive agent kill remains under the Sentinel effect worker and durable token. Reject active systemd-oomd and Meta oomd because either would duplicate privileged kill authority. |
 | D7 | ECS scheduling order | **Keep Sentinel** | Preserve deterministic ECS order; change wall-clock pacing and admission only. Reject host scheduler decisions as simulation-order authority. |
 | D8 | IO load response | **Reimplement minimal** | Implement queue-specific admission/batching and verified IO controller outcomes. Reject the current unused return value and reject global sleep as IO backpressure. |
 | D9 | Per-agent PSI/metrics | **Keep Sentinel** | Retain publishers and eBPF readers, add freshness/unknown/IO and bind decisions to snapshots. Reject treating missing samples as zero. |
@@ -547,7 +562,7 @@ ordered field tuple, never from map iteration or incidental JSON formatting.
 | `resource_operations` | stable `operation_id` | Immutable plan plus current state, expected generations, prior readback, attempt boot ID, result/readback, compensation, and error. |
 | `pressure_governor` | canonical `node_id` | Current governor generation, state, signal/freshness snapshot, enter/hold/cooldown times, and policy digest. |
 | `resource_admissions` | stable `request_id` | Admission class, owner/transition correlation, decision generation, pending/terminal outcome, retry bound, and expiry. |
-| `resource_event_outbox` | `operation_id:event_kind` | Exact versioned domain-event payload, topic, pending/published state, attempt count, and EventStore receipt. |
+| `resource_event_outbox` | `operation_id:event_kind` | Exact versioned domain-event payload, topic, stable namespaced `publish_operation_id`, canonical publication digest, pending/published state, attempt count, and verified EventStore receipt. |
 | `resource_effect_markers` | stable `operation_id` | Compact permanent idempotency marker after the full terminal operation is eligible for retention compaction. |
 
 One redb write transaction atomically commits each local state transition and its
@@ -560,14 +575,34 @@ outside every database transaction:
    kernel/systemd operation, and reads the target back.
 3. Transaction B CAS-checks the expected generations and atomically records the
    verified outcome, contract/governor/admission state, and pending local event.
-4. A publication-only worker calls Limbo
-   [`append_with_outbox`](../../../crates/sentinel-limbo/src/event_store.rs#L997-L1052)
-   with the same stable `operation_id`. Limbo's operation-id idempotency and its
-   event/outbox transaction make a retry return the existing event rather than
-   create a second one.
-5. Only after the EventStore receipt does a local redb transaction mark the
-   resource outbox row published. A crash between steps 4 and 5 repeats only the
-   idempotent publication call; this worker has no kernel/systemd effect capability.
+4. A publication-only worker calls a new digest-bound EventStore publication
+   contract. The current
+   [`append_with_outbox`](../../../crates/sentinel-limbo/src/event_store.rs#L997-L1051)
+   is explicitly insufficient: `INSERT OR IGNORE` does not read or compare the
+   existing event/outbox rows, and `last_insert_rowid()` after an ignored insert is
+   not a binding receipt.
+5. The new contract derives a stable globally namespaced
+   `publish_operation_id = resource-v1:<hex-sha256>` for each resource event kind;
+   the hash input is the version plus length-prefixed resource operation ID and
+   canonical event kind, so delimiters cannot alias two publications. It binds a
+   second canonical length-prefixed digest over publication schema, publish
+   operation ID, resource request/operation ID, event ID/type, aggregate ID, topic,
+   and exact payload bytes. Multiple event kinds for one resource operation
+   therefore have distinct EventStore idempotency IDs.
+6. In one Limbo transaction, publication either inserts the event plus domain
+   outbox row or atomically reads both existing rows for that
+   `publish_operation_id`. Existing schema, identities, topic, payload, and digest
+   must match exactly; any collision is typed `PublicationConflict` and does not
+   alter either store. Success returns `EventPublicationReceiptV1` containing the
+   publish operation ID, event ID, event-row identity, outbox-row identity, and
+   canonical digest read back from the committed rows. It never uses a connection's
+   ambient last-insert value as a receipt.
+7. A local redb transaction marks exactly one `resource_event_outbox` row published
+   only if that receipt's publish operation ID, row identities, and digest match
+   the row's immutable expectation. A wrong/stale receipt is
+   `PublicationReceiptMismatch`. A crash before the Limbo commit retries an absent
+   insert; a crash after commit but before redb acknowledgement performs the exact
+   matching readback. This worker has no kernel/systemd effect capability.
 
 A crash after an operating-system effect but before Transaction B leaves an
 `Applying` operation. Startup reads the actual kernel/systemd state and records
@@ -665,9 +700,7 @@ Readiness is command-specific:
 - pressure admission fails safe for new expendable work when required telemetry is
   stale/unknown, while control, recovery, and durability work remain admitted;
 - optional topology/uclamp/IO features are `Unsupported` unless the active policy
-  explicitly makes them mandatory;
-- boot readiness is false if current kernel/systemd readback contradicts a
-  previously applied mandatory contract.
+  explicitly makes them mandatory.
 
 ### 8.5 `PressureGovernorV1`
 
@@ -706,7 +739,9 @@ The fixed action order is:
 5. slow wall-clock simulation pacing within the approved bound;
 6. apply reversible profile reductions to eligible agents;
 7. request kernel/systemd reclaim and remeasure;
-8. select at most one eligible destructive action under a restart/kill token;
+8. reserve at most one eligible destructive action under a durable restart/kill
+   token, execute it only through the Sentinel effect worker, and bind its readback
+   to that token;
 9. verify the effect and enter cooldown;
 10. recover capacity gradually and replay durable pending admissions exactly once.
 
@@ -817,10 +852,11 @@ also requires:
 - no immortal OOM setting without a reserved-memory/restart/failure analysis;
 - per-service and global restart tokens durable across daemon restart;
 - #705/#656 approval of any conditional systemd-oomd package/unit/config/privilege
-  and update delta, then RC2 capability and dry-run/observation evidence before kill
-  activation;
+  and update delta, then RC2 capability and permanent dry-run/observation evidence;
+  active systemd-oomd kill configuration is forbidden because its prekill hook
+  cannot veto autonomously selected kills;
 - a kill/restart receipt containing selected candidate set, reason, generation,
-  action result, readback, and token balance.
+  effect-worker operation ID, action result, readback, and token balance.
 
 ### 8.8 Topology and priority boundary
 
@@ -867,7 +903,11 @@ absence never blocks product startup.
 | IO controller or device mapping is absent | If IO is mandatory, fail before launch. If optional, apply the reduced effective contract and report `Unsupported` with a different digest. |
 | Crash after any individual cgroup/systemd write | Restart reads actual values and completes or compensates the same operation. It never emits duplicate success. |
 | Event/outbox append fails after verified kernel apply | Applied generation remains durable and publication retries independently; the kernel mutation is not repeated blindly. |
-| Crash after EventStore append but before local resource-outbox acknowledgement | The publication-only worker retries the stable operation ID; Limbo returns the existing event/outbox result and no effect-capable code is invoked. |
+| Two resource event kinds share one resource operation | Each uses a distinct namespaced `publish_operation_id`; both exact event/outbox pairs commit and return their own digest-bound receipts. |
+| A `publish_operation_id` already exists with a different event ID, topic, payload, schema, or digest | The EventStore transaction returns `PublicationConflict`; neither existing nor proposed data changes and redb remains pending. |
+| Crash occurs before the Limbo publication commit | No receipt exists; retry inserts or rechecks the same exact publication and never invokes an effect-capable worker. |
+| Crash occurs after Limbo commit but before local resource-outbox acknowledgement | The publication worker atomically reads back the matching event and domain-outbox rows and returns their binding receipt; no duplicate event/outbox or operating-system effect occurs. |
+| A stale, fabricated, cross-event, or wrong-digest publication receipt is supplied | Redb returns `PublicationReceiptMismatch` and leaves only that resource event pending; unrelated rows continue. |
 | `controlplane.redb` resource schema/value/digest is corrupt or from a future version | Automatic resource effects and new expendable admissions remain fenced with typed `ResourceAuthorityCorrupt`; no record is skipped and read-only/operator recovery remains available. |
 | Owner, contract, or authority generation changes during apply | CAS fails, compensation restores prior readback, and a typed conflict is recorded. |
 | Compensation fails | Target enters `DegradedNeedsReconcile`; further conflicting mutation is fenced, unrelated targets continue. |
@@ -888,6 +928,7 @@ absence never blocks product startup.
 | CPU hotplug/NUMA topology changes | Optional placement becomes stale and is reconciled or removed; resource ownership and ECS correctness remain intact. |
 | Restore/reboot loses kernel state | Desired durable generations are reconciled against new capability/readback before agent admission opens. |
 | Restart token store is corrupt or unavailable | Automatic destructive recovery fails closed; operator recovery remains available. |
+| systemd-oomd is configured without dry-run or its prekill hook reports an error/timeout | RC2 readiness fails and Sentinel does not treat the hook as a veto. Active oomd is disabled before resource mutation readiness; only the Sentinel effect worker may consume a kill token and act. |
 | Metrics/event sink is unavailable | Local resource state transition remains durable; bounded outbox retries without reapplying effects. |
 
 ## 10. Butterfly-effect integration map
@@ -914,7 +955,7 @@ Host capability/catalog -> controlplane.redb authority
         local resource event outbox               runtime readiness
                    |
                    v
-     EventStore stable operation ID -> domain outbox/projections/API
+ digest-bound EventStore publish ID -> domain outbox/projections/API
 
 PressureGovernorV1 -> AdmissionPort
         |              |   |   |   |
@@ -923,9 +964,14 @@ PressureGovernorV1 -> AdmissionPort
         |              |   +----------> LLM/gateway
         |              +--------------> durable shift handoff (keeps RC-B0)
         v
-Restart/KillBudgetPort <---- platform rules + #624 supervision
-        |
-        `----> #650 acceptance
+Restart/KillBudgetPort <---- Sentinel effect worker <---- platform rules + #624
+                                                          supervision
+
+RC-B0 -----------------------------------------------> #650 M0 acceptance
+RC0 -> RC1 -> RC2 -> RC3 ---- hardening evidence -----^ only if a concrete
+                                                        #650 correctness,
+                                                        security, or stability
+                                                        failure is proved
 
 Topology observation (#502) -> #655 optional policy -> #705/#656 if scx
 Slurm/Flux deep mechanisms -> #690/#691, never an M0 runtime dependency
@@ -939,13 +985,13 @@ Slurm/Flux deep mechanisms -> #690/#691, never an M0 runtime dependency
 | `sentinel-sandbox` | Canonical value/plan/readback helpers and production PID-limit semantics behind the controller adapter | Does not own product admission, persistence, direct root paths, or service restart policy. |
 | Runtime health/reconciliation | Compare desired/applied/capability generations and repair non-terminal operations | Does not independently select limits. |
 | Platform-controlplane | Submit typed resource/restart requests and consume receipts | Does not write cgroups, signals, or systemd directly after cutover. |
-| systemd deployment | Slice hierarchy, weights, high/max/OOM/tasks/IO/restart policy and boot validation | Does not own agent roster or simulation policy. |
-| Event/CQRS chain | Versioned desired/applied/governor/admission/action outcomes via durable outbox | Projection failure cannot repeat kernel effects. |
+| systemd deployment | Slice hierarchy, weights, high/max/OOM/tasks/IO/restart policy, permanent oomd dry-run, and boot validation | Does not own agent roster, simulation policy, or destructive victim authority. |
+| Event/CQRS chain | Versioned desired/applied/governor/admission/action outcomes via namespaced, digest-bound publication and verified receipts | Collision, duplicate publication, or projection failure cannot repeat kernel effects. |
 | API/console | Read-only resource state, freshness, capability, generation, pending work, and action outcomes; authenticated operator commands | No raw paths, PIDs, arbitrary controller values, secrets, or self-attested role. |
 | LLM/gateway | Queue/concurrency admission and bounded backpressure | Provider routing/cost contracts remain separately owned. |
 | Workbench #694 | Uses the narrow admission port around invocation starts | #720 does not implement dispatch, sandbox channel, or completion evidence. |
 | #624 | Supplies supervision/panic outcome into restart budget | #720 does not choose unwind/abort strategy. |
-| #650 | Approves numeric product policy and consumes final live evidence | Does not block token-free implementation or choose dependencies. |
+| #650 | Accepts RC-B0 as the only predeclared blocker, approves numeric product policy, and consumes relevant live evidence | Does not wait for incomplete RC0-RC3 hardening, require performance optimization, block token-free implementation, or choose dependencies. |
 | #502/#655 | Observe then decide topology placement and optional sched_ext experiment | Cannot change M0 portable fallback or make scx mandatory. |
 | #690/#691 | Deeply mine Slurm/Flux mechanisms | Cannot silently add cluster/batch control planes to the single node. |
 | #705/#656 | Approve and maintain any future dependency | D1-D16 add no mandatory M0 dependency. Conditional systemd-oomd package/unit/config/privilege ownership and any future scx integration require exact #705 approval and #656 update ownership where applicable. |
@@ -985,7 +1031,12 @@ RC-B0 -> RC0 -> RC1 -> RC2 -> RC3. No core child may wait on a later child.
 Independent #655/#690/#691 research may proceed in parallel, but it cannot change
 this M0 chain. Within the chain, token-free test preparation may overlap only after
 the predecessor's versioned port is frozen; merge, cutover, and live evidence stay
-ordered by the arrows.
+ordered by the arrows. This implementation order is not an M0 acceptance gate:
+only RC-B0 is the source-proved blocker and points to #650. After RC-B0, active M0
+work and the RC0 -> RC1 -> RC2 -> RC3 hardening chain may proceed in parallel.
+RC0-RC3 evidence may block a particular #650 criterion only if its own live AC
+proves a concrete correctness, security, or stability failure; the classification
+cannot be promoted merely because hardening remains incomplete.
 
 ### RC-B0. Pressure-safe shift transition ordering
 
@@ -1052,16 +1103,20 @@ schema/migration, node/boot binding, retention, corruption, #729/#751 recovery, 
 publication boundary in section 8.2; add `ResourceContractV1`, canonical target
 catalog, command-specific readiness, exact mandatory/optional controller
 capability, production `pids.max`, ordered apply/readback/compensation, durable
-desired/applied generations, idempotent event outbox, the delegated
+desired/applied generations, the new namespaced digest-bound EventStore
+publication/receipt contract plus local outbox, the delegated
 `sentinel-resource-controller.service` single writer and legacy-tree cutover,
-boot/restart reconciliation, API and health read models.
+boot/restart reconciliation, API and health read models. Existing
+`append_with_outbox` behavior is not accepted as satisfying this contract.
 
 **ACs:** apply and read back every profile field; reject partial mandatory
 capability; recover after every write/outbox failpoint; preserve unrelated target
 progress; reject spoofed paths/targets/generations; expose no secrets; prove
 restart convergence; migrate/retry atomically from every supported schema
 failpoint; fail closed on corrupt/future records; scan every non-terminal row;
-prove EventStore retry without a repeated operating-system effect; prove
+prove namespaced multi-event publication, exact duplicate readback, collision
+conflict, crash-before/after-commit recovery, and wrong-receipt rejection without
+a repeated operating-system effect; prove
 engine-consistent #729 backup/restore and #751 coverage; prove systemd
 reload/reconciliation, missing delegation, stale old-tree detection, boot change,
 single-writer cutover, and rollback readback.
@@ -1094,7 +1149,7 @@ capability, PID, readback, publication, and recovery contracts.
 RC-B0. Future live target `SINGLE_NODE` is assigned by the runtime owner.
 
 **Depends on:** RC-B0 and RC0 ports. It retains the RC-B0 ordering tests and does
-not require RC2 systemd-oomd activation.
+not require RC2 systemd-oomd observation.
 
 **Scope:** `PressureGovernorV1`, freshness-bound PSI snapshot, durable state,
 hysteresis/hold/cooldown, admission classes, exactly-once pending shift roster,
@@ -1137,13 +1192,15 @@ integrates with #624 without owning panic strategy.
 low/high/max, OOM grouping/preference, TasksMax, restart/kill tokens, boot
 validation, service/API health, and only after exact #705/#656 approval where
 applicable, conditional systemd-oomd package/unit/config/privilege capability,
-observe/dry-run/activation, update, and rollback.
+permanent dry-run observation, update, and rollback. Sentinel's effect worker is
+the only destructive agent-kill authority.
 
 **ACs:** protected control/durability services stay responsive under hostile
 agent/background CPU, memory, IO, and fork pressure; wrong/missing unit properties
-fail readiness; one eligible victim at most per token/cooldown; failed action is not
+fail readiness; active systemd-oomd configuration fails readiness; one eligible
+victim at most per Sentinel token/cooldown; failed effect-worker action is not
 success; tokens and non-terminal actions survive restart; no unapproved service is
-kill-eligible.
+kill-eligible and a prekill hook is never treated as authorization or veto.
 
 **Negative/failure:** unavailable systemd/oomd, unit drift, aggregate
 overcommit, wrong device, fork bomb, OOM storm, restart loop, corrupted token state,
@@ -1155,15 +1212,16 @@ sidecars under reproducible CPU/memory/IO/PID loads. Numeric gates require #650
 approval.
 
 **Rollout/rollback:** read-only unit audit -> static slice/weights -> memory high and
-PID limits -> OOM observe/dry-run -> separately approved victim activation.
-Rollback disables destructive OOM policy first, restores signed unit/catalog
+PID limits -> permanent systemd-oomd dry-run observation -> separately enabled
+Sentinel effect-worker victim policy. Rollback disables Sentinel destructive
+policy first, verifies systemd-oomd remains dry-run, restores signed unit/catalog
 configuration, daemon-reloads, restarts only within budget, and verifies every
 property.
 
 **TOGAF target decision:** after ORC architecture approval and independently of
 implementation status, the final target defines the exact service hierarchy,
-aggregate host reserve, conditional OOM victim/restart-token boundaries, and
-command-specific readiness.
+aggregate host reserve, systemd-oomd observability-only boundary, Sentinel-only
+destructive victim/restart-token authority, and command-specific readiness.
 
 ### RC3. Final single-node resource acceptance and fault matrix
 
@@ -1200,7 +1258,7 @@ optimizations remain optional.
 | #227 | Require RC-B0/RC0/RC1/RC2 cycle budgets and measured control-plane latency; a slow resource controller cannot run unbounded in the tick. |
 | #265 | Mark Heavy/Suspended and transactional resize as superseded target claims owned by RC0/RC1; preserve the closed issue as delivery history. |
 | #624 | Define a versioned supervision-outcome input to RC2 restart tokens and keep panic-strategy authority in #624. |
-| #650 | Add RC-B0 through RC3 as downstream acceptance dependencies; #650 approves numeric limits/latency/pressure policy, not implementation internals. |
+| #650 | Add only RC-B0 as the source-proved downstream acceptance blocker. RC0-RC3 remain parallel/later `M0_HARDENING`, and incomplete hardening does not pause active M0 or make performance optimization mandatory. A specific RC0-RC3 result may block only the exact #650 criterion whose live evidence proves a concrete correctness, security, or stability failure. #650 still owns approved numeric product policy. |
 | #690/#691 | Record Slurm/Flux adoption rejected for M0 here; their research may propose later mechanism-only work without changing RC-B0 through RC3. |
 | #705 | Record no mandatory new M0 dependency. Any conditional systemd-oomd package/unit/config/privilege delta and any future scx/oomd/cluster-scheduler integration require an exact dependency, license, security, ownership, update, and rollback decision. |
 | #656 | Own upgrades only for dependencies approved by #705; kernel/systemd compatibility claims stay in the deployment/RC owners unless represented as repository dependencies. |
@@ -1214,8 +1272,8 @@ optimizations remain optional.
 Before any GitHub body or child mutation:
 
 1. ORC approves or changes D1-D16.
-2. ORC approves the RC-B0 -> RC0 -> RC1 -> RC2 -> RC3 ordering and exact
-   existing-owner deltas.
+2. ORC approves the RC-B0 -> RC0 -> RC1 -> RC2 -> RC3 implementation order, the
+   separate RC-B0 -> #650 blocker edge, and the exact existing-owner deltas.
 3. Each new/changed body receives runtime target, complete ACs, negative criteria,
    benchmarks, rollout, rollback, TOGAF delta, dependencies, and reciprocal links.
 4. Labels are normalized without preserving contradictory history labels on new
@@ -1242,10 +1300,14 @@ Before any GitHub body or child mutation:
 6. RC2 unit catalog and property validator before systemd mutation.
 7. RC2 static non-destructive slice/weights/high/PID policy before OOM actions.
 8. After exact #705/#656 approval where applicable, conditional systemd-oomd
-   capability, observe/dry-run evidence, and separate activation approval.
+   capability and permanent dry-run/observation evidence; active oomd kill
+   configuration is never a Sentinel rollout stage.
 9. RC3 final exact-main live matrix, benchmark, rollback drill, and stability
    readback.
-10. #650 consumes the evidence and alone approves product thresholds/readiness.
+10. #650 consumes RC-B0 as the only predeclared blocker and alone approves product
+    thresholds/readiness. RC0-RC3 continue as hardening and affect an exact #650
+    criterion only after concrete live failure evidence, never from incomplete
+    implementation or performance-optimization status alone.
 
 ### 13.2 Rollback invariants
 
@@ -1269,11 +1331,13 @@ Every implementation child must record:
 - exact source/base/merge/deployed SHA and config/catalog digest;
 - capability and desired/applied readback before and after;
 - failpoint/restart matrix and negative tests;
-- event/outbox/projection/API correlation by stable operation ID;
+- event/outbox/projection/API correlation by namespaced publish operation ID,
+  canonical digest, and verified receipt;
 - process tree, service NRestarts, logs, pressure freshness, and token state;
 - benchmark method, workload, sidecars, p50/p95/max, and correctness results;
 - snapshot/backup/rollback verification and final cleanup;
 - secret/public-safety negative scans;
+- normalized consecutive duplicate-line negative scan for document and PR evidence;
 - explicit distinction between mock, local, single-node live, and upstream evidence.
 
 ## 14. TOGAF target deltas
@@ -1291,10 +1355,13 @@ architecture guide records only this final target contract:
 3. `controlplane.redb` as the single resource authority, its schema/node/boot and
    recovery boundaries, `ResourceContractV1`, capability snapshot,
    desired/applied generation, ordered apply/readback/compensation/reconcile,
-   idempotent EventStore publication, and PID control;
+   namespaced digest-bound EventStore publication with verified receipts, and PID
+   control;
 4. distinguish CPU fairness weight, hard quota, affinity, uclamp, OS priority, and
    simulation schedule order;
-5. define memory low/high/max/OOM-group and approved victim/restart-token policy;
+5. define memory low/high/max/OOM-group, systemd-oomd as permanently
+   observability-only, and Sentinel's effect worker as the sole destructive
+   victim/restart-token authority;
 6. define IO weight/cap/device/readback and queue-specific backpressure;
 7. retain cgroup/systemd/default scheduler as the portable M0 path;
 8. keep NUMA/cache/resctrl/sched_ext optional, capability-gated, measured,
@@ -1333,13 +1400,15 @@ This research issue does not edit the TOGAF HTML.
   OOM, throughput, or power measurement in this study.
 - Exact numeric CPU/memory/IO/PID limits, PSI thresholds, durations, hysteresis,
   cooldown, restart tokens, reserved headroom, benchmark gates, and soak duration
-  remain unapproved policy inputs for RC-B0 through RC3 and #650.
+  remain unapproved policy inputs for RC0 through RC3 and #650. RC-B0's
+  admission-before-effect correctness invariant is not a performance threshold.
 - The systemd version and kernel capability available on a future target are not
   assumed from repository source. RC0/RC2 must discover and verify them live under
   an explicit runtime assignment.
-- systemd-oomd is a conditional decision: the eligible/protected set, dry-run
-  result, memory/swap model, and rollback must be approved before destructive
-  activation.
+- systemd-oomd is a conditional observability-only decision: the
+  eligible/protected set, permanent dry-run result, memory/swap model, and rollback
+  must be approved. Destructive oomd activation is outside the target contract;
+  Sentinel owns every token-gated destructive agent action.
 - sched_ext/scx is rejected for M0, not declared universally unsuitable. #655 may
   propose a bounded experiment later.
 - Slurm and Flux source mechanisms are intentionally left to #690/#691 for deep
