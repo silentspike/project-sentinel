@@ -1,5 +1,13 @@
 # microVM guest workload contract
 
+Status: source contract only. The repository does not yet package the guest
+launcher, build a canonical root filesystem containing it, attest guest
+readiness to the requested workload, or durably reconcile Firecracker launch
+ownership after a host crash. Consequently, `runtime = "microvm"` is rejected
+by the production daemon and the adapter is not registered there. This document
+defines the contract a future implementation must satisfy; it is not evidence
+that the contract is implemented.
+
 The `microvm` NanoRuntime does not treat a successful Firecracker boot as a
 successful workload launch. The configured root filesystem must contain a
 guest launcher that consumes the complete requested `NanoWorkloadSpec` and
@@ -32,9 +40,9 @@ The guest launcher must:
 
 The kernel and rootfs paths remain configured by `SENTINEL_MICROVM_KERNEL` and
 `SENTINEL_MICROVM_ROOTFS`. A generic rootfs that lacks the launcher is not a
-valid #472 live-test artifact. Repository unit tests prove host-side encoding
-and validation; the actual image and guest execution require the issue-specific
-Deploy-VM gate.
+valid production artifact. Existing repository tests cover only adapter-level
+host-side behavior and do not prove a packaged launcher, guest execution,
+workload-bound readiness, or restart recovery.
 
 ## Snapshot and restore
 

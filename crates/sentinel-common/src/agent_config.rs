@@ -221,13 +221,17 @@ impl RuntimeSelectionConfig {
             }
             Some(crate::nano_runtime::RUNTIME_BWRAP_LANDLOCK)
             | Some(crate::nano_runtime::RUNTIME_ECS_NATIVE)
-            | Some(crate::nano_runtime::RUNTIME_MICROVM)
             | None => {
                 if self.wasm_path.is_some() || self.wasm_tool_name.is_some() {
                     return Err(anyhow!(
                         "runtime.wasm_path and runtime.wasm_tool_name require nano_runtime = wasm-wasmtime"
                     ));
                 }
+            }
+            Some(crate::nano_runtime::RUNTIME_MICROVM) => {
+                return Err(anyhow!(
+                    "runtime microvm is not production-selectable until the versioned guest launcher, workload readiness attestation, and durable crash-recovery contract are implemented"
+                ));
             }
             Some(other) => return Err(anyhow!("unsupported NanoRuntime '{other}'")),
         }
@@ -378,7 +382,7 @@ shift_set = 1
 
         let misplaced = RuntimeSelectionConfig {
             nano_runtime: Some(crate::nano_runtime::RUNTIME_ECS_NATIVE.to_string()),
-            wasm_path: Some("/tmp/not-used.wasm".to_string()),
+            wasm_path: Some("/work/tmp/project-sentinel/not-used.wasm".to_string()),
             wasm_tool_name: None,
         };
         assert!(misplaced.validate().is_err());
@@ -472,6 +476,16 @@ shift_set = 1
                 panic!("Agent {} personality invalid: {}", agent.identity.id, e);
             });
         }
+    }
+
+    #[test]
+    fn microvm_selection_fails_closed_without_guest_attestation_contract() {
+        let runtime = RuntimeSelectionConfig {
+            nano_runtime: Some(crate::nano_runtime::RUNTIME_MICROVM.to_string()),
+            ..RuntimeSelectionConfig::default()
+        };
+        let error = runtime.validate().unwrap_err();
+        assert!(error.to_string().contains("not production-selectable"));
     }
 
     #[test]

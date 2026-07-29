@@ -10,8 +10,8 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use sentinel_common::{
-    agent_config::AgentConfig, AgentId, DomainEvent, FencedStore, OwnerRegistry, OwnerWriteGuard,
-    StateTransferScope,
+    agent_config::AgentConfig, room::BuildingConfig, AgentId, DomainEvent, FencedStore,
+    OwnerRegistry, OwnerWriteGuard, StateTransferScope,
 };
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -154,6 +154,23 @@ CREATE TABLE IF NOT EXISTS runtime_config_recovery (
     owner_scope TEXT NOT NULL,
     old_config_json TEXT NOT NULL,
     staged_config_json TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('transitioning', 'recovery_required')),
+    reason TEXT NOT NULL DEFAULT '',
+    started_tick INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+)";
+
+const CREATE_RUNTIME_CONFIG_APPLY_RECOVERY: &str = "
+CREATE TABLE IF NOT EXISTS runtime_config_apply_recovery (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+    old_agents_json TEXT NOT NULL,
+    staged_agents_json TEXT NOT NULL,
+    old_building_json TEXT NOT NULL,
+    staged_building_json TEXT NOT NULL,
+    pre_snapshot_id TEXT NOT NULL,
+    stopped_agent_ids_json TEXT NOT NULL DEFAULT '[]',
+    spawned_agent_ids_json TEXT NOT NULL DEFAULT '[]',
     phase TEXT NOT NULL CHECK(phase IN ('transitioning', 'recovery_required')),
     reason TEXT NOT NULL DEFAULT '',
     started_tick INTEGER NOT NULL,
@@ -376,6 +393,20 @@ pub struct RuntimeConfigRecoveryMarker {
     pub updated_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeConfigApplyRecoveryMarker {
+    pub old_agents: Vec<AgentConfig>,
+    pub staged_agents: Vec<AgentConfig>,
+    pub old_building: BuildingConfig,
+    pub staged_building: BuildingConfig,
+    pub pre_snapshot_id: String,
+    pub stopped_agent_ids: Vec<AgentId>,
+    pub spawned_agent_ids: Vec<AgentId>,
+    pub phase: RuntimeConfigRecoveryPhase,
+    pub reason: String,
+    pub started_tick: u64,
+}
+
 // ──────────────────────────────────────────────
 // EventStore
 // ──────────────────────────────────────────────
@@ -438,6 +469,7 @@ impl EventStore {
         conn.execute_batch(CREATE_PROJECTION_OFFSETS)?;
         conn.execute_batch(CREATE_SIM_METADATA)?;
         conn.execute_batch(CREATE_RUNTIME_CONFIG_RECOVERY)?;
+        conn.execute_batch(CREATE_RUNTIME_CONFIG_APPLY_RECOVERY)?;
 
         // Security: Immutable Snapshots — Schutz vor Loeschung junger Snapshots.
         // #250: dieselbe SSOT-Konstante wie der Daemon-Retention-Skip (siehe IMMUTABLE_SNAPSHOT_MS).
@@ -706,6 +738,183 @@ impl EventStore {
             })
         })
         .collect()
+    }
+
+    pub fn begin_runtime_config_apply_recovery(
+        &self,
+        old_agents: &[AgentConfig],
+        staged_agents: &[AgentConfig],
+        old_building: &BuildingConfig,
+        staged_building: &BuildingConfig,
+        pre_snapshot_id: &str,
+        started_tick: u64,
+    ) -> anyhow::Result<()> {
+        let started_tick = i64::try_from(started_tick)
+            .map_err(|_| anyhow::anyhow!("runtime config apply tick exceeds i64"))?;
+        let conn =
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO runtime_config_apply_recovery
+             (singleton_id, old_agents_json, staged_agents_json, old_building_json,
+              staged_building_json, pre_snapshot_id, phase, reason, started_tick,
+              created_at, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, 'transitioning', '', ?6, ?7, ?7)",
+            params![
+                serde_json::to_string(old_agents)?,
+                serde_json::to_string(staged_agents)?,
+                serde_json::to_string(old_building)?,
+                serde_json::to_string(staged_building)?,
+                pre_snapshot_id,
+                started_tick,
+                now_ms,
+            ],
+        )?;
+        anyhow::ensure!(
+            inserted == 1,
+            "unresolved runtime config apply recovery already exists"
+        );
+        conn.commit()?;
+        Ok(())
+    }
+
+    pub fn record_runtime_config_apply_stop(&self, agent_id: AgentId) -> anyhow::Result<()> {
+        self.record_runtime_config_apply_agent("stopped_agent_ids_json", agent_id)
+    }
+
+    pub fn record_runtime_config_apply_spawn(&self, agent_id: AgentId) -> anyhow::Result<()> {
+        self.record_runtime_config_apply_agent("spawned_agent_ids_json", agent_id)
+    }
+
+    fn record_runtime_config_apply_agent(
+        &self,
+        column: &str,
+        agent_id: AgentId,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(column, "stopped_agent_ids_json" | "spawned_agent_ids_json"),
+            "invalid config apply recovery column"
+        );
+        let conn =
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
+        let current: String = conn.query_row(
+            &format!("SELECT {column} FROM runtime_config_apply_recovery WHERE singleton_id = 1"),
+            [],
+            |row| row.get(0),
+        )?;
+        let mut ids: Vec<AgentId> = serde_json::from_str(&current)?;
+        if !ids.contains(&agent_id) {
+            ids.push(agent_id);
+            ids.sort_by_key(|id| id.0);
+        }
+        let updated = conn.execute(
+            &format!(
+                "UPDATE runtime_config_apply_recovery SET {column} = ?1 WHERE singleton_id = 1"
+            ),
+            params![serde_json::to_string(&ids)?],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "runtime config apply recovery marker is missing"
+        );
+        conn.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_runtime_config_apply_recovery_required(&self, reason: &str) -> anyhow::Result<()> {
+        let conn =
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let updated = conn.execute(
+            "UPDATE runtime_config_apply_recovery
+             SET phase = 'recovery_required', reason = ?1, updated_at = ?2
+             WHERE singleton_id = 1",
+            params![reason, now_ms],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "runtime config apply recovery marker is missing"
+        );
+        conn.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_runtime_config_apply_recovery(&self) -> anyhow::Result<()> {
+        let conn =
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
+        let deleted = conn.execute(
+            "DELETE FROM runtime_config_apply_recovery WHERE singleton_id = 1",
+            [],
+        )?;
+        anyhow::ensure!(deleted == 1, "missing runtime config apply recovery marker");
+        conn.commit()?;
+        Ok(())
+    }
+
+    pub fn runtime_config_apply_recovery(
+        &self,
+    ) -> anyhow::Result<Option<RuntimeConfigApplyRecoveryMarker>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("Lock poisoned: {error}"))?;
+        let row = conn
+            .query_row(
+                "SELECT old_agents_json, staged_agents_json, old_building_json,
+                        staged_building_json, pre_snapshot_id, stopped_agent_ids_json,
+                        spawned_agent_ids_json, phase, reason, started_tick
+                 FROM runtime_config_apply_recovery WHERE singleton_id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(
+                old_agents,
+                staged_agents,
+                old_building,
+                staged_building,
+                pre_snapshot_id,
+                stopped_agent_ids,
+                spawned_agent_ids,
+                phase,
+                reason,
+                started_tick,
+            )| {
+                Ok(RuntimeConfigApplyRecoveryMarker {
+                    old_agents: serde_json::from_str(&old_agents)?,
+                    staged_agents: serde_json::from_str(&staged_agents)?,
+                    old_building: serde_json::from_str(&old_building)?,
+                    staged_building: serde_json::from_str(&staged_building)?,
+                    pre_snapshot_id,
+                    stopped_agent_ids: serde_json::from_str(&stopped_agent_ids)?,
+                    spawned_agent_ids: serde_json::from_str(&spawned_agent_ids)?,
+                    phase: RuntimeConfigRecoveryPhase::from_persisted(&phase)?,
+                    reason,
+                    started_tick: u64::try_from(started_tick)?,
+                })
+            },
+        )
+        .transpose()
     }
 
     /// Reserve the stable request ID immediately before network execution. If the

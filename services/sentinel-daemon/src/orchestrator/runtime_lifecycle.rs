@@ -6,11 +6,10 @@
 
 use anyhow::Result;
 use sentinel_common::nano_runtime::{
-    NanoHandle, NanoRecoveryResult, NanoRuntimeControlAction, NanoRuntimeControlResult,
+    NanoHandle, NanoHealth, NanoRecoveryResult, NanoRuntimeControlAction, NanoRuntimeControlResult,
     NanoRuntimeRegistry, NanoRuntimeResources, NanoSnapshot, NanoStopResult, NanoWorkloadSpec,
     RUNTIME_BWRAP_LANDLOCK,
 };
-use sentinel_microvm::MicrovmNanoRuntime;
 use sentinel_runtime::EcsNativeRuntime;
 use sentinel_sandbox::BwrapNanoRuntime;
 #[cfg(feature = "wasm")]
@@ -34,7 +33,6 @@ impl RuntimeAdapterOwner {
         registry.register(bwrap)?;
         #[cfg(feature = "wasm")]
         registry.register(WasmtimeNanoRuntime::new())?;
-        registry.register(MicrovmNanoRuntime::detect())?;
         Ok(Self { registry })
     }
 
@@ -85,11 +83,7 @@ impl RuntimeAdapterOwner {
         self.registry.reconcile_abandoned(workload)
     }
 
-    #[cfg(test)]
-    pub(super) fn health(
-        &mut self,
-        handle: &NanoHandle,
-    ) -> Result<sentinel_common::nano_runtime::NanoHealth> {
+    pub(super) fn health(&mut self, handle: &NanoHandle) -> Result<NanoHealth> {
         self.registry.health(handle)
     }
 
