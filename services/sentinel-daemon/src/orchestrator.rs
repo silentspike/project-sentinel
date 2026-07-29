@@ -5540,20 +5540,29 @@ fn agent_under_active_healing(
 /// Aktualisiert Name/Rolle eines live-aktualisierten Agents in der Read-Projection (Dashboard).
 /// Live-Component-Updates emittieren kein Event → die Projection wird hier gezielt nachgezogen.
 fn update_agent_projection_identity(projection_db_path: &str, cfg: &AgentConfig) -> Result<()> {
-    if projection_db_path.is_empty() {
-        return Ok(());
-    }
+    anyhow::ensure!(
+        !projection_db_path.is_empty(),
+        "projection database path is required for config apply"
+    );
     let db = sentinel_limbo::rusqlite::Connection::open(projection_db_path)
         .context("open projection database for config apply")?;
-    db.execute(
-        "UPDATE agent_live_view SET name = ?2, role = ?3 WHERE agent_id = ?1",
-        sentinel_limbo::rusqlite::params![
-            cfg.identity.id as i64,
-            cfg.identity.name,
-            cfg.identity.role
-        ],
-    )
-    .context("update projection identity for config apply")?;
+    let affected = db
+        .execute(
+            "UPDATE agent_live_view
+             SET name = ?2, role = ?3
+             WHERE agent_id = ?1 AND status = 'active'",
+            sentinel_limbo::rusqlite::params![
+                cfg.identity.id as i64,
+                cfg.identity.name,
+                cfg.identity.role
+            ],
+        )
+        .context("update projection identity for config apply")?;
+    anyhow::ensure!(
+        affected == 1,
+        "config apply projection identity update for AGENT-{:02} affected {affected} rows, expected exactly 1",
+        cfg.identity.id
+    );
     Ok(())
 }
 
@@ -5775,11 +5784,7 @@ fn config_apply_digest(
     agents: &[AgentConfig],
     building: &sentinel_common::room::BuildingConfig,
 ) -> Result<String> {
-    let mut sorted_agents = agents.to_vec();
-    sorted_agents.sort_by_key(|config| config.identity.id);
-    let payload = serde_json::to_vec(&(sorted_agents, building))
-        .context("serialize canonical config apply digest payload")?;
-    Ok(format!("{:x}", Sha256::digest(payload)))
+    crate::config_persist::config_apply_digest(agents, building)
 }
 
 fn update_runtime_orchestrator_config(
@@ -12502,6 +12507,149 @@ mod tests {
     }
 
     #[test]
+    fn config_apply_startup_rejects_corrupt_file_participant_before_mutation() {
+        use sentinel_common::room::{BuildingConfig, BuildingMeta, RoomConfig, RoomType};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let projection_path = tmp.path().join("projection.db");
+        let event_store =
+            EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap();
+        let state_store =
+            Arc::new(StateStore::open(tmp.path().join("state.redb").to_str().unwrap()).unwrap());
+        let old_config = test_ecs_agent_config(48, "Digest Old", "Operator", 1);
+        let mut staged_config = old_config.clone();
+        staged_config.identity.name = "Digest Staged".to_string();
+        let old_building = BuildingConfig {
+            building: BuildingMeta {
+                name: "Digest Old Building".to_string(),
+                address: "Old Street".to_string(),
+                floors: 1,
+            },
+            rooms: vec![RoomConfig {
+                id: "empfang".to_string(),
+                name: "Empfang".to_string(),
+                floor: 0,
+                capacity: 4,
+                room_type: RoomType::Common,
+                adjacent: Vec::new(),
+                department: None,
+                has_coffee_machine: false,
+                has_printer: false,
+            }],
+        };
+        let mut staged_building = old_building.clone();
+        staged_building.building.name = "Digest Staged Building".to_string();
+        crate::config_persist::persist_company_config(
+            &config_dir,
+            std::slice::from_ref(&old_config),
+            &old_building,
+            "digest-old",
+        )
+        .unwrap();
+        let old_digest =
+            config_apply_digest(std::slice::from_ref(&old_config), &old_building).unwrap();
+        let staged_digest =
+            config_apply_digest(std::slice::from_ref(&staged_config), &staged_building).unwrap();
+        crate::config_persist::stage_config_apply_recovery(
+            &config_dir,
+            "config-apply-corrupt-participant",
+            &old_digest,
+            &staged_digest,
+            std::slice::from_ref(&old_config),
+            std::slice::from_ref(&staged_config),
+            &old_building,
+            &staged_building,
+            131,
+        )
+        .unwrap();
+        event_store
+            .begin_runtime_config_apply_recovery(
+                "config-apply-corrupt-participant",
+                &old_digest,
+                &staged_digest,
+                std::slice::from_ref(&old_config),
+                std::slice::from_ref(&staged_config),
+                &old_building,
+                &staged_building,
+                "snapshot-not-reached",
+                &[],
+                131,
+            )
+            .unwrap();
+
+        let journal_path = config_dir.join(crate::config_persist::APPLY_RECOVERY_JOURNAL);
+        let mut corrupted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        let mut tampered_config = staged_config.clone();
+        tampered_config.identity.name = "Tampered".to_string();
+        corrupted["staged_agents"][0]["identity"]["name"] =
+            serde_json::Value::String(tampered_config.identity.name.clone());
+        std::fs::write(&journal_path, serde_json::to_vec(&corrupted).unwrap()).unwrap();
+
+        let error = reconcile_runtime_config_apply_recovery_marker(
+            &event_store,
+            &state_store,
+            None,
+            tmp.path(),
+            projection_path.to_str().unwrap(),
+            &config_dir,
+            4,
+            None,
+            &[],
+            sentinel_common::agent_config::AgentConfigValidation::default(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("staged payload digest conflict"),
+            "{error:#}"
+        );
+
+        // Even a self-consistent participant payload/digest pair cannot
+        // override the canonical SQLite digest identity.
+        corrupted["staged_digest"] = serde_json::Value::String(
+            config_apply_digest(std::slice::from_ref(&tampered_config), &staged_building)
+                .unwrap(),
+        );
+        std::fs::write(&journal_path, serde_json::to_vec(&corrupted).unwrap()).unwrap();
+        let canonical_error = reconcile_runtime_config_apply_recovery_marker(
+            &event_store,
+            &state_store,
+            None,
+            tmp.path(),
+            projection_path.to_str().unwrap(),
+            &config_dir,
+            4,
+            None,
+            &[],
+            sentinel_common::agent_config::AgentConfigValidation::default(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{canonical_error:#}")
+                .contains("filesystem participant conflicts with canonical saga"),
+            "{canonical_error:#}"
+        );
+        assert_eq!(
+            sentinel_common::agent_config::load_all_agents(&config_dir.join("agents")).unwrap(),
+            vec![old_config]
+        );
+        let marker = event_store
+            .runtime_config_apply_recovery()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            marker.phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::Prepared
+        );
+        assert_eq!(
+            marker.decision,
+            sentinel_limbo::RuntimeConfigApplyDecision::Rollback
+        );
+        assert!(journal_path.exists());
+    }
+
+    #[test]
     fn config_apply_startup_rolls_back_and_restores_exact_runtime_before_finalizing() {
         use sentinel_common::nano_runtime::{NanoSnapshot, NanoSnapshotSemantics};
         use sentinel_common::room::{BuildingConfig, BuildingMeta, RoomConfig, RoomType};
@@ -13355,6 +13503,79 @@ mod tests {
         assert_eq!(row.2, "active");
         assert_eq!(row.3, "empfang");
         assert_eq!(row.4, row_id);
+    }
+
+    #[test]
+    fn config_apply_projection_identity_requires_exactly_one_active_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_path = tmp.path().join("projection-missing.db");
+        drop(
+            sentinel_projection::ReadModelStore::open(missing_path.to_str().unwrap()).unwrap(),
+        );
+        let mut agent_cfg = test_agent_config(47, "Projection Agent", "Operations", 1);
+        let missing =
+            update_agent_projection_identity(missing_path.to_str().unwrap(), &agent_cfg)
+                .unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("affected 0 rows, expected exactly 1"),
+            "{missing:#}"
+        );
+        upsert_agent_projection_seed(&missing_path, &agent_cfg, 1).unwrap();
+        mark_agent_projection_despawned(&missing_path, AgentId(47), 2).unwrap();
+        let inactive =
+            update_agent_projection_identity(missing_path.to_str().unwrap(), &agent_cfg)
+                .unwrap_err();
+        assert!(
+            format!("{inactive:#}").contains("affected 0 rows, expected exactly 1"),
+            "{inactive:#}"
+        );
+
+        let duplicate_path = tmp.path().join("projection-duplicate.db");
+        let duplicate_db =
+            sentinel_limbo::rusqlite::Connection::open(&duplicate_path).unwrap();
+        duplicate_db
+            .execute_batch(
+                "CREATE TABLE agent_live_view (
+                    agent_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    status TEXT NOT NULL
+                 );
+                 INSERT INTO agent_live_view (agent_id, name, role, status)
+                 VALUES
+                    (47, 'first', 'old', 'active'),
+                    (47, 'second', 'old', 'active');",
+            )
+            .unwrap();
+        drop(duplicate_db);
+        let duplicate =
+            update_agent_projection_identity(duplicate_path.to_str().unwrap(), &agent_cfg)
+                .unwrap_err();
+        assert!(
+            format!("{duplicate:#}").contains("affected 2 rows, expected exactly 1"),
+            "{duplicate:#}"
+        );
+
+        let exact_path = tmp.path().join("projection-exact.db");
+        drop(
+            sentinel_projection::ReadModelStore::open(exact_path.to_str().unwrap()).unwrap(),
+        );
+        upsert_agent_projection_seed(&exact_path, &agent_cfg, 1).unwrap();
+        agent_cfg.identity.name = "Projection Updated".to_string();
+        agent_cfg.identity.role = "Lead".to_string();
+        update_agent_projection_identity(exact_path.to_str().unwrap(), &agent_cfg).unwrap();
+        let exact_db = sentinel_limbo::rusqlite::Connection::open(&exact_path).unwrap();
+        let identity: (String, String) = exact_db
+            .query_row(
+                "SELECT name, role FROM agent_live_view WHERE agent_id = 47",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            identity,
+            ("Projection Updated".to_string(), "Lead".to_string())
+        );
     }
 
     #[test]
