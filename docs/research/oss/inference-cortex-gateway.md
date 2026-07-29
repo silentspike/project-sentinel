@@ -26,21 +26,24 @@ The accepted decisions are:
    readiness, Gate B activation, and Gateway request classification.
 2. **KEEP** the Rust bridge's stable request ID and digest, durable
    `provider_in_flight` reservation, completion recovery, action claim, and
-   idempotent usage operation.
+   idempotent usage operation. Rust/EventStore remains the durable request,
+   effect, usage, atomic budget-reservation, and canonical attempt authority.
 3. **REIMPLEMENT** bounded Gateway admission in Sentinel Go: a finite queue,
    typed overload outcome, cancellation-safe FIFO grant, per-class limits, and
-   observable pressure. Port semantics, not code, from TGI and SGLang.
+   observable pressure. Go owns edge admission, provider/model selection, and
+   provider-execution deadlines. Port only channel/semaphore ideas from SGLang
+   and fail-fast overload semantics from TGI; neither proves bounded ingress.
 4. **REIMPLEMENT** capability-preserving provider wrappers. The current queue
-   wrapper preserves model inventory but drops streaming even when the wrapped
-   provider implements it.
+   wrapper preserves model inventory but drops both streaming and provider-status
+   reporting when the wrapped provider implements them.
 5. **REIMPLEMENT** terminal streaming usage and cancellation reconciliation.
    Streaming must use the same request identity, cost source, and durable outcome
    rules as non-streaming calls.
 6. **PORT THE CONTRACT, NOT THE DEPENDENCY** for budget reservation: reserve a
    conservative maximum before dispatch, reconcile exactly once to reported or
    catalog cost, and retain incurred input cost after post-dispatch cancellation.
-   LiteLLM demonstrates the mechanism, but it must not become Sentinel's budget
-   or routing authority.
+   LiteLLM demonstrates the idea, not crash durability. #695 and Rust/EventStore
+   remain Sentinel's budget authority; LiteLLM must not become routing authority.
 7. **KEEP** provider-side prompt-cache hints. Engine-side KV/prefix caching is an
    implementation detail behind a provider boundary and is never a durable
    business-state authority.
@@ -62,9 +65,10 @@ The accepted decisions are:
     rejection.
 
 The immediate accepted gaps are Gateway admission, wrapper capability
-preservation, streaming terminal accounting, and durable budget/attempt
-reconciliation. Proposed implementation contracts are included below, but are
-not live owner assignments until the ORC approves materialization.
+preservation, streaming terminal accounting, and #695's durable budget/attempt
+delta. Only the Go Gateway implementation is uncovered work. Proposed contracts
+are included below, but are not live owner assignments until the ORC approves
+materialization.
 
 ## Method and decision rules
 
@@ -176,19 +180,20 @@ execution and ephemeral engine cache.
 | `cmd/cortex-gateway/main.go:70-146` | Composition root | Requires the exact catalog, constructs one shared forward queue, wraps remote providers, and validates activation | Cortex Gateway; #650/#695 |
 | `cmd/cortex-gateway/main.go:341-350` | HTTP surface | Exposes compatibility, internal, agent-runtime, health, readiness, and metrics routes | Cortex Gateway |
 | `cmd/cortex-gateway/main.go:663-721` | Readiness | Token-free local readiness plus inventory/Gate B validation; provider calls are not readiness probes | #650 |
-| `cmd/cortex-gateway/internal/proxy/provider.go:21-103` | Provider ABI | Usage and cost fields exist; streaming and inventory are optional Go interfaces | Cortex Gateway |
+| `cmd/cortex-gateway/internal/proxy/provider.go:21-109` | Provider ABI | Usage/cost fields plus optional inventory, streaming, and status interfaces | Cortex Gateway |
 | `cmd/cortex-gateway/internal/proxy/catalog.go:28-75` | Provider catalog | Routing semantics have a stable digest; endpoints and credentials are deliberately outside it | #395 historical contract |
 | `cmd/cortex-gateway/internal/proxy/catalog.go:240-364` | Model policy | Hierarchy resolution and activation fail closed against allowlisted models | #395, #650 |
-| `cmd/cortex-gateway/internal/capability/detection.go:5-103` | Capability map | Capabilities are mutable, hand-maintained process state and are not bound to the catalog digest | Proposed A0 |
+| `cmd/cortex-gateway/internal/capability/detection.go:5-103` | Capability map | Capabilities are mutable, hand-maintained process state and are not bound to the catalog digest | Proposed #732 schema delta |
 | `cmd/cortex-gateway/internal/forwardqueue/manager.go:37-96` | Admission | Concurrency is bounded, but the waiter slice has no capacity limit; cancellation/grant race is handled | #764 pressure; #769 schedules |
-| `cmd/cortex-gateway/internal/proxy/queued_provider.go:10-53` | Queue wrapper | Preserves inventory only; it does not implement `StreamingProvider` | Proposed A1 |
-| `cmd/cortex-gateway/internal/proxy/provider_test.go:49-67` | Wrapper test | Proves inventory preservation only | Proposed A1; #769 |
-| `cmd/cortex-gateway/internal/proxy/pipeline_test.go:482-529` | Stream test | Registers an unwrapped mock, so productive queue composition is not covered | Proposed A1; #769 |
+| `cmd/cortex-gateway/internal/proxy/queued_provider.go:10-53` | Queue wrapper | Preserves inventory only; it drops `StreamingProvider` and `ProviderStatusReporter` | Proposed G1 |
+| `cmd/cortex-gateway/internal/proxy/provider_test.go:49-67` | Wrapper test | Proves inventory preservation only | Proposed G1; #769 |
+| `cmd/cortex-gateway/internal/proxy/pipeline.go:420-449` | Circuit-open response | Uses `ProviderStatusReporter` for Claude-Code typed 429/503 status; the productive wrapper hides it | Proposed G1 |
+| `cmd/cortex-gateway/internal/proxy/pipeline_test.go:482-529` | Stream test | Registers an unwrapped mock, so productive queue composition is not covered | Proposed G1; #769 |
 | `cmd/cortex-gateway/internal/proxy/pipeline.go:1082-1103` | Budget fallback | Budget exhaustion may switch providers before dispatch; there is no general provider retry loop | #695 |
 | `cmd/cortex-gateway/internal/proxy/pipeline.go:1454-1531` | Response sink | Non-stream terminal usage/cost has a single process-local sink | #695, #758 |
-| `cmd/cortex-gateway/internal/proxy/pipeline.go:1689-1747` | Streaming | Requires an optional interface and records latency/count only; it does not parse terminal usage or enter the response sink | Proposed A1/A2 |
+| `cmd/cortex-gateway/internal/proxy/pipeline.go:1689-1747` | Streaming | Requires an optional interface and records latency/count only; it does not parse terminal usage or enter the response sink | Proposed G1 plus #695/#732 |
 | `cmd/cortex-gateway/internal/proxy/claude.go:120-206` | Anthropic non-stream | Context deadline, response bound, provider usage and cache-token split | Cortex Gateway |
-| `cmd/cortex-gateway/internal/proxy/claude.go:247-334` | Anthropic stream | Relays raw SSE and propagates write/read error; no terminal usage reconciliation | Proposed A1/A2 |
+| `cmd/cortex-gateway/internal/proxy/claude.go:247-334` | Anthropic stream | Relays raw SSE and propagates write/read error; no terminal usage reconciliation | Proposed G1 plus #695/#732 |
 | `cmd/cortex-gateway/internal/proxy/claude_code.go:103-195` | Claude CLI adapter | Separate internal semaphore plus per-request subprocess and stderr drain | Cortex Gateway |
 | `cmd/cortex-gateway/internal/proxy/ollama.go:85-225` | Ollama adapter | Non-stream HTTP generation and token-free inventory | Cortex Gateway |
 | `cmd/cortex-gateway/internal/proxy/local_loop.go:20-237` | Deterministic fixture | Token-free, no network/subprocess, stable scenario digest, supports synthetic SSE | #650 test path |
@@ -207,12 +212,14 @@ execution and ephemeral engine cache.
 
 ### Verified gaps and non-gaps
 
-**G1, productive streaming composition.** `ClaudeProvider` implements
-`StreamingProvider`, but `NewQueuedProvider` returns a wrapper that implements
-only `Provider` and optionally `ModelInventoryProvider`. Productive composition
-wraps `anthropic-direct`; `streamAnthropicResponse` then type-asserts the wrapper.
-The source therefore predicts a 502 for that composition. This is a source-backed
-defect, not a runtime observation.
+**G1, productive optional-interface composition.** `ClaudeProvider` implements
+`StreamingProvider`, and `ClaudeCodeProvider` implements
+`ProviderStatusReporter`, but `NewQueuedProvider` returns a wrapper that
+implements only `Provider` and optionally `ModelInventoryProvider`. Productive
+composition wraps both providers. `streamAnthropicResponse` therefore cannot
+type-assert the streaming wrapper and predicts a 502. The circuit-open path at
+`pipeline.go:431` cannot recover Claude-Code's typed cooldown status and falls
+back to generic 503. These are source-backed defects, not runtime observations.
 
 **G2, unbounded waiting admission.** The Go queue bounds active forwards but
 appends every waiter to a slice. Slow providers can turn authenticated request
@@ -256,21 +263,32 @@ and future SGLang/KVFlow/Multi-LoRA mechanisms
 
 Target-only delta proposed for the main-session owner:
 
-1. Define Cortex Gateway as the sole admission, provider-selection, deadline,
-   budget-reservation, and attempt-outcome authority.
+1. Define Cortex Gateway as the edge-admission, provider/model-selection, and
+   provider-execution-deadline authority. Caller deadlines remain end-to-end
+   policy; there is no Gateway-owned global deadline.
 2. Define engines as replaceable execution adapters. Engine queue/KV cache state
    is ephemeral and cannot become event, budget, request, or ownership authority.
-3. Replace unconditional "provider failover" language with: failover is allowed
+3. Define Rust/EventStore as the durable request/effect/usage, atomic
+   budget-reservation, and canonical attempt-outcome authority. Every billable
+   Gateway route must obtain an authoritative reservation through the shared
+   port before dispatch or fail closed; a digest-bound non-billable exemption is
+   the only exception.
+4. Replace unconditional "provider failover" language with: failover is allowed
    before dispatch or after a typed definitive non-billable outcome; ambiguous
    dispatch is quarantined/reconciled and never blindly retried.
-4. Replace fixed concurrency claims with versioned bounded-admission policy:
+5. Replace fixed concurrency claims with versioned bounded-admission policy:
    global, request-class, provider, queue-capacity, deadline, overload outcome,
    and pressure metrics.
-5. Bind streaming to the same terminal usage, cost-source, request-digest, and
+6. Bind streaming to the same terminal usage, cost-source, request-digest, and
    cancellation outcome as non-streaming.
-6. Mark SGLang RadixAttention, vLLM prefix caching, KVFlow, Multi-LoRA, grammar
+7. Mark SGLang RadixAttention, vLLM prefix caching, KVFlow, Multi-LoRA, grammar
    engines, and local-engine selection `POST_M0` until target hardware,
    dependency ownership, security, and rollback gates pass.
+
+Once the architecture and owners approve this decision set, the main session
+should update both language-specific TOGAF target copies immediately. Target
+contracts do not wait for implementation evidence; measured results remain
+delivery evidence.
 
 No TOGAF file is changed by this worker.
 
@@ -304,7 +322,7 @@ credible alternatives were retained as screening evidence.
 | [SGLang](https://github.com/sgl-project/sglang/tree/e1f2f9d1fa84cd1b8d9020377fdd707b3a485687) | `e1f2f9d1fa84cd1b8d9020377fdd707b3a485687` | GPU engine/gateway | Deep | Mechanism source; wrap candidate |
 | [TGI](https://github.com/huggingface/text-generation-inference/tree/b4adbf2f6e2e721280bd0ea5f91d70f7d033f5ed) | `b4adbf2f6e2e721280bd0ea5f91d70f7d033f5ed` | GPU server | Deep | Reject adoption; port overload semantics |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp/tree/caa596ab3f0f8768ee326d6e3d5d39782194676c) | `caa596ab3f0f8768ee326d6e3d5d39782194676c` | CPU/GPU local server | Deep | Wrap candidate, post-M0 |
-| [LiteLLM](https://github.com/BerriAI/litellm/tree/c274cf321c5c35c629220a89bb497d15b56f870f) | `c274cf321c5c35c629220a89bb497d15b56f870f` | Provider proxy | Deep | Reject authority; port budget contract |
+| [LiteLLM](https://github.com/BerriAI/litellm/tree/c274cf321c5c35c629220a89bb497d15b56f870f) | `c274cf321c5c35c629220a89bb497d15b56f870f` | Provider proxy | Deep | Reject authority; port reservation idea |
 | [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo/tree/29ef3b5def0ea37bfcac015a81edbcbcd9ff1c31) | `29ef3b5def0ea37bfcac015a81edbcbcd9ff1c31` | Distributed serving | Scan | Post-M0 background |
 | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/f20ea652dd621006148aa918c970ba686cdda407) | `f20ea652dd621006148aa918c970ba686cdda407` | NVIDIA engine/runtime | Scan | Reject for current portable lane |
 | [LMDeploy](https://github.com/InternLM/lmdeploy/tree/821730d650d5999260cef6f3ce464edeced6047e) | `821730d650d5999260cef6f3ce464edeced6047e` | GPU engine/server | Scan | No unique mechanism |
@@ -337,8 +355,8 @@ git ls-remote https://github.com/mudler/LocalAI.git HEAD
   has practical API-key/CORS/path security tests, but its task queues are not
   capacity-bounded.
 - LiteLLM directly tests the provider-router/budget problem, including
-  cancellation reservation reconciliation, but importing its proxy would create
-  duplicate authority.
+  process-local cancellation reservation reconciliation, but importing its proxy
+  would create duplicate authority and would not supply crash durability.
 - Dynamo adds distributed KV-aware routing and operational machinery that is
   disproportionate before a single-node M0 target is accepted.
 - TensorRT-LLM is hardware/vendor-specific and cannot satisfy a portable default
@@ -399,8 +417,9 @@ No repository security-policy file exists at this pin, which is an adoption risk
 requiring an explicit deployment threat model.
 
 **Mechanisms.** The model gateway creates a bounded job channel of 1,000 and a
-200-permit semaphore. Submission awaits channel capacity rather than allocating
-an unbounded waiter list
+200-permit semaphore. This is not end-to-end bounded admission:
+`tx.send(job).await` can suspend an unbounded number of submit futures outside
+the channel, and `status_map` is populated before the await
 ([`job_queue.rs`](https://github.com/sgl-project/sglang/blob/e1f2f9d1fa84cd1b8d9020377fdd707b3a485687/sgl-model-gateway/src/core/job_queue.rs#L90-L238)).
 The runtime scheduler supports request abort and retraction, while its unified
 radix cache matches/inserts prefixes, tracks lock references, evicts, and caches
@@ -423,9 +442,11 @@ service discovery configuration in one operational surface
 [`server.rs`](https://github.com/sgl-project/sglang/blob/e1f2f9d1fa84cd1b8d9020377fdd707b3a485687/sgl-model-gateway/src/server.rs#L1030-L1150)).
 That surface must not replace Sentinel's control plane.
 
-**Decision.** `WRAP` only after the same post-M0 gate as vLLM. `PORT` the finite
-admission/backpressure semantics into Sentinel Go, not the implementation or
-SGLang gateway authority. RadixAttention remains engine-local and ephemeral.
+**Decision.** `WRAP` only after the same post-M0 gate as vLLM. `PORT` only the
+bounded-channel and semaphore mechanism into Sentinel Go, not SGLang's ingress
+contract or gateway authority. Sentinel additionally requires a hard ingress/
+waiter cap, immediate typed rejection or a bounded deadline, and tests for
+pre-send status cardinality. RadixAttention remains engine-local and ephemeral.
 
 ### 3. Text Generation Inference
 
@@ -510,8 +531,11 @@ The proxy's budget reservation estimates worst-case cost, applies reservations
 to all relevant counters, rolls back partial reservation failure, and can fail
 closed
 ([`budget_reservation.py`](https://github.com/BerriAI/litellm/blob/c274cf321c5c35c629220a89bb497d15b56f870f/litellm/proxy/spend_tracking/budget_reservation.py#L146-L252)).
-Reconciliation is finalized once. Cancellation retains estimated input cost,
-releases the output portion, and shields reconciliation from cancellation
+Reconciliation uses a `finalized` flag in the request's process-local Python
+dictionary. It prevents repeated in-process reconciliation but is not
+crash-durable exactly-once. Cancellation retains estimated input cost, releases
+the output portion, and shields that process-local reconciliation from
+cancellation
 ([`budget_reservation.py`](https://github.com/BerriAI/litellm/blob/c274cf321c5c35c629220a89bb497d15b56f870f/litellm/proxy/spend_tracking/budget_reservation.py#L255-L311)).
 Unit suites cover Redis reservation failure, reservation accounting, router
 parallel limits, cooldown, retry, and streaming fallback metadata
@@ -525,8 +549,10 @@ double provider charge even if the proxy suppresses duplicate local logging.
 Its provider, auth, spend, cache, and enterprise surface is a larger dependency
 and operations boundary than Sentinel needs.
 
-**Decision.** `REJECT` integration and sidecar authority. `PORT` the bounded
-reservation/reconcile/cancel contract into Sentinel-owned schemas and stores.
+**Decision.** `REJECT` integration and sidecar authority. `PORT` only the
+reserve/reconcile/cancel idea. Sentinel's atomic multi-scope store operation,
+stable identities, restart recovery, and exactly-once reconciliation are
+stronger Sentinel-owned contracts, not LiteLLM behavior.
 
 ## Mechanism and decision matrices
 
@@ -536,14 +562,14 @@ reservation/reconcile/cancel contract into Sentinel-owned schemas and stores.
 |---|---|---|---|---|
 | Provider/model policy | Immutable catalog and hierarchy mapping | LiteLLM router is broader | `KEEP` | Cortex Gateway |
 | Token-free readiness | Inventory/Gate B/local-loop | Engines expose health/model routes | `KEEP` | Cortex Gateway |
-| Active-call limit | Go semaphore-like manager; Rust semaphore | TGI fail-fast; SGLang bounded wait | `REIMPLEMENT` finite policy | Gateway plus #764 policy |
-| Waiting queue | Unbounded Go waiter slice | SGLang bounded mpsc | `PORT` semantics | Cortex Gateway |
+| Active-call limit | Go semaphore-like manager; Rust semaphore | TGI fail-fast; SGLang channel/semaphore | `REIMPLEMENT` finite policy | Gateway plus #764 policy |
+| Waiting queue | Unbounded Go waiter slice | TGI immediate reject; SGLang bounded channel but unbounded submit futures | `PORT` primitives plus hard ingress cap | Cortex Gateway |
 | Queue cancel race | Go cancellation/grant handling | SGLang drop cancellation | `KEEP` and expand tests | #769 evidence |
-| Streaming capability | Optional interface lost by wrapper | Engine/provider stream APIs | `REIMPLEMENT` wrapper matrix | Cortex Gateway |
+| Optional capabilities/status | Streaming and status reporter lost by wrapper | Engine/provider stream and status APIs | `REIMPLEMENT` exact wrapper matrix | Cortex Gateway |
 | Stream cancellation | HTTP context and write error | SGLang upstream cancel test | `PORT` terminal semantics | Cortex Gateway |
-| Stream usage/cost | Missing from single response sink | LiteLLM terminal reconciliation | `REIMPLEMENT` | Gateway + durable bridge |
-| Budget admission | In-memory check then record | LiteLLM reservation | `PORT` contract | #695 + durable store |
-| Retry/failover | Pre-dispatch budget fallback only | LiteLLM broad retries | `REJECT` ambiguous retry | Durable attempt outcome |
+| Stream usage/cost | Missing from single response sink | LiteLLM process-local reconciliation idea | `REIMPLEMENT` | Gateway adapter + #695/EventStore |
+| Budget admission | In-memory check then record | LiteLLM reservation idea | `PORT` idea, strengthen durability | #695 + Rust/EventStore |
+| Retry/failover | Pre-dispatch budget fallback only | LiteLLM broad retries | `REJECT` ambiguous retry | Rust/EventStore attempt outcome |
 | Circuit breaking | Gateway and bridge local breakers | Engines have backend health | `KEEP`, make outcome-aware | Gateway |
 | Request/effect identity | Stable Rust request ID/digest | No engine knows Sentinel effect | `KEEP` | Rust bridge/event store |
 | Usage authority | Gateway response plus durable event | Engines report token counters | `KEEP`; adapt reports | Event/projection |
@@ -559,10 +585,10 @@ reservation/reconcile/cancel contract into Sentinel-owned schemas and stores.
 | Candidate | Dependency/operations cost | Security posture at pin | Cache/admission value | Sentinel decision |
 |---|---|---|---|---|
 | vLLM | Python/CUDA/runtime image and GPU-specific deployment | Apache-2.0, security policy present | Strong scheduler, preemption, prefix cache | Post-M0 external wrapper candidate |
-| SGLang | Python/CUDA plus Rust gateway and broad runtime surface | Apache-2.0, no repo security policy | Strong radix cache and cancellation; bounded gateway queue | Post-M0 wrapper; port queue semantics |
+| SGLang | Python/CUDA plus Rust gateway and broad runtime surface | Apache-2.0, no repo security policy | Strong radix cache/cancellation; bounded channel but unbounded submit futures | Post-M0 wrapper; port primitives only |
 | TGI | Rust/Python/CUDA service image | Apache-2.0, no repo security policy | Typed overload; unbounded tokenizer channels | Reject adoption |
 | llama.cpp | C/C++ build and model-file operations; portable local lane | MIT, limited security policy | Slot/cache server, unbounded task deques | Post-M0 external wrapper candidate |
-| LiteLLM | Large Python proxy, provider/auth/storage operations | Mixed tree; MIT non-enterprise, separate enterprise terms | Strong budget/retry mechanisms | Reject authority; port reservation contract |
+| LiteLLM | Large Python proxy, provider/auth/storage operations | Mixed tree; MIT non-enterprise, separate enterprise terms | Useful reservation idea; finalized guard is process-local | Reject authority; port idea only |
 | Dynamo | Distributed router/KV/control infrastructure | Apache-2.0, security policy present | Advanced disaggregated routing | Too early; post-M0 background |
 | TensorRT-LLM | NVIDIA-specific compiler/runtime stack | Apache-2.0, security policy present | High-performance executor/KV stack | Reject as portable default |
 | LMDeploy | Python/CUDA/TurboMind service | Apache-2.0; no reviewed security file | Similar engine scheduling | No unique accepted mechanism |
@@ -574,9 +600,9 @@ reservation/reconcile/cancel contract into Sentinel-owned schemas and stores.
 | Change | Direct files/contract | Downstream effects | Guardrail |
 |---|---|---|---|
 | Finite Gateway queue | `forwardqueue`, composition config, metrics | External callers receive overload; Rust urgent/normal policy sees typed outcomes | Versioned defaults, class-specific policy, no silent drop |
-| Preserve streaming wrapper | `queued_provider`, provider capability tests | Productive Anthropic stream becomes reachable; queue permit lifetime spans stream | Test every optional interface combination; release on EOF/error/cancel |
-| Parse terminal stream usage | Claude adapter and response sink | Cost projection and budget reconciliation change; partial streams become billable outcomes | Raw chunks are not durable effects; terminal record keyed by request digest |
-| Durable budget reservation | shared event/schema plus Gateway/bridge | Concurrent cost admission, restart recovery, projection, operator diagnostics | Atomic reserve, exactly-once reconcile, expiry/quarantine, no negative balance |
+| Preserve optional interfaces | `queued_provider`, provider capability tests | Anthropic stream and Claude-Code typed cooldown/retry status survive wrapping | Test all inventory/stream/status combinations without invented capabilities |
+| Parse terminal stream usage | Claude adapter and response sink | Cost projection and budget reconciliation change; partial streams become billable outcomes | Raw chunks are not durable effects; outcome is bound to admission/attempt/reservation digests |
+| Durable budget reservation | #695 plus shared event/schema and Gateway port | Concurrent cost admission, restart recovery, projection, operator diagnostics | Atomic integer-unit multi-scope reserve, exactly-once reconcile, release/quarantine |
 | Typed attempt outcome | Go response and Rust bridge/event | Retry/failover, circuit breaker, outbox, observability | Unknown after dispatch is `AMBIGUOUS`, never inferred safe |
 | Engine adapter | provider catalog/config/deployment | Model inventory, readiness, image/license/CVE, cache metrics | #705 decision, target benchmark, rollback to prior provider |
 | Capability digest | catalog/capability schema | Readiness and routing reject drift | Bind to semantic catalog digest; no mutable undocumented capability |
@@ -588,6 +614,8 @@ reservation/reconcile/cancel contract into Sentinel-owned schemas and stores.
 
 ```text
 version
+admission_id
+admission_digest
 request_id
 request_digest
 request_class
@@ -595,27 +623,53 @@ agent_id_optional
 provider_id
 model_id
 catalog_digest
+capability_digest
 hierarchy_tier_optional
-max_input_tokens_optional
-max_output_tokens
-deadline_unix_ms
+max_input_tokens_optional_u64
+max_output_tokens_u64
+provider_execution_deadline_unix_ms
 queue_policy_id
 budget_reservation_id_optional
+budget_exemption:
+  NONE | NON_BILLABLE_LOCAL_LOOP | NON_BILLABLE_FAKE_PROVIDER_TEST
+budget_exemption_reason_digest_optional
 ```
 
 Validation rejects missing identity, unknown enum/version, digest mismatch,
 uncataloged provider/model, expired deadline, negative limits, and a reservation
-bound to another request digest.
+bound to another request digest. `admission_digest` is SHA-256 over the canonical
+V1 admission fields, including catalog, capability, reservation or exemption,
+and provider-execution deadline. A billable admission without an authoritative
+reservation fails closed. Exemption is an allowlisted, digest-bound reason; an
+arbitrary caller string cannot create a free route.
+
+### `BudgetAuthorityPortV1`
+
+The Go Gateway calls a versioned port backed by #695's Rust/EventStore authority
+before dispatching any billable external or internal request. The request carries
+the canonical admission, required budget scopes, and maximum integer cost. The
+response is either a bound `BudgetReservationV1`, a typed deny, or a validated
+non-billable exemption. Port timeout/unavailability rejects billable admission.
+Gateway memory may cache neither balance nor authorization. This solves external
+compatibility routes without moving durable authority into Go.
 
 ### `ProviderAttemptOutcomeV1`
 
 ```text
 version
+outcome_operation_id
+admission_id
+admission_digest
 request_id
 request_digest
 attempt_id
+attempt_digest
 provider_id
 model_id
+catalog_digest
+capability_digest
+budget_reservation_id_optional
+budget_exemption_optional
 dispatch_state:
   NOT_DISPATCHED | DISPATCHED | DEFINITIVE_REJECT | COMPLETED | AMBIGUOUS
 terminal_reason:
@@ -623,9 +677,13 @@ terminal_reason:
   PROVIDER_REJECT | PROVIDER_SUCCESS | CLIENT_CANCEL_AFTER_DISPATCH |
   DEADLINE_AFTER_DISPATCH | TRANSPORT_LOST | INVALID_RESPONSE
 provider_request_id_optional
-usage_outcome_optional
 occurred_at
 ```
+
+`attempt_digest` is SHA-256 over the canonical admission binding, reservation or
+exemption, provider/model/catalog/capability binding, dispatch state, terminal
+reason, provider request ID, and occurrence time. `outcome_operation_id` is
+stable for that attempt and is the idempotency key for append.
 
 No component may convert `AMBIGUOUS` to `NOT_DISPATCHED`. A fallback attempt is
 allowed only for `NOT_DISPATCHED` or a provider-specific `DEFINITIVE_REJECT`
@@ -634,16 +692,24 @@ contract proven non-billable.
 ### `UsageOutcomeV1`
 
 ```text
-input_tokens
-output_tokens
-cache_read_input_tokens
-cache_creation_input_tokens
-reported_cost_usd_optional
-resolved_cost_usd
+usage_operation_id
+attempt_id
+attempt_digest
+budget_reservation_id
+input_tokens_u64
+output_tokens_u64
+cache_read_input_tokens_u64
+cache_creation_input_tokens_u64
+reported_cost_microusd_u64_optional
+resolved_cost_microusd_u64
 cost_source: PROVIDER_REPORTED | CATALOG_COMPUTED | CONSERVATIVE_RESERVED
 terminal: true
 partial_stream: bool
 ```
+
+One micro-USD is one millionth of a US dollar. Integers avoid float/NaN,
+rounding, and cross-language comparison ambiguity. The usage operation is bound
+to exactly one attempt digest and reservation.
 
 Only a terminal usage outcome can reconcile a reservation. Missing provider
 usage uses catalog cost when token counts are trustworthy; otherwise the
@@ -655,46 +721,60 @@ conservative reservation remains quarantined for operator reconciliation.
 reservation_id
 request_id
 request_digest
-budget_scope_ids
-reserved_usd
-estimated_input_usd
-status: RESERVED | RECONCILED | QUARANTINED
+admission_id
+admission_digest
+scopes[]:
+  scope_kind: PROVIDER | PROJECT | AGREEMENT | CUSTOMER
+  scope_id
+  scope_generation_u64
+  window_kind: LIFETIME | CALENDAR_HOUR | CALENDAR_DAY | FIXED_RANGE
+  window_start_unix_ms
+  window_end_unix_ms_optional
+reserved_microusd_u64
+estimated_input_microusd_u64
+status:
+  RESERVED | PRE_DISPATCH_RELEASED | RECONCILED | QUARANTINED
 expires_at
 reconciled_usage_operation_id_optional
+quarantine_reason_optional
 ```
 
 Reserve and compare are one atomic store operation across applicable budget
 scopes. Reconciliation is idempotent by reservation and usage operation IDs.
-Post-dispatch cancellation retains known or estimated input cost. Expiry never
-silently refunds an ambiguous attempt.
+Pre-dispatch rejection/cancellation moves `RESERVED` to
+`PRE_DISPATCH_RELEASED`. Post-dispatch cancellation retains known or estimated
+input cost and reconciles only from a definitive terminal outcome. Expiry never
+silently refunds an ambiguous attempt; it becomes `QUARANTINED`.
 
 ### `ProviderCapabilitiesV1`
 
 The semantic catalog binds supported request format, streaming, usage-in-stream,
 structured output, tool use, inventory, cache accounting, cancellation, and
-definitive-rejection semantics. A wrapper must preserve exactly the capabilities
-it implements; it may not invent or drop an interface silently.
+definitive-rejection semantics. It also binds typed provider status and
+`retry_after_ms` reporting. A wrapper must preserve every currently supported
+optional interface combination, including `ModelInventoryProvider`,
+`StreamingProvider`, and `ProviderStatusReporter`, without inventing or dropping
+a capability.
 
 ### Attempt state machine
 
-```text
-RECEIVED
-  -> VALIDATED
-  -> REJECTED
-  -> ADMITTED
-  -> BUDGET_RESERVED
-  -> DISPATCHED
-       -> COMPLETED
-       -> DEFINITIVE_REJECT
-       -> AMBIGUOUS
-  -> USAGE_RECONCILED
-  -> EFFECT_RECOVERED
-```
+| From | Event/guard | To | Durable action | Retry/fallback |
+|---|---|---|---|---|
+| `RECEIVED` | schema/catalog/capability valid | `VALIDATED` | persist/bind admission digest | none |
+| `VALIDATED` | non-billable exemption valid | `ADMITTED_EXEMPT` | persist exemption reason digest | no reservation needed |
+| `VALIDATED` | billable and atomic reserve succeeds | `BUDGET_RESERVED` | persist all scope/window generations | none |
+| `VALIDATED` | billable, deny/port unavailable | `REJECTED` | typed deny; no provider call | no |
+| `BUDGET_RESERVED` | queue full, deadline, or cancel before dispatch | `PRE_DISPATCH_RELEASED` | atomically release reservation | a new admission may retry |
+| `ADMITTED_EXEMPT` or `BUDGET_RESERVED` | provider dispatch starts | `DISPATCHED` | append bound attempt operation | no automatic retry |
+| `DISPATCHED` | proven non-billable provider reject | `DEFINITIVE_REJECT` | release reservation exactly once | policy may create a new admission |
+| `DISPATCHED` | terminal provider result and usage | `COMPLETED` | append usage operation and reconcile reservation exactly once | no |
+| `DISPATCHED` | timeout, disconnect, lost/invalid terminal state | `AMBIGUOUS` | quarantine reservation and attempt | never automatic |
+| `COMPLETED` | durable usage reconciled | `USAGE_RECONCILED` | stable usage operation readback | no |
+| `USAGE_RECONCILED` | action claim succeeds | `EFFECT_RECOVERED` | one durable action/effect claim | no |
 
-Cancellation before `DISPATCHED` releases the queue slot and reservation.
-Cancellation after `DISPATCHED` produces a terminal or ambiguous attempt and
-does not authorize retry. Process restart resumes from durable reservation,
-attempt, completion, and usage identities.
+`AMBIGUOUS` has no transition to usage or effect without explicit authoritative
+reconciliation evidence. Restart resumes from admission, reservation, attempt,
+usage, and effect operation IDs. No state is reconstructed from process memory.
 
 ## Negative and failure matrix
 
@@ -704,7 +784,11 @@ attempt, completion, and usage identities.
 | Waiter context cancels before grant | Remove waiter and never call provider | Consume a permit or dispatch later |
 | Grant races cancellation | Exactly one grant/release outcome | Permit leak or duplicate dispatch |
 | Streaming wrapper around streaming provider | Capability preserved and permit held until terminal | 502 due to wrapper type loss |
-| Wrapper around non-stream provider | Streaming remains unsupported | Invented interface/capability |
+| Status-reporting provider behind wrapper | Typed cooldown status and retry-after preserved | Generic 503 caused by type loss |
+| Wrapper around non-stream/non-status provider | Unsupported interfaces remain absent | Invented interface/capability |
+| Billable route without reservation | Fail closed before dispatch | In-memory check or provider call |
+| Non-billable exemption | Allowlisted reason and admission digest agree | Caller-defined free route |
+| Budget scope generation/window mismatch | Reject reservation and append | Spend against stale scope |
 | Client disconnect before dispatch | No provider call; reservation released | Billable attempt or retry |
 | Client disconnect after dispatch | Cancel upstream, persist terminal/ambiguous outcome, reconcile incurred cost | Full refund or blind retry |
 | Provider deadline before headers | Outcome depends on dispatch acknowledgement; unknown is ambiguous | Assume non-billable |
@@ -716,6 +800,7 @@ attempt, completion, and usage identities.
 | Catalog/capability digest drift | Readiness/routing fail closed | Mutate capability map silently |
 | Budget store unavailable | Reject cost-bearing request | In-memory fail-open |
 | Concurrent near-limit requests | Atomic reservations keep total within ceiling | All requests pass stale balance |
+| Fractional/NaN/overflow cost | Canonical checked micro-USD integer rejects input | Float coercion or wraparound |
 | Outbox publish then crash | Duplicate delivery absorbed by stable operation ID | Duplicate usage/effect |
 | Engine cache eviction/restart | Recompute prompt/KV only | Change durable request/effect identity |
 | Provider/model removed | Token-free readiness or catalog validation fails | Send to uncataloged model |
@@ -724,12 +809,12 @@ attempt, completion, and usage identities.
 
 | Finding | Class | Rationale | Proposed owner |
 |---|---|---|---|
-| Concurrent budget check/record can bypass cost ceiling | `BLOCKS_M0` pending #695 acknowledgement | #695 explicitly requires cost ceiling under concurrency | #695 plus proposed A0/A2 |
-| Productive queue wrapper drops streaming interface | `M0_HARDENING` | Agent-runtime is non-streaming, but compatibility streaming is broken by composition | Proposed A1, tests #769 |
-| Go waiter queue has no capacity bound | `M0_HARDENING` | External/internal pressure can exhaust memory; no current runtime evidence was taken | #764 policy, proposed A1 |
-| Stream terminal usage/cost absent | `M0_HARDENING` | Streaming can incur cost outside the single sink | Proposed A1/A2, #732 |
-| Blind post-dispatch failover must remain forbidden | `M0_HARDENING` | Prevents future target drift from creating duplicate charge | Proposed A0/A2 |
-| Capability map not bound to catalog digest | `M0_HARDENING` | Mutable source map can disagree with productive wrapper capability | Proposed A0 |
+| Concurrent budget check/record can bypass cost ceiling | `BLOCKS_M0` pending #695 acknowledgement | #695 explicitly requires cost ceiling under concurrency | Precise #695 delta or successor |
+| Productive queue wrapper drops streaming and status interfaces | `M0_HARDENING` | Compatibility streaming breaks and Claude-Code typed cooldown status is hidden | Proposed G1, tests #769 |
+| Go waiter queue has no capacity bound | `M0_HARDENING` | External/internal pressure can exhaust memory; no current runtime evidence was taken | #764 policy, proposed G1 |
+| Stream terminal usage/cost absent | `M0_HARDENING` | Streaming can incur cost outside the single sink | Proposed G1 plus #695/#732 |
+| Blind post-dispatch failover must remain forbidden | `M0_HARDENING` | Prevents future target drift from creating duplicate charge | #695/#732 |
+| Capability map not bound to catalog digest | `M0_HARDENING` | Mutable source map can disagree with productive wrapper capability | #732 schema delta plus G1 |
 | vLLM/SGLang/llama.cpp engine selection | `POST_M0` | Requires target hardware, security, dependency, and rollback evidence | #705/#656 decision gate |
 | Prefix/KV reuse, Multi-LoRA, speculative decode, grammar engine | `POST_M0` | Performance/engine mechanisms do not block product semantics | #705 and later engine owner |
 | `sentinel-inference` prototype disposition | `POST_M0` | No productive path; audit before retain/rewrite/remove | #705 |
@@ -742,63 +827,35 @@ research recommendation, not owner acceptance.
 
 ## Proposed implementation-owner contracts
 
-No issue in this section exists yet. Materialization is forbidden until ORC
-approval. The graph avoids overlapping Go, shared-schema, and Rust write scopes:
+Materialization is forbidden until ORC approval. There is no new coordination
+epic and no duplicate durable-budget child. Existing owners receive precise
+deltas; only G1 is genuinely uncovered Go implementation work.
 
 ```text
-Proposed Epic A
-  +-> A0 shared contracts and conformance vectors
-  +-> A1 Go Gateway bounded admission and streaming
-  +-> A2 durable reservation and attempt reconciliation
+#732 schema/append delta S0
+  +-> #695 cost/attempt delta C0
+  +-> proposed G1 Go Gateway implementation
 
-A1 depends on A0 and #769.
-A2 depends on A0, #732, and #733.
-A1 and A2 may proceed in parallel after A0.
+#733 consumes S0 events and owns outbox/consumer outcomes.
+#764 supplies pressure policy to G1.
+#769 supplies deterministic Go schedules to G1.
+
+C0 and G1 implementation may proceed in parallel after S0.
+Billable G1 activation depends on the authoritative C0 port being live.
 ```
 
-There is no `A1 -> A2` or `A2 -> A1` dependency. Cross-language behavior is
-bound by versioned vectors, not shared implementation.
+This graph is acyclic. S0 is schema authority, C0 is durable budget/attempt
+authority, and G1 is edge implementation. G1 may be built against fake S0/C0
+ports in parallel, but its billable producer flag cannot activate before C0.
+Cross-language behavior is bound by versioned vectors, not shared implementation.
 
-### Proposed Epic A: Cortex inference-control hardening
+### Existing-owner delta S0: #732 schemas, validators, and append
 
-**Parent and inputs:** #650; research input #714; dependency decisions #705.
-**Ownership:** coordination only; children own disjoint files.
-**Runtime target:** implementation work defaults to `NONE`; any later provider
-or staging target requires a separate explicit authorization.
-**Goal:** make admission, attempt outcome, cancellation, streaming usage, and
-budget reservation bounded and restart-safe without moving authority into an
-engine or generic proxy.
-
-**Acceptance:**
-
-- A0, A1, and A2 pass independently and jointly.
-- #695 confirms the cost-ceiling contract.
-- #764 confirms pressure semantics; #769 supplies deterministic Go schedules.
-- #732/#733 remain event/outbox authorities.
-- No automatic post-dispatch retry or failover is introduced.
-- No engine/provider dependency is added without #705.
-
-**Negative:** no duplicate routing, budget, event, usage, or effect authority;
-no token-spending readiness; no unbounded queue; no runtime benchmark claim from
-build or developer machines.
-
-**Rollout/rollback:** schema readers first, then Gateway/bridge producers behind
-off-by-default config; rollback disables producers while readers remain
-compatible. PR revert is the source rollback.
-
-**Benchmark contract:** N/A for epic acceptance. Child structural/load tests
-must prove queue bounds and constant state cardinality. Target throughput and
-latency are separate authorized runtime benchmarks.
-
-**TOGAF target delta:** apply the six target-only deltas above after verified
-implementation.
-
-### A0: shared inference contracts, validators, and vectors
-
-**Owned write scope:** shared schema/types and fixtures selected by #732, plus
-schema-only Go mirrors and CI routing; no queue, provider, bridge, or projection
-implementation.
-**Dependencies:** Epic A, #732, #705; blocks A1/A2 producer cutover.
+**Owned write scope:** the exact shared schema, append validation, fixtures, and
+schema-only Go mirrors assigned by #732; no queue, provider, budget policy,
+bridge orchestration, outbox, or projection implementation.
+**Dependencies:** #732 canonical envelope/append authority; #705 only if a new
+dependency is proposed. S0 blocks C0/G1 production of V1 records.
 **Deliverables:** versioned `InferenceAdmissionV1`,
 `ProviderAttemptOutcomeV1`, `UsageOutcomeV1`, `BudgetReservationV1`, and
 `ProviderCapabilitiesV1`; canonical JSON vectors and invalid fixtures; unknown
@@ -814,124 +871,181 @@ version/field policy; schema digest.
 4. Capability digest includes stream usage and definitive-rejection semantics.
 5. CI path routing runs both language validators for schema/vector changes.
 
-**Negative tests:** unknown version/enum/field; missing digest; digest mismatch;
-reservation rebound to another request; negative token/cost; terminal usage
-without terminal attempt; invented wrapper capability; ambiguous marked
-non-billable; A1/A2 cross-dependency in owner graph.
+**Negative tests:** unknown version/enum/field; missing digest; admission,
+attempt, reservation, catalog, or capability digest mismatch; reservation rebound
+to another request; negative/overflow integer cost; terminal usage without a
+terminal attempt; invented wrapper capability; ambiguous marked non-billable;
+float/NaN cost representation; billable admission without reservation.
 
-**Target tests:** local deterministic fixtures only, runtime target `NONE`.
+**Runtime target block:** `NONE`; deploy, read-only, and benchmark targets none;
+`.155`, `.240`, `.241`, `.242`, providers, and Proxmox are forbidden. Local
+deterministic fixtures only. Rollback owner is the S0 implementer by PR revert.
 **Benchmark:** structural vector count and schema-size ceiling only; no timing.
 **Rollout/rollback:** readers accept old plus V1 before producers emit V1;
 rollback stops V1 production without deleting records.
 **Evidence:** exact vector hashes, validator outputs, CI paths, one-authority
 matrix.
-**TOGAF target delta:** versioned admission/attempt/usage contract.
+**TOGAF target delta:** once approved, immediately add the versioned
+admission/attempt/usage authority target to both language copies.
 
-### A1: Go Gateway bounded admission and streaming
+### Proposed new child G1: Go Gateway bounded admission and streaming
 
 **Owned write scope:** `cmd/cortex-gateway` queue, provider wrappers, stream
 adapter, Gateway metrics/config/tests only. No Rust, event store, projection, or
 TOGAF file.
-**Dependencies:** A0, #764 pressure policy, #769 deterministic Go schedules;
-parallel with A2.
+**Parent/dependencies:** new child under #650; research #714; S0 schema port;
+#764 pressure policy; #769 deterministic Go schedules. Implementation may run in
+parallel with C0, but billable activation depends on C0's live authoritative
+reservation port.
 **Deliverables:** finite queue capacity and class limits; typed overload and
-retry metadata; cancellation-safe grant; optional-interface wrapper matrix;
-stream terminal parser/outcome; request/cost propagation to the A0 contract.
+retry-after metadata; cancellation-safe grant; exact optional-interface wrapper
+matrix; stream terminal parser/outcome; request/cost propagation through the S0
+contract and C0 port.
 
 **Acceptance:**
 
 1. Active and waiting work are both bounded by configuration with safe defaults.
 2. Queue-full is typed and never calls a provider.
-3. Every supported optional provider interface is preserved exactly.
+3. Every supported inventory/stream/status optional-interface combination is
+   preserved exactly, including Claude-Code cooldown status and retry-after.
 4. A stream holds one permit until EOF/error/cancel and emits exactly one
    terminal outcome.
 5. Client disconnect cancels upstream work and distinguishes pre/post dispatch.
 6. Non-stream and stream share request identity, catalog digest, cost source, and
    terminal usage rules.
 7. Readiness remains token-free.
+8. Every billable route obtains a bound C0 reservation before dispatch or fails
+   closed. Only digest-bound local-loop/fake-provider exemptions bypass it.
 
-**Negative tests:** full queue, cancel-before-grant, grant/cancel race, timeout
-while waiting, wrapper capability combinations, duplicate terminal SSE, missing
-usage, disconnect after headers, provider 429 with and without definitive
-non-billable contract, queue-config overflow, readiness attempts provider
-generation. Use Go `testing/synctest`, race detector, and deterministic barriers
-under #769; no sleeps as proof.
+**Negative tests:** full ingress and full waiter cap; cancel-before-grant;
+grant/cancel race; timeout while waiting; all optional-interface combinations;
+status reporter with typed 429/503 and retry-after; duplicate terminal SSE;
+missing usage; disconnect after headers; provider 429 with and without definitive
+non-billable contract; queue-config overflow; C0 deny/timeout/unavailable;
+unrecognized exemption; readiness attempts provider generation. Use Go
+`testing/synctest`, race detector, and deterministic barriers under #769; no
+sleeps as proof.
 
-**Target tests:** local fake HTTP providers only, runtime target `NONE` for CI.
-Any real provider test needs separate authorization and a hard cost cap.
-**Benchmark contract:** structural bounds plus allocation/cardinality checks;
-target latency/throughput only on an authorized Gateway runtime target, never
-the build server.
-**Rollout:** metrics-only policy parsing, then bounded queue with conservative
-capacity, then stream producer behind a flag.
-**Rollback:** disable stream producer/new policy and revert the A1 PR; old A0
-readers remain.
-**Evidence:** schedule traces, race output, queue cardinality, typed responses,
-capability matrix, zero provider calls in negative paths.
-**TOGAF target delta:** bounded admission and stream terminal contract.
+**Runtime target block:** `SINGLE_NODE`; deploy and benchmark target `.240`;
+read-only target `.240`; forbidden `.155`, `.241`, and `.242`; no real provider call.
+Create an issue-specific `.240` snapshot before deployment. Use token-free
+`local-loop` and fake HTTP providers for queue, stream, status, cancellation,
+reservation-port, and restart probes.
 
-### A2: durable reservation and attempt reconciliation
+**Benchmark contract:** on `.240`, report issue-specific p50/p95/max for queue
+wait, Gateway handler completion, and cancel propagation; maximum queue/waiter
+cardinality, goroutine count, RSS, open connections, and status-map cardinality;
+typed overload count; provider call count in reject paths. Include exact workload
+shape, sample count, warm-up, limits, and raw normalized output. Build-server
+timings and upstream numbers are invalid.
+
+**Rollout:** snapshot; deploy complete affected Gateway/daemon/store set; enable
+metrics and bounded non-billable paths; validate S0/C0 port fail-closed behavior;
+then enable billable producer only after C0 readback. Scan health/restarts/logs
+and compare usage/cardinality before approval.
+
+**Rollback:** disable billable/stream producer flags, restore prior complete
+service set or issue snapshot, verify queue/process/store health, then revert G1.
+The G1 implementation owner performs and records rollback. Never convert
+quarantined attempts during rollback.
+
+**Evidence:** local schedule/race tests; `.240` snapshot/deploy/rollback commands;
+token-free queue/cancel/stream/status/restart outputs; p50/p95/max and resource/
+cardinality data; zero provider calls in reject paths; S0/C0 readback.
+**TOGAF target delta:** once approved, immediately add bounded admission,
+provider-execution deadline, status/retry-after, and stream-terminal targets to
+both language copies.
+
+### Existing-owner delta C0: #695 durable budget and attempt reconciliation
 
 **Owned write scope:** daemon bridge and the exact persistence/projection files
-assigned by #732/#733/#695. No Go queue/provider implementation.
-**Dependencies:** A0, #732, #733, #695; parallel with A1 after A0.
+assigned by #695, using #732 append schemas and #733 delivery outcomes. No Go
+queue/provider implementation and no parallel budget owner.
+**Ownership/dependencies:** append this precise delta to active #695. If #695
+finishes before the delta can land, create an explicit successor linked after
+#695 rather than a parallel child. S0 precedes V1 production; #733 remains the
+outbox/consumer authority. C0 and G1 implementation may run in parallel after
+S0, but C0 blocks billable G1 activation.
 **Deliverables:** atomic budget reservation; attempt/outcome persistence;
 idempotent terminal usage reconciliation; cancellation and restart recovery;
-typed bridge response handling.
+typed bridge response handling; authoritative `BudgetAuthorityPortV1`.
 
 **Acceptance:**
 
 1. Concurrent reservations cannot exceed an accepted budget scope.
 2. Reservation is durable before provider dispatch and bound to request digest.
-3. Definitive completion reconciles exactly once to provider-reported or catalog
+3. Every scope kind, generation, and time window is part of one atomic integer
+   micro-USD comparison/reservation.
+4. Definitive completion reconciles exactly once to provider-reported or catalog
    cost.
-4. Post-dispatch cancel retains incurred input or conservative cost.
-5. Ambiguous dispatch remains quarantined across restart and cannot retry.
-6. Completion recovery produces exactly one usage event and one action claim.
-7. Outbox redelivery is absorbed by stable operation IDs.
-8. Store unavailable fails closed for cost-bearing requests.
+5. Pre-dispatch cancellation releases exactly once; post-dispatch cancellation
+   retains incurred input or conservative cost.
+6. Ambiguous dispatch remains quarantined across restart and cannot retry,
+   reconcile usage, or recover effects without authoritative evidence.
+7. Completion recovery produces exactly one usage event and one action claim.
+8. Outbox redelivery is absorbed by stable operation IDs.
+9. Port/store unavailable fails closed for every billable route.
 
 **Negative tests:** concurrent last-budget race; crash before/after reservation;
 crash before/after dispatch; timeout with unknown provider state; duplicate
 terminal outcome; mismatched request digest; duplicate outbox; projection
-restart; expired ambiguous reservation; negative/NaN cost; provider cost outside
-catalog sanity bounds.
+restart; expired ambiguous reservation; stale scope generation/window; float,
+negative, overflow, or malformed micro-USD; provider cost outside catalog sanity
+bounds; billable admission without reservation; arbitrary exemption reason.
 
-**Target tests:** deterministic local stores and fake Gateway, runtime target
-`NONE` in CI. A later staging failover/cost test requires explicit VM/provider
-authorization.
-**Benchmark contract:** reservation/event cardinality and bounded recovery batch
-size; no build-server timing.
-**Rollout:** dual-read, shadow reservation, reconcile comparison, then
-fail-closed enforcement; readiness reports incompatible schema/store.
-**Rollback:** stop new reservations, drain/reconcile existing records, retain
-readers, revert producer. Never delete ambiguous records.
-**Evidence:** state-transition histories, store rows/events, restart tests,
-projection totals, zero duplicate provider/effect/usage calls.
-**TOGAF target delta:** durable attempt/budget state machine and safe failover
-preconditions.
+**Runtime target block:** `SINGLE_NODE`; deploy and benchmark target `.240`;
+read-only target `.240`; forbidden `.155`, `.241`, and `.242`; no real provider call.
+Create an issue-specific snapshot, deploy the complete affected daemon/Gateway/
+store/projection set, and use local-loop/fake-provider journeys for concurrent
+reserve, cancel, crash, restart, outbox replay, and projection readback.
+
+**Benchmark contract:** on `.240`, report p50/p95/max reservation-port and
+reconciliation latency; maximum outstanding reservation/attempt rows, recovery
+batch, RSS, task/thread count, and event/projection cardinality; exact workload,
+sample count, warm-up, and raw normalized output. Prove totals remain equal
+across restart/redelivery. No build-server timing.
+
+**Rollout:** snapshot; land S0 readers; deploy C0 shadow reservation and compare
+against existing #695 cost decisions; enable authoritative reserve/reconcile;
+then permit G1 billable activation. Readiness fails closed on incompatible
+schema/port/store.
+
+**Rollback:** disable new billable admission, drain definitive records, preserve
+and expose quarantined attempts, restore the complete service set or snapshot,
+then revert C0. The #695/C0 owner performs and records rollback. Never delete or
+refund ambiguous records automatically.
+
+**Evidence:** `.240` snapshot/deploy/rollback commands; token-free state
+transitions; store/event/projection readbacks; restart/redelivery histories;
+p50/p95/max plus resources/cardinality; zero duplicate provider/effect/usage.
+**TOGAF target delta:** once approved, immediately add durable integer-unit
+multi-scope reservation, attempt transition, and safe-failover targets to both
+language copies.
 
 ### Existing-owner deltas after approval
 
-- **#695:** accept `BudgetReservationV1` as the cost-ceiling concurrency
-  mechanism; require authoritative actions to remain schema-validated; add
-  concurrent reservation and cancellation negative ACs.
-- **#696:** consume exact A0-A2 release evidence and preserve model/catalog/
+- **#695:** own C0 `BudgetReservationV1`, `BudgetAuthorityPortV1`, and canonical
+  attempt reconciliation as its existing provider/project cost-ceiling
+  implementation; require schema-validated actions and add concurrent reserve,
+  cancellation, restart, and ambiguous-dispatch negative ACs. If timing requires
+  follow-up, create a successor after #695 rather than parallel authority.
+- **#696:** consume exact S0/C0/G1 release evidence and preserve model/catalog/
   request lineage in delivery records.
 - **#705:** decide retain/rewrite/remove for `sentinel-inference`; separately
   decide any vLLM/SGLang/llama.cpp adapter dependency with license, security,
   image, CVE, owner, update, migration, and rollback evidence.
 - **#656:** only after #705 accepts a dependency, own update cadence and
   compatibility matrices.
-- **#732:** own canonical attempt/usage/reservation event schema and producer
-  validation, not provider policy.
+- **#732:** own S0 canonical attempt/usage/reservation schema and append
+  validation, not provider or budget policy.
 - **#733:** own durable delivery, retry outcome, and consumer idempotency for new
   events, not provider retry.
 - **#758:** consume bounded queue/attempt/reservation counters and causal IDs;
   never become a second business-state store.
-- **#764:** define pressure tiers and admission policy inputs consumed by A1.
-- **#769:** add wrapper capability, queue capacity, grant/cancel, timeout, and
-  disconnect schedules. It remains test ownership, not production implementation.
+- **#764:** define pressure tiers and admission policy inputs consumed by G1.
+- **#769:** add wrapper inventory/stream/status combinations, ingress/waiter
+  capacity, grant/cancel, timeout, retry-after, and disconnect schedules. It
+  remains test ownership, not production implementation.
 
 Closed #395 receives a follow-up link only if materialization is approved; its
 historical body and status must not be rewritten.
@@ -940,15 +1054,20 @@ historical body and status must not be rewritten.
 
 ### M0 hardening rollout
 
-1. Land A0 readers, invalid fixtures, and CI paths.
-2. Land A1 and A2 behind independent producer flags.
-3. Compare old usage totals with V1 reconciliation using local deterministic
+1. After architecture/owner approval, update both TOGAF target-language copies;
+   do not wait for implementation evidence.
+2. Land S0 readers, invalid fixtures, append validation, and CI paths.
+3. Build C0 and G1 in parallel behind independent producer flags. G1 may exercise
+   only non-billable local-loop/fake-provider paths until C0 is live.
+4. Compare old usage totals with C0 V1 reconciliation using local deterministic
    fakes; any unexplained difference blocks enforcement.
-4. Enable bounded admission first. Queue overflow must be visible and typed.
-5. Enable durable reservation only after existing pending completions reconcile.
-6. Enable streaming terminal accounting only after wrapper composition and
-   disconnect schedules pass.
-7. Remove flags only after #695/#696 acceptance and target TOGAF update.
+5. Snapshot `.240`, deploy complete affected sets, and pass C0/G1 live,
+   restart, rollback, p50/p95/max, and resource/cardinality contracts.
+6. Enable C0 authoritative reservation after existing pending completions
+   reconcile.
+7. Enable G1 billable admission only after successful C0 port/readback.
+8. Enable streaming terminal accounting only after wrapper composition and
+   disconnect schedules pass; #696 consumes the complete release evidence.
 
 Rollback never retries ambiguous attempts, deletes reservations, or switches to
 an uncataloged provider. It disables new producers, retains compatible readers,
@@ -982,7 +1101,7 @@ upstream claims are not acceptance evidence.
 | AC-3 deep reviews | `PASS` | Five pinned reviews covering source, tests, failures, security, license, operations |
 | AC-4 complete mechanism matrix | `PASS` | Mechanism, dependency/security/operations, butterfly, schema, and failure matrices |
 | AC-5 explicit decision per mechanism | `PENDING_MAINTAINER_APPROVAL` | Twelve executive decisions and mechanism matrix await ORC decision |
-| AC-6 accepted gap has live quality owner | `PENDING_MATERIALIZATION` | Complete Epic A/A0/A1/A2 contracts exist only in this study |
+| AC-6 accepted gap has live quality owner | `PENDING_MATERIALIZATION` | Complete #732 S0, #695 C0, and sole new G1 contracts exist only in this study |
 | AC-7 M0 classification and acknowledgement | `PENDING_OWNER_ACK` | Every finding classified; live owners have not yet acknowledged deltas |
 | AC-8 public-safe study | `PASS` after final gates | One English ASCII document, no secrets, provider calls, copied code, or runtime data |
 | AC-N1 no popularity dependency | `PASS` | Rubric and #705 gate; no dependency mutation |
@@ -1047,7 +1166,8 @@ Negative structure fixtures must reject:
 - an unbounded accepted queue;
 - engine/upstream/build-server timing presented as Sentinel evidence;
 - a live materialization claim while AC-5/AC-6/AC-7 remain pending;
-- `A1 -> A2` or `A2 -> A1`;
+- a new coordination epic or parallel durable-budget owner beside #650/#695;
+- a cyclic S0/C0/G1 owner graph or billable G1 activation before C0;
 - a repository file outside this document.
 
 ## Known limits
