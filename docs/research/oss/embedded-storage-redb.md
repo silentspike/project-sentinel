@@ -1015,13 +1015,12 @@ The final correction-round readback confirms the ORC reconciliation:
 | --- | --- | --- | --- |
 | #726 | `b41ad622257ec0d6ebe6feae91c1cc93835a6f1ceb0e46d397af9241d0226e7e` | Open; `status:blocked`; `quality:ready` | #722 is closed research input; #751/#753/#755 are active consumers |
 | #728 | `119bb7e05bc2f7826566ba3b7a08bec754e479e2255c64677879087d23085628` | Open; `status:blocked`; `quality:ready` | Topline, dependencies, blocker, out-of-scope, and AC-11 route recovery to #751/#753/#755 |
+| #729 | `5d8dbe42438dca4f6d968e7ee1fa80d4f76db4e8367d668b1807bfb835d192bb` | Open; `status:blocked`; `quality:ready`; Quality run `30478719879` PASS | Authority and node-local authority require 2PC; derived one-phase requires named immutable rebuild authority and approved store-bound adversarial-crash evidence; no benchmark waiver |
 | #730 | `942e2bb0ec845972871d8c7043c1f7fc30881aceb3297fb0976bd1cd79703cda` | Open; `status:blocked`; `quality:ready` | Typed receipt plus separate blob-file and segment-extent protocols |
 
-The quality-gate readback remains `PASSED` for all three bodies, with
-`quality:ready` retained by ORC after reconciliation. AC-6 is therefore `PASS`
-at this report revision. #729 remains the implementation target for the
-additional one-phase threat-boundary delta stated above; this worker did not
-rewrite its body.
+The quality-gate readback is `PASSED` for all four reconciled owners, with
+`quality:ready` retained by ORC. AC-6 is therefore `PASS` at this report
+revision. The worker did not rewrite any issue body.
 
 ## Implementation Slices
 
@@ -1153,7 +1152,7 @@ silently disabled.
 | AC-3 | Pinned deep review of redb, heed/LMDB, SQLite, Fjall, and RocksDB; sled rejection evidence |
 | AC-4 | Complete mechanism-by-candidate crossmatrix for redb, heed/LMDB, SQLite, Fjall, RocksDB, and rejected sled, plus failure, determinism/1:n, security, dependency, maintenance, integration, and performance-hypothesis deltas |
 | AC-5 | Exact decision table; no upstream number is used as Sentinel evidence |
-| AC-6 | PASS after ORC reciprocal-body reconciliation: final live #726/#728/#730 body, label, reciprocal-link, and quality readback confirms #722 research history, #751/#753/#755 recovery consumers, and backend-specific receipt ownership |
+| AC-6 | PASS after ORC reciprocal-body reconciliation: final live #726/#728/#729/#730 body, label, reciprocal-link, and quality readback confirms #722 research history, #751/#753/#755 recovery consumers, backend-specific receipt ownership, and the fail-closed redb security policy |
 | AC-7 | S-01 through S-13 classification with explicit promotion conditions and closed destructive-capability gates |
 | AC-8 | This public-safe English/ASCII report; repository validation remains required before merge |
 | AC-9 | Unified redb/CAS/dedup invariants and table/blob inventory |
