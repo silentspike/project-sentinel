@@ -305,7 +305,7 @@ next action
 sustained OOM pressure and preferences, and pressure-watch behavior
 ([cgroup tests](https://github.com/systemd/systemd/blob/08ca33fddebdb029ef84b97bb645d9325b783838/test/units/TEST-19-CGROUP.sh),
 [OOM tests](https://github.com/systemd/systemd/blob/08ca33fddebdb029ef84b97bb645d9325b783838/test/units/TEST-55-OOMD.sh),
-[pressure tests](https://github.com/systemd/systemd/blob/08ca33fddeb029ef84b97bb645d9325b783838/test/units/TEST-79-PRESSURE.sh)).
+[pressure tests](https://raw.githubusercontent.com/systemd/systemd/08ca33fddebdb029ef84b97bb645d9325b783838/test/units/TEST-79-PRESSURE.sh)).
 Tests explicitly skip unsupported capabilities; Sentinel readiness must not turn
 such a skip into a false enforcement claim.
 
