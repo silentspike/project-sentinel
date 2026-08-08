@@ -7,18 +7,21 @@ use super::{
     digest::ContentDigest,
     error::DeliveryError,
     ports::{
-        expected_integration_contract_digest, AdapterReadiness, AuthorityReceiptV1,
-        AuthorityValidationRequestV1, CandidateAuthorityQueryV1, DeliveryEffectKind,
-        DeliveryEffectPort, DeliveryEffectRequestV1, DeliveryIntegrationPort,
-        DeliveryPublicationPort, WorkbenchEvidenceReceiptV1, WorkbenchEvidenceRequestV1,
+        expected_effect_saga_contract_digest, expected_integration_contract_digest,
+        expected_workbench_execution_saga_contract_digest, AdapterReadiness, AuthorityReceiptV1,
+        AuthorityValidationRequestV1,
+        CandidateAuthorityQueryV1, DeliveryEffectKind, DeliveryEffectPort,
+        DeliveryEffectRequestV1, DeliveryIntegrationPort, DeliveryPublicationPort,
+        WorkbenchEvidenceReceiptV1, WorkbenchEvidenceRequestV1,
     },
     schema::{
         AcceptanceV1, ApprovalV1, AuthorityRole, CandidateState, CustomerAction,
-        CustomerFeedbackV1, DeliveryReceiptV1, DeliveryState, FindingV1, PrincipalV1,
-        ProjectCloseoutV1, QaAggregateOutcomesV1, QaCaseOutcome, QaEvaluationPlanV1,
-        QaEvaluationRunReceiptV1, QaEvidenceGraphV1, QaHarnessOutcome, QaReleaseGateReceiptV1,
-        QaRunState, ReleaseCandidateV1, ReleaseManifestV1, ReleaseState, ReleaseV1, ReviewV1,
-        RollbackV1, TestRunV1, VersionedRefV1, DELIVERY_SCHEMA_V1,
+        CustomerFeedbackV1, DataControlV1, DeliveryReceiptV1, DeliveryState, FindingV1,
+        PrincipalV1, ProjectCloseoutV1, QaAggregateOutcomesV1, QaCaseOutcome,
+        QaCaseReasonCode, QaDatasetCaseV1, QaEvaluationPlanV1, QaEvaluationRunReceiptV1,
+        QaEvidenceGraphV1, QaHarnessOutcome, QaReleaseGateReceiptV1, QaRunState,
+        ReleaseCandidateV1, ReleaseManifestV1, ReleaseState, ReleaseV1, ReviewV1, RollbackV1,
+        SourceTupleV1, TestRunV1, VersionedRefV1, DELIVERY_SCHEMA_V1,
     },
     state::{
         transition_candidate, transition_delivery, transition_qa_run, transition_release,
@@ -80,6 +83,14 @@ where
         context: &CommandContextV1,
         candidate: ReleaseCandidateV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        validate_record_header(
+            candidate.schema_version,
+            "candidate_id",
+            &candidate.candidate_id,
+            candidate.generation,
+        )?;
+        validate_ref("candidate agreement", &candidate.agreement)?;
+        validate_ref("candidate project", &candidate.project)?;
         self.require_current_authority(
             context,
             &candidate.tenant_id,
@@ -89,6 +100,12 @@ where
         if candidate.schema_version != super::schema::DELIVERY_SCHEMA_V1
             || candidate.state != CandidateState::Draft
             || candidate.candidate_digest != candidate.computed_digest()?
+            || candidate.work_items_digest == ContentDigest::zero()
+            || candidate.source_digest == ContentDigest::zero()
+            || candidate.toolchain_digest == ContentDigest::zero()
+            || candidate.runtime_profile_digest == ContentDigest::zero()
+            || candidate.acceptance_criteria_digest == ContentDigest::zero()
+            || candidate.created_at_ms > context.now_ms
         {
             return Err(DeliveryError::Validation(
                 "candidate schema, state, or canonical digest is invalid".to_string(),
@@ -165,6 +182,10 @@ where
         plan: QaEvaluationPlanV1,
         mut run: QaEvaluationRunReceiptV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        validate_qa_plan(&plan)?;
+        validate_record_header(run.schema_version, "run_id", &run.run_id, run.generation)?;
+        validate_ref("QA plan candidate", &plan.candidate)?;
+        validate_ref("QA run plan", &run.plan)?;
         self.require_current_authority(
             context,
             tenant_id,
@@ -186,6 +207,7 @@ where
             || run.aggregate_outcomes.is_some()
             || run.gate_receipt.is_some()
             || run.durable_event_generation != 0
+            || run.request_digest == ContentDigest::zero()
             || plan.candidate.id != candidate_id
             || run.plan.id != plan.plan_id
             || run.plan.generation != plan.generation
@@ -393,6 +415,7 @@ where
         project_id: &str,
         run_id: &str,
     ) -> Result<(DeliveryCommitReceiptV1, WorkbenchEvidenceReceiptV1), DeliveryError> {
+        self.require_execution_saga()?;
         let authority_before =
             self.require_current_authority(context, tenant_id, AuthorityRole::Qa, "execute_qa")?;
         let mut aggregate = self.required_aggregate(tenant_id, project_id)?;
@@ -424,12 +447,7 @@ where
             digest: ContentDigest::of_domain(
                 "workbench-invocation",
                 DELIVERY_SCHEMA_V1,
-                &(
-                    tenant_id,
-                    project_id,
-                    &run_ref,
-                    &authority_before.receipt_digest,
-                ),
+                &(tenant_id, project_id, &run_ref, &authority_before.principal),
             )?,
         };
         let request = WorkbenchEvidenceRequestV1 {
@@ -441,11 +459,15 @@ where
             qa_run: run_ref.clone(),
             assigned_qa: authority_before.principal.clone(),
             authority_receipt_digest: authority_before.receipt_digest.clone(),
+            authority_identity_digest: authority_before.stable_identity_digest()?,
             invocation,
             request_digest: ContentDigest::zero(),
         }
         .seal()?;
-        let command_digest = command_digest(context, &(tenant_id, project_id, run_id, &request))?;
+        let command_digest = command_digest(
+            context,
+            &(tenant_id, project_id, run_id, &request.request_digest),
+        )?;
         if let Some(existing) = self.existing(context, "execute_qa", tenant_id, &command_digest)? {
             let receipt = aggregate
                 .workbench_receipts
@@ -468,19 +490,24 @@ where
         let receipt = self.integration.execute_qa(&request)?;
         let authority_after =
             self.require_current_authority(context, tenant_id, AuthorityRole::Qa, "execute_qa")?;
-        if authority_after != authority_before {
+        if !same_authority_identity(&authority_after, &authority_before) {
             return Err(DeliveryError::StaleEvidence(
                 "QA authority changed between workbench request and evidence adoption".to_string(),
             ));
         }
-        if receipt.receipt_digest != receipt.computed_digest()?
+        validate_ref("workbench cleanup receipt", &receipt.cleanup_receipt)?;
+        if receipt.schema_version != DELIVERY_SCHEMA_V1
+            || receipt.receipt_digest != receipt.computed_digest()?
             || receipt.input_digest != request.request_digest
             || receipt.invocation != request.invocation
             || receipt.assignment != request.qa_run
             || receipt.qa_run != request.qa_run
             || receipt.assigned_qa != request.assigned_qa
             || receipt.authority_receipt_digest != request.authority_receipt_digest
+            || receipt.authority_identity_digest != request.authority_identity_digest
+            || receipt.authority_identity_digest != authority_after.stable_identity_digest()?
             || receipt.output_digest == ContentDigest::zero()
+            || receipt.artifact_ownership_digest == ContentDigest::zero()
             || receipt.result_inventory_digest == ContentDigest::zero()
             || receipt.logs_digest == ContentDigest::zero()
             || receipt.failure_classification_digest == ContentDigest::zero()
@@ -594,7 +621,13 @@ where
             .qa_plans
             .get(&run.plan.id)
             .ok_or_else(|| DeliveryError::CorruptStore("QA plan missing".to_string()))?;
-        validate_evidence_graph(plan, &run_ref, &graph)?;
+        validate_qa_evidence_graph(
+            plan,
+            &run_ref,
+            &graph,
+            &authority.principal,
+            context.now_ms,
+        )?;
         validate_evidence_outcome(workbench, &graph)?;
         if aggregate
             .evidence_graphs
@@ -630,6 +663,14 @@ where
         run_id: &str,
         gate: QaReleaseGateReceiptV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        validate_record_header(
+            gate.schema_version,
+            "gate_id",
+            &gate.gate_id,
+            gate.generation,
+        )?;
+        validate_ref("gate candidate", &gate.candidate)?;
+        validate_ref("gate plan", &gate.plan)?;
         let gate_authority =
             self.require_current_authority(context, tenant_id, AuthorityRole::Qa, "record_gate")?;
         let command_digest = command_digest(context, &(tenant_id, project_id, run_id, &gate))?;
@@ -639,6 +680,11 @@ where
         if gate.actor != gate_authority.principal
             || gate.issued_at_ms > context.now_ms
             || gate.expires_at_ms <= context.now_ms
+            || gate.case_inventory_digest == ContentDigest::zero()
+            || gate.deterministic_evidence_digest == ContentDigest::zero()
+            || gate.source_evidence_digest == ContentDigest::zero()
+            || gate.policy_digest == ContentDigest::zero()
+            || gate.release_manifest_digest == ContentDigest::zero()
         {
             return Err(DeliveryError::AuthorityDenied(
                 "gate actor or validity window is not authoritative".to_string(),
@@ -692,9 +738,9 @@ where
                 ))
             || gate.case_inventory_digest != qa_case_inventory_digest(graph)?
             || gate.deterministic_evidence_digest != qa_deterministic_evidence_digest(graph)?
-            || gate.model_evidence_digest != qa_model_evidence_digest(graph)?
+            || gate.model_evidence_digest.is_some()
+            || gate.calibration_digest.is_some()
             || gate.flake_disposition_digest != qa_flake_disposition_digest(graph)?
-            || gate.calibration_digest != plan.aggregation_policy_digest
             || gate.source_evidence_digest != qa_source_evidence_digest(graph)?
             || gate.policy_digest != plan.release_policy_digest
         {
@@ -791,6 +837,84 @@ where
         findings: Vec<FindingV1>,
         approval: Option<ApprovalV1>,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        validate_record_header(
+            review.schema_version,
+            "review_id",
+            &review.review_id,
+            review.generation,
+        )?;
+        validate_record_header(
+            test_run.schema_version,
+            "test_run_id",
+            &test_run.test_run_id,
+            test_run.generation,
+        )?;
+        validate_ref("review candidate", &review.candidate)?;
+        validate_ref("test-run candidate", &test_run.candidate)?;
+        validate_ref("test-run QA plan", &test_run.qa_plan)?;
+        validate_ref("test-run runner receipt", &test_run.runner_receipt)?;
+        if review.created_at_ms > context.now_ms
+            || review.findings_digest == ContentDigest::zero()
+            || test_run.result_inventory_digest == ContentDigest::zero()
+            || test_run.logs_digest == ContentDigest::zero()
+        {
+            return Err(DeliveryError::Validation(
+                "review or test-run timestamps and evidence digests are invalid".to_string(),
+            ));
+        }
+        for finding in &findings {
+            validate_record_header(
+                finding.schema_version,
+                "finding_id",
+                &finding.finding_id,
+                finding.generation,
+            )?;
+            validate_ref("finding candidate", &finding.candidate)?;
+            require_unique_source_tuples("finding evidence", &finding.evidence)?;
+            if let Some(resolution) = &finding.resolved_by {
+                validate_ref("finding resolution", resolution)?;
+            }
+        }
+        let mut finding_source_digests = std::collections::BTreeMap::new();
+        for source in findings.iter().flat_map(|finding| finding.evidence.iter()) {
+            let locator = (
+                source.owner.as_str(),
+                source.source_type.as_str(),
+                source.id.as_str(),
+                source.generation,
+            );
+            if let Some(existing_digest) =
+                finding_source_digests.insert(locator, &source.digest)
+            {
+                if existing_digest != &source.digest {
+                    return Err(DeliveryError::Conflict(
+                        "one finding-source locator generation carries conflicting digests"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        if let Some(value) = &approval {
+            validate_record_header(
+                value.schema_version,
+                "approval_id",
+                &value.approval_id,
+                value.generation,
+            )?;
+            validate_ref("approval candidate", &value.candidate)?;
+            validate_ref("approval gate", &value.gate)?;
+            if value.policy_digest == ContentDigest::zero()
+                || value.approved_at_ms > context.now_ms
+            {
+                return Err(DeliveryError::Validation(
+                    "approval policy or timestamp is invalid".to_string(),
+                ));
+            }
+        }
+        require_unique_ids(
+            "finding",
+            findings.iter().map(|value| value.finding_id.as_str()),
+        )?;
         let review_authority = self.require_current_authority(
             context,
             tenant_id,
@@ -841,6 +965,7 @@ where
             (QaRunState::CompletedFail, Some(QaHarnessOutcome::Fail))
                 | (QaRunState::HarnessError, Some(QaHarnessOutcome::Error))
         );
+        let unresolved_findings = findings.iter().any(|finding| finding.resolved_by.is_none());
         if candidate
             .implementer_principal_ids
             .contains(&context.principal.principal_id)
@@ -859,8 +984,8 @@ where
                 .any(|finding| finding.candidate != plan.candidate)
             || review.findings_digest
                 != ContentDigest::of_domain("qa-findings", DELIVERY_SCHEMA_V1, &findings)?
-            || review.approved != terminal_pass
             || test_run.passed != terminal_pass
+            || (review.approved && (!terminal_pass || unresolved_findings))
         {
             return Err(DeliveryError::StaleEvidence(
                 "review bundle is self-authored, inconsistent, or bound to another candidate"
@@ -869,6 +994,8 @@ where
         }
         if let Some(approval) = &approval {
             if !terminal_pass
+                || !review.approved
+                || unresolved_findings
                 || approval.candidate != plan.candidate
                 || approval.approver != review_authority.principal
             {
@@ -876,9 +1003,9 @@ where
                     "approval is not an independent exact-candidate QA approval".to_string(),
                 ));
             }
-        } else if terminal_pass {
+        } else if review.approved {
             return Err(DeliveryError::MissingEvidence(
-                "passing review requires an independent approval".to_string(),
+                "approved review requires an independent approval".to_string(),
             ));
         }
         if aggregate
@@ -949,6 +1076,31 @@ where
         manifest: ReleaseManifestV1,
         mut release: ReleaseV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        validate_record_header(
+            manifest.schema_version,
+            "manifest_id",
+            &manifest.manifest_id,
+            manifest.generation,
+        )?;
+        validate_record_header(
+            release.schema_version,
+            "release_id",
+            &release.release_id,
+            release.generation,
+        )?;
+        validate_ref("release manifest", &release.manifest)?;
+        if manifest.tenant_id != tenant_id
+            || manifest.project.id != project_id
+            || manifest.created_at_ms > context.now_ms
+            || manifest.qa_evidence_digest == ContentDigest::zero()
+            || manifest.sbom_digest == ContentDigest::zero()
+            || manifest.dependency_snapshot_digest == ContentDigest::zero()
+            || manifest.provenance_digest == ContentDigest::zero()
+        {
+            return Err(DeliveryError::Validation(
+                "manifest tenant, project, timestamp, or evidence digest is invalid".to_string(),
+            ));
+        }
         let release_authority = self.require_current_authority(
             context,
             tenant_id,
@@ -1032,15 +1184,23 @@ where
         }
         let effect_request = DeliveryEffectRequestV1 {
             schema_version: DELIVERY_SCHEMA_V1,
+            operation_id: format!(
+                "rollout:{tenant_id}:{project_id}:{}",
+                release.release_id
+            ),
             kind: DeliveryEffectKind::Rollout,
             tenant_id: tenant_id.to_string(),
             project: candidate.project.clone(),
             candidate: Some(manifest.candidate.clone()),
             subject: release.manifest.clone(),
+            target: None,
+            actor: release_authority.principal.clone(),
             actor_authority_receipt_digest: release_authority.receipt_digest.clone(),
+            actor_authority_identity_digest: release_authority.stable_identity_digest()?,
             request_digest: ContentDigest::zero(),
         }
         .seal()?;
+        self.require_effect_saga()?;
         let effect_receipt = self.effects.apply(&effect_request)?;
         validate_effect_receipt(
             &effect_request,
@@ -1054,7 +1214,7 @@ where
             AuthorityRole::ReleaseManager,
             "promote",
         )?;
-        if authority_after != release_authority {
+        if !same_authority_identity(&authority_after, &release_authority) {
             return Err(DeliveryError::StaleEvidence(
                 "release authority changed between rollout and local adoption".to_string(),
             ));
@@ -1122,6 +1282,21 @@ where
         project_id: &str,
         mut receipt: DeliveryReceiptV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        validate_record_header(
+            receipt.schema_version,
+            "delivery_id",
+            &receipt.delivery_id,
+            receipt.generation,
+        )?;
+        validate_ref("delivery release", &receipt.release)?;
+        if receipt.issued_at_ms > context.now_ms
+            || receipt.preview_digest == ContentDigest::zero()
+            || !canonical_id(&receipt.customer_principal_id)
+        {
+            return Err(DeliveryError::Validation(
+                "delivery timestamp, preview, or customer identity is invalid".to_string(),
+            ));
+        }
         self.require_current_authority(
             context,
             &receipt.tenant_id,
@@ -1198,6 +1373,23 @@ where
         mut feedback: CustomerFeedbackV1,
         acceptance: Option<AcceptanceV1>,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        validate_record_header(
+            feedback.schema_version,
+            "feedback_id",
+            &feedback.feedback_id,
+            feedback.generation,
+        )?;
+        validate_ref("feedback delivery", &feedback.delivery)?;
+        if let Some(value) = &acceptance {
+            validate_record_header(
+                value.schema_version,
+                "acceptance_id",
+                &value.acceptance_id,
+                value.generation,
+            )?;
+            validate_ref("acceptance delivery", &value.delivery)?;
+            validate_ref("acceptance release", &value.release)?;
+        }
         let customer_authority = self.require_current_authority(
             context,
             tenant_id,
@@ -1215,6 +1407,7 @@ where
             || feedback.schema_version != super::schema::DELIVERY_SCHEMA_V1
             || feedback.created_at_ms != context.now_ms
             || feedback.feedback_digest != feedback.computed_digest()?
+            || !feedback.requested_work_item_refs.is_empty()
         {
             return Err(DeliveryError::AuthorityDenied(
                 "customer feedback principal is not authenticated authority".to_string(),
@@ -1237,11 +1430,6 @@ where
             ));
         }
         if feedback.action == CustomerAction::RequestChanges {
-            if !feedback.requested_work_item_refs.is_empty() {
-                return Err(DeliveryError::Validation(
-                    "caller may not supply governed rework authority data".to_string(),
-                ));
-            }
             let release = aggregate
                 .releases
                 .get(&delivery_snapshot.release.id)
@@ -1256,15 +1444,23 @@ where
                 })?;
             let request = DeliveryEffectRequestV1 {
                 schema_version: DELIVERY_SCHEMA_V1,
+                operation_id: format!(
+                    "rework:{tenant_id}:{project_id}:{}",
+                    feedback.feedback_id
+                ),
                 kind: DeliveryEffectKind::GovernedRework,
                 tenant_id: tenant_id.to_string(),
                 project: manifest.project.clone(),
                 candidate: Some(manifest.candidate.clone()),
                 subject: feedback.delivery.clone(),
+                target: None,
+                actor: customer_authority.principal.clone(),
                 actor_authority_receipt_digest: customer_authority.receipt_digest.clone(),
+                actor_authority_identity_digest: customer_authority.stable_identity_digest()?,
                 request_digest: ContentDigest::zero(),
             }
             .seal()?;
+            self.require_effect_saga()?;
             let receipt = self.effects.apply(&request)?;
             validate_effect_receipt(&request, &receipt, &customer_authority, context.now_ms)?;
             let authority_after = self.require_current_authority(
@@ -1273,7 +1469,7 @@ where
                 AuthorityRole::Customer,
                 "customer_action",
             )?;
-            if authority_after != customer_authority {
+            if !same_authority_identity(&authority_after, &customer_authority) {
                 return Err(DeliveryError::StaleEvidence(
                     "customer authority changed between rework effect and adoption".to_string(),
                 ));
@@ -1300,7 +1496,7 @@ where
                 if acceptance.schema_version != super::schema::DELIVERY_SCHEMA_V1
                     || acceptance.customer != customer_authority.principal
                     || acceptance.delivery != feedback.delivery
-                    || acceptance.release.id != delivery.release.id
+                    || acceptance.release != delivery.release
                     || acceptance.accepted_at_ms != context.now_ms
                     || acceptance.acceptance_digest != acceptance.computed_digest()?
                 {
@@ -1360,6 +1556,14 @@ where
         project_id: &str,
         mut rollback: RollbackV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        validate_record_header(
+            rollback.schema_version,
+            "rollback_id",
+            &rollback.rollback_id,
+            rollback.generation,
+        )?;
+        validate_ref("rollback source", &rollback.from_release)?;
+        validate_ref("rollback target", &rollback.to_release)?;
         let rollback_authority = self.require_current_authority(
             context,
             tenant_id,
@@ -1414,15 +1618,23 @@ where
             })?;
         let effect_request = DeliveryEffectRequestV1 {
             schema_version: DELIVERY_SCHEMA_V1,
+            operation_id: format!(
+                "rollback:{tenant_id}:{project_id}:{}",
+                rollback.rollback_id
+            ),
             kind: DeliveryEffectKind::Rollback,
             tenant_id: tenant_id.to_string(),
             project: from_manifest.project.clone(),
             candidate: Some(from_manifest.candidate.clone()),
             subject: rollback.from_release.clone(),
+            target: Some(rollback.to_release.clone()),
+            actor: rollback_authority.principal.clone(),
             actor_authority_receipt_digest: rollback_authority.receipt_digest.clone(),
+            actor_authority_identity_digest: rollback_authority.stable_identity_digest()?,
             request_digest: ContentDigest::zero(),
         }
         .seal()?;
+        self.require_effect_saga()?;
         let effect_receipt = self.effects.apply(&effect_request)?;
         validate_effect_receipt(
             &effect_request,
@@ -1436,7 +1648,7 @@ where
             AuthorityRole::ReleaseManager,
             "rollback",
         )?;
-        if authority_after != rollback_authority {
+        if !same_authority_identity(&authority_after, &rollback_authority) {
             return Err(DeliveryError::StaleEvidence(
                 "release authority changed between rollback effect and adoption".to_string(),
             ));
@@ -1509,6 +1721,15 @@ where
         project_id: &str,
         mut closeout: ProjectCloseoutV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        validate_record_header(
+            closeout.schema_version,
+            "closeout_id",
+            &closeout.closeout_id,
+            closeout.generation,
+        )?;
+        validate_ref("closeout project", &closeout.project)?;
+        validate_ref("closeout release", &closeout.accepted_release)?;
+        validate_ref("closeout acceptance", &closeout.acceptance)?;
         let closeout_authority = self.require_current_authority(
             context,
             tenant_id,
@@ -1551,21 +1772,36 @@ where
             .releases
             .get(&closeout.accepted_release.id)
             .ok_or_else(|| DeliveryError::MissingEvidence("accepted release".to_string()))?;
+        if closeout.accepted_release
+            != versioned_release_ref(accepted_release)?
+        {
+            return Err(DeliveryError::StaleEvidence(
+                "closeout release reference is stale or differently digested".to_string(),
+            ));
+        }
         let manifest = aggregate
             .manifests
             .get(&accepted_release.manifest.id)
             .ok_or_else(|| DeliveryError::MissingEvidence("accepted manifest".to_string()))?;
         let effect_request = DeliveryEffectRequestV1 {
             schema_version: DELIVERY_SCHEMA_V1,
+            operation_id: format!(
+                "memory:{tenant_id}:{project_id}:{}",
+                closeout.closeout_id
+            ),
             kind: DeliveryEffectKind::MemoryPublication,
             tenant_id: tenant_id.to_string(),
             project: closeout.project.clone(),
             candidate: Some(manifest.candidate.clone()),
             subject: closeout.accepted_release.clone(),
+            target: None,
+            actor: closeout_authority.principal.clone(),
             actor_authority_receipt_digest: closeout_authority.receipt_digest.clone(),
+            actor_authority_identity_digest: closeout_authority.stable_identity_digest()?,
             request_digest: ContentDigest::zero(),
         }
         .seal()?;
+        self.require_effect_saga()?;
         let effect_receipt = self.effects.apply(&effect_request)?;
         validate_effect_receipt(
             &effect_request,
@@ -1579,7 +1815,7 @@ where
             AuthorityRole::ReleaseManager,
             "closeout",
         )?;
-        if authority_after != closeout_authority {
+        if !same_authority_identity(&authority_after, &closeout_authority) {
             return Err(DeliveryError::StaleEvidence(
                 "release authority changed between memory publication and closeout".to_string(),
             ));
@@ -1653,6 +1889,22 @@ where
                 reason,
             }),
         }
+    }
+
+    fn require_execution_saga(&self) -> Result<(), DeliveryError> {
+        require_saga_readiness(
+            self.integration.execution_saga_readiness(),
+            "workbench_execution_saga",
+            &expected_workbench_execution_saga_contract_digest(),
+        )
+    }
+
+    fn require_effect_saga(&self) -> Result<(), DeliveryError> {
+        require_saga_readiness(
+            self.effects.readiness(),
+            "delivery_effect_saga",
+            &expected_effect_saga_contract_digest(),
+        )
     }
 
     fn require_current_authority(
@@ -1902,6 +2154,313 @@ pub fn qa_flake_disposition_digest(
     }
 }
 
+fn canonical_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn validate_record_header(
+    schema_version: u16,
+    id_name: &str,
+    id: &str,
+    generation: u64,
+) -> Result<(), DeliveryError> {
+    if schema_version != DELIVERY_SCHEMA_V1 || generation == 0 || !canonical_id(id) {
+        return Err(DeliveryError::Validation(format!(
+            "{id_name} schema, identifier, or generation is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_ref(name: &str, value: &VersionedRefV1) -> Result<(), DeliveryError> {
+    if !canonical_id(&value.id)
+        || value.generation == 0
+        || value.digest == ContentDigest::zero()
+    {
+        return Err(DeliveryError::Validation(format!(
+            "{name} is not a canonical versioned reference"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_data_control(name: &str, value: &DataControlV1) -> Result<(), DeliveryError> {
+    if !canonical_id(&value.classification)
+        || !canonical_id(&value.encryption_key_owner)
+        || value.access_policy_digest == ContentDigest::zero()
+        || value.redaction_policy_digest == ContentDigest::zero()
+        || value.audit_policy_digest == ContentDigest::zero()
+    {
+        return Err(DeliveryError::Validation(format!(
+            "{name} data-control policy is incomplete"
+        )));
+    }
+    validate_ref(&format!("{name} retention frontier"), &value.retention_frontier)
+}
+
+fn validate_source_tuple(name: &str, value: &SourceTupleV1) -> Result<(), DeliveryError> {
+    if !canonical_id(&value.owner)
+        || !canonical_id(&value.source_type)
+        || !canonical_id(&value.id)
+        || value.generation == 0
+        || value.digest == ContentDigest::zero()
+    {
+        return Err(DeliveryError::Validation(format!(
+            "{name} source tuple is incomplete or malformed"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_qa_plan(plan: &QaEvaluationPlanV1) -> Result<(), DeliveryError> {
+    validate_record_header(plan.schema_version, "plan_id", &plan.plan_id, plan.generation)?;
+    for (name, value) in [
+        ("QA request", &plan.request),
+        ("QA candidate", &plan.candidate),
+        ("QA agreement", &plan.agreement),
+        ("QA project", &plan.project),
+    ] {
+        validate_ref(name, value)?;
+    }
+    if plan.work_items_digest == ContentDigest::zero()
+        || plan.acceptance_criteria_digest == ContentDigest::zero()
+        || plan.fixture_inventory_digest == ContentDigest::zero()
+        || plan.evaluator_policy_digest == ContentDigest::zero()
+        || plan.aggregation_policy_digest == ContentDigest::zero()
+        || plan.release_policy_digest == ContentDigest::zero()
+        || plan.runner_binary_digest == ContentDigest::zero()
+        || plan.toolchain_digest == ContentDigest::zero()
+        || plan.sandbox_profile_digest == ContentDigest::zero()
+        || plan.capability_digest == ContentDigest::zero()
+        || plan.environment_digest == ContentDigest::zero()
+        || plan.credential_policy_digest == ContentDigest::zero()
+        || plan.required_case_ids.is_empty()
+        || (plan.retry_limit == 0 && !plan.retryable_classes.is_empty())
+        || (plan.retry_limit > 0 && plan.retryable_classes.is_empty())
+        || plan
+            .required_case_ids
+            .iter()
+            .chain(&plan.optional_case_ids)
+            .any(|case_id| !canonical_id(case_id))
+        || plan
+            .required_case_ids
+            .iter()
+            .any(|case_id| plan.optional_case_ids.contains(case_id))
+        || plan
+            .retryable_classes
+            .iter()
+            .any(|class| !canonical_id(class))
+        || plan.plan_digest != plan.computed_digest()?
+    {
+        return Err(DeliveryError::Validation(
+            "QA plan is incomplete, ambiguous, or has an invalid digest".to_string(),
+        ));
+    }
+    validate_data_control("QA plan", &plan.data_control)
+}
+
+fn validate_dataset_case(case: &QaDatasetCaseV1) -> Result<(), DeliveryError> {
+    validate_record_header(
+        case.schema_version,
+        "dataset case_id",
+        &case.case_id,
+        case.generation,
+    )?;
+    if !canonical_id(&case.required_class)
+        || case.input_digest == ContentDigest::zero()
+        || case.oracle_digest == ContentDigest::zero()
+        || case.provenance.is_empty()
+        || case.license.trim().is_empty()
+        || case.access_policy_digest == ContentDigest::zero()
+        || case.contamination_policy_digest == ContentDigest::zero()
+        || case.retired_at_ms.is_some()
+        || case.superseded_by.is_some()
+        || case.slices.is_empty()
+        || case
+            .slices
+            .iter()
+            .any(|(key, value)| !canonical_id(key) || !canonical_id(value))
+    {
+        return Err(DeliveryError::MissingEvidence(format!(
+            "dataset case {} is incomplete, retired, or superseded",
+            case.case_id
+        )));
+    }
+    validate_data_control("dataset case", &case.data_control)?;
+    require_unique_source_tuples("dataset provenance", &case.provenance)
+}
+
+fn require_unique_source_tuples(
+    name: &str,
+    sources: &[SourceTupleV1],
+) -> Result<(), DeliveryError> {
+    if sources.is_empty() {
+        return Err(DeliveryError::MissingEvidence(format!(
+            "{name} source inventory is empty"
+        )));
+    }
+    let mut seen_locators = std::collections::BTreeMap::new();
+    for source in sources {
+        validate_source_tuple(name, source)?;
+        let locator = (
+            source.owner.as_str(),
+            source.source_type.as_str(),
+            source.id.as_str(),
+            source.generation,
+        );
+        if let Some(existing_digest) = seen_locators.insert(locator, &source.digest) {
+            let conflict = if existing_digest == &source.digest {
+                "an exactly duplicated source tuple"
+            } else {
+                "one immutable locator generation with conflicting digests"
+            };
+            return Err(DeliveryError::Conflict(format!("{name} contains {conflict}")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_graph_source_immutability(graph: &QaEvidenceGraphV1) -> Result<(), DeliveryError> {
+    let mut digests_by_locator = std::collections::BTreeMap::new();
+    for source in graph
+        .dataset_cases
+        .iter()
+        .flat_map(|case| case.provenance.iter())
+        .chain(
+            graph
+                .case_results
+                .iter()
+                .flat_map(|result| result.sources.iter()),
+        )
+    {
+        let locator = (
+            source.owner.as_str(),
+            source.source_type.as_str(),
+            source.id.as_str(),
+            source.generation,
+        );
+        if let Some(existing_digest) = digests_by_locator.insert(locator, &source.digest) {
+            if existing_digest != &source.digest {
+                return Err(DeliveryError::Conflict(
+                    "one source locator generation carries conflicting digests across the evidence graph"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn qa_fixture_inventory_digest(
+    cases: &[QaDatasetCaseV1],
+) -> Result<ContentDigest, DeliveryError> {
+    let inventory: std::collections::BTreeMap<_, _> = cases
+        .iter()
+        .map(|case| {
+            Ok((
+                case.case_id.clone(),
+                VersionedRefV1 {
+                    id: case.case_id.clone(),
+                    generation: case.generation,
+                    digest: ContentDigest::of_domain(
+                        "qa-dataset-case",
+                        DELIVERY_SCHEMA_V1,
+                        case,
+                    )?,
+                },
+            ))
+        })
+        .collect::<Result<_, DeliveryError>>()?;
+    if inventory.len() != cases.len() {
+        return Err(DeliveryError::Conflict(
+            "fixture inventory contains duplicate case identifiers".to_string(),
+        ));
+    }
+    ContentDigest::of_domain("qa-fixture-inventory", DELIVERY_SCHEMA_V1, &inventory)
+}
+
+fn require_unique_ids<'a>(
+    record_type: &str,
+    ids: impl Iterator<Item = &'a str>,
+) -> Result<(), DeliveryError> {
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        if !canonical_id(id) {
+            return Err(DeliveryError::Validation(format!(
+                "{record_type} has a non-canonical identifier"
+            )));
+        }
+        if !seen.insert(id) {
+            return Err(DeliveryError::Conflict(format!(
+                "duplicate {record_type} identifier {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn legal_case_reason(outcome: QaCaseOutcome, reason: QaCaseReasonCode) -> bool {
+    matches!(
+        (outcome, reason),
+        (QaCaseOutcome::Pass, QaCaseReasonCode::Verified)
+            | (QaCaseOutcome::Fail, QaCaseReasonCode::AssertionFailed)
+            | (QaCaseOutcome::Fail, QaCaseReasonCode::ModelRejected)
+            | (QaCaseOutcome::Error, QaCaseReasonCode::HarnessError)
+            | (QaCaseOutcome::Skipped, QaCaseReasonCode::SkippedByPolicy)
+            | (
+                QaCaseOutcome::Unscored | QaCaseOutcome::NeedsHumanReview,
+                QaCaseReasonCode::NeedsHumanReview
+            )
+            | (
+                QaCaseOutcome::FlakyUnresolved,
+                QaCaseReasonCode::FlakyUnresolved
+            )
+    )
+}
+
+fn legal_flake_disposition(
+    outcome: QaCaseOutcome,
+    disposition: &super::schema::QaFlakeDispositionV1,
+) -> bool {
+    use super::schema::{QaFlakeClassification, QaFlakeReason};
+
+    matches!(
+        (outcome, disposition.reason, disposition.classification),
+        (
+            QaCaseOutcome::Pass,
+            QaFlakeReason::RetryPassed,
+            QaFlakeClassification::Infrastructure
+                | QaFlakeClassification::ModelVariance
+                | QaFlakeClassification::TestHarness
+        ) | (
+            QaCaseOutcome::NeedsHumanReview,
+            QaFlakeReason::KnownInfrastructure | QaFlakeReason::EvaluatorVariance,
+            QaFlakeClassification::Infrastructure
+                | QaFlakeClassification::ModelVariance
+                | QaFlakeClassification::TestHarness
+        ) | (
+            QaCaseOutcome::FlakyUnresolved,
+            QaFlakeReason::Unresolved,
+            QaFlakeClassification::Infrastructure
+                | QaFlakeClassification::ModelVariance
+                | QaFlakeClassification::TestHarness
+                | QaFlakeClassification::ProductDefect
+        )
+    )
+}
+
+fn versioned_release_ref(release: &ReleaseV1) -> Result<VersionedRefV1, DeliveryError> {
+    Ok(VersionedRefV1 {
+        id: release.release_id.clone(),
+        generation: release.generation,
+        digest: ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, release)?,
+    })
+}
+
 pub fn qa_source_evidence_digest(
     graph: &QaEvidenceGraphV1,
 ) -> Result<ContentDigest, DeliveryError> {
@@ -1919,43 +2478,99 @@ pub fn qa_source_evidence_digest(
     ContentDigest::of_domain("qa-source-evidence", DELIVERY_SCHEMA_V1, &sources)
 }
 
-fn validate_evidence_graph(
+pub fn validate_qa_evidence_graph(
     plan: &QaEvaluationPlanV1,
     run_ref: &VersionedRefV1,
     graph: &QaEvidenceGraphV1,
+    qa_authority: &PrincipalV1,
+    now_ms: u64,
 ) -> Result<(), DeliveryError> {
+    validate_qa_plan(plan)?;
+    if graph.schema_version != DELIVERY_SCHEMA_V1
+        || graph.run != *run_ref
+        || graph.graph_digest != graph.computed_digest()?
+    {
+        return Err(DeliveryError::StaleEvidence(
+            "evidence graph schema, run, or digest is invalid".to_string(),
+        ));
+    }
+    if !graph.model_results.is_empty()
+        || graph
+            .case_results
+            .iter()
+            .any(|result| !result.grader_refs.is_empty())
+    {
+        return Err(DeliveryError::AdapterUnavailable {
+            dependency: "qa_model_evidence_#749",
+            reason: "model evidence and calibration remain unavailable until #749 supplies their authoritative contract".to_string(),
+        });
+    }
+    require_unique_ids(
+        "dataset case",
+        graph.dataset_cases.iter().map(|value| value.case_id.as_str()),
+    )?;
+    require_unique_ids(
+        "case result",
+        graph.case_results.iter().map(|value| value.result_id.as_str()),
+    )?;
+    require_unique_ids(
+        "deterministic assertion",
+        graph
+            .deterministic_results
+            .iter()
+            .map(|value| value.assertion_id.as_str()),
+    )?;
+    require_unique_ids(
+        "flake disposition",
+        graph
+            .flake_dispositions
+            .iter()
+            .map(|value| value.disposition_id.as_str()),
+    )?;
     let case_ids: BTreeSet<_> = graph
         .dataset_cases
         .iter()
         .map(|case| case.case_id.as_str())
         .collect();
-    if plan
+    let planned_case_ids: BTreeSet<_> = plan
         .required_case_ids
         .iter()
-        .any(|case_id| !case_ids.contains(case_id.as_str()))
-        || graph.dataset_cases.iter().any(|case| {
-            case.schema_version != DELIVERY_SCHEMA_V1
-                || (!plan.required_case_ids.contains(&case.case_id)
-                    && !plan.optional_case_ids.contains(&case.case_id))
-                || case.required != plan.required_case_ids.contains(&case.case_id)
-        })
+        .chain(&plan.optional_case_ids)
+        .map(String::as_str)
+        .collect();
+    for case in &graph.dataset_cases {
+        validate_dataset_case(case)?;
+    }
+    if case_ids != planned_case_ids
+        || graph
+            .dataset_cases
+            .iter()
+            .any(|case| case.required != plan.required_case_ids.contains(&case.case_id))
+        || qa_fixture_inventory_digest(&graph.dataset_cases)? != plan.fixture_inventory_digest
     {
         return Err(DeliveryError::MissingEvidence(
-            "dataset inventory does not cover the exact QA plan".to_string(),
+            "dataset inventory does not exactly match the digest-bound QA fixture plan"
+                .to_string(),
         ));
     }
-    let result_case_ids: BTreeSet<_> = graph
+    require_unique_ids(
+        "case result dataset case",
+        graph
+            .case_results
+            .iter()
+            .map(|result| result.case_ref.id.as_str()),
+    )?;
+    let required_result_case_ids: BTreeSet<_> = graph
         .case_results
         .iter()
+        .filter(|result| result.required)
         .map(|result| result.case_ref.id.as_str())
         .collect();
-    if plan
-        .required_case_ids
-        .iter()
-        .any(|case_id| !result_case_ids.contains(case_id.as_str()))
-    {
+    let planned_required_case_ids: BTreeSet<_> =
+        plan.required_case_ids.iter().map(String::as_str).collect();
+    if required_result_case_ids != planned_required_case_ids {
         return Err(DeliveryError::MissingEvidence(
-            "required QA case result is missing".to_string(),
+            "required QA case results are missing, duplicated, or differently bound".to_string(),
         ));
     }
     for result in &graph.case_results {
@@ -1966,15 +2581,39 @@ fn validate_evidence_graph(
             .ok_or_else(|| DeliveryError::MissingEvidence("dataset case".to_string()))?;
         let case_digest = ContentDigest::of_domain("qa-dataset-case", DELIVERY_SCHEMA_V1, case)?;
         if result.schema_version != DELIVERY_SCHEMA_V1
+            || result.generation == 0
+            || !canonical_id(&result.result_id)
             || result.run != *run_ref
             || result.case_ref.generation != case.generation
             || result.case_ref.digest != case_digest
             || result.required != case.required
+            || !legal_case_reason(result.outcome, result.reason_code)
+            || result.attempts == 0
+            || result.slices != case.slices
         {
             return Err(DeliveryError::StaleEvidence(
                 "case result is bound to another run or dataset case".to_string(),
             ));
         }
+        require_unique_source_tuples("case result", &result.sources)?;
+        if result.outcome == QaCaseOutcome::Pass && result.assertion_refs.is_empty()
+        {
+            return Err(DeliveryError::MissingEvidence(
+                "PASS case has no deterministic assertion evidence; model grading is unavailable until #749".to_string(),
+            ));
+        }
+        if result.outcome == QaCaseOutcome::FlakyUnresolved && result.disposition.is_none() {
+            return Err(DeliveryError::MissingEvidence(
+                "unresolved flaky result requires a current authorized disposition".to_string(),
+            ));
+        }
+        require_unique_ids(
+            "case assertion reference",
+            result
+                .assertion_refs
+                .iter()
+                .map(|value| value.id.as_str()),
+        )?;
         for assertion_ref in &result.assertion_refs {
             let assertion = graph
                 .deterministic_results
@@ -1983,7 +2622,17 @@ fn validate_evidence_graph(
                 .ok_or_else(|| {
                     DeliveryError::MissingEvidence("deterministic assertion".to_string())
                 })?;
-            if assertion_ref.generation != assertion.generation
+            if assertion.schema_version != DELIVERY_SCHEMA_V1
+                || assertion.generation == 0
+                || !canonical_id(&assertion.assertion_id)
+                || assertion.plan_digest != plan.plan_digest
+                || assertion.case_digest != case_digest
+                || assertion.assertion_digest == ContentDigest::zero()
+                || assertion.oracle_digest != case.oracle_digest
+                || assertion.input_digest != case.input_digest
+                || assertion.evidence_digest == ContentDigest::zero()
+                || assertion.actual_digest == ContentDigest::zero()
+                || assertion_ref.generation != assertion.generation
                 || assertion_ref.digest
                     != ContentDigest::of_domain(
                         "qa-deterministic-result",
@@ -1995,32 +2644,72 @@ fn validate_evidence_graph(
                     "deterministic assertion reference is stale".to_string(),
                 ));
             }
+            if !assertion.passed && result.outcome == QaCaseOutcome::Pass {
+                return Err(DeliveryError::MissingEvidence(
+                    "failed deterministic assertion cannot support PASS".to_string(),
+                ));
+            }
         }
-        for grader_ref in &result.grader_refs {
-            let grader = graph
-                .model_results
+        if let Some(disposition_ref) = &result.disposition {
+            validate_ref("case flake disposition", disposition_ref)?;
+            let disposition = graph
+                .flake_dispositions
                 .iter()
-                .find(|value| value.evidence_id == grader_ref.id)
-                .ok_or_else(|| DeliveryError::MissingEvidence("model grader".to_string()))?;
-            if grader_ref.generation != grader.generation
-                || grader_ref.digest
-                    != ContentDigest::of_domain("qa-model-evidence", DELIVERY_SCHEMA_V1, grader)?
+                .find(|value| value.disposition_id == disposition_ref.id)
+                .ok_or_else(|| DeliveryError::MissingEvidence("flake disposition".to_string()))?;
+            if disposition_ref.generation != disposition.generation
+                || disposition_ref.digest
+                    != ContentDigest::of_domain(
+                        "qa-flake-disposition",
+                        DELIVERY_SCHEMA_V1,
+                        disposition,
+                    )?
             {
                 return Err(DeliveryError::StaleEvidence(
-                    "model grader reference is stale".to_string(),
+                    "case flake disposition reference is stale".to_string(),
                 ));
             }
         }
     }
+    validate_graph_source_immutability(graph)?;
+    let referenced_assertions: BTreeSet<_> = graph
+        .case_results
+        .iter()
+        .flat_map(|result| result.assertion_refs.iter().map(|value| value.id.as_str()))
+        .collect();
+    if referenced_assertions.len() != graph.deterministic_results.len()
+        || graph
+            .deterministic_results
+            .iter()
+            .any(|value| !referenced_assertions.contains(value.assertion_id.as_str()))
+    {
+        return Err(DeliveryError::MissingEvidence(
+            "deterministic evidence inventory contains missing or unreferenced records".to_string(),
+        ));
+    }
     for disposition in &graph.flake_dispositions {
+        validate_ref("flake result", &disposition.result)?;
+        validate_ref("flake defect", &disposition.defect_ref)?;
+        validate_ref(
+            "flake deterministic regression fixture",
+            &disposition.deterministic_regression_fixture,
+        )?;
         let result = graph
             .case_results
             .iter()
             .find(|value| value.result_id == disposition.result.id)
             .ok_or_else(|| DeliveryError::MissingEvidence("flake result".to_string()))?;
-        if disposition.result.generation != result.generation
-            || disposition.result.digest
-                != ContentDigest::of_domain("qa-case-result", DELIVERY_SCHEMA_V1, result)?
+        if disposition.schema_version != DELIVERY_SCHEMA_V1
+            || disposition.generation == 0
+            || !canonical_id(&disposition.disposition_id)
+            || disposition.owner != *qa_authority
+            || disposition.policy_revision != plan.generation
+            || disposition.expires_at_ms <= now_ms
+            || result.disposition.as_ref().map(|value| value.id.as_str())
+                != Some(disposition.disposition_id.as_str())
+            || !legal_flake_disposition(result.outcome, disposition)
+            || disposition.result.generation != result.generation
+            || disposition.result.digest != qa_case_result_binding_digest(result)?
         {
             return Err(DeliveryError::StaleEvidence(
                 "flake disposition references another result".to_string(),
@@ -2028,6 +2717,16 @@ fn validate_evidence_graph(
         }
     }
     Ok(())
+}
+
+pub fn qa_case_result_binding_digest(
+    result: &super::schema::QaCaseResultV1,
+) -> Result<ContentDigest, DeliveryError> {
+    let mut binding = result.clone();
+    if let Some(disposition) = &mut binding.disposition {
+        disposition.digest = ContentDigest::zero();
+    }
+    ContentDigest::of_domain("qa-case-result-binding", DELIVERY_SCHEMA_V1, &binding)
 }
 
 fn validate_evidence_outcome(
@@ -2048,6 +2747,10 @@ fn validate_evidence_outcome(
                 && required
                     .iter()
                     .all(|result| result.outcome == QaCaseOutcome::Pass)
+                && graph
+                    .deterministic_results
+                    .iter()
+                    .all(|assertion| assertion.passed)
         }
         QaHarnessOutcome::Fail => {
             receipt.required_cases_complete
@@ -2080,14 +2783,22 @@ fn validate_effect_receipt(
 ) -> Result<(), DeliveryError> {
     if receipt.schema_version != DELIVERY_SCHEMA_V1
         || receipt.receipt_digest != receipt.computed_digest()?
+        || receipt.operation_id != request.operation_id
         || receipt.kind != request.kind
         || receipt.tenant_id != request.tenant_id
         || receipt.project != request.project
         || receipt.candidate != request.candidate
+        || receipt.subject != request.subject
+        || receipt.target != request.target
+        || receipt.actor != request.actor
         || receipt.request_digest != request.request_digest
-        || receipt.actor_authority_receipt_digest != authority.receipt_digest
+        || receipt.actor_authority_receipt_digest != request.actor_authority_receipt_digest
+        || receipt.actor_authority_identity_digest != request.actor_authority_identity_digest
+        || receipt.actor_authority_identity_digest != authority.stable_identity_digest()?
+        || request.actor != authority.principal
         || receipt.effect_ref.digest == ContentDigest::zero()
         || receipt.effect_ref.generation == 0
+        || receipt.effect_ref.id.is_empty()
         || receipt.issuer.is_empty()
         || receipt.issued_at_ms > now_ms
     {
@@ -2096,4 +2807,38 @@ fn validate_effect_receipt(
         ));
     }
     Ok(())
+}
+
+fn same_authority_identity(left: &AuthorityReceiptV1, right: &AuthorityReceiptV1) -> bool {
+    left.principal == right.principal
+        && left.contract_version == right.contract_version
+        && left.contract_authority_generation == right.contract_authority_generation
+        && left.contract_digest == right.contract_digest
+        && left.issuer == right.issuer
+}
+
+fn require_saga_readiness(
+    readiness: AdapterReadiness,
+    dependency: &'static str,
+    expected_digest: &ContentDigest,
+) -> Result<(), DeliveryError> {
+    match readiness {
+        AdapterReadiness::Ready {
+            contract_version,
+            authority_generation,
+            contract_digest,
+        } if contract_version == DELIVERY_SCHEMA_V1
+            && authority_generation > 0
+            && &contract_digest == expected_digest =>
+        {
+            Ok(())
+        }
+        AdapterReadiness::Ready { .. } => Err(DeliveryError::StaleEvidence(format!(
+            "{dependency} contract version, generation, or digest is not current"
+        ))),
+        AdapterReadiness::Unavailable { reason } => Err(DeliveryError::AdapterUnavailable {
+            dependency,
+            reason,
+        }),
+    }
 }

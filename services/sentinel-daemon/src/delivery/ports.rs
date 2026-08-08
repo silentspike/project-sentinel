@@ -107,6 +107,25 @@ pub struct AuthorityReceiptV1 {
 }
 
 impl AuthorityReceiptV1 {
+    /// Stable authority lineage used by durable external-operation identities.
+    ///
+    /// Short-lived receipt metadata is deliberately excluded: renewing the same
+    /// authority must not create a second workbench invocation or delivery
+    /// effect. Contract, issuer, or principal changes must create a new identity.
+    pub fn stable_identity_digest(&self) -> Result<ContentDigest, DeliveryError> {
+        ContentDigest::of_domain(
+            "authority-identity",
+            DELIVERY_SCHEMA_V1,
+            &(
+                &self.principal,
+                self.contract_version,
+                self.contract_authority_generation,
+                &self.contract_digest,
+                &self.issuer,
+            ),
+        )
+    }
+
     pub fn computed_digest(&self) -> Result<ContentDigest, DeliveryError> {
         let mut unsigned = self.clone();
         unsigned.receipt_digest = ContentDigest::zero();
@@ -130,6 +149,7 @@ pub struct WorkbenchEvidenceRequestV1 {
     pub qa_run: VersionedRefV1,
     pub assigned_qa: PrincipalV1,
     pub authority_receipt_digest: ContentDigest,
+    pub authority_identity_digest: ContentDigest,
     pub invocation: VersionedRefV1,
     pub request_digest: ContentDigest,
 }
@@ -137,11 +157,19 @@ pub struct WorkbenchEvidenceRequestV1 {
 impl WorkbenchEvidenceRequestV1 {
     pub fn computed_digest(&self) -> Result<ContentDigest, DeliveryError> {
         let mut unsigned = self.clone();
+        // Authority receipts are short-lived authorization proofs. They are not
+        // part of the stable workbench idempotency identity.
+        unsigned.authority_receipt_digest = ContentDigest::zero();
         unsigned.request_digest = ContentDigest::zero();
         ContentDigest::of_domain("workbench-evidence-request", DELIVERY_SCHEMA_V1, &unsigned)
     }
 
     pub fn seal(mut self) -> Result<Self, DeliveryError> {
+        if self.authority_identity_digest == ContentDigest::zero() {
+            return Err(DeliveryError::Validation(
+                "workbench authority identity is missing".to_string(),
+            ));
+        }
         self.request_digest = self.computed_digest()?;
         Ok(self)
     }
@@ -156,6 +184,7 @@ pub struct WorkbenchEvidenceReceiptV1 {
     pub qa_run: VersionedRefV1,
     pub assigned_qa: PrincipalV1,
     pub authority_receipt_digest: ContentDigest,
+    pub authority_identity_digest: ContentDigest,
     pub input_digest: ContentDigest,
     pub output_digest: ContentDigest,
     pub artifact_ownership_digest: ContentDigest,
@@ -192,6 +221,16 @@ impl WorkbenchEvidenceReceiptV1 {
 /// command that needs workflow or workbench authority returns a typed error.
 pub trait DeliveryIntegrationPort: Send + Sync {
     fn readiness(&self) -> AdapterReadiness;
+
+    /// Readiness for the durable execution-saga contract. A Ready adapter must
+    /// durably claim the stable request digest before invoking the workbench,
+    /// persist the opaque outcome before returning, and return that same
+    /// outcome on retry/reconcile after caller crash or disconnect.
+    fn execution_saga_readiness(&self) -> AdapterReadiness {
+        AdapterReadiness::Unavailable {
+            reason: "productive #694 workbench execution saga is not provisioned".to_string(),
+        }
+    }
 
     fn candidate_authority(
         &self,
@@ -270,23 +309,46 @@ pub enum DeliveryEffectKind {
 #[serde(deny_unknown_fields)]
 pub struct DeliveryEffectRequestV1 {
     pub schema_version: u16,
+    pub operation_id: String,
     pub kind: DeliveryEffectKind,
     pub tenant_id: String,
     pub project: VersionedRefV1,
     pub candidate: Option<VersionedRefV1>,
     pub subject: VersionedRefV1,
+    pub target: Option<VersionedRefV1>,
+    pub actor: PrincipalV1,
     pub actor_authority_receipt_digest: ContentDigest,
+    pub actor_authority_identity_digest: ContentDigest,
     pub request_digest: ContentDigest,
 }
 
 impl DeliveryEffectRequestV1 {
     pub fn computed_digest(&self) -> Result<ContentDigest, DeliveryError> {
         let mut unsigned = self.clone();
+        // Renewal of the same authority must not change the effect's durable
+        // operation identity or cause the real effect to run twice.
+        unsigned.actor_authority_receipt_digest = ContentDigest::zero();
         unsigned.request_digest = ContentDigest::zero();
         ContentDigest::of_domain("delivery-effect-request", DELIVERY_SCHEMA_V1, &unsigned)
     }
 
     pub fn seal(mut self) -> Result<Self, DeliveryError> {
+        if self.schema_version != DELIVERY_SCHEMA_V1
+            || !valid_wire_id(&self.operation_id)
+            || self.project.generation == 0
+            || self.project.digest == ContentDigest::zero()
+            || self.subject.generation == 0
+            || self.subject.digest == ContentDigest::zero()
+            || self.actor_authority_identity_digest == ContentDigest::zero()
+            || self
+                .target
+                .as_ref()
+                .is_some_and(|value| value.generation == 0 || value.digest == ContentDigest::zero())
+        {
+            return Err(DeliveryError::Validation(
+                "delivery effect request identity or binding is invalid".to_string(),
+            ));
+        }
         self.request_digest = self.computed_digest()?;
         Ok(self)
     }
@@ -296,12 +358,17 @@ impl DeliveryEffectRequestV1 {
 #[serde(deny_unknown_fields)]
 pub struct DeliveryEffectReceiptV1 {
     pub schema_version: u16,
+    pub operation_id: String,
     pub kind: DeliveryEffectKind,
     pub tenant_id: String,
     pub project: VersionedRefV1,
     pub candidate: Option<VersionedRefV1>,
+    pub subject: VersionedRefV1,
+    pub target: Option<VersionedRefV1>,
+    pub actor: PrincipalV1,
     pub request_digest: ContentDigest,
     pub actor_authority_receipt_digest: ContentDigest,
+    pub actor_authority_identity_digest: ContentDigest,
     pub effect_ref: VersionedRefV1,
     pub issuer: String,
     pub issued_at_ms: u64,
@@ -322,6 +389,15 @@ impl DeliveryEffectReceiptV1 {
 }
 
 pub trait DeliveryEffectPort: Send + Sync {
+    /// A Ready implementation owns the #710 durable intent/outcome/reconcile
+    /// boundary. It must claim `(operation_id, request_digest)` before the
+    /// external effect and return the same sealed outcome on every retry.
+    fn readiness(&self) -> AdapterReadiness {
+        AdapterReadiness::Unavailable {
+            reason: "productive #710 effect saga is not provisioned".to_string(),
+        }
+    }
+
     fn apply(
         &self,
         request: &DeliveryEffectRequestV1,
@@ -396,4 +472,30 @@ pub fn expected_integration_contract_digest() -> ContentDigest {
         &"delivery-integration-v1",
     )
     .expect("constant integration contract must be canonical")
+}
+
+pub fn expected_effect_saga_contract_digest() -> ContentDigest {
+    ContentDigest::of_domain(
+        "effect-saga-contract",
+        DELIVERY_SCHEMA_V1,
+        &"delivery-effect-saga-v1",
+    )
+    .expect("constant effect saga contract must be canonical")
+}
+
+pub fn expected_workbench_execution_saga_contract_digest() -> ContentDigest {
+    ContentDigest::of_domain(
+        "workbench-execution-saga-contract",
+        DELIVERY_SCHEMA_V1,
+        &"workbench-execution-saga-v1",
+    )
+    .expect("constant workbench execution saga contract must be canonical")
+}
+
+fn valid_wire_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 240
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
