@@ -502,7 +502,7 @@ where
             || receipt.assignment != request.qa_run
             || receipt.qa_run != request.qa_run
             || receipt.assigned_qa != request.assigned_qa
-            || receipt.authority_receipt_digest != request.authority_receipt_digest
+            || receipt.authority_receipt_digest == ContentDigest::zero()
             || receipt.authority_identity_digest != request.authority_identity_digest
             || receipt.authority_identity_digest != authority_after.stable_identity_digest()?
             || receipt.output_digest == ContentDigest::zero()
@@ -1189,12 +1189,6 @@ where
         .seal()?;
         self.require_effect_saga()?;
         let effect_receipt = self.effects.apply(&effect_request)?;
-        validate_effect_receipt(
-            &effect_request,
-            &effect_receipt,
-            &release_authority,
-            context.now_ms,
-        )?;
         let authority_after = self.require_current_authority(
             context,
             tenant_id,
@@ -1206,6 +1200,12 @@ where
                 "release authority changed between rollout and local adoption".to_string(),
             ));
         }
+        validate_effect_receipt(
+            &effect_request,
+            &effect_receipt,
+            &authority_after,
+            context.now_ms,
+        )?;
         let authority_after_effect =
             self.integration
                 .candidate_authority(&CandidateAuthorityQueryV1 {
@@ -1446,7 +1446,6 @@ where
             .seal()?;
             self.require_effect_saga()?;
             let receipt = self.effects.apply(&request)?;
-            validate_effect_receipt(&request, &receipt, &customer_authority, context.now_ms)?;
             let authority_after = self.require_current_authority(
                 context,
                 tenant_id,
@@ -1458,6 +1457,7 @@ where
                     "customer authority changed between rework effect and adoption".to_string(),
                 ));
             }
+            validate_effect_receipt(&request, &receipt, &authority_after, context.now_ms)?;
             feedback.requested_work_item_refs = vec![receipt.effect_ref];
             feedback = feedback.seal()?;
         }
@@ -1617,12 +1617,6 @@ where
         .seal()?;
         self.require_effect_saga()?;
         let effect_receipt = self.effects.apply(&effect_request)?;
-        validate_effect_receipt(
-            &effect_request,
-            &effect_receipt,
-            &rollback_authority,
-            context.now_ms,
-        )?;
         let authority_after = self.require_current_authority(
             context,
             tenant_id,
@@ -1634,6 +1628,12 @@ where
                 "release authority changed between rollback effect and adoption".to_string(),
             ));
         }
+        validate_effect_receipt(
+            &effect_request,
+            &effect_receipt,
+            &authority_after,
+            context.now_ms,
+        )?;
         rollback.effect_receipt = Some(effect_receipt.effect_ref);
         {
             let from = aggregate
@@ -1779,12 +1779,6 @@ where
         .seal()?;
         self.require_effect_saga()?;
         let effect_receipt = self.effects.apply(&effect_request)?;
-        validate_effect_receipt(
-            &effect_request,
-            &effect_receipt,
-            &closeout_authority,
-            context.now_ms,
-        )?;
         let authority_after = self.require_current_authority(
             context,
             tenant_id,
@@ -1796,6 +1790,12 @@ where
                 "release authority changed between memory publication and closeout".to_string(),
             ));
         }
+        validate_effect_receipt(
+            &effect_request,
+            &effect_receipt,
+            &authority_after,
+            context.now_ms,
+        )?;
         closeout.memory_publication = Some(effect_receipt.effect_ref);
         if aggregate
             .closeouts
@@ -2772,7 +2772,7 @@ fn validate_effect_receipt(
         || receipt.target != request.target
         || receipt.actor != request.actor
         || receipt.request_digest != request.request_digest
-        || receipt.actor_authority_receipt_digest != request.actor_authority_receipt_digest
+        || receipt.actor_authority_receipt_digest == ContentDigest::zero()
         || receipt.actor_authority_identity_digest != request.actor_authority_identity_digest
         || receipt.actor_authority_identity_digest != authority.stable_identity_digest()?
         || request.actor != authority.principal
