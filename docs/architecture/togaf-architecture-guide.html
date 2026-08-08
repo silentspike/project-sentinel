@@ -720,8 +720,8 @@ IMPULSE: [P1] Andreas is addressing you. [P0] Urgent need to take a break.
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Sandbox</strong></td><td class="p-3 border-b border-border/60">bwrap + Landlock<sup><a href="#ref-16" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[16]</a></sup> + cgroups v2 <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-green/12 text-neon-green border border-neon-green/25">Validated</span></td><td class="p-3 border-b border-border/60">~4.9 ms start measured (i7-3930K, vs Docker ~500ms). <a href="https://github.com/anthropic-experimental/sandbox-runtime" class="text-neon-blue hover:underline">Anthropic uses bwrap for Claude Code</a>. Fine-grained FS control without privileges.</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Tool Execution</strong></td><td class="p-3 border-b border-border/60">Wasmtime 42 Component Model<sup><a href="#ref-11" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[11]</a></sup> (WIT + WASI 0.2<sup><a href="#ref-12" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[12]</a></sup>) <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-purple/15 text-neon-purple border border-neon-purple/30">SOTA</span></td><td class="p-3 border-b border-border/60">&micro;s startup. WIT IDL for compile-time type-safe host functions. WASI 0.2 filesystem (preopened dirs &rarr; sentinel-fs). Fuel-based CPU metering. StoreLimits for memory. InstancePre cache for plugin hot-reload. 24-month LTS (Bytecode Alliance).</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Night-Run</strong></td><td class="p-3 border-b border-border/60">Daemon-intern <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-blue/12 text-neon-blue border border-neon-blue/25">v20</span></td><td class="p-3 border-b border-border/60">Consolidation runs in the daemon process (not a separate service &mdash; avoids the redb lock). NMDA scoring, summary, memory/profile updates, <code class="text-neon-blue text-[0.8em]">personality_evolution</code> with <code class="text-neon-blue text-[0.8em]">source='night_run'</code>.</td></tr>
-                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Event Store</strong></td><td class="p-3 border-b border-border/60">Limbo append-only (events + snapshots + outbox)</td><td class="p-3 border-b border-border/60">Every mutating change as an event. The basis for replay, audit trail, and debugging.</td></tr>
-                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">CQRS-lite</strong></td><td class="p-3 border-b border-border/60">Projection Worker (agent_live_view, room_live_view, kpi_1m)</td><td class="p-3 border-b border-border/60">Write path stays stable; the dashboard reads from optimized read models. Rebuildable from the event log.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Event Truth</strong></td><td class="p-3 border-b border-border/60">SQLite ledger + typed append gateway + Outbox/Inbox outcomes</td><td class="p-3 border-b border-border/60">The store, not the caller or broker, seals each authoritative fact. Stable operation identities, expected revisions and durable outcomes make retries safe across crashes.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Generation-safe CQRS</strong></td><td class="p-3 border-b border-border/60">Projection catalog + local transactional frontiers + blue-green generations</td><td class="p-3 border-b border-border/60">Read models rebuild beside the live generation, catch up, validate and switch through one durable pointer. No empty-view window and no silent cursor skip.</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Constrained Output</strong></td><td class="p-3 border-b border-border/60">XGrammar<sup><a href="#ref-5" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[5]</a></sup> (Research Ref)</td><td class="p-3 border-b border-border/60">Reference for local inference serving. With hosted LLMs (Claude, Ollama), the provider controls the outputs.</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Monitoring</strong></td><td class="p-3 border-b border-border/60">eBPF via aya<sup><a href="#ref-13" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[13]</a></sup> (fentry + Tracepoints)</td><td class="p-3 border-b border-border/60">Programs in the kernel via <strong>fentry</strong> (~365 ns/hit measured on the live daemon, i7-3930K). Per-CPU hash maps (lock-free). Graceful degradation.</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Protocols</strong></td><td class="p-3 border-b border-border/60">A2A<sup><a href="#ref-17" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[17]</a></sup> (incl. ACP<sup><a href="#ref-18" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[18]</a></sup>)</td><td class="p-3 border-b border-border/60">Google/Linux Foundation agent protocol. Zenoh topics designed to be A2A-compatible.</td></tr>
@@ -733,13 +733,15 @@ IMPULSE: [P1] Andreas is addressing you. [P0] Urgent need to take a break.
         <!-- Limbo Tuning -->
         <div class="bg-surface-1 border border-border p-7 mt-6 card-hover">
             <div class="font-mono font-bold text-[0.65rem] text-dim uppercase tracking-widest mb-4 flex items-center gap-2">
-                <i data-lucide="settings" class="w-4 h-4 text-neon-blue"></i> Limbo/SQLite Tuning // Performance-Pragmas
+                <i data-lucide="settings" class="w-4 h-4 text-neon-blue"></i> SQLite Durability Profiles // Explicit by data class
             </div>
             <pre class="bg-black border border-border p-5 overflow-x-auto font-mono text-[0.82rem] leading-relaxed text-neon-green">PRAGMA journal_mode = WAL;            -- Write-Ahead Log: concurrent readers
-PRAGMA synchronous = NORMAL;          -- 50% fewer fsyncs
+PRAGMA synchronous = FULL;            -- authoritative facts: acknowledge only a power-loss-safe commit
 PRAGMA mmap_size = 268435456;         -- 256 MB memory map
 PRAGMA page_size = 8192;              -- optimized for NVMe sectors
--- Plus: batch inserts in transactions (measured ~2x: 26 events batched 19ms vs. individually 41ms, WAL)</pre>
+-- Rebuildable telemetry may use NORMAL only in a separate declared profile
+-- with a proven source and a startup rebuild contract.
+-- Batch inserts remain transactions; batching never weakens the selected durability class.</pre>
         </div>
 
         <!-- Evaluierte Alternativen -->
@@ -1371,7 +1373,7 @@ PRAGMA page_size = 8192;              -- optimized for NVMe sectors
                 <thead><tr><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.7rem] border-b border-border">Layer</th><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.7rem] border-b border-border">Technology</th><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.7rem] border-b border-border">Role</th></tr></thead>
                 <tbody>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Communication (Rust)</td><td class="p-3 border-b border-border/60"><strong class="text-bright">Zenoh</strong><sup><a href="#ref-1" class="text-neon-blue no-underline text-[0.7rem] font-bold">[1]</a></sup><sup><a href="#ref-27" class="text-neon-blue no-underline text-[0.7rem] font-bold">[27]</a></sup></td><td class="p-3 border-b border-border/60">Rust-native pub/sub + SHM &mdash; <strong class="text-neon-green">1.5 &micro;s SHM latency, 1.1 &micro;s/1kB publish measured</strong> (i7-3930K, 2011) [27]</td></tr>
-                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Communication (Go)</td><td class="p-3 border-b border-border/60"><strong class="text-neon-green">NATS JetStream</strong> <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-blue/12 text-neon-blue border border-neon-blue/25">NEW</span></td><td class="p-3 border-b border-border/60">Go-side message bus: 1:n fan-out, durable pull consumers, exactly-once via Msg-ID. Complements Zenoh for the Go services.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Communication (Go)</td><td class="p-3 border-b border-border/60"><strong class="text-neon-green">NATS JetStream</strong> <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-blue/12 text-neon-blue border border-neon-blue/25">NEW</span></td><td class="p-3 border-b border-border/60">Go-side 1:n bus with durable pull consumers and producer PubAck. Delivery is at least once; stable Sentinel inbox and outcome receipts make business effects idempotent, not a bounded message-ID window.</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Hot State</td><td class="p-3 border-b border-border/60"><strong class="text-bright">redb</strong><sup><a href="#ref-7" class="text-neon-blue no-underline text-[0.7rem] font-bold">[7]</a></sup><sup><a href="#ref-31" class="text-neon-blue no-underline text-[0.7rem] font-bold">[31]</a></sup></td><td class="p-3 border-b border-border/60">Agent state, ECS components. <strong class="text-neon-green">redb read ~0.7 &micro;s measured</strong> (i7-3930K). Pure Rust, CoW crash-safe; chosen over LMDB (no C FFI) [31]</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Structured Data</td><td class="p-3 border-b border-border/60"><strong class="text-bright">Limbo</strong><sup><a href="#ref-8" class="text-neon-blue no-underline text-[0.7rem] font-bold">[8]</a></sup></td><td class="p-3 border-b border-border/60">Chat rooms, meeting logs (async, MVCC)</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Virtual FS</td><td class="p-3 border-b border-border/60"><strong class="text-bright">sentinel-fs</strong> (CAS + FUSE + io_uring)<sup><a href="#ref-14" class="text-neon-blue no-underline text-[0.7rem] font-bold">[14]</a></sup><sup><a href="#ref-29" class="text-neon-blue no-underline text-[0.7rem] font-bold">[29]</a></sup></td><td class="p-3 border-b border-border/60">Inline dedup &mdash; <strong class="text-neon-green">dedup-hit write 26 &micro;s, CAS read 13 &micro;s measured</strong> (i7-3930K); io_uring zero-syscall [29]</td></tr>
@@ -1382,8 +1384,8 @@ PRAGMA page_size = 8192;              -- optimized for NVMe sectors
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Event Bridge</td><td class="p-3 border-b border-border/60"><strong class="text-neon-green">sentinel-nats-bridge</strong> <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-blue/12 text-neon-blue border border-neon-blue/25">NEW</span></td><td class="p-3 border-b border-border/60">Temporary Go service: Limbo event store &rarr; NATS JetStream. To be replaced by the daemon's Zenoh&harr;NATS bridge.</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Personality Evolution</td><td class="p-3 border-b border-border/60"><strong class="text-bright">redb</strong> (VOICE_STYLE, BEHAVIORAL_NOTES, NARRATIVE_SUMMARY)</td><td class="p-3 border-b border-border/60">Night-run writes to redb, the gateway reads &rarr; [SYSTEM_INJECTION]. <span class="text-dim">TOML stays the readonly SSOT (DNA)</span></td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Fact Retrieval</td><td class="p-3 border-b border-border/60"><strong class="text-bright">redb</strong> AGENT_FACTS (JIT RAG)</td><td class="p-3 border-b border-border/60">Keyword match, trigger-based, no embedding</td></tr>
-                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Event Store</td><td class="p-3 border-b border-border/60"><strong class="text-bright">Append-only events + outbox</strong></td><td class="p-3 border-b border-border/60">Source of truth, hash-based replay</td></tr>
-                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">CQRS-lite</td><td class="p-3 border-b border-border/60"><strong class="text-bright">Projection Worker</strong></td><td class="p-3 border-b border-border/60">Read models for the dashboard</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Event Truth</td><td class="p-3 border-b border-border/60"><strong class="text-bright">Store-sealed ledger + durable outcomes</strong></td><td class="p-3 border-b border-border/60">Authoritative facts, replay-safe operations and auditable effect lineage</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Generation-safe CQRS</td><td class="p-3 border-b border-border/60"><strong class="text-bright">Blue-green projection workers</strong></td><td class="p-3 border-b border-border/60">Transactional read-model frontiers and atomic generation activation</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Output Control</td><td class="p-3 border-b border-border/60"><strong class="text-bright">XGrammar</strong><sup><a href="#ref-5" class="text-neon-blue no-underline text-[0.7rem] font-bold">[5]</a></sup></td><td class="p-3 border-b border-border/60">Research reference [5] &mdash; provider-side output control, not measured in Sentinel</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">ECS core</td><td class="p-3 border-b border-border/60"><strong class="text-bright">bevy_ecs</strong><sup><a href="#ref-9" class="text-neon-blue no-underline text-[0.7rem] font-bold">[9]</a></sup></td><td class="p-3 border-b border-border/60">Deterministic world simulation</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60">Orchestrator</td><td class="p-3 border-b border-border/60"><strong class="text-bright">sentinel-daemon</strong> (composition root)</td><td class="p-3 border-b border-border/60">Central binary: ECS + runtime + Zenoh + Limbo + redb. A dedicated std::thread for the tick loop, tokio for async I/O.</td></tr>
@@ -2102,26 +2104,44 @@ sentinel/telemetry/spans        # SpanExport (optional, debug-only)</pre>
         </span>
         <h2 class="font-sans font-extrabold text-bright text-[clamp(1.8rem,3vw,2.5rem)] leading-tight mb-10 flex items-center gap-5 section-line">Technical Deep-Dive</h2>
 
-        <!-- Event Sourcing + CQRS-lite -->
+        <!-- Durable Event Truth + CQRS -->
         <h3 class="font-sans font-bold text-xl text-bright mt-10 mb-5 flex items-center gap-3 border-l-[3px] border-neon-purple pl-4">
-            <i data-lucide="database" class="w-5 h-5 text-neon-purple"></i> Event Sourcing + CQRS-lite
+            <i data-lucide="database" class="w-5 h-5 text-neon-purple"></i> Durable Event Truth + Generation-Safe CQRS
         </h3>
 
         <div class="border-l-4 border-neon-green bg-neon-green/[0.02] p-6 mb-6">
-            <strong class="text-neon-green flex items-center gap-2"><i data-lucide="target" class="w-4 h-4"></i> Design principle</strong>
-            <p class="text-sm mt-2">Append-only events as the <strong class="text-bright">single source of truth</strong>. No UPDATE, no DELETE on the events table. Every state is the sum of its events. Replay possible at any time.</p>
+            <strong class="text-neon-green flex items-center gap-2"><i data-lucide="target" class="w-4 h-4"></i> Binding contract: facts outlive every derived model</strong>
+            <p class="text-sm mt-2">The append-only SQLite ledger is the local fact authority. A caller submits only an authenticated <code class="font-mono text-neon-blue text-[0.8em]">AppendProposalV2</code>; the store alone seals an <code class="font-mono text-neon-blue text-[0.8em]">EventEnvelopeV2</code> and assigns generation, revision, position, commit time and receipt digests. NATS transports sealed facts <strong class="text-bright">at least once</strong>; durable Sentinel inbox and outcome receipts make effects idempotent. Every read model owns a transactional frontier and rebuilds as a new generation beside the live one. No report, consumer or restart may make a committed fact less true.</p>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+            <div class="bg-surface-1 border border-neon-blue/30 p-6 card-hover">
+                <h4 class="font-sans font-bold text-lg text-bright mb-3 flex items-center gap-2"><i data-lucide="file-input" class="w-4 h-4 text-neon-blue"></i> A proposal is not a fact</h4>
+                <p class="text-[0.85rem] leading-relaxed mb-3"><code class="font-mono text-neon-blue text-[0.8em]">AppendProposalV2</code> carries stable caller identities, canonical request bytes, expected revision, payload/schema references and bounded authority and causal context. Callers cannot set store-owned fields. A requested event ID is accepted only for a registered deterministic producer contract.</p>
+                <p class="text-[0.8rem] text-dim">After namespace authentication and canonical encoding, the store first resolves <code class="font-mono text-accent-gold text-[0.8em]">(authority_scope_digest, operation_id)</code>. An exact retry returns the same sealed outcome even if the stream head or active authority has advanced. Only a new operation compares the current expected revision.</p>
+            </div>
+            <div class="bg-surface-1 border border-neon-purple/30 p-6 card-hover">
+                <h4 class="font-sans font-bold text-lg text-bright mb-3 flex items-center gap-2"><i data-lucide="badge-check" class="w-4 h-4 text-neon-purple"></i> Authority travels explicitly</h4>
+                <p class="text-[0.85rem] leading-relaxed mb-3"><code class="font-mono text-neon-blue text-[0.8em]">AuthorityRefV1</code> and <code class="font-mono text-neon-blue text-[0.8em]">CausalContextV1</code> bind tenant, company, project and, when needed, workflow and work item with generation and digest to the stream, request, operation, delivery, effect, quarantine, backup cut and projection.</p>
+                <p class="text-[0.8rem] text-dim">Historical facts remain readable, but unknown authority is never invented from defaults. Cross-tenant or cross-project replay, context rebinding and unknown mutating contexts fail closed before an event, intent, effect or frontier is changed.</p>
+            </div>
         </div>
 
         <pre class="bg-surface-0 border border-border p-5 overflow-x-auto text-[0.78rem] font-mono text-txt leading-relaxed mb-6"><code><span class="text-dim">-- Append-only event store (source of truth)</span>
 <span class="text-neon-green">CREATE TABLE</span> events (
-    event_id       <span class="text-neon-blue">TEXT PRIMARY KEY</span>,       <span class="text-dim">-- UUIDv7</span>
-    stream_id      <span class="text-neon-blue">TEXT NOT NULL</span>,          <span class="text-dim">-- agent:{name} / room:{id} / system</span>
+    event_id       <span class="text-neon-blue">TEXT PRIMARY KEY</span>,       <span class="text-dim">-- stable UUIDv7</span>
+    truth_generation <span class="text-neon-blue">TEXT NOT NULL</span>,        <span class="text-dim">-- backup/restore lineage</span>
+    stream_id      <span class="text-neon-blue">TEXT NOT NULL</span>,          <span class="text-dim">-- agent:{name} / room:{id} / project:{id}</span>
+    stream_revision <span class="text-neon-blue">INTEGER NOT NULL</span>,      <span class="text-dim">-- compare-and-append</span>
+    global_position <span class="text-neon-blue">INTEGER NOT NULL</span>,      <span class="text-dim">-- local to this generation</span>
     event_type     <span class="text-neon-blue">TEXT NOT NULL</span>,
     schema_version <span class="text-neon-blue">INTEGER NOT NULL</span>,
-    correlation_id <span class="text-neon-blue">TEXT NOT NULL</span>,         <span class="text-dim">-- Saga-ready: end-to-end transaction</span>
+    correlation_id <span class="text-neon-blue">TEXT NOT NULL</span>,         <span class="text-dim">-- end-to-end operation</span>
     causation_id   <span class="text-neon-blue">TEXT</span>,                  <span class="text-dim">-- Saga-ready: triggering event</span>
-    operation_id   <span class="text-neon-blue">TEXT</span>,                  <span class="text-dim">-- Saga-ready: compensatable operation</span>
+    operation_id   <span class="text-neon-blue">TEXT NOT NULL</span>,         <span class="text-dim">-- stable retry/effect identity</span>
     compensation_type <span class="text-neon-blue">TEXT</span>,              <span class="text-dim">-- none | counter_event | revert_snapshot</span>
+    payload_digest <span class="text-neon-blue">TEXT NOT NULL</span>,
+    durability     <span class="text-neon-blue">TEXT NOT NULL</span>,         <span class="text-dim">-- authoritative | operational | rebuildable</span>
     payload_json   <span class="text-neon-blue">TEXT NOT NULL</span>,
     tick           <span class="text-neon-blue">INTEGER NOT NULL</span>,
     created_at_ms  <span class="text-neon-blue">INTEGER NOT NULL</span>
@@ -2144,8 +2164,95 @@ sentinel/telemetry/spans        # SpanExport (optional, debug-only)</pre>
         </div>
 
         <div class="border-l-3 border-accent-cyan bg-accent-cyan/[0.03] px-5 py-4 my-6 rounded-r text-[0.88rem]" style="border-left: 3px solid #06b6d4;">
-            <strong class="text-accent-cyan block text-[0.65rem] uppercase tracking-[1.5px] mb-2 flex items-center gap-2"><i data-lucide="lightbulb" class="w-3.5 h-3.5"></i> Saga-ready without a saga</strong>
-            No full saga orchestrator (out of scope). But every mutating event carries the three saga fields. That makes distributed compensation possible without breaking the data model the moment horizontal scaling arrives.
+            <strong class="text-accent-cyan block text-[0.65rem] uppercase tracking-[1.5px] mb-2 flex items-center gap-2"><i data-lucide="lightbulb" class="w-3.5 h-3.5"></i> In plain language</strong>
+            The event ledger is the notarized company history. The outbox is the mail room, NATS is the delivery network, projections are purpose-built reports, and the Hippocampus is an employee's memory. A report may be rebuilt and a message may arrive twice; neither may rewrite history nor repeat a payment, tool action, cost or memory.
+        </div>
+
+        <h3 id="event-truth" class="font-sans font-bold text-xl text-bright mt-12 mb-5 flex items-center gap-3 border-l-[3px] border-neon-green pl-4 scroll-mt-24">
+            <i data-lucide="book-check" class="w-5 h-5 text-neon-green"></i> Event Truth Plane: Commit, Delivery, Projection, Memory
+        </h3>
+
+        <div class="border-l-4 border-neon-green bg-neon-green/[0.02] p-6 mb-6">
+            <strong class="text-neon-green flex items-center gap-2"><i data-lucide="shield-check" class="w-4 h-4"></i> Exactly-once is an outcome, not a transport option</strong>
+            <p class="text-sm mt-2">SQLite commits the local fact. JetStream delivers it at least once. A durable Sentinel inbox with an outcome receipt proves whether the consumer already performed the business effect. A duplicate delivery returns the stored result instead of repeating work, cost, memory or an external call. A bounded message-ID window is an optimization, never permanent authority.</p>
+        </div>
+
+        <pre class="bg-surface-0 border border-border p-5 overflow-x-auto text-[0.78rem] font-mono text-txt leading-relaxed mb-8"><code><span class="text-neon-blue">AppendProposalV2</span>              Request + AuthorityScope + CausalContext + ExpectedRevision
+        &darr;
+<span class="text-neon-green">SQLite durable transaction</span> Store-sealed EventEnvelopeV2 + Outbox intent + effect reservation
+        &darr; durable acknowledgement
+<span class="text-accent-gold">Outbox claim</span>                 ClaimGeneration + opaque token + stable message ID &rarr; publish &rarr; PubAck
+        &darr; at-least-once delivery
+<span class="text-neon-purple">Consumer inbox</span>               ClaimGeneration + token &rarr; validate event/effect + current authority
+        &darr;
+<span class="text-bright">Business outcome</span>              local transaction OR reserve &rarr; external call &rarr; outcome probe
+        &darr;
+<span class="text-neon-green">Projection transaction</span>       view mutation + local frontier in one commit
+        &darr;
+<span class="text-dim">Catalog / retention</span>             mirror frontier; uncertainty retains history</code></pre>
+
+        <h4 class="font-sans font-bold text-lg text-bright mt-8 mb-4">Five independent proof boundaries</h4>
+        <div class="overflow-x-auto mb-8">
+            <table class="w-full border-collapse text-[0.82rem] border border-border">
+                <thead><tr><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.7rem] border-b border-border">Boundary</th><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.7rem] border-b border-border">Authority</th><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.7rem] border-b border-border">Proof before progress</th></tr></thead>
+                <tbody>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Fact commit</strong></td><td class="p-3 border-b border-border/60">SQLite EventAppendGateway</td><td class="p-3 border-b border-border/60">Proposal, schema, digest, producer and authority scope are valid. Exact replay resolves before the head comparison; only a new operation compares expected revision and receives a store-sealed envelope and outcome.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Transport</strong></td><td class="p-3 border-b border-border/60">JetStream</td><td class="p-3 border-b border-border/60">The outbox closes only on PubAck or verified duplicate sequence. A timeout remains indeterminate and retries with the same identity. BrokerAcceptance is not TransportDurability unless the effective replicated storage policy proves it.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Effect</strong></td><td class="p-3 border-b border-border/60">Sentinel inbox/outcome store</td><td class="p-3 border-b border-border/60">Every mutation CAS-checks the active monotone ClaimGeneration and opaque token. Claim and local effect commit together; external effects reserve a stable request, persist result or probe, and reject stale claimants after reclaim.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Projection</strong></td><td class="p-3 border-b border-border/60">Projection-local transaction</td><td class="p-3 border-b border-border/60">Authority context, active claim generation, view mutation and local frontier commit atomically. Known malformed data is quarantined; stale claimants and unknown historical authority cannot move the frontier.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3"><strong class="text-bright">Retention / restore</strong></td><td class="p-3">EventTruthCutReceipt &rarr; StorageGeneration</td><td class="p-3">A store-sealed event-truth cut binds head, consumers, claims/outcomes, projections and holds. StorageGeneration references it in one direction; uncertainty retains history and blocks activation.</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="bg-surface-1 border border-neon-blue/30 p-6 mb-8 card-hover">
+            <h4 class="font-sans font-bold text-lg text-bright mb-3 flex items-center gap-2"><i data-lucide="waypoints" class="w-4 h-4 text-neon-blue"></i> Acyclic Event Truth lineage</h4>
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 text-[0.8rem]">
+                <div class="border-l-2 border-neon-blue pl-4"><strong class="text-neon-blue block mb-1">EventTruthGenerationDescriptor</strong><span class="text-dim">Immutable engine, schema, codec and authority-scope identity for one event generation.</span></div>
+                <div class="border-l-2 border-neon-green pl-4"><strong class="text-neon-green block mb-1">EventTruthHead</strong><span class="text-dim">Monotone durable upper position. Normal appends move only this head and do not create a cross-store generation.</span></div>
+                <div class="border-l-2 border-accent-gold pl-4"><strong class="text-accent-gold block mb-1">EventTruthCutReceipt</strong><span class="text-dim">Store-sealed cut over the head, required frontiers, projections, claims/outcomes, quarantine and retention holds.</span></div>
+            </div>
+            <p class="text-dim text-[0.72rem] italic mt-4"><code class="font-mono text-neon-blue text-[0.8em]">StorageGeneration</code> contains a one-way reference to this cut. Event Truth never points back to the top-level manifest digest, avoiding both digest cycles and false cross-store atomicity claims.</p>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-8">
+            <div class="bg-surface-1 border border-neon-purple/30 p-6 card-hover">
+                <h4 class="font-sans font-bold text-lg text-bright mb-3 flex items-center gap-2"><i data-lucide="layers-3" class="w-4 h-4 text-neon-purple"></i> Blue-green projection generations</h4>
+                <p class="text-[0.85rem] leading-relaxed mb-3"><strong class="text-bright">Building &rarr; CatchingUp &rarr; Validated &rarr; Live &rarr; Retired.</strong> A rebuild creates a private database or generation beside the active one, starts from its declared frontier, catches up while old readers remain served, validates counts, digests and domain invariants, then changes exactly one durable active pointer.</p>
+                <p class="text-[0.8rem] text-dim">Existing readers drain the old generation. Rollback remains possible through validation. There is no <code class="font-mono text-accent-red text-[0.8em]">clear_all</code> window and no dashboard that briefly shows an empty company.</p>
+            </div>
+            <div class="bg-surface-1 border border-accent-gold/30 p-6 card-hover">
+                <h4 class="font-sans font-bold text-lg text-bright mb-3 flex items-center gap-2"><i data-lucide="brain" class="w-4 h-4 text-accent-gold"></i> Agent memory is a projection</h4>
+                <p class="text-[0.85rem] leading-relaxed mb-3">An episode uses source-event identity rather than a process-local counter. The Hippocampus commits episode, source receipt and per-agent frontier in one redb transaction. Only then may the catalog mirror progress.</p>
+                <p class="text-[0.8rem] text-dim">A failed memory write leaves the event pending. First start uses an explicit Beginning or authenticated RecoveryCut policy and never jumps silently to the latest row. Real company experience therefore survives a restart exactly once.</p>
+            </div>
+        </div>
+
+        <h4 class="font-sans font-bold text-lg text-bright mt-8 mb-4">Durability, schema and retention policy</h4>
+        <div class="overflow-x-auto mb-8">
+            <table class="w-full border-collapse text-[0.82rem] border border-border">
+                <thead><tr><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.7rem] border-b border-border">Contract</th><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.7rem] border-b border-border">Binding rule</th></tr></thead>
+                <tbody>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Durability classes</strong></td><td class="p-3 border-b border-border/60"><em>Authoritative</em> customer, work, cost and authority facts plus <em>DurableOperational</em> repair and security outcomes acknowledge only a FULL-durable commit. <em>RebuildableTelemetry</em> may batch or use NORMAL only in a separate declared profile with a proven source and startup rebuild contract.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Schema authority</strong></td><td class="p-3 border-b border-border/60">One immutable ordered SQL migration manifest with checksums. One executor migrates; Rust and Go peers verify a compatible range. Event payloads remain immutable and evolve through registered codecs and upcasters.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Consumer catalog</strong></td><td class="p-3 border-b border-border/60">Every required consumer declares stable ID/version, start policy, generation, local frontier, lag contract, quarantine and retirement transition. A missing required consumer is not caught up.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3"><strong class="text-bright">Delete frontier</strong></td><td class="p-3">The minimum proven-safe point over consumers, live projection generations, outbox/inbox outcomes, backups, snapshots, audit policy and migration claims. Missing, unknown or quarantined means retain.</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <h4 class="font-sans font-bold text-lg text-bright mt-8 mb-4">Mechanism sources and clean boundaries</h4>
+        <div class="overflow-x-auto mb-8">
+            <table class="w-full border-collapse text-[0.8rem] border border-border">
+                <thead><tr><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.68rem] border-b border-border">Source</th><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.68rem] border-b border-border">What Sentinel adopts</th><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.68rem] border-b border-border">Boundary</th></tr></thead>
+                <tbody>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><a href="https://www.sqlite.org/wal.html" class="text-neon-blue hover:underline"><strong>SQLite</strong></a></td><td class="p-3 border-b border-border/60">WAL commit and synchronization semantics, online backup, crash and I/O-fault discipline.</td><td class="p-3 border-b border-border/60">Local event and projection engine without a separate database service.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><a href="https://github.com/tursodatabase/turso" class="text-neon-blue hover:underline"><strong>Turso</strong></a></td><td class="p-3 border-b border-border/60">Explicit WAL/logical-log recovery, atomic persistent cursors and deterministic concurrency simulation.</td><td class="p-3 border-b border-border/60">MIT-licensed source for recovery contracts; an engine switch requires full schema, crash and conformance parity.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><a href="https://github.com/MaterializeInc/materialize" class="text-neon-blue hover:underline"><strong>Materialize</strong></a></td><td class="p-3 border-b border-border/60">Upper/since frontiers, compare-and-append retry outcomes, shared arrangements and bounded compaction.</td><td class="p-3 border-b border-border/60">Small Sentinel-owned contracts instead of a distributed dataflow service; no BSL source copying.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><a href="https://github.com/EventStore/EventStore" class="text-neon-blue hover:underline"><strong>EventStoreDB/Kurrent</strong></a></td><td class="p-3 border-b border-border/60">Expected stream revisions, duplicate-append outcomes, persistent checkpoints and parked poison messages.</td><td class="p-3 border-b border-border/60">Behavioral contract only; original Sentinel implementation and no copying of Kurrent-licensed source.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3"><a href="https://docs.nats.io/nats-concepts/jetstream" class="text-neon-blue hover:underline"><strong>NATS JetStream</strong></a></td><td class="p-3">PubAck, durable acknowledgement floor, redelivery and bounded producer deduplication.</td><td class="p-3">JetStream transports delivery; a Sentinel wrapper binds identity and outcome, while permanent business authority remains Sentinel-owned.</td></tr>
+                </tbody>
+            </table>
         </div>
 
         <!-- Zenoh topic hierarchy -->
@@ -2433,18 +2540,19 @@ Result:
         <div class="bg-surface-1 border border-neon-green/30 p-7 card-hover" style="background: linear-gradient(135deg, #0e0e18, rgba(0,255,157,0.02));">
             <div class="flex items-center justify-between mb-4">
                 <span class="font-mono font-bold text-[0.65rem] uppercase tracking-widest flex items-center gap-2">
-                    <i data-lucide="git-branch" class="w-4 h-4 text-neon-green"></i> Pointer-based restore
+                    <i data-lucide="git-branch" class="w-4 h-4 text-neon-green"></i> Generation-safe pointer activation
                 </span>
                 <span class="inline-block px-2 py-0.5 font-mono font-extrabold text-[0.55rem] uppercase rounded tracking-wider bg-neon-purple/15 text-neon-purple border border-neon-purple/30">SOTA</span>
             </div>
-            <p class="text-sm leading-relaxed mb-4">Events are <strong class="text-bright">immutable</strong> (append-only). A restore changes no events &mdash; only the <strong class="text-bright">pointers</strong> (projection offsets, active snapshot) are set to an earlier state. Low I/O, low latency, no replay needed.</p>
-            <pre class="bg-black border border-border p-4 overflow-x-auto font-mono text-[0.78rem] leading-relaxed text-neon-green">Events:     [E1] [E2] [E3] ... [E1000] [E1001] ... [E5000] ...
-                       &uarr;                  &uarr;              &uarr;
-Snapshots:          S_hourly_1         S_hourly_2     S_daily_1
-                    (last_event=E3)    (last_event=E1001)
+            <p class="text-sm leading-relaxed mb-4">Events and content blocks are <strong class="text-bright">immutable</strong>. A restore does not rewrite them. After complete validation it activates exactly one <strong class="text-bright">StorageGeneration pointer</strong>: redb schemas, Event Truth cut, projection generation, ECS snapshot and CAS reachability move as one contract. If the requested time lies between two anchors, only the bounded canonical event tail is replayed.</p>
+            <pre class="bg-black border border-border p-4 overflow-x-auto font-mono text-[0.78rem] leading-relaxed text-neon-green">Immutable history: [E1] [E2] [E3] ... [E1000] [E1001] ... [E5000] ...
+                          &uarr;                    &uarr;
+Generation anchors:   G_hourly_1             G_hourly_2
+                      cut=E3                 cut=E1001
 
-Current:  Pointer &rarr; S_daily_1 + events after E5000
-Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
+Stage:     anchor G_hourly_1 + canonical tail (E3, target]
+Validate:  schemas + digests + frontiers + authority + CAS reachability
+Activate:  one durable ActiveStorageGeneration pointer, readiness last</pre>
         </div>
 
         <!-- Tiered Retention -->
@@ -2463,14 +2571,14 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
                 </tbody>
             </table>
         </div>
-        <p class="text-dim text-[0.72rem] italic mt-2">Promotion: hourly &rarr; daily &rarr; weekly &rarr; monthly. Events before the oldest snapshot are deleted (freelist reuse, no VACUUM).</p>
+        <p class="text-dim text-[0.72rem] italic mt-2">Promotion: hourly &rarr; daily &rarr; weekly &rarr; monthly. A retained anchor does not by itself authorize deletion. Pruning is bounded by the minimum proven-safe frontier across consumers, projection generations, claims/outcomes, backups, snapshots, holds and migrations.</p>
 
         <!-- WorldSnapshot -->
         <h3 class="font-sans font-bold text-xl text-bright mt-10 mb-5 flex items-center gap-3 border-l-[3px] border-neon-purple pl-4">
             <i data-lucide="archive" class="w-5 h-5 text-neon-purple"></i> WorldSnapshot (atomic state block)
         </h3>
         <div class="bg-surface-1 border border-border p-7 card-hover">
-            <p class="text-sm mb-4">A snapshot holds the <strong class="text-bright">complete state</strong> of the entire simulation at one tick &mdash; serialized as a bincode BLOB (size scales linearly with agent and room count (example: ~100 KB for 25 agents + 20 rooms)):</p>
+            <p class="text-sm mb-4">A WorldSnapshot holds the <strong class="text-bright">complete logical ECS/redb/cursor anchor</strong> of the simulation at one tick &mdash; serialized as a bincode BLOB. The enclosing StorageGeneration binds this anchor to Event Truth, projections and external CAS/segment bytes. Its size scales linearly with agent and room count (example: ~100 KB for 25 agents + 20 rooms):</p>
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
                 <div class="bg-surface-2 border border-border/60 p-4">
                     <div class="font-mono font-bold text-[0.7rem] text-neon-green uppercase tracking-wider mb-2">redb hot state (11 tables)</div>
@@ -2493,13 +2601,27 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
                 <div class="bg-surface-2 border border-border/60 p-4">
                     <div class="font-mono font-bold text-[0.7rem] text-neon-purple uppercase tracking-wider mb-2">Cursor state</div>
                     <div class="space-y-1 text-[0.78rem]">
-                        <div>last_event_id (event store position)</div>
-                        <div>projection_offsets (CQRS bookmarks)</div>
+                        <div>EventTruthCutReceipt (descriptor + head)</div>
+                        <div>projection generation + local frontiers</div>
                         <div>tick, sim_hour, timestamp_ms</div>
-                        <div>schema_version (migration)</div>
+                        <div>schema/schedule/component profile digests</div>
                     </div>
                 </div>
             </div>
+        </div>
+
+        <!-- StorageGeneration -->
+        <h3 class="font-sans font-bold text-xl text-bright mt-10 mb-5 flex items-center gap-3 border-l-[3px] border-neon-blue pl-4">
+            <i data-lucide="layers-3" class="w-5 h-5 text-neon-blue"></i> StorageGeneration (the application-wide consistent cut)
+        </h3>
+        <div class="bg-surface-1 border border-neon-blue/30 p-7 card-hover mb-8">
+            <p class="text-sm leading-relaxed mb-5"><code class="font-mono text-neon-blue text-[0.8em]">StorageGeneration</code> binds generation and parent, redb and SQLite schema digests, one projection generation, CAS roots with BlockRef/chunk profile and exactly one one-way reference to a store-sealed <code class="font-mono text-neon-blue text-[0.8em]">EventTruthCutReceipt</code>. The associated <code class="font-mono text-accent-gold text-[0.8em]">DurableExecutionCut</code> adds tick/ECS plus workflow, Workbench, outcome, queue and authority frontiers. Event Truth never points back to the top-level manifest.</p>
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div class="border-l-2 border-neon-blue pl-4"><strong class="text-neon-blue block mb-1">World</strong><span class="text-dim text-[0.8rem]">Tick, simulation time, ECS snapshot, component schema and schedule/effect profile.</span></div>
+                <div class="border-l-2 border-neon-purple pl-4"><strong class="text-neon-purple block mb-1">Truth and workflow</strong><span class="text-dim text-[0.8rem]">Event head/cut, consumer and projection frontiers, claims/outcomes, workflow waits and collaboration lineage.</span></div>
+                <div class="border-l-2 border-neon-green pl-4"><strong class="text-neon-green block mb-1">Effects and artifacts</strong><span class="text-dim text-[0.8rem]">Workbench receipts, UnknownOutcome set, CAS manifests/reachability/pins and credential/authority generations.</span></div>
+            </div>
+            <p class="text-dim text-[0.72rem] italic mt-4">This is a saga across storage engines, not a fictional cross-store transaction. Each engine stages and fsyncs under its own contract; the committed manifest and active-generation pointer are published last. A crash before publication leaves the old generation active, while a crash after publication reconciles forward from the new cut.</p>
         </div>
 
         <!-- Hot-Swap Restore -->
@@ -2507,30 +2629,30 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
             <i data-lucide="rotate-ccw" class="w-5 h-5 text-accent-gold"></i> Hot-Swap Restore (in the running daemon)
         </h3>
         <div class="bg-surface-1 border border-border p-7 card-hover">
-            <p class="text-sm mb-4">No daemon restart. The simulation is rolled back to a snapshot point while running:</p>
+            <p class="text-sm mb-4">No daemon restart. The target generation is built beside the active state; only a validated activation step makes it visible:</p>
             <div class="space-y-2 text-sm">
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">1.</strong><span>Pause the tick loop</span></div>
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">2.</strong><span>Create a pre-restore snapshot (rollback point)</span></div>
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">3.</strong><span>Load the snapshot + deserialize bincode</span></div>
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">4.</strong><span>redb <code class="text-neon-blue text-[0.8em]">restore_all_tables()</code> &mdash; all 11 tables in ONE atomic write transaction</span></div>
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">5.</strong><span>ECS world <code class="text-neon-blue text-[0.8em]">restore_ecs_state()</code> &mdash; despawn entities + spawn from the snapshot</span></div>
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">6.</strong><span>Terminate agent sandbox processes (SIGTERM) + respawn them in fresh bwrap+Landlock sandboxes</span></div>
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">7.</strong><span><strong class="text-neon-green">Projection seeding</strong>: fill projection tables directly from the snapshot (NOT event replay!). Set the offset to <code class="text-neon-blue text-[0.8em]">max(event_id)</code></span></div>
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">8.</strong><span>NATS: broadcast a <code class="text-neon-blue text-[0.8em]">SnapshotRestored</code> event &rarr; consumer reset</span></div>
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">9.</strong><span>Dashboard: WebSocket <code class="text-neon-blue text-[0.8em]">snapshot_restored</code> event &rarr; cache invalidation + full reload</span></div>
-                <div class="flex gap-3 py-2"><strong class="text-bright whitespace-nowrap w-8 shrink-0">10.</strong><span>Resume the tick loop from <code class="text-neon-blue text-[0.8em]">snapshot.tick + 1</code></span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">1.</strong><span>Close restore admission, take the tick/world barrier and drain active writes</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">2.</strong><span>Record the current <code class="text-neon-blue text-[0.8em]">StorageGeneration</code> and <code class="text-neon-blue text-[0.8em]">DurableExecutionCut</code> as the durable rollback point</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">3.</strong><span>Authenticate the target manifest; validate generations, schemas, digests, frontiers and BlockRef/chunk/schedule profiles</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">4.</strong><span>Stage the sealed EventTruthCutReceipt, authority catalog, operation/outcome/outbox/inbox claims, consumers, workflows and collaboration records in the inactive generation</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">5.</strong><span>Stage redb hot state in one local write transaction, CAS/segment reachability and the ECS world; validate Workbench receipt roots and UnknownOutcome set</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">6.</strong><span>Build projections to the declared cut, reconcile runtime and queue state, and keep uncertain external effects probed or durably blocked; never jump a cursor</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">7.</strong><span>Recheck engine integrity, business lineage, authority generations and complete reachability; rebuild derived caches</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">8.</strong><span>Switch the active generation under the barrier; retain the previous generation through postcondition verification</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-8 shrink-0">9.</strong><span>Bind sandboxes and consumers to the new generation and publish <code class="text-neon-blue text-[0.8em]">RecoveryActivated</code> with cut, generation and cursor</span></div>
+                <div class="flex gap-3 py-2"><strong class="text-bright whitespace-nowrap w-8 shrink-0">10.</strong><span>Open route, readiness and effect admission last; resume at <code class="text-neon-blue text-[0.8em]">snapshot.tick + 1</code></span></div>
             </div>
             <div class="grid grid-cols-2 gap-4 mt-5">
                 <div class="bg-surface-2 border border-neon-green/30 p-3 text-center">
-                    <div class="font-mono font-extrabold text-2xl text-neon-green">~37 &micro;s</div>
-                    <div class="text-dim text-[0.72rem] uppercase tracking-wider mt-1">ECS state restore measured (i7-3930K) &mdash; full 9-step incl. sandbox respawn: &lt;500 ms target</div>
+                    <div class="font-mono font-extrabold text-2xl text-neon-green">&lt;500 ms</div>
+                    <div class="text-dim text-[0.72rem] uppercase tracking-wider mt-1">10-step generation activation, p99 on the reference class</div>
                 </div>
                 <div class="bg-surface-2 border border-border/60 p-3 text-center">
                     <div class="font-mono font-extrabold text-2xl text-neon-blue">0</div>
-                    <div class="text-dim text-[0.72rem] uppercase tracking-wider mt-1">Downtime (hot-swap)</div>
+                    <div class="text-dim text-[0.72rem] uppercase tracking-wider mt-1">Daemon restarts (hot-swap)</div>
                 </div>
             </div>
-            <p class="text-dim text-[0.72rem] italic mt-3 pt-3 border-t border-glow"><strong class="text-neon-green">Why projection seeding instead of event replay:</strong> events are immutable. Replaying from <code class="text-neon-blue text-[0.8em]">snapshot.last_event_id</code> would replay all events up to the present state &mdash; exactly the state we do NOT want. Instead: fill the projection directly from the snapshot data, set the offset to <code class="text-neon-blue text-[0.8em]">max(event_id)</code> &rarr; old events are skipped.</p>
+            <p class="text-dim text-[0.72rem] italic mt-3 pt-3 border-t border-glow"><strong class="text-neon-green">Projection cut, never a cursor trick:</strong> the target generation declares either a matching projection generation or a reproducible rebuild to exactly its Event Truth cut. The global current <code class="text-neon-blue text-[0.8em]">max(event_id)</code> is never a shortcut; it would silently skip business facts.</p>
         </div>
 
         <!-- Arbitrary-Zeitpunkt-Restore (Ziel) -->
@@ -2538,10 +2660,10 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
             <i data-lucide="history" class="w-5 h-5 text-accent-gold"></i> Arbitrary-Point-in-Time Restore <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-accent-gold/12 text-accent-gold border border-accent-gold/25">v23 target</span>
         </h3>
         <div class="bg-surface-1 border border-accent-gold/30 p-7 card-hover">
-            <p class="text-sm leading-relaxed mb-3">The restore above jumps to <em>stored</em> snapshot points. The goal is the slider on <strong class="text-bright">any moment AND any event</strong> of the first hour (e.g. &ldquo;when agent X created the file&rdquo;), coarser after that &mdash; matching the tiered retention.</p>
-            <p class="text-sm leading-relaxed mb-3"><strong class="text-bright">Mechanics:</strong> the nearest <strong class="text-bright">anchor snapshot &le; target</strong> + a bounded deterministic <strong class="text-bright">re-play of <code class="text-neon-blue text-[0.8em]">(anchor,&nbsp;target]</code></strong>, addressed via <code class="text-neon-blue text-[0.8em]">events.id</code> (intra-tick ordering). Distinction from &ldquo;no replay&rdquo; above: that means <em>replay up to now</em> &mdash; a bounded re-play <em>up to a target</em> is allowed and is exactly the lever. It builds on the determinism profile (Cluster 12) and runs as a <code class="text-neon-green text-[0.8em]">FencedStateTransfer&nbsp;scope=world</code>.</p>
+            <p class="text-sm leading-relaxed mb-3">Stored generations are anchors. The slider may address <strong class="text-bright">any retained time and any retained event</strong> of the finest tier, with progressively coarser anchors according to retention policy.</p>
+            <p class="text-sm leading-relaxed mb-3"><strong class="text-bright">Mechanics:</strong> select the nearest complete <strong class="text-bright">generation anchor &le; target</strong>, then deterministically replay only <strong class="text-bright"><code class="text-neon-blue text-[0.8em]">(anchor,&nbsp;target]</code></strong>. Business ordering within a tick comes from the canonical ECS effect key (tick, phase, stable emitter, type, sequence); <code class="text-neon-blue text-[0.8em]">events.id</code> is a durable locator assigned afterward, never the source of ordering. The operation runs as <code class="text-neon-green text-[0.8em]">FencedStateTransfer&nbsp;scope=world</code>.</p>
             <p class="text-sm leading-relaxed pt-3 border-t border-glow"><strong class="text-neon-green">Two accompanying mechanics:</strong> when jumping back, the discarded future is marked overwritable (<code class="text-neon-blue text-[0.8em]">restore_generation</code>/epoch &mdash; the pruner clears it in the normal window). And CAS blocks referenced by a retained snapshot are <strong class="text-bright">pinned</strong> so the trash GC does not delete them &mdash; an old restore always finds its files.</p>
-            <p class="text-sm leading-relaxed pt-3 border-t border-glow"><strong class="text-neon-green">Empirically validated (spike #490, measured):</strong> bounded same-machine re-play is <strong class="text-bright">byte-identical</strong> to the live run through 10,000 ticks (in- and cross-process) whenever the anchor snapshot captures the complete state; every observed divergence traced to enumerated snapshot-coverage gaps (AutonomyCooldown/Smells/Chat/Gaia/Broadcast buffers), not engine nondeterminism. Verdict: <strong class="text-bright">GO, conditional</strong> on closing those gaps &mdash; see <code class="text-neon-blue text-[0.8em]">docs/spikes/SPIKE-490-exact-replay.md</code>.</p>
+            <p class="text-sm leading-relaxed pt-3 border-t border-glow"><strong class="text-neon-green">Determinism contract:</strong> every profile revision must re-execute at least 10,000 ticks byte-identically both in-process and across processes. The anchor includes all ECS resources and transient input buffers. Unexplained divergence blocks replay, restore and homogeneous migration.</p>
         </div>
 
         <!-- Immutable Snapshots (Security) -->
@@ -2554,7 +2676,7 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
             </div>
             <div class="space-y-2 text-sm">
                 <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-48 shrink-0">Snapshot protection</strong><span>A SQLite trigger blocks DELETE on <code class="text-neon-blue text-[0.8em]">world_snapshots</code> when the snapshot is younger than 7 days. DB-level protection that no code can bypass.</span></div>
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-48 shrink-0">CAS GC grace period</strong><span>Chunks with refcount 0 are NOT deleted immediately but moved to a trash queue. Only actually freed after 24h. Ransomware recovery: <code class="text-neon-blue text-[0.8em]">restore_from_trash()</code></span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-48 shrink-0">CAS GC delete claim</strong><span>Refcount 0 creates only a candidate. Before trash or delete, a durable generation-bound claim proves absence from manifests, snapshots, pins, active readers, ingest, restore, migration and remote reachability; the same digest is revalidated immediately before unlink. Uncertainty retains bytes and the 24h trash tier remains reversible.</span></div>
                 <div class="flex gap-3 py-2"><strong class="text-bright whitespace-nowrap w-48 shrink-0">Write anomaly</strong><span>Platform control-plane rule: agent write rate &gt; 5 MB/s &rarr; alert event. Detects ransomware-like behavior (mass encryption). On confirmation: automatic SIGSTOP of the affected agent process.</span></div>
             </div>
         </div>
@@ -2565,11 +2687,11 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
         </h3>
         <div class="bg-surface-1 border border-border p-7 card-hover">
             <div class="space-y-2 text-sm">
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-48 shrink-0">Pruning rule</strong><span>Events before the oldest retained snapshot are deleted (batched DELETE, 10k rows/batch)</span></div>
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-48 shrink-0">Safety guard 1</strong><span>Prune ONLY if <code class="text-neon-blue text-[0.8em]">min(projection_offset) &gt; prune_point</code></span></div>
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-48 shrink-0">Safety guard 2</strong><span>Prune ONLY if the outbox backlog == 0</span></div>
-                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-48 shrink-0">No VACUUM</strong><span>SQLite freelist reuse: deleted pages are reused for new writes. The DB does not shrink but also stops growing. VACUUM avoided because of its EXCLUSIVE file lock.</span></div>
-                <div class="flex gap-3 py-2"><strong class="text-bright whitespace-nowrap w-48 shrink-0">Operator API</strong><span><code class="text-neon-blue text-[0.8em]">POST /operator/prune</code> (manual) + auto-prune in the SnapshotManager (after tier cleanup)</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-48 shrink-0">Pruning rule</strong><span>The delete frontier is the minimum proven-safe point over required consumers, live and rollback-capable projection generations, claims/outcomes, recovery points, backups, snapshots, audit/legal holds and migrations. Missing, unknown, quarantined or incomplete means retain.</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-48 shrink-0">Event Truth proof</strong><span>Pruning consumes a store-sealed <code class="text-neon-blue text-[0.8em]">EventTruthCutReceipt</code>. Offset rows, <code class="text-neon-blue text-[0.8em]">MAX(id)</code>, broker acknowledgements or an empty outbox backlog do not independently prove deletability.</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-48 shrink-0">Lifecycle</strong><span>Start, retirement, rebuild, quarantine and reactivation are authorized durable consumer transitions. Deleting an offset row never simulates retirement.</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-48 shrink-0">Logical vs physical</strong><span>Logical retention and SQLite WAL checkpoint, freelist and compaction policy are separate. Physical maintenance never changes retained event identity or cut lineage.</span></div>
+                <div class="flex gap-3 py-2"><strong class="text-bright whitespace-nowrap w-48 shrink-0">Operator API</strong><span><code class="text-neon-blue text-[0.8em]">POST /operator/prune</code> first returns a dry run with every range, blocker and estimated byte count. Only a revalidated identical frontier authorizes batched deletion.</span></div>
             </div>
         </div>
 
@@ -2680,7 +2802,7 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
             <div class="bg-surface-1 border border-accent-red/30 p-6 card-hover">
                 <h4 class="font-sans font-bold text-lg text-bright mb-3">Single survivor requires proven isolation</h4>
                 <p class="text-[0.85rem] leading-relaxed mb-3">After quorum loss, a remaining node may issue new authority only if it (1) possesses the last required RecoveryPoint and (2) proves the absence of old writers through <strong class="text-bright">independent hardware fencing</strong> &mdash; for example BMC/Redfish power state<sup><a href="#ref-33" class="text-neon-blue no-underline text-[0.7rem] font-bold">[33]</a></sup> plus a durable fence receipt. Without that proof, the control plane remains fail-closed; a membership timeout or &ldquo;peer unreachable&rdquo; is never sufficient.</p>
-                <p class="text-[0.85rem] leading-relaxed"><strong class="text-bright">&ldquo;No functional loss&rdquo;</strong> applies only to explicitly Hot+Replicated classes: after failure, functions and already accepted work survive; throughput, parallelism, and if necessary the rate of logical 1 Hz time may fall. External side effects are authorized exactly once through outbox, idempotency, and OwnerTerm.</p>
+                <p class="text-[0.85rem] leading-relaxed"><strong class="text-bright">&ldquo;No functional loss&rdquo;</strong> applies only to explicitly Hot+Replicated classes: after failure, functions and already accepted work survive; throughput, parallelism, and if necessary the rate of logical 1 Hz time may fall. Outbox and OwnerTerm allow exactly one active effect authority; stable operation identity, durable outcomes and probes make retries idempotent or explicitly uncertain.</p>
             </div>
         </div>
         <div class="bg-surface-1 border border-border p-6 mt-4">
