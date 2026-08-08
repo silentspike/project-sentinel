@@ -31,4 +31,9 @@ pub use selection::{
 };
 pub use service::{ConsolidationResult, HippocampusService};
 pub use sleep::{SleepCycle, SleepPhase};
-pub use store::{HippocampusStore, NarrativeState, ReadOnlyHippocampusStore, RedbFactStore};
+pub use store::{
+    EpisodeProjectionAdvance, EpisodeProjectionApplyOutcome, EpisodeProjectionControl,
+    EpisodeProjectionFrontier, EpisodeProjectionQuarantine, EpisodeProjectionQuarantineReason,
+    EpisodeProjectionStartPolicy, EpisodeProjectionWrite, EpisodeSourceReceipt, HippocampusStore,
+    NarrativeState, ReadOnlyHippocampusStore, RedbFactStore, EPISODE_PROJECTION_VERSION,
+};
