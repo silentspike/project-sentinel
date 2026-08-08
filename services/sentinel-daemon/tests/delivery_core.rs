@@ -113,35 +113,31 @@ fn fixture_source() -> SourceTupleV1 {
 
 fn fixture_cases() -> Vec<QaDatasetCaseV1> {
     let source = fixture_source();
-    [
-        ("security", true),
-        ("structure", true),
-        ("visual", false),
-    ]
-    .into_iter()
-    .map(|(case_id, required)| QaDatasetCaseV1 {
-        schema_version: DELIVERY_SCHEMA_V1,
-        case_id: case_id.to_string(),
-        generation: 1,
-        split: DatasetSplit::HiddenHoldout,
-        required,
-        required_class: if required {
-            "deterministic".to_string()
-        } else {
-            "optional".to_string()
-        },
-        slices: BTreeMap::from([("surface".to_string(), case_id.to_string())]),
-        input_digest: digest(&format!("{case_id}-input")),
-        oracle_digest: digest(&format!("{case_id}-oracle")),
-        provenance: vec![source.clone()],
-        license: "internal-test-fixture".to_string(),
-        access_policy_digest: digest("fixture-access"),
-        contamination_policy_digest: digest("fixture-contamination"),
-        retired_at_ms: None,
-        superseded_by: None,
-        data_control: data_control(),
-    })
-    .collect()
+    [("security", true), ("structure", true), ("visual", false)]
+        .into_iter()
+        .map(|(case_id, required)| QaDatasetCaseV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            case_id: case_id.to_string(),
+            generation: 1,
+            split: DatasetSplit::HiddenHoldout,
+            required,
+            required_class: if required {
+                "deterministic".to_string()
+            } else {
+                "optional".to_string()
+            },
+            slices: BTreeMap::from([("surface".to_string(), case_id.to_string())]),
+            input_digest: digest(&format!("{case_id}-input")),
+            oracle_digest: digest(&format!("{case_id}-oracle")),
+            provenance: vec![source.clone()],
+            license: "internal-test-fixture".to_string(),
+            access_policy_digest: digest("fixture-access"),
+            contamination_policy_digest: digest("fixture-contamination"),
+            retired_at_ms: None,
+            superseded_by: None,
+            data_control: data_control(),
+        })
+        .collect()
 }
 
 fn plan(candidate: &ReleaseCandidateV1) -> QaEvaluationPlanV1 {
@@ -262,12 +258,8 @@ fn evidence_graph(
                 assertion_id: format!("assertion-{}", case.case_id),
                 generation: 1,
                 plan_digest: plan_digest.clone(),
-                case_digest: ContentDigest::of_domain(
-                    "qa-dataset-case",
-                    DELIVERY_SCHEMA_V1,
-                    case,
-                )
-                .unwrap(),
+                case_digest: ContentDigest::of_domain("qa-dataset-case", DELIVERY_SCHEMA_V1, case)
+                    .unwrap(),
                 assertion_digest: digest(&format!("{}-assertion", case.case_id)),
                 oracle_digest: case.oracle_digest.clone(),
                 input_digest: case.input_digest.clone(),
@@ -494,12 +486,11 @@ impl DeliveryIntegrationPort for FakeIntegration {
                     .receipt_contract_generation_delta
                     .load(Ordering::SeqCst) as u64,
             contract_digest: request.contract_digest.clone(),
-            issued_at_ms: 1
-                + if self.controls.renew_receipts.load(Ordering::SeqCst) == 0 {
-                    0
-                } else {
-                    call as u64
-                },
+            issued_at_ms: 1 + if self.controls.renew_receipts.load(Ordering::SeqCst) == 0 {
+                0
+            } else {
+                call as u64
+            },
             expires_at_ms: 10_000,
             issuer: "test-authority".to_string(),
             receipt_digest: ContentDigest::zero(),
@@ -555,24 +546,19 @@ impl DeliveryIntegrationPort for FakeIntegration {
             cleanup_receipt: reference("cleanup-1", 1),
             receipt_digest: ContentDigest::zero(),
         };
-        match self
-            .controls
-            .workbench_receipt_fault
-            .load(Ordering::SeqCst)
-        {
+        match self.controls.workbench_receipt_fault.load(Ordering::SeqCst) {
             1 => receipt.schema_version = DELIVERY_SCHEMA_V1 + 1,
             2 => receipt.artifact_ownership_digest = ContentDigest::zero(),
             3 => receipt.cleanup_receipt.generation = 0,
             4 => receipt.cleanup_receipt.digest = ContentDigest::zero(),
             _ => {}
         }
-        receipt.result_inventory_digest =
-            qa_evidence_inventory_digest(&evidence_graph(
-                &request.qa_run,
-                &request.qa_plan.digest,
-                &receipt,
-            ))
-            .unwrap();
+        receipt.result_inventory_digest = qa_evidence_inventory_digest(&evidence_graph(
+            &request.qa_run,
+            &request.qa_plan.digest,
+            &receipt,
+        ))
+        .unwrap();
         let receipt = receipt.seal()?;
         self.controls
             .durable_workbench_outcomes
@@ -839,8 +825,7 @@ impl DeliveryPublicationStatePort for ConflictOnceStore {
         expected_request_digest: &ContentDigest,
         receipt: PublicationReceiptV1,
     ) -> Result<(), DeliveryError> {
-        self.inner
-            .mark_published(expected_request_digest, receipt)
+        self.inner.mark_published(expected_request_digest, receipt)
     }
 }
 
@@ -1212,10 +1197,7 @@ fn assignment_accepts_explicit_no_retry_no_seed_plan() {
     deterministic_plan.retry_limit = 0;
     deterministic_plan.retryable_classes.clear();
     deterministic_plan = deterministic_plan.seal().unwrap();
-    let planned_run = run(
-        &deterministic_plan,
-        principal("qa-1", AuthorityRole::Qa),
-    );
+    let planned_run = run(&deterministic_plan, principal("qa-1", AuthorityRole::Qa));
     core.assign_qa(
         &context(
             "release-manager",
@@ -1629,7 +1611,9 @@ fn workbench_receipt_rejects_incomplete_schema_ownership_and_cleanup_bindings() 
     for fault in 1..=4 {
         let temp = TempDir::new().unwrap();
         let (integration, controls) = FakeIntegration::controlled();
-        controls.workbench_receipt_fault.store(fault, Ordering::SeqCst);
+        controls
+            .workbench_receipt_fault
+            .store(fault, Ordering::SeqCst);
         let (core, _, _, _) = running_qa_core(&temp, integration);
         let result = core.execute_qa(
             &context(
@@ -1731,7 +1715,12 @@ fn unresolved_or_malformed_findings_cannot_authorize_gate_or_promotion() {
     let temp = TempDir::new().unwrap();
     let (core, candidate, plan, qa) = completed_qa_core(&temp);
     let aggregate = core.load("tenant-a", "project-1").unwrap().unwrap();
-    let workbench = aggregate.workbench_receipts.values().next().unwrap().clone();
+    let workbench = aggregate
+        .workbench_receipts
+        .values()
+        .next()
+        .unwrap()
+        .clone();
     let graph = aggregate.evidence_graphs["run-1"].clone();
     let candidate_ref = VersionedRefV1 {
         id: candidate.candidate_id.clone(),
@@ -2947,7 +2936,10 @@ fn rollback_reconciles_durable_effect_after_local_revision_conflict_without_reex
         Err(DeliveryError::RevisionConflict { .. })
     ));
     let unchanged = core.load("tenant-a", "project-1").unwrap().unwrap();
-    assert_eq!(unchanged.active_release_id.as_deref(), Some("release-failed"));
+    assert_eq!(
+        unchanged.active_release_id.as_deref(),
+        Some("release-failed")
+    );
     assert!(unchanged.rollbacks.is_empty());
 
     core.rollback(&command, "tenant-a", "project-1", rollback)
@@ -2995,9 +2987,7 @@ fn closeout_requires_bound_memory_receipt_and_survives_restart() {
     aggregate
         .manifests
         .insert("manifest-1".to_string(), fixture_manifest("manifest-1", 1));
-    aggregate
-        .releases
-        .insert("release-1".to_string(), release);
+    aggregate.releases.insert("release-1".to_string(), release);
     let core = core_with_seeded_aggregate(&temp, aggregate);
     let command = context(
         "release-manager",
@@ -3040,12 +3030,7 @@ fn closeout_requires_bound_memory_receipt_and_survives_restart() {
     let mut stale_release_closeout = closeout.clone();
     stale_release_closeout.accepted_release.generation += 1;
     assert!(matches!(
-        core.closeout(
-            &command,
-            "tenant-a",
-            "project-1",
-            stale_release_closeout
-        ),
+        core.closeout(&command, "tenant-a", "project-1", stale_release_closeout),
         Err(DeliveryError::StaleEvidence(_))
     ));
     let first = core
@@ -3261,7 +3246,10 @@ fn renewed_authority_receipt_does_not_change_external_operation_identity() {
     renewed.expires_at_ms = 200;
     renewed.receipt_digest = ContentDigest::zero();
     renewed = renewed.seal().unwrap();
-    assert_eq!(authority_identity, renewed.stable_identity_digest().unwrap());
+    assert_eq!(
+        authority_identity,
+        renewed.stable_identity_digest().unwrap()
+    );
     workbench.authority_receipt_digest = renewed.receipt_digest.clone();
     assert_eq!(
         old_workbench_digest,
@@ -3383,13 +3371,26 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
         digest: digest("run-request"),
     };
     let valid = evidence_graph(&run_ref, &plan.plan_digest, &receipt);
-    validate_qa_evidence_graph(&plan, &run_ref, &valid, &principal("qa-1", AuthorityRole::Qa), 150).unwrap();
+    validate_qa_evidence_graph(
+        &plan,
+        &run_ref,
+        &valid,
+        &principal("qa-1", AuthorityRole::Qa),
+        150,
+    )
+    .unwrap();
 
     let mut empty = valid.clone();
     empty.case_results[0].assertion_refs.clear();
     empty = empty.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &empty, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &empty,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::MissingEvidence(_))
     ));
 
@@ -3405,17 +3406,15 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
     optional_result.case_ref = VersionedRefV1 {
         id: optional_case.case_id.clone(),
         generation: optional_case.generation,
-        digest: ContentDigest::of_domain(
-            "qa-dataset-case",
-            DELIVERY_SCHEMA_V1,
-            &optional_case,
-        )
-        .unwrap(),
+        digest: ContentDigest::of_domain("qa-dataset-case", DELIVERY_SCHEMA_V1, &optional_case)
+            .unwrap(),
     };
     optional_result.required = false;
     optional_result.slices = optional_case.slices;
     optional_result.assertion_refs.clear();
-    optional_without_assertion.case_results.push(optional_result);
+    optional_without_assertion
+        .case_results
+        .push(optional_result);
     optional_without_assertion = optional_without_assertion.seal().unwrap();
     assert!(matches!(
         validate_qa_evidence_graph(
@@ -3438,7 +3437,13 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
     .unwrap();
     failed = failed.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &failed, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &failed,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::MissingEvidence(_))
     ));
 
@@ -3448,7 +3453,13 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
         .push(duplicate.dataset_cases[0].clone());
     duplicate = duplicate.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &duplicate, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &duplicate,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::Conflict(_))
     ));
 
@@ -3495,7 +3506,13 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
     model_only.model_results.push(verified_model.clone());
     model_only = model_only.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &model_only, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &model_only,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::AdapterUnavailable {
             dependency: "qa_model_evidence_#749",
             ..
@@ -3513,7 +3530,13 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
         .push(uncalibrated_model);
     deterministic_with_model = deterministic_with_model.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &deterministic_with_model, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &deterministic_with_model,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::AdapterUnavailable {
             dependency: "qa_model_evidence_#749",
             ..
@@ -3530,7 +3553,13 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
     mismatched_model.model_results.push(model);
     mismatched_model = mismatched_model.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &mismatched_model, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &mismatched_model,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::AdapterUnavailable {
             dependency: "qa_model_evidence_#749",
             ..
@@ -3582,16 +3611,18 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
         .disposition
         .as_mut()
         .unwrap()
-        .digest = ContentDigest::of_domain(
-        "qa-flake-disposition",
-        DELIVERY_SCHEMA_V1,
-        &disposition,
-    )
-    .unwrap();
+        .digest =
+        ContentDigest::of_domain("qa-flake-disposition", DELIVERY_SCHEMA_V1, &disposition).unwrap();
     expired_flake.flake_dispositions.push(disposition);
     expired_flake = expired_flake.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &expired_flake, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &expired_flake,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::StaleEvidence(_))
     ));
 
@@ -3619,14 +3650,15 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
         defect_ref: reference("defect-wrong-owner", 1),
         deterministic_regression_fixture: reference("regression-wrong-owner", 1),
     };
-    wrong_owner_flake.case_results[0].disposition.as_mut().unwrap().digest =
-        ContentDigest::of_domain(
-            "qa-flake-disposition",
-            DELIVERY_SCHEMA_V1,
-            &wrong_owner,
-        )
-        .unwrap();
-    wrong_owner_flake.flake_dispositions.push(wrong_owner.clone());
+    wrong_owner_flake.case_results[0]
+        .disposition
+        .as_mut()
+        .unwrap()
+        .digest =
+        ContentDigest::of_domain("qa-flake-disposition", DELIVERY_SCHEMA_V1, &wrong_owner).unwrap();
+    wrong_owner_flake
+        .flake_dispositions
+        .push(wrong_owner.clone());
     wrong_owner_flake = wrong_owner_flake.seal().unwrap();
     assert!(matches!(
         validate_qa_evidence_graph(
@@ -3651,13 +3683,12 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
         digest: qa_case_result_binding_digest(&malformed_flake.case_results[0]).unwrap(),
     };
     wrong_owner.defect_ref.digest = ContentDigest::zero();
-    malformed_flake.case_results[0].disposition.as_mut().unwrap().digest =
-        ContentDigest::of_domain(
-            "qa-flake-disposition",
-            DELIVERY_SCHEMA_V1,
-            &wrong_owner,
-        )
-        .unwrap();
+    malformed_flake.case_results[0]
+        .disposition
+        .as_mut()
+        .unwrap()
+        .digest =
+        ContentDigest::of_domain("qa-flake-disposition", DELIVERY_SCHEMA_V1, &wrong_owner).unwrap();
     malformed_flake.flake_dispositions.push(wrong_owner);
     malformed_flake = malformed_flake.seal().unwrap();
     assert!(matches!(
@@ -3715,7 +3746,14 @@ fn evidence_graph_accepts_cross_inventory_reuse_and_independent_result_sources()
         },
     ];
     graph = graph.seal().unwrap();
-    validate_qa_evidence_graph(&plan, &run_ref, &graph, &principal("qa-1", AuthorityRole::Qa), 150).unwrap();
+    validate_qa_evidence_graph(
+        &plan,
+        &run_ref,
+        &graph,
+        &principal("qa-1", AuthorityRole::Qa),
+        150,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -3741,7 +3779,13 @@ fn evidence_graph_rejects_fixture_substitution_and_invalid_source_tuples() {
     substituted.dataset_cases[0].input_digest = digest("substituted-input");
     substituted = substituted.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &substituted, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &substituted,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::MissingEvidence(_))
     ));
 
@@ -3749,7 +3793,13 @@ fn evidence_graph_rejects_fixture_substitution_and_invalid_source_tuples() {
     empty_sources.dataset_cases[0].provenance.clear();
     empty_sources = empty_sources.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &empty_sources, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &empty_sources,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::MissingEvidence(_))
     ));
 
@@ -3760,7 +3810,13 @@ fn evidence_graph_rejects_fixture_substitution_and_invalid_source_tuples() {
         .push(repeated_source);
     duplicate_result_source = duplicate_result_source.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &duplicate_result_source, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &duplicate_result_source,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::Conflict(_))
     ));
 
@@ -3769,7 +3825,13 @@ fn evidence_graph_rejects_fixture_substitution_and_invalid_source_tuples() {
         digest("cross-inventory-conflicting-content");
     cross_inventory_conflict = cross_inventory_conflict.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &cross_inventory_conflict, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &cross_inventory_conflict,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::Conflict(_))
     ));
 
@@ -3781,7 +3843,13 @@ fn evidence_graph_rejects_fixture_substitution_and_invalid_source_tuples() {
         .push(conflicting_digest);
     conflicting_result_source = conflicting_result_source.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &conflicting_result_source, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &conflicting_result_source,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::Conflict(_))
     ));
 
@@ -3789,7 +3857,13 @@ fn evidence_graph_rejects_fixture_substitution_and_invalid_source_tuples() {
     malformed_source.case_results[0].sources[0].digest = ContentDigest::zero();
     malformed_source = malformed_source.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &malformed_source, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &malformed_source,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::Validation(_))
     ));
 }
@@ -3819,7 +3893,13 @@ fn evidence_graph_rejects_changed_or_missing_case_slices() {
         .insert("surface".to_string(), "relabeled".to_string());
     changed = changed.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &changed, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &changed,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::StaleEvidence(_))
     ));
 
@@ -3827,7 +3907,13 @@ fn evidence_graph_rejects_changed_or_missing_case_slices() {
     missing.case_results[0].slices.clear();
     missing = missing.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &missing, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &missing,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::StaleEvidence(_))
     ));
 }
@@ -3855,7 +3941,13 @@ fn evidence_graph_rejects_duplicate_result_for_same_case() {
     duplicate.case_results.push(second_result);
     duplicate = duplicate.seal().unwrap();
     assert!(matches!(
-        validate_qa_evidence_graph(&plan, &run_ref, &duplicate, &principal("qa-1", AuthorityRole::Qa), 150),
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &duplicate,
+            &principal("qa-1", AuthorityRole::Qa),
+            150
+        ),
         Err(DeliveryError::Conflict(_))
     ));
 }
