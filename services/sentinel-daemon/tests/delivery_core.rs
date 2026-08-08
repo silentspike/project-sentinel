@@ -226,6 +226,7 @@ fn run(plan: &QaEvaluationPlanV1, qa: PrincipalV1) -> QaEvaluationRunReceiptV1 {
         started_at_ms: None,
         finished_at_ms: None,
         attempts: 0,
+        case_attempt_history_digest: None,
         harness_outcome: None,
         cleanup_receipt: None,
         aggregate_outcomes: None,
@@ -284,39 +285,57 @@ fn evidence_graph(
             } else {
                 QaCaseOutcome::Pass
             };
+            let reason_code = match outcome {
+                QaCaseOutcome::Pass => QaCaseReasonCode::Verified,
+                QaCaseOutcome::Fail => QaCaseReasonCode::AssertionFailed,
+                QaCaseOutcome::Error => QaCaseReasonCode::HarnessError,
+                _ => unreachable!("fixture outcome is closed"),
+            };
+            let case_ref = VersionedRefV1 {
+                id: case.case_id.clone(),
+                generation: case.generation,
+                digest: ContentDigest::of_domain("qa-dataset-case", DELIVERY_SCHEMA_V1, case)
+                    .unwrap(),
+            };
+            let assertion_ref = VersionedRefV1 {
+                id: assertion.assertion_id.clone(),
+                generation: assertion.generation,
+                digest: ContentDigest::of_domain(
+                    "qa-deterministic-result",
+                    DELIVERY_SCHEMA_V1,
+                    assertion,
+                )
+                .unwrap(),
+            };
+            let attempt = QaCaseAttemptEvidenceV1 {
+                schema_version: DELIVERY_SCHEMA_V1,
+                attempt_id: format!("attempt-{}-1", case.case_id),
+                generation: 1,
+                attempt_number: 1,
+                run: run.clone(),
+                case_ref: case_ref.clone(),
+                outcome,
+                reason_code,
+                assertion_refs: vec![assertion_ref.clone()],
+                attempt_digest: ContentDigest::zero(),
+            }
+            .seal()
+            .unwrap();
             QaCaseResultV1 {
                 schema_version: DELIVERY_SCHEMA_V1,
                 result_id: format!("result-{}", case.case_id),
                 generation: 1,
                 run: run.clone(),
-                case_ref: VersionedRefV1 {
-                    id: case.case_id.clone(),
-                    generation: case.generation,
-                    digest: ContentDigest::of_domain("qa-dataset-case", DELIVERY_SCHEMA_V1, case)
-                        .unwrap(),
-                },
+                case_ref,
                 outcome,
                 required: true,
-                reason_code: match outcome {
-                    QaCaseOutcome::Pass => QaCaseReasonCode::Verified,
-                    QaCaseOutcome::Fail => QaCaseReasonCode::AssertionFailed,
-                    QaCaseOutcome::Error => QaCaseReasonCode::HarnessError,
-                    _ => unreachable!("fixture outcome is closed"),
-                },
+                reason_code,
                 sources: case.provenance.clone(),
-                assertion_refs: vec![VersionedRefV1 {
-                    id: assertion.assertion_id.clone(),
-                    generation: assertion.generation,
-                    digest: ContentDigest::of_domain(
-                        "qa-deterministic-result",
-                        DELIVERY_SCHEMA_V1,
-                        assertion,
-                    )
-                    .unwrap(),
-                }],
+                assertion_refs: vec![assertion_ref],
                 grader_refs: vec![],
                 slices: case.slices.clone(),
                 attempts: 1,
+                attempt_history: vec![attempt],
                 disposition: None,
             }
         })
@@ -338,6 +357,101 @@ fn evidence_graph(
     }
     .seal()
     .unwrap()
+}
+
+fn resolved_retry_graph(
+    mut graph: QaEvidenceGraphV1,
+    plan: &QaEvaluationPlanV1,
+) -> QaEvidenceGraphV1 {
+    let pass_assertion = graph.deterministic_results[0].clone();
+    let pass_ref = VersionedRefV1 {
+        id: pass_assertion.assertion_id.clone(),
+        generation: pass_assertion.generation,
+        digest: ContentDigest::of_domain(
+            "qa-deterministic-result",
+            DELIVERY_SCHEMA_V1,
+            &pass_assertion,
+        )
+        .unwrap(),
+    };
+    let mut failed_assertion = pass_assertion.clone();
+    failed_assertion.assertion_id = format!("{}-attempt-1-fail", pass_assertion.assertion_id);
+    failed_assertion.assertion_digest = digest("attempt-1-failed-assertion");
+    failed_assertion.evidence_digest = digest("attempt-1-failed-evidence");
+    failed_assertion.actual_digest = digest("attempt-1-failed-actual");
+    failed_assertion.passed = false;
+    let failed_ref = VersionedRefV1 {
+        id: failed_assertion.assertion_id.clone(),
+        generation: failed_assertion.generation,
+        digest: ContentDigest::of_domain(
+            "qa-deterministic-result",
+            DELIVERY_SCHEMA_V1,
+            &failed_assertion,
+        )
+        .unwrap(),
+    };
+    graph.deterministic_results.push(failed_assertion);
+    let result = &mut graph.case_results[0];
+    result.outcome = QaCaseOutcome::Pass;
+    result.reason_code = QaCaseReasonCode::Verified;
+    result.attempts = 2;
+    result.assertion_refs = vec![failed_ref.clone(), pass_ref.clone()];
+    result.attempt_history = vec![
+        QaCaseAttemptEvidenceV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            attempt_id: format!("{}-attempt-1", result.result_id),
+            generation: 1,
+            attempt_number: 1,
+            run: result.run.clone(),
+            case_ref: result.case_ref.clone(),
+            outcome: QaCaseOutcome::Fail,
+            reason_code: QaCaseReasonCode::AssertionFailed,
+            assertion_refs: vec![failed_ref],
+            attempt_digest: ContentDigest::zero(),
+        }
+        .seal()
+        .unwrap(),
+        QaCaseAttemptEvidenceV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            attempt_id: format!("{}-attempt-2", result.result_id),
+            generation: 2,
+            attempt_number: 2,
+            run: result.run.clone(),
+            case_ref: result.case_ref.clone(),
+            outcome: QaCaseOutcome::Pass,
+            reason_code: QaCaseReasonCode::Verified,
+            assertion_refs: vec![pass_ref.clone()],
+            attempt_digest: ContentDigest::zero(),
+        }
+        .seal()
+        .unwrap(),
+    ];
+    result.disposition = Some(VersionedRefV1 {
+        id: "flake-retry-passed".to_string(),
+        generation: 1,
+        digest: ContentDigest::zero(),
+    });
+    let disposition = QaFlakeDispositionV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        disposition_id: "flake-retry-passed".to_string(),
+        generation: 1,
+        result: VersionedRefV1 {
+            id: result.result_id.clone(),
+            generation: result.generation,
+            digest: qa_case_result_binding_digest(result).unwrap(),
+        },
+        owner: principal("qa-1", AuthorityRole::Qa),
+        classification: QaFlakeClassification::TestHarness,
+        reason: QaFlakeReason::RetryPassed,
+        policy_revision: plan.generation,
+        expires_at_ms: 200,
+        defect_ref: reference("defect-retry-passed", 1),
+        deterministic_regression_fixture: pass_ref,
+    };
+    result.disposition.as_mut().unwrap().digest =
+        ContentDigest::of_domain("qa-flake-disposition", DELIVERY_SCHEMA_V1, &disposition).unwrap();
+    graph.flake_dispositions = vec![disposition];
+    graph.seal().unwrap()
 }
 
 struct FakeIntegration {
@@ -986,6 +1100,48 @@ fn seeded_store(temp: &TempDir, mut aggregate: DeliveryAggregateV1) -> DeliveryS
     store
 }
 
+fn active_release_aggregate() -> (DeliveryAggregateV1, ReleaseV1) {
+    let release = ReleaseV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        release_id: "release-preview".to_string(),
+        generation: 1,
+        manifest: reference("manifest-preview", 1),
+        state: ReleaseState::Active,
+        activated_at_ms: Some(100),
+        rollout_receipt: Some(reference("rollout-preview", 1)),
+    };
+    let mut aggregate = DeliveryAggregateV1::new("tenant-a", "project-1");
+    aggregate
+        .releases
+        .insert(release.release_id.clone(), release.clone());
+    aggregate.active_release_id = Some(release.release_id.clone());
+    (aggregate, release)
+}
+
+fn preview_receipt(
+    delivery_id: &str,
+    release: &ReleaseV1,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+) -> DeliveryReceiptV1 {
+    DeliveryReceiptV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        delivery_id: delivery_id.to_string(),
+        generation: 1,
+        tenant_id: "tenant-a".to_string(),
+        release: versioned_release(release),
+        customer_principal_id: "customer-1".to_string(),
+        preview_digest: digest("bounded-preview-policy"),
+        preview_ttl_policy_version: DELIVERY_PREVIEW_TTL_POLICY_V1,
+        receipt_digest: ContentDigest::zero(),
+        state: DeliveryState::PreviewReady,
+        issued_at_ms,
+        expires_at_ms,
+    }
+    .seal()
+    .unwrap()
+}
+
 #[test]
 fn unavailable_integration_fails_closed_without_preventing_store_startup() {
     let temp = TempDir::new().unwrap();
@@ -995,8 +1151,8 @@ fn unavailable_integration_fails_closed_without_preventing_store_startup() {
         UnavailableDeliveryEffects,
     );
     assert!(matches!(
-        core.readiness(),
-        AdapterReadiness::Unavailable { .. }
+        core.command_readiness(DeliveryCommandV1::RegisterCandidate),
+        Err(DeliveryError::AdapterUnavailable { .. })
     ));
     let result = core.register_candidate(
         &context("developer", AuthorityRole::Developer, "register-1", 100),
@@ -1008,6 +1164,220 @@ fn unavailable_integration_fails_closed_without_preventing_store_startup() {
     ));
     assert!(core.load("tenant-a", "project-1").unwrap().is_none());
     core.store().health().unwrap();
+}
+
+#[test]
+fn command_readiness_includes_the_exact_required_saga_contract() {
+    let temp = TempDir::new().unwrap();
+    let core = DeliveryCore::new_test_only(
+        store(&temp),
+        FakeIntegration::new().0,
+        UnavailableDeliveryEffects,
+    );
+    assert!(core
+        .command_readiness(DeliveryCommandV1::IssueDelivery)
+        .is_ok());
+    assert!(core.command_readiness(DeliveryCommandV1::ExecuteQa).is_ok());
+    for command in [
+        DeliveryCommandV1::Promote,
+        DeliveryCommandV1::CustomerRequestChanges,
+        DeliveryCommandV1::Rollback,
+        DeliveryCommandV1::Closeout,
+    ] {
+        assert!(matches!(
+            core.command_readiness(command),
+            Err(DeliveryError::AdapterUnavailable {
+                dependency: "delivery_effect_saga",
+                ..
+            })
+        ));
+    }
+
+    let temp = TempDir::new().unwrap();
+    let (integration, controls) = FakeIntegration::controlled();
+    controls
+        .execution_saga_digest_mode
+        .store(2, Ordering::SeqCst);
+    let core = DeliveryCore::new_test_only(store(&temp), integration, FakeEffects);
+    assert!(matches!(
+        core.command_readiness(DeliveryCommandV1::ExecuteQa),
+        Err(DeliveryError::StaleEvidence(_))
+    ));
+    assert!(core
+        .command_readiness(DeliveryCommandV1::RegisterCandidate)
+        .is_ok());
+}
+
+#[test]
+fn delivery_preview_ttl_is_server_timed_versioned_and_hard_bounded() {
+    let temp = TempDir::new().unwrap();
+    let (aggregate, release) = active_release_aggregate();
+    let store = seeded_store(&temp, aggregate);
+    let core = DeliveryCore::new_test_only(store, FakeIntegration::new().0, FakeEffects);
+    let release_manager =
+        |key: &str| context("release-manager", AuthorityRole::ReleaseManager, key, 1_000);
+    let mut cases = vec![
+        preview_receipt("preview-zero", &release, 1_000, 1_000),
+        preview_receipt(
+            "preview-too-long",
+            &release,
+            1_000,
+            1_000 + DELIVERY_PREVIEW_MAX_TTL_MS + 1,
+        ),
+        preview_receipt("preview-backdated", &release, 999, 1_100),
+        preview_receipt("preview-future", &release, 1_001, 1_100),
+    ];
+    let mut wrong_policy = preview_receipt("preview-wrong-policy", &release, 1_000, 1_100);
+    wrong_policy.preview_ttl_policy_version = DELIVERY_PREVIEW_TTL_POLICY_V1 + 1;
+    wrong_policy = wrong_policy.seal().unwrap();
+    cases.push(wrong_policy);
+    for (index, receipt) in cases.into_iter().enumerate() {
+        assert!(matches!(
+            core.issue_delivery(
+                &release_manager(&format!("preview-invalid-{index}")),
+                "project-1",
+                receipt,
+            ),
+            Err(DeliveryError::Validation(_))
+        ));
+    }
+    let before = core.load("tenant-a", "project-1").unwrap().unwrap();
+    assert!(before.deliveries.is_empty());
+    assert_eq!(before.revision, 1);
+
+    core.issue_delivery(
+        &release_manager("preview-boundary"),
+        "project-1",
+        preview_receipt(
+            "preview-boundary",
+            &release,
+            1_000,
+            1_000 + DELIVERY_PREVIEW_MAX_TTL_MS,
+        ),
+    )
+    .unwrap();
+    let after = core.load("tenant-a", "project-1").unwrap().unwrap();
+    assert_eq!(after.deliveries.len(), 1);
+    assert_eq!(after.revision, 2);
+}
+
+#[test]
+fn customer_action_rejects_local_conflicts_before_any_external_effect() {
+    let temp = TempDir::new().unwrap();
+    let (mut aggregate, release) = active_release_aggregate();
+    let manifest = fixture_manifest("manifest-preview", 1);
+    aggregate
+        .manifests
+        .insert(manifest.manifest_id.clone(), manifest);
+    let mut delivery = preview_receipt("delivery-local-validation", &release, 100, 1_000);
+    delivery.state = DeliveryState::Delivered;
+    delivery = delivery.seal().unwrap();
+    aggregate
+        .deliveries
+        .insert(delivery.delivery_id.clone(), delivery.clone());
+    let delivery_ref = VersionedRefV1 {
+        id: delivery.delivery_id.clone(),
+        generation: delivery.generation,
+        digest: delivery.receipt_digest.clone(),
+    };
+    let customer = principal("customer-1", AuthorityRole::Customer);
+    let feedback = |feedback_id: &str, action: CustomerAction| {
+        CustomerFeedbackV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            feedback_id: feedback_id.to_string(),
+            generation: 1,
+            delivery: delivery_ref.clone(),
+            customer: customer.clone(),
+            action,
+            feedback_digest: ContentDigest::zero(),
+            requested_work_item_refs: vec![],
+            created_at_ms: 200,
+        }
+        .seal()
+        .unwrap()
+    };
+    let acceptance = |acceptance_id: &str| {
+        AcceptanceV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            acceptance_id: acceptance_id.to_string(),
+            generation: 1,
+            delivery: delivery_ref.clone(),
+            release: delivery.release.clone(),
+            customer: customer.clone(),
+            acceptance_digest: ContentDigest::zero(),
+            accepted_at_ms: 200,
+        }
+        .seal()
+        .unwrap()
+    };
+    aggregate.feedback.insert(
+        "feedback-occupied".to_string(),
+        feedback("feedback-occupied", CustomerAction::Reject),
+    );
+    aggregate.acceptances.insert(
+        "acceptance-occupied".to_string(),
+        acceptance("acceptance-occupied"),
+    );
+    let effects = DurableFakeEffects::default();
+    let calls = Arc::clone(&effects.calls);
+    let core = DeliveryCore::new_test_only(
+        seeded_store(&temp, aggregate),
+        FakeIntegration::new().0,
+        effects,
+    );
+    let before = core.load("tenant-a", "project-1").unwrap().unwrap();
+
+    assert!(matches!(
+        core.customer_action(
+            &context(
+                "customer-1",
+                AuthorityRole::Customer,
+                "request-with-acceptance",
+                200,
+            ),
+            "tenant-a",
+            "project-1",
+            feedback("feedback-new", CustomerAction::RequestChanges),
+            Some(acceptance("acceptance-new")),
+        ),
+        Err(DeliveryError::Validation(_))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    assert!(matches!(
+        core.customer_action(
+            &context(
+                "customer-1",
+                AuthorityRole::Customer,
+                "request-occupied-feedback",
+                200,
+            ),
+            "tenant-a",
+            "project-1",
+            feedback("feedback-occupied", CustomerAction::RequestChanges),
+            None,
+        ),
+        Err(DeliveryError::Conflict(_))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    assert!(matches!(
+        core.customer_action(
+            &context(
+                "customer-1",
+                AuthorityRole::Customer,
+                "accept-occupied-id",
+                200,
+            ),
+            "tenant-a",
+            "project-1",
+            feedback("feedback-accept", CustomerAction::Accept),
+            Some(acceptance("acceptance-occupied")),
+        ),
+        Err(DeliveryError::Conflict(_))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(core.load("tenant-a", "project-1").unwrap().unwrap(), before);
 }
 
 #[test]
@@ -1400,6 +1770,54 @@ fn workbench_effect_reconciles_after_authority_toctou_without_reexecution() {
     let recovered = core.load("tenant-a", "project-1").unwrap().unwrap();
     assert_eq!(recovered.workbench_receipts.len(), 1);
     assert_eq!(recovered.qa_runs["run-1"].attempts, 1);
+}
+
+#[test]
+fn workbench_rejects_durable_outcome_after_stable_authority_generation_changes() {
+    let temp = TempDir::new().unwrap();
+    let (integration, controls) = FakeIntegration::controlled();
+    let qa_calls = Arc::clone(&integration.qa_calls);
+    let (core, _, _, _) = running_qa_core(&temp, integration);
+    let next_authorize = controls.authorize_calls.load(Ordering::SeqCst) + 2;
+    controls
+        .flip_authority_on_call
+        .store(next_authorize, Ordering::SeqCst);
+    assert!(matches!(
+        core.execute_qa(
+            &context("qa-1", AuthorityRole::Qa, "execute-old-lineage", 140),
+            "tenant-a",
+            "project-1",
+            "run-1",
+        ),
+        Err(DeliveryError::StaleEvidence(_))
+    ));
+    assert_eq!(qa_calls.load(Ordering::SeqCst), 1);
+
+    let old_outcome = controls
+        .durable_workbench_outcomes
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .cloned()
+        .unwrap();
+    *controls.replay_workbench_receipt.lock().unwrap() = Some(old_outcome);
+    controls.flip_authority_on_call.store(0, Ordering::SeqCst);
+    controls.authority_generation.store(8, Ordering::SeqCst);
+
+    assert!(matches!(
+        core.execute_qa(
+            &context("qa-1", AuthorityRole::Qa, "execute-new-lineage", 141),
+            "tenant-a",
+            "project-1",
+            "run-1",
+        ),
+        Err(DeliveryError::StaleEvidence(_))
+    ));
+    assert_eq!(qa_calls.load(Ordering::SeqCst), 1);
+    let unchanged = core.load("tenant-a", "project-1").unwrap().unwrap();
+    assert!(unchanged.workbench_receipts.is_empty());
+    assert_eq!(unchanged.qa_runs["run-1"].attempts, 0);
 }
 
 #[test]
@@ -2448,6 +2866,7 @@ fn exact_gate_manifest_delivery_and_explicit_customer_acceptance_form_one_lineag
         release: release_ref.clone(),
         customer_principal_id: "customer-1".to_string(),
         preview_digest: digest("bounded-preview"),
+        preview_ttl_policy_version: DELIVERY_PREVIEW_TTL_POLICY_V1,
         receipt_digest: ContentDigest::zero(),
         state: DeliveryState::PreviewReady,
         issued_at_ms: 190,
@@ -3194,6 +3613,22 @@ fn health_rejects_record_map_key_identity_mismatch() {
 }
 
 #[test]
+fn health_rejects_idempotency_authority_namespace_key_tampering() {
+    let temp = TempDir::new().unwrap();
+    let store = seeded_store(&temp, DeliveryAggregateV1::new("tenant-a", "project-1"));
+    store
+        .rekey_idempotency_record_test_only(
+            "tenant-a:seed-authority:seed_fixture:seed-1",
+            "tenant-a:forged-authority:seed_fixture:seed-1",
+        )
+        .unwrap();
+    assert!(matches!(
+        store.health(),
+        Err(DeliveryError::CorruptStore(_))
+    ));
+}
+
+#[test]
 fn legal_state_machines_reject_terminal_reopen_and_shortcuts() {
     assert!(transition_qa_run(QaRunState::CompletedPass, QaRunState::Running).is_err());
     assert!(transition_candidate(CandidateState::Draft, CandidateState::Promoted).is_err());
@@ -3478,6 +3913,13 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
         &failed.deterministic_results[0],
     )
     .unwrap();
+    failed.case_results[0].attempt_history[0].assertion_refs[0] =
+        failed.case_results[0].assertion_refs[0].clone();
+    failed.case_results[0].attempt_history[0].attempt_digest = ContentDigest::zero();
+    failed.case_results[0].attempt_history[0] = failed.case_results[0].attempt_history[0]
+        .clone()
+        .seal()
+        .unwrap();
     failed = failed.seal().unwrap();
     assert!(matches!(
         validate_qa_evidence_graph(
@@ -3612,6 +4054,15 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
     let mut missing_flake = valid.clone();
     missing_flake.case_results[0].outcome = QaCaseOutcome::FlakyUnresolved;
     missing_flake.case_results[0].reason_code = QaCaseReasonCode::FlakyUnresolved;
+    missing_flake.case_results[0].attempt_history[0].outcome = QaCaseOutcome::FlakyUnresolved;
+    missing_flake.case_results[0].attempt_history[0].reason_code =
+        QaCaseReasonCode::FlakyUnresolved;
+    missing_flake.case_results[0].attempt_history[0].attempt_digest = ContentDigest::zero();
+    missing_flake.case_results[0].attempt_history[0] = missing_flake.case_results[0]
+        .attempt_history[0]
+        .clone()
+        .seal()
+        .unwrap();
     missing_flake.case_results[0].disposition = None;
     missing_flake = missing_flake.seal().unwrap();
     assert!(matches!(
@@ -3628,6 +4079,15 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
     let mut expired_flake = valid.clone();
     expired_flake.case_results[0].outcome = QaCaseOutcome::FlakyUnresolved;
     expired_flake.case_results[0].reason_code = QaCaseReasonCode::FlakyUnresolved;
+    expired_flake.case_results[0].attempt_history[0].outcome = QaCaseOutcome::FlakyUnresolved;
+    expired_flake.case_results[0].attempt_history[0].reason_code =
+        QaCaseReasonCode::FlakyUnresolved;
+    expired_flake.case_results[0].attempt_history[0].attempt_digest = ContentDigest::zero();
+    expired_flake.case_results[0].attempt_history[0] = expired_flake.case_results[0]
+        .attempt_history[0]
+        .clone()
+        .seal()
+        .unwrap();
     expired_flake.case_results[0].disposition = Some(VersionedRefV1 {
         id: "flake-1".to_string(),
         generation: 1,
@@ -3672,6 +4132,15 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
     let mut wrong_owner_flake = valid.clone();
     wrong_owner_flake.case_results[0].outcome = QaCaseOutcome::FlakyUnresolved;
     wrong_owner_flake.case_results[0].reason_code = QaCaseReasonCode::FlakyUnresolved;
+    wrong_owner_flake.case_results[0].attempt_history[0].outcome = QaCaseOutcome::FlakyUnresolved;
+    wrong_owner_flake.case_results[0].attempt_history[0].reason_code =
+        QaCaseReasonCode::FlakyUnresolved;
+    wrong_owner_flake.case_results[0].attempt_history[0].attempt_digest = ContentDigest::zero();
+    wrong_owner_flake.case_results[0].attempt_history[0] = wrong_owner_flake.case_results[0]
+        .attempt_history[0]
+        .clone()
+        .seal()
+        .unwrap();
     wrong_owner_flake.case_results[0].disposition = Some(reference("flake-wrong-owner", 1));
     let mut wrong_owner = QaFlakeDispositionV1 {
         schema_version: DELIVERY_SCHEMA_V1,
@@ -3717,6 +4186,15 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
     let mut malformed_flake = valid;
     malformed_flake.case_results[0].outcome = QaCaseOutcome::FlakyUnresolved;
     malformed_flake.case_results[0].reason_code = QaCaseReasonCode::FlakyUnresolved;
+    malformed_flake.case_results[0].attempt_history[0].outcome = QaCaseOutcome::FlakyUnresolved;
+    malformed_flake.case_results[0].attempt_history[0].reason_code =
+        QaCaseReasonCode::FlakyUnresolved;
+    malformed_flake.case_results[0].attempt_history[0].attempt_digest = ContentDigest::zero();
+    malformed_flake.case_results[0].attempt_history[0] = malformed_flake.case_results[0]
+        .attempt_history[0]
+        .clone()
+        .seal()
+        .unwrap();
     malformed_flake.case_results[0].disposition = Some(reference("flake-malformed", 1));
     wrong_owner.disposition_id = "flake-malformed".to_string();
     wrong_owner.owner = principal("qa-1", AuthorityRole::Qa);
@@ -3743,6 +4221,172 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
             150,
         ),
         Err(DeliveryError::Validation(_))
+    ));
+}
+
+#[test]
+fn case_attempt_history_retains_failures_and_binds_retry_regression_evidence() {
+    let temp = TempDir::new().unwrap();
+    let (core, _, plan, _) = running_qa_core(&temp, FakeIntegration::new().0);
+    let (_, receipt) = core
+        .execute_qa(
+            &context("qa-1", AuthorityRole::Qa, "execute-attempt-history", 140),
+            "tenant-a",
+            "project-1",
+            "run-1",
+        )
+        .unwrap();
+    let run_ref = VersionedRefV1 {
+        id: "run-1".to_string(),
+        generation: 1,
+        digest: digest("run-request"),
+    };
+    let resolved =
+        resolved_retry_graph(evidence_graph(&run_ref, &plan.plan_digest, &receipt), &plan);
+    validate_qa_evidence_graph(
+        &plan,
+        &run_ref,
+        &resolved,
+        &principal("qa-1", AuthorityRole::Qa),
+        150,
+    )
+    .unwrap();
+
+    let mut lost_failure = resolved.clone();
+    lost_failure.case_results[0].attempt_history.remove(0);
+    lost_failure = lost_failure.seal().unwrap();
+    assert!(matches!(
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &lost_failure,
+            &principal("qa-1", AuthorityRole::Qa),
+            150,
+        ),
+        Err(DeliveryError::MissingEvidence(_))
+    ));
+
+    let mut duplicate_number = resolved.clone();
+    duplicate_number.case_results[0].attempt_history[1].attempt_number = 1;
+    duplicate_number.case_results[0].attempt_history[1].attempt_digest = ContentDigest::zero();
+    duplicate_number.case_results[0].attempt_history[1] = duplicate_number.case_results[0]
+        .attempt_history[1]
+        .clone()
+        .seal()
+        .unwrap();
+    duplicate_number = duplicate_number.seal().unwrap();
+    assert!(matches!(
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &duplicate_number,
+            &principal("qa-1", AuthorityRole::Qa),
+            150,
+        ),
+        Err(DeliveryError::StaleEvidence(_))
+    ));
+
+    let mut invented = resolved.clone();
+    invented.flake_dispositions[0].deterministic_regression_fixture =
+        reference("invented-regression", 1);
+    invented.case_results[0]
+        .disposition
+        .as_mut()
+        .unwrap()
+        .digest = ContentDigest::of_domain(
+        "qa-flake-disposition",
+        DELIVERY_SCHEMA_V1,
+        &invented.flake_dispositions[0],
+    )
+    .unwrap();
+    invented = invented.seal().unwrap();
+    assert!(matches!(
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &invented,
+            &principal("qa-1", AuthorityRole::Qa),
+            150,
+        ),
+        Err(DeliveryError::MissingEvidence(_))
+    ));
+
+    for change_generation in [true, false] {
+        let mut stale = resolved.clone();
+        if change_generation {
+            stale.flake_dispositions[0]
+                .deterministic_regression_fixture
+                .generation += 1;
+        } else {
+            stale.flake_dispositions[0]
+                .deterministic_regression_fixture
+                .digest = digest("wrong-regression-digest");
+        }
+        stale.case_results[0].disposition.as_mut().unwrap().digest = ContentDigest::of_domain(
+            "qa-flake-disposition",
+            DELIVERY_SCHEMA_V1,
+            &stale.flake_dispositions[0],
+        )
+        .unwrap();
+        stale = stale.seal().unwrap();
+        assert!(matches!(
+            validate_qa_evidence_graph(
+                &plan,
+                &run_ref,
+                &stale,
+                &principal("qa-1", AuthorityRole::Qa),
+                150,
+            ),
+            Err(DeliveryError::StaleEvidence(_))
+        ));
+    }
+
+    let mut failed_regression = resolved;
+    let regression_id = failed_regression.flake_dispositions[0]
+        .deterministic_regression_fixture
+        .id
+        .clone();
+    let regression = failed_regression
+        .deterministic_results
+        .iter_mut()
+        .find(|value| value.assertion_id == regression_id)
+        .unwrap();
+    regression.passed = false;
+    let regression_ref = VersionedRefV1 {
+        id: regression.assertion_id.clone(),
+        generation: regression.generation,
+        digest: ContentDigest::of_domain("qa-deterministic-result", DELIVERY_SCHEMA_V1, regression)
+            .unwrap(),
+    };
+    let result = &mut failed_regression.case_results[0];
+    *result
+        .assertion_refs
+        .iter_mut()
+        .find(|value| value.id == regression_id)
+        .unwrap() = regression_ref.clone();
+    result.attempt_history[1].assertion_refs = vec![regression_ref.clone()];
+    result.attempt_history[1].attempt_digest = ContentDigest::zero();
+    result.attempt_history[1] = result.attempt_history[1].clone().seal().unwrap();
+    result.disposition.as_mut().unwrap().digest = ContentDigest::zero();
+    failed_regression.flake_dispositions[0].deterministic_regression_fixture = regression_ref;
+    failed_regression.flake_dispositions[0].result.digest =
+        qa_case_result_binding_digest(result).unwrap();
+    result.disposition.as_mut().unwrap().digest = ContentDigest::of_domain(
+        "qa-flake-disposition",
+        DELIVERY_SCHEMA_V1,
+        &failed_regression.flake_dispositions[0],
+    )
+    .unwrap();
+    failed_regression = failed_regression.seal().unwrap();
+    assert!(matches!(
+        validate_qa_evidence_graph(
+            &plan,
+            &run_ref,
+            &failed_regression,
+            &principal("qa-1", AuthorityRole::Qa),
+            150,
+        ),
+        Err(DeliveryError::MissingEvidence(_)) | Err(DeliveryError::StaleEvidence(_))
     ));
 }
 

@@ -62,6 +62,10 @@ pub struct DeliveryCommitRequestV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdempotencyRecordV1 {
+    tenant_id: String,
+    principal_id: String,
+    command_kind: String,
+    caller_key: String,
     command_digest: ContentDigest,
     receipt: DeliveryCommitReceiptV1,
 }
@@ -215,6 +219,15 @@ impl DeliveryStore {
             return Ok(None);
         };
         let record: IdempotencyRecordV1 = decode(existing.value(), "idempotency")?;
+        if record.tenant_id != tenant_id
+            || record.principal_id != principal_id
+            || record.command_kind != command_kind
+            || record.caller_key != idempotency_key
+        {
+            return Err(DeliveryError::CorruptStore(
+                "idempotency key does not match its authority namespace".to_string(),
+            ));
+        }
         if &record.command_digest != command_digest {
             return Err(DeliveryError::IdempotencyConflict { key });
         }
@@ -253,6 +266,15 @@ impl DeliveryStore {
             let existing = table.get(idempotency_key.as_str())?;
             if let Some(existing) = existing {
                 let record: IdempotencyRecordV1 = decode(existing.value(), "idempotency")?;
+                if record.tenant_id != request.tenant_id
+                    || record.principal_id != request.principal_id
+                    || record.command_kind != request.command_kind
+                    || record.caller_key != request.idempotency_key
+                {
+                    return Err(DeliveryError::CorruptStore(
+                        "idempotency key does not match its authority namespace".to_string(),
+                    ));
+                }
                 if record.command_digest != request.command_digest {
                     return Err(DeliveryError::IdempotencyConflict {
                         key: idempotency_key,
@@ -350,6 +372,10 @@ impl DeliveryStore {
             duplicate: false,
         };
         let idempotency = IdempotencyRecordV1 {
+            tenant_id: request.tenant_id.clone(),
+            principal_id: request.principal_id.clone(),
+            command_kind: request.command_kind.clone(),
+            caller_key: request.idempotency_key.clone(),
             command_digest: request.command_digest.clone(),
             receipt: receipt.clone(),
         };
@@ -457,6 +483,34 @@ impl DeliveryStore {
         if updated {
             write.commit()?;
         }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn rekey_idempotency_record_test_only(
+        &self,
+        original_key: &str,
+        replacement_key: &str,
+    ) -> Result<(), DeliveryError> {
+        if original_key.is_empty() || replacement_key.is_empty() || original_key == replacement_key
+        {
+            return Err(DeliveryError::Validation(
+                "test idempotency rekey requires distinct non-empty keys".to_string(),
+            ));
+        }
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(IDEMPOTENCY)?;
+            let bytes = {
+                let existing = table.get(original_key)?.ok_or_else(|| {
+                    DeliveryError::NotFound("test idempotency record".to_string())
+                })?;
+                existing.value().to_vec()
+            };
+            table.remove(original_key)?;
+            table.insert(replacement_key, bytes.as_slice())?;
+        }
+        write.commit()?;
         Ok(())
     }
 
@@ -652,8 +706,24 @@ impl DeliveryStore {
         }
         let idempotency = read.open_table(IDEMPOTENCY)?;
         for row in idempotency.iter()? {
-            let (_, value) = row?;
+            let (key, value) = row?;
             let record: IdempotencyRecordV1 = decode(value.value(), "idempotency")?;
+            for (name, component) in [
+                ("tenant_id", record.tenant_id.as_str()),
+                ("principal_id", record.principal_id.as_str()),
+                ("command_kind", record.command_kind.as_str()),
+                ("caller_key", record.caller_key.as_str()),
+            ] {
+                validate_component(name, component).map_err(|_| {
+                    DeliveryError::CorruptStore(
+                        "idempotency authority namespace is invalid".to_string(),
+                    )
+                })?;
+            }
+            let expected_key = format!(
+                "{}:{}:{}:{}",
+                record.tenant_id, record.principal_id, record.command_kind, record.caller_key
+            );
             let journal = journal_by_operation
                 .get(&record.receipt.operation_id)
                 .ok_or_else(|| {
@@ -661,7 +731,8 @@ impl DeliveryStore {
                         "idempotency receipt exists without journal row".to_string(),
                     )
                 })?;
-            if record.command_digest == ContentDigest::zero()
+            if key.value() != expected_key
+                || record.command_digest == ContentDigest::zero()
                 || record.receipt.event_digest == ContentDigest::zero()
                 || record.receipt.duplicate
                 || record.command_digest != journal.command_digest
@@ -669,7 +740,7 @@ impl DeliveryStore {
                 || record.receipt.project_revision != journal.project_revision
             {
                 return Err(DeliveryError::CorruptStore(
-                    "idempotency record has an empty digest".to_string(),
+                    "idempotency record key, authority, receipt, or digest is invalid".to_string(),
                 ));
             }
         }

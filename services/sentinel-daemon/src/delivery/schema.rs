@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use super::digest::ContentDigest;
 
 pub const DELIVERY_SCHEMA_V1: u16 = 1;
+pub const DELIVERY_PREVIEW_TTL_POLICY_V1: u16 = 1;
+pub const DELIVERY_PREVIEW_MAX_TTL_MS: u64 = 15 * 60 * 1_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -204,6 +206,7 @@ pub struct QaEvaluationRunReceiptV1 {
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
     pub attempts: u16,
+    pub case_attempt_history_digest: Option<ContentDigest>,
     pub harness_outcome: Option<QaHarnessOutcome>,
     pub cleanup_receipt: Option<VersionedRefV1>,
     pub aggregate_outcomes: Option<QaAggregateOutcomesV1>,
@@ -236,6 +239,21 @@ pub enum QaCaseReasonCode {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct QaCaseAttemptEvidenceV1 {
+    pub schema_version: u16,
+    pub attempt_id: String,
+    pub generation: u64,
+    pub attempt_number: u16,
+    pub run: VersionedRefV1,
+    pub case_ref: VersionedRefV1,
+    pub outcome: QaCaseOutcome,
+    pub reason_code: QaCaseReasonCode,
+    pub assertion_refs: Vec<VersionedRefV1>,
+    pub attempt_digest: ContentDigest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QaCaseResultV1 {
     pub schema_version: u16,
     pub result_id: String,
@@ -250,6 +268,7 @@ pub struct QaCaseResultV1 {
     pub grader_refs: Vec<VersionedRefV1>,
     pub slices: BTreeMap<String, String>,
     pub attempts: u16,
+    pub attempt_history: Vec<QaCaseAttemptEvidenceV1>,
     pub disposition: Option<VersionedRefV1>,
 }
 
@@ -571,6 +590,7 @@ pub struct DeliveryReceiptV1 {
     pub release: VersionedRefV1,
     pub customer_principal_id: String,
     pub preview_digest: ContentDigest,
+    pub preview_ttl_policy_version: u16,
     pub receipt_digest: ContentDigest,
     pub state: DeliveryState,
     pub issued_at_ms: u64,
@@ -740,6 +760,19 @@ impl AcceptanceV1 {
 
     pub fn seal(mut self) -> Result<Self, super::error::DeliveryError> {
         self.acceptance_digest = self.computed_digest()?;
+        Ok(self)
+    }
+}
+
+impl QaCaseAttemptEvidenceV1 {
+    pub fn computed_digest(&self) -> Result<ContentDigest, super::error::DeliveryError> {
+        let mut unsigned = self.clone();
+        unsigned.attempt_digest = ContentDigest::zero();
+        ContentDigest::of_domain("qa-case-attempt-evidence", DELIVERY_SCHEMA_V1, &unsigned)
+    }
+
+    pub fn seal(mut self) -> Result<Self, super::error::DeliveryError> {
+        self.attempt_digest = self.computed_digest()?;
         Ok(self)
     }
 }
