@@ -16,7 +16,8 @@ second workflow platform to solve the current event and projection defects.
 The missing component is a small Sentinel-owned event-truth layer around the
 engines already in the product:
 
-1. one versioned event envelope and one authoritative append gateway;
+1. one versioned caller proposal, one store-sealed event envelope, and one
+   authoritative append gateway;
 2. explicit acknowledgement and durability classes;
 3. stream-revision compare-and-append for concurrent writers;
 4. a durable outbox that records JetStream broker acceptance through `PubAck`
@@ -31,7 +32,10 @@ engines already in the product:
    policy;
 10. an immutable event-truth generation descriptor, a monotonic event-truth
     head, and sealed cut receipts referenced one-way by the storage generation
-    defined by [#708](https://github.com/silentspike/project-sentinel/issues/708).
+    owned by [#728](https://github.com/silentspike/project-sentinel/issues/728)
+    and the active recovery owners #751/#753/#755. Closed
+    [research #708](https://github.com/silentspike/project-sentinel/issues/708)
+    remains input only and owns no implementation or activation step.
 
 SQLite WAL provides the required local transaction primitive. JetStream
 provides broker acceptance, at-least-once redelivery, and bounded producer
@@ -350,8 +354,8 @@ Current tests prove narrower properties than the target contract:
 
 | Test source | What it proves | What it does not prove |
 | --- | --- | --- |
-| [`sentinel-limbo/tests/acceptance.rs:162-425`](../../../crates/sentinel-limbo/tests/acceptance.rs#L162-L425) and [`event_store.rs:2569-3139`](../../../crates/sentinel-limbo/src/event_store.rs#L2569-L3139) | Append-only API shape, event+outbox transaction, operation-ID replay, monotonic offsets, WAL mode, and local outbox flow | Expected stream revision, conflicting replay digest, power-loss durable ack, PubAck, or permanent effects |
-| [`outbox_publisher.rs:245-418`](../../../crates/sentinel-limbo/src/outbox_publisher.rs#L245-L418) | Transport failure remains pending and later retries; batching and shutdown drain | Broker acceptance, effective storage/replica/sync policy, indeterminate PubAck, claim leases, poison lane, concurrent publishers |
+| [`sentinel-limbo/tests/acceptance.rs:162-425`](../../../crates/sentinel-limbo/tests/acceptance.rs#L162-L425) and [`event_store.rs:2569-3139`](../../../crates/sentinel-limbo/src/event_store.rs#L2569-L3139) | Append-only API shape, event+outbox transaction, operation-ID replay, monotonic offsets, WAL mode, and local outbox flow | Proposal/sealed-envelope field ownership, replay-before-revision, structured authority context/rebinding, conflicting replay digest, power-loss durable ack, PubAck, or permanent effects |
+| [`outbox_publisher.rs:245-418`](../../../crates/sentinel-limbo/src/outbox_publisher.rs#L245-L418) | Transport failure remains pending and later retries; batching and shutdown drain | Store-issued claim generation/token CAS, stale-worker fencing, broker acceptance, effective storage/replica/sync policy, indeterminate PubAck, poison lane, concurrent publishers |
 | [`sentinel-nats-bridge/bridge_test.go:1-78`](../../../services/sentinel-nats-bridge/bridge_test.go#L1-L78) | Stable operation ID maps to stable `Nats-Msg-Id` | JetStream publish API, PubAck, power-loss boundary, crash between publish/mark, permanent business idempotency |
 | [`sentinel-projection/tests/acceptance.rs:113-738`](../../../crates/sentinel-projection/tests/acceptance.rs#L113-L738) | Rebuild equivalence, restart continuation, several idempotent handlers, hierarchy catch-up, and rejection of a malformed known v2 cost event | Blue-green activation, all-handler replay safety, poison resolution, or catalog/local-frontier crash reconciliation |
 | [`episode_producer.rs:373-588`](../../../services/sentinel-daemon/src/episode_producer.rs#L373-L588) | Event-to-episode mapping, scheduling, process-local ID increment, and agent registration | First-start policy, redb write failure, crash ordering, source receipt, atomic frontier, or concurrent producers |
@@ -385,15 +389,15 @@ failpoint; sleeping and killing at a guessed time is not evidence.
 
 | Schedule | Injected boundary | Allowed durable state after restart | Forbidden result | Owner |
 | --- | --- | --- | --- | --- |
-| F-01 append validation | Before schema/digest/authority validation | No event, outbox, or effect reservation | Invalid event is visible to any reader | #732 |
-| F-02 expected revision | Two writers read revision `r`; both append at `r` | Exactly one append wins; loser gets typed `WrongExpectedRevision` or exact replay outcome | Both logical updates claim revision `r+1` | #732 |
-| F-03 append transaction | After event insert, before outbox/effect-intent insert | Transaction rolls back completely | Event exists without its required intents | #732 |
+| F-01 append validation | Before proposal/context/schema/digest/authority validation | No event, outbox, or effect reservation; unknown historical context remains explicitly unknown | Caller-supplied store fields, invalid context, or invented historical authority is visible to any reader | #732 |
+| F-02 replay before revision | Exact retry after the original append advanced the stream, or same scoped operation ID with a different request/context digest | After namespace authentication, exact digest match returns the prior sealed envelope/outcome without checking the new head or creating an effect; mismatch is `OperationConflict` | Legitimate retry returns `WrongExpectedRevision`, or cross-tenant/project/context rebinding is treated as replay | #732 |
+| F-03 new-operation append | Replay lookup misses; two genuinely new operations read revision `r`, then one stops after event insert before intents | Only one new operation wins revision `r+1`; the loser gets typed `WrongExpectedRevision`; event plus intents commit or roll back together | Revision is checked before exact replay lookup, both updates claim `r+1`, or an event exists without required intents | #732 |
 | F-04 durable ack | After SQLite commit record but before required sync/ack return | Caller receives no success; retry returns the prior operation outcome or a typed indeterminate result | Success is returned for data lost by the declared crash model | #732 |
-| F-05 outbox publish | Before broker acceptance | Row remains retryable under the same message/operation ID | Row becomes complete | #733 |
-| F-06 PubAck gap | Broker accepted the message, publisher lost `PubAck` | Republish/probe with the same ID; duplicate broker storage is bounded, business identity unchanged | New operation ID, silent completion from socket write, or a stable-media claim inferred from acceptance | #733 |
-| F-07 publish then mark | `PubAck` received, before local completion commit or before the configured server sync boundary | Redelivery is permitted; broker acceptance is recorded separately from transport durability; power-loss recovery matches the declared storage/replica/sync policy | `PubAck` is treated as proof of stable media or duplicate business effect is accepted as transport behavior | #733/#679 |
-| F-08 local consumer effect | After local view/effect mutation, before inbox outcome/ack | Local mutation and inbox outcome either both commit or both roll back | Mutation commits without a durable outcome identity | #733/#734 |
-| F-09 external effect | After request dispatch with no terminal response | Bound upstream idempotency key or authoritative probe resolves the same request; without either capability the attempt stays indeterminate/quarantined for manual resolution | Blind automatic retry, whether under the same or a new identity | #733/#710 |
+| F-05 outbox claim/reclaim | Lease expires or shutdown starts after claim; another worker receives a higher claim generation/token | Only the exact active token may publish or transition; the old claimant rejects/no-ops and advances no frontier | Old claimant publishes, retries, quarantines, or completes after reclaim | #733 |
+| F-06 PubAck gap and stale claimant | Broker accepted the message; publisher lost `PubAck`; lease expires and a new claimant wins before the old response arrives | Republish/probe keeps the same message ID; a late old-token `PubAck` rejects/no-ops; only the active token records acceptance | Late old claimant completes, a new operation ID is used, or acceptance is inferred from socket write | #733 |
+| F-07 publish then mark | Active-token `PubAck` arrives before local completion commit or configured server sync boundary | Broker acceptance records only under active-token CAS; redelivery is permitted; transport durability matches the declared storage/replica/sync policy | Stale token records acceptance, `PubAck` proves stable media, or duplicate effect is accepted as transport behavior | #733/#679 |
+| F-08 local consumer effect | Lease expires/reclaim races local view/effect mutation and inbox outcome | Exact active-token CAS, local mutation, inbox outcome, and frontier commit together or not at all; old claimant rejects/no-ops | Stale claimant commits state/outcome or advances a frontier | #733/#734 |
+| F-09 external effect | External response arrives after lease expiry/reclaim or shutdown, or dispatch has no terminal response | Active token plus bound upstream idempotency/probe resolves the same request; stale-token response rejects/no-ops; without upstream capability the attempt stays indeterminate/quarantined/manual | Late old claimant commits outcome/frontier or any blind automatic retry | #733/#710 |
 | F-10 malformed relevant event | Decode/upcast/handler validation fails | Source position and digest enter quarantine; frontier does not pass it | Ack/skip plus frontier advance | #733/#734 |
 | F-11 projection commit | After view+local-frontier commit, before catalog offset commit | Restart reconciles catalog from the local frontier; replay is harmless | Catalog guesses completion beyond local frontier | #734 |
 | F-12 projection rebuild | During build, catch-up, validation, or activation | Old generation remains live until one atomic validated pointer switch | Readers see empty, mixed, or partial generations | #734 |
@@ -447,13 +451,59 @@ Rules:
 
 ## Event Truth Contract
 
-### EventEnvelopeV2
+### Caller Proposal, Causal Authority, and Sealed EventEnvelopeV2
+
+The following shape refines the accepted #718 contract without creating a
+second schema owner; #732 owns the canonical field codec and bounds.
 
 ```text
+AuthorityRefV1 {
+    kind: Tenant | Company | Project | Workflow | WorkItem,
+    id: BoundedAuthorityId,
+    authority_generation: u64,
+    authority_digest: Digest,
+}
+
+CausalContextV1 {
+    schema_version: 1,
+    tenant: AuthorityRefV1,
+    company: AuthorityRefV1,
+    project: AuthorityRefV1,
+    workflow: Option<AuthorityRefV1>,
+    work_item: Option<AuthorityRefV1>,
+    request_id: RequestId,
+    request_digest: Digest,
+    correlation_id: CorrelationId,
+    causation_event_id: Option<EventId>,
+    operation_id: OperationId,
+    attempt: u32,
+    source_generation: GenerationId,
+    source_digest: Digest,
+    bounded_optional_lineage,
+}
+
+AppendProposalV2 {
+    proposal_version: 2,
+    requested_event_id: Option<UuidV7>,
+    event_type: EventType,
+    schema_version: u32,
+    payload_codec: CodecId,
+    payload_digest: Digest,
+    payload: Bytes,
+    causal_context: CausalContextV1,
+    producer: ProducerId,
+    owner_term: Option<OwnerTerm>,
+    tick: Option<u64>,
+    requested_durability: EventDurability,
+    expected_stream_revision: Exact(u64) | NoStream,
+    delivery_intents,
+    effect_reservations,
+}
+
 EventEnvelopeV2 {
-    event_id: UuidV7,
+    event_id: UuidV7, // store-assigned or validated requested_event_id
     event_truth_generation: GenerationId,
-    stream_id: StreamId,
+    stream_namespace: AuthorityScopeDigest,
     stream_revision: u64,
     global_position: GenerationLocalPosition,
     event_type: EventType,
@@ -461,20 +511,51 @@ EventEnvelopeV2 {
     payload_codec: CodecId,
     payload_digest: Digest,
     payload: Bytes,
-    operation_id: OperationId,
-    correlation_id: CorrelationId,
-    causation_id: Option<EventId>,
+    causal_context: CausalContextV1,
     producer: ProducerId,
     owner_term: Option<OwnerTerm>,
     tick: Option<u64>,
-    created_at_ms: i64,
+    appended_at_ms: i64,
     durability: EventDurability,
+    canonical_request_digest: Digest,
+    append_receipt_digest: Digest,
+    sealed_envelope_digest: Digest,
 }
 ```
 
 The database position orders rows only within one event-truth generation. It
-is not a portable event identity. Event IDs, operation IDs, and source
-provenance survive backup, restore, projection rebuild, and cluster transfer.
+is not a portable event identity. Event IDs, operation IDs, structured causal
+authority, and source provenance survive backup, restore, projection rebuild,
+and cluster transfer.
+
+The caller authors `AppendProposalV2`, never a persisted envelope. It must
+supply the stable operation/request/correlation identities, direct causation
+for non-root work, bounded payload/provenance, producer identity, requested
+durability, and expected revision. It may request an event ID only under a
+registered deterministic producer contract; otherwise the store assigns
+UUIDv7. The gateway authenticates the caller/service and validates every caller
+ID, digest, owner term, context bound, authority hierarchy, and generation. For
+a replay lookup, validation proves the namespace structure and the caller's
+permission to query that scope; only a replay miss performs current write
+authorization, so an exact retry can retrieve its prior outcome after authority
+or stream-head state has advanced.
+
+The caller cannot supply `event_truth_generation`, `stream_namespace`, exact
+stream revision, generation-local position, authoritative append time,
+canonical request digest, receipt digest, or sealed-envelope digest. The store
+derives or assigns those fields inside the append transaction. #732 remains the
+sole schema/codec owner for `AuthorityRefV1`, `CausalContextV1`, proposal, and
+envelope.
+
+`CausalContextV1` is versioned and size-bounded, and its tenant/company/project
+hierarchy plus applicable workflow/work-item authority generation/digest is
+validated before append or effect. The derived authority-scope digest is part
+of the stream namespace and canonical request/operation key. The exact context
+or its canonical digest is preserved in delivery/effect intents, inbox/outcome
+keys, quarantine evidence, replay lookup, backup cuts, and projection
+authorization. Historical decode records missing context as unknown; it never
+invents a tenant, project, generation, or authority digest, and unknown
+historical authority cannot cross a mutating boundary without explicit repair.
 
 ### Append Gateway
 
@@ -482,30 +563,43 @@ All production writers use one typed gateway:
 
 ```text
 append(AppendRequest {
-    envelope,
-    expected_stream_revision: Exact(u64) | NoStream,
-    delivery_intents,
-    effect_reservations,
+    authenticated_caller,
+    proposal: AppendProposalV2,
 }) -> AppendOutcome
 ```
 
 The transaction performs:
 
-1. validate schema, producer authority, owner term, and payload digest;
-2. compare expected stream revision;
-3. detect the operation ID and return the prior outcome for a replay;
-4. insert the event;
-5. create all outbox and local effect reservations;
-6. commit at the requested durability boundary;
-7. return the assigned stream revision and generation-local position.
+1. decode and canonicalize the proposal, authenticate the caller/service and
+   structured authority namespace for scoped lookup, validate
+   bounds/schema/payload/context integrity, and compute the complete canonical
+   request digest without yet requiring current write authority;
+2. look up `(authority_scope_digest, operation_id)` before reading the current
+   stream head. Exact digest match returns the prior sealed envelope/outcome
+   without a new event, intent, or effect even when the stream advanced;
+3. reject the same scoped operation ID with a different complete proposal,
+   context, expected revision, delivery/effect intent, or digest as
+   `OperationConflict`;
+4. only for a genuinely new operation, validate current write authority and
+   compare the expected stream revision;
+5. assign current event-truth generation, stream namespace/revision,
+   generation-local position, event ID when not validly requested,
+   authoritative append time, and store-owned receipt fields;
+6. insert the sealed event and all delivery/effect intents carrying the same
+   authority/context digest;
+7. commit at the requested durability boundary and return the sealed envelope,
+   sealed-envelope digest, append-receipt digest, and outcome digest.
 
 `AppendOutcome` is closed and typed: `Appended`, `ReplayOfPriorOperation`,
 `WrongExpectedRevision`, `OperationConflict`, `UnauthorizedProducer`,
 `UnknownSchema`, `PayloadDigestMismatch`, `StaleOwnerTerm`, or
-`IndeterminateDurability`. A reused operation ID with a different canonical
-request digest is a conflict, never a replay. A caller cannot change stream,
+`IndeterminateDurability`. `Appended` and `ReplayOfPriorOperation` both bind the
+same prior sealed envelope and outcome digest. A reused scoped operation ID
+with a different canonical request digest is a conflict, never a replay. A
+caller cannot change authority context, stream namespace, expected revision,
 payload, durability, delivery intents, or effect reservations while retaining
-the operation ID.
+the operation ID. Cross-tenant/project replay and context rebinding are typed
+authorization/conflict failures, never deduplication hits.
 
 An event-only append is allowed only for an explicitly typed local event that
 has no delivery contract. It must not be an alternate unreviewed API.
@@ -516,8 +610,9 @@ has no delivery contract. It must not be an alternate unreviewed API.
 
 ```text
 Pending
-  -> Claimed { boot_id, attempt, lease_until }
-  -> BrokerAccepted { stream, sequence, duplicate, acceptance_digest }
+  -> Claimed { boot_id, attempt, lease_until, claim_generation, claim_token }
+  -> BrokerAccepted { stream, sequence, duplicate, acceptance_digest,
+                      claim_generation, claim_token_digest }
   -> Completed
   | Retryable { next_attempt, error_class }
   | Quarantined { reason, evidence }
@@ -528,6 +623,13 @@ publish keeps the same message ID, probes when possible, or republishes. It
 never marks completion from a successful socket write alone. Exhausted retry
 enters a visible quarantine with operator resolve/retry/discard policy; it does
 not disappear into a terminal `failed` row.
+
+The store issues a monotonic `claim_generation` plus opaque claim token for
+every claim or reclaim. Reclaim increments the generation and atomically
+invalidates the prior token. Publish, broker acceptance, retry, quarantine,
+completion, lease extension, and shutdown release each compare-and-swap the
+exact active `(claim_generation, claim_token)`; a stale transition rejects or
+is an idempotent no-op and cannot advance an outbox or retention frontier.
 
 `PubAck` creates a typed acceptance record, not a universal durability proof:
 
@@ -566,19 +668,25 @@ closed or marks transport durability indeterminate.
 ### Consumer Inbox and Outcome
 
 Every consumer that changes durable state or triggers an external effect owns
-an inbox keyed by `(consumer_id, event_id, effect_id)`:
+an inbox keyed by
+`(consumer_id, authority_scope_digest, event_id, effect_id)`:
 
 ```text
-Unseen -> Executing { boot_id, attempt, request_digest }
-       -> Succeeded { outcome_digest, receipt }
+Unseen -> Executing { boot_id, attempt, request_digest,
+                      claim_generation, claim_token }
+       -> Succeeded { outcome_digest, receipt,
+                      claim_generation, claim_token_digest }
        | Retryable
        | Quarantined
 ```
 
 The inbox claim and local business state commit in one transaction whenever
-they share an engine. For an external effect, Sentinel reserves a stable
-request identity before the call and records one of two explicit capability
-contracts:
+they share an engine, and both CAS the exact active store-issued claim token.
+Reclaim invalidates the old token before another worker can commit. Late local
+work, `PubAck`, external response, retry, quarantine, completion, shutdown, or
+lease extension from the stale claimant rejects/no-ops and advances no
+frontier. For an external effect, Sentinel reserves a stable request identity
+before the call and records one of two explicit capability contracts:
 
 - `BoundIdempotencyKey`: the external system commits to treating that identity
   as the same operation across retries;
@@ -605,6 +713,7 @@ ProjectionDefinition {
     code_version,
     schema_version,
     source_generation,
+    authority_scope_policy_digest,
     start_policy: Beginning | RecoveryCut | ExplicitPosition,
     required_for_readiness,
     handler_contract_digest,
@@ -614,6 +723,7 @@ ProjectionGeneration {
     generation_id,
     projection_id,
     source_generation,
+    authority_scope_policy_digest,
     local_frontier,
     status: Building | CatchingUp | Validated | Live | Retired | Quarantined,
     validation_digest,
@@ -624,7 +734,9 @@ Each read-model transaction commits its view changes and local frontier in the
 same projection database transaction. The event-store catalog mirrors that
 frontier for retention and observability, but after restart it reconciles from
 the projection's own durable frontier rather than guessing that processing
-happened.
+happened. Projection handlers authorize the event's structured causal context
+against the generation's scope-policy digest; replay cannot rebind a tenant,
+project, workflow, or work item to another projection authority.
 
 ### Handler Outcomes
 
@@ -695,6 +807,7 @@ EventTruthGenerationDescriptor {
     schema_manifest_digest,
     event_codec_digest,
     producer_catalog_digest,
+    causal_context_schema_digest,
     lower_position,
     created_by_operation_id,
     descriptor_digest,
@@ -713,6 +826,7 @@ EventTruthCutReceipt {
     generation_id,
     parent_storage_generation_id: Option<GenerationId>,
     event_truth_head_digest,
+    authority_scope_catalog_digest,
     durable_upper,
     required_consumer_frontiers,
     projection_generations,
@@ -733,7 +847,8 @@ current generation.
 Backup, restore, and migration capture a specific head and seal one immutable
 `EventTruthCutReceipt`. The receipt binds its capture operation, generation,
 durable upper, all mandatory consumer frontiers, active projection generations,
-unresolved outbox/inbox outcomes, and the snapshot recovery cut. It may name
+the authority-scope catalog, unresolved outbox/inbox outcomes, and the snapshot
+recovery cut. It may name
 the prior storage generation for lineage, but it MUST NOT contain the final
 parent `StorageGeneration` or `RecoveryPoint` manifest digest.
 
@@ -1006,13 +1121,21 @@ Runtime target class: `BOTH`.
 Scope:
 
 - `EventEnvelopeV2` and compatibility decoder;
+- caller-authored `AppendProposalV2` separated from store-sealed
+  `EventEnvelopeV2`, with exact caller/store field ownership;
+- #732-owned versioned, bounded `CausalContextV1` authority references and
+  cross-language canonical vectors;
 - deterministic operation identity and generation-local global position;
-- expected stream revision compare-and-append;
+- replay-before-revision lookup keyed by authority scope plus operation ID,
+  followed by expected-revision compare-and-append only for new operations;
 - one typed append gateway and audited callsite migration;
 - authoritative versus rebuildable durability classes;
 - canonical SQL migration manifest and one migration authority;
 - event schema registry, upcasters, and compatibility tests;
-- crash/OS-loss failpoints for WAL and commit acknowledgement.
+- crash/OS-loss failpoints for WAL and commit acknowledgement;
+- exact retry after advanced head, stale-head new operation, conflicting digest,
+  cross-tenant/project replay, context rebinding, unknown-history, and
+  caller-supplied-store-field negative tests.
 
 Rollback retains v1 decoding and dual-read compatibility. A new v2 event is
 never rewritten to v1.
@@ -1028,6 +1151,8 @@ contract through #552 later.
 Scope:
 
 - claim/retry/quarantine outbox state machine;
+- store-issued monotonic claim generation plus opaque token CAS on every
+  outbox/inbox transition, receipt, local effect, and frontier commit;
 - JetStream publish API and required `PubAck` as `BrokerAcceptance`;
 - `TransportDurability` bound to effective storage kind, replica count, server
   sync policy, configuration digest, and declared crash model;
@@ -1039,6 +1164,8 @@ Scope:
   key or authoritative outcome probe for automated reconciliation; otherwise
   indeterminate is quarantined/manual and never auto-retried;
 - crash after publish, effect, outcome commit, and ack;
+- deterministic old-claimant/new-claim races, late PubAck/external response,
+  lease-expiry, reclaim, and shutdown fencing tests;
 - operator quarantine resolution and readiness/metrics.
 
 Rollback can return transport scheduling to the legacy loop only while the new
@@ -1114,7 +1241,7 @@ Scope:
 | AC-3 | PASS | Five immutable upstream commits with implementation, tests, failures, license/security, and operations evidence |
 | AC-4 | PASS | Fifteen-row mechanism-by-five-candidate matrix, cross-cut matrix, Sentinel findings, and deterministic failure schedules |
 | AC-5 | PASS | One exact action per mechanism; no upstream/build/CI number is Sentinel runtime evidence |
-| AC-6 | PENDING ORC OWNER INTEGRATION | Live ordered epic #731 and disjoint children #732-#736 exist, but #733/#736/#728 require the exact acceptance/durability and acyclic cut addenda from this corrected report |
+| AC-6 | PENDING ORC OWNER INTEGRATION | Live ordered epic #731 and disjoint children #732-#736 exist, but #732/#733/#736/#728 require the exact proposal/envelope, causal authority, fencing, acceptance/durability, and acyclic cut addenda from this corrected report |
 | AC-7 | PASS | E-01 through E-15 classified as `BLOCKS_M0`, `M0_HARDENING`, or `POST_M0`; only source-proven E-01 blocks M0 |
 | AC-8 | PASS | This sole public English/ASCII report passes local/external link, GFM, public-safety, typo, and diff gates at the frozen head |
 | AC-9 | PENDING ORC INTEGRATION | The exact semantic delta below is ready; this worker is forbidden to edit either TOGAF language copy or claim issue completion |
@@ -1152,16 +1279,24 @@ Apply this exact semantic target as one coherent event-truth subsection:
 1. **Engine and authority.** SQLite through rusqlite remains the one local
    event ledger. One ordered migration authority owns its schema. Go and other
    processes verify a compatible schema and do not run independent DDL.
-2. **Envelope and order.** `EventEnvelopeV2` carries stable event and operation
-   identities, event-truth generation, stream ID/revision, generation-local
-   position, schema/codec/payload digest, producer, optional owner term,
-   correlation/causation, timestamp/tick, and durability class. A row position
-   is never a portable event identity.
-3. **Append.** Every authoritative writer uses one expected-revision append
-   gateway. One SQLite transaction validates authority/schema/digest,
-   deduplicates the canonical operation, appends the event, and creates all
-   required delivery and effect intents. Event-only append requires an
-   explicit no-delivery event class.
+2. **Proposal, authority, and envelope.** A caller submits bounded payload and
+   provenance in `AppendProposalV2`, requested durability/expected revision,
+   and #732-owned versioned `CausalContextV1`. Tenant/company/project and
+   applicable workflow/work-item authority ID, generation, and digest form the
+   authenticated stream namespace. The store alone seals `EventEnvelopeV2`
+   with current event-truth generation, exact stream revision,
+   generation-local position, authoritative append time, canonical request
+   digest, and receipt/envelope digests. Caller IDs are explicitly allowlisted
+   and validated; no caller supplies store-owned fields. Historical decode
+   records unknown authority and never fabricates context.
+3. **Append and replay.** Every authoritative writer uses one typed gateway.
+   After canonicalization and namespace authentication, it looks up authority
+   scope plus operation ID before checking current revision. Exact request
+   digest returns the prior sealed outcome without a new effect even after the
+   head advanced; different digest is `OperationConflict`. Only a new operation
+   checks current write authority/expected revision, assigns store fields, and
+   atomically appends event plus context-bound delivery/effect intents.
+   Event-only append requires an explicit no-delivery event class.
 4. **Durability.** Authoritative and durable-operational events acknowledge
    only at their declared SQLite durable-commit boundary. Rebuildable telemetry
    names its durable source and startup gate. `synchronous=NORMAL` is not
@@ -1176,13 +1311,19 @@ Apply this exact semantic target as one coherent event-truth subsection:
    system honors a bound idempotency key or exposes an authoritative outcome
    probe; otherwise timeout/indeterminate is quarantined/manual and never
    automatically retried.
+   Every outbox/inbox claim receives a store-issued monotonic claim generation
+   and opaque token. All transitions, receipts, local effects, and frontier
+   commits CAS the active token; reclaim invalidates old workers, and late
+   `PubAck`/external responses reject/no-op without frontier movement.
 6. **Poison and uncertainty.** Malformed relevant events, exhausted delivery,
    and ambiguous effects enter typed quarantine with evidence and operator
    resolution. No relevant cursor/frontier advances past unresolved authority.
 7. **Projection.** Each projection commits view mutations and its local
    frontier in one transaction. Rebuild uses a side-by-side generation:
    build, catch up, validate, atomically activate, drain, retire. The active
-   database is never cleared in place.
+   database is never cleared in place. Projection and replay authorization bind
+   the exact causal authority context; no tenant/project context rebinding is
+   permitted.
 8. **Agent memory.** Episode production is a durable projection. Episode,
    source-event receipt, and per-agent frontier commit in one Hippocampus
    transaction. First-start position is an explicit catalog policy, not an
@@ -1196,7 +1337,8 @@ Apply this exact semantic target as one coherent event-truth subsection:
     compatibility lineage. Normal appends advance a monotonic
     `EventTruthHead`, not `StorageGeneration`. Backup, restore, or migration
     seals an `EventTruthCutReceipt` over the captured head, durable upper,
-    mandatory frontiers, projection generations, outcomes, and recovery cut.
+    mandatory frontiers, authority-scope catalog, projection generations,
+    outcomes, and recovery cut.
     The receipt never embeds the final parent-manifest digest. #728's top-level
     `StorageGeneration`/`RecoveryPoint` manifest references the cut digest
     one-way with redb/filesystem/CAS receipts and owns the sole canonical
