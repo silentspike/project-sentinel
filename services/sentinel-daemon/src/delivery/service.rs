@@ -20,7 +20,8 @@ use super::{
         QaDatasetCaseV1, QaEvaluationPlanV1, QaEvaluationRunReceiptV1, QaEvidenceGraphV1,
         QaHarnessOutcome, QaReleaseGateReceiptV1, QaRunState, ReleaseCandidateV1,
         ReleaseManifestV1, ReleaseState, ReleaseV1, ReviewV1, RollbackV1, SourceTupleV1, TestRunV1,
-        VersionedRefV1, DELIVERY_SCHEMA_V1,
+        VersionedRefV1, DELIVERY_PREVIEW_MAX_TTL_MS, DELIVERY_PREVIEW_TTL_POLICY_V1,
+        DELIVERY_SCHEMA_V1,
     },
     state::{
         transition_candidate, transition_delivery, transition_qa_run, transition_release,
@@ -38,6 +39,24 @@ pub struct CommandContextV1 {
     pub principal: PrincipalV1,
     pub idempotency_key: String,
     pub now_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryCommandV1 {
+    RegisterCandidate,
+    AssignQa,
+    TransitionQa,
+    ExecuteQa,
+    ImportEvidenceGraph,
+    RecordGate,
+    RecordReviewBundle,
+    Promote,
+    IssueDelivery,
+    CustomerAccept,
+    CustomerReject,
+    CustomerRequestChanges,
+    Rollback,
+    Closeout,
 }
 
 pub struct DeliveryCore<I, S = DeliveryStore, E = super::ports::UnavailableDeliveryEffects> {
@@ -65,8 +84,24 @@ where
         }
     }
 
-    pub fn readiness(&self) -> AdapterReadiness {
-        self.integration.readiness()
+    pub fn command_readiness(&self, command: DeliveryCommandV1) -> Result<(), DeliveryError> {
+        self.require_integration()?;
+        match command {
+            DeliveryCommandV1::ExecuteQa => self.require_execution_saga(),
+            DeliveryCommandV1::Promote
+            | DeliveryCommandV1::CustomerRequestChanges
+            | DeliveryCommandV1::Rollback
+            | DeliveryCommandV1::Closeout => self.require_effect_saga(),
+            DeliveryCommandV1::RegisterCandidate
+            | DeliveryCommandV1::AssignQa
+            | DeliveryCommandV1::TransitionQa
+            | DeliveryCommandV1::ImportEvidenceGraph
+            | DeliveryCommandV1::RecordGate
+            | DeliveryCommandV1::RecordReviewBundle
+            | DeliveryCommandV1::IssueDelivery
+            | DeliveryCommandV1::CustomerAccept
+            | DeliveryCommandV1::CustomerReject => Ok(()),
+        }
     }
 
     pub fn load(
@@ -201,6 +236,7 @@ where
             || run.started_at_ms.is_some()
             || run.finished_at_ms.is_some()
             || run.attempts != 0
+            || run.case_attempt_history_digest.is_some()
             || run.harness_outcome.is_some()
             || run.cleanup_receipt.is_some()
             || run.aggregate_outcomes.is_some()
@@ -502,6 +538,8 @@ where
             || receipt.assignment != request.qa_run
             || receipt.qa_run != request.qa_run
             || receipt.assigned_qa != request.assigned_qa
+            // This authenticates the durable outcome as sealed by the workbench.
+            // It deliberately need not equal a later, short-lived authority receipt.
             || receipt.authority_receipt_digest == ContentDigest::zero()
             || receipt.authority_identity_digest != request.authority_identity_digest
             || receipt.authority_identity_digest != authority_after.stable_identity_digest()?
@@ -622,6 +660,7 @@ where
             .ok_or_else(|| DeliveryError::CorruptStore("QA plan missing".to_string()))?;
         validate_qa_evidence_graph(plan, &run_ref, &graph, &authority.principal, context.now_ms)?;
         validate_evidence_outcome(workbench, &graph)?;
+        let attempt_history_digest = qa_case_attempt_history_digest(&graph)?;
         if aggregate
             .evidence_graphs
             .insert(run_id.to_string(), graph.clone())
@@ -631,6 +670,11 @@ where
                 "evidence graph for run {run_id} already exists"
             )));
         }
+        aggregate
+            .qa_runs
+            .get_mut(run_id)
+            .ok_or_else(|| DeliveryError::CorruptStore("QA run disappeared".to_string()))?
+            .case_attempt_history_digest = Some(attempt_history_digest.clone());
         let expected_revision = aggregate.revision;
         aggregate.revision += 1;
         self.commit(
@@ -642,6 +686,7 @@ where
             json!({
                 "run_id": run_id,
                 "graph_digest": graph.graph_digest,
+                "case_attempt_history_digest": attempt_history_digest,
                 "workbench_receipt": graph.workbench_receipt,
             }),
             expected_revision,
@@ -736,6 +781,8 @@ where
             || gate.flake_disposition_digest != qa_flake_disposition_digest(graph)?
             || gate.source_evidence_digest != qa_source_evidence_digest(graph)?
             || gate.policy_digest != plan.release_policy_digest
+            || run.case_attempt_history_digest.as_ref()
+                != Some(&qa_case_attempt_history_digest(graph)?)
         {
             return Err(DeliveryError::MissingEvidence(
                 "gate outcome or evidence graph does not match the exact terminal run".to_string(),
@@ -1276,12 +1323,19 @@ where
             receipt.generation,
         )?;
         validate_ref("delivery release", &receipt.release)?;
-        if receipt.issued_at_ms > context.now_ms
+        let preview_ttl_ms = receipt.expires_at_ms.checked_sub(receipt.issued_at_ms);
+        if receipt.issued_at_ms != context.now_ms
+            || receipt.preview_ttl_policy_version != DELIVERY_PREVIEW_TTL_POLICY_V1
+            || !matches!(
+                preview_ttl_ms,
+                Some(ttl) if ttl > 0 && ttl <= DELIVERY_PREVIEW_MAX_TTL_MS
+            )
             || receipt.preview_digest == ContentDigest::zero()
             || !canonical_id(&receipt.customer_principal_id)
         {
             return Err(DeliveryError::Validation(
-                "delivery timestamp, preview, or customer identity is invalid".to_string(),
+                "delivery preview TTL policy, timestamp, digest, or customer identity is invalid"
+                    .to_string(),
             ));
         }
         self.require_current_authority(
@@ -1301,7 +1355,6 @@ where
         }
         let mut aggregate = self.required_aggregate(&receipt.tenant_id, project_id)?;
         if receipt.state != DeliveryState::PreviewReady
-            || receipt.expires_at_ms <= context.now_ms
             || receipt.receipt_digest != receipt.computed_digest()?
         {
             return Err(DeliveryError::Validation(
@@ -1377,6 +1430,19 @@ where
             validate_ref("acceptance delivery", &value.delivery)?;
             validate_ref("acceptance release", &value.release)?;
         }
+        match (feedback.action, acceptance.as_ref()) {
+            (CustomerAction::Accept, None) => {
+                return Err(DeliveryError::MissingEvidence(
+                    "explicit customer acceptance".to_string(),
+                ));
+            }
+            (CustomerAction::Reject | CustomerAction::RequestChanges, Some(_)) => {
+                return Err(DeliveryError::Validation(
+                    "acceptance evidence is allowed only for accept".to_string(),
+                ));
+            }
+            _ => {}
+        }
         let customer_authority = self.require_current_authority(
             context,
             tenant_id,
@@ -1401,6 +1467,20 @@ where
             ));
         }
         let mut aggregate = self.required_aggregate(tenant_id, project_id)?;
+        if aggregate.feedback.contains_key(&feedback.feedback_id) {
+            return Err(DeliveryError::Conflict(format!(
+                "feedback {} already exists",
+                feedback.feedback_id
+            )));
+        }
+        if acceptance
+            .as_ref()
+            .is_some_and(|value| aggregate.acceptances.contains_key(&value.acceptance_id))
+        {
+            return Err(DeliveryError::Conflict(
+                "acceptance ID already exists".to_string(),
+            ));
+        }
         let delivery_snapshot = aggregate
             .deliveries
             .get(&feedback.delivery.id)
@@ -1415,6 +1495,25 @@ where
             return Err(DeliveryError::AuthorityDenied(
                 "delivery is expired, already terminal, or belongs to another customer".to_string(),
             ));
+        }
+        let next = match feedback.action {
+            CustomerAction::Accept => DeliveryState::Accepted,
+            CustomerAction::Reject => DeliveryState::Rejected,
+            CustomerAction::RequestChanges => DeliveryState::ChangesRequested,
+        };
+        transition_delivery(delivery_snapshot.state, next)?;
+        if let Some(value) = acceptance.as_ref() {
+            if value.schema_version != super::schema::DELIVERY_SCHEMA_V1
+                || value.customer != customer_authority.principal
+                || value.delivery != feedback.delivery
+                || value.release != delivery_snapshot.release
+                || value.accepted_at_ms != context.now_ms
+                || value.acceptance_digest != value.computed_digest()?
+            {
+                return Err(DeliveryError::AuthorityDenied(
+                    "acceptance is not bound to the authenticated delivery".to_string(),
+                ));
+            }
         }
         if feedback.action == CustomerAction::RequestChanges {
             let release = aggregate
@@ -1461,49 +1560,16 @@ where
             feedback.requested_work_item_refs = vec![receipt.effect_ref];
             feedback = feedback.seal()?;
         }
-        let next = match feedback.action {
-            CustomerAction::Accept => DeliveryState::Accepted,
-            CustomerAction::Reject => DeliveryState::Rejected,
-            CustomerAction::RequestChanges => DeliveryState::ChangesRequested,
-        };
         let delivery = aggregate
             .deliveries
             .get_mut(&feedback.delivery.id)
             .ok_or_else(|| DeliveryError::NotFound(format!("delivery {}", feedback.delivery.id)))?;
         transition_delivery(delivery.state, next)?;
         delivery.state = next;
-        match feedback.action {
-            CustomerAction::Accept => {
-                let acceptance = acceptance.ok_or_else(|| {
-                    DeliveryError::MissingEvidence("explicit customer acceptance".to_string())
-                })?;
-                if acceptance.schema_version != super::schema::DELIVERY_SCHEMA_V1
-                    || acceptance.customer != customer_authority.principal
-                    || acceptance.delivery != feedback.delivery
-                    || acceptance.release != delivery.release
-                    || acceptance.accepted_at_ms != context.now_ms
-                    || acceptance.acceptance_digest != acceptance.computed_digest()?
-                {
-                    return Err(DeliveryError::AuthorityDenied(
-                        "acceptance is not bound to the authenticated delivery".to_string(),
-                    ));
-                }
-                if aggregate
-                    .acceptances
-                    .insert(acceptance.acceptance_id.clone(), acceptance)
-                    .is_some()
-                {
-                    return Err(DeliveryError::Conflict(
-                        "acceptance ID already exists".to_string(),
-                    ));
-                }
-            }
-            _ if acceptance.is_some() => {
-                return Err(DeliveryError::Validation(
-                    "acceptance evidence is allowed only for accept".to_string(),
-                ));
-            }
-            _ => {}
+        if let Some(acceptance) = acceptance {
+            aggregate
+                .acceptances
+                .insert(acceptance.acceptance_id.clone(), acceptance);
         }
         if aggregate
             .feedback
@@ -2090,6 +2156,23 @@ pub fn qa_case_inventory_digest(graph: &QaEvidenceGraphV1) -> Result<ContentDige
     )
 }
 
+pub fn qa_case_attempt_history_digest(
+    graph: &QaEvidenceGraphV1,
+) -> Result<ContentDigest, DeliveryError> {
+    let histories: Vec<_> = graph
+        .case_results
+        .iter()
+        .map(|result| {
+            (
+                &result.result_id,
+                result.generation,
+                &result.attempt_history,
+            )
+        })
+        .collect();
+    ContentDigest::of_domain("qa-case-attempt-history", DELIVERY_SCHEMA_V1, &histories)
+}
+
 pub fn qa_deterministic_evidence_digest(
     graph: &QaEvidenceGraphV1,
 ) -> Result<ContentDigest, DeliveryError> {
@@ -2401,6 +2484,140 @@ fn legal_case_reason(outcome: QaCaseOutcome, reason: QaCaseReasonCode) -> bool {
     )
 }
 
+fn validate_case_attempt_history(
+    result: &super::schema::QaCaseResultV1,
+    graph: &QaEvidenceGraphV1,
+    plan: &QaEvaluationPlanV1,
+    case_digest: &ContentDigest,
+) -> Result<(), DeliveryError> {
+    if result.attempt_history.is_empty()
+        || usize::from(result.attempts) != result.attempt_history.len()
+    {
+        return Err(DeliveryError::MissingEvidence(
+            "case attempt history is empty or does not match the declared attempt count"
+                .to_string(),
+        ));
+    }
+    require_unique_ids(
+        "case attempt",
+        result
+            .attempt_history
+            .iter()
+            .map(|attempt| attempt.attempt_id.as_str()),
+    )?;
+    let mut referenced = BTreeSet::new();
+    let mut earlier_deterministic_failure = false;
+    for (index, attempt) in result.attempt_history.iter().enumerate() {
+        let expected_number = u16::try_from(index + 1).map_err(|_| {
+            DeliveryError::Validation("case attempt inventory exceeds u16".to_string())
+        })?;
+        if attempt.schema_version != DELIVERY_SCHEMA_V1
+            || attempt.generation == 0
+            || attempt.attempt_number != expected_number
+            || attempt.run != result.run
+            || attempt.case_ref != result.case_ref
+            || !legal_case_reason(attempt.outcome, attempt.reason_code)
+            || attempt.attempt_digest != attempt.computed_digest()?
+        {
+            return Err(DeliveryError::StaleEvidence(
+                "case attempt history has a gap or stale run/case/digest binding".to_string(),
+            ));
+        }
+        require_unique_ids(
+            "case attempt assertion reference",
+            attempt.assertion_refs.iter().map(|value| value.id.as_str()),
+        )?;
+        if attempt.outcome == QaCaseOutcome::Pass && attempt.assertion_refs.is_empty() {
+            return Err(DeliveryError::MissingEvidence(
+                "passing case attempt has no deterministic evidence".to_string(),
+            ));
+        }
+        let mut has_failed_assertion = false;
+        for assertion_ref in &attempt.assertion_refs {
+            let assertion = graph
+                .deterministic_results
+                .iter()
+                .find(|value| value.assertion_id == assertion_ref.id)
+                .ok_or_else(|| {
+                    DeliveryError::MissingEvidence(
+                        "case attempt deterministic assertion".to_string(),
+                    )
+                })?;
+            let expected_digest =
+                ContentDigest::of_domain("qa-deterministic-result", DELIVERY_SCHEMA_V1, assertion)?;
+            if assertion_ref.generation != assertion.generation
+                || assertion_ref.digest != expected_digest
+                || assertion.plan_digest != plan.plan_digest
+                || assertion.case_digest != *case_digest
+            {
+                return Err(DeliveryError::StaleEvidence(
+                    "case attempt assertion reference is stale or differently bound".to_string(),
+                ));
+            }
+            if attempt.outcome == QaCaseOutcome::Pass && !assertion.passed {
+                return Err(DeliveryError::MissingEvidence(
+                    "failed deterministic assertion cannot support a passing attempt".to_string(),
+                ));
+            }
+            has_failed_assertion |= !assertion.passed;
+            if !referenced.insert((
+                assertion_ref.id.clone(),
+                assertion_ref.generation,
+                assertion_ref.digest.clone(),
+            )) {
+                return Err(DeliveryError::Conflict(
+                    "deterministic attempt evidence was reused across attempts".to_string(),
+                ));
+            }
+        }
+        if attempt.outcome == QaCaseOutcome::Fail && !has_failed_assertion {
+            return Err(DeliveryError::MissingEvidence(
+                "failed case attempt has no failed deterministic assertion".to_string(),
+            ));
+        }
+        if index + 1 < result.attempt_history.len() && attempt.outcome == QaCaseOutcome::Fail {
+            earlier_deterministic_failure = true;
+        }
+    }
+    let parent_references: BTreeSet<_> = result
+        .assertion_refs
+        .iter()
+        .map(|value| (value.id.clone(), value.generation, value.digest.clone()))
+        .collect();
+    if parent_references.len() != result.assertion_refs.len() || parent_references != referenced {
+        return Err(DeliveryError::MissingEvidence(
+            "case result does not retain the exact union of attempt evidence".to_string(),
+        ));
+    }
+    let final_attempt = result
+        .attempt_history
+        .last()
+        .ok_or_else(|| DeliveryError::MissingEvidence("case attempt history".to_string()))?;
+    if earlier_deterministic_failure && final_attempt.outcome == QaCaseOutcome::Pass {
+        if result.disposition.is_none()
+            || !matches!(
+                (result.outcome, result.reason_code),
+                (QaCaseOutcome::Pass, QaCaseReasonCode::Verified)
+                    | (
+                        QaCaseOutcome::FlakyUnresolved,
+                        QaCaseReasonCode::FlakyUnresolved
+                    )
+            )
+        {
+            return Err(DeliveryError::MissingEvidence(
+                "a later pass cannot hide an earlier deterministic failure".to_string(),
+            ));
+        }
+    } else if result.outcome != final_attempt.outcome
+        || result.reason_code != final_attempt.reason_code
+    {
+        return Err(DeliveryError::StaleEvidence(
+            "final case status is not derived from the terminal attempt".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn legal_flake_disposition(
     outcome: QaCaseOutcome,
     disposition: &super::schema::QaFlakeDispositionV1,
@@ -2579,6 +2796,7 @@ pub fn validate_qa_evidence_graph(
                 "case result is bound to another run or dataset case".to_string(),
             ));
         }
+        validate_case_attempt_history(result, graph, plan, &case_digest)?;
         require_unique_source_tuples("case result", &result.sources)?;
         if result.outcome == QaCaseOutcome::Pass && result.assertion_refs.is_empty() {
             return Err(DeliveryError::MissingEvidence(
@@ -2624,7 +2842,16 @@ pub fn validate_qa_evidence_graph(
                     "deterministic assertion reference is stale".to_string(),
                 ));
             }
-            if !assertion.passed && result.outcome == QaCaseOutcome::Pass {
+            let retained_historical_failure = result.disposition.is_some()
+                && result
+                    .attempt_history
+                    .iter()
+                    .take(result.attempt_history.len().saturating_sub(1))
+                    .any(|attempt| attempt.assertion_refs.contains(assertion_ref));
+            if !assertion.passed
+                && result.outcome == QaCaseOutcome::Pass
+                && !retained_historical_failure
+            {
                 return Err(DeliveryError::MissingEvidence(
                     "failed deterministic assertion cannot support PASS".to_string(),
                 ));
@@ -2695,6 +2922,34 @@ pub fn validate_qa_evidence_graph(
                 "flake disposition references another result".to_string(),
             ));
         }
+        let regression = graph
+            .deterministic_results
+            .iter()
+            .find(|value| value.assertion_id == disposition.deterministic_regression_fixture.id)
+            .ok_or_else(|| {
+                DeliveryError::MissingEvidence(
+                    "flake deterministic regression evidence".to_string(),
+                )
+            })?;
+        let regression_digest =
+            ContentDigest::of_domain("qa-deterministic-result", DELIVERY_SCHEMA_V1, regression)?;
+        let regression_ref = &disposition.deterministic_regression_fixture;
+        let final_attempt = result
+            .attempt_history
+            .last()
+            .ok_or_else(|| DeliveryError::MissingEvidence("case attempt history".to_string()))?;
+        if regression_ref.generation != regression.generation
+            || regression_ref.digest != regression_digest
+            || !regression.passed
+            || regression.plan_digest != plan.plan_digest
+            || regression.case_digest != result.case_ref.digest
+            || !result.assertion_refs.contains(regression_ref)
+            || !final_attempt.assertion_refs.contains(regression_ref)
+        {
+            return Err(DeliveryError::StaleEvidence(
+                "flake deterministic regression references another result".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -2727,10 +2982,16 @@ fn validate_evidence_outcome(
                 && required
                     .iter()
                     .all(|result| result.outcome == QaCaseOutcome::Pass)
-                && graph
-                    .deterministic_results
-                    .iter()
-                    .all(|assertion| assertion.passed)
+                && required.iter().all(|result| {
+                    result.attempt_history.last().is_some_and(|attempt| {
+                        attempt.outcome == QaCaseOutcome::Pass
+                            && attempt.assertion_refs.iter().all(|assertion_ref| {
+                                graph.deterministic_results.iter().any(|assertion| {
+                                    assertion.assertion_id == assertion_ref.id && assertion.passed
+                                })
+                            })
+                    })
+                })
         }
         QaHarnessOutcome::Fail => {
             receipt.required_cases_complete
@@ -2772,6 +3033,8 @@ fn validate_effect_receipt(
         || receipt.target != request.target
         || receipt.actor != request.actor
         || receipt.request_digest != request.request_digest
+        // The effect receipt remains immutable across reconciliation. Its original
+        // authority receipt must be present, while stable identity is checked below.
         || receipt.actor_authority_receipt_digest == ContentDigest::zero()
         || receipt.actor_authority_identity_digest != request.actor_authority_identity_digest
         || receipt.actor_authority_identity_digest != authority.stable_identity_digest()?

@@ -18,12 +18,12 @@ deployment.
 | Area | Dependency-independent evidence |
 | --- | --- |
 | Schemas | Unknown-field-rejecting, domain-separated versioned QA, candidate, review, finding, approval, manifest, release, delivery, feedback, acceptance, rollback and closeout records |
-| State | Legal candidate, QA-run, release, and delivery transitions reject shortcuts and terminal reopen |
+| State | Legal candidate, QA-run, release, and delivery transitions reject shortcuts and terminal reopen; case attempts are gapless, sealed, retained, and derive the final result |
 | Authority | Opaque current-authority receipt, stable principal/contract-generation/digest/issuer identity, exact receipt binding, TOCTOU revalidation and developer/QA/release/customer separation |
 | Currentness | Exact candidate, run, assignment, invocation, strict plan/fixture/DataControl/independent full-tuple source/result graph, gate, manifest, full release reference, delivery, acceptance and closeout bindings |
-| Durability | Test-only redb fixture behind separate #732 aggregate/append and #733 publication-state contracts; no productive store claim |
+| Durability | Test-only redb fixture behind separate #732 aggregate/append and #733 publication-state contracts; idempotency records repeat and validate the complete authority namespace; no productive store claim |
 | Recovery | Test-fixture restart readback for candidate, QA lineage, publication, rollback and closeout |
-| Effects | Distinct canonical #694 workbench and #710 delivery-effect saga readiness, authority-renewal-stable but lineage-sensitive operations/receipts, complete workbench ownership/cleanup evidence, exact rollback source+target receipts and durable deterministic fakes; productive #694/#695/#710 adapters remain deferred |
+| Effects | Command-specific #694/#710 saga readiness, authority-renewal-stable but lineage-sensitive operations/receipts, complete workbench ownership/cleanup evidence, local-before-effect customer validation, exact rollback source+target receipts and durable deterministic fakes; productive #694/#695/#710 adapters remain deferred |
 | Console | Unreachable public-DTO scaffold with fail-closed validation; no product-surface or browser-security claim |
 
 ## Acceptance boundary
@@ -41,7 +41,12 @@ integration, and all productive CQRS/effect claims remain open.
 No screenshot alone is claimed as AC-N5 evidence. No build-server timing is
 reported as benchmark evidence.
 
-Every PASS case, required or optional, needs passing deterministic assertion evidence. Any populated
+Every PASS case, required or optional, needs passing deterministic assertion evidence. Each case
+retains a sealed gapless attempt history whose assertion-ref union equals the
+parent record. A later pass retains an earlier deterministic failure and needs
+a current disposition whose regression ref resolves to matching, passing
+terminal-attempt evidence; invented, stale, differently digested, or failed
+regressions are rejected. Any populated
 model record or grader reference is typed unavailable before its verdict is
 evaluated; deterministic gates require absent model and calibration bindings
 until #749 provides both authorities together. Focused negative coverage
@@ -71,32 +76,41 @@ The current source contains focused positive and negative tests for:
   finding evidence through gate and promotion denial;
 - required and optional PASS results without deterministic assertions;
 - missing, expired, malformed, wrong-owner, and cross-tenant flake dispositions;
+- lost/gapped/duplicated attempt histories and invented, stale, or failed
+  deterministic regression evidence;
+- RequestChanges with acceptance evidence or occupied feedback/acceptance IDs
+  reaching the effect port (the expected call count is zero);
+- zero, overlong, backdated, future-issued, or wrong-policy preview TTLs, with
+  the exact maximum boundary accepted;
+- command-readiness probes that omit the required #694 or #710 saga; and
+- idempotency table keys that disagree with tenant/principal/command/caller-key
+  fields;
   and
 - the previously accepted model-blocking, fixture/source, slice, retry/seed,
   distinct-saga, restart, idempotency, and publication-receipt matrices.
 
 ## Current local checks
 
-The following results were observed on 2026-08-08 against committed base
-`7e42e7700dc6e22264a4f56813fba8060ede0111` plus the exact seven-file local
-correction diff:
+The current bundled ORC correction is an uncommitted local diff on integrated
+head `27335ee97edccb4656c89293ad76d81d669b096f`. It changes only existing #696
+schema/service/store/test/docs/evidence files. The following non-Rust results
+are refreshed after the correction; the earlier remote Rust PASS belongs to the
+pre-correction head and is not counted as final evidence:
 
 ```text
 git diff --check
-  PASS
-typos <exact seven-file scope>
-  PASS
-ASCII and public secret-pattern scans over the exact seven-file scope
-  PASS (no matches)
+  PENDING refresh after this evidence edit
+typos <current six-file correction scope>
+  PENDING refresh after this evidence edit
+ASCII and public secret-pattern scans over docs/evidence
+  PENDING refresh after this evidence edit
 exact changed-file scope comparison
-  PASS (seven owned files)
-npm test -- --run tests/delivery-view.test.ts
-  NOT RUN: local Console dependencies are absent (`vitest: not found`)
-npm run typecheck
-  NOT RUN: local Console dependencies are absent (`tsc: not found`)
+  PENDING refresh after this evidence edit
+Console focused/full/typecheck/build
+  PASS on integrated head before this Rust/docs-only correction; Console sources unchanged
 cargo remote
-  NOT RUN on this correction diff: ORC authorized the sequential remote window
-  only after the correction commit and one current-main merge
+  NOT RUN on this correction diff: Builder remains reserved for #472 until
+  explicit BUILDER_RESUME
 ```
 
 The missing local Console toolchain is an environment blocker, not a product
