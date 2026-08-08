@@ -68,7 +68,7 @@ The core defines the following record families:
 | `QaEvaluationRunReceiptV1` | exact plan, stable request, actors, durable event generation, attempts, outcomes and cleanup |
 | `QaCaseResultV1` | case and evidence generations, assertion and observed-output digests, artifact refs, failure class, timing, provenance and cleanup |
 | `QaDeterministicEvidenceV1` | byte-stable assertion subset and evidence digest |
-| `QaModelEvaluationV1` | provider/model/request/prompt/rubric/score/cost variance without a reproducibility claim |
+| `QaModelEvaluationV1` | schema scaffold only; every populated model record is typed unavailable until #749 supplies calibration and independent authority |
 | `QaFlakeRecordV1` | append-only attempt refs, deterministic/model split, disposition authority and expiry |
 | `QaReleaseGateReceiptV1` | exact plan/candidate/evidence set, evaluator authority, policy, validity and future manifest input digest |
 | `ReleaseManifestV1` | agreement, project, work items, exact candidate, artifacts, QA gate, source/toolchain/runtime, release actor, cost and rollback reference |
@@ -79,10 +79,21 @@ The core defines the following record families:
 | `RollbackV1` | exact source/target releases, reason, actor and effect receipt |
 | `ProjectCloseoutV1` | exact acceptance/release, source lineage and authoritative memory publication receipt |
 
-Only the evaluation-plan digest and explicitly deterministic evidence subsets are
-byte-stability gates. Model identity, request, cost, timing, attempts, and
-probabilistic results remain visible operational evidence and are never relabeled
-as deterministic.
+Only the evaluation-plan digest and explicitly deterministic evidence subsets
+are byte-stability gates. Model/calibration fields remain schema scaffolds but
+must be absent from every valid #696 graph and gate until #749 supplies their
+productive calibration and independent-authority contract.
+
+Assignment validates every plan reference and every policy/input digest as
+nonzero and canonical, requires disjoint required/optional case sets, and
+validates the declared seed and retry contract plus classification, key owner,
+access, redaction, retention-frontier, and audit bindings in `DataControlV1`.
+An empty seed set is an explicit deterministic plan. A zero retry limit requires
+an empty retry-class set; a positive retry limit requires at least one canonical
+retry class.
+The fixture inventory is a domain-separated digest over the sorted
+`(case_id, generation, case_digest)` map, so replacing a fixture while retaining
+its case ID changes the plan binding.
 
 ## 4. Legal lifecycle
 
@@ -120,9 +131,10 @@ Approved -> Active -> Superseded
 Superseded -> Active
 ```
 
-Only one release ID is active in an aggregate. Promotion supersedes the previous
-active release in the same atomic redb commit. Rollback marks the failed active
-release rolled back and reactivates an exact prior release in one commit.
+Only one release ID is active in an aggregate. The test fixture adopts promotion
+or rollback state in one local CAS commit after a separately durable effect-saga
+receipt exists. The external effect and local adoption are never described as
+one atomic transaction.
 
 ### 4.4 Delivery and customer action
 
@@ -193,10 +205,11 @@ delivery:<tenant>:<project>:<revision>:<event-type>
 
 The publication request binds operation ID, event type, aggregate and row
 identity, exact canonical envelope bytes, envelope digest, and request digest.
-The publisher returns operation ID, event ID, aggregate/row identity, payload
-digest, and request digest. Only an exact receipt marks the matching fixture row
-published. Crash-before-publication, crash-after-publication-before-local-ACK,
-duplicate ACK, wrong-row/wrong-digest receipt, and idempotency collision remain
+The publisher returns schema version, canonical non-empty event ID, operation
+ID, aggregate/row identity, payload digest, and request digest. Only an exact
+receipt marks the matching fixture row published. Crash-before-publication,
+crash-after-publication-before-local-ACK, duplicate ACK, wrong-schema,
+empty-event-ID, wrong-row/wrong-digest receipt, and idempotency collision remain
 recoverable or fail closed.
 
 The test fixture's `health()` decodes every table and validates schema, aggregate
@@ -221,36 +234,92 @@ Promotion resolves it again so a stale candidate cannot pass on old evidence.
 
 The QA request is called outside any writer transaction. It binds tenant,
 project, exact candidate, plan, run ID and generation, assigned QA principal and
-authority generation, current-authority receipt, stable invocation, and request
-digest. The opaque #694 receipt binds all of those plus input/output, artifact
-ownership, structured result inventory, logs, screenshots, failure summary,
-harness outcome, and cleanup. A second authority check after the effect prevents
-TOCTOU adoption after revocation or actor replacement.
+authority generation, stable invocation, and request digest. A separate stable
+authority-identity digest binds principal, contract version, contract authority
+generation, contract digest, and issuer. The short-lived receipt digest is
+carried for authorization/audit but is zeroed while computing the stable request
+digest; changing only receipt issuance, expiry, or receipt digest cannot create
+another operation identity. Changing any stable authority-identity field changes
+the request and rejects an older outcome. The opaque #694 receipt repeats the
+exact stable authority identity and binds the stable operation plus input/output,
+artifact ownership, structured result inventory, logs, screenshots, failure
+summary, harness outcome, and a canonical generation- and digest-bound cleanup
+reference. Wrong receipt schema, missing artifact ownership, or malformed
+cleanup evidence fails closed. A second authority check after the effect
+prevents TOCTOU adoption after revocation or actor replacement while allowing a
+renewed receipt for the same stable authority identity.
 
 The receipt is imported as a persisted `QaEvidenceGraphV1`: exact dataset cases,
-case results, deterministic assertions, model evidence, and flake dispositions
-are reference- and digest-validated against the terminal run. The gate derives
-its inventories from that graph; caller-supplied nonzero digest flags are not
-sufficient.
+case results, deterministic assertions, and flake dispositions are reference-
+and digest-validated against the terminal run. IDs are unique, record
+schemas/generations are current, assertion evidence is bound to the exact plan
+and case, outcome/reason matrices are closed, and every PASS result, including
+an optional case, has at least one valid passing deterministic assertion.
+Populated model records or
+grader references fail with typed #749 unavailability before any model verdict
+is evaluated; a model can neither authorize nor veto deterministic evidence.
+Gate receipts therefore require both `model_evidence_digest` and
+`calibration_digest` to be absent. The complete
+required/optional case inventory must match the plan's fixture digest. Every
+active case requires license, access/contamination policy, DataControl, and at
+least one canonical `(owner, type, id, generation, digest)` source tuple; result
+sources are a separate nonempty immutable inventory for workbench, event,
+artifact, policy, and completion evidence. Both inventories reject only an
+exactly repeated full source tuple and reject one immutable
+`(owner, type, id, generation)` locator carrying conflicting digests. Different
+owners, types, or generations may legitimately share a source ID. Result slices
+must exactly equal the digest-bound dataset-case slices, so role, project,
+model, language, or surface labels cannot be changed or dropped. There is
+also one graph-wide locator-to-digest index across every dataset and result
+inventory: repeated identical locator/digest citations across inventories are
+valid, while any digest change for the same locator generation is a conflict.
+There is exactly one result per required case. Missing, malformed, retired,
+superseded, substituted, exactly duplicated, locator-conflicting,
+slice-relabeled, or empty-source evidence fails closed, as do stale or
+policy-mismatched flake dispositions. Every unresolved-flake result requires a
+current, unexpired disposition owned by the exact QA authority; result, defect,
+and deterministic-regression references are all canonical and digest-bound.
+The gate derives its inventories from
+that graph; caller-supplied nonzero digest flags or
+aggregation-policy-as-calibration substitutions are not sufficient.
 
-The productive adapter must deduplicate the stable invocation/request across
-restart. The deterministic fake proves same-process retry and cross-run replay
-rejection only; productive crash-safe exactly-once execution remains gated on
-#694.
+`execution_saga_readiness` is a separate exact #694 contract. Until a
+productive #694 adapter can durably claim the stable request before execution,
+persist the opaque outcome before returning, and reconcile that outcome after
+crash/disconnect, execution is typed unavailable. The deterministic fake proves
+effect-once reconciliation after local adoption failure and cross-run replay
+rejection; it is not productive authority.
+
+Workbench execution and external delivery effects use distinct canonical
+readiness digests (`workbench-execution-saga-v1` and
+`delivery-effect-saga-v1`). The #694 workbench port cannot satisfy #710 effect
+readiness and the #710 effect port cannot satisfy #694 workbench readiness;
+swapped, stale, zero-generation, or wrong-version contracts fail before either
+port is invoked.
 
 ## 8. External-effect sagas
 
 Rollout/rollback, governed #695 rework creation, and closeout memory publication
-are behind `DeliveryEffectPort`, unavailable by default. Each request binds
-tenant, project, candidate/subject, current actor-authority receipt, operation
-kind, and request digest. The trusted receipt returns an opaque effect reference
-and exact request/authority bindings.
+are behind `DeliveryEffectPort`, unavailable by default. Each request binds a
+stable operation ID, tenant, project, candidate, subject, optional target,
+actor, operation kind, and request digest. Rollback binds both exact source and
+target release references and their digests. The short-lived authority receipt
+is carried for authorization/audit but excluded from the stable request digest.
+The same stable authority-identity digest used by the workbench contract is
+included in the request digest and repeated exactly by the receipt. The trusted
+receipt returns an opaque effect reference and exact operation, source, target,
+actor, authority identity, request, tenant, project, and candidate bindings.
 
-The effect happens outside the local transaction. The core then revalidates
-current authority and performs local CAS adoption. Missing, stale, cross-tenant,
-wrong-kind, wrong-project, wrong-candidate, wrong-authority, or ambiguous
-receipts cause no state transition. This is explicitly a restartable saga, not
-an atomic cross-system effect claim.
+The effect happens outside the local transaction. A Ready #710 adapter must
+durably claim `(operation_id, request_digest)` before the real effect, persist
+the sealed outcome before returning, and replay/reconcile that same outcome on
+retry after caller crash, disconnect, or local revision conflict. The core then
+revalidates the same authority identity and performs local CAS adoption.
+Missing, stale, cross-tenant, wrong-kind, wrong-project, wrong-candidate,
+wrong-source, wrong-target, wrong-actor, or ambiguous receipts cause no state
+transition. Without the exact saga readiness contract all effect methods are
+typed unavailable. This is explicitly a restartable saga, not an atomic
+cross-system effect claim.
 
 ## 9. QA addendum and negative contract
 
@@ -258,13 +327,17 @@ The #717 addendum is represented in the canonical schemas. Productive evaluators
 must additionally enforce:
 
 - required case inventory cannot shrink;
-- deterministic failure cannot be overridden by model scoring or a correlated
-  majority;
+- populated model evidence remains typed unavailable and is never evaluated as
+  a decision until #749 provides calibrated, independently authorized model
+  evaluation;
 - active-scenario lanes require explicit capabilities and cleanup/quarantine;
 - candidate data is untrusted input, not policy or instructions;
 - unknown provider/model identity is never called byte-reproducible;
 - unresolved flakes and human-review results cannot issue a passing release
   gate;
+- every finding has canonical immutable source evidence; every unresolved
+  finding blocks review approval, the release gate, and promotion regardless of
+  severity until a versioned resolution reference exists;
 - attempts and dispositions are append-only;
 - retention/pruning cannot pass the required effect frontier;
 - restored generations must match before readiness.
@@ -328,23 +401,23 @@ rollback, closeout, unpublished outbox row, or recovery frontier.
 | AC-1 schemas and legal transitions | Implemented and testable |
 | AC-2 independent authority | Implemented; live probes deferred |
 | AC-3 productive #694 suite | Port and fake only; productive execution deferred |
-| AC-4 missing/stale/different gate | Core negative tests cover missing approval, expiry, plan-digest substitution and incomplete evidence; broader runner matrix deferred |
+| AC-4 missing/stale/different gate | Core negative tests cover missing approval, unresolved findings, expiry, plan-digest substitution and incomplete evidence; broader runner matrix deferred |
 | AC-5 immutable manifest | Core rejects ID reuse and binds exact gate/candidate/authority; canonical #732 append deferred |
 | AC-6 customer flow | Core records/transitions implemented; authenticated API/browser and productive delivery effect deferred |
 | AC-7 rework history | Governed-rework request/receipt saga implemented with fake; productive #695 effect deferred |
-| AC-8 rollback | Receipt-gated, idempotent, restart-safe local adoption tested; productive rollout/rollback effect deferred |
+| AC-8 rollback | Exact source+target receipt, stable operation, revision-conflict reconciliation and restart-safe local adoption tested with a durable fake; productive #710 rollout/rollback effect deferred |
 | AC-9 Console lineage | Isolated public-DTO scaffold only; product/API/live criterion OPEN |
 | AC-10 memory closeout | Receipt-gated saga and restart readback tested with fake; productive memory path deferred |
 | AC-11 Gaia oversight | No bypass surface added; productive observation deferred |
-| AC-12 restart/idempotency | Test-only store, QA retry, outbox, rollback and closeout boundaries covered; productive adapter crash matrix deferred |
+| AC-12 restart/idempotency | Test-only store, QA outcome reconciliation, outbox, effect revision-conflict retry, rollback and closeout boundaries covered; productive adapter crash matrix deferred |
 | AC-13 `.240` journey | Not authorized in this phase |
-| AC-14 canonical QA schemas | Versioned closed schemas and persisted validated graph implemented; complete productive import lane deferred |
-| AC-15 deterministic/probabilistic split | Domain-separated schema and graph bindings implemented; repeated productive evaluator proof deferred |
+| AC-14 canonical QA schemas | Plan, dataset, run, case, deterministic, flake and gate core are versioned and strictly validated; PARTIAL because model/calibration authority and the productive import lane remain #749/dependency deferred |
+| AC-15 deterministic/probabilistic split | Deterministic bindings are implemented; populated model/grader evidence is typed unavailable and model/calibration activation remains #749-deferred |
 | AC-16 sandbox/capability enforcement | Contract fields only; #694 implementation deferred |
-| AC-17 retry/flake append-only history | Typed schema/lifecycle and exact references implemented; productive evaluator/property/restart proof deferred |
-| AC-18 #709/#710 effects | Stable effect/request/receipt and local adoption boundaries only; productive integration deferred |
+| AC-17 retry/flake append-only history | Typed schema/lifecycle, exact references, current QA ownership and mandatory unresolved-flake disposition are implemented; productive evaluator/property/restart proof deferred |
+| AC-18 #709/#710 effects | Distinct #694-workbench/#710-effect fail-closed readiness plus stable operation/intent/outcome/reconcile contracts and deterministic fake proof; productive integration deferred |
 | AC-19 #722 recovery | Participant contract documented; recovery integration deferred |
-| AC-20 complete gate negative matrix | Core validates exact persisted graph and legal pass/fail/harness outcomes; productive evaluator/retention negatives deferred |
+| AC-20 complete gate negative matrix | Core accepts explicit no-retry/no-seed plans and exact cross-inventory source reuse while rejecting zero plan inputs, inconsistent retries, fixture substitution, empty/malformed/duplicate/local-or-graph-wide locator-conflicting sources, relabeled slices, duplicate results, PASS without deterministic evidence, stale/forged flake dispositions, unresolved findings, any populated model/grader evidence, fake calibration, and illegal pass/fail/harness summaries; productive evaluator/retention negatives deferred |
 
 Negative criteria AC-N1 through AC-N4 are enforced by the state machine and
 authority boundary. AC-N5 requires later matching API/event/artifact readback.

@@ -424,7 +424,9 @@ impl DeliveryStore {
                 )));
             };
             let mut entry: DeliveryOutboxEntryV1 = decode(existing.value(), "outbox")?;
-            if &entry.request.request_digest != expected_request_digest
+            if receipt.schema_version != SCHEMA_VERSION
+                || !validate_event_id(&receipt.event_id)
+                || &entry.request.request_digest != expected_request_digest
                 || receipt.request_digest != *expected_request_digest
                 || receipt.operation_id != entry.request.operation_id
                 || receipt.aggregate_id != entry.request.aggregate_id
@@ -471,6 +473,65 @@ impl DeliveryStore {
             {
                 return Err(DeliveryError::CorruptStore(
                     "aggregate key or schema mismatch".to_string(),
+                ));
+            }
+            macro_rules! validate_identity_map {
+                ($map:expr, $id:ident, $label:literal) => {
+                    for (map_key, record) in &$map {
+                        if map_key != &record.$id
+                            || record.schema_version != SCHEMA_VERSION
+                            || record.generation == 0
+                        {
+                            return Err(DeliveryError::CorruptStore(format!(
+                                "{} key, schema, or generation mismatch",
+                                $label
+                            )));
+                        }
+                    }
+                };
+            }
+            validate_identity_map!(aggregate.candidates, candidate_id, "candidate");
+            validate_identity_map!(aggregate.qa_plans, plan_id, "QA plan");
+            validate_identity_map!(aggregate.qa_runs, run_id, "QA run");
+            validate_identity_map!(aggregate.reviews, review_id, "review");
+            validate_identity_map!(aggregate.test_runs, test_run_id, "test run");
+            validate_identity_map!(aggregate.findings, finding_id, "finding");
+            validate_identity_map!(aggregate.approvals, approval_id, "approval");
+            validate_identity_map!(aggregate.gates, gate_id, "gate");
+            validate_identity_map!(aggregate.manifests, manifest_id, "manifest");
+            validate_identity_map!(aggregate.releases, release_id, "release");
+            validate_identity_map!(aggregate.deliveries, delivery_id, "delivery");
+            validate_identity_map!(aggregate.feedback, feedback_id, "feedback");
+            validate_identity_map!(aggregate.acceptances, acceptance_id, "acceptance");
+            validate_identity_map!(aggregate.rollbacks, rollback_id, "rollback");
+            validate_identity_map!(aggregate.closeouts, closeout_id, "closeout");
+            for (map_key, receipt) in &aggregate.workbench_receipts {
+                if map_key != &receipt.invocation.id
+                    || receipt.schema_version != SCHEMA_VERSION
+                    || receipt.invocation.generation == 0
+                {
+                    return Err(DeliveryError::CorruptStore(
+                        "workbench receipt key, schema, or generation mismatch".to_string(),
+                    ));
+                }
+            }
+            for (map_key, graph) in &aggregate.evidence_graphs {
+                if map_key != &graph.run.id
+                    || graph.schema_version != SCHEMA_VERSION
+                    || graph.run.generation == 0
+                {
+                    return Err(DeliveryError::CorruptStore(
+                        "evidence graph key, schema, or generation mismatch".to_string(),
+                    ));
+                }
+            }
+            if aggregate
+                .active_release_id
+                .as_ref()
+                .is_some_and(|release_id| !aggregate.releases.contains_key(release_id))
+            {
+                return Err(DeliveryError::CorruptStore(
+                    "active release identity is missing".to_string(),
                 ));
             }
             aggregate_revisions.insert(key.value().to_string(), aggregate.revision);
@@ -575,7 +636,9 @@ impl DeliveryStore {
                 ));
             }
             if let Some(receipt) = &entry.published_receipt {
-                if receipt.operation_id != entry.request.operation_id
+                if receipt.schema_version != SCHEMA_VERSION
+                    || !validate_event_id(&receipt.event_id)
+                    || receipt.operation_id != entry.request.operation_id
                     || receipt.aggregate_id != entry.request.aggregate_id
                     || receipt.row_identity != entry.request.row_identity
                     || receipt.payload_digest != entry.request.payload_digest
@@ -696,6 +759,14 @@ fn validate_component(name: &str, value: &str) -> Result<(), DeliveryError> {
         )));
     }
     Ok(())
+}
+
+fn validate_event_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 240
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(

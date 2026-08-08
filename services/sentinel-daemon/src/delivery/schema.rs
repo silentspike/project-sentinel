@@ -383,7 +383,7 @@ pub struct QaReleaseGateReceiptV1 {
     pub case_inventory_digest: ContentDigest,
     pub deterministic_evidence_digest: ContentDigest,
     pub model_evidence_digest: Option<ContentDigest>,
-    pub calibration_digest: ContentDigest,
+    pub calibration_digest: Option<ContentDigest>,
     pub source_evidence_digest: ContentDigest,
     pub flake_disposition_digest: Option<ContentDigest>,
     pub policy_digest: ContentDigest,
