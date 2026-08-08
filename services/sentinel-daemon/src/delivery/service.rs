@@ -9,19 +9,18 @@ use super::{
     ports::{
         expected_effect_saga_contract_digest, expected_integration_contract_digest,
         expected_workbench_execution_saga_contract_digest, AdapterReadiness, AuthorityReceiptV1,
-        AuthorityValidationRequestV1,
-        CandidateAuthorityQueryV1, DeliveryEffectKind, DeliveryEffectPort,
-        DeliveryEffectRequestV1, DeliveryIntegrationPort, DeliveryPublicationPort,
-        WorkbenchEvidenceReceiptV1, WorkbenchEvidenceRequestV1,
+        AuthorityValidationRequestV1, CandidateAuthorityQueryV1, DeliveryEffectKind,
+        DeliveryEffectPort, DeliveryEffectRequestV1, DeliveryIntegrationPort,
+        DeliveryPublicationPort, WorkbenchEvidenceReceiptV1, WorkbenchEvidenceRequestV1,
     },
     schema::{
         AcceptanceV1, ApprovalV1, AuthorityRole, CandidateState, CustomerAction,
         CustomerFeedbackV1, DataControlV1, DeliveryReceiptV1, DeliveryState, FindingV1,
-        PrincipalV1, ProjectCloseoutV1, QaAggregateOutcomesV1, QaCaseOutcome,
-        QaCaseReasonCode, QaDatasetCaseV1, QaEvaluationPlanV1, QaEvaluationRunReceiptV1,
-        QaEvidenceGraphV1, QaHarnessOutcome, QaReleaseGateReceiptV1, QaRunState,
-        ReleaseCandidateV1, ReleaseManifestV1, ReleaseState, ReleaseV1, ReviewV1, RollbackV1,
-        SourceTupleV1, TestRunV1, VersionedRefV1, DELIVERY_SCHEMA_V1,
+        PrincipalV1, ProjectCloseoutV1, QaAggregateOutcomesV1, QaCaseOutcome, QaCaseReasonCode,
+        QaDatasetCaseV1, QaEvaluationPlanV1, QaEvaluationRunReceiptV1, QaEvidenceGraphV1,
+        QaHarnessOutcome, QaReleaseGateReceiptV1, QaRunState, ReleaseCandidateV1,
+        ReleaseManifestV1, ReleaseState, ReleaseV1, ReviewV1, RollbackV1, SourceTupleV1, TestRunV1,
+        VersionedRefV1, DELIVERY_SCHEMA_V1,
     },
     state::{
         transition_candidate, transition_delivery, transition_qa_run, transition_release,
@@ -621,13 +620,7 @@ where
             .qa_plans
             .get(&run.plan.id)
             .ok_or_else(|| DeliveryError::CorruptStore("QA plan missing".to_string()))?;
-        validate_qa_evidence_graph(
-            plan,
-            &run_ref,
-            &graph,
-            &authority.principal,
-            context.now_ms,
-        )?;
+        validate_qa_evidence_graph(plan, &run_ref, &graph, &authority.principal, context.now_ms)?;
         validate_evidence_outcome(workbench, &graph)?;
         if aggregate
             .evidence_graphs
@@ -883,9 +876,7 @@ where
                 source.id.as_str(),
                 source.generation,
             );
-            if let Some(existing_digest) =
-                finding_source_digests.insert(locator, &source.digest)
-            {
+            if let Some(existing_digest) = finding_source_digests.insert(locator, &source.digest) {
                 if existing_digest != &source.digest {
                     return Err(DeliveryError::Conflict(
                         "one finding-source locator generation carries conflicting digests"
@@ -903,8 +894,7 @@ where
             )?;
             validate_ref("approval candidate", &value.candidate)?;
             validate_ref("approval gate", &value.gate)?;
-            if value.policy_digest == ContentDigest::zero()
-                || value.approved_at_ms > context.now_ms
+            if value.policy_digest == ContentDigest::zero() || value.approved_at_ms > context.now_ms
             {
                 return Err(DeliveryError::Validation(
                     "approval policy or timestamp is invalid".to_string(),
@@ -1184,10 +1174,7 @@ where
         }
         let effect_request = DeliveryEffectRequestV1 {
             schema_version: DELIVERY_SCHEMA_V1,
-            operation_id: format!(
-                "rollout:{tenant_id}:{project_id}:{}",
-                release.release_id
-            ),
+            operation_id: format!("rollout:{tenant_id}:{project_id}:{}", release.release_id),
             kind: DeliveryEffectKind::Rollout,
             tenant_id: tenant_id.to_string(),
             project: candidate.project.clone(),
@@ -1444,10 +1431,7 @@ where
                 })?;
             let request = DeliveryEffectRequestV1 {
                 schema_version: DELIVERY_SCHEMA_V1,
-                operation_id: format!(
-                    "rework:{tenant_id}:{project_id}:{}",
-                    feedback.feedback_id
-                ),
+                operation_id: format!("rework:{tenant_id}:{project_id}:{}", feedback.feedback_id),
                 kind: DeliveryEffectKind::GovernedRework,
                 tenant_id: tenant_id.to_string(),
                 project: manifest.project.clone(),
@@ -1618,10 +1602,7 @@ where
             })?;
         let effect_request = DeliveryEffectRequestV1 {
             schema_version: DELIVERY_SCHEMA_V1,
-            operation_id: format!(
-                "rollback:{tenant_id}:{project_id}:{}",
-                rollback.rollback_id
-            ),
+            operation_id: format!("rollback:{tenant_id}:{project_id}:{}", rollback.rollback_id),
             kind: DeliveryEffectKind::Rollback,
             tenant_id: tenant_id.to_string(),
             project: from_manifest.project.clone(),
@@ -1772,9 +1753,7 @@ where
             .releases
             .get(&closeout.accepted_release.id)
             .ok_or_else(|| DeliveryError::MissingEvidence("accepted release".to_string()))?;
-        if closeout.accepted_release
-            != versioned_release_ref(accepted_release)?
-        {
+        if closeout.accepted_release != versioned_release_ref(accepted_release)? {
             return Err(DeliveryError::StaleEvidence(
                 "closeout release reference is stale or differently digested".to_string(),
             ));
@@ -1785,10 +1764,7 @@ where
             .ok_or_else(|| DeliveryError::MissingEvidence("accepted manifest".to_string()))?;
         let effect_request = DeliveryEffectRequestV1 {
             schema_version: DELIVERY_SCHEMA_V1,
-            operation_id: format!(
-                "memory:{tenant_id}:{project_id}:{}",
-                closeout.closeout_id
-            ),
+            operation_id: format!("memory:{tenant_id}:{project_id}:{}", closeout.closeout_id),
             kind: DeliveryEffectKind::MemoryPublication,
             tenant_id: tenant_id.to_string(),
             project: closeout.project.clone(),
@@ -2177,10 +2153,7 @@ fn validate_record_header(
 }
 
 fn validate_ref(name: &str, value: &VersionedRefV1) -> Result<(), DeliveryError> {
-    if !canonical_id(&value.id)
-        || value.generation == 0
-        || value.digest == ContentDigest::zero()
-    {
+    if !canonical_id(&value.id) || value.generation == 0 || value.digest == ContentDigest::zero() {
         return Err(DeliveryError::Validation(format!(
             "{name} is not a canonical versioned reference"
         )));
@@ -2199,7 +2172,10 @@ fn validate_data_control(name: &str, value: &DataControlV1) -> Result<(), Delive
             "{name} data-control policy is incomplete"
         )));
     }
-    validate_ref(&format!("{name} retention frontier"), &value.retention_frontier)
+    validate_ref(
+        &format!("{name} retention frontier"),
+        &value.retention_frontier,
+    )
 }
 
 fn validate_source_tuple(name: &str, value: &SourceTupleV1) -> Result<(), DeliveryError> {
@@ -2217,7 +2193,12 @@ fn validate_source_tuple(name: &str, value: &SourceTupleV1) -> Result<(), Delive
 }
 
 fn validate_qa_plan(plan: &QaEvaluationPlanV1) -> Result<(), DeliveryError> {
-    validate_record_header(plan.schema_version, "plan_id", &plan.plan_id, plan.generation)?;
+    validate_record_header(
+        plan.schema_version,
+        "plan_id",
+        &plan.plan_id,
+        plan.generation,
+    )?;
     for (name, value) in [
         ("QA request", &plan.request),
         ("QA candidate", &plan.candidate),
@@ -2318,7 +2299,9 @@ fn require_unique_source_tuples(
             } else {
                 "one immutable locator generation with conflicting digests"
             };
-            return Err(DeliveryError::Conflict(format!("{name} contains {conflict}")));
+            return Err(DeliveryError::Conflict(format!(
+                "{name} contains {conflict}"
+            )));
         }
     }
     Ok(())
@@ -2366,11 +2349,7 @@ pub fn qa_fixture_inventory_digest(
                 VersionedRefV1 {
                     id: case.case_id.clone(),
                     generation: case.generation,
-                    digest: ContentDigest::of_domain(
-                        "qa-dataset-case",
-                        DELIVERY_SCHEMA_V1,
-                        case,
-                    )?,
+                    digest: ContentDigest::of_domain("qa-dataset-case", DELIVERY_SCHEMA_V1, case)?,
                 },
             ))
         })
@@ -2507,11 +2486,17 @@ pub fn validate_qa_evidence_graph(
     }
     require_unique_ids(
         "dataset case",
-        graph.dataset_cases.iter().map(|value| value.case_id.as_str()),
+        graph
+            .dataset_cases
+            .iter()
+            .map(|value| value.case_id.as_str()),
     )?;
     require_unique_ids(
         "case result",
-        graph.case_results.iter().map(|value| value.result_id.as_str()),
+        graph
+            .case_results
+            .iter()
+            .map(|value| value.result_id.as_str()),
     )?;
     require_unique_ids(
         "deterministic assertion",
@@ -2549,8 +2534,7 @@ pub fn validate_qa_evidence_graph(
         || qa_fixture_inventory_digest(&graph.dataset_cases)? != plan.fixture_inventory_digest
     {
         return Err(DeliveryError::MissingEvidence(
-            "dataset inventory does not exactly match the digest-bound QA fixture plan"
-                .to_string(),
+            "dataset inventory does not exactly match the digest-bound QA fixture plan".to_string(),
         ));
     }
     require_unique_ids(
@@ -2596,8 +2580,7 @@ pub fn validate_qa_evidence_graph(
             ));
         }
         require_unique_source_tuples("case result", &result.sources)?;
-        if result.outcome == QaCaseOutcome::Pass && result.assertion_refs.is_empty()
-        {
+        if result.outcome == QaCaseOutcome::Pass && result.assertion_refs.is_empty() {
             return Err(DeliveryError::MissingEvidence(
                 "PASS case has no deterministic assertion evidence; model grading is unavailable until #749".to_string(),
             ));
@@ -2609,10 +2592,7 @@ pub fn validate_qa_evidence_graph(
         }
         require_unique_ids(
             "case assertion reference",
-            result
-                .assertion_refs
-                .iter()
-                .map(|value| value.id.as_str()),
+            result.assertion_refs.iter().map(|value| value.id.as_str()),
         )?;
         for assertion_ref in &result.assertion_refs {
             let assertion = graph
@@ -2836,9 +2816,8 @@ fn require_saga_readiness(
         AdapterReadiness::Ready { .. } => Err(DeliveryError::StaleEvidence(format!(
             "{dependency} contract version, generation, or digest is not current"
         ))),
-        AdapterReadiness::Unavailable { reason } => Err(DeliveryError::AdapterUnavailable {
-            dependency,
-            reason,
-        }),
+        AdapterReadiness::Unavailable { reason } => {
+            Err(DeliveryError::AdapterUnavailable { dependency, reason })
+        }
     }
 }
