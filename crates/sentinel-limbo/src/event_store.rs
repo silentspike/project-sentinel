@@ -13,6 +13,8 @@ use sentinel_common::{
     agent_config::AgentConfig, nano_runtime::NanoSnapshot, room::BuildingConfig, AgentId,
     DomainEvent, FencedStore, OwnerRegistry, OwnerWriteGuard, StateTransferScope,
 };
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -173,6 +175,9 @@ CREATE TABLE IF NOT EXISTS runtime_config_apply_recovery (
     old_building_json TEXT NOT NULL,
     staged_building_json TEXT NOT NULL,
     pre_snapshot_id TEXT NOT NULL,
+    pre_snapshot_digest TEXT NOT NULL DEFAULT '',
+    applied_snapshot_id TEXT NOT NULL DEFAULT '',
+    applied_snapshot_digest TEXT NOT NULL DEFAULT '',
     pre_runtime_snapshots_json TEXT NOT NULL DEFAULT '[]',
     applied_runtime_snapshots_json TEXT NOT NULL DEFAULT '[]',
     stopped_agent_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -190,6 +195,41 @@ CREATE TABLE IF NOT EXISTS runtime_config_apply_recovery (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 )";
+
+pub const RUNTIME_CONFIG_APPLY_SCHEMA_VERSION: u16 = 3;
+pub const LEGACY_CONFIG_APPLY_PRE_DIGEST_MISSING: &str =
+    "legacy config apply pre-snapshot digest unavailable; manual recovery required";
+
+/// Canonical identity of the complete Config Apply payload.
+///
+/// Both the SQLite decision authority and the filesystem participant use this
+/// function so migration, startup recovery, and publication cannot silently
+/// diverge on agent ordering.
+pub fn runtime_config_apply_digest(
+    agents: &[AgentConfig],
+    building: &BuildingConfig,
+) -> anyhow::Result<String> {
+    let mut sorted_agents = agents.to_vec();
+    sorted_agents.sort_by_key(|config| config.identity.id);
+    let mut unique_ids = HashSet::with_capacity(sorted_agents.len());
+    for config in &sorted_agents {
+        anyhow::ensure!(
+            unique_ids.insert(config.identity.id),
+            "config apply payload has duplicate agent id {}",
+            config.identity.id
+        );
+    }
+    let payload = serde_json::to_vec(&(sorted_agents, building))
+        .map_err(|error| anyhow::anyhow!("serialize canonical config apply payload: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(payload)))
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 // ──────────────────────────────────────────────
 // #493 Dead Branch helpers (free fns over an existing Connection — no re-lock)
@@ -472,6 +512,9 @@ pub struct RuntimeConfigApplyRecoveryMarker {
     pub old_building: BuildingConfig,
     pub staged_building: BuildingConfig,
     pub pre_snapshot_id: String,
+    pub pre_snapshot_digest: Option<String>,
+    pub applied_snapshot_id: Option<String>,
+    pub applied_snapshot_digest: Option<String>,
     pub pre_runtime_snapshots: Vec<NanoSnapshot>,
     pub applied_runtime_snapshots: Vec<NanoSnapshot>,
     pub stopped_agent_ids: Vec<AgentId>,
@@ -480,6 +523,46 @@ pub struct RuntimeConfigApplyRecoveryMarker {
     pub decision: RuntimeConfigApplyDecision,
     pub reason: String,
     pub started_tick: u64,
+}
+
+/// Borrowed inputs required to durably begin a runtime config-apply recovery saga.
+///
+/// The event store derives the initial phase, decision, and reason internally so
+/// callers cannot choose persisted saga state.
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeConfigApplyRecoveryStart<'a> {
+    pub op_id: &'a str,
+    pub old_digest: &'a str,
+    pub staged_digest: &'a str,
+    pub old_agents: &'a [AgentConfig],
+    pub staged_agents: &'a [AgentConfig],
+    pub old_building: &'a BuildingConfig,
+    pub staged_building: &'a BuildingConfig,
+    pub pre_snapshot_id: &'a str,
+    pub pre_snapshot_digest: &'a str,
+    pub pre_runtime_snapshots: &'a [NanoSnapshot],
+    pub started_tick: u64,
+}
+
+#[derive(Debug)]
+struct RuntimeConfigApplyV2Row {
+    schema_version: i64,
+    op_id: String,
+    old_digest: String,
+    staged_digest: String,
+    old_agents_json: String,
+    staged_agents_json: String,
+    old_building_json: String,
+    staged_building_json: String,
+    pre_snapshot_id: String,
+    pre_runtime_snapshots_json: String,
+    applied_runtime_snapshots_json: String,
+    stopped_agent_ids_json: String,
+    spawned_agent_ids_json: String,
+    phase: String,
+    decision: String,
+    reason: String,
+    started_tick: i64,
 }
 
 // ──────────────────────────────────────────────
@@ -546,6 +629,22 @@ impl EventStore {
         conn.execute_batch(CREATE_RUNTIME_CONFIG_RECOVERY)?;
         conn.execute_batch(CREATE_RUNTIME_CONFIG_APPLY_RECOVERY)?;
         Self::ensure_runtime_config_apply_migrations(&conn)?;
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS protect_runtime_config_apply_snapshots;
+             CREATE TRIGGER protect_runtime_config_apply_snapshots
+             BEFORE DELETE ON world_snapshots
+             WHEN EXISTS (
+                 SELECT 1 FROM runtime_config_apply_recovery
+                 WHERE singleton_id = 1 AND phase != 'finalized'
+                   AND (
+                       pre_snapshot_id = OLD.id
+                       OR (applied_snapshot_id != '' AND applied_snapshot_id = OLD.id)
+                   )
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'Cannot delete snapshot referenced by active runtime config apply');
+             END;",
+        )?;
 
         // Security: Immutable Snapshots — Schutz vor Loeschung junger Snapshots.
         // #250: dieselbe SSOT-Konstante wie der Daemon-Retention-Skip (siehe IMMUTABLE_SNAPSHOT_MS).
@@ -595,42 +694,384 @@ impl EventStore {
     }
 
     fn ensure_runtime_config_apply_migrations(conn: &Connection) -> anyhow::Result<()> {
-        if Self::table_has_column(
-            conn,
-            "runtime_config_apply_recovery",
-            "schema_version",
-        )? {
+        if Self::table_has_column(conn, "runtime_config_apply_recovery", "schema_version")? {
+            let has_pre_snapshot_digest = Self::table_has_column(
+                conn,
+                "runtime_config_apply_recovery",
+                "pre_snapshot_digest",
+            )?;
+            let has_applied_snapshot_id = Self::table_has_column(
+                conn,
+                "runtime_config_apply_recovery",
+                "applied_snapshot_id",
+            )?;
+            let has_applied_snapshot_digest = Self::table_has_column(
+                conn,
+                "runtime_config_apply_recovery",
+                "applied_snapshot_digest",
+            )?;
+            anyhow::ensure!(
+                has_applied_snapshot_id == has_applied_snapshot_digest,
+                "runtime config apply snapshot binding schema is partial"
+            );
+            if has_pre_snapshot_digest && has_applied_snapshot_id {
+                return Ok(());
+            }
+
+            // Schema v2 carried no cryptographic binding for the pre-apply World
+            // Snapshot and no applied-snapshot binding. Validate the complete row
+            // before the first DDL statement so any malformed/conflicting or
+            // unprovable forward decision leaves both schema and data untouched.
+            let transaction = conn.unchecked_transaction()?;
+            let legacy = transaction
+                .query_row(
+                    "SELECT schema_version, op_id, old_digest, staged_digest,
+                            old_agents_json, staged_agents_json, old_building_json,
+                            staged_building_json, pre_snapshot_id,
+                            pre_runtime_snapshots_json, applied_runtime_snapshots_json,
+                            stopped_agent_ids_json, spawned_agent_ids_json, phase,
+                            decision, reason, started_tick
+                     FROM runtime_config_apply_recovery WHERE singleton_id = 1",
+                    [],
+                    |row| {
+                        Ok(RuntimeConfigApplyV2Row {
+                            schema_version: row.get(0)?,
+                            op_id: row.get(1)?,
+                            old_digest: row.get(2)?,
+                            staged_digest: row.get(3)?,
+                            old_agents_json: row.get(4)?,
+                            staged_agents_json: row.get(5)?,
+                            old_building_json: row.get(6)?,
+                            staged_building_json: row.get(7)?,
+                            pre_snapshot_id: row.get(8)?,
+                            pre_runtime_snapshots_json: row.get(9)?,
+                            applied_runtime_snapshots_json: row.get(10)?,
+                            stopped_agent_ids_json: row.get(11)?,
+                            spawned_agent_ids_json: row.get(12)?,
+                            phase: row.get(13)?,
+                            decision: row.get(14)?,
+                            reason: row.get(15)?,
+                            started_tick: row.get(16)?,
+                        })
+                    },
+                )
+                .optional()?;
+
+            let migrated = legacy
+                .map(|legacy| -> anyhow::Result<_> {
+                    anyhow::ensure!(
+                        legacy.schema_version == 2 || legacy.schema_version == 3,
+                        "unsupported runtime config apply migration schema {}",
+                        legacy.schema_version
+                    );
+                    let old_agents: Vec<AgentConfig> =
+                        serde_json::from_str(&legacy.old_agents_json).map_err(|error| {
+                            anyhow::anyhow!(
+                                "decode v2 config apply old agents fail-closed: {error}"
+                            )
+                        })?;
+                    let staged_agents: Vec<AgentConfig> =
+                        serde_json::from_str(&legacy.staged_agents_json).map_err(|error| {
+                            anyhow::anyhow!(
+                                "decode v2 config apply staged agents fail-closed: {error}"
+                            )
+                        })?;
+                    let old_building: BuildingConfig =
+                        serde_json::from_str(&legacy.old_building_json).map_err(|error| {
+                            anyhow::anyhow!(
+                                "decode v2 config apply old building fail-closed: {error}"
+                            )
+                        })?;
+                    let staged_building: BuildingConfig =
+                        serde_json::from_str(&legacy.staged_building_json).map_err(|error| {
+                            anyhow::anyhow!(
+                                "decode v2 config apply staged building fail-closed: {error}"
+                            )
+                        })?;
+                    let _: Vec<NanoSnapshot> = serde_json::from_str(
+                        &legacy.pre_runtime_snapshots_json,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "decode v2 config apply pre-runtime snapshots fail-closed: {error}"
+                        )
+                    })?;
+                    let _: Vec<NanoSnapshot> = serde_json::from_str(
+                        &legacy.applied_runtime_snapshots_json,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "decode v2 config apply applied-runtime snapshots fail-closed: {error}"
+                        )
+                    })?;
+                    let _: Vec<AgentId> = serde_json::from_str(&legacy.stopped_agent_ids_json)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "decode v2 config apply stopped agents fail-closed: {error}"
+                            )
+                        })?;
+                    let _: Vec<AgentId> = serde_json::from_str(&legacy.spawned_agent_ids_json)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "decode v2 config apply spawned agents fail-closed: {error}"
+                            )
+                        })?;
+                    let phase = RuntimeConfigApplyPhase::from_persisted(&legacy.phase)?;
+                    let decision = RuntimeConfigApplyDecision::from_persisted(&legacy.decision)?;
+                    anyhow::ensure!(
+                        !legacy.op_id.is_empty()
+                            && !legacy.pre_snapshot_id.is_empty()
+                            && legacy.started_tick >= 0,
+                        "v2 config apply recovery identity is invalid"
+                    );
+                    let old_digest = runtime_config_apply_digest(&old_agents, &old_building)?;
+                    let staged_digest =
+                        runtime_config_apply_digest(&staged_agents, &staged_building)?;
+                    anyhow::ensure!(
+                        legacy.old_digest.is_empty() || legacy.old_digest == old_digest,
+                        "v2 config apply old payload digest conflict"
+                    );
+                    anyhow::ensure!(
+                        legacy.staged_digest.is_empty() || legacy.staged_digest == staged_digest,
+                        "v2 config apply staged payload digest conflict"
+                    );
+                    if decision == RuntimeConfigApplyDecision::Forward
+                        && phase != RuntimeConfigApplyPhase::Finalized
+                    {
+                        anyhow::ensure!(
+                            has_applied_snapshot_id,
+                            "v2 forward config apply has no applied snapshot binding"
+                        );
+                        let (snapshot_id, snapshot_digest): (String, String) = transaction
+                            .query_row(
+                                "SELECT applied_snapshot_id, applied_snapshot_digest
+                                 FROM runtime_config_apply_recovery WHERE singleton_id = 1",
+                                [],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )?;
+                        anyhow::ensure!(
+                            !snapshot_id.is_empty() && is_canonical_sha256(&snapshot_digest),
+                            "v2 forward config apply applied snapshot binding is invalid"
+                        );
+                    }
+                    let active_rollback = decision == RuntimeConfigApplyDecision::Rollback
+                        && phase != RuntimeConfigApplyPhase::Finalized;
+                    let reason = if active_rollback {
+                        if legacy.reason.is_empty() {
+                            LEGACY_CONFIG_APPLY_PRE_DIGEST_MISSING.to_string()
+                        } else if legacy
+                            .reason
+                            .contains(LEGACY_CONFIG_APPLY_PRE_DIGEST_MISSING)
+                        {
+                            legacy.reason
+                        } else {
+                            format!(
+                                "{}; {}",
+                                legacy.reason, LEGACY_CONFIG_APPLY_PRE_DIGEST_MISSING
+                            )
+                        }
+                    } else {
+                        legacy.reason
+                    };
+                    Ok((old_digest, staged_digest, active_rollback, reason))
+                })
+                .transpose()?;
+
+            if !has_pre_snapshot_digest {
+                transaction.execute_batch(
+                    "ALTER TABLE runtime_config_apply_recovery
+                         ADD COLUMN pre_snapshot_digest TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+            if !has_applied_snapshot_id {
+                transaction.execute_batch(
+                    "ALTER TABLE runtime_config_apply_recovery
+                         ADD COLUMN applied_snapshot_id TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE runtime_config_apply_recovery
+                         ADD COLUMN applied_snapshot_digest TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+            if let Some((old_digest, staged_digest, active_rollback, reason)) = migrated {
+                transaction.execute(
+                    "UPDATE runtime_config_apply_recovery
+                     SET schema_version = ?1, old_digest = ?2, staged_digest = ?3,
+                         phase = CASE WHEN ?4 THEN 'recovery_required' ELSE phase END,
+                         decision = CASE WHEN ?4 THEN 'rollback' ELSE decision END,
+                         reason = ?5",
+                    params![
+                        RUNTIME_CONFIG_APPLY_SCHEMA_VERSION,
+                        old_digest,
+                        staged_digest,
+                        active_rollback,
+                        reason,
+                    ],
+                )?;
+            }
+            transaction.commit()?;
             return Ok(());
         }
 
         let transaction = conn.unchecked_transaction()?;
+        let legacy = transaction
+            .query_row(
+                "SELECT old_agents_json, staged_agents_json, old_building_json,
+                        staged_building_json, pre_snapshot_id,
+                        stopped_agent_ids_json, spawned_agent_ids_json,
+                        reason, started_tick, created_at, updated_at
+                 FROM runtime_config_apply_recovery WHERE singleton_id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let migrated = legacy
+            .map(
+                |(
+                    old_agents_json,
+                    staged_agents_json,
+                    old_building_json,
+                    staged_building_json,
+                    pre_snapshot_id,
+                    stopped_agent_ids_json,
+                    spawned_agent_ids_json,
+                    reason,
+                    started_tick,
+                    created_at,
+                    updated_at,
+                )| {
+                    let old_agents: Vec<AgentConfig> = serde_json::from_str(&old_agents_json)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "decode legacy config apply old agents fail-closed: {error}"
+                            )
+                        })?;
+                    let staged_agents: Vec<AgentConfig> = serde_json::from_str(&staged_agents_json)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "decode legacy config apply staged agents fail-closed: {error}"
+                            )
+                        })?;
+                    let old_building: BuildingConfig = serde_json::from_str(&old_building_json)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "decode legacy config apply old building fail-closed: {error}"
+                            )
+                        })?;
+                    let staged_building: BuildingConfig =
+                        serde_json::from_str(&staged_building_json).map_err(|error| {
+                            anyhow::anyhow!(
+                                "decode legacy config apply staged building fail-closed: {error}"
+                            )
+                        })?;
+                    let stopped_agent_ids: Vec<AgentId> =
+                        serde_json::from_str(&stopped_agent_ids_json).map_err(|error| {
+                            anyhow::anyhow!(
+                                "decode legacy config apply stopped agents fail-closed: {error}"
+                            )
+                        })?;
+                    let spawned_agent_ids: Vec<AgentId> =
+                        serde_json::from_str(&spawned_agent_ids_json).map_err(|error| {
+                            anyhow::anyhow!(
+                                "decode legacy config apply spawned agents fail-closed: {error}"
+                            )
+                        })?;
+                    anyhow::ensure!(
+                        !pre_snapshot_id.is_empty() && started_tick >= 0,
+                        "legacy config apply recovery identity is invalid"
+                    );
+                    let old_digest = runtime_config_apply_digest(&old_agents, &old_building)?;
+                    let staged_digest =
+                        runtime_config_apply_digest(&staged_agents, &staged_building)?;
+                    Ok((
+                        old_agents_json,
+                        staged_agents_json,
+                        old_building_json,
+                        staged_building_json,
+                        pre_snapshot_id,
+                        serde_json::to_string(&stopped_agent_ids)?,
+                        serde_json::to_string(&spawned_agent_ids)?,
+                        if reason.is_empty() {
+                            LEGACY_CONFIG_APPLY_PRE_DIGEST_MISSING.to_string()
+                        } else if reason.contains(LEGACY_CONFIG_APPLY_PRE_DIGEST_MISSING) {
+                            reason
+                        } else {
+                            format!("{reason}; {LEGACY_CONFIG_APPLY_PRE_DIGEST_MISSING}")
+                        },
+                        started_tick,
+                        created_at,
+                        updated_at,
+                        old_digest,
+                        staged_digest,
+                    ))
+                },
+            )
+            .transpose()?;
         transaction.execute_batch(
             "ALTER TABLE runtime_config_apply_recovery
                  RENAME TO runtime_config_apply_recovery_v1;",
         )?;
         transaction.execute_batch(CREATE_RUNTIME_CONFIG_APPLY_RECOVERY)?;
-        transaction.execute(
-            "INSERT INTO runtime_config_apply_recovery (
-                singleton_id, schema_version, op_id, old_digest, staged_digest,
-                old_agents_json, staged_agents_json, old_building_json,
-                staged_building_json, pre_snapshot_id, pre_runtime_snapshots_json,
-                applied_runtime_snapshots_json, stopped_agent_ids_json,
-                spawned_agent_ids_json, phase, decision, reason, started_tick,
-                created_at, updated_at
-             )
-             SELECT singleton_id, 2, 'legacy-' || started_tick, '', '',
+        if let Some((
+            old_agents_json,
+            staged_agents_json,
+            old_building_json,
+            staged_building_json,
+            pre_snapshot_id,
+            stopped_agent_ids_json,
+            spawned_agent_ids_json,
+            reason,
+            started_tick,
+            created_at,
+            updated_at,
+            old_digest,
+            staged_digest,
+        )) = migrated
+        {
+            transaction.execute(
+                "INSERT INTO runtime_config_apply_recovery (
+                    singleton_id, schema_version, op_id, old_digest, staged_digest,
                     old_agents_json, staged_agents_json, old_building_json,
-                    staged_building_json, pre_snapshot_id, '[]', '[]',
-                    stopped_agent_ids_json, spawned_agent_ids_json,
-                    'recovery_required', 'rollback',
-                    CASE
-                        WHEN reason = '' THEN 'legacy config apply requires deterministic rollback'
-                        ELSE reason
-                    END,
-                    started_tick, created_at, updated_at
-             FROM runtime_config_apply_recovery_v1",
-            [],
-        )?;
+                    staged_building_json, pre_snapshot_id, pre_snapshot_digest,
+                    applied_snapshot_id, applied_snapshot_digest, pre_runtime_snapshots_json,
+                    applied_runtime_snapshots_json, stopped_agent_ids_json,
+                    spawned_agent_ids_json, phase, decision, reason, started_tick,
+                    created_at, updated_at
+                 ) VALUES (
+                    1, ?1, 'legacy-' || ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                    '', '', '', '[]', '[]', ?10, ?11, 'recovery_required',
+                    'rollback', ?12, ?2, ?13, ?14
+                 )",
+                params![
+                    RUNTIME_CONFIG_APPLY_SCHEMA_VERSION,
+                    started_tick,
+                    old_digest,
+                    staged_digest,
+                    old_agents_json,
+                    staged_agents_json,
+                    old_building_json,
+                    staged_building_json,
+                    pre_snapshot_id,
+                    stopped_agent_ids_json,
+                    spawned_agent_ids_json,
+                    reason,
+                    created_at,
+                    updated_at,
+                ],
+            )?;
+        }
         transaction.execute_batch("DROP TABLE runtime_config_apply_recovery_v1;")?;
         transaction.commit()?;
         Ok(())
@@ -860,22 +1301,42 @@ impl EventStore {
 
     pub fn begin_runtime_config_apply_recovery(
         &self,
-        op_id: &str,
-        old_digest: &str,
-        staged_digest: &str,
-        old_agents: &[AgentConfig],
-        staged_agents: &[AgentConfig],
-        old_building: &BuildingConfig,
-        staged_building: &BuildingConfig,
-        pre_snapshot_id: &str,
-        pre_runtime_snapshots: &[NanoSnapshot],
-        started_tick: u64,
+        start: RuntimeConfigApplyRecoveryStart<'_>,
     ) -> anyhow::Result<()> {
+        let RuntimeConfigApplyRecoveryStart {
+            op_id,
+            old_digest,
+            staged_digest,
+            old_agents,
+            staged_agents,
+            old_building,
+            staged_building,
+            pre_snapshot_id,
+            pre_snapshot_digest,
+            pre_runtime_snapshots,
+            started_tick,
+        } = start;
         anyhow::ensure!(!op_id.is_empty(), "config apply op_id must not be empty");
         anyhow::ensure!(
-            !old_digest.is_empty() && !staged_digest.is_empty(),
-            "config apply digests must not be empty"
+            is_canonical_sha256(old_digest)
+                && is_canonical_sha256(staged_digest)
+                && is_canonical_sha256(pre_snapshot_digest),
+            "config apply digests must be canonical lowercase SHA-256"
         );
+        anyhow::ensure!(
+            !pre_snapshot_id.is_empty(),
+            "config apply pre-snapshot id must not be empty"
+        );
+        anyhow::ensure!(
+            old_digest == runtime_config_apply_digest(old_agents, old_building)?
+                && staged_digest == runtime_config_apply_digest(staged_agents, staged_building)?,
+            "config apply payload digest conflict"
+        );
+        let old_agents_json = serde_json::to_string(old_agents)?;
+        let staged_agents_json = serde_json::to_string(staged_agents)?;
+        let old_building_json = serde_json::to_string(old_building)?;
+        let staged_building_json = serde_json::to_string(staged_building)?;
+        let pre_runtime_snapshots_json = serde_json::to_string(pre_runtime_snapshots)?;
         let started_tick = i64::try_from(started_tick)
             .map_err(|_| anyhow::anyhow!("runtime config apply tick exceeds i64"))?;
         let conn =
@@ -886,7 +1347,10 @@ impl EventStore {
             .as_millis() as i64;
         let existing = conn
             .query_row(
-                "SELECT op_id, phase, old_digest, staged_digest
+                "SELECT op_id, phase, old_digest, staged_digest,
+                        old_agents_json, staged_agents_json, old_building_json,
+                        staged_building_json, pre_snapshot_id, pre_snapshot_digest,
+                        pre_runtime_snapshots_json, started_tick
                  FROM runtime_config_apply_recovery WHERE singleton_id = 1",
                 [],
                 |row| {
@@ -895,15 +1359,46 @@ impl EventStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((existing_op, phase, existing_old, existing_staged)) = existing {
+        if let Some((
+            existing_op,
+            phase,
+            existing_old,
+            existing_staged,
+            existing_old_agents,
+            existing_staged_agents,
+            existing_old_building,
+            existing_staged_building,
+            existing_pre_snapshot_id,
+            existing_pre_snapshot_digest,
+            existing_pre_runtime_snapshots,
+            existing_started_tick,
+        )) = existing
+        {
             if existing_op == op_id {
                 anyhow::ensure!(
-                    existing_old == old_digest && existing_staged == staged_digest,
-                    "config apply op_id digest conflict"
+                    existing_old == old_digest
+                        && existing_staged == staged_digest
+                        && existing_old_agents == old_agents_json
+                        && existing_staged_agents == staged_agents_json
+                        && existing_old_building == old_building_json
+                        && existing_staged_building == staged_building_json
+                        && existing_pre_snapshot_id == pre_snapshot_id
+                        && existing_pre_snapshot_digest == pre_snapshot_digest
+                        && existing_pre_runtime_snapshots == pre_runtime_snapshots_json
+                        && existing_started_tick == started_tick,
+                    "config apply op_id binding conflict"
                 );
                 conn.commit()?;
                 return Ok(());
@@ -922,21 +1417,24 @@ impl EventStore {
             "INSERT INTO runtime_config_apply_recovery
              (singleton_id, schema_version, op_id, old_digest, staged_digest,
               old_agents_json, staged_agents_json, old_building_json,
-              staged_building_json, pre_snapshot_id, pre_runtime_snapshots_json,
-              applied_runtime_snapshots_json, phase, decision, reason, started_tick,
-              created_at, updated_at)
-             VALUES (1, 2, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '[]',
-                     'prepared', 'rollback', '', ?10, ?11, ?11)",
+              staged_building_json, pre_snapshot_id, pre_snapshot_digest,
+              applied_snapshot_id, applied_snapshot_digest, pre_runtime_snapshots_json,
+              applied_runtime_snapshots_json, phase, decision, reason,
+              started_tick, created_at, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '', '', ?11, '[]',
+                     'prepared', 'rollback', '', ?12, ?13, ?13)",
             params![
+                RUNTIME_CONFIG_APPLY_SCHEMA_VERSION,
                 op_id,
                 old_digest,
                 staged_digest,
-                serde_json::to_string(old_agents)?,
-                serde_json::to_string(staged_agents)?,
-                serde_json::to_string(old_building)?,
-                serde_json::to_string(staged_building)?,
+                old_agents_json,
+                staged_agents_json,
+                old_building_json,
+                staged_building_json,
                 pre_snapshot_id,
-                serde_json::to_string(pre_runtime_snapshots)?,
+                pre_snapshot_digest,
+                pre_runtime_snapshots_json,
                 started_tick,
                 now_ms,
             ],
@@ -1014,8 +1512,18 @@ impl EventStore {
     pub fn mark_runtime_config_apply_runtimes_applied(
         &self,
         op_id: &str,
+        applied_snapshot_id: &str,
+        applied_snapshot_digest: &str,
         applied_runtime_snapshots: &[NanoSnapshot],
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !applied_snapshot_id.is_empty() && !applied_snapshot_digest.is_empty(),
+            "applied config snapshot binding must be complete"
+        );
+        anyhow::ensure!(
+            is_canonical_sha256(applied_snapshot_digest),
+            "applied config snapshot digest must be canonical lowercase SHA-256"
+        );
         let conn =
             self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let now_ms = std::time::SystemTime::now()
@@ -1025,23 +1533,33 @@ impl EventStore {
         let snapshots = serde_json::to_string(applied_runtime_snapshots)?;
         let updated = conn.execute(
             "UPDATE runtime_config_apply_recovery
-             SET phase = 'runtimes_applied', applied_runtime_snapshots_json = ?2,
-                 updated_at = ?3
+             SET phase = 'runtimes_applied', applied_snapshot_id = ?2,
+                 applied_snapshot_digest = ?3,
+                 applied_runtime_snapshots_json = ?4, updated_at = ?5
              WHERE singleton_id = 1 AND op_id = ?1 AND phase = 'prepared'
                AND decision = 'rollback'",
-            params![op_id, snapshots, now_ms],
+            params![
+                op_id,
+                applied_snapshot_id,
+                applied_snapshot_digest,
+                snapshots,
+                now_ms
+            ],
         )?;
         if updated == 0 {
-            let existing: (String, String) = conn.query_row(
-                "SELECT phase, applied_runtime_snapshots_json
+            let existing: (String, String, String, String) = conn.query_row(
+                "SELECT phase, applied_snapshot_id, applied_snapshot_digest,
+                        applied_runtime_snapshots_json
                  FROM runtime_config_apply_recovery
                  WHERE singleton_id = 1 AND op_id = ?1",
                 params![op_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
             anyhow::ensure!(
                 existing.0 == RuntimeConfigApplyPhase::RuntimesApplied.as_persisted()
-                    && existing.1 == snapshots,
+                    && existing.1 == applied_snapshot_id
+                    && existing.2 == applied_snapshot_digest
+                    && existing.3 == snapshots,
                 "config apply runtimes-applied transition conflict"
             );
         }
@@ -1152,7 +1670,10 @@ impl EventStore {
              WHERE singleton_id = 1 AND op_id = ?1 AND phase != 'finalized'",
             params![op_id, reason, now_ms],
         )?;
-        anyhow::ensure!(updated == 1, "runtime config apply recovery marker is missing");
+        anyhow::ensure!(
+            updated == 1,
+            "runtime config apply recovery marker is missing"
+        );
         conn.commit()?;
         Ok(())
     }
@@ -1212,7 +1733,8 @@ impl EventStore {
             .query_row(
                 "SELECT schema_version, op_id, old_digest, staged_digest,
                         old_agents_json, staged_agents_json, old_building_json,
-                        staged_building_json, pre_snapshot_id, pre_runtime_snapshots_json,
+                        staged_building_json, pre_snapshot_id, pre_snapshot_digest,
+                        applied_snapshot_id, applied_snapshot_digest, pre_runtime_snapshots_json,
                         applied_runtime_snapshots_json, stopped_agent_ids_json,
                         spawned_agent_ids_json, phase, decision, reason, started_tick
                  FROM runtime_config_apply_recovery WHERE singleton_id = 1",
@@ -1235,7 +1757,10 @@ impl EventStore {
                         row.get::<_, String>(13)?,
                         row.get::<_, String>(14)?,
                         row.get::<_, String>(15)?,
-                        row.get::<_, i64>(16)?,
+                        row.get::<_, String>(16)?,
+                        row.get::<_, String>(17)?,
+                        row.get::<_, String>(18)?,
+                        row.get::<_, i64>(19)?,
                     ))
                 },
             )
@@ -1251,6 +1776,9 @@ impl EventStore {
                 old_building,
                 staged_building,
                 pre_snapshot_id,
+                pre_snapshot_digest,
+                applied_snapshot_id,
+                applied_snapshot_digest,
                 pre_runtime_snapshots,
                 applied_runtime_snapshots,
                 stopped_agent_ids,
@@ -1261,28 +1789,77 @@ impl EventStore {
                 started_tick,
             )| {
                 let schema_version = u16::try_from(schema_version)?;
+                let old_agents: Vec<AgentConfig> = serde_json::from_str(&old_agents)?;
+                let staged_agents: Vec<AgentConfig> = serde_json::from_str(&staged_agents)?;
+                let old_building: BuildingConfig = serde_json::from_str(&old_building)?;
+                let staged_building: BuildingConfig = serde_json::from_str(&staged_building)?;
+                let phase_value = RuntimeConfigApplyPhase::from_persisted(&phase)?;
+                let decision_value = RuntimeConfigApplyDecision::from_persisted(&decision)?;
                 anyhow::ensure!(
-                    schema_version == 2,
+                    schema_version == RUNTIME_CONFIG_APPLY_SCHEMA_VERSION,
                     "unsupported runtime config apply schema {schema_version}"
+                );
+                anyhow::ensure!(
+                    old_digest == runtime_config_apply_digest(&old_agents, &old_building)?
+                        && staged_digest
+                            == runtime_config_apply_digest(&staged_agents, &staged_building)?,
+                    "runtime config apply payload digest conflict"
+                );
+                anyhow::ensure!(
+                    applied_snapshot_id.is_empty() == applied_snapshot_digest.is_empty(),
+                    "runtime config apply snapshot binding is partial"
+                );
+                let legacy_missing_pre_digest = pre_snapshot_digest.is_empty()
+                    && phase_value == RuntimeConfigApplyPhase::RecoveryRequired
+                    && decision_value == RuntimeConfigApplyDecision::Rollback
+                    && reason.contains(LEGACY_CONFIG_APPLY_PRE_DIGEST_MISSING);
+                anyhow::ensure!(
+                    is_canonical_sha256(&pre_snapshot_digest)
+                        || legacy_missing_pre_digest
+                        || phase_value == RuntimeConfigApplyPhase::Finalized,
+                    "runtime config apply pre-snapshot digest is missing or invalid"
+                );
+                anyhow::ensure!(
+                    applied_snapshot_digest.is_empty()
+                        || is_canonical_sha256(&applied_snapshot_digest),
+                    "runtime config apply snapshot digest is not canonical SHA-256"
+                );
+                anyhow::ensure!(
+                    !matches!(
+                        phase_value,
+                        RuntimeConfigApplyPhase::RuntimesApplied
+                            | RuntimeConfigApplyPhase::CommittedPendingFinalize
+                    ) || !applied_snapshot_id.is_empty(),
+                    "runtime config apply phase {phase} requires an applied snapshot binding"
+                );
+                anyhow::ensure!(
+                    decision_value != RuntimeConfigApplyDecision::Forward
+                        || phase_value == RuntimeConfigApplyPhase::Finalized
+                        || !applied_snapshot_id.is_empty(),
+                    "forward config apply decision requires an applied snapshot binding"
                 );
                 Ok(RuntimeConfigApplyRecoveryMarker {
                     schema_version,
                     op_id,
                     old_digest,
                     staged_digest,
-                    old_agents: serde_json::from_str(&old_agents)?,
-                    staged_agents: serde_json::from_str(&staged_agents)?,
-                    old_building: serde_json::from_str(&old_building)?,
-                    staged_building: serde_json::from_str(&staged_building)?,
+                    old_agents,
+                    staged_agents,
+                    old_building,
+                    staged_building,
                     pre_snapshot_id,
+                    pre_snapshot_digest: (!pre_snapshot_digest.is_empty())
+                        .then_some(pre_snapshot_digest),
+                    applied_snapshot_id: (!applied_snapshot_id.is_empty())
+                        .then_some(applied_snapshot_id),
+                    applied_snapshot_digest: (!applied_snapshot_digest.is_empty())
+                        .then_some(applied_snapshot_digest),
                     pre_runtime_snapshots: serde_json::from_str(&pre_runtime_snapshots)?,
-                    applied_runtime_snapshots: serde_json::from_str(
-                        &applied_runtime_snapshots,
-                    )?,
+                    applied_runtime_snapshots: serde_json::from_str(&applied_runtime_snapshots)?,
                     stopped_agent_ids: serde_json::from_str(&stopped_agent_ids)?,
                     spawned_agent_ids: serde_json::from_str(&spawned_agent_ids)?,
-                    phase: RuntimeConfigApplyPhase::from_persisted(&phase)?,
-                    decision: RuntimeConfigApplyDecision::from_persisted(&decision)?,
+                    phase: phase_value,
+                    decision: decision_value,
                     reason,
                     started_tick: u64::try_from(started_tick)?,
                 })
@@ -2849,7 +3426,19 @@ impl EventStore {
     pub fn delete_world_snapshot(&self, id: &str) -> anyhow::Result<bool> {
         let conn =
             self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
-        let deleted = conn.execute("DELETE FROM world_snapshots WHERE id = ?1", params![id])?;
+        let deleted = conn.execute(
+            "DELETE FROM world_snapshots
+             WHERE id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM runtime_config_apply_recovery
+                   WHERE singleton_id = 1 AND phase != 'finalized'
+                     AND (
+                         pre_snapshot_id = ?1
+                         OR (applied_snapshot_id != '' AND applied_snapshot_id = ?1)
+                     )
+               )",
+            params![id],
+        )?;
         conn.commit()?;
         Ok(deleted > 0)
     }
@@ -2961,6 +3550,11 @@ pub trait OutboxTransport: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sentinel_common::agent_config::{
+        BackgroundConfig, CapabilitiesConfig, IdentityConfig, PersonalityConfig, PreferencesConfig,
+        RuntimeSelectionConfig,
+    };
+    use sentinel_common::room::{BuildingMeta, RoomConfig, RoomType};
     use sentinel_common::{
         ActivationState, DomainEvent, LocalOwnerBaseRole, LocalOwnerBaseState,
         LocalOwnerStateSnapshot, NodeId, OwnerTerm, OwnerTermSnapshot,
@@ -2969,6 +3563,172 @@ mod tests {
 
     fn test_event(event_type: &str, aggregate_id: &str) -> DomainEvent {
         DomainEvent::new(event_type, aggregate_id, r#"{"test":true}"#, "corr-1", 42)
+    }
+
+    fn config_apply_agent(id: u16, name: &str) -> AgentConfig {
+        AgentConfig {
+            identity: IdentityConfig {
+                id,
+                name: name.to_string(),
+                role: "Engineer".to_string(),
+                department: "Platform".to_string(),
+                tier: None,
+                shift_set: 1,
+                kpis: Vec::new(),
+                reports_to: None,
+                direct_reports: Vec::new(),
+            },
+            personality: PersonalityConfig {
+                openness: 0.5,
+                conscientiousness: 0.5,
+                extraversion: 0.5,
+                agreeableness: 0.5,
+                neuroticism: 0.5,
+                caffeine_tolerance: 0.5,
+                morning_person: true,
+            },
+            preferences: PreferencesConfig {
+                favorite_room: "platform".to_string(),
+                coffee_preference: "espresso".to_string(),
+                lunch_time: "12:30".to_string(),
+            },
+            background: BackgroundConfig {
+                bio: "Config apply migration fixture".to_string(),
+                quirks: Vec::new(),
+            },
+            runtime: RuntimeSelectionConfig::default(),
+            capabilities: CapabilitiesConfig::default(),
+        }
+    }
+
+    fn config_apply_building(name: &str) -> BuildingConfig {
+        BuildingConfig {
+            building: BuildingMeta {
+                name: name.to_string(),
+                address: "Fixture Street 1".to_string(),
+                floors: 1,
+            },
+            rooms: vec![RoomConfig {
+                id: "platform".to_string(),
+                name: "Platform".to_string(),
+                floor: 0,
+                capacity: 8,
+                room_type: RoomType::Office,
+                adjacent: Vec::new(),
+                department: Some("Platform".to_string()),
+                has_coffee_machine: false,
+                has_printer: false,
+            }],
+        }
+    }
+
+    fn create_legacy_runtime_config_apply_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE runtime_config_apply_recovery (
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                old_agents_json TEXT NOT NULL,
+                staged_agents_json TEXT NOT NULL,
+                old_building_json TEXT NOT NULL,
+                staged_building_json TEXT NOT NULL,
+                pre_snapshot_id TEXT NOT NULL,
+                stopped_agent_ids_json TEXT NOT NULL DEFAULT '[]',
+                spawned_agent_ids_json TEXT NOT NULL DEFAULT '[]',
+                phase TEXT NOT NULL CHECK(phase IN ('transitioning','recovery_required')),
+                reason TEXT NOT NULL DEFAULT '',
+                started_tick INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+    }
+
+    fn create_v2_runtime_config_apply_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE runtime_config_apply_recovery (
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                schema_version INTEGER NOT NULL,
+                op_id TEXT NOT NULL,
+                old_digest TEXT NOT NULL,
+                staged_digest TEXT NOT NULL,
+                old_agents_json TEXT NOT NULL,
+                staged_agents_json TEXT NOT NULL,
+                old_building_json TEXT NOT NULL,
+                staged_building_json TEXT NOT NULL,
+                pre_snapshot_id TEXT NOT NULL,
+                pre_runtime_snapshots_json TEXT NOT NULL DEFAULT '[]',
+                applied_runtime_snapshots_json TEXT NOT NULL DEFAULT '[]',
+                stopped_agent_ids_json TEXT NOT NULL DEFAULT '[]',
+                spawned_agent_ids_json TEXT NOT NULL DEFAULT '[]',
+                phase TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                started_tick INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_v2_runtime_config_apply(
+        conn: &Connection,
+        old_agents_json: &str,
+        staged_agents_json: &str,
+        old_building_json: &str,
+        staged_building_json: &str,
+        old_digest: &str,
+        staged_digest: &str,
+        phase: &str,
+        decision: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO runtime_config_apply_recovery (
+                singleton_id, schema_version, op_id, old_digest, staged_digest,
+                old_agents_json, staged_agents_json, old_building_json,
+                staged_building_json, pre_snapshot_id, pre_runtime_snapshots_json,
+                applied_runtime_snapshots_json, stopped_agent_ids_json,
+                spawned_agent_ids_json, phase, decision, reason, started_tick,
+                created_at, updated_at
+             ) VALUES (1, 2, 'v2-op', ?1, ?2, ?3, ?4, ?5, ?6,
+                       'pre-v2', '[]', '[]', '[7]', '[]', ?7, ?8, '', 77, 100, 101)",
+            params![
+                old_digest,
+                staged_digest,
+                old_agents_json,
+                staged_agents_json,
+                old_building_json,
+                staged_building_json,
+                phase,
+                decision,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn assert_v2_config_apply_schema_unchanged(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        assert!(!EventStore::table_has_column(
+            &conn,
+            "runtime_config_apply_recovery",
+            "pre_snapshot_digest"
+        )
+        .unwrap());
+        assert!(!EventStore::table_has_column(
+            &conn,
+            "runtime_config_apply_recovery",
+            "applied_snapshot_id"
+        )
+        .unwrap());
+        let schema_version: i64 = conn
+            .query_row(
+                "SELECT schema_version FROM runtime_config_apply_recovery WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, 2);
     }
 
     #[test]
@@ -2999,6 +3759,265 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn open_migrates_active_legacy_config_apply_to_canonical_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-config-apply.db");
+        let old_agents = vec![config_apply_agent(7, "Legacy Old")];
+        let staged_agents = vec![config_apply_agent(7, "Legacy Staged")];
+        let old_building = config_apply_building("Legacy Old Building");
+        let staged_building = config_apply_building("Legacy Staged Building");
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_legacy_runtime_config_apply_schema(&conn);
+            conn.execute(
+                "INSERT INTO runtime_config_apply_recovery (
+                    singleton_id, old_agents_json, staged_agents_json,
+                    old_building_json, staged_building_json, pre_snapshot_id,
+                    stopped_agent_ids_json, spawned_agent_ids_json, phase,
+                    reason, started_tick, created_at, updated_at
+                 ) VALUES (1, ?1, ?2, ?3, ?4, 'pre-legacy-7', '[7]', '[]',
+                           'recovery_required', '', 77, 100, 101)",
+                params![
+                    serde_json::to_string(&old_agents).unwrap(),
+                    serde_json::to_string(&staged_agents).unwrap(),
+                    serde_json::to_string(&old_building).unwrap(),
+                    serde_json::to_string(&staged_building).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let marker = store
+            .runtime_config_apply_recovery()
+            .unwrap()
+            .expect("migrated canonical marker");
+        assert_eq!(marker.schema_version, RUNTIME_CONFIG_APPLY_SCHEMA_VERSION);
+        assert_eq!(marker.op_id, "legacy-77");
+        assert_eq!(marker.old_agents, old_agents);
+        assert_eq!(marker.staged_agents, staged_agents);
+        assert_eq!(marker.old_building, old_building);
+        assert_eq!(marker.staged_building, staged_building);
+        assert_eq!(marker.pre_snapshot_id, "pre-legacy-7");
+        assert_eq!(marker.stopped_agent_ids, vec![AgentId(7)]);
+        assert_eq!(marker.phase, RuntimeConfigApplyPhase::RecoveryRequired);
+        assert_eq!(marker.decision, RuntimeConfigApplyDecision::Rollback);
+        assert_eq!(
+            marker.old_digest,
+            runtime_config_apply_digest(&marker.old_agents, &marker.old_building).unwrap()
+        );
+        assert_eq!(
+            marker.staged_digest,
+            runtime_config_apply_digest(&marker.staged_agents, &marker.staged_building).unwrap()
+        );
+        assert!(!marker.old_digest.is_empty());
+        assert!(!marker.staged_digest.is_empty());
+        assert_eq!(marker.pre_snapshot_digest, None);
+        assert!(marker
+            .reason
+            .contains(LEGACY_CONFIG_APPLY_PRE_DIGEST_MISSING));
+    }
+
+    #[test]
+    fn open_migrates_v2_empty_digests_to_manual_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2-empty-digests.db");
+        let old_agents = vec![config_apply_agent(7, "V2 Old")];
+        let staged_agents = vec![config_apply_agent(7, "V2 Staged")];
+        let old_building = config_apply_building("V2 Old Building");
+        let staged_building = config_apply_building("V2 Staged Building");
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_v2_runtime_config_apply_schema(&conn);
+            insert_v2_runtime_config_apply(
+                &conn,
+                &serde_json::to_string(&old_agents).unwrap(),
+                &serde_json::to_string(&staged_agents).unwrap(),
+                &serde_json::to_string(&old_building).unwrap(),
+                &serde_json::to_string(&staged_building).unwrap(),
+                "",
+                "",
+                "recovery_required",
+                "rollback",
+            );
+        }
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let marker = store.runtime_config_apply_recovery().unwrap().unwrap();
+        assert_eq!(marker.phase, RuntimeConfigApplyPhase::RecoveryRequired);
+        assert_eq!(marker.decision, RuntimeConfigApplyDecision::Rollback);
+        assert_eq!(marker.pre_snapshot_digest, None);
+        assert_eq!(marker.applied_snapshot_id, None);
+        assert_eq!(marker.applied_snapshot_digest, None);
+        assert!(marker
+            .reason
+            .contains(LEGACY_CONFIG_APPLY_PRE_DIGEST_MISSING));
+        assert_eq!(
+            marker.old_digest,
+            runtime_config_apply_digest(&old_agents, &old_building).unwrap()
+        );
+        assert_eq!(
+            marker.staged_digest,
+            runtime_config_apply_digest(&staged_agents, &staged_building).unwrap()
+        );
+    }
+
+    #[test]
+    fn open_normalizes_v2_runtimes_applied_rollback_to_manual_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2-runtimes-applied.db");
+        let old_agents = vec![config_apply_agent(7, "V2 Old")];
+        let staged_agents = vec![config_apply_agent(7, "V2 Staged")];
+        let old_building = config_apply_building("V2 Old Building");
+        let staged_building = config_apply_building("V2 Staged Building");
+        let old_digest = runtime_config_apply_digest(&old_agents, &old_building).unwrap();
+        let staged_digest = runtime_config_apply_digest(&staged_agents, &staged_building).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_v2_runtime_config_apply_schema(&conn);
+            insert_v2_runtime_config_apply(
+                &conn,
+                &serde_json::to_string(&old_agents).unwrap(),
+                &serde_json::to_string(&staged_agents).unwrap(),
+                &serde_json::to_string(&old_building).unwrap(),
+                &serde_json::to_string(&staged_building).unwrap(),
+                &old_digest,
+                &staged_digest,
+                "runtimes_applied",
+                "rollback",
+            );
+        }
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let marker = store.runtime_config_apply_recovery().unwrap().unwrap();
+        assert_eq!(marker.phase, RuntimeConfigApplyPhase::RecoveryRequired);
+        assert_eq!(marker.decision, RuntimeConfigApplyDecision::Rollback);
+        assert_eq!(marker.pre_snapshot_digest, None);
+        assert_eq!(marker.applied_snapshot_id, None);
+        assert_eq!(marker.applied_snapshot_digest, None);
+        assert!(marker
+            .reason
+            .contains(LEGACY_CONFIG_APPLY_PRE_DIGEST_MISSING));
+    }
+
+    #[test]
+    fn malformed_or_conflicting_v2_row_rolls_back_schema_migration() {
+        let valid_old_agents_json =
+            serde_json::to_string(&vec![config_apply_agent(7, "V2 Old")]).unwrap();
+        for (name, old_agents_json, old_digest) in [
+            ("malformed", "{malformed".to_string(), String::new()),
+            (
+                "conflicting",
+                valid_old_agents_json,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("v2-{name}.db"));
+            let staged_agents = vec![config_apply_agent(7, "V2 Staged")];
+            let old_building = config_apply_building("V2 Old Building");
+            let staged_building = config_apply_building("V2 Staged Building");
+            {
+                let conn = Connection::open(&path).unwrap();
+                create_v2_runtime_config_apply_schema(&conn);
+                insert_v2_runtime_config_apply(
+                    &conn,
+                    &old_agents_json,
+                    &serde_json::to_string(&staged_agents).unwrap(),
+                    &serde_json::to_string(&old_building).unwrap(),
+                    &serde_json::to_string(&staged_building).unwrap(),
+                    &old_digest,
+                    "",
+                    "recovery_required",
+                    "rollback",
+                );
+            }
+            assert!(EventStore::open(path.to_str().unwrap()).is_err());
+            assert_v2_config_apply_schema_unchanged(&path);
+        }
+    }
+
+    #[test]
+    fn v2_forward_without_applied_binding_leaves_schema_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2-forward-unbound.db");
+        let old_agents = vec![config_apply_agent(7, "V2 Old")];
+        let staged_agents = vec![config_apply_agent(7, "V2 Staged")];
+        let old_building = config_apply_building("V2 Old Building");
+        let staged_building = config_apply_building("V2 Staged Building");
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_v2_runtime_config_apply_schema(&conn);
+            insert_v2_runtime_config_apply(
+                &conn,
+                &serde_json::to_string(&old_agents).unwrap(),
+                &serde_json::to_string(&staged_agents).unwrap(),
+                &serde_json::to_string(&old_building).unwrap(),
+                &serde_json::to_string(&staged_building).unwrap(),
+                &runtime_config_apply_digest(&old_agents, &old_building).unwrap(),
+                &runtime_config_apply_digest(&staged_agents, &staged_building).unwrap(),
+                "committed_pending_finalize",
+                "forward",
+            );
+        }
+        let error = match EventStore::open(path.to_str().unwrap()) {
+            Ok(_) => panic!("unbound v2 forward authority must fail store open"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("has no applied snapshot binding"));
+        assert_v2_config_apply_schema_unchanged(&path);
+    }
+
+    #[test]
+    fn malformed_legacy_config_apply_rolls_back_schema_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed-legacy-config-apply.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_legacy_runtime_config_apply_schema(&conn);
+            conn.execute(
+                "INSERT INTO runtime_config_apply_recovery (
+                    singleton_id, old_agents_json, staged_agents_json,
+                    old_building_json, staged_building_json, pre_snapshot_id,
+                    stopped_agent_ids_json, spawned_agent_ids_json, phase,
+                    reason, started_tick, created_at, updated_at
+                 ) VALUES (1, '{malformed', '[]', '{}', '{}', 'pre-bad',
+                           '[]', '[]', 'transitioning', '', 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let error = match EventStore::open(path.to_str().unwrap()) {
+            Ok(_) => panic!("malformed legacy authority must fail store open"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("decode legacy config apply old agents fail-closed"));
+
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            !EventStore::table_has_column(&conn, "runtime_config_apply_recovery", "schema_version")
+                .unwrap(),
+            "failed migration must retain the legacy authority"
+        );
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM runtime_config_apply_recovery",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        let migrated_table: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'runtime_config_apply_recovery_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_table, 0);
     }
 
     #[test]
@@ -4213,6 +5232,198 @@ mod tests {
             trigger_sql.contains(&IMMUTABLE_SNAPSHOT_MS.to_string()),
             "Trigger-SQL muss die geteilte Konstante {IMMUTABLE_SNAPSHOT_MS} einbetten: {trigger_sql}"
         );
+    }
+
+    #[test]
+    fn active_config_apply_pre_snapshot_is_retained_until_finalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-config-apply-pre-anchor.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let old_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - (8 * 86400 * 1000);
+        store
+            .save_world_snapshot_at(
+                "config-apply-pre-anchor",
+                "hourly",
+                200,
+                8.0,
+                100,
+                b"pre-anchor",
+                old_ts,
+            )
+            .unwrap();
+
+        let old_agents = vec![config_apply_agent(60, "Pre Old")];
+        let staged_agents = vec![config_apply_agent(60, "Pre Staged")];
+        let old_building = config_apply_building("Pre Old Building");
+        let staged_building = config_apply_building("Pre Staged Building");
+        let old_digest = runtime_config_apply_digest(&old_agents, &old_building).unwrap();
+        let staged_digest = runtime_config_apply_digest(&staged_agents, &staged_building).unwrap();
+        store
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                op_id: "config-apply-pre-anchor-op",
+                old_digest: &old_digest,
+                staged_digest: &staged_digest,
+                old_agents: &old_agents,
+                staged_agents: &staged_agents,
+                old_building: &old_building,
+                staged_building: &staged_building,
+                pre_snapshot_id: "config-apply-pre-anchor",
+                pre_snapshot_digest:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                pre_runtime_snapshots: &[],
+                started_tick: 200,
+            })
+            .unwrap();
+
+        assert!(!store
+            .delete_world_snapshot("config-apply-pre-anchor")
+            .unwrap());
+        store
+            .mark_runtime_config_apply_recovery_required(
+                "config-apply-pre-anchor-op",
+                "injected restart",
+            )
+            .unwrap();
+        assert!(!store
+            .delete_world_snapshot("config-apply-pre-anchor")
+            .unwrap());
+        let raw_delete_error = store
+            .conn()
+            .execute(
+                "DELETE FROM world_snapshots WHERE id = 'config-apply-pre-anchor'",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            raw_delete_error
+                .to_string()
+                .contains("active runtime config apply"),
+            "{raw_delete_error}"
+        );
+
+        store
+            .finalize_runtime_config_apply(
+                "config-apply-pre-anchor-op",
+                RuntimeConfigApplyDecision::Rollback,
+            )
+            .unwrap();
+        assert!(store
+            .delete_world_snapshot("config-apply-pre-anchor")
+            .unwrap());
+    }
+
+    #[test]
+    fn active_config_apply_applied_snapshot_is_retained_until_forward_finalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-config-apply-applied-anchor.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let old_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - (8 * 86400 * 1000);
+        store
+            .save_world_snapshot_at(
+                "config-apply-applied-pre",
+                "hourly",
+                210,
+                8.0,
+                105,
+                b"applied-pre-anchor",
+                old_ts,
+            )
+            .unwrap();
+        store
+            .save_world_snapshot_at(
+                "config-apply-applied-anchor",
+                "hourly",
+                211,
+                9.0,
+                106,
+                b"applied-anchor",
+                old_ts,
+            )
+            .unwrap();
+
+        let old_agents = vec![config_apply_agent(61, "Applied Old")];
+        let staged_agents = vec![config_apply_agent(61, "Applied Staged")];
+        let old_building = config_apply_building("Applied Old Building");
+        let staged_building = config_apply_building("Applied Staged Building");
+        let old_digest = runtime_config_apply_digest(&old_agents, &old_building).unwrap();
+        let staged_digest = runtime_config_apply_digest(&staged_agents, &staged_building).unwrap();
+        store
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                op_id: "config-apply-applied-anchor-op",
+                old_digest: &old_digest,
+                staged_digest: &staged_digest,
+                old_agents: &old_agents,
+                staged_agents: &staged_agents,
+                old_building: &old_building,
+                staged_building: &staged_building,
+                pre_snapshot_id: "config-apply-applied-pre",
+                pre_snapshot_digest:
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                pre_runtime_snapshots: &[],
+                started_tick: 210,
+            })
+            .unwrap();
+        store
+            .mark_runtime_config_apply_runtimes_applied(
+                "config-apply-applied-anchor-op",
+                "config-apply-applied-anchor",
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                &[],
+            )
+            .unwrap();
+        assert!(!store
+            .delete_world_snapshot("config-apply-applied-anchor")
+            .unwrap());
+
+        let event = DomainEvent::new(
+            "config_applied",
+            "WORLD",
+            r#"{"agent_count":1}"#,
+            "config-apply-applied-anchor-op",
+            211,
+        )
+        .with_operation_id("config-apply-applied-anchor-op");
+        store
+            .commit_runtime_config_apply(
+                "config-apply-applied-anchor-op",
+                &event,
+                "sentinel.events",
+            )
+            .unwrap();
+        assert!(!store
+            .delete_world_snapshot("config-apply-applied-anchor")
+            .unwrap());
+        let raw_delete_error = store
+            .conn()
+            .execute(
+                "DELETE FROM world_snapshots WHERE id = 'config-apply-applied-anchor'",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            raw_delete_error
+                .to_string()
+                .contains("active runtime config apply"),
+            "{raw_delete_error}"
+        );
+
+        store
+            .finalize_runtime_config_apply(
+                "config-apply-applied-anchor-op",
+                RuntimeConfigApplyDecision::Forward,
+            )
+            .unwrap();
+        assert!(store
+            .delete_world_snapshot("config-apply-applied-anchor")
+            .unwrap());
     }
 
     /// #250/AC-7: Promotion (UPDATE tier) darf den Restore-Anker NICHT veraendern — Payload-Blob,
