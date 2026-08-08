@@ -7,9 +7,11 @@
 use std::collections::HashMap;
 
 use sentinel_common::events::{DomainEvent, DomainEventPayload};
+use sentinel_common::AgentId;
 use sentinel_hippocampus::{
-    Episode, EpisodeProjectionAdvance, EpisodeProjectionApplyOutcome, EpisodeProjectionControl,
-    EpisodeProjectionQuarantine, EpisodeProjectionQuarantineReason, EpisodeProjectionStartPolicy,
+    Episode, EpisodeProjectionAdvance, EpisodeProjectionAgent, EpisodeProjectionApplyOutcome,
+    EpisodeProjectionControl, EpisodeProjectionQuarantine, EpisodeProjectionQuarantineReason,
+    EpisodeProjectionReadiness, EpisodeProjectionStartPolicy, EpisodeProjectionSubject,
     EpisodeProjectionWrite, HippocampusService, EPISODE_PROJECTION_VERSION,
 };
 use sentinel_limbo::EventStore;
@@ -36,6 +38,8 @@ pub struct EpisodeProducer {
     agent_names: HashMap<u16, String>,
     /// Whether the durable projection contract was initialized successfully.
     projection_initialized: bool,
+    /// Explicit durable start contract. Never inferred from the Limbo mirror.
+    start_policy: EpisodeProjectionStartPolicy,
     /// Zaehler fuer aufeinanderfolgende Laeufe ohne konvertierbare Events (Starvation-Diagnostik).
     empty_runs: u32,
 }
@@ -53,11 +57,29 @@ impl EpisodeProducer {
         agents: &[(u16, String)],
         event_store: &EventStore,
     ) -> Self {
+        Self::new_with_start_policy(
+            hippocampus,
+            agents,
+            event_store,
+            EpisodeProjectionStartPolicy::Beginning,
+        )
+    }
+
+    /// Construct with an explicitly authorized migration/recovery start.
+    /// Callers must authenticate `RecoveryCut` or `ExplicitPosition`; this path
+    /// deliberately never derives either policy from the legacy Limbo offset.
+    pub fn new_with_start_policy(
+        hippocampus: HippocampusService,
+        agents: &[(u16, String)],
+        event_store: &EventStore,
+        start_policy: EpisodeProjectionStartPolicy,
+    ) -> Self {
         let mut producer = Self {
             hippocampus,
             last_event_id: 0,
             agent_names: agents.iter().cloned().collect(),
             projection_initialized: false,
+            start_policy,
             empty_runs: 0,
         };
         producer.ensure_projection_initialized(event_store);
@@ -69,12 +91,28 @@ impl EpisodeProducer {
         &self.hippocampus
     }
 
+    /// Typed AgentId-based readiness readback for later orchestrator wiring.
+    pub fn episode_projection_readiness(
+        &self,
+        agent_id: AgentId,
+    ) -> anyhow::Result<EpisodeProjectionReadiness> {
+        self.hippocampus
+            .store()
+            .load_episode_projection_readiness(EpisodeProjectionSubject::Agent { agent_id })
+    }
+
     /// Registriert einen neuen Agenten (z.B. bei Schichtwechsel).
     pub fn register_agent(&mut self, id: u16, name: String) {
+        let projection_agent = EpisodeProjectionAgent {
+            subject: EpisodeProjectionSubject::Agent {
+                agent_id: AgentId(id),
+            },
+            agent_name: name.clone(),
+        };
         match self
             .hippocampus
             .store()
-            .initialize_episode_projection_agent(&name)
+            .initialize_episode_projection_agent(&projection_agent)
         {
             Ok(_) => {
                 self.agent_names.insert(id, name);
@@ -145,6 +183,7 @@ impl EpisodeProducer {
                         event_store,
                         *source_row_id,
                         event,
+                        projection_subject_from_event(event),
                         request_digest,
                         EpisodeProjectionQuarantineReason::MalformedRelevantPayload,
                         &error.to_string(),
@@ -160,6 +199,7 @@ impl EpisodeProducer {
                     event_store,
                     *source_row_id,
                     event,
+                    episode_subject(&payload),
                     request_digest,
                     EpisodeProjectionQuarantineReason::EventTypeMismatch,
                     &format!(
@@ -173,11 +213,12 @@ impl EpisodeProducer {
                 continue;
             }
 
-            let Some(stable_agent_name) = self.episode_agent_name(&payload) else {
+            let Some((projection_subject, stable_agent_name)) = self.episode_agent(&payload) else {
                 if !self.quarantine_event(
                     event_store,
                     *source_row_id,
                     event,
+                    episode_subject(&payload),
                     request_digest,
                     EpisodeProjectionQuarantineReason::UnknownAgent,
                     "relevant event references an unregistered agent",
@@ -187,7 +228,7 @@ impl EpisodeProducer {
                 continue;
             };
             let episode_id = stable_episode_id(
-                &stable_agent_name,
+                projection_subject,
                 &event.event_id,
                 EPISODE_PROJECTION_VERSION,
                 &request_digest,
@@ -201,6 +242,7 @@ impl EpisodeProducer {
             debug_assert_eq!(agent_name, stable_agent_name);
 
             let input = EpisodeProjectionWrite {
+                subject: projection_subject,
                 agent_name: agent_name.clone(),
                 source_event_id: event.event_id.clone(),
                 source_row_id: *source_row_id,
@@ -258,15 +300,29 @@ impl EpisodeProducer {
     }
 
     fn ensure_projection_initialized(&mut self, event_store: &EventStore) -> bool {
-        let mut agents: Vec<String> = self.agent_names.values().cloned().collect();
-        agents.push("_building".to_string());
-        agents.sort();
-        agents.dedup();
+        let mut agents: Vec<EpisodeProjectionAgent> = self
+            .agent_names
+            .iter()
+            .map(|(agent_id, agent_name)| EpisodeProjectionAgent {
+                subject: EpisodeProjectionSubject::Agent {
+                    agent_id: AgentId(*agent_id),
+                },
+                agent_name: agent_name.clone(),
+            })
+            .collect();
+        agents.push(EpisodeProjectionAgent {
+            subject: EpisodeProjectionSubject::Building,
+            agent_name: "_building".to_string(),
+        });
+        agents.sort_by_key(|agent| match agent.subject {
+            EpisodeProjectionSubject::Agent { agent_id } => (0, agent_id.0),
+            EpisodeProjectionSubject::Building => (1, 0),
+        });
 
         match self
             .hippocampus
             .store()
-            .initialize_episode_projection(&EpisodeProjectionStartPolicy::Beginning, &agents)
+            .initialize_episode_projection(&self.start_policy, &agents)
         {
             Ok(control) => {
                 self.projection_initialized = true;
@@ -309,19 +365,20 @@ impl EpisodeProducer {
         event_store: &EventStore,
         source_row_id: i64,
         event: &DomainEvent,
+        affected_subject: Option<EpisodeProjectionSubject>,
         request_digest: String,
         reason: EpisodeProjectionQuarantineReason,
         diagnostic: &str,
     ) -> bool {
         let record = EpisodeProjectionQuarantine {
-            affected_scope: quarantine_scope(event),
+            affected_subject,
             source_event_id: event.event_id.clone(),
             source_row_id,
             event_type: event.event_type.clone(),
             projection_version: EPISODE_PROJECTION_VERSION,
             request_digest,
             reason,
-            diagnostic: bounded_diagnostic(diagnostic),
+            diagnostic_digest: quarantine_diagnostic_digest(diagnostic),
         };
         match self
             .hippocampus
@@ -339,14 +396,18 @@ impl EpisodeProducer {
         }
     }
 
-    fn episode_agent_name(&self, payload: &DomainEventPayload) -> Option<String> {
-        match payload {
-            DomainEventPayload::AgentActionReceived { agent_id, .. }
-            | DomainEventPayload::BioActionPerformed { agent_id, .. } => {
-                self.agent_names.get(&agent_id.0).cloned()
-            }
-            DomainEventPayload::ChaosTriggered { .. } => Some("_building".to_string()),
-            _ => None,
+    fn episode_agent(
+        &self,
+        payload: &DomainEventPayload,
+    ) -> Option<(EpisodeProjectionSubject, String)> {
+        let subject = episode_subject(payload)?;
+        match subject {
+            EpisodeProjectionSubject::Agent { agent_id } => self
+                .agent_names
+                .get(&agent_id.0)
+                .cloned()
+                .map(|name| (subject, name)),
+            EpisodeProjectionSubject::Building => Some((subject, "_building".to_string())),
         }
     }
 
@@ -473,14 +534,20 @@ fn source_request_digest(event: &DomainEvent) -> String {
 }
 
 fn stable_episode_id(
-    agent_scope: &str,
+    subject: EpisodeProjectionSubject,
     source_event_id: &str,
     projection_version: u32,
     request_digest: &str,
 ) -> u64 {
     let mut digest = Sha256::new();
     digest.update(b"sentinel-episode-id-v1\0");
-    digest_field(&mut digest, agent_scope.as_bytes());
+    match subject {
+        EpisodeProjectionSubject::Agent { agent_id } => {
+            digest.update([0]);
+            digest.update(agent_id.0.to_be_bytes());
+        }
+        EpisodeProjectionSubject::Building => digest.update([1]),
+    }
     digest_field(&mut digest, source_event_id.as_bytes());
     digest.update(projection_version.to_be_bytes());
     digest_field(&mut digest, request_digest.as_bytes());
@@ -495,30 +562,35 @@ fn digest_field(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
 }
 
-fn quarantine_scope(event: &DomainEvent) -> String {
-    if !event.aggregate_id.is_empty()
-        && event.aggregate_id.len() <= 512
-        && !event.aggregate_id.contains('\u{1f}')
-    {
-        return event.aggregate_id.clone();
+fn episode_subject(payload: &DomainEventPayload) -> Option<EpisodeProjectionSubject> {
+    match payload {
+        DomainEventPayload::AgentActionReceived { agent_id, .. }
+        | DomainEventPayload::BioActionPerformed { agent_id, .. } => {
+            AgentId::new(agent_id.0)
+                .ok()
+                .map(|agent_id| EpisodeProjectionSubject::Agent { agent_id })
+        }
+        DomainEventPayload::ChaosTriggered { .. } => Some(EpisodeProjectionSubject::Building),
+        _ => None,
     }
-    let mut digest = Sha256::new();
-    digest.update(b"sentinel-episode-quarantine-scope-v1\0");
-    digest_field(&mut digest, event.aggregate_id.as_bytes());
-    format!("unresolved:{:x}", digest.finalize())
 }
 
-fn bounded_diagnostic(value: &str) -> String {
-    if value.len() <= 256 {
-        return value.to_string();
+fn projection_subject_from_event(event: &DomainEvent) -> Option<EpisodeProjectionSubject> {
+    if event.event_type == "chaos_triggered" {
+        return Some(EpisodeProjectionSubject::Building);
     }
-    let truncate_at = value
-        .char_indices()
-        .take_while(|(index, _)| *index <= 256)
-        .last()
-        .map(|(index, _)| index)
-        .unwrap_or(0);
-    value[..truncate_at].to_string()
+    let raw_id = event.aggregate_id.strip_prefix("AGENT-")?;
+    let agent_id = raw_id.parse::<u16>().ok()?;
+    AgentId::new(agent_id)
+        .ok()
+        .map(|agent_id| EpisodeProjectionSubject::Agent { agent_id })
+}
+
+fn quarantine_diagnostic_digest(value: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"sentinel-episode-quarantine-diagnostic-v1\0");
+    digest_field(&mut digest, value.as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 /// Klassifiziert eine Agent-Aktion nach Relevanz und Emotion.
@@ -598,7 +670,6 @@ fn format_action_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_common::AgentId;
 
     fn temp_hippocampus() -> (HippocampusService, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -711,6 +782,77 @@ mod tests {
 
         let result = producer.event_to_episode(&payload, 14, 0, 100, 1.0);
         assert!(result.is_none(), "Unknown agent should return None");
+    }
+
+    #[test]
+    fn unknown_agent_without_frontier_is_canonicalized_to_global_quarantine() {
+        let (hippocampus, dir) = temp_hippocampus();
+        let event_store = temp_event_store(&dir);
+        let agents = vec![(1, "Thomas".to_string()), (2, "Lisa".to_string())];
+        let mut producer = EpisodeProducer::new(hippocampus, &agents, &event_store);
+        append_payload(
+            &event_store,
+            &DomainEventPayload::BioActionPerformed {
+                agent_id: AgentId(3),
+                action: "drink".to_string(),
+            },
+            10,
+        );
+
+        assert_eq!(producer.tick(&event_store, 20, 1.0), 0);
+        let quarantines = producer
+            .hippocampus()
+            .store()
+            .list_episode_projection_quarantine()
+            .unwrap();
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(quarantines[0].affected_subject, None);
+        for agent_id in [AgentId(1), AgentId(2)] {
+            let readiness = producer.episode_projection_readiness(agent_id).unwrap();
+            assert!(!readiness.is_ready());
+            assert!(readiness.blockers.iter().any(|block| matches!(
+                block,
+                sentinel_hippocampus::EpisodeProjectionReadinessBlock::GlobalQuarantine { .. }
+            )));
+        }
+    }
+
+    #[test]
+    fn unknown_runtime_agent_with_durable_frontier_remains_subject_local() {
+        let (hippocampus, dir) = temp_hippocampus();
+        let event_store = temp_event_store(&dir);
+        let agents = vec![(1, "Thomas".to_string()), (2, "Lisa".to_string())];
+        let mut producer = EpisodeProducer::new(hippocampus, &agents, &event_store);
+        producer.agent_names.remove(&2);
+        append_payload(
+            &event_store,
+            &DomainEventPayload::BioActionPerformed {
+                agent_id: AgentId(2),
+                action: "drink".to_string(),
+            },
+            10,
+        );
+
+        assert_eq!(producer.tick(&event_store, 20, 1.0), 0);
+        let quarantines = producer
+            .hippocampus()
+            .store()
+            .list_episode_projection_quarantine()
+            .unwrap();
+        assert_eq!(
+            quarantines[0].affected_subject,
+            Some(EpisodeProjectionSubject::Agent {
+                agent_id: AgentId(2),
+            })
+        );
+        assert!(producer
+            .episode_projection_readiness(AgentId(1))
+            .unwrap()
+            .is_ready());
+        assert!(!producer
+            .episode_projection_readiness(AgentId(2))
+            .unwrap()
+            .is_ready());
     }
 
     #[test]
@@ -893,6 +1035,164 @@ mod tests {
     }
 
     #[test]
+    fn beginning_policy_refuses_legacy_episodes_without_changing_mirror_or_state() {
+        let (hippocampus, dir) = temp_hippocampus();
+        hippocampus
+            .store()
+            .store_episodes(
+                "Thomas",
+                &[Episode {
+                    id: 77,
+                    agent_name: "Thomas".to_string(),
+                    summary: "Legacy episode".to_string(),
+                    relevance: 0.5,
+                    emotion: 0.2,
+                    repetitions: 1,
+                    hours_ago: 1.0,
+                    participants: Vec::new(),
+                    tags: vec!["legacy".to_string()],
+                }],
+            )
+            .unwrap();
+        let event_store = temp_event_store(&dir);
+        let old_row = append_payload(
+            &event_store,
+            &DomainEventPayload::TransitCompleted {
+                agent_id: AgentId(1),
+                room_id: "lobby".to_string(),
+            },
+            5,
+        );
+        event_store.update_offset(OFFSET_NAME, old_row).unwrap();
+        let new_event = DomainEvent::new(
+            "bio_action_performed",
+            "AGENT-01",
+            &DomainEventPayload::BioActionPerformed {
+                agent_id: AgentId(1),
+                action: "drink".to_string(),
+            }
+            .to_json(),
+            "episode-producer-test",
+            10,
+        );
+        event_store.append_event(&new_event).unwrap();
+
+        let agents = vec![(1, "Thomas".to_string())];
+        let mut producer = EpisodeProducer::new(hippocampus, &agents, &event_store);
+        assert!(!producer.projection_initialized);
+        assert_eq!(producer.tick(&event_store, 20, 1.0), 0);
+        assert_eq!(event_store.get_offset(OFFSET_NAME).unwrap(), Some(old_row));
+        let episodes = producer
+            .hippocampus()
+            .store()
+            .load_episodes("Thomas")
+            .unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].id, 77);
+        assert!(producer
+            .hippocampus()
+            .store()
+            .load_episode_projection_control()
+            .unwrap()
+            .is_none());
+        let subject = EpisodeProjectionSubject::Agent {
+            agent_id: AgentId(1),
+        };
+        assert!(producer
+            .hippocampus()
+            .store()
+            .load_episode_projection_frontier(subject)
+            .unwrap()
+            .is_none());
+        assert!(producer
+            .hippocampus()
+            .store()
+            .load_episode_source_receipt(subject, &new_event.event_id)
+            .unwrap()
+            .is_none());
+        let readiness = producer
+            .episode_projection_readiness(AgentId(1))
+            .unwrap();
+        assert!(!readiness.is_ready());
+        assert!(readiness.blockers.iter().any(|block| matches!(
+            block,
+            sentinel_hippocampus::EpisodeProjectionReadinessBlock::ProjectionUninitialized
+        )));
+    }
+
+    #[test]
+    fn explicit_position_allows_authorized_legacy_projection_start() {
+        let (hippocampus, dir) = temp_hippocampus();
+        hippocampus
+            .store()
+            .store_episodes(
+                "Thomas",
+                &[Episode {
+                    id: 77,
+                    agent_name: "Thomas".to_string(),
+                    summary: "Legacy episode".to_string(),
+                    relevance: 0.5,
+                    emotion: 0.2,
+                    repetitions: 1,
+                    hours_ago: 1.0,
+                    participants: Vec::new(),
+                    tags: vec!["legacy".to_string()],
+                }],
+            )
+            .unwrap();
+        let event_store = temp_event_store(&dir);
+        let old_row = append_payload(
+            &event_store,
+            &DomainEventPayload::TransitCompleted {
+                agent_id: AgentId(1),
+                room_id: "lobby".to_string(),
+            },
+            5,
+        );
+        event_store.update_offset(OFFSET_NAME, old_row).unwrap();
+        append_payload(
+            &event_store,
+            &DomainEventPayload::BioActionPerformed {
+                agent_id: AgentId(1),
+                action: "drink".to_string(),
+            },
+            10,
+        );
+
+        let agents = vec![(1, "Thomas".to_string())];
+        let mut producer = EpisodeProducer::new_with_start_policy(
+            hippocampus,
+            &agents,
+            &event_store,
+            EpisodeProjectionStartPolicy::ExplicitPosition {
+                source_row_id: old_row,
+            },
+        );
+        assert!(producer.projection_initialized);
+        assert_eq!(producer.last_event_id, old_row);
+        assert_eq!(producer.tick(&event_store, 20, 1.0), 1);
+        let episodes = producer
+            .hippocampus()
+            .store()
+            .load_episodes("Thomas")
+            .unwrap();
+        assert_eq!(episodes.len(), 2);
+        assert_eq!(episodes[0].id, 77);
+        assert_eq!(
+            producer
+                .hippocampus()
+                .store()
+                .load_episode_projection_control()
+                .unwrap()
+                .unwrap()
+                .start_policy,
+            EpisodeProjectionStartPolicy::ExplicitPosition {
+                source_row_id: old_row,
+            }
+        );
+    }
+
+    #[test]
     fn malformed_relevant_event_is_quarantined_without_agent_advance() {
         let (hippocampus, dir) = temp_hippocampus();
         let event_store = temp_event_store(&dir);
@@ -923,16 +1223,61 @@ mod tests {
             quarantines[0].reason,
             EpisodeProjectionQuarantineReason::MalformedRelevantPayload
         );
+        let encoded_quarantine = serde_json::to_string(&quarantines[0]).unwrap();
+        assert!(!encoded_quarantine.contains("payload"));
+        assert!(!encoded_quarantine.contains("not-json"));
         assert_eq!(
             producer
                 .hippocampus()
                 .store()
-                .load_episode_projection_frontier("Thomas")
+                .load_episode_projection_frontier(EpisodeProjectionSubject::Agent {
+                    agent_id: AgentId(1),
+                })
                 .unwrap()
                 .unwrap()
                 .last_source_row_id,
             0
         );
+        let readiness = producer
+            .episode_projection_readiness(AgentId(1))
+            .unwrap();
+        assert!(!readiness.is_ready());
+        assert!(readiness.blockers.iter().any(|block| matches!(
+            block,
+            sentinel_hippocampus::EpisodeProjectionReadinessBlock::SubjectQuarantine { .. }
+        )));
+    }
+
+    #[test]
+    fn malformed_event_without_resolvable_subject_blocks_globally() {
+        let (hippocampus, dir) = temp_hippocampus();
+        let event_store = temp_event_store(&dir);
+        let malformed = DomainEvent::new(
+            "agent_action_received",
+            "unresolved-agent",
+            "{not-json",
+            "episode-producer-test",
+            10,
+        );
+        event_store.append_event(&malformed).unwrap();
+        let agents = vec![(1, "Thomas".to_string()), (2, "Lisa".to_string())];
+        let mut producer = EpisodeProducer::new(hippocampus, &agents, &event_store);
+
+        assert_eq!(producer.tick(&event_store, 20, 1.0), 0);
+        let quarantines = producer
+            .hippocampus()
+            .store()
+            .list_episode_projection_quarantine()
+            .unwrap();
+        assert_eq!(quarantines[0].affected_subject, None);
+        for agent_id in [AgentId(1), AgentId(2)] {
+            let readiness = producer.episode_projection_readiness(agent_id).unwrap();
+            assert!(!readiness.is_ready());
+            assert!(readiness.blockers.iter().any(|block| matches!(
+                block,
+                sentinel_hippocampus::EpisodeProjectionReadinessBlock::GlobalQuarantine { .. }
+            )));
+        }
     }
 
     #[test]
@@ -986,9 +1331,19 @@ mod tests {
         );
         let digest = source_request_digest(&event);
         assert_eq!(digest, source_request_digest(&event));
-        let id = stable_episode_id("Thomas", &event.event_id, 1, &digest);
-        assert_eq!(id, stable_episode_id("Thomas", &event.event_id, 1, &digest));
-        assert_ne!(id, stable_episode_id("Lisa", &event.event_id, 1, &digest));
+        let thomas = EpisodeProjectionSubject::Agent {
+            agent_id: AgentId(1),
+        };
+        let lisa = EpisodeProjectionSubject::Agent {
+            agent_id: AgentId(2),
+        };
+        let id = stable_episode_id(thomas, &event.event_id, 1, &digest);
+        assert_eq!(id, stable_episode_id(thomas, &event.event_id, 1, &digest));
+        assert_ne!(id, stable_episode_id(lisa, &event.event_id, 1, &digest));
+        assert_ne!(
+            id,
+            stable_episode_id(EpisodeProjectionSubject::Building, &event.event_id, 1, &digest)
+        );
 
         let mut changed = event.clone();
         changed.tick += 1;
