@@ -3382,8 +3382,7 @@ fn effect_saga_rejects_outcome_from_another_authority_lineage() {
 
         let mut changed_request = old_request.clone();
         changed_request.actor = changed_authority.principal.clone();
-        changed_request.actor_authority_receipt_digest =
-            changed_authority.receipt_digest.clone();
+        changed_request.actor_authority_receipt_digest = changed_authority.receipt_digest.clone();
         changed_request.actor_authority_identity_digest =
             changed_authority.stable_identity_digest().unwrap();
         changed_request.request_digest = ContentDigest::zero();
