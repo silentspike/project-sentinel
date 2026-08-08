@@ -483,6 +483,12 @@ pub enum OwnerIssueError {
     ReadinessClosed { scope: StateTransferScope },
     #[error("owner scope is not materialized: {scope:?}")]
     UnknownScope { scope: StateTransferScope },
+    #[error("local owner recipient mismatch for {scope:?}: expected {expected}, actual {actual}")]
+    RecipientMismatch {
+        scope: StateTransferScope,
+        expected: NodeId,
+        actual: NodeId,
+    },
     #[error("owner generation mismatch for {scope:?}: expected {expected}, actual {actual}")]
     GenerationMismatch {
         scope: StateTransferScope,
@@ -570,12 +576,10 @@ pub enum LocalOwnerRole {
 /// scopes never synthesize self-ownership.
 ///
 /// **Single-node fast path (V26):** `validate`/`current_owner` sit on the hot path of
-/// every store write. An atomic `mode` flag is loaded `Acquire` (pairing with the
-/// `Release` store in [`commit_owner`](Self::commit_owner)) and short-circuits the
-/// `RwLock`/map lookup entirely while single-node — so the prod write path takes **no**
-/// lock and is byte-for-byte the pre-cluster behavior (the acquire load is a plain load
-/// on x86; one cheap load-acquire on weakly-ordered archs). Only after a real cross-node
-/// commit does `validate` consult the term map under the read lock.
+/// every store write. The mode-independent local readiness fence costs one atomic load;
+/// once it is open, an atomic `mode` load short-circuits the `RwLock`/map lookup while
+/// single-node. Only after a real cross-node commit does `validate` consult the term map
+/// under the read lock.
 #[derive(Debug)]
 pub struct OwnerRegistry {
     /// The node this registry acts for. Single-node: owns every scope at epoch 1.
@@ -590,8 +594,9 @@ pub struct OwnerRegistry {
     base_states: RwLock<HashMap<StateTransferScope, LocalOwnerBaseState>>,
     /// Scope-keyed handoff/migration overlays. Snapshot installation never clears these.
     saga_states: RwLock<HashMap<StateTransferScope, LocalOwnerSagaState>>,
-    /// Boot-local owner/activation latch. Every cluster process starts closed and only
-    /// opens after a valid durable marker and cache rebuild (or a fresh full snapshot).
+    /// Process-local write-readiness latch. Cluster processes start closed until a valid
+    /// durable marker/cache rebuild; either mode may close it to fence normal writes
+    /// during an unresolved recovery.
     readiness: AtomicBool,
 }
 
@@ -685,9 +690,93 @@ impl OwnerRegistry {
     }
 
     pub fn close_owner_readiness(&self) {
+        self.readiness.store(false, Ordering::Release);
+    }
+
+    /// Re-open the local write fence after a non-ownership recovery has been fully
+    /// validated. Cluster callers may only re-open a registry whose authoritative
+    /// World term and recipient-local World state were already installed; this method
+    /// never substitutes for [`rebuild_from_owner_snapshot`](Self::rebuild_from_owner_snapshot).
+    pub fn reopen_owner_readiness_after_verified_local_recovery(
+        &self,
+    ) -> Result<(), OwnerIssueError> {
+        self.reopen_owner_readiness_after_verified_local_recovery_with_hook(|| {})
+    }
+
+    fn reopen_owner_readiness_after_verified_local_recovery_with_hook<F>(
+        &self,
+        before_cluster_open: F,
+    ) -> Result<(), OwnerIssueError>
+    where
+        F: FnOnce(),
+    {
         if self.is_cluster_mode() {
-            self.readiness.store(false, Ordering::Release);
+            let scope = StateTransferScope::World;
+            let terms = self.terms.read().expect("owner term map poisoned");
+            let base_states = self
+                .base_states
+                .read()
+                .expect("local owner base map poisoned");
+            let saga_states = self
+                .saga_states
+                .read()
+                .expect("local owner saga map poisoned");
+            let term = terms
+                .get(&scope)
+                .ok_or_else(|| OwnerIssueError::UnknownScope {
+                    scope: scope.clone(),
+                })?;
+            let base = base_states
+                .get(&scope)
+                .ok_or_else(|| OwnerIssueError::UnknownScope {
+                    scope: scope.clone(),
+                })?;
+            if base.recipient_node != self.this_node {
+                return Err(OwnerIssueError::RecipientMismatch {
+                    scope,
+                    expected: self.this_node,
+                    actual: base.recipient_node,
+                });
+            }
+            if base.owner_term != *term {
+                return Err(OwnerIssueError::TermChanged {
+                    scope,
+                    guard_owner: base.owner_term.owner_node,
+                    guard_epoch: base.owner_term.epoch,
+                    guard_generation: base.owner_term.coordinator_generation,
+                    current_owner: term.owner_node,
+                    current_epoch: term.epoch,
+                    current_generation: term.coordinator_generation,
+                });
+            }
+            if term.owner_node != self.this_node {
+                return Err(OwnerIssueError::NotOwner {
+                    scope,
+                    this_node: self.this_node,
+                    owner_node: term.owner_node,
+                });
+            }
+            if base.base_role != LocalOwnerBaseRole::Owner {
+                return Err(OwnerIssueError::RoleNotOwner { scope });
+            }
+            if base.activation_state != ActivationState::Routable {
+                return Err(OwnerIssueError::NotRoutable {
+                    scope,
+                    activation: base.activation_state,
+                });
+            }
+            if let Some(overlay) = saga_states.get(&scope) {
+                return Err(OwnerIssueError::SagaOverlay {
+                    scope,
+                    role: overlay.role,
+                });
+            }
+            before_cluster_open();
+            self.readiness.store(true, Ordering::Release);
+            return Ok(());
         }
+        self.readiness.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Replace the in-memory global and recipient-local base view and open readiness
@@ -961,11 +1050,11 @@ impl OwnerRegistry {
         }
     }
 
-    /// Mint a write guard for a scope this node owns. In single-node mode this always
-    /// succeeds (the seed owns every scope); the guard carries the committed epoch so
-    /// `begin_fenced_write`/commit can re-check it (V19).
+    /// Mint a write guard for a scope this node owns while the local write-readiness
+    /// fence is open. Single-node retains OwnsAll authority, but an unresolved local
+    /// recovery can still close guard issuance without entering cluster mode.
     pub fn issue(&self, scope: StateTransferScope) -> Result<OwnerWriteGuard, OwnerIssueError> {
-        if self.is_cluster_mode() && !self.readiness.load(Ordering::Acquire) {
+        if !self.readiness.load(Ordering::Acquire) {
             return Err(OwnerIssueError::ReadinessClosed { scope });
         }
         let term = self.current_owner(&scope)?;
@@ -982,10 +1071,11 @@ impl OwnerRegistry {
     /// Re-check a guard against the current committed owner term (V19) **and** this
     /// node's local retirement (V4). Rejects a guard whose epoch is older than the
     /// committed epoch, that asserts a different owner node, or that targets a scope this
-    /// node has locally retired, with [`StaleEpochError`]. Always `Ok` in single-node
-    /// mode (no committed term advances, no local retirement is recorded).
+    /// node has locally retired, with [`StaleEpochError`]. Single-node still skips term
+    /// maps, but it rejects guards while the mode-independent local readiness fence is
+    /// closed.
     pub fn validate(&self, guard: &OwnerWriteGuard) -> Result<(), OwnerIssueError> {
-        if self.is_cluster_mode() && !self.readiness.load(Ordering::Acquire) {
+        if !self.readiness.load(Ordering::Acquire) {
             return Err(OwnerIssueError::ReadinessClosed {
                 scope: guard.scope.clone(),
             });
@@ -1101,9 +1191,20 @@ mod tests {
         (global, local)
     }
 
+    fn rebuilt_closed_cluster() -> OwnerRegistry {
+        let registry = OwnerRegistry::new_cluster_for_test(node(2));
+        let pair = snapshot_pair(node(2), node(2), ActivationState::Routable);
+        registry
+            .rebuild_from_owner_snapshot(&pair.0, &pair.1, vec![])
+            .unwrap();
+        registry.close_owner_readiness();
+        registry
+    }
+
     #[test]
     fn single_node_registry_owns_every_scope() {
         let reg = OwnerRegistry::single_node(node(0));
+        assert!(reg.owner_readiness());
         for scope in [
             StateTransferScope::World,
             StateTransferScope::for_agent("AGENT-07"),
@@ -1113,6 +1214,32 @@ mod tests {
             assert_eq!(guard.epoch(), SINGLE_NODE_EPOCH);
             assert_eq!(guard.coordinator_generation(), 0);
             assert!(reg.validate(&guard).is_ok());
+        }
+    }
+
+    #[test]
+    fn single_node_readiness_close_rejects_existing_and_new_guards() {
+        let reg = OwnerRegistry::single_node(node(0));
+        assert!(reg.owner_readiness());
+        let world_guard = reg.issue(StateTransferScope::World).unwrap();
+
+        reg.close_owner_readiness();
+
+        assert!(!reg.owner_readiness());
+        assert!(matches!(
+            reg.validate(&world_guard),
+            Err(OwnerIssueError::ReadinessClosed {
+                scope: StateTransferScope::World
+            })
+        ));
+        for scope in [
+            StateTransferScope::World,
+            StateTransferScope::for_agent("AGENT-07"),
+        ] {
+            assert!(matches!(
+                reg.issue(scope.clone()),
+                Err(OwnerIssueError::ReadinessClosed { scope: closed }) if closed == scope
+            ));
         }
     }
 
@@ -1153,6 +1280,193 @@ mod tests {
         reg.rebuild_from_owner_snapshot(&pair.0, &pair.1, vec![])
             .unwrap();
         assert!(reg.issue(StateTransferScope::World).is_ok());
+    }
+
+    #[test]
+    fn verified_local_recovery_reopens_single_node_but_not_empty_cluster_cache() {
+        let single = OwnerRegistry::single_node(node(1));
+        single.close_owner_readiness();
+        single
+            .reopen_owner_readiness_after_verified_local_recovery()
+            .unwrap();
+        assert!(single.issue(StateTransferScope::World).is_ok());
+
+        let cluster = OwnerRegistry::new_cluster_for_test(node(2));
+        assert!(matches!(
+            cluster.reopen_owner_readiness_after_verified_local_recovery(),
+            Err(OwnerIssueError::UnknownScope {
+                scope: StateTransferScope::World
+            })
+        ));
+        assert!(!cluster.owner_readiness());
+
+        let pair = snapshot_pair(node(2), node(2), ActivationState::Routable);
+        cluster
+            .rebuild_from_owner_snapshot(&pair.0, &pair.1, vec![])
+            .unwrap();
+        cluster.close_owner_readiness();
+        cluster
+            .reopen_owner_readiness_after_verified_local_recovery()
+            .unwrap();
+        assert!(cluster.issue(StateTransferScope::World).is_ok());
+    }
+
+    #[test]
+    fn cluster_verified_recovery_rejects_stale_world_base_term() {
+        let registry = rebuilt_closed_cluster();
+        registry
+            .terms
+            .write()
+            .unwrap()
+            .get_mut(&StateTransferScope::World)
+            .unwrap()
+            .epoch += 1;
+
+        assert!(matches!(
+            registry.reopen_owner_readiness_after_verified_local_recovery(),
+            Err(OwnerIssueError::TermChanged { .. })
+        ));
+        assert!(!registry.owner_readiness());
+    }
+
+    #[test]
+    fn cluster_verified_recovery_rejects_wrong_world_recipient() {
+        let registry = rebuilt_closed_cluster();
+        registry
+            .base_states
+            .write()
+            .unwrap()
+            .get_mut(&StateTransferScope::World)
+            .unwrap()
+            .recipient_node = node(3);
+
+        assert!(matches!(
+            registry.reopen_owner_readiness_after_verified_local_recovery(),
+            Err(OwnerIssueError::RecipientMismatch { .. })
+        ));
+        assert!(!registry.owner_readiness());
+    }
+
+    #[test]
+    fn cluster_verified_recovery_rejects_follower_world_base() {
+        let registry = rebuilt_closed_cluster();
+        registry
+            .base_states
+            .write()
+            .unwrap()
+            .get_mut(&StateTransferScope::World)
+            .unwrap()
+            .base_role = LocalOwnerBaseRole::Follower;
+
+        assert!(matches!(
+            registry.reopen_owner_readiness_after_verified_local_recovery(),
+            Err(OwnerIssueError::RoleNotOwner { .. })
+        ));
+        assert!(!registry.owner_readiness());
+    }
+
+    #[test]
+    fn cluster_verified_recovery_rejects_not_routable_world_base() {
+        let registry = rebuilt_closed_cluster();
+        registry
+            .base_states
+            .write()
+            .unwrap()
+            .get_mut(&StateTransferScope::World)
+            .unwrap()
+            .activation_state = ActivationState::NotRoutable;
+
+        assert!(matches!(
+            registry.reopen_owner_readiness_after_verified_local_recovery(),
+            Err(OwnerIssueError::NotRoutable { .. })
+        ));
+        assert!(!registry.owner_readiness());
+    }
+
+    #[test]
+    fn cluster_verified_recovery_rejects_world_saga_overlay() {
+        let registry = rebuilt_closed_cluster();
+        let owner_term = registry
+            .terms
+            .read()
+            .unwrap()
+            .get(&StateTransferScope::World)
+            .unwrap()
+            .clone();
+        registry.saga_states.write().unwrap().insert(
+            StateTransferScope::World,
+            LocalOwnerSagaState {
+                scope: StateTransferScope::World,
+                operation_kind: LocalOwnerOperationKind::Migration,
+                op_id: Some(uuid::Uuid::from_bytes([9; 16])),
+                owner_term,
+                role: LocalOwnerSagaRole::OwnerActivating,
+                transition_seq: 1,
+            },
+        );
+
+        assert!(matches!(
+            registry.reopen_owner_readiness_after_verified_local_recovery(),
+            Err(OwnerIssueError::SagaOverlay { .. })
+        ));
+        assert!(!registry.owner_readiness());
+    }
+
+    #[test]
+    fn cluster_verified_recovery_holds_authority_locks_through_readiness_publish() {
+        let registry = std::sync::Arc::new(rebuilt_closed_cluster());
+        let (start_writer_tx, start_writer_rx) = std::sync::mpsc::sync_channel(0);
+        let (writer_attempting_tx, writer_attempting_rx) = std::sync::mpsc::sync_channel(0);
+        let (writer_published_tx, writer_published_rx) = std::sync::mpsc::sync_channel(0);
+
+        std::thread::scope(|scope| {
+            let writer_registry = std::sync::Arc::clone(&registry);
+            scope.spawn(move || {
+                start_writer_rx.recv().unwrap();
+                writer_attempting_tx.send(()).unwrap();
+                let mut saga_states = writer_registry.saga_states.write().unwrap();
+                let readiness_when_writer_acquired = writer_registry.owner_readiness();
+                let owner_term = writer_registry
+                    .terms
+                    .read()
+                    .unwrap()
+                    .get(&StateTransferScope::World)
+                    .unwrap()
+                    .clone();
+                saga_states.insert(
+                    StateTransferScope::World,
+                    LocalOwnerSagaState {
+                        scope: StateTransferScope::World,
+                        operation_kind: LocalOwnerOperationKind::Migration,
+                        op_id: Some(uuid::Uuid::from_bytes([10; 16])),
+                        owner_term,
+                        role: LocalOwnerSagaRole::OwnerActivating,
+                        transition_seq: 1,
+                    },
+                );
+                writer_published_tx
+                    .send(readiness_when_writer_acquired)
+                    .unwrap();
+            });
+
+            registry
+                .reopen_owner_readiness_after_verified_local_recovery_with_hook(|| {
+                    start_writer_tx.send(()).unwrap();
+                    writer_attempting_rx.recv().unwrap();
+                    assert!(matches!(
+                        writer_published_rx.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    ));
+                    assert!(!registry.owner_readiness());
+                })
+                .unwrap();
+
+            assert!(registry.owner_readiness());
+            assert!(
+                writer_published_rx.recv().unwrap(),
+                "the writer may acquire only after readiness was published under the read locks"
+            );
+        });
     }
 
     #[test]

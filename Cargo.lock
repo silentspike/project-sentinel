@@ -4703,6 +4703,7 @@ dependencies = [
  "sentinel-telemetry",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",

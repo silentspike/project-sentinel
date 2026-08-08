@@ -13,7 +13,6 @@
 use anyhow::{Context, Result};
 use sentinel_common::agent_config::{load_agent_config, AgentConfig};
 use sentinel_common::room::BuildingConfig;
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -34,9 +33,7 @@ pub struct ConfigApplyRecoveryJournal {
     pub participant_phase: ConfigApplyParticipantPhase,
 }
 
-#[derive(
-    Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq,
-)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigApplyParticipantPhase {
     Prepared,
@@ -164,9 +161,7 @@ pub fn stage_config_apply_recovery(
     write_config_apply_journal(config_dir, &journal)
 }
 
-pub fn load_config_apply_recovery(
-    config_dir: &Path,
-) -> Result<Option<ConfigApplyRecoveryJournal>> {
+pub fn load_config_apply_recovery(config_dir: &Path) -> Result<Option<ConfigApplyRecoveryJournal>> {
     let journal_path = config_dir.join(APPLY_RECOVERY_JOURNAL);
     if !journal_path.exists() {
         return Ok(None);
@@ -189,11 +184,7 @@ pub(crate) fn config_apply_digest(
     agents: &[AgentConfig],
     building: &BuildingConfig,
 ) -> Result<String> {
-    let mut sorted_agents = agents.to_vec();
-    sorted_agents.sort_by_key(|config| config.identity.id);
-    let payload = serde_json::to_vec(&(sorted_agents, building))
-        .context("serialize canonical config apply digest payload")?;
-    Ok(format!("{:x}", Sha256::digest(payload)))
+    sentinel_limbo::runtime_config_apply_digest(agents, building)
 }
 
 fn validate_config_apply_journal(journal: &ConfigApplyRecoveryJournal) -> Result<()> {
@@ -235,13 +226,8 @@ pub fn publish_config_apply_participant(
             ConfigApplyParticipantPhase::PublishedOld,
         )
     };
-    persist_company_config(
-        config_dir,
-        agents,
-        building,
-        &label,
-    )
-    .context("publish config apply filesystem participant")?;
+    persist_company_config(config_dir, agents, building, &label)
+        .context("publish config apply filesystem participant")?;
     journal.participant_phase = phase;
     write_config_apply_journal(config_dir, &journal)
 }
@@ -535,10 +521,7 @@ mod tests {
         .unwrap();
 
         publish_config_apply_participant(cfg, "op-77", true).unwrap();
-        assert_eq!(
-            load_all_agents(&cfg.join("agents")).unwrap(),
-            staged_agents
-        );
+        assert_eq!(load_all_agents(&cfg.join("agents")).unwrap(), staged_agents);
         assert_eq!(
             BuildingConfig::load(&cfg.join("rooms.toml")).unwrap(),
             staged_building
@@ -610,10 +593,7 @@ mod tests {
         // Replaying the opposite durable decision converges all canonical
         // files even when the previous publication had already completed.
         publish_config_apply_participant(cfg, "op-partial", true).unwrap();
-        assert_eq!(
-            load_all_agents(&cfg.join("agents")).unwrap(),
-            staged_agents
-        );
+        assert_eq!(load_all_agents(&cfg.join("agents")).unwrap(), staged_agents);
         assert_eq!(
             BuildingConfig::load(&cfg.join("rooms.toml")).unwrap(),
             staged_building
@@ -667,6 +647,9 @@ mod tests {
             BuildingConfig::load(&cfg.join("rooms.toml")).unwrap(),
             old_building
         );
-        assert!(journal_path.exists(), "corrupt participant remains fail-closed");
+        assert!(
+            journal_path.exists(),
+            "corrupt participant remains fail-closed"
+        );
     }
 }

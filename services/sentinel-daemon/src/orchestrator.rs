@@ -13,6 +13,8 @@
 mod runtime_lifecycle;
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -37,7 +39,7 @@ use sentinel_ecs::{
     spawn_prepared_agent, ActionReceiver, LimboEventStore, PerceptionSender, SimulationTime,
 };
 use sentinel_hippocampus::{NMDA_CONSOLIDATION_THRESHOLD, NMDA_MAX_CONSOLIDATION_EPISODES};
-use sentinel_limbo::EventStore;
+use sentinel_limbo::{EventStore, RuntimeConfigApplyRecoveryStart};
 use sentinel_redb::StateStore;
 use sentinel_runtime::RuntimeOrchestrator;
 use sentinel_sandbox::{IsolationStatus, SandboxEnforcer, SandboxHandle, SandboxWarning};
@@ -327,12 +329,27 @@ impl DaemonNanoRuntimeRegistry {
         self.recovery_blocked_agents.insert(agent_id);
     }
 
+    fn block_all_for_recovery(&mut self, agent_ids: impl IntoIterator<Item = AgentId>) {
+        self.recovery_blocked_agents.extend(agent_ids);
+    }
+
     fn unblock_after_verified_recovery(&mut self, agent_id: AgentId) {
         self.recovery_blocked_agents.remove(&agent_id);
     }
 
     fn is_recovery_blocked(&self, agent_id: AgentId) -> bool {
         self.recovery_blocked_agents.contains(&agent_id)
+    }
+
+    #[cfg(test)]
+    fn recovery_blocked_agent_ids(&self) -> Vec<AgentId> {
+        let mut agent_ids = self
+            .recovery_blocked_agents
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        agent_ids.sort_by_key(|agent_id| agent_id.0);
+        agent_ids
     }
 
     fn validate_handle_for_config(
@@ -1298,15 +1315,150 @@ fn agents_for_prepared_residency(all: &[AgentConfig]) -> Vec<&AgentConfig> {
         .collect()
 }
 
-/// Automatic World work is opportunistically suppressed on followers. Every store
-/// still performs its own V19 begin/commit checks, so an authority change between
-/// this scheduling decision and a write remains fail closed. Explicit operator
-/// mutations deliberately bypass this scheduling predicate and reach their typed
-/// store rejection paths.
+/// World work is suppressed on followers and while local recovery has closed
+/// readiness. Every store still performs its own V19 begin/commit checks, so an
+/// authority change between this scheduling decision and a write remains fail closed.
 fn world_background_work_allowed(registry: &sentinel_common::OwnerRegistry) -> bool {
     registry
         .issue(sentinel_common::StateTransferScope::World)
         .is_ok()
+}
+
+fn unfenced_world_background_work_allowed(
+    registry: &sentinel_common::OwnerRegistry,
+    restore_fence: &RestoreFence,
+) -> bool {
+    !restore_fence.is_active() && world_background_work_allowed(registry)
+}
+
+fn reject_fenced_agent_lifecycle(
+    agent_id: u16,
+    response_tx: mpsc::SyncSender<AgentLifecycleResponse>,
+    action: &str,
+    outcome: &str,
+    note: &str,
+) {
+    let _ = response_tx.send(AgentLifecycleResponse {
+        accepted: false,
+        agent_id,
+        aggregate_id: format!("AGENT-{agent_id:02}"),
+        action: action.to_string(),
+        new_status: String::new(),
+        affected_pids: 0,
+        outcome: outcome.to_string(),
+        note: note.to_string(),
+    });
+}
+
+fn retain_read_only_or_reject_fenced_runtime_command(
+    command: RuntimeControlCommand,
+    current_shift: u8,
+    rejection_status: &str,
+    rejection_note: &str,
+) -> Option<RuntimeControlCommand> {
+    match command {
+        read_only @ RuntimeControlCommand::StateHash { .. } => Some(read_only),
+        RuntimeControlCommand::Reconcile {
+            request,
+            response_tx,
+        } => {
+            let _ = response_tx.send(RuntimeReconcileResponse {
+                accepted: false,
+                dry_run: request.dry_run,
+                current_shift,
+                repair_last_status: rejection_status.to_string(),
+                errors: vec![rejection_note.to_string()],
+                ..RuntimeReconcileResponse::default()
+            });
+            None
+        }
+        RuntimeControlCommand::AnalysisFloodTest {
+            request,
+            response_tx,
+        } => {
+            let _ = response_tx.send(RuntimeAnalysisFloodTestResponse {
+                accepted: false,
+                requested: request.count,
+                queue_depth: 0,
+                dropped_total: 0,
+                coalesced_total: 0,
+                enqueue_elapsed_us: 0,
+                enqueue_per_request_ns: 0,
+                note: rejection_note.to_string(),
+            });
+            None
+        }
+        RuntimeControlCommand::PanicTest {
+            request,
+            response_tx,
+        } => {
+            let _ = response_tx.send(RuntimePanicTestResponse {
+                accepted: false,
+                worker: request.worker,
+                note: rejection_note.to_string(),
+            });
+            None
+        }
+        RuntimeControlCommand::StallRestartTest {
+            request,
+            response_tx,
+        } => {
+            let _ = response_tx.send(RuntimeStallRestartTestResponse {
+                accepted: false,
+                agent_id: request.agent_id,
+                aggregate_id: format!("AGENT-{:02}", request.agent_id),
+                agent_name: String::new(),
+                mode: request.mode,
+                stall_secs: request.stall_secs,
+                pid_before: None,
+                pid_after: None,
+                runtime_present_after: false,
+                security_runtime_present_after: false,
+                bookkeeping_elapsed_ns: 0,
+                note: rejection_note.to_string(),
+            });
+            None
+        }
+        RuntimeControlCommand::Pause {
+            agent_id,
+            response_tx,
+        } => {
+            reject_fenced_agent_lifecycle(
+                agent_id,
+                response_tx,
+                "pause",
+                rejection_status,
+                rejection_note,
+            );
+            None
+        }
+        RuntimeControlCommand::Resume {
+            agent_id,
+            response_tx,
+        } => {
+            reject_fenced_agent_lifecycle(
+                agent_id,
+                response_tx,
+                "resume",
+                rejection_status,
+                rejection_note,
+            );
+            None
+        }
+        RuntimeControlCommand::Despawn {
+            agent_id,
+            response_tx,
+        } => {
+            reject_fenced_agent_lifecycle(
+                agent_id,
+                response_tx,
+                "despawn",
+                rejection_status,
+                rejection_note,
+            );
+            None
+        }
+    }
 }
 
 fn attempt_world_owned_runtime_snapshot<F>(
@@ -1333,14 +1485,26 @@ where
     attempt_world_owned_runtime_snapshot(registry, save)
 }
 
+fn attempt_shutdown_world_persistence<F>(
+    registry: &sentinel_common::OwnerRegistry,
+    restore_fence: &RestoreFence,
+    persist: F,
+) -> Option<anyhow::Result<()>>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    unfenced_world_background_work_allowed(registry, restore_fence).then(persist)
+}
+
 fn attempt_shutdown_runtime_snapshot<F>(
     registry: &sentinel_common::OwnerRegistry,
+    restore_fence: &RestoreFence,
     save: F,
 ) -> Option<anyhow::Result<()>>
 where
     F: FnOnce() -> anyhow::Result<()>,
 {
-    attempt_world_owned_runtime_snapshot(registry, save)
+    attempt_shutdown_world_persistence(registry, restore_fence, save)
 }
 
 fn rebuild_owner_registry_from_store(
@@ -1874,22 +2038,26 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // NanoRuntime spawn can become serving after a process restart.
     let startup_config_apply = reconcile_runtime_config_apply_recovery_marker(
         event_store.as_ref(),
-        &state_store,
-        fs_layer.as_deref(),
-        data_dir,
-        &data_dir.join("projection.db").to_string_lossy(),
-        &config.config_dir,
-        config.max_agents,
-        active_fs_mount.as_deref(),
-        &config.agent_command,
-        agent_validation,
+        &RuntimeConfigApplyStartupReconcileContext {
+            config_dir: &config.config_dir,
+            max_agents: config.max_agents,
+            fs_mount: active_fs_mount.as_deref(),
+            agent_command: &config.agent_command,
+            agent_validation,
+            #[cfg(test)]
+            abandoned_reconcile_observer: None,
+        },
     )
     .context("startup blocked by unresolved config apply recovery")?;
+    fence_owner_readiness_for_startup_config_apply(
+        sentinel_common::OwnerRegistry::global(),
+        startup_config_apply.is_some(),
+    );
     if startup_config_apply.is_some() {
         all_agents = load_all_agents_with_validation(&agents_dir, agent_validation)
             .context("reload authoritative roster after config apply recovery")?;
-        runtime_orch = RuntimeOrchestrator::new(config.max_agents)
-            .with_event_store(Arc::clone(&event_store));
+        runtime_orch =
+            RuntimeOrchestrator::new(config.max_agents).with_event_store(Arc::clone(&event_store));
     }
     let recovered_runtime_configs = reconcile_runtime_config_recovery_markers(
         event_store.as_ref(),
@@ -2321,6 +2489,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 perception_tx,
                 all_agents_clone,
                 startup_config_apply,
+                sentinel_common::OwnerRegistry::global(),
                 current_shift,
                 tick_rate,
                 time_scale,
@@ -2362,6 +2531,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 operator_auth_required,
                 ecs_fs_mount,
                 fs_layer.clone(),
+                #[cfg(test)]
+                None,
                 #[cfg(feature = "llm")]
                 platform_llm_analyzer.clone(),
             )
@@ -3270,6 +3441,45 @@ fn upsert_agent_projection_seed(
             now_ms,
         ],
     )?;
+    Ok(())
+}
+
+fn validate_agent_projection_identity(
+    projection_db_path: &std::path::Path,
+    agent_cfg: &AgentConfig,
+) -> Result<()> {
+    let db = sentinel_limbo::rusqlite::Connection::open_with_flags(
+        projection_db_path,
+        sentinel_limbo::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .with_context(|| {
+        format!(
+            "Projection DB read-only oeffnen: {}",
+            projection_db_path.display()
+        )
+    })?;
+    let mut statement =
+        db.prepare("SELECT name, role, shift_set FROM agent_live_view WHERE agent_id = ?1")?;
+    let rows = statement
+        .query_map(
+            sentinel_limbo::rusqlite::params![i64::from(agent_cfg.identity.id)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    anyhow::ensure!(
+        rows.len() == 1
+            && rows[0].0 == agent_cfg.identity.name
+            && rows[0].1 == agent_cfg.identity.role
+            && rows[0].2 == i64::from(agent_cfg.identity.shift_set),
+        "projection identity mismatch for AGENT-{:02}",
+        agent_cfg.identity.id
+    );
     Ok(())
 }
 
@@ -5039,21 +5249,43 @@ fn commit_world_restore_stores(
     })
 }
 
+fn load_bound_world_snapshot(
+    snapshot_id: &str,
+    expected_digest: Option<&str>,
+    event_store: &EventStore,
+) -> Result<sentinel_common::WorldSnapshot> {
+    let bytes = event_store
+        .load_world_snapshot(snapshot_id)?
+        .ok_or_else(|| anyhow!("Bound World Snapshot nicht gefunden: {snapshot_id}"))?;
+    if let Some(expected_digest) = expected_digest {
+        let actual_digest = format!("{:x}", Sha256::digest(&bytes));
+        anyhow::ensure!(
+            actual_digest == expected_digest,
+            "bound world snapshot digest conflict for {snapshot_id}"
+        );
+    }
+    let snapshot = sentinel_common::decode_world_snapshot(&bytes)
+        .with_context(|| format!("Bound World Snapshot dekodieren: {snapshot_id}"))?;
+    anyhow::ensure!(
+        snapshot.snapshot_id == snapshot_id,
+        "bound world snapshot identity conflict: row={snapshot_id} payload={}",
+        snapshot.snapshot_id
+    );
+    Ok(snapshot)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn rollback_world_restore_stores(
-    pre_snapshot_id: &str,
+fn restore_world_snapshot_stores(
+    snapshot_id: &str,
+    expected_digest: Option<&str>,
     world: &mut bevy_ecs::prelude::World,
     event_store: &Arc<EventStore>,
     state_store: &Arc<StateStore>,
     fs_layer: Option<&sentinel_fs::layer::LayerManager>,
     data_dir: &std::path::Path,
     projection_db_path: &str,
-) -> Result<()> {
-    let bytes = event_store
-        .load_world_snapshot(pre_snapshot_id)?
-        .ok_or_else(|| anyhow!("Pre-Restore Snapshot nicht gefunden: {pre_snapshot_id}"))?;
-    let snapshot = sentinel_common::decode_world_snapshot(&bytes)
-        .with_context(|| format!("Pre-Restore Snapshot dekodieren: {pre_snapshot_id}"))?;
+) -> Result<sentinel_common::WorldSnapshot> {
+    let snapshot = load_bound_world_snapshot(snapshot_id, expected_digest, event_store)?;
     if let Some(fs_metadata) = &snapshot.fs_metadata {
         validate_fs_metadata_blobs(data_dir, fs_metadata)?;
     }
@@ -5079,7 +5311,30 @@ fn rollback_world_restore_stores(
             .force_reset_offset(name, max_event_id)
             .with_context(|| format!("Rollback Projection-Offset fuer {name} setzen"))?;
     }
-    Ok(())
+    Ok(snapshot)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rollback_world_restore_stores(
+    pre_snapshot_id: &str,
+    world: &mut bevy_ecs::prelude::World,
+    event_store: &Arc<EventStore>,
+    state_store: &Arc<StateStore>,
+    fs_layer: Option<&sentinel_fs::layer::LayerManager>,
+    data_dir: &std::path::Path,
+    projection_db_path: &str,
+) -> Result<()> {
+    restore_world_snapshot_stores(
+        pre_snapshot_id,
+        None,
+        world,
+        event_store,
+        state_store,
+        fs_layer,
+        data_dir,
+        projection_db_path,
+    )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5634,18 +5889,79 @@ fn reconcile_runtime_config_recovery_markers(
     })
 }
 
+fn config_apply_snapshot_binding(
+    marker: &sentinel_limbo::RuntimeConfigApplyRecoveryMarker,
+) -> Result<(&str, &str)> {
+    match marker.decision {
+        sentinel_limbo::RuntimeConfigApplyDecision::Rollback => {
+            anyhow::ensure!(
+                !marker.pre_snapshot_id.is_empty(),
+                "config apply rollback snapshot id is missing"
+            );
+            let digest = marker.pre_snapshot_digest.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "legacy config apply pre-snapshot digest unavailable; manual recovery required"
+                )
+            })?;
+            Ok((&marker.pre_snapshot_id, digest))
+        }
+        sentinel_limbo::RuntimeConfigApplyDecision::Forward => {
+            let snapshot_id = marker
+                .applied_snapshot_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("committed config apply snapshot id is missing"))?;
+            let digest = marker
+                .applied_snapshot_digest
+                .as_deref()
+                .ok_or_else(|| anyhow!("committed config apply snapshot digest is missing"))?;
+            Ok((snapshot_id, digest))
+        }
+    }
+}
+
+fn validate_config_apply_snapshot_binding(
+    event_store: &EventStore,
+    marker: &sentinel_limbo::RuntimeConfigApplyRecoveryMarker,
+) -> Result<()> {
+    let (snapshot_id, expected_digest) = config_apply_snapshot_binding(marker)?;
+    let snapshot = load_bound_world_snapshot(snapshot_id, Some(expected_digest), event_store)
+        .context("validate bound config apply snapshot")?;
+    let expected_runtime_snapshots =
+        if marker.decision == sentinel_limbo::RuntimeConfigApplyDecision::Forward {
+            &marker.applied_runtime_snapshots
+        } else {
+            &marker.pre_runtime_snapshots
+        };
+    anyhow::ensure!(
+        snapshot.nano_runtime_snapshots.as_slice() == expected_runtime_snapshots.as_slice(),
+        "bound config apply runtime snapshot identity conflict"
+    );
+    Ok(())
+}
+
+struct RuntimeConfigApplyStartupReconcileContext<'a> {
+    config_dir: &'a std::path::Path,
+    max_agents: usize,
+    fs_mount: Option<&'a str>,
+    agent_command: &'a [String],
+    agent_validation: sentinel_common::agent_config::AgentConfigValidation,
+    #[cfg(test)]
+    abandoned_reconcile_observer: Option<&'a AtomicUsize>,
+}
+
 fn reconcile_runtime_config_apply_recovery_marker(
     event_store: &EventStore,
-    state_store: &Arc<StateStore>,
-    fs_layer: Option<&sentinel_fs::layer::LayerManager>,
-    data_dir: &std::path::Path,
-    projection_db_path: &str,
-    config_dir: &std::path::Path,
-    max_agents: usize,
-    fs_mount: Option<&str>,
-    agent_command: &[String],
-    agent_validation: sentinel_common::agent_config::AgentConfigValidation,
+    context: &RuntimeConfigApplyStartupReconcileContext<'_>,
 ) -> Result<Option<sentinel_limbo::RuntimeConfigApplyRecoveryMarker>> {
+    let RuntimeConfigApplyStartupReconcileContext {
+        config_dir,
+        max_agents,
+        fs_mount,
+        agent_command,
+        agent_validation,
+        #[cfg(test)]
+        abandoned_reconcile_observer,
+    } = context;
     let Some(marker) = event_store.runtime_config_apply_recovery()? else {
         if let Some(orphan) = crate::config_persist::load_config_apply_recovery(config_dir)? {
             anyhow::ensure!(
@@ -5661,22 +5977,22 @@ fn reconcile_runtime_config_apply_recovery_marker(
     let old_digest = config_apply_digest(&marker.old_agents, &marker.old_building)?;
     let staged_digest = config_apply_digest(&marker.staged_agents, &marker.staged_building)?;
     anyhow::ensure!(
-        marker.schema_version == 2
+        marker.schema_version == sentinel_limbo::RUNTIME_CONFIG_APPLY_SCHEMA_VERSION
             && marker.old_digest == old_digest
             && marker.staged_digest == staged_digest,
         "config apply recovery payload digest conflict"
     );
-
-    match crate::config_persist::load_config_apply_recovery(config_dir)? {
-        Some(participant) => {
-            anyhow::ensure!(
-                participant.op_id == marker.op_id
-                    && participant.old_digest == marker.old_digest
-                    && participant.staged_digest == marker.staged_digest,
-                "config apply filesystem participant conflicts with canonical saga"
-            );
-        }
-        None => crate::config_persist::stage_config_apply_recovery(
+    let participant = crate::config_persist::load_config_apply_recovery(config_dir)?;
+    if let Some(participant) = participant.as_ref() {
+        anyhow::ensure!(
+            participant.op_id == marker.op_id
+                && participant.old_digest == marker.old_digest
+                && participant.staged_digest == marker.staged_digest,
+            "config apply filesystem participant conflicts with canonical saga"
+        );
+    }
+    let rematerialize_participant = || {
+        crate::config_persist::stage_config_apply_recovery(
             config_dir,
             &marker.op_id,
             &marker.old_digest,
@@ -5687,10 +6003,13 @@ fn reconcile_runtime_config_apply_recovery_marker(
             &marker.staged_building,
             marker.started_tick,
         )
-        .context("rematerialize config apply filesystem participant")?,
-    }
+        .context("rematerialize config apply filesystem participant")
+    };
 
     if marker.phase == sentinel_limbo::RuntimeConfigApplyPhase::Finalized {
+        if participant.is_none() {
+            rematerialize_participant()?;
+        }
         crate::config_persist::publish_config_apply_participant(
             config_dir,
             &marker.op_id,
@@ -5700,7 +6019,13 @@ fn reconcile_runtime_config_apply_recovery_marker(
         return Ok(None);
     }
 
-    let mut runtimes = DaemonNanoRuntimeRegistry::production(max_agents.max(1), fs_mount)?;
+    validate_config_apply_snapshot_binding(event_store, &marker)
+        .context("validate config apply world snapshot before startup mutation")?;
+    if participant.is_none() {
+        rematerialize_participant()?;
+    }
+
+    let mut runtimes = DaemonNanoRuntimeRegistry::production((*max_agents).max(1), *fs_mount)?;
     let mut workloads = marker.old_agents.clone();
     workloads.extend(marker.staged_agents.clone());
     workloads.sort_by_key(|config| config.identity.id);
@@ -5708,22 +6033,13 @@ fn reconcile_runtime_config_apply_recovery_marker(
         !DaemonNanoRuntimeRegistry::workload_affecting_change(left, right, agent_command)
     });
     for config in &workloads {
+        #[cfg(test)]
+        if let Some(observer) = abandoned_reconcile_observer {
+            observer.fetch_add(1, Ordering::SeqCst);
+        }
         runtimes.reconcile_abandoned_config(config, agent_command)?;
     }
 
-    if marker.decision == sentinel_limbo::RuntimeConfigApplyDecision::Rollback {
-        let mut recovery_world = create_simulation_world().0;
-        rollback_world_restore_stores(
-            &marker.pre_snapshot_id,
-            &mut recovery_world,
-            &Arc::new(event_store.clone()),
-            state_store,
-            fs_layer,
-            data_dir,
-            projection_db_path,
-        )
-        .context("restore pre-apply files, ECS/redb, and projection before startup")?;
-    }
     crate::config_persist::publish_config_apply_participant(
         config_dir,
         &marker.op_id,
@@ -5736,11 +6052,8 @@ fn reconcile_runtime_config_apply_recovery_marker(
     } else {
         &marker.old_agents
     };
-    let loaded = load_all_agents_with_validation(
-        &config_dir.join("agents"),
-        agent_validation,
-    )
-    .context("reload canonical config apply participant")?;
+    let loaded = load_all_agents_with_validation(&config_dir.join("agents"), *agent_validation)
+        .context("reload canonical config apply participant")?;
     let expected_building =
         if marker.decision == sentinel_limbo::RuntimeConfigApplyDecision::Forward {
             &marker.staged_building
@@ -5762,7 +6075,7 @@ fn reconcile_runtime_config_apply_recovery_marker(
             "startup recovery prepared; serving remains fenced until runtime validation",
         )
         .context("persist startup config apply recovery fence")?;
-    Ok(event_store.runtime_config_apply_recovery()?)
+    event_store.runtime_config_apply_recovery()
 }
 
 fn validate_runtime_ownership_for_config_apply(
@@ -6023,6 +6336,7 @@ fn apply_runtime_changing_agent_update(
 fn compensate_config_apply_transaction(
     op_id: &str,
     pre_snapshot_id: &str,
+    pre_snapshot_digest: &str,
     pre_runtime_snapshots: &[sentinel_common::nano_runtime::NanoSnapshot],
     old_agents: &[AgentConfig],
     old_building: &sentinel_common::room::BuildingConfig,
@@ -6043,6 +6357,19 @@ fn compensate_config_apply_transaction(
     projection_db_path: &str,
     config_dir: &std::path::Path,
 ) -> Result<()> {
+    // Validate the immutable rollback authority before stopping or replacing a
+    // single runtime. A corrupt BLOB at the same snapshot ID cannot authorize
+    // partial compensation.
+    let pre_snapshot = load_bound_world_snapshot(
+        pre_snapshot_id,
+        Some(pre_snapshot_digest),
+        event_store.as_ref(),
+    )
+    .context("validate pre-apply snapshot before compensation")?;
+    anyhow::ensure!(
+        pre_snapshot.nano_runtime_snapshots.as_slice() == pre_runtime_snapshots,
+        "pre-apply runtime snapshot identity conflict before compensation"
+    );
     let mut current_ids = nano_runtimes.agent_ids();
     current_ids.extend(runtime_orch.agents().keys().copied());
     current_ids.extend(world_agent_ids(world));
@@ -6073,8 +6400,9 @@ fn compensate_config_apply_transaction(
         remove_security_runtime_snapshot(security_runtime_state, agent_id);
     }
 
-    rollback_world_restore_stores(
+    restore_world_snapshot_stores(
         pre_snapshot_id,
+        Some(pre_snapshot_digest),
         world,
         event_store,
         state_store,
@@ -6082,10 +6410,21 @@ fn compensate_config_apply_transaction(
         data_dir,
         projection_db_path,
     )
+    .map(|_| ())
     .context("restore pre-apply world/store/projection snapshot")?;
 
     let mut snapshots = pre_runtime_snapshots.to_vec();
     snapshots.sort_by_key(|snapshot| snapshot.agent_id.map(|agent_id| agent_id.0));
+    let mut expected_resident = HashSet::with_capacity(snapshots.len());
+    for snapshot in &snapshots {
+        let agent_id = snapshot
+            .agent_id
+            .ok_or_else(|| anyhow!("pre-apply runtime snapshot has no agent id"))?;
+        anyhow::ensure!(
+            expected_resident.insert(agent_id),
+            "duplicate pre-apply runtime snapshot for {agent_id}"
+        );
+    }
     for snapshot in snapshots {
         let agent_id = snapshot
             .agent_id
@@ -6114,11 +6453,46 @@ fn compensate_config_apply_transaction(
     crate::config_persist::publish_config_apply_participant(config_dir, op_id, false)
         .context("restore authoritative pre-apply config files")?;
 
+    let adapter_ids = nano_runtimes
+        .agent_ids()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let logical_ids = runtime_orch
+        .agents()
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    let ecs_ids = world_agent_ids(world).into_iter().collect::<HashSet<_>>();
+    let old_roster_ids = old_agents
+        .iter()
+        .map(|config| AgentId(config.identity.id))
+        .collect::<HashSet<_>>();
+    anyhow::ensure!(
+        adapter_ids == expected_resident,
+        "compensated adapter residency mismatch: expected={expected_resident:?} actual={adapter_ids:?}"
+    );
+    anyhow::ensure!(
+        logical_ids == expected_resident,
+        "compensated logical residency mismatch: expected={expected_resident:?} actual={logical_ids:?}"
+    );
+    anyhow::ensure!(
+        expected_resident.is_subset(&ecs_ids) && ecs_ids.is_subset(&old_roster_ids),
+        "compensated ECS roster mismatch: resident={expected_resident:?} old_roster={old_roster_ids:?} actual={ecs_ids:?}"
+    );
+
     for config in old_agents {
         let agent_id = AgentId(config.identity.id);
-        nano_runtimes
-            .validate_handle_for_config(config, agent_command)
-            .with_context(|| format!("validate compensated runtime for {agent_id}"))?;
+        if expected_resident.contains(&agent_id) {
+            nano_runtimes
+                .validate_handle_for_config(config, agent_command)
+                .with_context(|| format!("validate compensated runtime for {agent_id}"))?;
+        } else {
+            anyhow::ensure!(
+                nano_runtimes.handle(agent_id).is_none()
+                    && !runtime_orch.agents().contains_key(&agent_id),
+                "compensation invented nonresident runtime ownership for {agent_id}"
+            );
+        }
         if event_store
             .list_runtime_config_recoveries()?
             .iter()
@@ -6126,40 +6500,150 @@ fn compensate_config_apply_transaction(
         {
             event_store
                 .clear_runtime_config_recovery(agent_id)
-                .with_context(|| {
-                    format!("clear compensated per-agent recovery for {agent_id}")
-                })?;
+                .with_context(|| format!("clear compensated per-agent recovery for {agent_id}"))?;
         }
         nano_runtimes.unblock_after_verified_recovery(agent_id);
     }
 
     event_store
-        .finalize_runtime_config_apply(
-            op_id,
-            sentinel_limbo::RuntimeConfigApplyDecision::Rollback,
-        )
+        .finalize_runtime_config_apply(op_id, sentinel_limbo::RuntimeConfigApplyDecision::Rollback)
         .context("finalize compensated config apply decision")?;
     crate::config_persist::clear_config_apply_recovery(config_dir)
         .context("clear compensated config file recovery journal")?;
     Ok(())
 }
 
-fn fence_config_apply_recovery(
-    affected_agents: &[AgentConfig],
-    world: &mut bevy_ecs::prelude::World,
-    runtime_orch: &mut RuntimeOrchestrator,
-    nano_runtimes: &mut DaemonNanoRuntimeRegistry,
-    projection_db_path: &str,
-    restore_fence: &mut RestoreFence,
-) {
-    for config in affected_agents {
-        let agent_id = AgentId(config.identity.id);
-        nano_runtimes.block_for_recovery(agent_id);
-        let _ = runtime_orch.despawn_agent(agent_id);
-        despawn_agent_from_world(world, agent_id);
-        let _ = mark_agent_projection_recovery_required(projection_db_path, agent_id);
+struct ConfigApplyRecoveryFenceContext<'a> {
+    world: &'a mut bevy_ecs::prelude::World,
+    runtime_orch: &'a mut RuntimeOrchestrator,
+    sandbox: &'a SandboxEnforcer,
+    sandbox_handles: &'a mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &'a mut EbpfCollector,
+    agent_processes: &'a mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    nano_runtimes: &'a mut DaemonNanoRuntimeRegistry,
+    security_runtime_state: &'a operator_api::SharedSecurityRuntimeState,
+    projection_db_path: &'a str,
+    restore_fence: &'a mut RestoreFence,
+    owner_registry: &'a sentinel_common::OwnerRegistry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigApplyFailureMarker {
+    op_id: String,
+    decision: sentinel_limbo::RuntimeConfigApplyDecision,
+    phase: sentinel_limbo::RuntimeConfigApplyPhase,
+}
+
+impl From<sentinel_limbo::RuntimeConfigApplyRecoveryMarker> for ConfigApplyFailureMarker {
+    fn from(marker: sentinel_limbo::RuntimeConfigApplyRecoveryMarker) -> Self {
+        Self {
+            op_id: marker.op_id,
+            decision: marker.decision,
+            phase: marker.phase,
+        }
     }
-    restore_fence.begin();
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigApplyFailureDisposition {
+    Compensate,
+    Fence { reason: String },
+}
+
+impl ConfigApplyFailureDisposition {
+    fn should_compensate(&self) -> bool {
+        matches!(self, Self::Compensate)
+    }
+
+    fn should_fence(&self) -> bool {
+        matches!(self, Self::Fence { .. })
+    }
+
+    fn fence_reason(&self) -> Option<&str> {
+        match self {
+            Self::Compensate => None,
+            Self::Fence { reason } => Some(reason),
+        }
+    }
+}
+
+fn config_apply_failure_disposition(
+    expected_op_id: &str,
+    marker_read: Result<Option<ConfigApplyFailureMarker>>,
+) -> ConfigApplyFailureDisposition {
+    match marker_read {
+        Ok(Some(marker))
+            if marker.op_id == expected_op_id
+                && marker.decision == sentinel_limbo::RuntimeConfigApplyDecision::Rollback
+                && matches!(
+                    marker.phase,
+                    sentinel_limbo::RuntimeConfigApplyPhase::Prepared
+                        | sentinel_limbo::RuntimeConfigApplyPhase::RuntimesApplied
+                ) =>
+        {
+            ConfigApplyFailureDisposition::Compensate
+        }
+        Ok(Some(marker)) if marker.op_id != expected_op_id => {
+            ConfigApplyFailureDisposition::Fence {
+                reason: format!(
+                    "config-apply marker op_id mismatch: expected={expected_op_id} actual={}",
+                    marker.op_id
+                ),
+            }
+        }
+        Ok(Some(marker)) => ConfigApplyFailureDisposition::Fence {
+            reason: format!(
+                "config-apply marker is not rollback-safe: op_id={} decision={:?} phase={:?}",
+                marker.op_id, marker.decision, marker.phase
+            ),
+        },
+        Ok(None) => ConfigApplyFailureDisposition::Fence {
+            reason: "config-apply marker is missing".to_string(),
+        },
+        Err(error) => ConfigApplyFailureDisposition::Fence {
+            reason: format!("config-apply marker read failed: {error:#}"),
+        },
+    }
+}
+
+fn fence_config_apply_recovery(
+    old_agents: &[AgentConfig],
+    staged_agents: &[AgentConfig],
+    ctx: ConfigApplyRecoveryFenceContext<'_>,
+) {
+    let mut affected_agent_ids = old_agents
+        .iter()
+        .chain(staged_agents)
+        .map(|config| AgentId(config.identity.id))
+        .collect::<Vec<_>>();
+    affected_agent_ids.sort_by_key(|agent_id| agent_id.0);
+    affected_agent_ids.dedup();
+
+    ctx.nano_runtimes
+        .block_all_for_recovery(affected_agent_ids.iter().copied());
+    ctx.restore_fence.begin();
+    ctx.owner_registry.close_owner_readiness();
+
+    for agent_id in affected_agent_ids {
+        if let Err(error) = stop_agent_runtime_layer(
+            agent_id,
+            ctx.nano_runtimes,
+            ctx.sandbox,
+            ctx.sandbox_handles,
+            ctx.ebpf_collector,
+            ctx.agent_processes,
+        ) {
+            error!(
+                %agent_id,
+                error = %error,
+                "Config-Apply recovery fence retained a runtime handle for startup retry"
+            );
+        }
+        let _ = ctx.runtime_orch.despawn_agent(agent_id);
+        despawn_agent_from_world(ctx.world, agent_id);
+        remove_security_runtime_snapshot(ctx.security_runtime_state, agent_id);
+        let _ = mark_agent_projection_recovery_required(ctx.projection_db_path, agent_id);
+    }
 }
 
 /// ECS Tick-Loop auf dediziertem Thread.
@@ -6403,6 +6887,27 @@ fn run_provision_worker(
 }
 
 /// Speichert Runtime-Snapshot vor Beendigung (AC-4).
+#[cfg(test)]
+#[derive(Default)]
+struct StartupConfigApplyTestProbe {
+    world_observer: Option<mpsc::SyncSender<sentinel_common::EcsSnapshot>>,
+    blocked_observer: Option<mpsc::SyncSender<Vec<AgentId>>>,
+    residency_observer: Option<mpsc::SyncSender<(Vec<AgentId>, Vec<AgentId>)>>,
+    readiness_before_open_observer: Option<mpsc::SyncSender<bool>>,
+    fail_validation_for: Option<AgentId>,
+    fence_after_first_restore_command: bool,
+    restore_queue_observer: Option<mpsc::Sender<(usize, bool)>>,
+}
+
+fn fence_owner_readiness_for_startup_config_apply(
+    owner_registry: &sentinel_common::OwnerRegistry,
+    recovery_required: bool,
+) {
+    if recovery_required {
+        owner_registry.close_owner_readiness();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ecs_tick_loop(
     state_store: Arc<StateStore>,
@@ -6414,6 +6919,7 @@ fn ecs_tick_loop(
     perception_tx: mpsc::SyncSender<Perception>,
     mut all_agents: Vec<AgentConfig>,
     startup_config_apply: Option<sentinel_limbo::RuntimeConfigApplyRecoveryMarker>,
+    owner_registry: &sentinel_common::OwnerRegistry,
     initial_shift: u8,
     tick_rate: Duration,
     time_scale: f32,
@@ -6455,6 +6961,7 @@ fn ecs_tick_loop(
     operator_auth_required: bool,
     fs_mount: Option<String>,
     fs_layer: Option<Arc<sentinel_fs::layer::LayerManager>>,
+    #[cfg(test)] startup_config_apply_probe: Option<StartupConfigApplyTestProbe>,
     #[cfg(feature = "llm")]
     platform_llm_analyzer: crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle,
 ) -> Result<u64> {
@@ -6634,6 +7141,32 @@ fn ecs_tick_loop(
     );
     world.insert_resource(sentinel_ecs::ToolRuntimeResource(tool_runtime));
 
+    let startup_bound_world_snapshot = if let Some(marker) = startup_config_apply.as_ref() {
+        let (snapshot_id, expected_digest) = config_apply_snapshot_binding(marker)?;
+        let data_dir = std::path::Path::new(&events_db_path_str)
+            .parent()
+            .unwrap_or(std::path::Path::new("/opt/sentinel/data"));
+        let snapshot = restore_world_snapshot_stores(
+            snapshot_id,
+            Some(expected_digest),
+            &mut world,
+            &event_store,
+            &state_store_for_sim,
+            fs_layer.as_deref(),
+            data_dir,
+            &projection_db_path,
+        )
+        .with_context(|| {
+            format!(
+                "restore {:?} config apply snapshot into the serving ECS world",
+                marker.decision
+            )
+        })?;
+        Some(snapshot)
+    } else {
+        None
+    };
+
     // -- Production NanoRuntime selection (DEV-007: explicit bwrap fallback) --
     let mut nano_runtimes =
         DaemonNanoRuntimeRegistry::production(all_agents.len().max(1), fs_mount.as_deref())?;
@@ -6659,7 +7192,7 @@ fn ecs_tick_loop(
         .map(|agent| AgentId(agent.identity.id))
         .collect();
 
-    if is_restored {
+    if is_restored && startup_config_apply.is_none() {
         // Nach Restore: Shift-Transition durchfuehren falls Schicht gewechselt hat
         // (z.B. Daemon um 13:59 gestoppt, um 14:05 neu gestartet)
         let removed = runtime_orch.shift_transition_except(initial_shift, &prepared_agent_ids);
@@ -6690,16 +7223,23 @@ fn ecs_tick_loop(
         runtime_orch
             .install_prepared_agent(identity, shift)
             .with_context(|| format!("materialize frozen prepared target {agent_id}"))?;
-        let entity = spawn_prepared_agent(
-            &mut world,
-            agent_id,
-            &agent_cfg.identity.name,
-            &agent_cfg.identity.role,
-            agent_cfg.identity.shift_set,
-            &agent_cfg.preferences.favorite_room,
-        );
-        apply_personality(&mut world, entity, &agent_cfg.personality);
-        sentinel_ecs::apply_capabilities(&mut world, entity, &agent_cfg.capabilities);
+        if startup_config_apply.is_some() {
+            anyhow::ensure!(
+                crate::config_apply::find_agent_entity(&mut world, agent_id).is_some(),
+                "startup config apply snapshot is missing prepared ECS state for {agent_id}"
+            );
+        } else {
+            let entity = spawn_prepared_agent(
+                &mut world,
+                agent_id,
+                &agent_cfg.identity.name,
+                &agent_cfg.identity.role,
+                agent_cfg.identity.shift_set,
+                &agent_cfg.preferences.favorite_room,
+            );
+            apply_personality(&mut world, entity, &agent_cfg.personality);
+            sentinel_ecs::apply_capabilities(&mut world, entity, &agent_cfg.capabilities);
+        }
     }
 
     // Active agents: Orchestrator registers (unless restored), ECS creates the entity,
@@ -6725,8 +7265,28 @@ fn ecs_tick_loop(
                 "startup config apply recovery has duplicate snapshot for {agent_id}"
             );
         }
+        nano_runtimes.block_all_for_recovery(startup_runtime_snapshots.keys().copied());
     }
-    for agent_cfg in &shift_agents {
+    let startup_active_agents = if startup_config_apply.is_some() {
+        let mut configs = startup_runtime_snapshots
+            .keys()
+            .map(|agent_id| {
+                all_agents
+                    .iter()
+                    .find(|config| config.identity.id == agent_id.0)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "startup config apply runtime snapshot has no config for {agent_id}"
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        configs.sort_by_key(|config| config.identity.id);
+        configs
+    } else {
+        shift_agents.clone()
+    };
+    for agent_cfg in &startup_active_agents {
         let agent_id = AgentId(agent_cfg.identity.id);
 
         if startup_config_apply.is_some() {
@@ -6812,17 +7372,23 @@ fn ecs_tick_loop(
             );
         }
 
-        // ECS Entity erstellen
-        let entity = spawn_agent(
-            &mut world,
-            agent_id,
-            &agent_cfg.identity.name,
-            &agent_cfg.identity.role,
-            agent_cfg.identity.shift_set,
-            &agent_cfg.preferences.favorite_room,
-        );
-        apply_personality(&mut world, entity, &agent_cfg.personality);
-        sentinel_ecs::apply_capabilities(&mut world, entity, &agent_cfg.capabilities);
+        if startup_config_apply.is_some() {
+            anyhow::ensure!(
+                crate::config_apply::find_agent_entity(&mut world, agent_id).is_some(),
+                "startup config apply snapshot is missing active ECS state for {agent_id}"
+            );
+        } else {
+            let entity = spawn_agent(
+                &mut world,
+                agent_id,
+                &agent_cfg.identity.name,
+                &agent_cfg.identity.role,
+                agent_cfg.identity.shift_set,
+                &agent_cfg.preferences.favorite_room,
+            );
+            apply_personality(&mut world, entity, &agent_cfg.personality);
+            sentinel_ecs::apply_capabilities(&mut world, entity, &agent_cfg.capabilities);
+        }
     }
     anyhow::ensure!(
         startup_runtime_snapshots.is_empty(),
@@ -6831,18 +7397,34 @@ fn ecs_tick_loop(
     );
 
     if let Some(marker) = startup_config_apply.as_ref() {
-        let expected_snapshots = if marker.decision
-            == sentinel_limbo::RuntimeConfigApplyDecision::Forward
-        {
-            &marker.applied_runtime_snapshots
-        } else {
-            &marker.pre_runtime_snapshots
-        };
+        let mut expected_ecs_ids = startup_bound_world_snapshot
+            .as_ref()
+            .expect("startup config apply snapshot was restored")
+            .ecs
+            .identities
+            .iter()
+            .map(|(_, identity)| identity.agent_id)
+            .collect::<Vec<_>>();
+        expected_ecs_ids.sort_by_key(|agent_id| agent_id.0);
+        expected_ecs_ids.dedup();
+        let mut actual_ecs_ids = world_agent_ids(&mut world);
+        actual_ecs_ids.sort_by_key(|agent_id| agent_id.0);
+        anyhow::ensure!(
+            actual_ecs_ids == expected_ecs_ids,
+            "startup config apply ECS residency mismatch: expected={expected_ecs_ids:?} actual={actual_ecs_ids:?}"
+        );
+        let expected_snapshots =
+            if marker.decision == sentinel_limbo::RuntimeConfigApplyDecision::Forward {
+                &marker.applied_runtime_snapshots
+            } else {
+                &marker.pre_runtime_snapshots
+            };
         let expected_snapshot_ids = expected_snapshots
             .iter()
             .filter_map(|snapshot| snapshot.agent_id)
             .collect::<HashSet<_>>();
-        for agent_cfg in &shift_agents {
+        let mut recovered_agent_ids = Vec::with_capacity(startup_active_agents.len());
+        for agent_cfg in &startup_active_agents {
             let agent_id = AgentId(agent_cfg.identity.id);
             nano_runtimes
                 .validate_handle_for_config(agent_cfg, &agent_command)
@@ -6866,27 +7448,130 @@ fn ecs_tick_loop(
                     "startup config apply recovery snapshot binding mismatch for {agent_id}"
                 );
             }
-            let last_event_id = event_store.get_latest_event_id().unwrap_or_default();
-            upsert_agent_projection_seed(
+            #[cfg(test)]
+            if startup_config_apply_probe
+                .as_ref()
+                .is_some_and(|probe| probe.fail_validation_for == Some(agent_id))
+            {
+                if let Some(observer) = startup_config_apply_probe
+                    .as_ref()
+                    .and_then(|probe| probe.blocked_observer.as_ref())
+                {
+                    observer
+                        .send(nano_runtimes.recovery_blocked_agent_ids())
+                        .context("report startup recovery latch state to test observer")?;
+                }
+                anyhow::bail!("injected startup config apply validation failure for {agent_id}");
+            }
+            validate_agent_projection_identity(
                 std::path::Path::new(&projection_db_path),
                 agent_cfg,
-                last_event_id,
             )
             .with_context(|| {
                 format!("startup config apply recovery projection validation for {agent_id}")
             })?;
-            nano_runtimes.unblock_after_verified_recovery(agent_id);
+            recovered_agent_ids.push(agent_id);
         }
         crate::config_persist::clear_config_apply_recovery(&config_dir)
             .context("finalize startup config apply filesystem participant")?;
         event_store
             .finalize_runtime_config_apply(&marker.op_id, marker.decision)
             .context("finalize startup config apply canonical decision")?;
+        for agent_id in recovered_agent_ids {
+            nano_runtimes.unblock_after_verified_recovery(agent_id);
+        }
         info!(
             op_id = %marker.op_id,
             decision = ?marker.decision,
             "Startup config apply recovery fully validated and finalized"
         );
+
+        // The snapshot is the recovery authority. Only after its saga is fully
+        // finalized may current wall-clock shift policy replace that residency.
+        let desired_shift_ids = shift_agents
+            .iter()
+            .map(|config| AgentId(config.identity.id))
+            .collect::<HashSet<_>>();
+        let snapshot_resident_ids = world_agent_ids(&mut world);
+        for agent_id in snapshot_resident_ids {
+            if !desired_shift_ids.contains(&agent_id) && !prepared_agent_ids.contains(&agent_id) {
+                teardown_agent_full(
+                    agent_id,
+                    &mut world,
+                    &mut runtime_orch,
+                    &sandbox,
+                    &mut sandbox_handles,
+                    &mut ebpf_collector,
+                    &mut agent_processes,
+                    &mut nano_runtimes,
+                    &security_runtime_state,
+                )
+                .with_context(|| {
+                    format!("reconcile recovered runtime {agent_id} to current shift")
+                })?;
+            }
+        }
+        for agent_cfg in &shift_agents {
+            let agent_id = AgentId(agent_cfg.identity.id);
+            if nano_runtimes.handle(agent_id).is_none() {
+                if crate::config_apply::find_agent_entity(&mut world, agent_id).is_some() {
+                    despawn_agent_from_world(&mut world, agent_id);
+                }
+                anyhow::ensure!(
+                    spawn_agent_full(
+                        &mut runtime_orch,
+                        &mut world,
+                        agent_cfg,
+                        &sandbox,
+                        &mut sandbox_handles,
+                        &mut ebpf_collector,
+                        &mut agent_processes,
+                        &mut nano_runtimes,
+                        &agent_command,
+                        &security_runtime_state,
+                        event_store_for_isolation.as_ref(),
+                        fs_mount.as_deref(),
+                    ),
+                    "spawn current-shift runtime {agent_id} after config apply recovery"
+                );
+            }
+        }
+    }
+    #[cfg(test)]
+    if let Some(observer) = startup_config_apply_probe
+        .as_ref()
+        .and_then(|probe| probe.residency_observer.as_ref())
+    {
+        let mut adapter_ids = nano_runtimes.agent_ids();
+        adapter_ids.sort_by_key(|agent_id| agent_id.0);
+        let mut logical_ids = runtime_orch.agents().keys().copied().collect::<Vec<_>>();
+        logical_ids.sort_by_key(|agent_id| agent_id.0);
+        observer
+            .send((adapter_ids, logical_ids))
+            .context("report startup runtime residency to test observer")?;
+    }
+    #[cfg(test)]
+    if let Some(observer) = startup_config_apply_probe
+        .as_ref()
+        .and_then(|probe| probe.world_observer.as_ref())
+    {
+        observer
+            .send(sentinel_ecs::snapshot_ecs_state(&mut world))
+            .context("report startup serving-world snapshot to test observer")?;
+    }
+    #[cfg(test)]
+    if let Some(observer) = startup_config_apply_probe
+        .as_ref()
+        .and_then(|probe| probe.readiness_before_open_observer.as_ref())
+    {
+        observer
+            .send(owner_registry.owner_readiness())
+            .context("report owner readiness immediately before verified recovery opens it")?;
+    }
+    if startup_config_apply.is_some() {
+        owner_registry
+            .reopen_owner_readiness_after_verified_local_recovery()
+            .context("re-open owner readiness after verified config apply recovery")?;
     }
 
     // GOLF: Default-Goals fuer alle gespawnten Agents erstellen
@@ -6989,8 +7674,8 @@ fn ecs_tick_loop(
         // therefore happen strictly between ECS ticks, while closing readiness still
         // prevents normal guards from being minted or committed against either view.
         let owner_tick_barrier = sentinel_common::owner_tick_barrier();
-        let world_background_allowed =
-            world_background_work_allowed(sentinel_common::OwnerRegistry::global());
+        let world_owner_allowed = world_background_work_allowed(owner_registry);
+        let world_background_allowed = !restore_fence.is_active() && world_owner_allowed;
 
         if world_background_allowed {
             if let Some(rx) = evolution_result_rx.as_ref() {
@@ -7046,8 +7731,11 @@ fn ecs_tick_loop(
             }
         }
 
-        // RuntimeOrchestrator Tick synchronisieren
-        runtime_orch.set_tick(tick_count);
+        // RuntimeOrchestrator Tick synchronisieren. A fenced World does not
+        // advance either the ECS or logical-runtime clock.
+        if world_background_allowed {
+            runtime_orch.set_tick(tick_count);
+        }
 
         // ECS Schedule ausfuehren (alle 12 Systems in Reihenfolge)
         if world_background_allowed {
@@ -7089,6 +7777,13 @@ fn ecs_tick_loop(
         }
 
         while let Ok(command) = platform_rx.try_recv() {
+            if !world_background_allowed {
+                warn!(
+                    command = ?command,
+                    "Queued platform mutation dropped without effect while World is fenced"
+                );
+                continue;
+            }
             info!(command = ?command, "Platform-Controlplane Trigger empfangen");
             match command {
                 crate::platform_controlplane::PlatformControlCommand::AnalyzeNow => platform_cp
@@ -7116,6 +7811,26 @@ fn ecs_tick_loop(
         }
 
         while let Ok(command) = runtime_rx.try_recv() {
+            let command = if world_background_allowed {
+                Some(command)
+            } else if world_owner_allowed {
+                retain_read_only_or_reject_fenced_runtime_command(
+                    command,
+                    current_shift,
+                    "restore_fence_active",
+                    "Runtime mutation is blocked while restore recovery is active",
+                )
+            } else {
+                retain_read_only_or_reject_fenced_runtime_command(
+                    command,
+                    current_shift,
+                    "world_authority_unavailable",
+                    "World mutation authority is unavailable on this node",
+                )
+            };
+            let Some(command) = command else {
+                continue;
+            };
             match command {
                 RuntimeControlCommand::Reconcile {
                     request,
@@ -7597,7 +8312,7 @@ fn ecs_tick_loop(
         }
 
         // Platform-Controlplane: Self-Healing (alle N Ticks)
-        if !restore_fence.is_active()
+        if world_background_allowed
             && sentinel_common::feature_flags::RuntimeFlags::global().platform_controlplane_enabled
             && platform_cp.should_run(tick_count)
         {
@@ -7748,11 +8463,13 @@ fn ecs_tick_loop(
                 }
             }
         }
-        if should_run_periodic_runtime_reconcile_unfenced(
-            platform_cp.config(),
-            tick_count,
-            &restore_fence,
-        ) {
+        if world_background_allowed
+            && should_run_periodic_runtime_reconcile_unfenced(
+                platform_cp.config(),
+                tick_count,
+                &restore_fence,
+            )
+        {
             let request = periodic_runtime_reconcile_request(platform_cp.config());
             let response = execute_runtime_reconcile(
                 tick_count,
@@ -7827,13 +8544,16 @@ fn ecs_tick_loop(
 
         // Prune: Empfange Cutoff von Operator-API, arbeite 1 Batch/Tick ab
         while let Ok(cutoff) = prune_rx.try_recv() {
-            if restore_fence.is_active() {
-                warn!(cutoff, "Prune waehrend Restore-Fence blockiert");
+            if !world_background_allowed {
+                warn!(
+                    cutoff,
+                    "Queued prune mutation dropped without effect while World is fenced"
+                );
             } else {
                 snapshot_manager.start_prune(cutoff);
             }
         }
-        if !restore_fence.is_active() {
+        if world_background_allowed {
             snapshot_manager.prune_tick(&event_store_for_prune, tick_count);
         }
 
@@ -8321,6 +9041,10 @@ fn ecs_tick_loop(
 
         // Nightrun-Trigger verarbeiten (via Operator-API)
         while let Ok(nightrun_cmd) = nightrun_rx.try_recv() {
+            if !world_background_allowed {
+                warn!("Queued nightrun mutation dropped without effect while World is fenced");
+                continue;
+            }
             info!(
                 shift_set = ?nightrun_cmd.shift_set,
                 dry_run = nightrun_cmd.dry_run,
@@ -8688,8 +9412,8 @@ fn ecs_tick_loop(
 
         // Time Machine: Manuelle Snapshot-Trigger via Operator-API
         while let Ok(_snap_cmd) = snapshot_rx.try_recv() {
-            if restore_fence.is_active() {
-                warn!("Manueller Snapshot waehrend Restore-Fence blockiert");
+            if !world_background_allowed {
+                warn!("Queued manual snapshot dropped without effect while World is fenced");
                 continue;
             }
             let event_store_for_snap = world
@@ -8723,7 +9447,28 @@ fn ecs_tick_loop(
         }
 
         // Time Machine: Hot-Swap Restore via Operator-API
+        #[cfg(test)]
+        let mut restore_commands_started = 0usize;
         while let Ok(restore_cmd) = restore_rx.try_recv() {
+            if !unfenced_world_background_work_allowed(owner_registry, &restore_fence) {
+                warn!(
+                    cmd = ?restore_cmd,
+                    "Queued restore mutation dropped without effect while World is fenced"
+                );
+                continue;
+            }
+            #[cfg(test)]
+            {
+                restore_commands_started += 1;
+                if startup_config_apply_probe
+                    .as_ref()
+                    .is_some_and(|probe| probe.fence_after_first_restore_command)
+                    && restore_commands_started == 1
+                {
+                    restore_fence.begin();
+                    continue;
+                }
+            }
             info!(cmd = ?restore_cmd, "Hot-Swap Restore gestartet");
             let event_store_for_restore = world
                 .get_resource::<sentinel_ecs::LimboEventStore>()
@@ -8772,12 +9517,19 @@ fn ecs_tick_loop(
                 error!("Hot-Swap Restore nicht moeglich: EventStore oder StateStore fehlt");
             }
         }
+        #[cfg(test)]
+        if let Some(observer) = startup_config_apply_probe
+            .as_ref()
+            .and_then(|probe| probe.restore_queue_observer.as_ref())
+        {
+            let _ = observer.send((restore_commands_started, restore_fence.is_active()));
+        }
 
         // Runtime Config-Apply (#425): Firma zur Laufzeit aendern — Live-Diff oder Fresh-Load.
         // Laeuft zwischen Ticks (nach schedule.run) → tick-synchron.
         while let Ok(apply_cmd) = config_apply_rx.try_recv() {
-            if restore_fence.is_active() {
-                warn!("Config-Apply waehrend Restore-Fence blockiert");
+            if !unfenced_world_background_work_allowed(owner_registry, &restore_fence) {
+                warn!("Queued config apply mutation dropped without effect while World is fenced");
                 continue;
             }
             // Defensive Re-Validierung (Endpoint hat bereits 4xx geliefert; hier nur Schutz).
@@ -8831,6 +9583,7 @@ fn ecs_tick_loop(
                         continue;
                     }
                 };
+            let recovery_old_agents = all_agents.clone();
             if let Err(error) =
                 validate_runtime_ownership_for_config_apply(&runtime_orch, &nano_runtimes)
             {
@@ -8868,6 +9621,24 @@ fn ecs_tick_loop(
                 }
             };
             info!(snapshot_id = %pre_apply_snapshot, "Pre-Apply Safety-Snapshot erstellt");
+            let pre_snapshot_digest = match es.load_world_snapshot(&pre_apply_snapshot) {
+                Ok(Some(bytes)) => format!("{:x}", Sha256::digest(bytes)),
+                Ok(None) => {
+                    error!(
+                        snapshot_id = %pre_apply_snapshot,
+                        "Config-Apply fail-closed: durable Pre-Apply snapshot disappeared"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    error!(
+                        snapshot_id = %pre_apply_snapshot,
+                        error = %error,
+                        "Config-Apply fail-closed: durable Pre-Apply snapshot readback failed"
+                    );
+                    continue;
+                }
+            };
             let op_id = uuid::Uuid::now_v7().to_string();
             let old_digest = match config_apply_digest(&all_agents, &old_building) {
                 Ok(digest) => digest,
@@ -8876,17 +9647,16 @@ fn ecs_tick_loop(
                     continue;
                 }
             };
-            let staged_digest =
-                match config_apply_digest(&apply_cmd.agents, &apply_cmd.building) {
-                    Ok(digest) => digest,
-                    Err(error) => {
-                        error!(
-                            error = %error,
-                            "Config-Apply fail-closed: staged config digest failed"
-                        );
-                        continue;
-                    }
-                };
+            let staged_digest = match config_apply_digest(&apply_cmd.agents, &apply_cmd.building) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    error!(
+                        error = %error,
+                        "Config-Apply fail-closed: staged config digest failed"
+                    );
+                    continue;
+                }
+            };
             if let Err(error) = crate::config_persist::stage_config_apply_recovery(
                 &config_dir,
                 &op_id,
@@ -8904,18 +9674,21 @@ fn ecs_tick_loop(
                 );
                 continue;
             }
-            if let Err(error) = es.begin_runtime_config_apply_recovery(
-                &op_id,
-                &old_digest,
-                &staged_digest,
-                &all_agents,
-                &apply_cmd.agents,
-                &old_building,
-                &apply_cmd.building,
-                &pre_apply_snapshot,
-                &pre_runtime_snapshots,
-                tick_count,
-            ) {
+            if let Err(error) =
+                es.begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                    op_id: &op_id,
+                    old_digest: &old_digest,
+                    staged_digest: &staged_digest,
+                    old_agents: &all_agents,
+                    staged_agents: &apply_cmd.agents,
+                    old_building: &old_building,
+                    staged_building: &apply_cmd.building,
+                    pre_snapshot_id: &pre_apply_snapshot,
+                    pre_snapshot_digest: &pre_snapshot_digest,
+                    pre_runtime_snapshots: &pre_runtime_snapshots,
+                    started_tick: tick_count,
+                })
+            {
                 error!(
                     error = %error,
                     "Config-Apply fail-closed: durable transaction marker failed"
@@ -9150,9 +9923,9 @@ fn ecs_tick_loop(
                             &security_runtime_state,
                         ) {
                             Ok(_) => {
-                            if let Err(error) =
-                                es.record_runtime_config_apply_stop(&op_id, *agent_id)
-                            {
+                                if let Err(error) =
+                                    es.record_runtime_config_apply_stop(&op_id, *agent_id)
+                                {
                                     lifecycle_errors.push(format!(
                                         "{agent_id}: durable stop journal failed: {error:#}"
                                     ));
@@ -9181,17 +9954,37 @@ fn ecs_tick_loop(
                 let applied_runtime_snapshots = nano_runtimes
                     .snapshot_all()
                     .context("snapshot applied runtime set before commit decision")?;
+                let applied_snapshot_id = snapshot_manager
+                    .create_and_store(
+                        &mut world,
+                        &ss,
+                        &es,
+                        data_dir,
+                        fs_layer.as_deref(),
+                        fs_mount.as_deref(),
+                        tick_count,
+                        sim_hour,
+                        applied_runtime_snapshots.clone(),
+                    )
+                    .context("persist post-apply world snapshot before forward decision")?;
+                let applied_snapshot_bytes = es
+                    .load_world_snapshot(&applied_snapshot_id)?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "post-apply world snapshot disappeared before decision: {applied_snapshot_id}"
+                        )
+                    })?;
+                let applied_snapshot_digest =
+                    format!("{:x}", Sha256::digest(&applied_snapshot_bytes));
                 es.mark_runtime_config_apply_runtimes_applied(
                     &op_id,
+                    &applied_snapshot_id,
+                    &applied_snapshot_digest,
                     &applied_runtime_snapshots,
                 )
-                .context("persist RUNTIMES_APPLIED phase")?;
-                crate::config_persist::publish_config_apply_participant(
-                    &config_dir,
-                    &op_id,
-                    true,
-                )
-                .context("publish staged config filesystem participant")?;
+                .context("persist RUNTIMES_APPLIED phase and world snapshot binding")?;
+                crate::config_persist::publish_config_apply_participant(&config_dir, &op_id, true)
+                    .context("publish staged config filesystem participant")?;
 
                 let payload = DomainEventPayload::ConfigApplied {
                     mode: format!("{mode:?}").to_lowercase(),
@@ -9215,44 +10008,69 @@ fn ecs_tick_loop(
             })();
 
             if let Err(transition_error) = transition {
-                let committed_forward = es
-                    .runtime_config_apply_recovery()
-                    .ok()
-                    .flatten()
-                    .is_some_and(|marker| {
-                        marker.op_id == op_id
-                            && marker.decision
-                                == sentinel_limbo::RuntimeConfigApplyDecision::Forward
-                    });
-                if committed_forward {
+                let disposition = config_apply_failure_disposition(
+                    &op_id,
+                    es.runtime_config_apply_recovery()
+                        .map(|marker| marker.map(ConfigApplyFailureMarker::from)),
+                );
+                if disposition.should_fence() {
+                    let disposition_reason = disposition
+                        .fence_reason()
+                        .expect("fencing disposition must carry a reason");
+                    error!(
+                        error = %transition_error,
+                        reason = %disposition_reason,
+                        "Config-Apply transition outcome is not safe to compensate"
+                    );
                     let marker = es.mark_runtime_config_apply_recovery_required(
                         &op_id,
-                        &format!(
-                            "forward decision committed but caller observed an error: {transition_error:#}"
-                        ),
+                        &format!("{disposition_reason}; caller observed: {transition_error:#}"),
                     );
+                    match &marker {
+                        Ok(()) => error!(
+                            error = %transition_error,
+                            reason = %disposition_reason,
+                            "Config-Apply RecoveryRequired phase recorded; daemon remains fenced"
+                        ),
+                        Err(marker_error) => error!(
+                            marker_error = %marker_error,
+                            reason = %disposition_reason,
+                            "Config-Apply RecoveryRequired phase write failed; the durable active saga remains unresolved"
+                        ),
+                    }
                     fence_config_apply_recovery(
+                        &recovery_old_agents,
                         &apply_cmd.agents,
-                        &mut world,
-                        &mut runtime_orch,
-                        &mut nano_runtimes,
-                        &projection_db_path,
-                        &mut restore_fence,
+                        ConfigApplyRecoveryFenceContext {
+                            world: &mut world,
+                            runtime_orch: &mut runtime_orch,
+                            sandbox: &sandbox,
+                            sandbox_handles: &mut sandbox_handles,
+                            ebpf_collector: &mut ebpf_collector,
+                            agent_processes: &mut agent_processes,
+                            nano_runtimes: &mut nano_runtimes,
+                            security_runtime_state: &security_runtime_state,
+                            projection_db_path: &projection_db_path,
+                            restore_fence: &mut restore_fence,
+                            owner_registry,
+                        },
                     );
                     error!(
                         error = %transition_error,
                         marker = ?marker,
-                        "Config-Apply forward decision is durable; startup must finalize"
+                        "Config-Apply transition remains unresolved; startup must reconcile"
                     );
                     continue;
                 }
+                debug_assert!(disposition.should_compensate());
                 error!(
                     error = %transition_error,
-                    "Config-Apply failed; compensating the complete transaction"
+                    "Config-Apply failed with an exact rollback-safe marker; compensating the complete transaction"
                 );
                 let compensation = compensate_config_apply_transaction(
                     &op_id,
                     &pre_apply_snapshot,
+                    &pre_snapshot_digest,
                     &pre_runtime_snapshots,
                     &all_agents,
                     &old_building,
@@ -9274,18 +10092,31 @@ fn ecs_tick_loop(
                     &config_dir,
                 );
                 if let Err(compensation_error) = compensation {
-                    let reason = format!(
-                        "apply={transition_error:#}; compensation={compensation_error:#}"
-                    );
-                    let marker =
-                        es.mark_runtime_config_apply_recovery_required(&op_id, &reason);
+                    let reason =
+                        format!("apply={transition_error:#}; compensation={compensation_error:#}");
+                    let marker = es.mark_runtime_config_apply_recovery_required(&op_id, &reason);
+                    if let Err(marker_error) = &marker {
+                        error!(
+                            error = %marker_error,
+                            "Config-Apply RecoveryRequired phase write failed; the durable active saga remains unresolved"
+                        );
+                    }
                     fence_config_apply_recovery(
-                        &all_agents,
-                        &mut world,
-                        &mut runtime_orch,
-                        &mut nano_runtimes,
-                        &projection_db_path,
-                        &mut restore_fence,
+                        &recovery_old_agents,
+                        &apply_cmd.agents,
+                        ConfigApplyRecoveryFenceContext {
+                            world: &mut world,
+                            runtime_orch: &mut runtime_orch,
+                            sandbox: &sandbox,
+                            sandbox_handles: &mut sandbox_handles,
+                            ebpf_collector: &mut ebpf_collector,
+                            agent_processes: &mut agent_processes,
+                            nano_runtimes: &mut nano_runtimes,
+                            security_runtime_state: &security_runtime_state,
+                            projection_db_path: &projection_db_path,
+                            restore_fence: &mut restore_fence,
+                            owner_registry,
+                        },
                     );
                     error!(
                         error = %compensation_error,
@@ -9315,13 +10146,28 @@ fn ecs_tick_loop(
                     &op_id,
                     &format!("committed config finalization failed: {error:#}"),
                 );
+                if let Err(marker_error) = &marker {
+                    error!(
+                        error = %marker_error,
+                        "Config-Apply RecoveryRequired phase write failed; the durable active saga remains unresolved"
+                    );
+                }
                 fence_config_apply_recovery(
+                    &recovery_old_agents,
                     &apply_cmd.agents,
-                    &mut world,
-                    &mut runtime_orch,
-                    &mut nano_runtimes,
-                    &projection_db_path,
-                    &mut restore_fence,
+                    ConfigApplyRecoveryFenceContext {
+                        world: &mut world,
+                        runtime_orch: &mut runtime_orch,
+                        sandbox: &sandbox,
+                        sandbox_handles: &mut sandbox_handles,
+                        ebpf_collector: &mut ebpf_collector,
+                        agent_processes: &mut agent_processes,
+                        nano_runtimes: &mut nano_runtimes,
+                        security_runtime_state: &security_runtime_state,
+                        projection_db_path: &projection_db_path,
+                        restore_fence: &mut restore_fence,
+                        owner_registry,
+                    },
                 );
                 error!(
                     error = %error,
@@ -9387,6 +10233,10 @@ fn ecs_tick_loop(
         // Migriert wird die aus dem Live-Welt-Snapshot abgeleitete Instanz — die Live-Daemon-Welt
         // bleibt unangetastet (LOKAL). Cross-node/Netzwerk-Migration ist out-of-scope (Multi-Node-gated).
         while let Ok(migrate_cmd) = migrate_rx.try_recv() {
+            if !unfenced_world_background_work_allowed(owner_registry, &restore_fence) {
+                warn!("Queued migration mutation dropped without effect while World is fenced");
+                continue;
+            }
             let reason = if migrate_cmd.reason.trim().is_empty() {
                 "manual".to_string()
             } else {
@@ -9472,30 +10322,39 @@ fn ecs_tick_loop(
         }
 
         // Episode Producer (alle 30 Ticks = ~30s bei 1s Tick-Rate)
-        if world_background_allowed && episode_producer.should_run(tick_count) {
+        if unfenced_world_background_work_allowed(owner_registry, &restore_fence)
+            && episode_producer.should_run(tick_count)
+        {
             let tick_rate_s = tick_rate.as_secs_f64();
             episode_producer.tick(&event_store_for_episodes, tick_count, tick_rate_s);
         }
 
-        // Periodischer Runtime-Snapshot (alle 600 Ticks = ~10 Minuten bei 1s Tick-Rate)
-        if let Some(snapshot_result) = attempt_periodic_runtime_snapshot(
-            tick_count,
-            sentinel_common::OwnerRegistry::global(),
-            || runtime_orch.save_state(),
-        ) {
-            if let Err(e) = snapshot_result {
-                warn!(error = %e, tick = tick_count, "Periodischer Snapshot fehlgeschlagen");
-            } else {
-                info!(
-                    tick = tick_count,
-                    "Periodischer Runtime-Snapshot gespeichert"
-                );
+        // Periodischer Runtime-Snapshot (alle 600 Ticks = ~10 Minuten bei 1s Tick-Rate).
+        // Owner authority alone is insufficient while restore recovery fences the World.
+        if unfenced_world_background_work_allowed(owner_registry, &restore_fence) {
+            if let Some(snapshot_result) =
+                attempt_periodic_runtime_snapshot(tick_count, owner_registry, || {
+                    runtime_orch.save_state()
+                })
+            {
+                if let Err(e) = snapshot_result {
+                    warn!(error = %e, tick = tick_count, "Periodischer Snapshot fehlgeschlagen");
+                } else {
+                    info!(
+                        tick = tick_count,
+                        "Periodischer Runtime-Snapshot gespeichert"
+                    );
+                }
             }
         }
 
-        tick_count += 1;
+        if unfenced_world_background_work_allowed(owner_registry, &restore_fence) {
+            tick_count += 1;
+        }
 
-        if world_background_allowed && tick_count.is_multiple_of(60) {
+        if unfenced_world_background_work_allowed(owner_registry, &restore_fence)
+            && tick_count.is_multiple_of(60)
+        {
             // sim_hour periodisch persistieren
             if let Err(e) = state_store_for_sim.set_sim_hour(sim_hour) {
                 warn!(error = %e, "sim_hour persist fehlgeschlagen");
@@ -9565,10 +10424,12 @@ fn ecs_tick_loop(
 
     // 4. sim_hour persistieren
     let t = Instant::now();
-    if world_background_work_allowed(sentinel_common::OwnerRegistry::global()) {
-        if let Err(e) = state_store_for_sim.set_sim_hour(sim_hour) {
-            warn!(error = %e, "sim_hour Shutdown-Persist fehlgeschlagen");
-        }
+    if let Some(Err(error)) =
+        attempt_shutdown_world_persistence(owner_registry, &restore_fence, || {
+            state_store_for_sim.set_sim_hour(sim_hour)
+        })
+    {
+        warn!(error = %error, "sim_hour Shutdown-Persist fehlgeschlagen");
     }
     info!(
         duration_ms = t.elapsed().as_millis() as u64,
@@ -9580,7 +10441,7 @@ fn ecs_tick_loop(
     //    und entfernt/spawnt Agents entsprechend.)
     let t = Instant::now();
     let runtime_snapshot_result =
-        attempt_shutdown_runtime_snapshot(sentinel_common::OwnerRegistry::global(), || {
+        attempt_shutdown_runtime_snapshot(owner_registry, &restore_fence, || {
             runtime_orch.save_state()
         });
     let runtime_snapshot_attempted = runtime_snapshot_result.is_some();
@@ -9762,6 +10623,17 @@ mod tests {
             )
             .unwrap();
         assert!(world_background_work_allowed(&owner));
+        let mut restore_fence = RestoreFence::default();
+        assert!(unfenced_world_background_work_allowed(
+            &owner,
+            &restore_fence
+        ));
+        restore_fence.begin();
+        assert!(world_background_work_allowed(&owner));
+        assert!(!unfenced_world_background_work_allowed(
+            &owner,
+            &restore_fence
+        ));
 
         let follower = sentinel_common::OwnerRegistry::new_cluster_for_test(follower_node);
         follower
@@ -9802,13 +10674,37 @@ mod tests {
             attempts.set(attempts.get() + 1);
             Ok(())
         });
-        let shutdown = attempt_shutdown_runtime_snapshot(&follower, || {
+        let restore_fence = RestoreFence::default();
+        let shutdown = attempt_shutdown_runtime_snapshot(&follower, &restore_fence, || {
             attempts.set(attempts.get() + 1);
             Ok(())
         });
 
         assert!(periodic.is_none());
         assert!(shutdown.is_none());
+        assert_eq!(attempts.get(), 0);
+    }
+
+    #[test]
+    fn active_restore_fence_blocks_shutdown_sim_hour_and_runtime_snapshot_persistence() {
+        use std::cell::Cell;
+
+        let owner = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+        let mut restore_fence = RestoreFence::default();
+        restore_fence.begin();
+        let attempts = Cell::new(0usize);
+
+        let sim_hour = attempt_shutdown_world_persistence(&owner, &restore_fence, || {
+            attempts.set(attempts.get() + 1);
+            Ok(())
+        });
+        let runtime = attempt_shutdown_runtime_snapshot(&owner, &restore_fence, || {
+            attempts.set(attempts.get() + 1);
+            Ok(())
+        });
+
+        assert!(sim_hour.is_none());
+        assert!(runtime.is_none());
         assert_eq!(attempts.get(), 0);
     }
 
@@ -10429,6 +11325,27 @@ mod tests {
         config.runtime.nano_runtime =
             Some(sentinel_common::nano_runtime::RUNTIME_ECS_NATIVE.to_string());
         config
+    }
+
+    fn test_config_apply_building(name: &str) -> sentinel_common::room::BuildingConfig {
+        sentinel_common::room::BuildingConfig {
+            building: sentinel_common::room::BuildingMeta {
+                name: name.to_string(),
+                address: "Fixture Street".to_string(),
+                floors: 1,
+            },
+            rooms: vec![sentinel_common::room::RoomConfig {
+                id: "empfang".to_string(),
+                name: "Empfang".to_string(),
+                floor: 0,
+                capacity: 8,
+                room_type: sentinel_common::room::RoomType::Common,
+                adjacent: Vec::new(),
+                department: None,
+                has_coffee_machine: false,
+                has_printer: false,
+            }],
+        }
     }
 
     #[test]
@@ -11235,6 +12152,171 @@ mod tests {
                 &bytes,
             )
             .unwrap();
+    }
+
+    fn world_snapshot_digest(snapshot: &WorldSnapshot) -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(sentinel_common::encode_world_snapshot(snapshot).unwrap())
+        )
+    }
+
+    fn config_apply_snapshot_for_agents(
+        snapshot_id: &str,
+        agents: &[AgentConfig],
+        tick: u64,
+    ) -> WorldSnapshot {
+        assert!(!agents.is_empty());
+        let mut snapshot = restore_snapshot_for_agent(
+            snapshot_id,
+            agents[0].identity.id,
+            &agents[0].identity.name,
+            &agents[0].preferences.favorite_room,
+            tick,
+            0,
+            b"config-apply-snapshot-state",
+            None,
+        );
+        let (mut world, _) = create_simulation_world();
+        for agent in agents {
+            let entity = spawn_agent(
+                &mut world,
+                AgentId(agent.identity.id),
+                &agent.identity.name,
+                &agent.identity.role,
+                agent.identity.shift_set,
+                &agent.preferences.favorite_room,
+            );
+            apply_personality(&mut world, entity, &agent.personality);
+            sentinel_ecs::apply_capabilities(&mut world, entity, &agent.capabilities);
+        }
+        snapshot.ecs = sentinel_ecs::snapshot_ecs_state(&mut world);
+        snapshot.ecs.sim_tick = tick;
+        snapshot.redb.agent_states = agents
+            .iter()
+            .map(|agent| {
+                (
+                    agent.identity.id,
+                    format!("snapshot-state-{}", agent.identity.id).into_bytes(),
+                )
+            })
+            .collect();
+        snapshot.nano_runtime_snapshots = agents
+            .iter()
+            .map(|agent| sentinel_common::nano_runtime::NanoSnapshot {
+                runtime_key: RUNTIME_ECS_NATIVE.to_string(),
+                workload_id: format!("AGENT-{:02}", agent.identity.id),
+                agent_id: Some(AgentId(agent.identity.id)),
+                semantics: sentinel_common::nano_runtime::NanoSnapshotSemantics::RuntimeMetadata,
+                payload: serde_json::json!({
+                    "external_canonical_world": true,
+                    "agent_id": AgentId(agent.identity.id),
+                }),
+            })
+            .collect();
+        snapshot
+    }
+
+    fn run_startup_config_apply_fixture(
+        temp_root: &tempfile::TempDir,
+        event_store: Arc<EventStore>,
+        state_store: Arc<StateStore>,
+        config_dir: std::path::PathBuf,
+        projection_path: &std::path::Path,
+        agents: Vec<AgentConfig>,
+        marker: sentinel_limbo::RuntimeConfigApplyRecoveryMarker,
+        owner_registry: &sentinel_common::OwnerRegistry,
+        initial_shift: u8,
+        probe: Option<StartupConfigApplyTestProbe>,
+    ) -> Result<u64> {
+        let (_tx, rx) = mpsc::channel();
+        let (_operator_tx, operator_rx) = mpsc::channel();
+        let (perception_tx, _perception_rx) = mpsc::sync_channel(8);
+        let (ebpf_collector, ebpf_tx) = test_ebpf();
+        ecs_tick_loop(
+            Arc::clone(&state_store),
+            Arc::clone(&event_store),
+            rx,
+            operator_rx,
+            mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+            mpsc::channel::<RuntimeControlCommand>().1,
+            perception_tx,
+            agents,
+            Some(marker),
+            owner_registry,
+            initial_shift,
+            Duration::from_millis(100),
+            1.0,
+            true,
+            Arc::new(AtomicBool::new(true)),
+            test_controlplane(temp_root),
+            RuntimeOrchestrator::new(8).with_event_store(Arc::clone(&event_store)),
+            test_sandbox(),
+            ebpf_collector,
+            ebpf_tx,
+            test_episode_producer(temp_root, &event_store),
+            mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+            None,
+            None,
+            mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorMigrateCommand>().1,
+            config_dir,
+            8,
+            sentinel_common::agent_config::AgentConfigValidation::default(),
+            mpsc::channel::<i64>().1,
+            crate::config::RetentionConfig::default(),
+            String::new(),
+            Vec::new(),
+            crate::adaptive_tick::AdaptiveConfig::default(),
+            sentinel_ecs::RoomDistanceMap::default(),
+            sentinel_ecs::RoomInfoMap::default(),
+            None,
+            crate::config::ResourceManagerConfig::default(),
+            crate::config::PlatformControlplaneConfig::default(),
+            String::new(),
+            Arc::new(RwLock::new(
+                crate::platform_controlplane::PlatformStateSnapshot::default(),
+            )),
+            Arc::new(RwLock::new(
+                crate::runtime_health::RuntimeHealthSnapshot::default(),
+            )),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            projection_path.to_string_lossy().to_string(),
+            false,
+            None,
+            None,
+            probe,
+            #[cfg(feature = "llm")]
+            crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
+        )
+    }
+
+    fn fenced_startup_owner_registry() -> sentinel_common::OwnerRegistry {
+        let registry = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+        registry.close_owner_readiness();
+        registry
+    }
+
+    #[test]
+    fn startup_owner_readiness_stays_open_without_config_apply_marker() {
+        let registry = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+
+        fence_owner_readiness_for_startup_config_apply(&registry, false);
+
+        assert!(registry.owner_readiness());
+    }
+
+    #[test]
+    fn startup_owner_readiness_closes_when_config_apply_recovery_is_required() {
+        let registry = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+
+        fence_owner_readiness_for_startup_config_apply(&registry, true);
+
+        assert!(!registry.owner_readiness());
     }
 
     #[test]
@@ -12193,10 +13275,11 @@ mod tests {
                 "CREATE TABLE agent_live_view (
                     agent_id INTEGER PRIMARY KEY,
                     name TEXT NOT NULL,
-                    role TEXT NOT NULL
+                    role TEXT NOT NULL,
+                    status TEXT NOT NULL
                  );
-                 INSERT INTO agent_live_view(agent_id, name, role)
-                 VALUES (32, 'Stable Name', 'Stable Role');",
+                 INSERT INTO agent_live_view(agent_id, name, role, status)
+                 VALUES (32, 'Stable Name', 'Stable Role', 'active');",
             )
             .unwrap();
         drop(projection);
@@ -12375,19 +13458,54 @@ mod tests {
         {
             let event_store = EventStore::open(events_path.to_str().unwrap()).unwrap();
             event_store
-                .begin_runtime_config_apply_recovery(
+                .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
                     op_id,
-                    &old_digest,
-                    &staged_digest,
-                    &old_agents,
-                    &staged_agents,
-                    &old_building,
-                    &staged_building,
-                    "world-snapshot-apply-recovery",
-                    &[],
-                    92,
-                )
+                    old_digest: &old_digest,
+                    staged_digest: &staged_digest,
+                    old_agents: &old_agents,
+                    staged_agents: &staged_agents,
+                    old_building: &old_building,
+                    staged_building: &staged_building,
+                    pre_snapshot_id: "world-snapshot-apply-recovery",
+                    pre_snapshot_digest:
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    pre_runtime_snapshots: &[],
+                    started_tick: 92,
+                })
                 .unwrap();
+            event_store
+                .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                    op_id,
+                    old_digest: &old_digest,
+                    staged_digest: &staged_digest,
+                    old_agents: &old_agents,
+                    staged_agents: &staged_agents,
+                    old_building: &old_building,
+                    staged_building: &staged_building,
+                    pre_snapshot_id: "world-snapshot-apply-recovery",
+                    pre_snapshot_digest:
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    pre_runtime_snapshots: &[],
+                    started_tick: 92,
+                })
+                .expect("exact begin retry is idempotent");
+            let binding_error = event_store
+                .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                    op_id,
+                    old_digest: &old_digest,
+                    staged_digest: &staged_digest,
+                    old_agents: &old_agents,
+                    staged_agents: &staged_agents,
+                    old_building: &old_building,
+                    staged_building: &staged_building,
+                    pre_snapshot_id: "world-snapshot-apply-recovery",
+                    pre_snapshot_digest:
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    pre_runtime_snapshots: &[],
+                    started_tick: 92,
+                })
+                .unwrap_err();
+            assert!(format!("{binding_error:#}").contains("op_id binding conflict"));
             event_store
                 .record_runtime_config_apply_stop(op_id, AgentId(35))
                 .unwrap();
@@ -12395,16 +13513,16 @@ mod tests {
                 .record_runtime_config_apply_spawn(op_id, AgentId(35))
                 .unwrap();
             event_store
-                .mark_runtime_config_apply_runtimes_applied(op_id, &[])
+                .mark_runtime_config_apply_runtimes_applied(
+                    op_id,
+                    "applied-snapshot",
+                    &"a".repeat(64),
+                    &[],
+                )
                 .unwrap();
-            let event = DomainEvent::new(
-                "config_applied",
-                "WORLD",
-                r#"{"agent_count":1}"#,
-                op_id,
-                92,
-            )
-            .with_operation_id(op_id);
+            let event =
+                DomainEvent::new("config_applied", "WORLD", r#"{"agent_count":1}"#, op_id, 92)
+                    .with_operation_id(op_id);
             event_store
                 .commit_runtime_config_apply(op_id, &event, "sentinel.events")
                 .unwrap();
@@ -12429,6 +13547,18 @@ mod tests {
         assert_eq!(marker.old_agents, old_agents);
         assert_eq!(marker.staged_agents, staged_agents);
         assert_eq!(marker.pre_snapshot_id, "world-snapshot-apply-recovery");
+        assert_eq!(
+            marker.pre_snapshot_digest.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            marker.applied_snapshot_id.as_deref(),
+            Some("applied-snapshot")
+        );
+        assert_eq!(
+            marker.applied_snapshot_digest.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert_eq!(marker.stopped_agent_ids, vec![AgentId(35)]);
         assert_eq!(marker.spawned_agent_ids, vec![AgentId(35)]);
         assert!(restarted.has_event_operation_id(op_id).unwrap());
@@ -12452,21 +13582,28 @@ mod tests {
         let conflict_store = EventStore::open(conflict_path.to_str().unwrap()).unwrap();
         let conflict_op = "config-apply-event-conflict";
         conflict_store
-            .begin_runtime_config_apply_recovery(
-                conflict_op,
-                &old_digest,
-                &staged_digest,
-                &old_agents,
-                &staged_agents,
-                &old_building,
-                &staged_building,
-                "world-snapshot-event-conflict",
-                &[],
-                93,
-            )
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                op_id: conflict_op,
+                old_digest: &old_digest,
+                staged_digest: &staged_digest,
+                old_agents: &old_agents,
+                staged_agents: &staged_agents,
+                old_building: &old_building,
+                staged_building: &staged_building,
+                pre_snapshot_id: "world-snapshot-event-conflict",
+                pre_snapshot_digest:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                pre_runtime_snapshots: &[],
+                started_tick: 93,
+            })
             .unwrap();
         conflict_store
-            .mark_runtime_config_apply_runtimes_applied(conflict_op, &[])
+            .mark_runtime_config_apply_runtimes_applied(
+                conflict_op,
+                "conflict-snapshot",
+                &"b".repeat(64),
+                &[],
+            )
             .unwrap();
         conflict_store
             .append_event(
@@ -12512,11 +13649,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let config_dir = tmp.path().join("config");
-        let projection_path = tmp.path().join("projection.db");
-        let event_store =
-            EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap();
-        let state_store =
-            Arc::new(StateStore::open(tmp.path().join("state.redb").to_str().unwrap()).unwrap());
+        let event_store = EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap();
         let old_config = test_ecs_agent_config(48, "Digest Old", "Operator", 1);
         let mut staged_config = old_config.clone();
         staged_config.identity.name = "Digest Staged".to_string();
@@ -12547,6 +13680,13 @@ mod tests {
             "digest-old",
         )
         .unwrap();
+        let pre_snapshot = config_apply_snapshot_for_agents(
+            "config-apply-corrupt-participant-pre",
+            std::slice::from_ref(&old_config),
+            131,
+        );
+        save_world_snapshot_fixture(&event_store, &pre_snapshot);
+        let pre_snapshot_digest = world_snapshot_digest(&pre_snapshot);
         let old_digest =
             config_apply_digest(std::slice::from_ref(&old_config), &old_building).unwrap();
         let staged_digest =
@@ -12564,18 +13704,19 @@ mod tests {
         )
         .unwrap();
         event_store
-            .begin_runtime_config_apply_recovery(
-                "config-apply-corrupt-participant",
-                &old_digest,
-                &staged_digest,
-                std::slice::from_ref(&old_config),
-                std::slice::from_ref(&staged_config),
-                &old_building,
-                &staged_building,
-                "snapshot-not-reached",
-                &[],
-                131,
-            )
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                op_id: "config-apply-corrupt-participant",
+                old_digest: &old_digest,
+                staged_digest: &staged_digest,
+                old_agents: std::slice::from_ref(&old_config),
+                staged_agents: std::slice::from_ref(&staged_config),
+                old_building: &old_building,
+                staged_building: &staged_building,
+                pre_snapshot_id: &pre_snapshot.snapshot_id,
+                pre_snapshot_digest: &pre_snapshot_digest,
+                pre_runtime_snapshots: &pre_snapshot.nano_runtime_snapshots,
+                started_tick: 131,
+            })
             .unwrap();
 
         let journal_path = config_dir.join(crate::config_persist::APPLY_RECOVERY_JOURNAL);
@@ -12589,15 +13730,14 @@ mod tests {
 
         let error = reconcile_runtime_config_apply_recovery_marker(
             &event_store,
-            &state_store,
-            None,
-            tmp.path(),
-            projection_path.to_str().unwrap(),
-            &config_dir,
-            4,
-            None,
-            &[],
-            sentinel_common::agent_config::AgentConfigValidation::default(),
+            &RuntimeConfigApplyStartupReconcileContext {
+                config_dir: &config_dir,
+                max_agents: 4,
+                fs_mount: None,
+                agent_command: &[],
+                agent_validation: sentinel_common::agent_config::AgentConfigValidation::default(),
+                abandoned_reconcile_observer: None,
+            },
         )
         .unwrap_err();
         assert!(
@@ -12608,21 +13748,19 @@ mod tests {
         // Even a self-consistent participant payload/digest pair cannot
         // override the canonical SQLite digest identity.
         corrupted["staged_digest"] = serde_json::Value::String(
-            config_apply_digest(std::slice::from_ref(&tampered_config), &staged_building)
-                .unwrap(),
+            config_apply_digest(std::slice::from_ref(&tampered_config), &staged_building).unwrap(),
         );
         std::fs::write(&journal_path, serde_json::to_vec(&corrupted).unwrap()).unwrap();
         let canonical_error = reconcile_runtime_config_apply_recovery_marker(
             &event_store,
-            &state_store,
-            None,
-            tmp.path(),
-            projection_path.to_str().unwrap(),
-            &config_dir,
-            4,
-            None,
-            &[],
-            sentinel_common::agent_config::AgentConfigValidation::default(),
+            &RuntimeConfigApplyStartupReconcileContext {
+                config_dir: &config_dir,
+                max_agents: 4,
+                fs_mount: None,
+                agent_command: &[],
+                agent_validation: sentinel_common::agent_config::AgentConfigValidation::default(),
+                abandoned_reconcile_observer: None,
+            },
         )
         .unwrap_err();
         assert!(
@@ -12647,6 +13785,308 @@ mod tests {
             sentinel_limbo::RuntimeConfigApplyDecision::Rollback
         );
         assert!(journal_path.exists());
+    }
+
+    #[test]
+    fn config_apply_finalized_startup_does_not_require_collected_snapshot() {
+        use sentinel_common::room::{BuildingConfig, BuildingMeta, RoomConfig, RoomType};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let old_config = test_ecs_agent_config(49, "Finalized Old", "Operator", 1);
+        let mut staged_config = old_config.clone();
+        staged_config.identity.name = "Finalized Staged".to_string();
+        let old_building = BuildingConfig {
+            building: BuildingMeta {
+                name: "Finalized Old Building".to_string(),
+                address: "Old Street".to_string(),
+                floors: 1,
+            },
+            rooms: vec![RoomConfig {
+                id: "empfang".to_string(),
+                name: "Empfang".to_string(),
+                floor: 0,
+                capacity: 4,
+                room_type: RoomType::Common,
+                adjacent: Vec::new(),
+                department: None,
+                has_coffee_machine: false,
+                has_printer: false,
+            }],
+        };
+        let mut staged_building = old_building.clone();
+        staged_building.building.name = "Finalized Staged Building".to_string();
+        let old_digest =
+            config_apply_digest(std::slice::from_ref(&old_config), &old_building).unwrap();
+        let staged_digest =
+            config_apply_digest(std::slice::from_ref(&staged_config), &staged_building).unwrap();
+
+        let finalized_config_dir = tmp.path().join("finalized-config");
+        let finalized_store =
+            EventStore::open(tmp.path().join("finalized-events.db").to_str().unwrap()).unwrap();
+        finalized_store
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                op_id: "config-apply-finalized-missing-snapshot",
+                old_digest: &old_digest,
+                staged_digest: &staged_digest,
+                old_agents: std::slice::from_ref(&old_config),
+                staged_agents: std::slice::from_ref(&staged_config),
+                old_building: &old_building,
+                staged_building: &staged_building,
+                pre_snapshot_id: "collected-finalized-snapshot",
+                pre_snapshot_digest:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                pre_runtime_snapshots: &[],
+                started_tick: 149,
+            })
+            .unwrap();
+        finalized_store
+            .finalize_runtime_config_apply(
+                "config-apply-finalized-missing-snapshot",
+                sentinel_limbo::RuntimeConfigApplyDecision::Rollback,
+            )
+            .unwrap();
+        let finalized_reconcile_calls = AtomicUsize::new(0);
+        assert!(reconcile_runtime_config_apply_recovery_marker(
+            &finalized_store,
+            &RuntimeConfigApplyStartupReconcileContext {
+                config_dir: &finalized_config_dir,
+                max_agents: 4,
+                fs_mount: None,
+                agent_command: &[],
+                agent_validation: sentinel_common::agent_config::AgentConfigValidation::default(),
+                abandoned_reconcile_observer: Some(&finalized_reconcile_calls),
+            },
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(finalized_reconcile_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            crate::config_persist::load_config_apply_recovery(&finalized_config_dir)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            sentinel_common::agent_config::load_all_agents(&finalized_config_dir.join("agents"))
+                .unwrap(),
+            vec![old_config.clone()]
+        );
+        assert_eq!(
+            sentinel_common::room::BuildingConfig::load(&finalized_config_dir.join("rooms.toml"))
+                .unwrap(),
+            old_building
+        );
+
+        let active_config_dir = tmp.path().join("active-config");
+        let active_store =
+            EventStore::open(tmp.path().join("active-events.db").to_str().unwrap()).unwrap();
+        active_store
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                op_id: "config-apply-active-missing-snapshot",
+                old_digest: &old_digest,
+                staged_digest: &staged_digest,
+                old_agents: std::slice::from_ref(&old_config),
+                staged_agents: std::slice::from_ref(&staged_config),
+                old_building: &old_building,
+                staged_building: &staged_building,
+                pre_snapshot_id: "collected-active-snapshot",
+                pre_snapshot_digest:
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                pre_runtime_snapshots: &[],
+                started_tick: 150,
+            })
+            .unwrap();
+        let active_reconcile_calls = AtomicUsize::new(0);
+        let error = reconcile_runtime_config_apply_recovery_marker(
+            &active_store,
+            &RuntimeConfigApplyStartupReconcileContext {
+                config_dir: &active_config_dir,
+                max_agents: 4,
+                fs_mount: None,
+                agent_command: &[],
+                agent_validation: sentinel_common::agent_config::AgentConfigValidation::default(),
+                abandoned_reconcile_observer: Some(&active_reconcile_calls),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Bound World Snapshot nicht gefunden"),
+            "{error:#}"
+        );
+        assert_eq!(active_reconcile_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            crate::config_persist::load_config_apply_recovery(&active_config_dir)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            active_store
+                .runtime_config_apply_recovery()
+                .unwrap()
+                .unwrap()
+                .phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::Prepared
+        );
+    }
+
+    #[test]
+    fn config_apply_startup_rejects_tampered_pre_snapshot_before_state_mutation() {
+        use sentinel_common::room::{BuildingConfig, BuildingMeta, RoomConfig, RoomType};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let events_path = tmp.path().join("events.db");
+        let projection_path = tmp.path().join("projection.db");
+        let event_store = EventStore::open(events_path.to_str().unwrap()).unwrap();
+        let state_store =
+            Arc::new(StateStore::open(tmp.path().join("state.redb").to_str().unwrap()).unwrap());
+        let old_config = test_ecs_agent_config(49, "Snapshot Old", "Operator", 1);
+        let mut staged_config = old_config.clone();
+        staged_config.identity.name = "Snapshot Staged".to_string();
+        let old_building = BuildingConfig {
+            building: BuildingMeta {
+                name: "Snapshot Old Building".to_string(),
+                address: "Old Street".to_string(),
+                floors: 1,
+            },
+            rooms: vec![RoomConfig {
+                id: "empfang".to_string(),
+                name: "Empfang".to_string(),
+                floor: 0,
+                capacity: 4,
+                room_type: RoomType::Common,
+                adjacent: Vec::new(),
+                department: None,
+                has_coffee_machine: false,
+                has_printer: false,
+            }],
+        };
+        let staged_building = old_building.clone();
+        crate::config_persist::persist_company_config(
+            &config_dir,
+            std::slice::from_ref(&old_config),
+            &old_building,
+            "snapshot-old",
+        )
+        .unwrap();
+        let mut pre_snapshot = restore_snapshot_for_agent(
+            "config-apply-tamper-pre",
+            49,
+            "Snapshot Old",
+            "bound-room",
+            140,
+            0,
+            b"bound-state",
+            None,
+        );
+        save_world_snapshot_fixture(&event_store, &pre_snapshot);
+        state_store.restore_all_tables(&pre_snapshot.redb).unwrap();
+        drop(sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap());
+        seed_projection_from_world_snapshot(projection_path.to_str().unwrap(), &pre_snapshot, 0, 1)
+            .unwrap();
+        let pre_digest = world_snapshot_digest(&pre_snapshot);
+        let old_digest =
+            config_apply_digest(std::slice::from_ref(&old_config), &old_building).unwrap();
+        let staged_digest =
+            config_apply_digest(std::slice::from_ref(&staged_config), &staged_building).unwrap();
+        event_store
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                op_id: "config-apply-tampered-pre",
+                old_digest: &old_digest,
+                staged_digest: &staged_digest,
+                old_agents: std::slice::from_ref(&old_config),
+                staged_agents: std::slice::from_ref(&staged_config),
+                old_building: &old_building,
+                staged_building: &staged_building,
+                pre_snapshot_id: &pre_snapshot.snapshot_id,
+                pre_snapshot_digest: &pre_digest,
+                pre_runtime_snapshots: &[],
+                started_tick: 140,
+            })
+            .unwrap();
+
+        pre_snapshot.ecs.positions[0].1.room_id = "tampered-room".to_string();
+        let tampered_bytes = sentinel_common::encode_world_snapshot(&pre_snapshot).unwrap();
+        let conn = sentinel_limbo::rusqlite::Connection::open(&events_path).unwrap();
+        conn.execute(
+            "UPDATE world_snapshots SET payload = ?2, payload_size = ?3 WHERE id = ?1",
+            sentinel_limbo::rusqlite::params![
+                &pre_snapshot.snapshot_id,
+                &tampered_bytes,
+                i64::try_from(tampered_bytes.len()).unwrap(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let redb_before = serde_json::to_vec(&state_store.dump_all_tables().unwrap()).unwrap();
+        let projection_before =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap())
+                .unwrap()
+                .get_agent(49)
+                .unwrap()
+                .unwrap();
+        assert!(
+            crate::config_persist::load_config_apply_recovery(&config_dir)
+                .unwrap()
+                .is_none(),
+            "fixture must start without a filesystem participant"
+        );
+        let abandoned_reconcile_calls = AtomicUsize::new(0);
+
+        let error = reconcile_runtime_config_apply_recovery_marker(
+            &event_store,
+            &RuntimeConfigApplyStartupReconcileContext {
+                config_dir: &config_dir,
+                max_agents: 4,
+                fs_mount: None,
+                agent_command: &[],
+                agent_validation: sentinel_common::agent_config::AgentConfigValidation::default(),
+                abandoned_reconcile_observer: Some(&abandoned_reconcile_calls),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("snapshot digest conflict"),
+            "{error:#}"
+        );
+        assert_eq!(
+            serde_json::to_vec(&state_store.dump_all_tables().unwrap()).unwrap(),
+            redb_before
+        );
+        let projection_after =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap())
+                .unwrap()
+                .get_agent(49)
+                .unwrap()
+                .unwrap();
+        assert_eq!(projection_after.name, projection_before.name);
+        assert_eq!(projection_after.role, projection_before.role);
+        assert_eq!(
+            projection_after.current_room,
+            projection_before.current_room
+        );
+        assert_eq!(
+            abandoned_reconcile_calls.load(Ordering::SeqCst),
+            0,
+            "invalid snapshot binding must fail before abandoned-runtime reconcile"
+        );
+        assert!(
+            crate::config_persist::load_config_apply_recovery(&config_dir)
+                .unwrap()
+                .is_none(),
+            "invalid snapshot binding must fail before filesystem participant staging"
+        );
+        assert_eq!(
+            sentinel_common::agent_config::load_all_agents(&config_dir.join("agents")).unwrap(),
+            vec![old_config]
+        );
+        assert_eq!(
+            event_store
+                .runtime_config_apply_recovery()
+                .unwrap()
+                .unwrap()
+                .phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::Prepared
+        );
     }
 
     #[test]
@@ -12697,7 +14137,7 @@ mod tests {
             "config-apply-startup-pre",
             38,
             "Startup Old",
-            "empfang",
+            "dynamic-restored-room",
             130,
             0,
             b"startup-old-state",
@@ -12718,6 +14158,17 @@ mod tests {
         drop(sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap());
         seed_projection_from_world_snapshot(projection_path.to_str().unwrap(), &pre_snapshot, 0, 1)
             .unwrap();
+        let mut staged_redb = pre_snapshot.redb.clone();
+        staged_redb.agent_states = vec![(38, b"startup-staged-state".to_vec())];
+        state_store.restore_all_tables(&staged_redb).unwrap();
+        let projection = sentinel_limbo::rusqlite::Connection::open(&projection_path).unwrap();
+        projection
+            .execute(
+                "UPDATE agent_live_view SET name = 'Startup Staged' WHERE agent_id = 38",
+                [],
+            )
+            .unwrap();
+        drop(projection);
 
         let op_id = "config-apply-startup-rollback";
         let old_digest =
@@ -12738,18 +14189,19 @@ mod tests {
         .unwrap();
         crate::config_persist::publish_config_apply_participant(&config_dir, op_id, true).unwrap();
         event_store
-            .begin_runtime_config_apply_recovery(
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
                 op_id,
-                &old_digest,
-                &staged_digest,
-                std::slice::from_ref(&old_config),
-                std::slice::from_ref(&staged_config),
-                &old_building,
-                &staged_building,
-                &pre_snapshot.snapshot_id,
-                &pre_snapshot.nano_runtime_snapshots,
-                130,
-            )
+                old_digest: &old_digest,
+                staged_digest: &staged_digest,
+                old_agents: std::slice::from_ref(&old_config),
+                staged_agents: std::slice::from_ref(&staged_config),
+                old_building: &old_building,
+                staged_building: &staged_building,
+                pre_snapshot_id: &pre_snapshot.snapshot_id,
+                pre_snapshot_digest: &world_snapshot_digest(&pre_snapshot),
+                pre_runtime_snapshots: &pre_snapshot.nano_runtime_snapshots,
+                started_tick: 130,
+            })
             .unwrap();
         event_store
             .record_runtime_config_apply_stop(op_id, AgentId(38))
@@ -12763,15 +14215,14 @@ mod tests {
 
         let marker = reconcile_runtime_config_apply_recovery_marker(
             event_store.as_ref(),
-            &state_store,
-            None,
-            tmp.path(),
-            projection_path.to_str().unwrap(),
-            &config_dir,
-            4,
-            None,
-            &[],
-            sentinel_common::agent_config::AgentConfigValidation::default(),
+            &RuntimeConfigApplyStartupReconcileContext {
+                config_dir: &config_dir,
+                max_agents: 4,
+                fs_mount: None,
+                agent_command: &[],
+                agent_validation: sentinel_common::agent_config::AgentConfigValidation::default(),
+                abandoned_reconcile_observer: None,
+            },
         )
         .unwrap()
         .expect("startup recovery remains fenced until runtime restore");
@@ -12793,7 +14244,8 @@ mod tests {
         );
         assert_eq!(
             state_store.dump_all_tables().unwrap().agent_states,
-            pre_snapshot.redb.agent_states
+            staged_redb.agent_states,
+            "startup preflight must not restore into a temporary, discarded world/store set"
         );
         assert_eq!(
             sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap())
@@ -12802,14 +14254,16 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .name,
-            "Startup Old"
+            "Startup Staged"
         );
 
         let shutdown = Arc::new(AtomicBool::new(true));
         let (_tx, rx) = mpsc::channel();
         let (_operator_tx, operator_rx) = mpsc::channel();
         let (perception_tx, _perception_rx) = mpsc::sync_channel(8);
+        let (startup_world_tx, startup_world_rx) = mpsc::sync_channel(1);
         let (ebpf_collector, ebpf_tx) = test_ebpf();
+        let owner_registry = fenced_startup_owner_registry();
         let result = ecs_tick_loop(
             Arc::clone(&state_store),
             Arc::clone(&event_store),
@@ -12820,6 +14274,7 @@ mod tests {
             perception_tx,
             vec![old_config],
             Some(marker),
+            &owner_registry,
             1,
             Duration::from_millis(100),
             1.0,
@@ -12865,10 +14320,41 @@ mod tests {
             false,
             None,
             None,
+            Some(StartupConfigApplyTestProbe {
+                world_observer: Some(startup_world_tx),
+                ..Default::default()
+            }),
             #[cfg(feature = "llm")]
             crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
         );
         assert_eq!(result.unwrap(), 0);
+        assert!(owner_registry.owner_readiness());
+        let serving_ecs = startup_world_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("serving ECS startup snapshot");
+        assert_eq!(
+            serving_ecs.positions.len(),
+            1,
+            "startup recovery must not create a duplicate ECS entity"
+        );
+        assert_eq!(
+            serving_ecs.positions[0].1.room_id, "dynamic-restored-room",
+            "the serving world must retain the pre-snapshot dynamic position, not config defaults"
+        );
+        assert_eq!(serving_ecs.sim_tick, pre_snapshot.ecs.sim_tick);
+        assert_eq!(
+            state_store.dump_all_tables().unwrap().agent_states,
+            pre_snapshot.redb.agent_states
+        );
+        assert_eq!(
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap())
+                .unwrap()
+                .get_agent(38)
+                .unwrap()
+                .unwrap()
+                .name,
+            "Startup Old"
+        );
         assert_eq!(
             event_store
                 .runtime_config_apply_recovery()
@@ -12877,9 +14363,529 @@ mod tests {
                 .phase,
             sentinel_limbo::RuntimeConfigApplyPhase::Finalized
         );
-        assert!(crate::config_persist::load_config_apply_recovery(&config_dir)
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::config_persist::load_config_apply_recovery(&config_dir)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn config_apply_startup_last_agent_failure_keeps_all_recovery_latches_closed() {
+        sentinel_common::feature_flags::RuntimeFlags::init();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let projection_path = tmp.path().join("projection.db");
+        let event_store =
+            Arc::new(EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap());
+        let state_store =
+            Arc::new(StateStore::open(tmp.path().join("state.redb").to_str().unwrap()).unwrap());
+        let agents = vec![
+            test_ecs_agent_config(40, "Latch First", "Operator", 1),
+            test_ecs_agent_config(41, "Latch Last", "Operator", 1),
+        ];
+        let old_building = test_config_apply_building("Latch Old Building");
+        let mut staged_building = old_building.clone();
+        staged_building.building.name = "Latch Staged Building".to_string();
+        crate::config_persist::persist_company_config(
+            &config_dir,
+            &agents,
+            &old_building,
+            "latch-old",
+        )
+        .unwrap();
+        let snapshot = config_apply_snapshot_for_agents("config-apply-latch-pre", &agents, 141);
+        save_world_snapshot_fixture(event_store.as_ref(), &snapshot);
+        state_store.restore_all_tables(&snapshot.redb).unwrap();
+        drop(sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap());
+        seed_projection_from_world_snapshot(projection_path.to_str().unwrap(), &snapshot, 0, 1)
+            .unwrap();
+        let old_digest = config_apply_digest(&agents, &old_building).unwrap();
+        let staged_digest = config_apply_digest(&agents, &staged_building).unwrap();
+        crate::config_persist::stage_config_apply_recovery(
+            &config_dir,
+            "config-apply-latch-failure",
+            &old_digest,
+            &staged_digest,
+            &agents,
+            &agents,
+            &old_building,
+            &staged_building,
+            141,
+        )
+        .unwrap();
+        event_store
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                op_id: "config-apply-latch-failure",
+                old_digest: &old_digest,
+                staged_digest: &staged_digest,
+                old_agents: &agents,
+                staged_agents: &agents,
+                old_building: &old_building,
+                staged_building: &staged_building,
+                pre_snapshot_id: &snapshot.snapshot_id,
+                pre_snapshot_digest: &world_snapshot_digest(&snapshot),
+                pre_runtime_snapshots: &snapshot.nano_runtime_snapshots,
+                started_tick: 141,
+            })
+            .unwrap();
+        event_store
+            .mark_runtime_config_apply_recovery_required(
+                "config-apply-latch-failure",
+                "injected restart",
+            )
+            .unwrap();
+        let marker = reconcile_runtime_config_apply_recovery_marker(
+            event_store.as_ref(),
+            &RuntimeConfigApplyStartupReconcileContext {
+                config_dir: &config_dir,
+                max_agents: 8,
+                fs_mount: None,
+                agent_command: &[],
+                agent_validation: sentinel_common::agent_config::AgentConfigValidation::default(),
+                abandoned_reconcile_observer: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let (blocked_tx, blocked_rx) = mpsc::sync_channel(1);
+        let owner_registry = fenced_startup_owner_registry();
+        let error = run_startup_config_apply_fixture(
+            &tmp,
+            Arc::clone(&event_store),
+            Arc::clone(&state_store),
+            config_dir.clone(),
+            &projection_path,
+            agents,
+            marker,
+            &owner_registry,
+            1,
+            Some(StartupConfigApplyTestProbe {
+                blocked_observer: Some(blocked_tx),
+                fail_validation_for: Some(AgentId(41)),
+                ..Default::default()
+            }),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("injected startup config apply validation failure"));
+        assert!(!owner_registry.owner_readiness());
+        assert_eq!(
+            blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            vec![AgentId(40), AgentId(41)]
+        );
+        assert_eq!(
+            event_store
+                .runtime_config_apply_recovery()
+                .unwrap()
+                .unwrap()
+                .phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::RecoveryRequired
+        );
+        assert!(
+            crate::config_persist::load_config_apply_recovery(&config_dir)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn config_apply_startup_recovers_snapshot_residency_before_current_shift() {
+        sentinel_common::feature_flags::RuntimeFlags::init();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let projection_path = tmp.path().join("projection.db");
+        let event_store =
+            Arc::new(EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap());
+        let state_store =
+            Arc::new(StateStore::open(tmp.path().join("state.redb").to_str().unwrap()).unwrap());
+        let old_shift = test_ecs_agent_config(42, "Old Shift", "Operator", 1);
+        let current_shift = test_ecs_agent_config(43, "Current Shift", "Operator", 2);
+        let agents = vec![old_shift.clone(), current_shift.clone()];
+        let old_building = test_config_apply_building("Shift Old Building");
+        let mut staged_building = old_building.clone();
+        staged_building.building.name = "Shift Staged Building".to_string();
+        crate::config_persist::persist_company_config(
+            &config_dir,
+            &agents,
+            &old_building,
+            "shift-old",
+        )
+        .unwrap();
+        let snapshot = config_apply_snapshot_for_agents(
+            "config-apply-shift-pre",
+            std::slice::from_ref(&old_shift),
+            142,
+        );
+        save_world_snapshot_fixture(event_store.as_ref(), &snapshot);
+        state_store.restore_all_tables(&snapshot.redb).unwrap();
+        drop(sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap());
+        seed_projection_from_world_snapshot(projection_path.to_str().unwrap(), &snapshot, 0, 1)
+            .unwrap();
+        let old_digest = config_apply_digest(&agents, &old_building).unwrap();
+        let staged_digest = config_apply_digest(&agents, &staged_building).unwrap();
+        crate::config_persist::stage_config_apply_recovery(
+            &config_dir,
+            "config-apply-shift-boundary",
+            &old_digest,
+            &staged_digest,
+            &agents,
+            &agents,
+            &old_building,
+            &staged_building,
+            142,
+        )
+        .unwrap();
+        event_store
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                op_id: "config-apply-shift-boundary",
+                old_digest: &old_digest,
+                staged_digest: &staged_digest,
+                old_agents: &agents,
+                staged_agents: &agents,
+                old_building: &old_building,
+                staged_building: &staged_building,
+                pre_snapshot_id: &snapshot.snapshot_id,
+                pre_snapshot_digest: &world_snapshot_digest(&snapshot),
+                pre_runtime_snapshots: &snapshot.nano_runtime_snapshots,
+                started_tick: 142,
+            })
+            .unwrap();
+        event_store
+            .mark_runtime_config_apply_recovery_required(
+                "config-apply-shift-boundary",
+                "restart crossed shift boundary",
+            )
+            .unwrap();
+        let marker = reconcile_runtime_config_apply_recovery_marker(
+            event_store.as_ref(),
+            &RuntimeConfigApplyStartupReconcileContext {
+                config_dir: &config_dir,
+                max_agents: 8,
+                fs_mount: None,
+                agent_command: &[],
+                agent_validation: sentinel_common::agent_config::AgentConfigValidation::default(),
+                abandoned_reconcile_observer: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let (world_tx, world_rx) = mpsc::sync_channel(1);
+        let (residency_tx, residency_rx) = mpsc::sync_channel(1);
+        let (readiness_tx, readiness_rx) = mpsc::sync_channel(1);
+        let owner_registry = fenced_startup_owner_registry();
+        assert_eq!(
+            run_startup_config_apply_fixture(
+                &tmp,
+                Arc::clone(&event_store),
+                Arc::clone(&state_store),
+                config_dir.clone(),
+                &projection_path,
+                agents,
+                marker,
+                &owner_registry,
+                2,
+                Some(StartupConfigApplyTestProbe {
+                    world_observer: Some(world_tx),
+                    residency_observer: Some(residency_tx),
+                    readiness_before_open_observer: Some(readiness_tx),
+                    ..Default::default()
+                }),
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!readiness_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(owner_registry.owner_readiness());
+        let world = world_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut resident_ids = world
+            .identities
+            .iter()
+            .map(|(_, identity)| identity.agent_id)
+            .collect::<Vec<_>>();
+        resident_ids.sort_by_key(|agent_id| agent_id.0);
+        assert_eq!(resident_ids, vec![AgentId(43)]);
+        assert_eq!(
+            residency_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (vec![AgentId(43)], vec![AgentId(43)])
+        );
+        assert_eq!(
+            event_store
+                .runtime_config_apply_recovery()
+                .unwrap()
+                .unwrap()
+                .phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::Finalized
+        );
+        assert!(
+            crate::config_persist::load_config_apply_recovery(&config_dir)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn config_apply_startup_forward_restores_bound_applied_world_before_finalizing() {
+        use sentinel_common::nano_runtime::{NanoSnapshot, NanoSnapshotSemantics};
+        use sentinel_common::room::{BuildingConfig, BuildingMeta, RoomConfig, RoomType};
+
+        sentinel_common::feature_flags::RuntimeFlags::init();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join("config");
+        let projection_path = tmp.path().join("projection.db");
+        let event_store =
+            Arc::new(EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap());
+        let state_store =
+            Arc::new(StateStore::open(tmp.path().join("state.redb").to_str().unwrap()).unwrap());
+        let old_config = test_ecs_agent_config(39, "Forward Old", "Operator", 1);
+        let mut staged_config = old_config.clone();
+        staged_config.identity.name = "Forward Staged".to_string();
+        staged_config.preferences.favorite_room = "config-default-room".to_string();
+        let old_building = BuildingConfig {
+            building: BuildingMeta {
+                name: "Forward Old Building".to_string(),
+                address: "Old Street".to_string(),
+                floors: 1,
+            },
+            rooms: vec![RoomConfig {
+                id: "config-default-room".to_string(),
+                name: "Config Default".to_string(),
+                floor: 0,
+                capacity: 4,
+                room_type: RoomType::Common,
+                adjacent: Vec::new(),
+                department: None,
+                has_coffee_machine: false,
+                has_printer: false,
+            }],
+        };
+        let mut staged_building = old_building.clone();
+        staged_building.building.name = "Forward Staged Building".to_string();
+        crate::config_persist::persist_company_config(
+            &config_dir,
+            std::slice::from_ref(&old_config),
+            &old_building,
+            "forward-old",
+        )
+        .unwrap();
+
+        let runtime_snapshot = NanoSnapshot {
+            runtime_key: RUNTIME_ECS_NATIVE.to_string(),
+            workload_id: "AGENT-39".to_string(),
+            agent_id: Some(AgentId(39)),
+            semantics: NanoSnapshotSemantics::RuntimeMetadata,
+            payload: serde_json::json!({
+                "external_canonical_world": true,
+                "agent_id": AgentId(39),
+            }),
+        };
+        let mut pre_snapshot = restore_snapshot_for_agent(
+            "config-apply-forward-pre",
+            39,
+            "Forward Old",
+            "pre-dynamic-room",
+            131,
+            0,
+            b"forward-old-state",
+            None,
+        );
+        pre_snapshot.nano_runtime_snapshots = vec![runtime_snapshot.clone()];
+        let mut applied_snapshot = restore_snapshot_for_agent(
+            "config-apply-forward-applied",
+            39,
+            "Forward Staged",
+            "applied-dynamic-room",
+            132,
+            0,
+            b"forward-applied-state",
+            None,
+        );
+        applied_snapshot.nano_runtime_snapshots = vec![runtime_snapshot.clone()];
+        save_world_snapshot_fixture(event_store.as_ref(), &pre_snapshot);
+        save_world_snapshot_fixture(event_store.as_ref(), &applied_snapshot);
+        state_store.restore_all_tables(&pre_snapshot.redb).unwrap();
+        drop(sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap());
+        seed_projection_from_world_snapshot(projection_path.to_str().unwrap(), &pre_snapshot, 0, 1)
+            .unwrap();
+
+        let op_id = "config-apply-startup-forward";
+        let old_digest =
+            config_apply_digest(std::slice::from_ref(&old_config), &old_building).unwrap();
+        let staged_digest =
+            config_apply_digest(std::slice::from_ref(&staged_config), &staged_building).unwrap();
+        crate::config_persist::stage_config_apply_recovery(
+            &config_dir,
+            op_id,
+            &old_digest,
+            &staged_digest,
+            std::slice::from_ref(&old_config),
+            std::slice::from_ref(&staged_config),
+            &old_building,
+            &staged_building,
+            131,
+        )
+        .unwrap();
+        event_store
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                op_id,
+                old_digest: &old_digest,
+                staged_digest: &staged_digest,
+                old_agents: std::slice::from_ref(&old_config),
+                staged_agents: std::slice::from_ref(&staged_config),
+                old_building: &old_building,
+                staged_building: &staged_building,
+                pre_snapshot_id: &pre_snapshot.snapshot_id,
+                pre_snapshot_digest: &world_snapshot_digest(&pre_snapshot),
+                pre_runtime_snapshots: &pre_snapshot.nano_runtime_snapshots,
+                started_tick: 131,
+            })
+            .unwrap();
+        let applied_bytes = sentinel_common::encode_world_snapshot(&applied_snapshot).unwrap();
+        let applied_digest = format!("{:x}", Sha256::digest(&applied_bytes));
+        event_store
+            .mark_runtime_config_apply_runtimes_applied(
+                op_id,
+                &applied_snapshot.snapshot_id,
+                &applied_digest,
+                &applied_snapshot.nano_runtime_snapshots,
+            )
+            .unwrap();
+        let event = DomainEvent::new(
+            "config_applied",
+            "company",
+            r#"{"agent_count":1}"#,
+            op_id,
+            132,
+        )
+        .with_operation_id(op_id);
+        event_store
+            .commit_runtime_config_apply(op_id, &event, "sentinel.events")
+            .unwrap();
+
+        let marker = reconcile_runtime_config_apply_recovery_marker(
+            event_store.as_ref(),
+            &RuntimeConfigApplyStartupReconcileContext {
+                config_dir: &config_dir,
+                max_agents: 4,
+                fs_mount: None,
+                agent_command: &[],
+                agent_validation: sentinel_common::agent_config::AgentConfigValidation::default(),
+                abandoned_reconcile_observer: None,
+            },
+        )
+        .unwrap()
+        .expect("committed forward recovery remains fenced until serving restore");
+        assert_eq!(
+            marker.decision,
+            sentinel_limbo::RuntimeConfigApplyDecision::Forward
+        );
+        assert_eq!(
+            marker.phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::RecoveryRequired
+        );
+        assert_eq!(
+            sentinel_common::agent_config::load_all_agents(&config_dir.join("agents")).unwrap(),
+            vec![staged_config.clone()]
+        );
+
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let (_tx, rx) = mpsc::channel();
+        let (_operator_tx, operator_rx) = mpsc::channel();
+        let (perception_tx, _perception_rx) = mpsc::sync_channel(8);
+        let (startup_world_tx, startup_world_rx) = mpsc::sync_channel(1);
+        let (ebpf_collector, ebpf_tx) = test_ebpf();
+        let owner_registry = fenced_startup_owner_registry();
+        let result = ecs_tick_loop(
+            Arc::clone(&state_store),
+            Arc::clone(&event_store),
+            rx,
+            operator_rx,
+            mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+            mpsc::channel::<RuntimeControlCommand>().1,
+            perception_tx,
+            vec![staged_config],
+            Some(marker),
+            &owner_registry,
+            1,
+            Duration::from_millis(100),
+            1.0,
+            true,
+            shutdown,
+            test_controlplane(&tmp),
+            RuntimeOrchestrator::new(4).with_event_store(Arc::clone(&event_store)),
+            test_sandbox(),
+            ebpf_collector,
+            ebpf_tx,
+            test_episode_producer(&tmp, &event_store),
+            mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+            None,
+            None,
+            mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorMigrateCommand>().1,
+            config_dir.clone(),
+            4,
+            sentinel_common::agent_config::AgentConfigValidation::default(),
+            mpsc::channel::<i64>().1,
+            crate::config::RetentionConfig::default(),
+            String::new(),
+            Vec::new(),
+            crate::adaptive_tick::AdaptiveConfig::default(),
+            sentinel_ecs::RoomDistanceMap::default(),
+            sentinel_ecs::RoomInfoMap::default(),
+            None,
+            crate::config::ResourceManagerConfig::default(),
+            crate::config::PlatformControlplaneConfig::default(),
+            String::new(),
+            Arc::new(RwLock::new(
+                crate::platform_controlplane::PlatformStateSnapshot::default(),
+            )),
+            Arc::new(RwLock::new(
+                crate::runtime_health::RuntimeHealthSnapshot::default(),
+            )),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            projection_path.to_string_lossy().to_string(),
+            false,
+            None,
+            None,
+            Some(StartupConfigApplyTestProbe {
+                world_observer: Some(startup_world_tx),
+                ..Default::default()
+            }),
+            #[cfg(feature = "llm")]
+            crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
+        );
+        assert_eq!(result.unwrap(), 0);
+        assert!(owner_registry.owner_readiness());
+        let serving_ecs = startup_world_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("serving ECS forward snapshot");
+        assert_eq!(serving_ecs.positions.len(), 1);
+        assert_eq!(serving_ecs.positions[0].1.room_id, "applied-dynamic-room");
+        assert_ne!(
+            serving_ecs.positions[0].1.room_id, "config-default-room",
+            "forward recovery must not reconstruct dynamic ECS state from config defaults"
+        );
+        assert_eq!(serving_ecs.sim_tick, applied_snapshot.ecs.sim_tick);
+        assert_eq!(
+            state_store.dump_all_tables().unwrap().agent_states,
+            applied_snapshot.redb.agent_states
+        );
+        assert_eq!(
+            event_store
+                .runtime_config_apply_recovery()
+                .unwrap()
+                .unwrap()
+                .phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::Finalized
+        );
+        assert!(
+            crate::config_persist::load_config_apply_recovery(&config_dir)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -12894,6 +14900,8 @@ mod tests {
         let state_store =
             Arc::new(StateStore::open(tmp.path().join("state.redb").to_str().unwrap()).unwrap());
         let old_config = test_ecs_agent_config(36, "Compensated Old", "Operator", 1);
+        let inactive_old_config = test_ecs_agent_config(38, "Inactive Old", "Operator", 2);
+        let old_agents = vec![old_config.clone(), inactive_old_config.clone()];
         let staged_config = test_ecs_agent_config(37, "Partial New", "Operator", 1);
         let old_building = BuildingConfig {
             building: BuildingMeta {
@@ -12916,7 +14924,7 @@ mod tests {
         let staged_building = old_building.clone();
         crate::config_persist::persist_company_config(
             &config_dir,
-            std::slice::from_ref(&old_config),
+            &old_agents,
             &old_building,
             "initial",
         )
@@ -12932,6 +14940,29 @@ mod tests {
             b"old-state",
             None,
         );
+        pre_snapshot.ecs.identities.push((
+            38,
+            AgentIdentity {
+                agent_id: AgentId(38),
+                name: inactive_old_config.identity.name.clone(),
+                role: inactive_old_config.identity.role.clone(),
+            },
+        ));
+        pre_snapshot.ecs.positions.push((
+            38,
+            Position {
+                room_id: inactive_old_config.preferences.favorite_room.clone(),
+                in_transit: false,
+                transit_target: None,
+                transit_remaining_ms: 0,
+                transit_correlation_id: None,
+                transit_route: Vec::new(),
+                transit_total_ms: 0,
+                transit_paused: false,
+                transit_pause_tick: 0,
+                transit_source: None,
+            },
+        ));
         state_store.restore_all_tables(&pre_snapshot.redb).unwrap();
         drop(sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap());
         seed_projection_from_world_snapshot(projection_path.to_str().unwrap(), &pre_snapshot, 0, 1)
@@ -12967,9 +14998,9 @@ mod tests {
         crate::config_persist::stage_config_apply_recovery(
             &config_dir,
             "config-apply-compensation",
-            &config_apply_digest(std::slice::from_ref(&old_config), &old_building).unwrap(),
+            &config_apply_digest(&old_agents, &old_building).unwrap(),
             &config_apply_digest(std::slice::from_ref(&staged_config), &staged_building).unwrap(),
-            std::slice::from_ref(&old_config),
+            &old_agents,
             std::slice::from_ref(&staged_config),
             &old_building,
             &staged_building,
@@ -12977,22 +15008,23 @@ mod tests {
         )
         .unwrap();
         event_store
-            .begin_runtime_config_apply_recovery(
-                "config-apply-compensation",
-                &config_apply_digest(std::slice::from_ref(&old_config), &old_building).unwrap(),
-                &config_apply_digest(
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                op_id: "config-apply-compensation",
+                old_digest: &config_apply_digest(&old_agents, &old_building).unwrap(),
+                staged_digest: &config_apply_digest(
                     std::slice::from_ref(&staged_config),
                     &staged_building,
                 )
                 .unwrap(),
-                std::slice::from_ref(&old_config),
-                std::slice::from_ref(&staged_config),
-                &old_building,
-                &staged_building,
-                &pre_snapshot.snapshot_id,
-                &pre_runtime_snapshots,
-                120,
-            )
+                old_agents: &old_agents,
+                staged_agents: std::slice::from_ref(&staged_config),
+                old_building: &old_building,
+                staged_building: &staged_building,
+                pre_snapshot_id: &pre_snapshot.snapshot_id,
+                pre_snapshot_digest: &world_snapshot_digest(&pre_snapshot),
+                pre_runtime_snapshots: &pre_runtime_snapshots,
+                started_tick: 120,
+            })
             .unwrap();
 
         assert!(teardown_agent_full(
@@ -13040,11 +15072,132 @@ mod tests {
             .unwrap();
         nano_runtimes.block_for_recovery(AgentId(36));
 
+        let pre_snapshot_digest = world_snapshot_digest(&pre_snapshot);
+        let original_snapshot_bytes =
+            sentinel_common::encode_world_snapshot(&pre_snapshot).unwrap();
+        let mut tampered_snapshot = pre_snapshot.clone();
+        tampered_snapshot.ecs.positions[0].1.room_id = "tampered-room".to_string();
+        let tampered_snapshot_bytes =
+            sentinel_common::encode_world_snapshot(&tampered_snapshot).unwrap();
+        let snapshot_conn =
+            sentinel_limbo::rusqlite::Connection::open(tmp.path().join("events.db")).unwrap();
+        snapshot_conn
+            .execute(
+                "UPDATE world_snapshots SET payload = ?2, payload_size = ?3 WHERE id = ?1",
+                sentinel_limbo::rusqlite::params![
+                    &pre_snapshot.snapshot_id,
+                    &tampered_snapshot_bytes,
+                    i64::try_from(tampered_snapshot_bytes.len()).unwrap(),
+                ],
+            )
+            .unwrap();
+        drop(snapshot_conn);
+        let mut ecs_before_rejected_compensation = world_agent_ids(&mut world);
+        ecs_before_rejected_compensation.sort_by_key(|agent_id| agent_id.0);
+        let logical_before_rejected_compensation = runtime_orch
+            .agents()
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        let adapter_before_rejected_compensation = nano_runtimes
+            .agent_ids()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let store_before_rejected_compensation =
+            serde_json::to_vec(&state_store.dump_all_tables().unwrap()).unwrap();
+        let projection_before_rejected_compensation =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap())
+                .unwrap()
+                .get_agent(36)
+                .unwrap()
+                .unwrap();
+        let config_before_rejected_compensation =
+            sentinel_common::agent_config::load_all_agents(&config_dir.join("agents")).unwrap();
+        let digest_error = compensate_config_apply_transaction(
+            "config-apply-compensation",
+            &pre_snapshot.snapshot_id,
+            &pre_snapshot_digest,
+            &pre_runtime_snapshots,
+            &old_agents,
+            &old_building,
+            &mut world,
+            &mut runtime_orch,
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+            &mut nano_runtimes,
+            &security_runtime_state,
+            &event_store,
+            &state_store,
+            None,
+            None,
+            &[],
+            tmp.path(),
+            projection_path.to_str().unwrap(),
+            &config_dir,
+        )
+        .unwrap_err();
+        assert!(format!("{digest_error:#}").contains("snapshot digest conflict"));
+        let mut ecs_after_rejected_compensation = world_agent_ids(&mut world);
+        ecs_after_rejected_compensation.sort_by_key(|agent_id| agent_id.0);
+        assert_eq!(
+            ecs_after_rejected_compensation,
+            ecs_before_rejected_compensation
+        );
+        assert_eq!(
+            runtime_orch
+                .agents()
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            logical_before_rejected_compensation
+        );
+        assert_eq!(
+            nano_runtimes
+                .agent_ids()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            adapter_before_rejected_compensation
+        );
+        assert_eq!(
+            serde_json::to_vec(&state_store.dump_all_tables().unwrap()).unwrap(),
+            store_before_rejected_compensation
+        );
+        let projection_after_rejected_compensation =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap())
+                .unwrap()
+                .get_agent(36)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            projection_after_rejected_compensation.name,
+            projection_before_rejected_compensation.name
+        );
+        assert_eq!(
+            sentinel_common::agent_config::load_all_agents(&config_dir.join("agents")).unwrap(),
+            config_before_rejected_compensation
+        );
+        let snapshot_conn =
+            sentinel_limbo::rusqlite::Connection::open(tmp.path().join("events.db")).unwrap();
+        snapshot_conn
+            .execute(
+                "UPDATE world_snapshots SET payload = ?2, payload_size = ?3 WHERE id = ?1",
+                sentinel_limbo::rusqlite::params![
+                    &pre_snapshot.snapshot_id,
+                    &original_snapshot_bytes,
+                    i64::try_from(original_snapshot_bytes.len()).unwrap(),
+                ],
+            )
+            .unwrap();
+        drop(snapshot_conn);
+
         compensate_config_apply_transaction(
             "config-apply-compensation",
             &pre_snapshot.snapshot_id,
+            &pre_snapshot_digest,
             &pre_runtime_snapshots,
-            std::slice::from_ref(&old_config),
+            &old_agents,
             &old_building,
             &mut world,
             &mut runtime_orch,
@@ -13065,14 +15218,21 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(world_agent_ids(&mut world), vec![AgentId(36)]);
+        let mut restored_ecs_ids = world_agent_ids(&mut world);
+        restored_ecs_ids.sort_by_key(|agent_id| agent_id.0);
+        assert_eq!(restored_ecs_ids, vec![AgentId(36), AgentId(38)]);
         assert!(runtime_orch.agents().contains_key(&AgentId(36)));
         assert!(!runtime_orch.agents().contains_key(&AgentId(37)));
+        assert!(!runtime_orch.agents().contains_key(&AgentId(38)));
         assert!(nano_runtimes.handle(AgentId(36)).is_some());
         assert!(nano_runtimes.handle(AgentId(37)).is_none());
+        assert!(
+            nano_runtimes.handle(AgentId(38)).is_none(),
+            "compensation must not invent an inactive runtime handle"
+        );
         assert_eq!(
             sentinel_common::agent_config::load_all_agents(&config_dir.join("agents")).unwrap(),
-            vec![old_config.clone()]
+            old_agents
         );
         assert_eq!(
             event_store
@@ -13109,6 +15269,196 @@ mod tests {
         runtimes.block_for_recovery(AgentId(34));
         let error = runtimes.spawn(&agent, &[]).unwrap_err();
         assert!(format!("{error:#}").contains("blocked by durable config recovery"));
+    }
+
+    #[test]
+    fn config_apply_failure_disposition_compensates_only_exact_early_rollback() {
+        use sentinel_limbo::{RuntimeConfigApplyDecision, RuntimeConfigApplyPhase};
+
+        const OP_ID: &str = "config-apply-disposition";
+        let marker = |op_id: &str, decision, phase| ConfigApplyFailureMarker {
+            op_id: op_id.to_string(),
+            decision,
+            phase,
+        };
+        let assert_fenced = |disposition: ConfigApplyFailureDisposition| {
+            assert!(!disposition.should_compensate());
+            assert!(disposition.should_fence());
+            assert!(disposition.fence_reason().is_some());
+        };
+
+        for phase in [
+            RuntimeConfigApplyPhase::Prepared,
+            RuntimeConfigApplyPhase::RuntimesApplied,
+        ] {
+            let disposition = config_apply_failure_disposition(
+                OP_ID,
+                Ok(Some(marker(
+                    OP_ID,
+                    RuntimeConfigApplyDecision::Rollback,
+                    phase,
+                ))),
+            );
+            assert!(disposition.should_compensate());
+            assert!(!disposition.should_fence());
+        }
+
+        for phase in [
+            RuntimeConfigApplyPhase::Prepared,
+            RuntimeConfigApplyPhase::RuntimesApplied,
+            RuntimeConfigApplyPhase::CommittedPendingFinalize,
+            RuntimeConfigApplyPhase::RecoveryRequired,
+            RuntimeConfigApplyPhase::Finalized,
+        ] {
+            assert_fenced(config_apply_failure_disposition(
+                OP_ID,
+                Ok(Some(marker(
+                    OP_ID,
+                    RuntimeConfigApplyDecision::Forward,
+                    phase,
+                ))),
+            ));
+        }
+
+        for phase in [
+            RuntimeConfigApplyPhase::RecoveryRequired,
+            RuntimeConfigApplyPhase::Finalized,
+        ] {
+            assert_fenced(config_apply_failure_disposition(
+                OP_ID,
+                Ok(Some(marker(
+                    OP_ID,
+                    RuntimeConfigApplyDecision::Rollback,
+                    phase,
+                ))),
+            ));
+        }
+        assert_fenced(config_apply_failure_disposition(
+            OP_ID,
+            Ok(Some(marker(
+                "foreign-config-apply",
+                RuntimeConfigApplyDecision::Rollback,
+                RuntimeConfigApplyPhase::Prepared,
+            ))),
+        ));
+        assert_fenced(config_apply_failure_disposition(OP_ID, Ok(None)));
+        assert_fenced(config_apply_failure_disposition(
+            OP_ID,
+            Err(anyhow!("synthetic marker read failure")),
+        ));
+    }
+
+    #[test]
+    fn config_apply_recovery_fence_blocks_union_and_retains_failed_adapter_handle() {
+        use sentinel_common::nano_runtime::NanoRuntime;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap());
+        let old_agent = test_ecs_agent_config(80, "Old Only", "Tester", 1);
+        let staged_agent = test_ecs_agent_config(81, "Staged Only", "Tester", 1);
+        let mut runtime_orch =
+            RuntimeOrchestrator::new(4).with_event_store(Arc::clone(&event_store));
+        let (mut world, _schedule) = create_simulation_world();
+        for config in [&old_agent, &staged_agent] {
+            let agent_id = AgentId(config.identity.id);
+            runtime_orch
+                .spawn_agent(
+                    AgentIdentity {
+                        agent_id,
+                        name: config.identity.name.clone(),
+                        role: config.identity.role.clone(),
+                    },
+                    ShiftInfo {
+                        shift_set: config.identity.shift_set,
+                        shift_start_hour: 6,
+                        shift_end_hour: 14,
+                        is_on_duty: true,
+                    },
+                    &config.preferences.favorite_room,
+                )
+                .unwrap();
+            spawn_agent(
+                &mut world,
+                agent_id,
+                &config.identity.name,
+                &config.identity.role,
+                config.identity.shift_set,
+                &config.preferences.favorite_room,
+            );
+        }
+
+        let mut adapter = EcsNativeRuntime::external_lifecycle(4);
+        let active = adapter
+            .spawn(DaemonNanoRuntimeRegistry::workload(&staged_agent, &[]))
+            .unwrap();
+        let retained_handle = NanoHandle {
+            instance_id: uuid::Uuid::new_v4(),
+            ..active
+        };
+        let mut nano_runtimes =
+            ecs_registry_with_handle(AgentId(81), retained_handle.clone(), adapter);
+        let sandbox = test_sandbox();
+        let mut sandbox_handles = HashMap::new();
+        let mut agent_processes = HashMap::new();
+        let (mut ebpf_collector, _) = test_ebpf();
+        let security_runtime_state: operator_api::SharedSecurityRuntimeState = Default::default();
+        for config in [&old_agent, &staged_agent] {
+            record_security_runtime_snapshot(
+                &security_runtime_state,
+                AgentId(config.identity.id),
+                &config.identity.name,
+                None,
+                None,
+            );
+        }
+
+        let seed = sentinel_common::NodeId(uuid::Uuid::from_bytes([80; 16]));
+        let owner_registry = sentinel_common::OwnerRegistry::new_for_test(seed);
+        assert!(owner_registry.owner_readiness());
+        assert!(owner_registry
+            .issue(sentinel_common::StateTransferScope::World)
+            .is_ok());
+        let mut restore_fence = RestoreFence::default();
+
+        fence_config_apply_recovery(
+            std::slice::from_ref(&old_agent),
+            std::slice::from_ref(&staged_agent),
+            ConfigApplyRecoveryFenceContext {
+                world: &mut world,
+                runtime_orch: &mut runtime_orch,
+                sandbox: &sandbox,
+                sandbox_handles: &mut sandbox_handles,
+                ebpf_collector: &mut ebpf_collector,
+                agent_processes: &mut agent_processes,
+                nano_runtimes: &mut nano_runtimes,
+                security_runtime_state: &security_runtime_state,
+                projection_db_path: "",
+                restore_fence: &mut restore_fence,
+                owner_registry: &owner_registry,
+            },
+        );
+
+        assert_eq!(
+            nano_runtimes.recovery_blocked_agent_ids(),
+            vec![AgentId(80), AgentId(81)]
+        );
+        assert!(runtime_orch.agents().is_empty());
+        assert!(world_agent_ids(&mut world).is_empty());
+        assert!(security_runtime_state.read().unwrap().is_empty());
+        assert_eq!(nano_runtimes.handle(AgentId(81)), Some(&retained_handle));
+        assert!(nano_runtimes.handle(AgentId(80)).is_none());
+        assert!(restore_fence.is_active());
+        assert!(!owner_registry.owner_readiness());
+        assert!(matches!(
+            owner_registry.issue(sentinel_common::StateTransferScope::World),
+            Err(sentinel_common::OwnerIssueError::ReadinessClosed { .. })
+        ));
+        assert!(!unfenced_world_background_work_allowed(
+            &owner_registry,
+            &restore_fence
+        ));
+        assert!(nano_runtimes.spawn(&staged_agent, &[]).is_err());
     }
 
     #[test]
@@ -13509,30 +15859,25 @@ mod tests {
     fn config_apply_projection_identity_requires_exactly_one_active_row() {
         let tmp = tempfile::tempdir().unwrap();
         let missing_path = tmp.path().join("projection-missing.db");
-        drop(
-            sentinel_projection::ReadModelStore::open(missing_path.to_str().unwrap()).unwrap(),
-        );
+        drop(sentinel_projection::ReadModelStore::open(missing_path.to_str().unwrap()).unwrap());
         let mut agent_cfg = test_agent_config(47, "Projection Agent", "Operations", 1);
-        let missing =
-            update_agent_projection_identity(missing_path.to_str().unwrap(), &agent_cfg)
-                .unwrap_err();
+        let missing = update_agent_projection_identity(missing_path.to_str().unwrap(), &agent_cfg)
+            .unwrap_err();
         assert!(
             format!("{missing:#}").contains("affected 0 rows, expected exactly 1"),
             "{missing:#}"
         );
         upsert_agent_projection_seed(&missing_path, &agent_cfg, 1).unwrap();
         mark_agent_projection_despawned(&missing_path, AgentId(47), 2).unwrap();
-        let inactive =
-            update_agent_projection_identity(missing_path.to_str().unwrap(), &agent_cfg)
-                .unwrap_err();
+        let inactive = update_agent_projection_identity(missing_path.to_str().unwrap(), &agent_cfg)
+            .unwrap_err();
         assert!(
             format!("{inactive:#}").contains("affected 0 rows, expected exactly 1"),
             "{inactive:#}"
         );
 
         let duplicate_path = tmp.path().join("projection-duplicate.db");
-        let duplicate_db =
-            sentinel_limbo::rusqlite::Connection::open(&duplicate_path).unwrap();
+        let duplicate_db = sentinel_limbo::rusqlite::Connection::open(&duplicate_path).unwrap();
         duplicate_db
             .execute_batch(
                 "CREATE TABLE agent_live_view (
@@ -13557,9 +15902,7 @@ mod tests {
         );
 
         let exact_path = tmp.path().join("projection-exact.db");
-        drop(
-            sentinel_projection::ReadModelStore::open(exact_path.to_str().unwrap()).unwrap(),
-        );
+        drop(sentinel_projection::ReadModelStore::open(exact_path.to_str().unwrap()).unwrap());
         upsert_agent_projection_seed(&exact_path, &agent_cfg, 1).unwrap();
         agent_cfg.identity.name = "Projection Updated".to_string();
         agent_cfg.identity.role = "Lead".to_string();
@@ -13741,6 +16084,7 @@ mod tests {
             ptx,
             vec![],
             None,
+            sentinel_common::OwnerRegistry::global(),
             1,
             Duration::from_millis(100),
             1.0, // time_scale
@@ -13784,6 +16128,7 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new())),
             String::new(),
             false,
+            None,
             None,
             None,
             #[cfg(feature = "llm")]
@@ -13835,6 +16180,7 @@ mod tests {
                 ptx,
                 all_agents,
                 None,
+                sentinel_common::OwnerRegistry::global(),
                 1,
                 Duration::from_millis(50),
                 1.0, // time_scale
@@ -13878,6 +16224,7 @@ mod tests {
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
                 false,
+                None,
                 None,
                 None,
                 #[cfg(feature = "llm")]
@@ -13946,6 +16293,7 @@ mod tests {
                 ptx,
                 all_agents,
                 None,
+                sentinel_common::OwnerRegistry::global(),
                 1,
                 Duration::from_millis(50),
                 1.0, // time_scale
@@ -13991,6 +16339,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
                 #[cfg(feature = "llm")]
                 crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
             )
@@ -14015,6 +16364,291 @@ mod tests {
             snapshot.is_ok() && snapshot.unwrap().is_some(),
             "Runtime-Snapshot muss nach Shutdown existieren"
         );
+    }
+
+    #[test]
+    fn queued_runtime_mutation_is_rejected_without_effect_while_world_is_fenced() {
+        sentinel_common::feature_flags::RuntimeFlags::init();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap());
+        let event_store_readback = Arc::clone(&event_store);
+        let state_store =
+            Arc::new(StateStore::open(tmp.path().join("state.redb").to_str().unwrap()).unwrap());
+        let (_action_tx, action_rx) = mpsc::channel();
+        let (_operator_tx, operator_rx) = mpsc::channel();
+        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (perception_tx, _perception_rx) = mpsc::sync_channel(8);
+        let (state_hash_before_tx, state_hash_before_rx) = mpsc::sync_channel(1);
+        runtime_tx
+            .send(RuntimeControlCommand::StateHash {
+                response_tx: state_hash_before_tx,
+            })
+            .unwrap();
+        let (despawn_response_tx, despawn_response_rx) = mpsc::sync_channel(1);
+        runtime_tx
+            .send(RuntimeControlCommand::Despawn {
+                agent_id: 1,
+                response_tx: despawn_response_tx,
+            })
+            .unwrap();
+        let (state_hash_after_tx, state_hash_after_rx) = mpsc::sync_channel(1);
+        runtime_tx
+            .send(RuntimeControlCommand::StateHash {
+                response_tx: state_hash_after_tx,
+            })
+            .unwrap();
+
+        let owner_registry = Box::leak(Box::new(sentinel_common::OwnerRegistry::new_for_test(
+            sentinel_common::NodeId::new(),
+        )));
+        owner_registry.close_owner_readiness();
+        let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let all_agents = vec![test_ecs_agent_config(1, "Fenced Agent", "Tester", 1)];
+        let (ebpf_collector, ebpf_tx) = test_ebpf();
+        let episode_producer = test_episode_producer(&tmp, &event_store);
+        let security_runtime_state = Arc::new(RwLock::new(HashMap::new()));
+        let security_runtime_readback = Arc::clone(&security_runtime_state);
+        let config_dir = tmp.path().join("config");
+
+        let handle = std::thread::spawn(move || {
+            ecs_tick_loop(
+                state_store,
+                event_store,
+                action_rx,
+                operator_rx,
+                mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+                runtime_rx,
+                perception_tx,
+                all_agents,
+                None,
+                owner_registry,
+                1,
+                Duration::from_millis(50),
+                1.0,
+                true,
+                shutdown,
+                test_controlplane(&tmp),
+                runtime_orch,
+                test_sandbox(),
+                ebpf_collector,
+                ebpf_tx,
+                episode_producer,
+                mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                None,
+                None,
+                mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorMigrateCommand>().1,
+                config_dir,
+                10,
+                sentinel_common::agent_config::AgentConfigValidation::default(),
+                mpsc::channel::<i64>().1,
+                crate::config::RetentionConfig::default(),
+                String::new(),
+                vec!["true".to_string()],
+                crate::adaptive_tick::AdaptiveConfig::default(),
+                sentinel_ecs::RoomDistanceMap::default(),
+                sentinel_ecs::RoomInfoMap::default(),
+                None,
+                crate::config::ResourceManagerConfig::default(),
+                crate::config::PlatformControlplaneConfig::default(),
+                String::new(),
+                Arc::new(RwLock::new(
+                    crate::platform_controlplane::PlatformStateSnapshot::default(),
+                )),
+                Arc::new(RwLock::new(
+                    crate::runtime_health::RuntimeHealthSnapshot::default(),
+                )),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
+                security_runtime_state,
+                String::new(),
+                false,
+                None,
+                None,
+                None,
+                #[cfg(feature = "llm")]
+                crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
+            )
+        });
+
+        let rejected = despawn_response_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("fenced runtime mutation response");
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.outcome, "world_authority_unavailable");
+        let state_hash_before = state_hash_before_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("read-only StateHash before fenced mutation");
+        let state_hash_after = state_hash_after_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("read-only StateHash after fenced mutation");
+        assert!(!state_hash_before.strict.is_empty());
+        assert_eq!(state_hash_after.strict, state_hash_before.strict);
+        assert_eq!(state_hash_after.core, state_hash_before.core);
+        assert_eq!(state_hash_after.tick, state_hash_before.tick);
+        assert_eq!(
+            state_hash_after.last_event_id,
+            state_hash_before.last_event_id
+        );
+        shutdown_clone.store(true, Ordering::SeqCst);
+        assert!(handle.join().unwrap().is_ok());
+
+        assert!(
+            event_store_readback
+                .get_all_events()
+                .unwrap()
+                .iter()
+                .all(|event| event.event_type != "agent_despawned"),
+            "fenced queued despawn must not persist an AgentDespawned event"
+        );
+        assert!(
+            security_runtime_readback.read().unwrap().contains_key(&1),
+            "fenced queued despawn must leave the exact runtime observation intact"
+        );
+    }
+
+    #[test]
+    fn mid_tick_restore_fence_blocks_later_commands_and_clock_progress() {
+        sentinel_common::feature_flags::RuntimeFlags::init();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap());
+        let event_store_readback = Arc::clone(&event_store);
+        let state_store =
+            Arc::new(StateStore::open(tmp.path().join("state.redb").to_str().unwrap()).unwrap());
+        let (_action_tx, action_rx) = mpsc::channel();
+        let (_operator_tx, operator_rx) = mpsc::channel();
+        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (perception_tx, _perception_rx) = mpsc::sync_channel(8);
+        let (restore_tx, restore_rx) = mpsc::channel();
+        restore_tx
+            .send(sentinel_common::OperatorRestoreCommand::from_snapshot_id(
+                "first-restore".to_string(),
+            ))
+            .unwrap();
+        restore_tx
+            .send(sentinel_common::OperatorRestoreCommand::from_snapshot_id(
+                "second-restore".to_string(),
+            ))
+            .unwrap();
+        let (migrate_tx, migrate_rx) = mpsc::channel();
+        migrate_tx
+            .send(sentinel_common::OperatorMigrateCommand {
+                reason: "must-remain-fenced".to_string(),
+            })
+            .unwrap();
+        let (restore_observer_tx, restore_observer_rx) = mpsc::channel();
+
+        let owner_registry = Box::leak(Box::new(sentinel_common::OwnerRegistry::new_for_test(
+            sentinel_common::NodeId::new(),
+        )));
+        let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let all_agents = vec![test_ecs_agent_config(1, "Fenced Agent", "Tester", 1)];
+        let (ebpf_collector, ebpf_tx) = test_ebpf();
+        let episode_producer = test_episode_producer(&tmp, &event_store);
+        let config_dir = tmp.path().join("config");
+
+        let handle = std::thread::spawn(move || {
+            ecs_tick_loop(
+                state_store,
+                event_store,
+                action_rx,
+                operator_rx,
+                mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+                runtime_rx,
+                perception_tx,
+                all_agents,
+                None,
+                owner_registry,
+                1,
+                Duration::from_millis(50),
+                1.0,
+                true,
+                shutdown,
+                test_controlplane(&tmp),
+                runtime_orch,
+                test_sandbox(),
+                ebpf_collector,
+                ebpf_tx,
+                episode_producer,
+                mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                None,
+                None,
+                mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
+                restore_rx,
+                mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+                migrate_rx,
+                config_dir,
+                10,
+                sentinel_common::agent_config::AgentConfigValidation::default(),
+                mpsc::channel::<i64>().1,
+                crate::config::RetentionConfig::default(),
+                String::new(),
+                vec!["true".to_string()],
+                crate::adaptive_tick::AdaptiveConfig::default(),
+                sentinel_ecs::RoomDistanceMap::default(),
+                sentinel_ecs::RoomInfoMap::default(),
+                None,
+                crate::config::ResourceManagerConfig::default(),
+                crate::config::PlatformControlplaneConfig::default(),
+                String::new(),
+                Arc::new(RwLock::new(
+                    crate::platform_controlplane::PlatformStateSnapshot::default(),
+                )),
+                Arc::new(RwLock::new(
+                    crate::runtime_health::RuntimeHealthSnapshot::default(),
+                )),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(RwLock::new(HashMap::new())),
+                String::new(),
+                false,
+                None,
+                None,
+                Some(StartupConfigApplyTestProbe {
+                    fence_after_first_restore_command: true,
+                    restore_queue_observer: Some(restore_observer_tx),
+                    ..Default::default()
+                }),
+                #[cfg(feature = "llm")]
+                crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
+            )
+        });
+
+        let (restore_starts, fence_active) = restore_observer_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("restore queue observation");
+        assert_eq!(restore_starts, 1, "second restore must not start");
+        assert!(fence_active);
+        let cursor_at_fence = event_store_readback.get_latest_event_id().unwrap();
+        let (state_hash_tx, state_hash_rx) = mpsc::sync_channel(1);
+        runtime_tx
+            .send(RuntimeControlCommand::StateHash {
+                response_tx: state_hash_tx,
+            })
+            .unwrap();
+        let state_hash = state_hash_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("StateHash remains readable after mid-tick fence");
+        assert_eq!(state_hash.tick, 0);
+        assert_eq!(state_hash.last_event_id, cursor_at_fence);
+
+        shutdown_clone.store(true, Ordering::SeqCst);
+        assert_eq!(handle.join().unwrap().unwrap(), 0);
+        assert!(event_store_readback
+            .get_all_events()
+            .unwrap()
+            .iter()
+            .all(|event| event.event_type != "migration_completed"));
     }
 
     #[test]
@@ -14065,6 +16699,7 @@ mod tests {
                 ptx,
                 all_agents,
                 None,
+                sentinel_common::OwnerRegistry::global(),
                 1,
                 Duration::from_millis(50),
                 1.0,
@@ -14108,6 +16743,7 @@ mod tests {
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
                 false,
+                None,
                 None,
                 None,
                 #[cfg(feature = "llm")]

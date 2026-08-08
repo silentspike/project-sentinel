@@ -14,9 +14,11 @@ mod kani;
 pub mod outbox_publisher;
 
 pub use event_store::{
-    EventStore, LlmCompletionEntry, MonotonicityError, OutboxEntry, OutboxTransport,
-    RuntimeConfigApplyDecision, RuntimeConfigApplyPhase, RuntimeConfigApplyRecoveryMarker,
-    RuntimeConfigRecoveryMarker, RuntimeConfigRecoveryPhase, SnapshotRow, IMMUTABLE_SNAPSHOT_MS,
+    runtime_config_apply_digest, EventStore, LlmCompletionEntry, MonotonicityError, OutboxEntry,
+    OutboxTransport, RuntimeConfigApplyDecision, RuntimeConfigApplyPhase,
+    RuntimeConfigApplyRecoveryMarker, RuntimeConfigApplyRecoveryStart, RuntimeConfigRecoveryMarker,
+    RuntimeConfigRecoveryPhase, SnapshotRow, IMMUTABLE_SNAPSHOT_MS,
+    RUNTIME_CONFIG_APPLY_SCHEMA_VERSION,
 };
 pub use outbox_publisher::{OutboxPublisher, OutboxPublisherConfig, PublishCycleStats};
 

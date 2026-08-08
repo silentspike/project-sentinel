@@ -468,6 +468,9 @@ struct ResolveLlmCompletionResponse {
 
 #[derive(Clone)]
 struct AppState {
+    owner_registry: &'static sentinel_common::OwnerRegistry,
+    #[cfg(test)]
+    before_direct_world_effect: Option<Arc<dyn Fn() + Send + Sync>>,
     allowed_rooms: Arc<HashSet<String>>,
     shared_secret: Option<String>,
     data_dir: PathBuf,
@@ -725,6 +728,9 @@ pub async fn start_server(
         .with_context(|| format!("Operator-API bind fehlgeschlagen: {}", config.bind_addr))?;
     let room_count = allowed_rooms.len();
     let state = AppState {
+        owner_registry: sentinel_common::OwnerRegistry::global(),
+        #[cfg(test)]
+        before_direct_world_effect: None,
         allowed_rooms: Arc::new(allowed_rooms.into_iter().collect()),
         shared_secret: config.shared_secret,
         data_dir,
@@ -885,6 +891,21 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
     }
     if !is_authorized(&request.headers, state.shared_secret.as_deref()) {
         return ApiError::Unauthorized.to_response();
+    }
+    let read_only_diagnostic_post = matches!(
+        path_only,
+        OPERATOR_OWNER_CHECK_PATH | OPERATOR_CONTROL_QUERY_PATH
+    );
+    if !read_only_diagnostic_post
+        && state
+            .owner_registry
+            .issue(sentinel_common::StateTransferScope::World)
+            .is_err()
+    {
+        return ApiError::ServiceUnavailable(
+            "World mutation authority is unavailable on this node",
+        )
+        .to_response();
     }
 
     match path_only {
@@ -1284,7 +1305,7 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                         .to_response()
                 }
             };
-            let reg = sentinel_common::OwnerRegistry::global();
+            let reg = state.owner_registry;
             let this = reg.this_node();
             let term = match reg.current_owner(&scope) {
                 Ok(term) => term,
@@ -2159,18 +2180,60 @@ fn is_protected_read_path(path: &str) -> bool {
 }
 
 fn open_fs_layer(state: &AppState) -> std::result::Result<Arc<LayerManager>, ApiError> {
-    if let Some(layer) = &state.fs_layer {
-        return Ok(Arc::clone(layer));
+    state
+        .fs_layer
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or(ApiError::ServiceUnavailable(
+            "sentinel-fs Layer nicht verfuegbar",
+        ))
+}
+
+/// Revalidates World authority at the exact synchronous side-effect boundary.
+///
+/// The tick barrier is intentionally scoped only to the supplied local effect.
+/// Channel waits, config materialization and handoff orchestration must never run
+/// inside this closure because they acquire or depend on the same barrier.
+fn with_direct_world_mutation<T>(
+    state: &AppState,
+    effect: impl FnOnce() -> std::result::Result<T, ApiError>,
+) -> std::result::Result<T, ApiError> {
+    #[cfg(test)]
+    if let Some(hook) = state.before_direct_world_effect.as_ref() {
+        hook();
     }
-    let cas = CasStore::open(&state.data_dir)
-        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs CAS nicht verfuegbar"))?;
-    let meta = MetadataStore::open(state.data_dir.join("metadata.redb"))
-        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Metadata nicht verfuegbar"))?;
-    let layer = Arc::new(LayerManager::new(cas, meta));
-    layer
-        .init_base_root()
-        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Base-Root nicht initialisierbar"))?;
-    Ok(layer)
+    let _tick_barrier = sentinel_common::owner_tick_barrier();
+    let guard = state
+        .owner_registry
+        .issue(sentinel_common::StateTransferScope::World)
+        .map_err(|_| {
+            ApiError::ServiceUnavailable("World mutation authority is unavailable on this node")
+        })?;
+    state.owner_registry.validate(&guard).map_err(|_| {
+        ApiError::ServiceUnavailable("World mutation authority is unavailable on this node")
+    })?;
+    effect()
+}
+
+fn open_fs_layer_for_mutation(
+    state: &AppState,
+) -> std::result::Result<Arc<LayerManager>, ApiError> {
+    with_direct_world_mutation(state, || {
+        let layer = if let Some(layer) = state.fs_layer.as_ref() {
+            Arc::clone(layer)
+        } else {
+            let cas = CasStore::open(&state.data_dir)
+                .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs CAS nicht verfuegbar"))?;
+            let meta = MetadataStore::open(state.data_dir.join("metadata.redb")).map_err(|_| {
+                ApiError::ServiceUnavailable("sentinel-fs Metadata nicht verfuegbar")
+            })?;
+            Arc::new(LayerManager::new(cas, meta))
+        };
+        layer.init_base_root().map_err(|_| {
+            ApiError::ServiceUnavailable("sentinel-fs Base-Root nicht initialisierbar")
+        })?;
+        Ok(layer)
+    })
 }
 
 fn now_ms() -> u64 {
@@ -2337,38 +2400,41 @@ fn create_fs_trash_fixture(
     }
     validate_relative_path(&payload.relative_path)?;
     let fs_agent_dir = fs_agent_dir_for_name(state, agent_name)?;
-    let layer = open_fs_layer(state)?;
+    let layer = open_fs_layer_for_mutation(state)?;
     let metadata = layer.meta();
-    let (parent_inode, file_name) =
-        fs_parent_and_name(&layer, &fs_agent_dir, &payload.relative_path)?;
-    if let Some(existing_inode) = layer
-        .lookup_dirent(&fs_agent_dir, parent_inode, &file_name)
-        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Dirent-Lookup fehlgeschlagen"))?
-    {
+    let (inode, inode_data) = with_direct_world_mutation(state, || {
+        let (parent_inode, file_name) =
+            fs_parent_and_name(&layer, &fs_agent_dir, &payload.relative_path)?;
+        if let Some(existing_inode) = layer
+            .lookup_dirent(&fs_agent_dir, parent_inode, &file_name)
+            .map_err(|_| ApiError::ServiceUnavailable("Fixture-Dirent-Lookup fehlgeschlagen"))?
+        {
+            layer
+                .unlink(&fs_agent_dir, parent_inode, &file_name, existing_inode)
+                .map_err(|_| {
+                    ApiError::ServiceUnavailable("Vorhandene Fixture-Datei nicht entfernbar")
+                })?;
+        }
+        let inode = layer
+            .write_file(
+                &fs_agent_dir,
+                parent_inode,
+                &file_name,
+                payload.content.as_bytes(),
+                0o644,
+            )
+            .map_err(|_| ApiError::ServiceUnavailable("Fixture-Write fehlgeschlagen"))?;
+        let inode_data = layer
+            .lookup_inode(&fs_agent_dir, inode)
+            .map_err(|_| ApiError::ServiceUnavailable("Fixture-Inode nicht lesbar"))?
+            .ok_or(ApiError::ServiceUnavailable(
+                "Fixture-Inode fehlt nach Write",
+            ))?;
         layer
-            .unlink(&fs_agent_dir, parent_inode, &file_name, existing_inode)
-            .map_err(|_| {
-                ApiError::ServiceUnavailable("Vorhandene Fixture-Datei nicht entfernbar")
-            })?;
-    }
-    let inode = layer
-        .write_file(
-            &fs_agent_dir,
-            parent_inode,
-            &file_name,
-            payload.content.as_bytes(),
-            0o644,
-        )
-        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Write fehlgeschlagen"))?;
-    let inode_data = layer
-        .lookup_inode(&fs_agent_dir, inode)
-        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Inode nicht lesbar"))?
-        .ok_or(ApiError::ServiceUnavailable(
-            "Fixture-Inode fehlt nach Write",
-        ))?;
-    layer
-        .unlink(&fs_agent_dir, parent_inode, &file_name, inode)
-        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Unlink fehlgeschlagen"))?;
+            .unlink(&fs_agent_dir, parent_inode, &file_name, inode)
+            .map_err(|_| ApiError::ServiceUnavailable("Fixture-Unlink fehlgeschlagen"))?;
+        Ok((inode, inode_data))
+    })?;
     let trashed_chunks = u64::from(
         metadata
             .get_trash_timestamp(&inode_data.hash)
@@ -2390,12 +2456,14 @@ fn set_fs_trash_age(
     state: &AppState,
 ) -> std::result::Result<FsTrashAgeResponse, ApiError> {
     let chunk_hash = decode_chunk_hash(&payload.chunk_hash)?;
-    let layer = open_fs_layer(state)?;
+    let layer = open_fs_layer_for_mutation(state)?;
     let trashed_at_ms = now_ms().saturating_sub(payload.hours_ago * 3600 * 1000);
-    let updated = layer
-        .meta()
-        .set_trash_timestamp(&chunk_hash, Some(trashed_at_ms))
-        .map_err(|_| ApiError::ServiceUnavailable("Trash-Queue nicht schreibbar"))?;
+    let updated = with_direct_world_mutation(state, || {
+        layer
+            .meta()
+            .set_trash_timestamp(&chunk_hash, Some(trashed_at_ms))
+            .map_err(|_| ApiError::ServiceUnavailable("Trash-Queue nicht schreibbar"))
+    })?;
     if !updated {
         return Err(ApiError::NotFound("chunk_hash nicht in fs_trash_queue"));
     }
@@ -2410,11 +2478,13 @@ fn run_fs_trash_gc(
     payload: FsTrashGcRequest,
     state: &AppState,
 ) -> std::result::Result<FsTrashGcResponse, ApiError> {
-    let layer = open_fs_layer(state)?;
-    let stats = layer
-        .meta()
-        .gc_trash(layer.cas(), payload.grace_period_hours)
-        .map_err(|_| ApiError::ServiceUnavailable("gc_trash fehlgeschlagen"))?;
+    let layer = open_fs_layer_for_mutation(state)?;
+    let stats = with_direct_world_mutation(state, || {
+        layer
+            .meta()
+            .gc_trash(layer.cas(), payload.grace_period_hours)
+            .map_err(|_| ApiError::ServiceUnavailable("gc_trash fehlgeschlagen"))
+    })?;
     Ok(FsTrashGcResponse {
         accepted: true,
         grace_period_hours: payload.grace_period_hours,
@@ -2492,9 +2562,6 @@ fn inspect_agent_fs_browse(
     };
     let aggregate_id = resolve_aggregate_id(state, agent_id);
     let layer = open_fs_layer(state)?;
-    layer.ensure_agent_root(&aggregate_id).map_err(|_| {
-        ApiError::ServiceUnavailable("sentinel-fs Agent-Root nicht initialisierbar")
-    })?;
 
     match layer
         .lookup_inode(&aggregate_id, inode)
@@ -2567,9 +2634,6 @@ fn inspect_agent_fs_read(
         .map_err(|_| ApiError::BadRequest("inode muss Integer sein"))?;
     let aggregate_id = resolve_aggregate_id(state, agent_id);
     let layer = open_fs_layer(state)?;
-    layer.ensure_agent_root(&aggregate_id).map_err(|_| {
-        ApiError::ServiceUnavailable("sentinel-fs Agent-Root nicht initialisierbar")
-    })?;
 
     let data = layer
         .lookup_inode(&aggregate_id, inode)
@@ -2630,8 +2694,10 @@ fn run_fs_dedup_benchmark(
         uuid::Uuid::now_v7()
     );
     let fs_agent_dir = fs_agent_dir_for_name(state, agent_name)?;
-    let layer = open_fs_layer(state)?;
-    let parent_inode = ensure_issue379_benchmark_dir(&layer, &fs_agent_dir)?;
+    let layer = open_fs_layer_for_mutation(state)?;
+    let parent_inode = with_direct_world_mutation(state, || {
+        ensure_issue379_benchmark_dir(&layer, &fs_agent_dir)
+    })?;
     let content = dedup_benchmark_content(payload.bytes_per_write, &file_prefix);
     let content_hash = CasStore::hash(&content);
 
@@ -2641,15 +2707,18 @@ fn run_fs_dedup_benchmark(
         .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Storage-Stats nicht lesbar"))?;
     let storage_stats_before_us = elapsed_us(stats_before_started.elapsed());
     let seed_started = Instant::now();
-    layer
-        .write_file(
-            &fs_agent_dir,
-            parent_inode,
-            &format!("{file_prefix}-seed.bin"),
-            &content,
-            0o644,
-        )
-        .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Seed-Write fehlgeschlagen"))?;
+    with_direct_world_mutation(state, || {
+        layer
+            .write_file(
+                &fs_agent_dir,
+                parent_inode,
+                &format!("{file_prefix}-seed.bin"),
+                &content,
+                0o644,
+            )
+            .map(|_| ())
+            .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Seed-Write fehlgeschlagen"))
+    })?;
     let seed_write_us = elapsed_us(seed_started.elapsed());
 
     let mut cas_check_latencies = Vec::with_capacity(payload.writes as usize);
@@ -2668,9 +2737,12 @@ fn run_fs_dedup_benchmark(
         cas_check_latencies.push(elapsed_us(cas_check_started.elapsed()));
 
         let write_started = Instant::now();
-        layer
-            .write_file(&fs_agent_dir, parent_inode, name, &content, 0o644)
-            .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Write fehlgeschlagen"))?;
+        with_direct_world_mutation(state, || {
+            layer
+                .write_file(&fs_agent_dir, parent_inode, name, &content, 0o644)
+                .map(|_| ())
+                .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Write fehlgeschlagen"))
+        })?;
         write_file_latencies.push(elapsed_us(write_started.elapsed()));
         loop_latencies.push(elapsed_us(loop_started.elapsed()));
     }
@@ -2899,9 +2971,10 @@ fn run_fs_ransomware_test(
         "Issue #264 fs-ransomware-test v2 gestartet"
     );
     let fs_agent_dir = fs_agent_dir_for_name(state, agent_name)?;
-    let layer = open_fs_layer(state)?;
-    let (parent_inode, file_name) =
-        fs_parent_and_name(&layer, &fs_agent_dir, &payload.relative_path)?;
+    let layer = open_fs_layer_for_mutation(state)?;
+    let (parent_inode, file_name) = with_direct_world_mutation(state, || {
+        fs_parent_and_name(&layer, &fs_agent_dir, &payload.relative_path)
+    })?;
     let runtime = current_runtime_snapshot_for_agent_name(state, agent_name)?;
     let home_host_path = runtime.home_host_path;
     let target = Path::new(&home_host_path).join(payload.relative_path.trim());
@@ -2910,13 +2983,15 @@ fn run_fs_ransomware_test(
         payload.snapshot_label, agent_name
     )
     .into_bytes();
-    replace_layer_file(
-        &layer,
-        &fs_agent_dir,
-        parent_inode,
-        &file_name,
-        &before_content,
-    )?;
+    with_direct_world_mutation(state, || {
+        replace_layer_file(
+            &layer,
+            &fs_agent_dir,
+            parent_inode,
+            &file_name,
+            &before_content,
+        )
+    })?;
     let before_sha256 = sha256_hex(&before_content);
     wait_for_expected_runtime_bytes(
         &layer,
@@ -2949,13 +3024,15 @@ fn run_fs_ransomware_test(
         uuid::Uuid::now_v7()
     )
     .into_bytes();
-    replace_layer_file(
-        &layer,
-        &fs_agent_dir,
-        parent_inode,
-        &file_name,
-        &mutated_content,
-    )?;
+    with_direct_world_mutation(state, || {
+        replace_layer_file(
+            &layer,
+            &fs_agent_dir,
+            parent_inode,
+            &file_name,
+            &mutated_content,
+        )
+    })?;
     let mutated_sha256 = sha256_hex(&mutated_content);
     wait_for_expected_runtime_bytes(
         &layer,
@@ -3273,7 +3350,13 @@ fn run_write_anomaly_test(
         .join(".issue264-write-anomaly.bin")
         .display()
         .to_string();
-    let _ = std::fs::remove_file(&host_path);
+    with_direct_world_mutation(state, || match std::fs::remove_file(&host_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(ApiError::ServiceUnavailable(
+            "Write-Anomaly-Testdatei konnte nicht entfernt werden",
+        )),
+    })?;
     let script = r#"import os, sys, time
 path = sys.argv[1]
 bps = int(sys.argv[2])
@@ -3311,11 +3394,14 @@ with open(path, 'wb', buffering=0) as handle:
         .arg(duration_secs.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = child.spawn().map_err(|_| {
-        ApiError::ServiceUnavailable("Write-Anomaly-Test konnte nicht gestartet werden")
+    let (mut child, helper_pid) = with_direct_world_mutation(state, || {
+        let child = child.spawn().map_err(|_| {
+            ApiError::ServiceUnavailable("Write-Anomaly-Test konnte nicht gestartet werden")
+        })?;
+        let helper_pid = child.id();
+        let _ = sentinel_sandbox::cgroups::add_pid_to_cgroup(agent_name, helper_pid);
+        Ok((child, helper_pid))
     })?;
-    let helper_pid = child.id();
-    let _ = sentinel_sandbox::cgroups::add_pid_to_cgroup(agent_name, helper_pid);
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -3366,11 +3452,14 @@ fn run_landlock_test(
         &inner_command,
     );
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let child = command
-        .spawn()
-        .map_err(|_| ApiError::ServiceUnavailable("Landlock-Test konnte nicht gestartet werden"))?;
-    let helper_pid = child.id();
-    let _ = sentinel_sandbox::cgroups::add_pid_to_cgroup(agent_name, helper_pid);
+    let (child, helper_pid) = with_direct_world_mutation(state, || {
+        let child = command.spawn().map_err(|_| {
+            ApiError::ServiceUnavailable("Landlock-Test konnte nicht gestartet werden")
+        })?;
+        let helper_pid = child.id();
+        let _ = sentinel_sandbox::cgroups::add_pid_to_cgroup(agent_name, helper_pid);
+        Ok((child, helper_pid))
+    })?;
     let output = child
         .wait_with_output()
         .map_err(|_| ApiError::ServiceUnavailable("Landlock-Test lieferte kein Ergebnis"))?;
@@ -3635,7 +3724,12 @@ mod tests {
                 fs_mount: None,
             },
         )])));
+        let owner_registry = Box::leak(Box::new(sentinel_common::OwnerRegistry::new_for_test(
+            sentinel_common::NodeId::new(),
+        )));
         let state = AppState {
+            owner_registry,
+            before_direct_world_effect: None,
             allowed_rooms: Arc::new(
                 ["empfang".to_string(), "flur_eg".to_string()]
                     .into_iter()
@@ -3813,6 +3907,194 @@ mod tests {
             }
             other => panic!("unerwartetes Kommando: {other:?}"),
         }
+    }
+
+    #[test]
+    fn closed_owner_readiness_rejects_mutations_before_fs_or_command_side_effects() {
+        let (state, rx, _platform_rx, _runtime_rx) = test_state(None);
+        assert!(state.data_dir.read_dir().unwrap().next().is_none());
+        state.owner_registry.close_owner_readiness();
+
+        let fs_response = handle_http_request(
+            test_request(
+                OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,
+                serde_json::json!({
+                    "agent_name": "Test Agent",
+                    "relative_path": "must-not-exist.txt",
+                    "content": "blocked"
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(fs_response.status, 503);
+        assert!(state.data_dir.read_dir().unwrap().next().is_none());
+
+        let command_response = handle_http_request(
+            test_request(
+                OPERATOR_CHAOS_PATH,
+                serde_json::json!({
+                    "room_id": "empfang",
+                    "chaos_type": "AirConBroken",
+                    "duration_ticks": 45
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(command_response.status, 503);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn closed_owner_readiness_preserves_read_only_diagnostics() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        state.owner_registry.close_owner_readiness();
+
+        let response = handle_http_request(test_get_request(OPERATOR_PLATFORM_STATE_PATH), &state);
+        assert_eq!(response.status, 200);
+
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::StateHash { response_tx } => {
+                response_tx
+                    .send(crate::runtime_control::StateHashResponse {
+                        strict: "strict".to_string(),
+                        core: "core".to_string(),
+                        tick: 42,
+                        last_event_id: 7,
+                    })
+                    .unwrap();
+            }
+            _ => panic!("expected read-only StateHash command"),
+        });
+        let state_hash = handle_http_request(test_get_request(OPERATOR_STATE_HASH_PATH), &state);
+        responder.join().unwrap();
+        assert_eq!(state_hash.status, 200);
+    }
+
+    #[test]
+    fn follower_world_authority_rejects_post_before_fs_or_command_side_effects() {
+        let (mut state, rx, _platform_rx, _runtime_rx) = test_state(Some("operator-key"));
+        let authorized_request = |path: &str, body: serde_json::Value| {
+            let mut request = test_request(path, body);
+            request
+                .headers
+                .insert(OPERATOR_KEY_HEADER.to_string(), "operator-key".to_string());
+            request
+        };
+        let owner = sentinel_common::NodeId::new();
+        let follower = sentinel_common::NodeId::new();
+        let term = sentinel_common::OwnerTerm {
+            scope: sentinel_common::StateTransferScope::World,
+            owner_node: owner,
+            epoch: 1,
+            coordinator_generation: sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+        };
+        let global = sentinel_common::OwnerTermSnapshot::new(
+            sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+            1,
+            vec![term.clone()],
+        )
+        .unwrap();
+        let local = sentinel_common::LocalOwnerStateSnapshot::new(
+            follower,
+            sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+            1,
+            vec![sentinel_common::LocalOwnerBaseState {
+                scope: sentinel_common::StateTransferScope::World,
+                recipient_node: follower,
+                owner_term: term,
+                base_role: sentinel_common::LocalOwnerBaseRole::Follower,
+                activation_state: sentinel_common::ActivationState::Routable,
+            }],
+        )
+        .unwrap();
+        let registry = Box::leak(Box::new(
+            sentinel_common::OwnerRegistry::new_cluster_for_test(follower),
+        ));
+        registry
+            .rebuild_from_owner_snapshot(&global, &local, vec![])
+            .unwrap();
+        assert!(registry.owner_readiness());
+        state.owner_registry = registry;
+        assert!(state.data_dir.read_dir().unwrap().next().is_none());
+
+        let owner_check = handle_http_request(
+            authorized_request(
+                OPERATOR_OWNER_CHECK_PATH,
+                serde_json::json!({ "scope": "world" }),
+            ),
+            &state,
+        );
+        assert_eq!(owner_check.status, 200);
+        let owner_check: serde_json::Value = serde_json::from_slice(&owner_check.body).unwrap();
+        assert_eq!(owner_check["own_write_validates"], false);
+
+        let control_query = handle_http_request(
+            authorized_request(
+                OPERATOR_CONTROL_QUERY_PATH,
+                serde_json::json!({
+                    "peer_alias": "seed",
+                    "kind": "ref",
+                    "block_ref": "sha256:test"
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(control_query.status, 503);
+        let control_query: serde_json::Value = serde_json::from_slice(&control_query.body).unwrap();
+        assert_eq!(control_query["error"], "control stream not configured");
+
+        let fs_response = handle_http_request(
+            authorized_request(
+                OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,
+                serde_json::json!({
+                    "agent_name": "Test Agent",
+                    "relative_path": "follower-must-not-exist.txt",
+                    "content": "blocked"
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(fs_response.status, 503);
+        assert!(state.data_dir.read_dir().unwrap().next().is_none());
+
+        let command_response = handle_http_request(
+            authorized_request(
+                OPERATOR_CHAOS_PATH,
+                serde_json::json!({
+                    "room_id": "empfang",
+                    "chaos_type": "AirConBroken",
+                    "duration_ticks": 45
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(command_response.status, 503);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn authority_change_before_direct_fs_effect_leaves_no_file() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        assert!(state.data_dir.read_dir().unwrap().next().is_none());
+        let registry = state.owner_registry;
+        state.before_direct_world_effect = Some(Arc::new(move || {
+            registry.close_owner_readiness();
+        }));
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,
+                serde_json::json!({
+                    "agent_name": "Test Agent",
+                    "relative_path": "authority-changed.txt",
+                    "content": "must-not-be-written"
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 503);
+        assert!(state.data_dir.read_dir().unwrap().next().is_none());
     }
 
     #[test]
@@ -5271,7 +5553,8 @@ mod tests {
 
     #[test]
     fn fs_trash_fixture_and_inspect_roundtrip() {
-        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        attach_test_fs_layer(&mut state);
         let fixture = handle_http_request(
             test_request(
                 OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,
