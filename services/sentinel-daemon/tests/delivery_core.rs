@@ -551,6 +551,7 @@ impl DeliveryIntegrationPort for FakeIntegration {
             2 => receipt.artifact_ownership_digest = ContentDigest::zero(),
             3 => receipt.cleanup_receipt.generation = 0,
             4 => receipt.cleanup_receipt.digest = ContentDigest::zero(),
+            5 => receipt.authority_receipt_digest = ContentDigest::zero(),
             _ => {}
         }
         receipt.result_inventory_digest = qa_evidence_inventory_digest(&evidence_graph(
@@ -1583,6 +1584,7 @@ fn workbench_receipt_cannot_be_replayed_across_runs() {
 fn workbench_receipt_cannot_be_replayed_across_authority_lineages() {
     let temp = TempDir::new().unwrap();
     let (integration, controls) = FakeIntegration::controlled();
+    let qa_calls = Arc::clone(&integration.qa_calls);
     let (core, _, _, _) = running_qa_core(&temp, integration);
     let (_, old_receipt) = core
         .execute_qa(
@@ -1592,6 +1594,7 @@ fn workbench_receipt_cannot_be_replayed_across_authority_lineages() {
             "run-1",
         )
         .unwrap();
+    assert_eq!(qa_calls.load(Ordering::SeqCst), 1);
     *controls.replay_workbench_receipt.lock().unwrap() = Some(old_receipt);
     controls.contract_generation.store(8, Ordering::SeqCst);
 
@@ -1604,11 +1607,15 @@ fn workbench_receipt_cannot_be_replayed_across_authority_lineages() {
         ),
         Err(DeliveryError::StaleEvidence(_))
     ));
+    assert_eq!(qa_calls.load(Ordering::SeqCst), 1);
+    let aggregate = core.load("tenant-a", "project-1").unwrap().unwrap();
+    assert_eq!(aggregate.workbench_receipts.len(), 1);
+    assert_eq!(aggregate.qa_runs["run-1"].attempts, 1);
 }
 
 #[test]
 fn workbench_receipt_rejects_incomplete_schema_ownership_and_cleanup_bindings() {
-    for fault in 1..=4 {
+    for fault in 1..=5 {
         let temp = TempDir::new().unwrap();
         let (integration, controls) = FakeIntegration::controlled();
         controls
@@ -3306,7 +3313,6 @@ fn renewed_authority_receipt_does_not_change_external_operation_identity() {
 
 #[test]
 fn effect_saga_rejects_outcome_from_another_authority_lineage() {
-    let effects = DurableFakeEffects::default();
     let actor = principal("release-manager", AuthorityRole::ReleaseManager);
     let old_authority = AuthorityReceiptV1 {
         schema_version: DELIVERY_SCHEMA_V1,
@@ -3338,19 +3344,57 @@ fn effect_saga_rejects_outcome_from_another_authority_lineage() {
     }
     .seal()
     .unwrap();
-    effects.apply(&old_request).unwrap();
 
-    let mut changed_authority = old_authority;
-    changed_authority.contract_authority_generation += 1;
-    let mut changed_request = old_request;
-    changed_request.actor_authority_identity_digest =
-        changed_authority.stable_identity_digest().unwrap();
-    changed_request.request_digest = ContentDigest::zero();
-    changed_request = changed_request.seal().unwrap();
-    assert!(matches!(
-        effects.apply(&changed_request),
-        Err(DeliveryError::IdempotencyConflict { .. })
-    ));
+    let mut changed_authorities = Vec::new();
+    let mut changed = old_authority.clone();
+    changed.principal.authority_generation += 1;
+    changed.receipt_digest = ContentDigest::zero();
+    changed_authorities.push(changed.seal().unwrap());
+    let mut changed = old_authority.clone();
+    changed.principal.principal_id = "replacement-release-manager".to_string();
+    changed.receipt_digest = ContentDigest::zero();
+    changed_authorities.push(changed.seal().unwrap());
+    let mut changed = old_authority.clone();
+    changed.principal.roles.insert(AuthorityRole::Auditor);
+    changed.receipt_digest = ContentDigest::zero();
+    changed_authorities.push(changed.seal().unwrap());
+    let mut changed = old_authority.clone();
+    changed.contract_version += 1;
+    changed.receipt_digest = ContentDigest::zero();
+    changed_authorities.push(changed.seal().unwrap());
+    let mut changed = old_authority.clone();
+    changed.contract_authority_generation += 1;
+    changed.receipt_digest = ContentDigest::zero();
+    changed_authorities.push(changed.seal().unwrap());
+    let mut changed = old_authority.clone();
+    changed.contract_digest = digest("replacement-contract");
+    changed.receipt_digest = ContentDigest::zero();
+    changed_authorities.push(changed.seal().unwrap());
+    let mut changed = old_authority.clone();
+    changed.issuer = "replacement-authority".to_string();
+    changed.receipt_digest = ContentDigest::zero();
+    changed_authorities.push(changed.seal().unwrap());
+
+    for changed_authority in changed_authorities {
+        let effects = DurableFakeEffects::default();
+        effects.apply(&old_request).unwrap();
+        assert_eq!(effects.calls.load(Ordering::SeqCst), 1);
+
+        let mut changed_request = old_request.clone();
+        changed_request.actor = changed_authority.principal.clone();
+        changed_request.actor_authority_receipt_digest =
+            changed_authority.receipt_digest.clone();
+        changed_request.actor_authority_identity_digest =
+            changed_authority.stable_identity_digest().unwrap();
+        changed_request.request_digest = ContentDigest::zero();
+        changed_request = changed_request.seal().unwrap();
+        assert_ne!(old_request.request_digest, changed_request.request_digest);
+        assert!(matches!(
+            effects.apply(&changed_request),
+            Err(DeliveryError::IdempotencyConflict { .. })
+        ));
+        assert_eq!(effects.calls.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[test]
