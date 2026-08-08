@@ -20,6 +20,7 @@ sentinel-cluster-control = { path = "../../crates/sentinel-cluster-control" }
 sentinel-ecs = { path = "../../crates/sentinel-ecs" }
 sentinel-projection = { path = "../../crates/sentinel-projection" }
 sentinel-runtime = { path = "../../crates/sentinel-runtime" }
+sentinel-workflow = { path = "../../crates/sentinel-workflow" }
 sentinel-zenoh = { path = "../../crates/sentinel-zenoh" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }
 sentinel-redb = { path = "../../crates/sentinel-redb" }

@@ -27,6 +27,7 @@ members = [
     "crates/sentinel-fs",
     "crates/sentinel-console-plane",
     "crates/sentinel-microvm",
+    "crates/sentinel-workflow",
     "services/sentinel-nightrun",
     "services/sentinel-gaia",
     "services/sentinel-gaia-loop",

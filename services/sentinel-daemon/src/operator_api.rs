@@ -495,6 +495,7 @@ struct AppState {
     /// (Chef-SPOF): a member must reject `/operator/handoff` even though it has a control
     /// stream + meta store.
     cluster_is_seed: bool,
+    workflow_api: Arc<crate::workflow_api::WorkflowApi>,
 }
 
 fn materialize_config_owner_scopes(
@@ -686,6 +687,7 @@ impl ApiError {
 pub async fn start_server(
     config: OperatorApiConfig,
     data_dir: PathBuf,
+    workflow_api: Arc<crate::workflow_api::WorkflowApi>,
     fs_mount: Option<String>,
     fs_layer: Option<Arc<LayerManager>>,
     allowed_rooms: Vec<String>,
@@ -744,6 +746,7 @@ pub async fn start_server(
         cluster_meta,
         cluster_node_alias,
         cluster_is_seed,
+        workflow_api,
     };
 
     info!(
@@ -784,6 +787,18 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
     let path_only = request_path(&request.path);
     let query = parse_query_params(&request.path);
 
+    if let Some(response) = state.workflow_api.handle(
+        &request.method,
+        &request.path,
+        &request.headers,
+        &request.body,
+    ) {
+        return HttpResponse {
+            status: response.status,
+            body: response.body,
+        };
+    }
+
     // GET-Endpoints ohne Auth (read-only)
     if request.method == "GET" {
         if is_protected_read_path(path_only)
@@ -822,7 +837,11 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 }
             },
             OPERATOR_RUNTIME_HEALTH_PATH => match state.runtime_health.read() {
-                Ok(snapshot) => json_response(200, snapshot.clone()),
+                Ok(snapshot) => {
+                    let mut snapshot = snapshot.clone();
+                    snapshot.company_workflow = Some(state.workflow_api.health());
+                    json_response(200, snapshot)
+                }
                 Err(_) => {
                     ApiError::ServiceUnavailable("Runtime-Health nicht verfuegbar").to_response()
                 }
@@ -3536,6 +3555,9 @@ fn max_body_bytes_for_path(path: &str) -> usize {
     match request_path(path) {
         OPERATOR_APICP_SNAPSHOT_PATH => MAX_APICP_SNAPSHOT_BODY_BYTES,
         OPERATOR_CONFIG_APPLY_PATH => MAX_CONFIG_APPLY_BODY_BYTES,
+        crate::workflow_api::CUSTOMER_COMMAND_PATH
+        | crate::workflow_api::OPERATOR_COMMAND_PATH
+        | crate::workflow_api::AGENT_COMMAND_PATH => crate::workflow_api::MAX_WORKFLOW_BODY_BYTES,
         _ => MAX_BODY_BYTES,
     }
 }
@@ -3614,6 +3636,9 @@ mod tests {
                 fs_mount: None,
             },
         )])));
+        let event_store = Arc::new(
+            sentinel_limbo::EventStore::open(":memory:").expect("in-memory EventStore fuer Tests"),
+        );
         let state = AppState {
             allowed_rooms: Arc::new(
                 ["empfang".to_string(), "flur_eg".to_string()]
@@ -3637,10 +3662,7 @@ mod tests {
             config_apply_max_agents: 60,
             config_apply_validation:
                 sentinel_common::agent_config::AgentConfigValidation::with_max_agent_id(60),
-            event_store: Arc::new(
-                sentinel_limbo::EventStore::open(":memory:")
-                    .expect("in-memory EventStore fuer Tests"),
-            ),
+            event_store: Arc::clone(&event_store),
             prune_tx: mpsc::channel().0,
             state_store,
             platform_state: Arc::new(std::sync::RwLock::new(PlatformStateSnapshot {
@@ -3712,6 +3734,7 @@ mod tests {
                         security_runtime_present: true,
                         last_repair_status: Some("stale".to_string()),
                     }],
+                    company_workflow: None,
                 },
             )),
             security_runtime_state,
@@ -3719,6 +3742,10 @@ mod tests {
             cluster_meta: None,
             cluster_node_alias: None,
             cluster_is_seed: false,
+            workflow_api: Arc::new(
+                crate::workflow_api::WorkflowApi::open(":memory:", None, Arc::clone(&event_store))
+                    .expect("in-memory workflow API"),
+            ),
         };
         std::mem::forget(dir);
         (state, rx, platform_rx, runtime_rx)
@@ -4805,6 +4832,9 @@ mod tests {
         assert_eq!(payload.stale_runtime_entries, 2);
         assert_eq!(payload.agents.len(), 1);
         assert_eq!(payload.agents[0].agent_id, 7);
+        let workflow = payload.company_workflow.expect("workflow health");
+        assert!(!workflow.enabled);
+        assert_eq!(workflow.status, "disabled");
     }
 
     #[test]
