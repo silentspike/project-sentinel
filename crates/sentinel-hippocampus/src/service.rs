@@ -105,8 +105,7 @@ impl HippocampusService {
         // Archive and clear in one redb transaction. Projection receipts may
         // point at the archive after consolidation, so split commits are not
         // safe across crashes.
-        self.store
-            .archive_and_clear_episodes(agent, &episodes)?;
+        self.store.archive_and_clear_episodes(agent, &episodes)?;
 
         Ok(ConsolidationResult {
             agent_name: agent.to_string(),

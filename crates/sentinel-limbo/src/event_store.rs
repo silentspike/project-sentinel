@@ -2966,7 +2966,9 @@ impl EventStore {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        let result = conn.query_row("SELECT MAX(id) FROM events", [], |row| row.get(0));
+        let result = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+            row.get(0)
+        });
         match result {
             Ok(id) => Ok(id),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
@@ -3759,6 +3761,21 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn latest_event_id_is_zero_for_empty_store_then_tracks_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latest-event-id.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(store.get_latest_event_id().unwrap(), 0);
+
+        let row_id = store
+            .append_event(&test_event("agent_action_received", "AGENT-01"))
+            .unwrap();
+        assert!(row_id > 0);
+        assert_eq!(store.get_latest_event_id().unwrap(), row_id);
     }
 
     #[test]

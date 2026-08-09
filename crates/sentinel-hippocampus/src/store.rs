@@ -859,6 +859,83 @@ impl HippocampusStore {
             .ok_or_else(|| anyhow::anyhow!("episode projection frontier was not initialized"))
     }
 
+    /// Validate staged subject/name bindings without mutating projection state.
+    pub fn validate_episode_projection_agents(
+        &self,
+        agents: &[EpisodeProjectionAgent],
+    ) -> anyhow::Result<()> {
+        let control = self
+            .load_episode_projection_control()?
+            .ok_or_else(|| anyhow::anyhow!("episode projection is not initialized"))?;
+        validate_projection_control(&control)?;
+
+        let mut staged_subjects = HashSet::new();
+        let mut staged_names = HashSet::new();
+        for agent in agents {
+            agent.subject.validate()?;
+            validate_projection_key_part(&agent.agent_name, "agent name")?;
+            anyhow::ensure!(
+                staged_subjects.insert(agent.subject),
+                "duplicate episode projection subject {}",
+                agent.subject.storage_key()
+            );
+            anyhow::ensure!(
+                staged_names.insert(agent.agent_name.as_str()),
+                "duplicate episode projection agent name {}",
+                agent.agent_name
+            );
+        }
+
+        let read_txn = self.db.begin_read()?;
+        let state = read_txn.open_table(EPISODE_PROJECTION_STATE)?;
+        let frontier_prefix = format!("frontier{KEY_SEPARATOR}");
+        let mut persisted_subjects = HashSet::new();
+        let mut persisted_names = HashSet::new();
+        for entry in state.iter()? {
+            let (key, value) = entry?;
+            if matches!(
+                key.value(),
+                EPISODE_PROJECTION_CONTROL_KEY | EPISODE_PROJECTION_CUTOVER_KEY
+            ) {
+                continue;
+            }
+            anyhow::ensure!(
+                key.value().starts_with(&frontier_prefix),
+                "unknown episode projection state key"
+            );
+            let frontier: EpisodeProjectionFrontier = serde_json::from_slice(value.value())?;
+            anyhow::ensure!(
+                key.value() == projection_frontier_key(frontier.subject).as_str(),
+                "episode projection frontier key/value subject mismatch"
+            );
+            validate_projection_frontier(&frontier, frontier.subject, &control)?;
+            anyhow::ensure!(
+                persisted_subjects.insert(frontier.subject),
+                "duplicate persisted episode projection subject {}",
+                frontier.subject.storage_key()
+            );
+            anyhow::ensure!(
+                persisted_names.insert(frontier.agent_name.clone()),
+                "duplicate persisted episode bucket name {}",
+                frontier.agent_name
+            );
+            for agent in agents {
+                anyhow::ensure!(
+                    frontier.subject != agent.subject || frontier.agent_name == agent.agent_name,
+                    "episode bucket name is immutable for subject {}",
+                    agent.subject.storage_key()
+                );
+                anyhow::ensure!(
+                    frontier.agent_name != agent.agent_name || frontier.subject == agent.subject,
+                    "episode bucket name {} is already bound to subject {}",
+                    agent.agent_name,
+                    frontier.subject.storage_key()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Load the store-owned source cursor.
     pub fn load_episode_projection_control(
         &self,
@@ -1090,13 +1167,10 @@ impl HippocampusStore {
         inject_episode_projection_fault(EpisodeProjectionFaultStage::AfterControl)?;
 
         if let Some(record) = resolution {
-            quarantine.remove(
-                quarantine_key(record.source_row_id, &record.source_event_id).as_str(),
-            )?;
+            quarantine
+                .remove(quarantine_key(record.source_row_id, &record.source_event_id).as_str())?;
             #[cfg(test)]
-            inject_episode_projection_fault(
-                EpisodeProjectionFaultStage::AfterQuarantineRemoval,
-            )?;
+            inject_episode_projection_fault(EpisodeProjectionFaultStage::AfterQuarantineRemoval)?;
         }
         validate_receipt_pair(&receipts, &receipt)?;
         validate_frontier_tip_integrity(
@@ -1325,12 +1399,26 @@ impl HippocampusStore {
             Some(expected_active_generation_id),
             true,
         )?;
-        let current = capture_generation_snapshot_from(&self.db)?;
         let candidate_subjects: Vec<_> = snapshot
             .subjects
             .iter()
             .map(|subject| (subject.agent.subject, subject.agent.agent_name.as_str()))
             .collect();
+        let candidate_digest = episode_projection_candidate_digest(&snapshot)?;
+        let write_txn = self.db.begin_write()?;
+        let state = write_txn.open_table(EPISODE_PROJECTION_STATE)?;
+        let receipts = write_txn.open_table(EPISODE_SOURCE_RECEIPTS)?;
+        let episodes = write_txn.open_table(EPISODES)?;
+        let archive = write_txn.open_table(ARCHIVE)?;
+        let quarantine = write_txn.open_table(EPISODE_QUARANTINE)?;
+        let current = capture_generation_snapshot_from_tables(
+            &state,
+            &receipts,
+            &episodes,
+            &archive,
+            &quarantine,
+        )?;
+        ensure_no_receiptless_live_episodes(&current)?;
         let current_subjects: Vec<_> = current
             .subjects
             .iter()
@@ -1340,9 +1428,6 @@ impl HippocampusStore {
             candidate_subjects == current_subjects,
             "episode projection generation must cover every active subject exactly"
         );
-        let candidate_digest = episode_projection_candidate_digest(&snapshot)?;
-        let write_txn = self.db.begin_write()?;
-        let archive = write_txn.open_table(ARCHIVE)?;
         let current_archive_digest =
             archive_snapshot_digest_from_table(&archive, &snapshot.subjects)?;
         anyhow::ensure!(
@@ -1372,9 +1457,64 @@ impl HippocampusStore {
         };
         insert_json(&mut generations, &key, &record)?;
         drop(generations);
+        drop(quarantine);
         drop(archive);
+        drop(episodes);
+        drop(receipts);
+        drop(state);
         write_txn.commit()?;
         Ok(candidate_digest)
+    }
+
+    /// Atomically discard one open candidate after binding every active-head
+    /// and candidate identity field. Projection state and the active record are
+    /// not modified.
+    pub fn discard_episode_projection_generation(
+        &self,
+        generation_id: &str,
+        expected_active_generation_id: &str,
+        expected_candidate_digest: &str,
+    ) -> anyhow::Result<EpisodeProjectionGenerationStatus> {
+        validate_generation_id(generation_id)?;
+        validate_generation_id(expected_active_generation_id)?;
+        anyhow::ensure!(
+            is_lower_sha256_hex(expected_candidate_digest),
+            "episode projection candidate digest must be SHA-256 hex"
+        );
+        let write_txn = self.db.begin_write()?;
+        let mut generations = write_txn.open_table(EPISODE_PROJECTION_GENERATIONS)?;
+        let control = load_generation_control(&generations)?;
+        anyhow::ensure!(
+            control.active_generation_id == expected_active_generation_id,
+            "episode projection generation discard active-head CAS conflict"
+        );
+        let key = generation_record_key(generation_id);
+        let record: EpisodeProjectionGenerationRecord = table_json_value(&generations, &key)?
+            .ok_or_else(|| anyhow::anyhow!("episode projection generation candidate not found"))?;
+        anyhow::ensure!(
+            matches!(
+                record.phase,
+                EpisodeProjectionGenerationPhase::Building
+                    | EpisodeProjectionGenerationPhase::Validated
+            ),
+            "only an open episode projection generation can be discarded"
+        );
+        anyhow::ensure!(
+            record.descriptor.parent_generation_id.as_deref()
+                == Some(expected_active_generation_id),
+            "episode projection generation discard parent CAS conflict"
+        );
+        anyhow::ensure!(
+            constant_time_bytes_eq(
+                record.candidate_digest.as_bytes(),
+                expected_candidate_digest.as_bytes(),
+            ),
+            "episode projection generation discard candidate CAS conflict"
+        );
+        generations.remove(key.as_str())?;
+        drop(generations);
+        write_txn.commit()?;
+        self.load_episode_projection_generation_status()
     }
 
     /// Validate complete subject coverage and deterministic per-agent digests
@@ -1396,10 +1536,10 @@ impl HippocampusStore {
             "episode projection generation validation CAS conflict"
         );
         let key = generation_record_key(generation_id);
-        let mut record: EpisodeProjectionGenerationRecord =
-            table_json_value(&generations, &key)?.ok_or_else(|| {
-                anyhow::anyhow!("episode projection generation candidate not found")
-            })?;
+        let mut record: EpisodeProjectionGenerationRecord = table_json_value(&generations, &key)?
+            .ok_or_else(|| {
+            anyhow::anyhow!("episode projection generation candidate not found")
+        })?;
         anyhow::ensure!(
             record.descriptor.source_cut == expected_source_cut.coverage
                 && record.snapshot.source_coverage == expected_source_cut.entries,
@@ -1584,9 +1724,8 @@ impl HippocampusStore {
         );
         let target_key = generation_record_key(generation_id);
         let mut target: EpisodeProjectionGenerationRecord =
-            table_json_value(&generations, &target_key)?.ok_or_else(|| {
-                anyhow::anyhow!("episode projection generation target not found")
-            })?;
+            table_json_value(&generations, &target_key)?
+                .ok_or_else(|| anyhow::anyhow!("episode projection generation target not found"))?;
         anyhow::ensure!(
             target.phase == required_phase,
             "episode projection generation target phase mismatch"
@@ -2440,13 +2579,8 @@ pub fn episode_projection_subject_coverage_digest(
     live_episodes: &[Episode],
     archived_episodes: &[Episode],
 ) -> anyhow::Result<String> {
-    let encoded = serde_json::to_vec(&(
-        agent,
-        frontier,
-        receipts,
-        live_episodes,
-        archived_episodes,
-    ))?;
+    let encoded =
+        serde_json::to_vec(&(agent, frontier, receipts, live_episodes, archived_episodes))?;
     // The typed v1 tuple fixes field order. Receipt order is source order;
     // episode vectors preserve their authoritative bucket order.
     Ok(projection_sha256(
@@ -2479,8 +2613,7 @@ pub fn episode_projection_source_cut_coverage(
     entries: &[EpisodeProjectionSourceCoverageEntry],
 ) -> anyhow::Result<EpisodeProjectionSourceCutCoverage> {
     anyhow::ensure!(
-        from_exclusive_source_row_id >= 0
-            && through_source_row_id >= from_exclusive_source_row_id,
+        from_exclusive_source_row_id >= 0 && through_source_row_id >= from_exclusive_source_row_id,
         "episode projection source-cut range is invalid"
     );
     anyhow::ensure!(
@@ -2621,6 +2754,48 @@ fn validate_source_cut_evidence(
     validate_source_cut_entries(&evidence.coverage, &evidence.entries)
 }
 
+fn permits_receiptless_legacy_root(
+    descriptor: &EpisodeProjectionGenerationDescriptor,
+    snapshot: &EpisodeProjectionGenerationSnapshot,
+) -> bool {
+    let EpisodeProjectionStartPolicy::RecoveryCut { source_row_id, .. } =
+        &snapshot.control.start_policy
+    else {
+        return false;
+    };
+    descriptor.parent_generation_id.is_none()
+        && descriptor.source_cut.from_exclusive_source_row_id == *source_row_id
+        && descriptor.source_cut.through_source_row_id == *source_row_id
+        && descriptor.source_cut.event_count == 0
+        && descriptor.source_cut.episode_count == 0
+        && descriptor.source_cut.irrelevant_count == 0
+        && descriptor.source_cut.quarantine_count == 0
+        && snapshot.control.last_source_row_id == *source_row_id
+        && snapshot.control.last_source_event_id.is_none()
+        && snapshot.control.effect_reference_tick == 0
+        && snapshot.source_coverage.is_empty()
+}
+
+fn ensure_no_receiptless_live_episodes(
+    snapshot: &EpisodeProjectionGenerationSnapshot,
+) -> anyhow::Result<()> {
+    for subject in &snapshot.subjects {
+        let receipt_episode_ids: HashSet<u64> = subject
+            .receipts
+            .iter()
+            .map(|receipt| receipt.episode_id)
+            .collect();
+        anyhow::ensure!(
+            subject
+                .live_episodes
+                .iter()
+                .all(|episode| receipt_episode_ids.contains(&episode.id)),
+            "active episode projection contains receiptless live legacy memory; consolidate it before staging"
+        );
+    }
+    Ok(())
+}
+
 fn validate_generation_snapshot(
     descriptor: &EpisodeProjectionGenerationDescriptor,
     snapshot: &EpisodeProjectionGenerationSnapshot,
@@ -2633,8 +2808,7 @@ fn validate_generation_snapshot(
         "episode projection generation parent mismatch"
     );
     validate_projection_control(&snapshot.control)?;
-    let archive_snapshot_digest =
-        episode_projection_archive_snapshot_digest(&snapshot.subjects)?;
+    let archive_snapshot_digest = episode_projection_archive_snapshot_digest(&snapshot.subjects)?;
     anyhow::ensure!(
         constant_time_bytes_eq(
             archive_snapshot_digest.as_bytes(),
@@ -2665,18 +2839,15 @@ fn validate_generation_snapshot(
             snapshot.source_cut == descriptor.source_cut
                 && snapshot.control.last_source_row_id
                     == descriptor.source_cut.through_source_row_id
-                && snapshot.control.effect_reference_tick
-                    == descriptor.source_cut.reference_tick,
+                && snapshot.control.effect_reference_tick == descriptor.source_cut.reference_tick,
             "episode projection generation control does not match its source cut"
         );
     } else {
         anyhow::ensure!(
             snapshot.source_cut.from_exclusive_source_row_id
                 == descriptor.source_cut.from_exclusive_source_row_id
-                && snapshot.source_cut.through_source_row_id
-                    == snapshot.control.last_source_row_id
-                && snapshot.source_cut.reference_tick
-                    == snapshot.control.effect_reference_tick
+                && snapshot.source_cut.through_source_row_id == snapshot.control.last_source_row_id
+                && snapshot.source_cut.reference_tick == snapshot.control.effect_reference_tick
                 && snapshot.control.last_source_row_id
                     >= descriptor.source_cut.through_source_row_id,
             "retained episode projection generation precedes its immutable source cut"
@@ -2691,7 +2862,9 @@ fn validate_generation_snapshot(
         validate_projection_key_part(&candidate.agent.agent_name, "generation agent name")?;
         let subject_key = candidate.agent.subject.storage_key();
         anyhow::ensure!(
-            previous_subject_key.as_deref().is_none_or(|previous| previous < subject_key.as_str()),
+            previous_subject_key
+                .as_deref()
+                .is_none_or(|previous| previous < subject_key.as_str()),
             "episode projection generation subjects must be unique and sorted"
         );
         previous_subject_key = Some(subject_key);
@@ -2767,11 +2940,13 @@ fn validate_generation_snapshot(
             .iter()
             .map(|receipt| receipt.episode_id)
             .collect();
-        for episode in &candidate.live_episodes {
-            anyhow::ensure!(
-                receipt_episode_ids.contains(&episode.id),
-                "live generation episode has no authoritative source receipt"
-            );
+        if !permits_receiptless_legacy_root(descriptor, snapshot) {
+            for episode in &candidate.live_episodes {
+                anyhow::ensure!(
+                    receipt_episode_ids.contains(&episode.id),
+                    "live generation episode has no authoritative source receipt"
+                );
+            }
         }
         let digest = episode_projection_subject_coverage_digest(
             &candidate.agent,
@@ -2821,9 +2996,9 @@ fn validate_generation_snapshot(
     let mut matched_episodes = HashSet::new();
     for subject in &snapshot.subjects {
         for receipt in &subject.receipts {
-            let entry = coverage_by_row.get(&receipt.source_row_id).ok_or_else(|| {
-                anyhow::anyhow!("episode receipt is absent from source coverage")
-            })?;
+            let entry = coverage_by_row
+                .get(&receipt.source_row_id)
+                .ok_or_else(|| anyhow::anyhow!("episode receipt is absent from source coverage"))?;
             anyhow::ensure!(
                 entry.source_event_id == receipt.source_event_id
                     && entry.request_digest == receipt.request_digest
@@ -2840,9 +3015,9 @@ fn validate_generation_snapshot(
     }
     let mut matched_quarantines = HashSet::new();
     for record in &snapshot.quarantines {
-        let entry = coverage_by_row.get(&record.source_row_id).ok_or_else(|| {
-            anyhow::anyhow!("episode quarantine is absent from source coverage")
-        })?;
+        let entry = coverage_by_row
+            .get(&record.source_row_id)
+            .ok_or_else(|| anyhow::anyhow!("episode quarantine is absent from source coverage"))?;
         anyhow::ensure!(
             entry.source_event_id == record.source_event_id
                 && entry.request_digest == record.request_digest
@@ -2884,7 +3059,9 @@ fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
     }
     left.iter()
         .zip(right)
-        .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
         == 0
 }
 
@@ -2897,13 +3074,7 @@ fn capture_generation_snapshot_from<D: ReadableDatabase>(
     let episodes = read_txn.open_table(EPISODES)?;
     let archive = read_txn.open_table(ARCHIVE)?;
     let quarantine = read_txn.open_table(EPISODE_QUARANTINE)?;
-    capture_generation_snapshot_from_tables(
-        &state,
-        &receipts,
-        &episodes,
-        &archive,
-        &quarantine,
-    )
+    capture_generation_snapshot_from_tables(&state, &receipts, &episodes, &archive, &quarantine)
 }
 
 fn capture_generation_snapshot_from_tables<S, R, E, A, Q>(
@@ -2961,12 +3132,12 @@ where
             (left.source_row_id, left.source_event_id.as_str())
                 .cmp(&(right.source_row_id, right.source_event_id.as_str()))
         });
-        let live_episodes = episodes
+        let live_episodes: Vec<Episode> = episodes
             .get(frontier.agent_name.as_str())?
             .map(|value| serde_json::from_slice(value.value()))
             .transpose()?
             .unwrap_or_default();
-        let archived_episodes = archive
+        let archived_episodes: Vec<Episode> = archive
             .get(frontier.agent_name.as_str())?
             .map(|value| serde_json::from_slice(value.value()))
             .transpose()?
@@ -3093,11 +3264,7 @@ fn apply_generation_snapshot_to_tables(
             &subject.frontier,
         )?;
         if !subject.live_episodes.is_empty() {
-            insert_json(
-                episodes,
-                &subject.agent.agent_name,
-                &subject.live_episodes,
-            )?;
+            insert_json(episodes, &subject.agent.agent_name, &subject.live_episodes)?;
         }
         for receipt in &subject.receipts {
             insert_json(
@@ -3464,9 +3631,9 @@ fn validate_cutover_binding(
             "episode projection cutover receipt does not bind the recovery policy"
         ),
         EpisodeProjectionStartPolicy::Beginning
-        | EpisodeProjectionStartPolicy::ExplicitPosition { .. } => anyhow::bail!(
-            "episode projection cutover receipt requires a recovery-cut policy"
-        ),
+        | EpisodeProjectionStartPolicy::ExplicitPosition { .. } => {
+            anyhow::bail!("episode projection cutover receipt requires a recovery-cut policy")
+        }
     }
     Ok(())
 }
@@ -3678,11 +3845,9 @@ fn validate_frontier_tip_integrity(
         .last_source_event_id
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("applied episode frontier lacks a source event"))?;
-    let receipt: EpisodeSourceReceipt = table_json_value(
-        receipts,
-        &source_receipt_key(subject, source_event_id),
-    )?
-    .ok_or_else(|| anyhow::anyhow!("episode frontier tip source receipt is missing"))?;
+    let receipt: EpisodeSourceReceipt =
+        table_json_value(receipts, &source_receipt_key(subject, source_event_id))?
+            .ok_or_else(|| anyhow::anyhow!("episode frontier tip source receipt is missing"))?;
     validate_receipt_pair(receipts, &receipt)?;
     anyhow::ensure!(
         receipt.subject == subject
@@ -3718,7 +3883,10 @@ fn validate_receipt_pair(
         receipt.projection_version,
         &receipt.request_digest,
     )?;
-    anyhow::ensure!(receipt.episode_id != 0, "episode receipt ID must be non-zero");
+    anyhow::ensure!(
+        receipt.episode_id != 0,
+        "episode receipt ID must be non-zero"
+    );
     let source_key = source_receipt_key(receipt.subject, &receipt.source_event_id);
     let identity_key = episode_identity_key(receipt.subject, receipt.episode_id);
     let source = receipts
@@ -3754,7 +3922,10 @@ fn projection_admission_from_records<'a>(
             applicable.push(record);
         }
     }
-    let Some(blocker) = applicable.into_iter().min_by_key(|record| record.source_row_id) else {
+    let Some(blocker) = applicable
+        .into_iter()
+        .min_by_key(|record| record.source_row_id)
+    else {
         return Ok(EpisodeProjectionAdmission::Allowed);
     };
     if matches!(
@@ -4097,9 +4268,7 @@ mod tests {
         source_event_id: &str,
         episode_id: u64,
     ) -> EpisodeProjectionGenerationCandidate {
-        let status = store
-            .load_episode_projection_generation_status()
-            .unwrap();
+        let status = store.load_episode_projection_generation_status().unwrap();
         let mut control = store.load_episode_projection_control().unwrap().unwrap();
         let mut frontier = store
             .load_episode_projection_frontier(projection_subject())
@@ -4231,9 +4400,7 @@ mod tests {
                 &[projection_agent()],
             )
             .unwrap();
-        let baseline = store
-            .load_episode_projection_generation_status()
-            .unwrap();
+        let baseline = store.load_episode_projection_generation_status().unwrap();
         let candidate = generation_candidate(&store, 1, "generation-event", 501);
         let candidate_evidence = generation_evidence(&candidate);
         let baseline_evidence = EpisodeProjectionSourceCutEvidence {
@@ -4317,11 +4484,21 @@ mod tests {
         let retained = activated
             .generations
             .iter()
-            .find(|generation| {
-                generation.descriptor.generation_id == baseline.active_generation_id
-            })
+            .find(|generation| generation.descriptor.generation_id == baseline.active_generation_id)
             .unwrap();
         assert_eq!(retained.phase, EpisodeProjectionGenerationPhase::Retained);
+        let before_retained_discard = store.load_episode_projection_generation_status().unwrap();
+        assert!(store
+            .discard_episode_projection_generation(
+                &baseline.active_generation_id,
+                &candidate.descriptor.generation_id,
+                &retained.candidate_digest,
+            )
+            .is_err());
+        assert_eq!(
+            store.load_episode_projection_generation_status().unwrap(),
+            before_retained_discard
+        );
         let rolled_back = store
             .rollback_episode_projection_generation(
                 &baseline.active_generation_id,
@@ -4331,8 +4508,157 @@ mod tests {
                 &candidate_evidence,
             )
             .unwrap();
-        assert_eq!(rolled_back.active_generation_id, baseline.active_generation_id);
+        assert_eq!(
+            rolled_back.active_generation_id,
+            baseline.active_generation_id
+        );
         assert!(store.load_episodes("Thomas").unwrap().is_empty());
+    }
+
+    #[test]
+    fn episode_projection_generation_discard_is_cas_bound_and_reopens_readiness() {
+        let _guard = PROJECTION_TEST_LOCK.lock().unwrap();
+        let (store, _dir) = temp_store();
+        store
+            .initialize_episode_projection(
+                &EpisodeProjectionStartPolicy::Beginning,
+                &[projection_agent()],
+            )
+            .unwrap();
+        let baseline = store.load_episode_projection_generation_status().unwrap();
+        let active = baseline.active_generation_id.clone();
+        let active_digest = baseline.generations[0].candidate_digest.clone();
+        let control_before = store.load_episode_projection_control().unwrap();
+        let frontier_before = store
+            .load_episode_projection_frontier(projection_subject())
+            .unwrap();
+        let episodes_before = store.load_episodes("Thomas").unwrap();
+        let quarantine_before = store.list_episode_projection_quarantine().unwrap();
+        let candidate = generation_candidate(&store, 1, "discard-candidate", 711);
+        let evidence = generation_evidence(&candidate);
+        let digest = store
+            .begin_episode_projection_generation(&candidate, &active, &evidence)
+            .unwrap();
+        assert!(!store
+            .load_episode_projection_readiness(projection_subject())
+            .unwrap()
+            .is_ready());
+
+        let wrong_source = EpisodeProjectionSourceCutEvidence {
+            coverage: baseline.generations[0].snapshot_source_cut.clone(),
+            entries: Vec::new(),
+        };
+        assert!(store
+            .validate_episode_projection_generation(
+                &candidate.descriptor.generation_id,
+                &active,
+                &wrong_source,
+            )
+            .is_err());
+        let archive_drift = make_episode(900, "concurrent archive drift");
+        store
+            .append_archive("Thomas", std::slice::from_ref(&archive_drift))
+            .unwrap();
+        assert!(store
+            .validate_episode_projection_generation(
+                &candidate.descriptor.generation_id,
+                &active,
+                &evidence,
+            )
+            .is_err());
+        assert!(!store
+            .load_episode_projection_readiness(projection_subject())
+            .unwrap()
+            .is_ready());
+        store.store_archive("Thomas", &[]).unwrap();
+        store
+            .validate_episode_projection_generation(
+                &candidate.descriptor.generation_id,
+                &active,
+                &evidence,
+            )
+            .unwrap();
+
+        let staged = store.load_episode_projection_generation_status().unwrap();
+        let assert_unchanged = || {
+            assert_eq!(
+                store.load_episode_projection_generation_status().unwrap(),
+                staged
+            );
+            assert_eq!(
+                store.load_episode_projection_control().unwrap(),
+                control_before
+            );
+            assert_eq!(
+                store
+                    .load_episode_projection_frontier(projection_subject())
+                    .unwrap(),
+                frontier_before
+            );
+            assert_eq!(
+                serde_json::to_vec(&store.load_episodes("Thomas").unwrap()).unwrap(),
+                serde_json::to_vec(&episodes_before).unwrap()
+            );
+            assert_eq!(
+                store.list_episode_projection_quarantine().unwrap(),
+                quarantine_before
+            );
+        };
+        assert!(store
+            .discard_episode_projection_generation(&"11".repeat(32), &active, &digest)
+            .is_err());
+        assert_unchanged();
+        assert!(store
+            .discard_episode_projection_generation(
+                &candidate.descriptor.generation_id,
+                &"22".repeat(32),
+                &digest,
+            )
+            .is_err());
+        assert_unchanged();
+        assert!(store
+            .discard_episode_projection_generation(
+                &candidate.descriptor.generation_id,
+                &active,
+                &"33".repeat(32),
+            )
+            .is_err());
+        assert_unchanged();
+        assert!(store
+            .discard_episode_projection_generation(&active, &active, &active_digest)
+            .is_err());
+        assert_unchanged();
+
+        let discarded = store
+            .discard_episode_projection_generation(
+                &candidate.descriptor.generation_id,
+                &active,
+                &digest,
+            )
+            .unwrap();
+        assert_eq!(discarded, baseline);
+        assert!(store
+            .load_episode_projection_readiness(projection_subject())
+            .unwrap()
+            .is_ready());
+        assert_eq!(
+            store.load_episode_projection_control().unwrap(),
+            control_before
+        );
+        assert_eq!(
+            store
+                .load_episode_projection_frontier(projection_subject())
+                .unwrap(),
+            frontier_before
+        );
+        assert_eq!(
+            serde_json::to_vec(&store.load_episodes("Thomas").unwrap()).unwrap(),
+            serde_json::to_vec(&episodes_before).unwrap()
+        );
+        assert_eq!(
+            store.list_episode_projection_quarantine().unwrap(),
+            quarantine_before
+        );
     }
 
     #[test]
@@ -4505,11 +4831,7 @@ mod tests {
             entries: Vec::new(),
         };
         assert!(store
-            .begin_episode_projection_generation(
-                &authoritative_candidate,
-                &active,
-                &stale,
-            )
+            .begin_episode_projection_generation(&authoritative_candidate, &active, &stale,)
             .is_err());
     }
 
@@ -4523,9 +4845,7 @@ mod tests {
                 &[projection_agent()],
             )
             .unwrap();
-        let baseline = store
-            .load_episode_projection_generation_status()
-            .unwrap();
+        let baseline = store.load_episode_projection_generation_status().unwrap();
         let baseline_evidence = EpisodeProjectionSourceCutEvidence {
             coverage: baseline.generations[0].snapshot_source_cut.clone(),
             entries: Vec::new(),
@@ -4614,10 +4934,7 @@ mod tests {
                 generation.descriptor.generation_id == first.descriptor.generation_id
             })
             .unwrap();
-        assert_eq!(
-            retained_first.snapshot_source_cut.through_source_row_id,
-            2
-        );
+        assert_eq!(retained_first.snapshot_source_cut.through_source_row_id, 2);
         let rolled_back = store
             .rollback_episode_projection_generation(
                 &first.descriptor.generation_id,
@@ -4666,9 +4983,7 @@ mod tests {
                 .unwrap()
                 .generations
                 .iter()
-                .find(|generation| {
-                    generation.phase == EpisodeProjectionGenerationPhase::Active
-                })
+                .find(|generation| generation.phase == EpisodeProjectionGenerationPhase::Active)
                 .unwrap()
                 .snapshot_source_cut
                 .clone(),
@@ -4743,6 +5058,115 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("already fixed"));
+    }
+
+    #[test]
+    fn recovery_cut_root_seals_legacy_live_memory_and_requires_consolidation_before_stage() {
+        let _guard = PROJECTION_TEST_LOCK.lock().unwrap();
+        let (store, dir) = temp_store();
+        let path = dir.path().join("test-hippocampus.redb");
+        let legacy = make_episode(77, "legacy episode");
+        store
+            .store_episodes("Thomas", std::slice::from_ref(&legacy))
+            .unwrap();
+        store
+            .initialize_episode_projection_cutover(&cutover_receipt(0), &[projection_agent()])
+            .unwrap();
+        let root = store.load_episode_projection_generation_status().unwrap();
+        assert_eq!(root.generations.len(), 1);
+        assert_eq!(root.generations[0].descriptor.parent_generation_id, None);
+        assert_eq!(
+            root.generations[0].phase,
+            EpisodeProjectionGenerationPhase::Active
+        );
+        assert_eq!(
+            serde_json::to_vec(&store.load_episodes("Thomas").unwrap()).unwrap(),
+            serde_json::to_vec(std::slice::from_ref(&legacy)).unwrap()
+        );
+        drop(store);
+
+        let store = HippocampusStore::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            store.load_episode_projection_generation_status().unwrap(),
+            root
+        );
+        assert_eq!(
+            serde_json::to_vec(&store.load_episodes("Thomas").unwrap()).unwrap(),
+            serde_json::to_vec(std::slice::from_ref(&legacy)).unwrap()
+        );
+        let active = root.active_generation_id.clone();
+        let evidence = EpisodeProjectionSourceCutEvidence {
+            coverage: root.generations[0].snapshot_source_cut.clone(),
+            entries: Vec::new(),
+        };
+        let mut without_legacy = generation_candidate_from_current(&store, &active, &evidence);
+        without_legacy.subjects[0].live_episodes.clear();
+        without_legacy.subjects[0].coverage_digest = episode_projection_subject_coverage_digest(
+            &without_legacy.subjects[0].agent,
+            &without_legacy.subjects[0].frontier,
+            &without_legacy.subjects[0].receipts,
+            &without_legacy.subjects[0].live_episodes,
+            &without_legacy.subjects[0].archived_episodes,
+        )
+        .unwrap();
+        let error = store
+            .begin_episode_projection_generation(&without_legacy, &active, &evidence)
+            .unwrap_err();
+        assert!(error.to_string().contains("consolidate it before staging"));
+        assert_eq!(
+            store.load_episode_projection_generation_status().unwrap(),
+            root
+        );
+        assert!(store
+            .load_episode_projection_readiness(projection_subject())
+            .unwrap()
+            .is_ready());
+
+        store
+            .archive_and_clear_episodes("Thomas", std::slice::from_ref(&legacy))
+            .unwrap();
+        assert!(store.load_episodes("Thomas").unwrap().is_empty());
+        assert_eq!(
+            serde_json::to_vec(&store.load_archive("Thomas").unwrap()).unwrap(),
+            serde_json::to_vec(std::slice::from_ref(&legacy)).unwrap()
+        );
+
+        let mut receiptless_new = generation_candidate_from_current(&store, &active, &evidence);
+        receiptless_new.subjects[0]
+            .live_episodes
+            .push(make_episode(78, "unreceipted new effect"));
+        receiptless_new.subjects[0].coverage_digest = episode_projection_subject_coverage_digest(
+            &receiptless_new.subjects[0].agent,
+            &receiptless_new.subjects[0].frontier,
+            &receiptless_new.subjects[0].receipts,
+            &receiptless_new.subjects[0].live_episodes,
+            &receiptless_new.subjects[0].archived_episodes,
+        )
+        .unwrap();
+        assert!(store
+            .begin_episode_projection_generation(&receiptless_new, &active, &evidence)
+            .unwrap_err()
+            .to_string()
+            .contains("no authoritative source receipt"));
+        assert_eq!(
+            store.load_episode_projection_generation_status().unwrap(),
+            root
+        );
+
+        let candidate = generation_candidate_from_current(&store, &active, &evidence);
+        store
+            .begin_episode_projection_generation(&candidate, &active, &evidence)
+            .unwrap();
+        let staged = store.load_episode_projection_generation_status().unwrap();
+        assert_eq!(staged.generations.len(), 2);
+        assert!(staged.generations.iter().any(|generation| {
+            generation.descriptor.generation_id == candidate.descriptor.generation_id
+                && generation.phase == EpisodeProjectionGenerationPhase::Building
+        }));
+        assert_eq!(
+            serde_json::to_vec(&store.load_archive("Thomas").unwrap()).unwrap(),
+            serde_json::to_vec(std::slice::from_ref(&legacy)).unwrap()
+        );
     }
 
     #[test]
@@ -4892,9 +5316,7 @@ mod tests {
             .unwrap()
             .is_none());
         let read_txn = generation_store.db.begin_read().unwrap();
-        let generations = read_txn
-            .open_table(EPISODE_PROJECTION_GENERATIONS)
-            .unwrap();
+        let generations = read_txn.open_table(EPISODE_PROJECTION_GENERATIONS).unwrap();
         assert!(generations.get("orphan").unwrap().is_some());
     }
 
@@ -5276,9 +5698,7 @@ mod tests {
                 reason: EpisodeProjectionQuarantineReason::MalformedRelevantPayload,
                 diagnostic_digest: "22".repeat(32),
             };
-            store
-                .quarantine_episode_projection(&quarantine, 0)
-                .unwrap();
+            store.quarantine_episode_projection(&quarantine, 0).unwrap();
             let mut write = projection_write(1, "fault-event", 91, 1);
             write.request_digest = quarantine.request_digest.clone();
             let resolution = EpisodeProjectionResolution {
@@ -5287,9 +5707,7 @@ mod tests {
             };
 
             EPISODE_PROJECTION_FAULT_STAGE.store(stage as u8, Ordering::SeqCst);
-            let error = store
-                .resolve_episode_projection(&resolution)
-                .unwrap_err();
+            let error = store.resolve_episode_projection(&resolution).unwrap_err();
             assert!(error.to_string().contains(&format!("{stage:?}")));
             assert_eq!(EPISODE_PROJECTION_FAULT_STAGE.load(Ordering::SeqCst), 0);
             drop(store);
@@ -5569,7 +5987,10 @@ mod tests {
                 .unwrap(),
             EpisodeProjectionApplyOutcome::Applied { .. }
         ));
-        assert_eq!(store.list_episode_projection_quarantine().unwrap(), vec![second.clone()]);
+        assert_eq!(
+            store.list_episode_projection_quarantine().unwrap(),
+            vec![second.clone()]
+        );
         assert!(!store
             .load_episode_projection_readiness(projection_subject())
             .unwrap()
@@ -5584,7 +6005,10 @@ mod tests {
                 .unwrap(),
             EpisodeProjectionApplyOutcome::Applied { .. }
         ));
-        assert!(store.list_episode_projection_quarantine().unwrap().is_empty());
+        assert!(store
+            .list_episode_projection_quarantine()
+            .unwrap()
+            .is_empty());
         assert!(store
             .load_episode_projection_readiness(projection_subject())
             .unwrap()
@@ -5716,24 +6140,39 @@ mod tests {
             reason: EpisodeProjectionQuarantineReason::MalformedRelevantPayload,
             diagnostic_digest: "fa".repeat(32),
         };
-        store.quarantine_episode_projection(&building, 2).unwrap();
-
         for subject in [projection_subject(), kevin.subject] {
             let readiness = store.load_episode_projection_readiness(subject).unwrap();
             assert!(!readiness.is_ready());
-            assert_eq!(
-                readiness
-                    .blockers
-                    .iter()
-                    .filter(|block| matches!(
-                        block,
-                        EpisodeProjectionReadinessBlock::GlobalQuarantine { .. }
-                    ))
-                    .count(),
-                2
-            );
+            let global_blockers: Vec<_> = readiness
+                .blockers
+                .iter()
+                .filter_map(|block| match block {
+                    EpisodeProjectionReadinessBlock::GlobalQuarantine { quarantine } => {
+                        Some(quarantine)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(global_blockers, vec![&unresolved]);
         }
-        for quarantine in [agent_quarantine, unresolved, building] {
+
+        let error = store
+            .quarantine_episode_projection(&building, 2)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("global episode projection quarantine blocks later source rows"));
+        assert_eq!(
+            store
+                .load_episode_projection_control()
+                .unwrap()
+                .unwrap()
+                .last_source_row_id,
+            2
+        );
+        let persisted = store.list_episode_projection_quarantine().unwrap();
+        assert_eq!(persisted, vec![agent_quarantine, unresolved]);
+        for quarantine in persisted {
             let encoded = serde_json::to_value(&quarantine).unwrap();
             let fields = encoded.as_object().unwrap();
             assert!(!fields.contains_key("payload"));
