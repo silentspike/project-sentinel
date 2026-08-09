@@ -10,18 +10,18 @@ use std::sync::{mpsc::SyncSender, Arc, RwLock};
 use sentinel_common::events::{DomainEvent, DomainEventPayload};
 use sentinel_common::AgentId;
 use sentinel_hippocampus::{
-    episode_projection_source_cut_coverage,
-    Episode, EpisodeProjectionAdmission, EpisodeProjectionAdvance, EpisodeProjectionAgent,
-    EpisodeProjectionApplyOutcome, EpisodeProjectionControl, EpisodeProjectionCutoverReceipt,
+    episode_projection_source_cut_coverage, Episode, EpisodeProjectionAdmission,
+    EpisodeProjectionAdvance, EpisodeProjectionAgent, EpisodeProjectionApplyOutcome,
+    EpisodeProjectionControl, EpisodeProjectionCutoverReceipt,
     EpisodeProjectionGenerationCandidate, EpisodeProjectionGenerationDescriptor,
     EpisodeProjectionGenerationPhase, EpisodeProjectionGenerationStatus,
-    EpisodeProjectionGenerationSubject,
-    EpisodeProjectionQuarantine, EpisodeProjectionQuarantineReason, EpisodeProjectionReadiness,
-    EpisodeProjectionResolution, EpisodeProjectionStartPolicy, EpisodeProjectionSubject,
+    EpisodeProjectionGenerationSubject, EpisodeProjectionQuarantine,
+    EpisodeProjectionQuarantineReason, EpisodeProjectionReadiness, EpisodeProjectionResolution,
     EpisodeProjectionSourceClassification, EpisodeProjectionSourceCoverageEntry,
-    EpisodeProjectionSourceCutEvidence, EpisodeProjectionWrite, EpisodeSourceReceipt,
-    HippocampusService, EPISODE_PROJECTION_MAX_LIVE_EPISODES_PER_SUBJECT,
-    EPISODE_PROJECTION_TICK_DURATION_MILLIS, EPISODE_PROJECTION_VERSION,
+    EpisodeProjectionSourceCutEvidence, EpisodeProjectionStartPolicy, EpisodeProjectionSubject,
+    EpisodeProjectionWrite, EpisodeSourceReceipt, HippocampusService,
+    EPISODE_PROJECTION_MAX_LIVE_EPISODES_PER_SUBJECT, EPISODE_PROJECTION_TICK_DURATION_MILLIS,
+    EPISODE_PROJECTION_VERSION,
 };
 use sentinel_limbo::EventStore;
 use sha2::{Digest, Sha256};
@@ -123,8 +123,7 @@ impl EpisodeProjectionAdmissionSnapshot {
     }
 }
 
-pub type SharedEpisodeProjectionAdmissionState =
-    Arc<RwLock<EpisodeProjectionAdmissionSnapshot>>;
+pub type SharedEpisodeProjectionAdmissionState = Arc<RwLock<EpisodeProjectionAdmissionSnapshot>>;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct EpisodeProjectionResolveRequest {
@@ -153,6 +152,11 @@ pub enum EpisodeProjectionGenerationRequest {
     Validate {
         generation_id: String,
         expected_active_generation_id: String,
+    },
+    Discard {
+        generation_id: String,
+        expected_active_generation_id: String,
+        expected_candidate_digest: String,
     },
     Activate {
         generation_id: String,
@@ -300,14 +304,68 @@ impl EpisodeProducer {
         let mut producer = Self {
             hippocampus,
             last_event_id: 0,
-            agent_names: agents.iter().cloned().collect(),
+            agent_names: projection_identity_map(agents)?,
             admission_state: Arc::new(RwLock::new(EpisodeProjectionAdmissionSnapshot::default())),
             tick_duration_millis,
             empty_runs: 0,
         };
         producer.initialize_projection(event_store, cutover, operator_secret)?;
+        producer.hydrate_durable_projection_identities()?;
         producer.refresh_admission_state()?;
         Ok(producer)
+    }
+
+    fn hydrate_durable_projection_identities(&mut self) -> anyhow::Result<()> {
+        let frontiers = self
+            .hippocampus
+            .store()
+            .list_episode_projection_frontiers()?;
+        let durable_agents = frontiers
+            .iter()
+            .map(|frontier| EpisodeProjectionAgent {
+                subject: frontier.subject,
+                agent_name: frontier.agent_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.hippocampus
+            .store()
+            .validate_episode_projection_agents(&durable_agents)?;
+
+        let mut hydrated = self.agent_names.clone();
+        let mut names = hydrated
+            .iter()
+            .map(|(agent_id, agent_name)| (agent_name.clone(), *agent_id))
+            .collect::<HashMap<_, _>>();
+        for frontier in frontiers {
+            match frontier.subject {
+                EpisodeProjectionSubject::Agent { agent_id } => {
+                    if let Some(existing_name) = hydrated.get(&agent_id.0) {
+                        anyhow::ensure!(
+                            existing_name == &frontier.agent_name,
+                            "durable episode projection subject {:?} conflicts with current roster",
+                            frontier.subject
+                        );
+                    }
+                    if let Some(existing_id) = names.get(&frontier.agent_name) {
+                        anyhow::ensure!(
+                            *existing_id == agent_id.0,
+                            "durable episode projection name {} conflicts with current roster",
+                            frontier.agent_name
+                        );
+                    }
+                    hydrated.insert(agent_id.0, frontier.agent_name.clone());
+                    names.insert(frontier.agent_name, agent_id.0);
+                }
+                EpisodeProjectionSubject::Building => {
+                    anyhow::ensure!(
+                        frontier.agent_name == "_building",
+                        "durable Building projection has an invalid storage locator"
+                    );
+                }
+            }
+        }
+        self.agent_names = hydrated;
+        Ok(())
     }
 
     /// Gibt eine Referenz auf den HippocampusService zurueck.
@@ -345,6 +403,38 @@ impl EpisodeProducer {
         Ok(())
     }
 
+    /// Validate a complete staged roster against immutable durable bindings.
+    pub fn validate_agent_bindings(&self, agents: &[(u16, String)]) -> anyhow::Result<()> {
+        let projection_agents = agents
+            .iter()
+            .map(|(id, name)| EpisodeProjectionAgent {
+                subject: EpisodeProjectionSubject::Agent {
+                    agent_id: AgentId(*id),
+                },
+                agent_name: name.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.hippocampus
+            .store()
+            .validate_episode_projection_agents(&projection_agents)
+    }
+
+    /// Idempotently register a prevalidated roster after the durable decision.
+    pub fn register_agents(&mut self, agents: &[(u16, String)]) -> anyhow::Result<()> {
+        self.validate_agent_bindings(agents)?;
+        for (id, name) in agents {
+            if self
+                .agent_names
+                .get(id)
+                .is_some_and(|existing| existing == name)
+            {
+                continue;
+            }
+            self.register_agent(*id, name.clone())?;
+        }
+        Ok(())
+    }
+
     /// Ob dieser Tick ein Produktionslauf sein soll.
     pub fn should_run(&self, tick: u64) -> bool {
         tick > 0 && tick.is_multiple_of(PRODUCE_INTERVAL_TICKS)
@@ -370,18 +460,15 @@ impl EpisodeProducer {
         if events.is_empty() {
             return 0;
         }
-        let mut effect_reference_tick = match self
-            .hippocampus
-            .store()
-            .load_episode_projection_control()
-        {
-            Ok(Some(control)) => control.effect_reference_tick,
-            Ok(None) => return 0,
-            Err(error) => {
-                warn!(%error, "Episode Producer: effect clock could not be loaded");
-                return 0;
-            }
-        };
+        let mut effect_reference_tick =
+            match self.hippocampus.store().load_episode_projection_control() {
+                Ok(Some(control)) => control.effect_reference_tick,
+                Ok(None) => return 0,
+                Err(error) => {
+                    warn!(%error, "Episode Producer: effect clock could not be loaded");
+                    return 0;
+                }
+            };
 
         let mut total = 0;
         let mut agents_with_episodes = std::collections::HashSet::new();
@@ -458,7 +545,11 @@ impl EpisodeProducer {
                     }
                     Ok(EpisodeProjectionAdmission::Allowed) => {}
                     Ok(EpisodeProjectionAdmission::GloballyBlocked(blocker)) => {
-                        warn!(source_row_id, blocker_row = blocker.source_row_id, "Episode Producer: global unresolved quarantine fences later work");
+                        warn!(
+                            source_row_id,
+                            blocker_row = blocker.source_row_id,
+                            "Episode Producer: global unresolved quarantine fences later work"
+                        );
                         break;
                     }
                     Err(error) => {
@@ -531,7 +622,11 @@ impl EpisodeProducer {
                     }
                     Ok(EpisodeProjectionAdmission::Allowed) => {}
                     Ok(EpisodeProjectionAdmission::GloballyBlocked(blocker)) => {
-                        warn!(source_row_id, blocker_row = blocker.source_row_id, "Episode Producer: global unresolved quarantine fences later work");
+                        warn!(
+                            source_row_id,
+                            blocker_row = blocker.source_row_id,
+                            "Episode Producer: global unresolved quarantine fences later work"
+                        );
                         break;
                     }
                     Err(error) => {
@@ -565,13 +660,8 @@ impl EpisodeProducer {
             let Some((agent_name, episode)) = self.event_to_episode(
                 &payload,
                 episode_id,
-                episode_hours_ago(
-                    event.tick,
-                    effect_reference_tick,
-                    self.tick_duration_millis,
-                ),
-            )
-            else {
+                episode_hours_ago(event.tick, effect_reference_tick, self.tick_duration_millis),
+            ) else {
                 warn!(event_id = %event.event_id, "Episode Producer: validiertes relevantes Event wurde nicht konvertiert");
                 break;
             };
@@ -664,10 +754,7 @@ impl EpisodeProducer {
             EpisodeProjectionSubject::Agent { agent_id } => (0, agent_id.0),
             EpisodeProjectionSubject::Building => (1, 0),
         });
-        let existing = self
-            .hippocampus
-            .store()
-            .load_episode_projection_control()?;
+        let existing = self.hippocampus.store().load_episode_projection_control()?;
         let control = match existing {
             Some(control) => {
                 if let Some(seal) = cutover {
@@ -691,7 +778,8 @@ impl EpisodeProducer {
                         authorization_digest: seal.authorization_digest.clone(),
                         operator_secret: operator_secret.to_string(),
                     };
-                    let receipt = self.validate_cutover_authorization(event_store, authorization)?;
+                    let receipt =
+                        self.validate_cutover_authorization(event_store, authorization)?;
                     self.hippocampus
                         .store()
                         .initialize_episode_projection_cutover(&receipt, &agents)?
@@ -744,7 +832,7 @@ impl EpisodeProducer {
         authorization: EpisodeProjectionCutoverAuthorization,
     ) -> anyhow::Result<EpisodeProjectionCutoverReceipt> {
         anyhow::ensure!(
-            authorization.operator_secret.as_bytes().len() >= 32,
+            authorization.operator_secret.len() >= 32,
             "episode projection cutover requires an operator secret of at least 32 bytes"
         );
         anyhow::ensure!(
@@ -766,7 +854,8 @@ impl EpisodeProducer {
             ),
             "episode projection cutover legacy state digest mismatch"
         );
-        let source_cut_digest = event_store_source_cut_digest(event_store, authorization.source_row_id)?;
+        let source_cut_digest =
+            event_store_source_cut_digest(event_store, authorization.source_row_id)?;
         anyhow::ensure!(
             constant_time_eq(
                 source_cut_digest.as_bytes(),
@@ -871,10 +960,12 @@ impl EpisodeProducer {
         _tick_rate_s: f64,
         request: &EpisodeProjectionResolveRequest,
     ) -> anyhow::Result<EpisodeProjectionResolveResponse> {
-        anyhow::ensure!(request.source_row_id > 0, "resolution source row must be positive");
         anyhow::ensure!(
-            is_sha256_hex(&request.request_digest)
-                && is_sha256_hex(&request.quarantine_digest),
+            request.source_row_id > 0,
+            "resolution source row must be positive"
+        );
+        anyhow::ensure!(
+            is_sha256_hex(&request.request_digest) && is_sha256_hex(&request.quarantine_digest),
             "resolution digests must be SHA-256 hex"
         );
         let event = load_exact_source_event(event_store, request.source_row_id)?;
@@ -971,10 +1062,7 @@ impl EpisodeProducer {
         let quarantine = self
             .hippocampus
             .store()
-            .load_episode_projection_quarantine(
-                request.source_row_id,
-                &request.source_event_id,
-            )?
+            .load_episode_projection_quarantine(request.source_row_id, &request.source_event_id)?
             .ok_or_else(|| anyhow::anyhow!("episode projection quarantine not found"))?;
         anyhow::ensure!(
             constant_time_eq(
@@ -1036,10 +1124,7 @@ impl EpisodeProducer {
         event_store: &EventStore,
         from_exclusive_source_row_id: i64,
         through_source_row_id: i64,
-    ) -> anyhow::Result<(
-        EpisodeProjectionSourceCutEvidence,
-        Vec<(i64, DomainEvent)>,
-    )> {
+    ) -> anyhow::Result<(EpisodeProjectionSourceCutEvidence, Vec<(i64, DomainEvent)>)> {
         anyhow::ensure!(
             from_exclusive_source_row_id >= 0
                 && through_source_row_id >= from_exclusive_source_row_id
@@ -1100,16 +1185,12 @@ impl EpisodeProducer {
         ))
     }
 
-    fn classify_source_event(
-        &self,
-        event: &DomainEvent,
-    ) -> EpisodeProjectionSourceClassification {
+    fn classify_source_event(&self, event: &DomainEvent) -> EpisodeProjectionSourceClassification {
         if !is_episode_event_type(&event.event_type) {
             return EpisodeProjectionSourceClassification::Irrelevant;
         }
-        let envelope_subject = projection_subject_from_event(event).and_then(|subject| {
-            self.is_registered_subject(subject).then_some(subject)
-        });
+        let envelope_subject = projection_subject_from_event(event)
+            .and_then(|subject| self.is_registered_subject(subject).then_some(subject));
         let payload: DomainEventPayload = match serde_json::from_str(&event.payload) {
             Ok(payload) => payload,
             Err(_) => {
@@ -1191,10 +1272,7 @@ impl EpisodeProducer {
         });
         let mut subjects = Vec::with_capacity(agents.len());
         for agent in agents {
-            let archived_episodes = self
-                .hippocampus
-                .store()
-                .load_archive(&agent.agent_name)?;
+            let archived_episodes = self.hippocampus.store().load_archive(&agent.agent_name)?;
             subjects.push(EpisodeProjectionGenerationSubject {
                 frontier: sentinel_hippocampus::EpisodeProjectionFrontier {
                     subject: agent.subject,
@@ -1245,9 +1323,10 @@ impl EpisodeProducer {
                         payload.event_type_str() == event.event_type,
                         "episode-classified source type changed"
                     );
-                    let (derived_subject, expected_agent_name) = self
-                        .episode_agent(&payload)
-                        .ok_or_else(|| anyhow::anyhow!("episode-classified subject is unavailable"))?;
+                    let (derived_subject, expected_agent_name) =
+                        self.episode_agent(&payload).ok_or_else(|| {
+                            anyhow::anyhow!("episode-classified subject is unavailable")
+                        })?;
                     anyhow::ensure!(
                         derived_subject == *subject,
                         "episode-classified subject changed"
@@ -1268,7 +1347,9 @@ impl EpisodeProducer {
                                 evidence.coverage.tick_duration_millis,
                             ),
                         )
-                        .ok_or_else(|| anyhow::anyhow!("episode-classified source has no effect"))?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("episode-classified source has no effect")
+                        })?;
                     anyhow::ensure!(
                         agent_name == expected_agent_name,
                         "episode-classified storage locator changed"
@@ -1276,7 +1357,9 @@ impl EpisodeProducer {
                     let candidate_subject = subjects
                         .iter_mut()
                         .find(|candidate| candidate.agent.subject == *subject)
-                        .ok_or_else(|| anyhow::anyhow!("episode subject is absent from generation"))?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("episode subject is absent from generation")
+                        })?;
                     candidate_subject.receipts.push(EpisodeSourceReceipt {
                         subject: *subject,
                         agent_name: agent_name.clone(),
@@ -1307,14 +1390,11 @@ impl EpisodeProducer {
                         }
                     }
                     candidate_subject.frontier.last_source_row_id = *source_row_id;
-                    candidate_subject.frontier.last_source_event_id =
-                        Some(event.event_id.clone());
+                    candidate_subject.frontier.last_source_event_id = Some(event.event_id.clone());
                     candidate_subject.frontier.last_request_digest =
                         Some(entry.request_digest.clone());
-                    candidate_subject.frontier.applied_count = candidate_subject
-                        .frontier
-                        .applied_count
-                        .saturating_add(1);
+                    candidate_subject.frontier.applied_count =
+                        candidate_subject.frontier.applied_count.saturating_add(1);
                 }
                 EpisodeProjectionSourceClassification::Quarantined {
                     affected_subject,
@@ -1374,19 +1454,15 @@ impl EpisodeProducer {
         proposed: &EpisodeProjectionGenerationCandidate,
         expected_active_generation_id: &str,
     ) -> anyhow::Result<String> {
-        let (expected, evidence) = self.build_authoritative_generation_candidate(
-            event_store,
-            expected_active_generation_id,
-        )?;
+        let (expected, evidence) = self
+            .build_authoritative_generation_candidate(event_store, expected_active_generation_id)?;
         anyhow::ensure!(
             serde_json::to_vec(proposed)? == serde_json::to_vec(&expected)?,
             "episode projection generation effects differ from authoritative replay"
         );
-        self.hippocampus.store().begin_episode_projection_generation(
-            proposed,
-            expected_active_generation_id,
-            &evidence,
-        )
+        self.hippocampus
+            .store()
+            .begin_episode_projection_generation(proposed, expected_active_generation_id, &evidence)
     }
 
     fn source_evidence_for_generation(
@@ -1463,7 +1539,29 @@ impl EpisodeProducer {
                         expected_active_generation_id,
                         &evidence,
                     )?;
-                ("validate".to_string(), Some(generation_id.clone()), Some(digest))
+                (
+                    "validate".to_string(),
+                    Some(generation_id.clone()),
+                    Some(digest),
+                )
+            }
+            EpisodeProjectionGenerationRequest::Discard {
+                generation_id,
+                expected_active_generation_id,
+                expected_candidate_digest,
+            } => {
+                self.hippocampus
+                    .store()
+                    .discard_episode_projection_generation(
+                        generation_id,
+                        expected_active_generation_id,
+                        expected_candidate_digest,
+                    )?;
+                (
+                    "discard".to_string(),
+                    Some(generation_id.clone()),
+                    Some(expected_candidate_digest.clone()),
+                )
             }
             EpisodeProjectionGenerationRequest::Activate {
                 generation_id,
@@ -1488,7 +1586,8 @@ impl EpisodeProducer {
                     .iter()
                     .find(|generation| generation.descriptor.generation_id == *generation_id)
                     .ok_or_else(|| anyhow::anyhow!("episode projection generation not found"))?;
-                let rollback = matches!(request, EpisodeProjectionGenerationRequest::Rollback { .. });
+                let rollback =
+                    matches!(request, EpisodeProjectionGenerationRequest::Rollback { .. });
                 let target_evidence = self.source_evidence_for_generation(
                     event_store,
                     &status,
@@ -1503,8 +1602,12 @@ impl EpisodeProducer {
                 let active_generation = status
                     .generations
                     .iter()
-                    .find(|generation| generation.descriptor.generation_id == status.active_generation_id)
-                    .ok_or_else(|| anyhow::anyhow!("active episode projection generation missing"))?;
+                    .find(|generation| {
+                        generation.descriptor.generation_id == status.active_generation_id
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("active episode projection generation missing")
+                    })?;
                 let active_evidence = self.authoritative_source_cut(
                     event_store,
                     active_generation
@@ -1518,25 +1621,29 @@ impl EpisodeProducer {
                         target.phase == EpisodeProjectionGenerationPhase::Retained,
                         "rollback target is not retained"
                     );
-                    self.hippocampus.store().rollback_episode_projection_generation(
-                        generation_id,
-                        expected_active_generation_id,
-                        expected_candidate_digest,
-                        &target_evidence,
-                        &active_evidence,
-                    )?;
+                    self.hippocampus
+                        .store()
+                        .rollback_episode_projection_generation(
+                            generation_id,
+                            expected_active_generation_id,
+                            expected_candidate_digest,
+                            &target_evidence,
+                            &active_evidence,
+                        )?;
                 } else {
                     anyhow::ensure!(
                         target.phase == EpisodeProjectionGenerationPhase::Validated,
                         "activation target is not validated"
                     );
-                    self.hippocampus.store().activate_episode_projection_generation(
-                        generation_id,
-                        expected_active_generation_id,
-                        expected_candidate_digest,
-                        &target_evidence,
-                        &active_evidence,
-                    )?;
+                    self.hippocampus
+                        .store()
+                        .activate_episode_projection_generation(
+                            generation_id,
+                            expected_active_generation_id,
+                            expected_candidate_digest,
+                            &target_evidence,
+                            &active_evidence,
+                        )?;
                 }
                 let control = self
                     .hippocampus
@@ -1550,9 +1657,7 @@ impl EpisodeProducer {
                     Some(expected_candidate_digest.clone()),
                 )
             }
-            EpisodeProjectionGenerationRequest::Status => {
-                ("status".to_string(), None, None)
-            }
+            EpisodeProjectionGenerationRequest::Status => ("status".to_string(), None, None),
         };
         self.refresh_admission_state()?;
         Ok(EpisodeProjectionGenerationResponse {
@@ -1613,7 +1718,11 @@ impl EpisodeProducer {
             .map(blocker_diagnostic)
             .collect();
         let mut agents = Vec::new();
-        let mut identities: Vec<(u16, &String)> = self.agent_names.iter().map(|(id, name)| (*id, name)).collect();
+        let mut identities: Vec<(u16, &String)> = self
+            .agent_names
+            .iter()
+            .map(|(id, name)| (*id, name))
+            .collect();
         identities.sort_by_key(|(id, _)| *id);
         for (agent_id, _) in identities {
             let subject = EpisodeProjectionSubject::Agent {
@@ -1753,6 +1862,32 @@ impl EpisodeProducer {
     }
 }
 
+fn projection_identity_map(agents: &[(u16, String)]) -> anyhow::Result<HashMap<u16, String>> {
+    let mut identities = HashMap::new();
+    let mut names = HashMap::new();
+    for (agent_id, agent_name) in agents {
+        if let Some(existing_name) = identities.get(agent_id) {
+            anyhow::ensure!(
+                existing_name == agent_name,
+                "current roster contains conflicting names for agent {agent_id}"
+            );
+        }
+        if let Some(existing_id) = names.get(agent_name) {
+            anyhow::ensure!(
+                existing_id == agent_id,
+                "current roster name {agent_name} is bound to multiple agents"
+            );
+        }
+        anyhow::ensure!(
+            agent_name != "_building",
+            "current roster cannot use the Building projection storage locator"
+        );
+        identities.insert(*agent_id, agent_name.clone());
+        names.insert(agent_name.clone(), *agent_id);
+    }
+    Ok(identities)
+}
+
 fn is_episode_event_type(event_type: &str) -> bool {
     matches!(
         event_type,
@@ -1878,9 +2013,7 @@ fn quarantine_record_digest(record: &EpisodeProjectionQuarantine) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn blocker_diagnostic(
-    record: &EpisodeProjectionQuarantine,
-) -> EpisodeProjectionBlockerDiagnostic {
+fn blocker_diagnostic(record: &EpisodeProjectionQuarantine) -> EpisodeProjectionBlockerDiagnostic {
     EpisodeProjectionBlockerDiagnostic {
         source_row_id: record.source_row_id,
         source_event_id: record.source_event_id.clone(),
@@ -1895,7 +2028,9 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     }
     left.iter()
         .zip(right)
-        .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
         == 0
 }
 
@@ -2067,8 +2202,7 @@ mod tests {
         let (hippocampus, dir) = temp_hippocampus();
         let event_store = temp_event_store(&dir);
         let mut producer =
-            EpisodeProducer::new(hippocampus, &[(1, "Thomas".to_string())], &event_store)
-                .unwrap();
+            EpisodeProducer::new(hippocampus, &[(1, "Thomas".to_string())], &event_store).unwrap();
         let irrelevant = DomainEvent::new(
             "task_created",
             "TASK-1",
@@ -2133,13 +2267,119 @@ mod tests {
             .is_err());
 
         let status = producer
-            .handle_generation_request(
-                &event_store,
-                &EpisodeProjectionGenerationRequest::Status,
-            )
+            .handle_generation_request(&event_store, &EpisodeProjectionGenerationRequest::Status)
             .unwrap();
         assert_eq!(status.operation, "status");
         assert!(status.generation_id.is_none());
+    }
+
+    #[test]
+    fn restart_hydrates_removed_agent_as_stable_projection_identity() {
+        let (hippocampus, dir) = temp_hippocampus();
+        let event_store = temp_event_store(&dir);
+        let agents = vec![(1, "Thomas".to_string()), (2, "Lisa".to_string())];
+        let producer = EpisodeProducer::new(hippocampus, &agents, &event_store).unwrap();
+        append_payload(
+            &event_store,
+            &DomainEventPayload::BioActionPerformed {
+                agent_id: AgentId(2),
+                action: "historical-drink".to_string(),
+            },
+            10,
+        );
+        let active_generation_id = producer
+            .hippocampus()
+            .store()
+            .load_episode_projection_generation_status()
+            .unwrap()
+            .active_generation_id;
+        let (before, before_evidence) = producer
+            .build_authoritative_generation_candidate(&event_store, &active_generation_id)
+            .unwrap();
+        assert_eq!(
+            before
+                .subjects
+                .iter()
+                .map(|subject| subject.agent.subject)
+                .collect::<Vec<_>>(),
+            vec![
+                EpisodeProjectionSubject::Agent {
+                    agent_id: AgentId(1),
+                },
+                EpisodeProjectionSubject::Agent {
+                    agent_id: AgentId(2),
+                },
+                EpisodeProjectionSubject::Building,
+            ]
+        );
+        assert!(matches!(
+            before_evidence.entries[0].classification,
+            EpisodeProjectionSourceClassification::Episode {
+                subject: EpisodeProjectionSubject::Agent {
+                    agent_id: AgentId(2)
+                }
+            }
+        ));
+
+        drop(producer);
+        let reopened =
+            HippocampusService::open(dir.path().join("test-hippocampus.redb").to_str().unwrap())
+                .unwrap();
+        let restarted =
+            EpisodeProducer::new(reopened, &[(1, "Thomas".to_string())], &event_store).unwrap();
+        assert_eq!(
+            restarted.agent_names.get(&1).map(String::as_str),
+            Some("Thomas")
+        );
+        assert_eq!(
+            restarted.agent_names.get(&2).map(String::as_str),
+            Some("Lisa")
+        );
+        let (after, after_evidence) = restarted
+            .build_authoritative_generation_candidate(&event_store, &active_generation_id)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&before).unwrap(),
+            serde_json::to_vec(&after).unwrap()
+        );
+        assert_eq!(before_evidence, after_evidence);
+    }
+
+    #[test]
+    fn restart_rejects_current_roster_conflicts_with_durable_projection_identities() {
+        let (hippocampus, dir) = temp_hippocampus();
+        let event_store = temp_event_store(&dir);
+        let producer = EpisodeProducer::new(
+            hippocampus,
+            &[(1, "Thomas".to_string()), (2, "Lisa".to_string())],
+            &event_store,
+        )
+        .unwrap();
+        drop(producer);
+
+        let reopened =
+            HippocampusService::open(dir.path().join("test-hippocampus.redb").to_str().unwrap())
+                .unwrap();
+        let rename_error = EpisodeProducer::new(
+            reopened,
+            &[(1, "Thomas".to_string()), (2, "Robert".to_string())],
+            &event_store,
+        )
+        .err()
+        .unwrap();
+        assert!(rename_error.to_string().contains("immutable"));
+
+        let reopened =
+            HippocampusService::open(dir.path().join("test-hippocampus.redb").to_str().unwrap())
+                .unwrap();
+        let alias_error = EpisodeProducer::new(
+            reopened,
+            &[(1, "Thomas".to_string()), (3, "Lisa".to_string())],
+            &event_store,
+        )
+        .err()
+        .unwrap();
+        assert!(alias_error.to_string().contains("already bound"));
     }
 
     #[test]
@@ -2147,8 +2387,7 @@ mod tests {
         let (hippocampus, dir) = temp_hippocampus();
         let event_store = temp_event_store(&dir);
         let producer =
-            EpisodeProducer::new(hippocampus, &[(1, "Thomas".to_string())], &event_store)
-                .unwrap();
+            EpisodeProducer::new(hippocampus, &[(1, "Thomas".to_string())], &event_store).unwrap();
         let older = DomainEvent::new(
             "bio_action_performed",
             "AGENT-01",
@@ -2179,19 +2418,26 @@ mod tests {
             .load_episode_projection_generation_status()
             .unwrap()
             .active_generation_id;
-        assert!(serde_json::from_value::<EpisodeProjectionGenerationRequest>(
-            serde_json::json!({
+        assert!(
+            serde_json::from_value::<EpisodeProjectionGenerationRequest>(serde_json::json!({
                 "action": "stage",
                 "expected_active_generation_id": expected_active_generation_id.clone(),
                 "candidate": {"untrusted": true}
-            }),
-        )
-        .is_err());
+            }),)
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<EpisodeProjectionGenerationRequest>(serde_json::json!({
+                "action": "discard",
+                "generation_id": "11".repeat(32),
+                "expected_active_generation_id": "22".repeat(32),
+                "expected_candidate_digest": "33".repeat(32),
+                "candidate": {"untrusted": true}
+            }))
+            .is_err()
+        );
         let (candidate, evidence) = producer
-            .build_authoritative_generation_candidate(
-                &event_store,
-                &expected_active_generation_id,
-            )
+            .build_authoritative_generation_candidate(&event_store, &expected_active_generation_id)
             .unwrap();
         assert_eq!(candidate.subjects.len(), 2);
         assert_eq!(candidate.subjects[0].agent.agent_name, "Thomas");
@@ -2216,21 +2462,13 @@ mod tests {
         );
 
         drop(producer);
-        let reopened = HippocampusService::open(
-            dir.path()
-                .join("test-hippocampus.redb")
-                .to_str()
-                .unwrap(),
-        )
-        .unwrap();
-        let mut producer =
-            EpisodeProducer::new(reopened, &[(1, "Thomas".to_string())], &event_store)
+        let reopened =
+            HippocampusService::open(dir.path().join("test-hippocampus.redb").to_str().unwrap())
                 .unwrap();
+        let mut producer =
+            EpisodeProducer::new(reopened, &[(1, "Thomas".to_string())], &event_store).unwrap();
         let (rebuilt, _) = producer
-            .build_authoritative_generation_candidate(
-                &event_store,
-                &expected_active_generation_id,
-            )
+            .build_authoritative_generation_candidate(&event_store, &expected_active_generation_id)
             .unwrap();
         assert_eq!(
             serde_json::to_vec(&candidate).unwrap(),
@@ -2269,18 +2507,16 @@ mod tests {
             )
             .unwrap();
         assert!(producer
-            .stage_generation_candidate(
-                &event_store,
-                &mutated,
-                &expected_active_generation_id,
-            )
+            .stage_generation_candidate(&event_store, &mutated, &expected_active_generation_id,)
             .is_err());
 
         let mut extra_live = rebuilt.clone();
         let mut fabricated = extra_live.subjects[0].live_episodes[0].clone();
         fabricated.id = fabricated.id.wrapping_add(1);
         fabricated.summary = "fabricated live episode".to_string();
-        extra_live.subjects[0].live_episodes.push(fabricated.clone());
+        extra_live.subjects[0]
+            .live_episodes
+            .push(fabricated.clone());
         extra_live.subjects[0].coverage_digest =
             sentinel_hippocampus::episode_projection_subject_coverage_digest(
                 &extra_live.subjects[0].agent,
@@ -2291,11 +2527,7 @@ mod tests {
             )
             .unwrap();
         assert!(producer
-            .stage_generation_candidate(
-                &event_store,
-                &extra_live,
-                &expected_active_generation_id,
-            )
+            .stage_generation_candidate(&event_store, &extra_live, &expected_active_generation_id,)
             .is_err());
 
         let mut extra_archive = rebuilt.clone();
@@ -2348,7 +2580,7 @@ mod tests {
                 &event_store,
                 &EpisodeProjectionGenerationRequest::Validate {
                     generation_id: candidate.descriptor.generation_id.clone(),
-                    expected_active_generation_id,
+                    expected_active_generation_id: expected_active_generation_id.clone(),
                 },
             )
             .unwrap();
@@ -2357,6 +2589,22 @@ mod tests {
             generation.descriptor.generation_id == rebuilt.descriptor.generation_id
                 && generation.phase == EpisodeProjectionGenerationPhase::Validated
         }));
+        let discarded = producer
+            .handle_generation_request(
+                &event_store,
+                &EpisodeProjectionGenerationRequest::Discard {
+                    generation_id: candidate.descriptor.generation_id.clone(),
+                    expected_active_generation_id,
+                    expected_candidate_digest: staged.candidate_digest.unwrap(),
+                },
+            )
+            .unwrap();
+        assert_eq!(discarded.operation, "discard");
+        assert_eq!(discarded.status.generations.len(), 1);
+        assert!(producer
+            .episode_projection_readiness(AgentId(1))
+            .unwrap()
+            .is_ready());
     }
 
     #[test]
@@ -2364,8 +2612,7 @@ mod tests {
         let (hippocampus, dir) = temp_hippocampus();
         let event_store = temp_event_store(&dir);
         let mut producer =
-            EpisodeProducer::new(hippocampus, &[(1, "Thomas".to_string())], &event_store)
-                .unwrap();
+            EpisodeProducer::new(hippocampus, &[(1, "Thomas".to_string())], &event_store).unwrap();
         for index in 0..501 {
             append_payload(
                 &event_store,
@@ -2405,13 +2652,9 @@ mod tests {
         );
 
         drop(producer);
-        let reopened = HippocampusService::open(
-            dir.path()
-                .join("test-hippocampus.redb")
-                .to_str()
-                .unwrap(),
-        )
-        .unwrap();
+        let reopened =
+            HippocampusService::open(dir.path().join("test-hippocampus.redb").to_str().unwrap())
+                .unwrap();
         let producer =
             EpisodeProducer::new(reopened, &[(1, "Thomas".to_string())], &event_store).unwrap();
         let (rebuilt, rebuilt_evidence) = producer
@@ -2429,8 +2672,7 @@ mod tests {
         let (hippocampus, dir) = temp_hippocampus();
         let event_store = temp_event_store(&dir);
         let mut producer =
-            EpisodeProducer::new(hippocampus, &[(1, "Thomas".to_string())], &event_store)
-                .unwrap();
+            EpisodeProducer::new(hippocampus, &[(1, "Thomas".to_string())], &event_store).unwrap();
         for index in 0..2001 {
             append_payload(
                 &event_store,
@@ -2486,16 +2728,15 @@ mod tests {
                 .all(|archived| archived.id != live_episode.id)
         }));
         let tip = subject.receipts.last().unwrap().episode_id;
-        assert!(subject.archived_episodes.iter().any(|episode| episode.id == tip));
+        assert!(subject
+            .archived_episodes
+            .iter()
+            .any(|episode| episode.id == tip));
 
         drop(producer);
-        let reopened = HippocampusService::open(
-            dir.path()
-                .join("test-hippocampus.redb")
-                .to_str()
-                .unwrap(),
-        )
-        .unwrap();
+        let reopened =
+            HippocampusService::open(dir.path().join("test-hippocampus.redb").to_str().unwrap())
+                .unwrap();
         let producer =
             EpisodeProducer::new(reopened, &[(1, "Thomas".to_string())], &event_store).unwrap();
         let (rebuilt, rebuilt_evidence) = producer
@@ -2559,8 +2800,7 @@ mod tests {
         let (hippocampus, dir) = temp_hippocampus();
         let event_store = temp_event_store(&dir);
         let producer =
-            EpisodeProducer::new(hippocampus, &[(1, "Thomas".to_string())], &event_store)
-                .unwrap();
+            EpisodeProducer::new(hippocampus, &[(1, "Thomas".to_string())], &event_store).unwrap();
         append_payload(
             &event_store,
             &DomainEventPayload::BioActionPerformed {
@@ -3009,15 +3249,111 @@ mod tests {
             agent_id: AgentId(5),
             action: "eat".to_string(),
         };
-        assert!(producer
-            .event_to_episode(&payload, 18, 0.0)
-            .is_none());
+        assert!(producer.event_to_episode(&payload, 18, 0.0).is_none());
 
         // Nach Registrierung: Agent bekannt
         producer.register_agent(5, "Kevin".to_string()).unwrap();
         let result = producer.event_to_episode(&payload, 18, 0.0);
         assert!(result.is_some());
         assert_eq!(result.unwrap().0, "Kevin");
+    }
+
+    #[test]
+    fn episode_projection_staged_agent_bindings_register_restart_idempotently() {
+        let (hippocampus, dir) = temp_hippocampus();
+        let event_store = temp_event_store(&dir);
+        let existing = vec![(1, "Thomas".to_string())];
+        let mut producer = EpisodeProducer::new(hippocampus, &existing, &event_store).unwrap();
+        let staged = vec![(1, "Thomas".to_string()), (2, "Kevin".to_string())];
+
+        producer.validate_agent_bindings(&staged).unwrap();
+        assert!(producer
+            .hippocampus()
+            .store()
+            .load_episode_projection_frontier(EpisodeProjectionSubject::Agent {
+                agent_id: AgentId(2),
+            })
+            .unwrap()
+            .is_none());
+        producer.register_agents(&staged).unwrap();
+        assert!(producer
+            .episode_projection_readiness(AgentId(2))
+            .unwrap()
+            .is_ready());
+
+        drop(producer);
+        let hippocampus =
+            HippocampusService::open(dir.path().join("test-hippocampus.redb").to_str().unwrap())
+                .unwrap();
+        let restarted = EpisodeProducer::new(hippocampus, &staged, &event_store).unwrap();
+        restarted.validate_agent_bindings(&staged).unwrap();
+        assert!(restarted
+            .episode_projection_readiness(AgentId(2))
+            .unwrap()
+            .is_ready());
+    }
+
+    #[test]
+    fn episode_projection_staged_agent_binding_rejects_rename_and_alias_without_writes() {
+        let (hippocampus, dir) = temp_hippocampus();
+        let event_store = temp_event_store(&dir);
+        let existing = vec![(1, "Thomas".to_string()), (2, "Kevin".to_string())];
+        let producer = EpisodeProducer::new(hippocampus, &existing, &event_store).unwrap();
+        let before_one = producer
+            .hippocampus()
+            .store()
+            .load_episode_projection_frontier(EpisodeProjectionSubject::Agent {
+                agent_id: AgentId(1),
+            })
+            .unwrap()
+            .unwrap();
+        let before_two = producer
+            .hippocampus()
+            .store()
+            .load_episode_projection_frontier(EpisodeProjectionSubject::Agent {
+                agent_id: AgentId(2),
+            })
+            .unwrap()
+            .unwrap();
+
+        let rename = producer
+            .validate_agent_bindings(&[(1, "Renamed".to_string()), (2, "Kevin".to_string())])
+            .unwrap_err();
+        assert!(format!("{rename:#}").contains("bucket name is immutable"));
+        let alias = producer
+            .validate_agent_bindings(&[(1, "Thomas".to_string()), (3, "Kevin".to_string())])
+            .unwrap_err();
+        assert!(format!("{alias:#}").contains("already bound"));
+        assert_eq!(
+            producer
+                .hippocampus()
+                .store()
+                .load_episode_projection_frontier(EpisodeProjectionSubject::Agent {
+                    agent_id: AgentId(1),
+                })
+                .unwrap()
+                .unwrap(),
+            before_one
+        );
+        assert_eq!(
+            producer
+                .hippocampus()
+                .store()
+                .load_episode_projection_frontier(EpisodeProjectionSubject::Agent {
+                    agent_id: AgentId(2),
+                })
+                .unwrap()
+                .unwrap(),
+            before_two
+        );
+        assert!(producer
+            .hippocampus()
+            .store()
+            .load_episode_projection_frontier(EpisodeProjectionSubject::Agent {
+                agent_id: AgentId(3),
+            })
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -3112,13 +3448,9 @@ mod tests {
             .to_string()
             .contains("Beginning episode projection requires an empty legacy episode store"));
         assert_eq!(event_store.get_offset(OFFSET_NAME).unwrap(), Some(old_row));
-        let reopened = HippocampusService::open(
-            dir.path()
-                .join("test-hippocampus.redb")
-                .to_str()
-                .unwrap(),
-        )
-        .unwrap();
+        let reopened =
+            HippocampusService::open(dir.path().join("test-hippocampus.redb").to_str().unwrap())
+                .unwrap();
         let episodes = reopened.store().load_episodes("Thomas").unwrap();
         assert_eq!(episodes.len(), 1);
         assert_eq!(episodes[0].id, 77);
@@ -3237,7 +3569,7 @@ mod tests {
                 .load_episode_projection_control()
                 .unwrap()
                 .unwrap()
-            .start_policy,
+                .start_policy,
             EpisodeProjectionStartPolicy::RecoveryCut {
                 source_row_id: old_row,
                 proof_digest: authorization_digest.clone(),
@@ -3289,13 +3621,11 @@ mod tests {
                 },
                 5,
             );
-            event_store.update_offset(OFFSET_NAME, source_row_id).unwrap();
-            let mut authorization = cutover_authorization(
-                &hippocampus,
-                &event_store,
-                source_row_id,
-                &"s".repeat(32),
-            );
+            event_store
+                .update_offset(OFFSET_NAME, source_row_id)
+                .unwrap();
+            let mut authorization =
+                cutover_authorization(&hippocampus, &event_store, source_row_id, &"s".repeat(32));
             match mutation {
                 "legacy" => authorization.legacy_state_digest = "00".repeat(32),
                 "source" => authorization.source_cut_digest = "11".repeat(32),
@@ -3312,12 +3642,12 @@ mod tests {
             .err()
             .unwrap();
             assert!(error.to_string().contains("cutover"));
-            assert_eq!(event_store.get_offset(OFFSET_NAME).unwrap(), Some(source_row_id));
+            assert_eq!(
+                event_store.get_offset(OFFSET_NAME).unwrap(),
+                Some(source_row_id)
+            );
             let reopened = HippocampusService::open(
-                dir.path()
-                    .join("test-hippocampus.redb")
-                    .to_str()
-                    .unwrap(),
+                dir.path().join("test-hippocampus.redb").to_str().unwrap(),
             )
             .unwrap();
             assert!(reopened
@@ -3374,14 +3704,13 @@ mod tests {
         assert!(!producer.admission_snapshot().allows_agent(AgentId(2)));
         producer.register_agent(2, "Lisa".to_string()).unwrap();
 
-        let request_for = |quarantine: &EpisodeProjectionQuarantine| {
-            EpisodeProjectionResolveRequest {
+        let request_for =
+            |quarantine: &EpisodeProjectionQuarantine| EpisodeProjectionResolveRequest {
                 source_row_id: quarantine.source_row_id,
                 source_event_id: quarantine.source_event_id.clone(),
                 request_digest: quarantine.request_digest.clone(),
                 quarantine_digest: quarantine_record_digest(quarantine),
-            }
-        };
+            };
         let error = producer
             .resolve_quarantine(&event_store, 20, 1.0, &request_for(&quarantines[1]))
             .unwrap_err();

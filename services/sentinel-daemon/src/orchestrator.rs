@@ -2757,8 +2757,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- LLM Bridge starten (Perception → Cortex Gateway → Action) --
     #[cfg(feature = "llm")]
     let _llm_bridge_handle = {
-        let (guarded_perception_tx, guarded_perception_rx) =
-            mpsc::sync_channel::<Perception>(128);
+        let (guarded_perception_tx, guarded_perception_rx) = mpsc::sync_channel::<Perception>(128);
         let perception_admission = Arc::clone(&episode_projection_admission);
         tokio::task::spawn_blocking(move || {
             while let Ok(perception) = perception_rx.recv() {
@@ -6335,6 +6334,51 @@ fn config_apply_digest(
     crate::config_persist::config_apply_digest(agents, building)
 }
 
+fn config_apply_episode_agents(agents: &[AgentConfig]) -> Vec<(u16, String)> {
+    agents
+        .iter()
+        .map(|agent| (agent.identity.id, agent.identity.name.clone()))
+        .collect()
+}
+
+fn validate_config_apply_episode_bindings(
+    episode_producer: &EpisodeProducer,
+    agents: &[AgentConfig],
+) -> Result<()> {
+    episode_producer
+        .validate_agent_bindings(&config_apply_episode_agents(agents))
+        .context("validate immutable episode projection bindings")
+}
+
+fn register_config_apply_episode_agents(
+    episode_producer: &mut EpisodeProducer,
+    agents: &[AgentConfig],
+) -> Result<()> {
+    episode_producer
+        .register_agents(&config_apply_episode_agents(agents))
+        .context("register committed episode projection roster")
+}
+
+fn mark_config_apply_episode_registration_recovery_required(
+    event_store: &EventStore,
+    op_id: &str,
+    registration_error: &anyhow::Error,
+) -> Result<()> {
+    let marker = event_store
+        .runtime_config_apply_recovery()?
+        .ok_or_else(|| anyhow!("committed config apply marker is missing"))?;
+    anyhow::ensure!(
+        marker.op_id == op_id
+            && marker.decision == sentinel_limbo::RuntimeConfigApplyDecision::Forward
+            && marker.phase != sentinel_limbo::RuntimeConfigApplyPhase::Finalized,
+        "episode projection registration requires the matching committed Forward decision"
+    );
+    event_store.mark_runtime_config_apply_recovery_required(
+        op_id,
+        &format!("committed episode projection registration failed: {registration_error:#}"),
+    )
+}
+
 fn update_runtime_orchestrator_config(
     runtime_orch: &mut RuntimeOrchestrator,
     cfg: &AgentConfig,
@@ -9322,10 +9366,8 @@ fn ecs_tick_loop(
                         if runtime_orch.get_agent_mut(agent_id).is_some() {
                             continue;
                         }
-                        if !episode_projection_allows_agent(
-                            &episode_projection_admission,
-                            agent_id,
-                        ) {
+                        if !episode_projection_allows_agent(&episode_projection_admission, agent_id)
+                        {
                             warn!(agent_id = %agent_id, "Agent spawn blocked by episode projection readiness");
                             continue;
                         }
@@ -9540,10 +9582,7 @@ fn ecs_tick_loop(
                     continue;
                 }
                 let agent_id = AgentId(agent_cfg.identity.id);
-                if !episode_projection_allows_agent(
-                    &episode_projection_admission,
-                    agent_id,
-                ) {
+                if !episode_projection_allows_agent(&episode_projection_admission, agent_id) {
                     agents_failed_total += 1;
                     warn!(agent_id = %agent_id, "Operator nightrun blocked by episode projection readiness");
                     continue;
@@ -10014,6 +10053,15 @@ fn ecs_tick_loop(
                 warn!(
                     error_count = errors.len(),
                     "Config-Apply im Tick-Loop abgelehnt (Re-Validierung) — keine Mutation"
+                );
+                continue;
+            }
+            if let Err(error) =
+                validate_config_apply_episode_bindings(&episode_producer, &apply_cmd.agents)
+            {
+                error!(
+                    error = %error,
+                    "Config-Apply fail-closed: immutable episode projection binding conflict"
                 );
                 continue;
             }
@@ -10600,6 +10648,45 @@ fn ecs_tick_loop(
                 continue;
             }
 
+            if let Err(registration_error) =
+                register_config_apply_episode_agents(&mut episode_producer, &apply_cmd.agents)
+            {
+                let marker = mark_config_apply_episode_registration_recovery_required(
+                    &es,
+                    &op_id,
+                    &registration_error,
+                );
+                if let Err(marker_error) = &marker {
+                    error!(
+                        error = %marker_error,
+                        "Config-Apply RecoveryRequired phase write failed after episode projection registration failure"
+                    );
+                }
+                fence_config_apply_recovery(
+                    &recovery_old_agents,
+                    &apply_cmd.agents,
+                    ConfigApplyRecoveryFenceContext {
+                        world: &mut world,
+                        runtime_orch: &mut runtime_orch,
+                        sandbox: &sandbox,
+                        sandbox_handles: &mut sandbox_handles,
+                        ebpf_collector: &mut ebpf_collector,
+                        agent_processes: &mut agent_processes,
+                        nano_runtimes: &mut nano_runtimes,
+                        security_runtime_state: &security_runtime_state,
+                        projection_db_path: &projection_db_path,
+                        restore_fence: &mut restore_fence,
+                        owner_registry,
+                    },
+                );
+                error!(
+                    error = %registration_error,
+                    marker = ?marker,
+                    "Config-Apply committed but episode projection registration remains recovery-required"
+                );
+                continue;
+            }
+
             sentinel_ecs::rebuild_room_maps(&mut world, &apply_cmd.building);
             all_agents = apply_cmd.agents.clone();
             #[cfg(feature = "llm")]
@@ -10802,21 +10889,19 @@ fn ecs_tick_loop(
                     request,
                     response_tx,
                 } => {
-                    let result = if unfenced_world_background_work_allowed(
-                        owner_registry,
-                        &restore_fence,
-                    ) {
-                        episode_producer
-                            .resolve_quarantine(
-                                &event_store_for_episodes,
-                                tick_count,
-                                tick_rate.as_secs_f64(),
-                                &request,
-                            )
-                            .map_err(|error| error.to_string())
-                    } else {
-                        Err("episode projection resolution is fenced".to_string())
-                    };
+                    let result =
+                        if unfenced_world_background_work_allowed(owner_registry, &restore_fence) {
+                            episode_producer
+                                .resolve_quarantine(
+                                    &event_store_for_episodes,
+                                    tick_count,
+                                    tick_rate.as_secs_f64(),
+                                    &request,
+                                )
+                                .map_err(|error| error.to_string())
+                        } else {
+                            Err("episode projection resolution is fenced".to_string())
+                        };
                     let _ = response_tx.send(result);
                     publish_episode_projection_health(
                         &runtime_health,
@@ -10827,16 +10912,14 @@ fn ecs_tick_loop(
                     request,
                     response_tx,
                 } => {
-                    let result = if unfenced_world_background_work_allowed(
-                        owner_registry,
-                        &restore_fence,
-                    ) {
-                        episode_producer
-                            .handle_generation_request(&event_store_for_episodes, &request)
-                            .map_err(|error| error.to_string())
-                    } else {
-                        Err("episode projection generation mutation is fenced".to_string())
-                    };
+                    let result =
+                        if unfenced_world_background_work_allowed(owner_registry, &restore_fence) {
+                            episode_producer
+                                .handle_generation_request(&event_store_for_episodes, &request)
+                                .map_err(|error| error.to_string())
+                        } else {
+                            Err("episode projection generation mutation is fenced".to_string())
+                        };
                     let _ = response_tx.send(result);
                     publish_episode_projection_health(
                         &runtime_health,
@@ -11076,10 +11159,9 @@ mod tests {
         let secret = "episode-projection-cutover-secret-0001";
         let agents = vec![(1_u16, "Thomas".to_string())];
 
-        let service = sentinel_hippocampus::HippocampusService::open(
-            hippocampus_path.to_str().unwrap(),
-        )
-        .unwrap();
+        let service =
+            sentinel_hippocampus::HippocampusService::open(hippocampus_path.to_str().unwrap())
+                .unwrap();
         service
             .record_episode(sentinel_hippocampus::Episode {
                 id: 77,
@@ -11125,13 +11207,12 @@ mod tests {
                 Some(secret),
                 1000,
             )
-                .unwrap(),
+            .unwrap(),
         );
 
-        let restart_without_one_time_material = sentinel_hippocampus::HippocampusService::open(
-            hippocampus_path.to_str().unwrap(),
-        )
-        .unwrap();
+        let restart_without_one_time_material =
+            sentinel_hippocampus::HippocampusService::open(hippocampus_path.to_str().unwrap())
+                .unwrap();
         drop(
             open_episode_producer(
                 restart_without_one_time_material,
@@ -11144,10 +11225,9 @@ mod tests {
             .unwrap(),
         );
 
-        let restart_with_non_secret_seal = sentinel_hippocampus::HippocampusService::open(
-            hippocampus_path.to_str().unwrap(),
-        )
-        .unwrap();
+        let restart_with_non_secret_seal =
+            sentinel_hippocampus::HippocampusService::open(hippocampus_path.to_str().unwrap())
+                .unwrap();
         drop(
             open_episode_producer(
                 restart_with_non_secret_seal,
@@ -11162,10 +11242,9 @@ mod tests {
 
         let mut stale = cutover.clone();
         stale.source_cut_digest = "ff".repeat(32);
-        let stale_restart = sentinel_hippocampus::HippocampusService::open(
-            hippocampus_path.to_str().unwrap(),
-        )
-        .unwrap();
+        let stale_restart =
+            sentinel_hippocampus::HippocampusService::open(hippocampus_path.to_str().unwrap())
+                .unwrap();
         let error = open_episode_producer(
             stale_restart,
             &agents,
@@ -11176,7 +11255,9 @@ mod tests {
         )
         .err()
         .expect("stale cutover config must fail closed");
-        assert!(error.to_string().contains("persisted cutover seal mismatch"));
+        assert!(error
+            .to_string()
+            .contains("persisted cutover seal mismatch"));
     }
 
     #[test]
@@ -11220,7 +11301,10 @@ mod tests {
         publish_episode_projection_health(&health, &admission);
 
         let health_snapshot = health.read().unwrap();
-        let worker = health_snapshot.worker_states.get("episode_projection").unwrap();
+        let worker = health_snapshot
+            .worker_states
+            .get("episode_projection")
+            .unwrap();
         assert!(worker.running);
         assert!(worker
             .last_error
@@ -12007,10 +12091,23 @@ mod tests {
 
     /// Erstellt EpisodeProducer fuer Tests (tempfile-basiert).
     fn test_episode_producer(tmp: &tempfile::TempDir, event_store: &EventStore) -> EpisodeProducer {
+        test_episode_producer_for_agents(tmp, event_store, &[])
+    }
+
+    fn test_episode_producer_for_agents(
+        tmp: &tempfile::TempDir,
+        event_store: &EventStore,
+        agents: &[AgentConfig],
+    ) -> EpisodeProducer {
         let path = tmp.path().join("test-hippocampus.redb");
         let hippocampus =
             sentinel_hippocampus::HippocampusService::open(path.to_str().unwrap()).unwrap();
-        EpisodeProducer::new(hippocampus, &[], event_store).unwrap()
+        EpisodeProducer::new(
+            hippocampus,
+            &config_apply_episode_agents(agents),
+            event_store,
+        )
+        .unwrap()
     }
 
     fn test_agent_config(id: u16, name: &str, role: &str, shift_set: u8) -> AgentConfig {
@@ -12984,6 +13081,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
+        let episode_producer = test_episode_producer_for_agents(temp_root, &event_store, &agents);
         ecs_tick_loop(
             Arc::clone(&state_store),
             Arc::clone(&event_store),
@@ -13009,7 +13107,7 @@ mod tests {
             test_sandbox(),
             ebpf_collector,
             ebpf_tx,
-            test_episode_producer(temp_root, &event_store),
+            episode_producer,
             mpsc::channel::<EpisodeProjectionOperatorCommand>().1,
             mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
             None,
@@ -16788,6 +16886,182 @@ mod tests {
         assert_eq!(
             identity,
             ("Projection Updated".to_string(), "Lead".to_string())
+        );
+    }
+
+    #[test]
+    fn config_apply_episode_binding_preflight_rejects_before_safety_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store = EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap();
+        let old = test_ecs_agent_config(48, "Immutable Name", "Operations", 1);
+        let mut staged = old.clone();
+        staged.identity.name = "Renamed Agent".to_string();
+        let producer =
+            test_episode_producer_for_agents(&tmp, &event_store, std::slice::from_ref(&old));
+        let before = producer
+            .hippocampus()
+            .store()
+            .load_episode_projection_frontier(
+                sentinel_hippocampus::EpisodeProjectionSubject::Agent {
+                    agent_id: AgentId(48),
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let error =
+            validate_config_apply_episode_bindings(&producer, std::slice::from_ref(&staged))
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("bucket name is immutable"));
+        assert!(event_store.get_all_events().unwrap().is_empty());
+        assert!(event_store.list_world_snapshots().unwrap().is_empty());
+        assert!(!tmp.path().join("config").exists());
+        assert_eq!(
+            producer
+                .hippocampus()
+                .store()
+                .load_episode_projection_frontier(
+                    sentinel_hippocampus::EpisodeProjectionSubject::Agent {
+                        agent_id: AgentId(48),
+                    },
+                )
+                .unwrap()
+                .unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn config_apply_episode_registration_adds_frontier_and_is_restart_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store = EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap();
+        let old = test_ecs_agent_config(49, "Existing Agent", "Operations", 1);
+        let added = test_ecs_agent_config(50, "Added Agent", "Operations", 1);
+        let staged = vec![old.clone(), added.clone()];
+        let mut producer =
+            test_episode_producer_for_agents(&tmp, &event_store, std::slice::from_ref(&old));
+
+        validate_config_apply_episode_bindings(&producer, &staged).unwrap();
+        assert!(producer
+            .hippocampus()
+            .store()
+            .load_episode_projection_frontier(
+                sentinel_hippocampus::EpisodeProjectionSubject::Agent {
+                    agent_id: AgentId(50),
+                },
+            )
+            .unwrap()
+            .is_none());
+        register_config_apply_episode_agents(&mut producer, &staged).unwrap();
+        assert!(producer
+            .episode_projection_readiness(AgentId(50))
+            .unwrap()
+            .is_ready());
+        drop(producer);
+
+        let mut restarted = test_episode_producer_for_agents(&tmp, &event_store, &staged);
+        register_config_apply_episode_agents(&mut restarted, &staged).unwrap();
+        assert!(restarted
+            .episode_projection_readiness(AgentId(50))
+            .unwrap()
+            .is_ready());
+    }
+
+    #[test]
+    fn config_apply_episode_registration_failure_stays_recovery_required_after_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store = EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap();
+        let old = test_ecs_agent_config(51, "Existing Agent", "Operations", 1);
+        let added = test_ecs_agent_config(52, "Contended Name", "Operations", 1);
+        let staged = vec![old.clone(), added.clone()];
+        let mut producer =
+            test_episode_producer_for_agents(&tmp, &event_store, std::slice::from_ref(&old));
+        validate_config_apply_episode_bindings(&producer, &staged).unwrap();
+
+        producer
+            .register_agent(53, "Contended Name".to_string())
+            .unwrap();
+        let building = test_config_apply_building("Episode Registration");
+        let old_digest = config_apply_digest(std::slice::from_ref(&old), &building).unwrap();
+        let staged_digest = config_apply_digest(&staged, &building).unwrap();
+        let op_id = "config-apply-episode-registration";
+        event_store
+            .begin_runtime_config_apply_recovery(RuntimeConfigApplyRecoveryStart {
+                op_id,
+                old_digest: &old_digest,
+                staged_digest: &staged_digest,
+                old_agents: std::slice::from_ref(&old),
+                staged_agents: &staged,
+                old_building: &building,
+                staged_building: &building,
+                pre_snapshot_id: "episode-registration-pre",
+                pre_snapshot_digest: &"1".repeat(64),
+                pre_runtime_snapshots: &[],
+                started_tick: 10,
+            })
+            .unwrap();
+        event_store
+            .mark_runtime_config_apply_runtimes_applied(
+                op_id,
+                "episode-registration-applied",
+                &"2".repeat(64),
+                &[],
+            )
+            .unwrap();
+        let event = DomainEvent::new(
+            "config_applied",
+            "company",
+            r#"{"agent_count":2}"#,
+            op_id,
+            11,
+        )
+        .with_operation_id(op_id);
+        event_store
+            .commit_runtime_config_apply(op_id, &event, "sentinel.events")
+            .unwrap();
+
+        let registration_error =
+            register_config_apply_episode_agents(&mut producer, &staged).unwrap_err();
+        assert!(format!("{registration_error:#}").contains("already bound"));
+        mark_config_apply_episode_registration_recovery_required(
+            &event_store,
+            op_id,
+            &registration_error,
+        )
+        .unwrap();
+        let marker = event_store
+            .runtime_config_apply_recovery()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            marker.phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::RecoveryRequired
+        );
+        assert_eq!(
+            marker.decision,
+            sentinel_limbo::RuntimeConfigApplyDecision::Forward
+        );
+        drop(producer);
+
+        let hippocampus = sentinel_hippocampus::HippocampusService::open(
+            tmp.path().join("test-hippocampus.redb").to_str().unwrap(),
+        )
+        .unwrap();
+        let restart_error = EpisodeProducer::new(
+            hippocampus,
+            &config_apply_episode_agents(&staged),
+            &event_store,
+        )
+        .err()
+        .expect("restart must remain fail-closed over the durable name conflict");
+        assert!(format!("{restart_error:#}").contains("already bound"));
+        assert_eq!(
+            event_store
+                .runtime_config_apply_recovery()
+                .unwrap()
+                .unwrap()
+                .phase,
+            sentinel_limbo::RuntimeConfigApplyPhase::RecoveryRequired
         );
     }
 
