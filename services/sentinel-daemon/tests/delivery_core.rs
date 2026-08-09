@@ -2459,7 +2459,7 @@ fn failed_qa_records_durable_non_promotable_gate() {
         aggregate.candidates[&candidate.candidate_id].state,
         CandidateState::GateFailed
     );
-    assert_eq!(aggregate.gates["gate-fail"].passed, false);
+    assert!(!aggregate.gates["gate-fail"].passed);
     assert_eq!(aggregate.qa_runs["run-1"].state, QaRunState::CompletedFail);
 }
 
@@ -3890,6 +3890,11 @@ fn evidence_graph_rejects_all_model_authority_until_issue_749() {
     optional_result.required = false;
     optional_result.slices = optional_case.slices;
     optional_result.assertion_refs.clear();
+    optional_result.attempt_history[0].attempt_id = "attempt-visual-1".to_string();
+    optional_result.attempt_history[0].case_ref = optional_result.case_ref.clone();
+    optional_result.attempt_history[0].assertion_refs.clear();
+    optional_result.attempt_history[0].attempt_digest = ContentDigest::zero();
+    optional_result.attempt_history[0] = optional_result.attempt_history[0].clone().seal().unwrap();
     optional_without_assertion
         .case_results
         .push(optional_result);
