@@ -31,6 +31,10 @@ use sentinel_common::{
 };
 
 use crate::config::OperatorApiConfig;
+use crate::episode_producer::{
+    EpisodeProjectionGenerationRequest, EpisodeProjectionOperatorCommand,
+    EpisodeProjectionResolveRequest, SharedEpisodeProjectionAdmissionState,
+};
 use crate::platform_controlplane::{
     PlatformAnalysisCommand, PlatformControlCommand, PlatformStateSnapshot,
     PlatformTriggerTestCommand,
@@ -67,6 +71,9 @@ const OPERATOR_PLATFORM_TRIGGER_TEST_PATH: &str = "/operator/platform-trigger-te
 const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-test";
 const OPERATOR_PLATFORM_STATE_PATH: &str = "/operator/platform-state";
 const OPERATOR_RUNTIME_HEALTH_PATH: &str = "/operator/runtime-health";
+const OPERATOR_EPISODE_PROJECTION_PATH: &str = "/operator/episode-projection";
+const OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH: &str = "/operator/episode-projection/resolve";
+const OPERATOR_EPISODE_PROJECTION_GENERATION_PATH: &str = "/operator/episode-projection/generation";
 const OPERATOR_RUNTIME_RECONCILE_PATH: &str = "/operator/runtime/reconcile";
 const OPERATOR_RUNTIME_ANALYSIS_FLOOD_TEST_PATH: &str = "/operator/runtime/analysis-flood-test";
 const OPERATOR_RUNTIME_PANIC_TEST_PATH: &str = "/operator/runtime/panic-test";
@@ -189,6 +196,12 @@ pub struct SecurityAgentRuntimeSnapshot {
     pub agent_id: u16,
     pub aggregate_id: String,
     pub agent_name: String,
+    #[serde(default)]
+    pub runtime_key: String,
+    #[serde(default)]
+    pub instance_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub runtime_pid: Option<u32>,
     pub bwrap_pid: Option<u32>,
     pub home_host_path: String,
     #[serde(default)]
@@ -462,6 +475,9 @@ struct ResolveLlmCompletionResponse {
 
 #[derive(Clone)]
 struct AppState {
+    owner_registry: &'static sentinel_common::OwnerRegistry,
+    #[cfg(test)]
+    before_direct_world_effect: Option<Arc<dyn Fn() + Send + Sync>>,
     allowed_rooms: Arc<HashSet<String>>,
     shared_secret: Option<String>,
     data_dir: PathBuf,
@@ -484,6 +500,8 @@ struct AppState {
     state_store: Arc<StateStore>,
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
+    episode_projection_admission: SharedEpisodeProjectionAdmissionState,
+    episode_projection_tx: mpsc::Sender<EpisodeProjectionOperatorCommand>,
     security_runtime_state: SharedSecurityRuntimeState,
     cluster_control: Option<Arc<crate::cluster_control::ClusterControl>>,
     /// The durable cluster-meta store (ADR-3) — the chef's authority for `OwnerCommit`
@@ -636,6 +654,7 @@ enum ApiError {
     NotFound(&'static str),
     /// #428: ungueltiger Zustandsuebergang (z.B. Pause auf bereits pausierten Agent).
     Conflict(&'static str),
+    UnprocessableEntity(&'static str),
     MethodNotAllowed,
     PayloadTooLarge,
     ServiceUnavailable(&'static str),
@@ -665,6 +684,7 @@ impl ApiError {
             ),
             Self::NotFound(msg) => json_response(404, ErrorResponse { error: msg }),
             Self::Conflict(msg) => json_response(409, ErrorResponse { error: msg }),
+            Self::UnprocessableEntity(msg) => json_response(422, ErrorResponse { error: msg }),
             Self::MethodNotAllowed => json_response(
                 405,
                 ErrorResponse {
@@ -706,6 +726,8 @@ pub async fn start_server(
     state_store: Arc<sentinel_redb::StateStore>,
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
+    episode_projection_admission: SharedEpisodeProjectionAdmissionState,
+    episode_projection_tx: mpsc::Sender<EpisodeProjectionOperatorCommand>,
     security_runtime_state: SharedSecurityRuntimeState,
     cluster_control: Option<Arc<crate::cluster_control::ClusterControl>>,
     cluster_meta: Option<Arc<sentinel_redb::ClusterMetaStore>>,
@@ -717,6 +739,9 @@ pub async fn start_server(
         .with_context(|| format!("Operator-API bind fehlgeschlagen: {}", config.bind_addr))?;
     let room_count = allowed_rooms.len();
     let state = AppState {
+        owner_registry: sentinel_common::OwnerRegistry::global(),
+        #[cfg(test)]
+        before_direct_world_effect: None,
         allowed_rooms: Arc::new(allowed_rooms.into_iter().collect()),
         shared_secret: config.shared_secret,
         data_dir,
@@ -739,6 +764,8 @@ pub async fn start_server(
         state_store,
         platform_state,
         runtime_health,
+        episode_projection_admission,
+        episode_projection_tx,
         security_runtime_state,
         cluster_control,
         cluster_meta,
@@ -786,9 +813,12 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
 
     // GET-Endpoints ohne Auth (read-only)
     if request.method == "GET" {
-        if is_protected_read_path(path_only)
-            && !is_authorized(&request.headers, state.shared_secret.as_deref())
-        {
+        let authorized = if path_only == OPERATOR_EPISODE_PROJECTION_PATH {
+            episode_projection_is_authorized(&request.headers, state.shared_secret.as_deref())
+        } else {
+            is_authorized(&request.headers, state.shared_secret.as_deref())
+        };
+        if is_protected_read_path(path_only) && !authorized {
             return ApiError::Unauthorized.to_response();
         }
         return match path_only {
@@ -825,6 +855,13 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Ok(snapshot) => json_response(200, snapshot.clone()),
                 Err(_) => {
                     ApiError::ServiceUnavailable("Runtime-Health nicht verfuegbar").to_response()
+                }
+            },
+            OPERATOR_EPISODE_PROJECTION_PATH => match state.episode_projection_admission.read() {
+                Ok(snapshot) => json_response(200, snapshot.clone()),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Episode projection diagnostics unavailable")
+                        .to_response()
                 }
             },
             OPERATOR_SECURITY_FS_TRASH_PATH => match inspect_fs_trash(query.get("hash"), state) {
@@ -875,11 +912,108 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
     if request.method != "POST" {
         return ApiError::MethodNotAllowed.to_response();
     }
-    if !is_authorized(&request.headers, state.shared_secret.as_deref()) {
+    let authorized = if matches!(
+        path_only,
+        OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH | OPERATOR_EPISODE_PROJECTION_GENERATION_PATH
+    ) {
+        episode_projection_is_authorized(&request.headers, state.shared_secret.as_deref())
+    } else {
+        is_authorized(&request.headers, state.shared_secret.as_deref())
+    };
+    if !authorized {
         return ApiError::Unauthorized.to_response();
+    }
+    let read_only_diagnostic_post = matches!(
+        path_only,
+        OPERATOR_OWNER_CHECK_PATH | OPERATOR_CONTROL_QUERY_PATH
+    );
+    if !read_only_diagnostic_post
+        && state
+            .owner_registry
+            .issue(sentinel_common::StateTransferScope::World)
+            .is_err()
+    {
+        return ApiError::ServiceUnavailable(
+            "World mutation authority is unavailable on this node",
+        )
+        .to_response();
     }
 
     match path_only {
+        OPERATOR_EPISODE_PROJECTION_GENERATION_PATH => {
+            let request: EpisodeProjectionGenerationRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        return ApiError::BadRequest(
+                            "Invalid episode projection generation request",
+                        )
+                        .to_response();
+                    }
+                };
+            let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+            if state
+                .episode_projection_tx
+                .send(EpisodeProjectionOperatorCommand::Generation {
+                    request,
+                    response_tx,
+                })
+                .is_err()
+            {
+                return ApiError::ServiceUnavailable(
+                    "Episode projection operator channel unavailable",
+                )
+                .to_response();
+            }
+            match response_rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(Ok(response)) => json_response(200, response),
+                Ok(Err(error)) => {
+                    warn!(%error, "Episode projection generation mutation rejected");
+                    ApiError::Conflict("Episode projection generation mutation rejected")
+                        .to_response()
+                }
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Episode projection generation mutation timeout")
+                        .to_response()
+                }
+            }
+        }
+        OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH => {
+            let request: EpisodeProjectionResolveRequest = match serde_json::from_slice(
+                &request.body,
+            ) {
+                Ok(request) => request,
+                Err(_) => {
+                    return ApiError::BadRequest(
+                            "Invalid request JSON (expected source_row_id, source_event_id, request_digest, quarantine_digest)",
+                        )
+                        .to_response();
+                }
+            };
+            let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+            if state
+                .episode_projection_tx
+                .send(EpisodeProjectionOperatorCommand::Resolve {
+                    request,
+                    response_tx,
+                })
+                .is_err()
+            {
+                return ApiError::ServiceUnavailable(
+                    "Episode projection operator channel unavailable",
+                )
+                .to_response();
+            }
+            match response_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(response)) => json_response(200, response),
+                Ok(Err(error)) => {
+                    warn!(%error, "Episode projection resolution rejected");
+                    ApiError::Conflict("Episode projection resolution rejected").to_response()
+                }
+                Err(_) => ApiError::ServiceUnavailable("Episode projection resolution timeout")
+                    .to_response(),
+            }
+        }
         OPERATOR_LLM_COMPLETION_RESOLVE_PATH => {
             let payload: ResolveLlmCompletionRequest = match serde_json::from_slice(&request.body) {
                 Ok(payload) => payload,
@@ -1276,7 +1410,7 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                         .to_response()
                 }
             };
-            let reg = sentinel_common::OwnerRegistry::global();
+            let reg = state.owner_registry;
             let this = reg.this_node();
             let term = match reg.current_owner(&scope) {
                 Ok(term) => term,
@@ -2074,8 +2208,9 @@ enum AgentLifecycleAction {
     Despawn,
 }
 
-/// #428: schickt einen per-Agent Lifecycle-Befehl in den Tick-Loop und mappt das `outcome`
-/// auf den HTTP-Status (ok->200, invalid_transition->409, not_found->404). Kein Panic/500.
+/// #428: schickt einen per-Agent Lifecycle-Befehl in den Tick-Loop und mappt nur bestaetigte
+/// Erfolge auf 200. Ungueltige Transitionen, fehlende Agents sowie typisierte nicht
+/// unterstuetzte oder fehlgeschlagene Runtime-Aktionen bleiben fail-closed.
 fn dispatch_agent_lifecycle(
     action: AgentLifecycleAction,
     agent_id: u16,
@@ -2107,9 +2242,18 @@ fn dispatch_agent_lifecycle(
         .recv_timeout(std::time::Duration::from_secs(10))
         .map_err(|_| ApiError::ServiceUnavailable("Agent-Lifecycle Timeout"))?;
     match response.outcome.as_str() {
+        "ok" if response.accepted => Ok(response),
         "invalid_transition" => Err(ApiError::Conflict("Agent ist bereits im Zielzustand")),
         "not_found" => Err(ApiError::NotFound("agent_id nicht in der Runtime")),
-        _ => Ok(response),
+        "unsupported_runtime_action" => Err(ApiError::UnprocessableEntity(
+            "Ausgewaehlte Runtime unterstuetzt diese Lifecycle-Aktion nicht",
+        )),
+        "runtime_action_failed" | "stop_failed" => Err(ApiError::ServiceUnavailable(
+            "Runtime-Lifecycle-Aktion ist fehlgeschlagen",
+        )),
+        _ => Err(ApiError::ServiceUnavailable(
+            "Runtime-Lifecycle lieferte kein bestaetigtes Ergebnis",
+        )),
     }
 }
 
@@ -2136,23 +2280,73 @@ fn is_security_path(path: &str) -> bool {
 fn is_protected_read_path(path: &str) -> bool {
     path == OPERATOR_APICP_SNAPSHOT_PATH
         || path == OPERATOR_RUNTIME_HEALTH_PATH
+        || path == OPERATOR_EPISODE_PROJECTION_PATH
         || path == OPERATOR_STATE_HASH_PATH
         || is_security_path(path)
 }
 
+fn episode_projection_is_authorized(
+    headers: &HashMap<String, String>,
+    shared_secret: Option<&str>,
+) -> bool {
+    shared_secret.is_some() && is_authorized(headers, shared_secret)
+}
+
 fn open_fs_layer(state: &AppState) -> std::result::Result<Arc<LayerManager>, ApiError> {
-    if let Some(layer) = &state.fs_layer {
-        return Ok(Arc::clone(layer));
+    state
+        .fs_layer
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or(ApiError::ServiceUnavailable(
+            "sentinel-fs Layer nicht verfuegbar",
+        ))
+}
+
+/// Revalidates World authority at the exact synchronous side-effect boundary.
+///
+/// The tick barrier is intentionally scoped only to the supplied local effect.
+/// Channel waits, config materialization and handoff orchestration must never run
+/// inside this closure because they acquire or depend on the same barrier.
+fn with_direct_world_mutation<T>(
+    state: &AppState,
+    effect: impl FnOnce() -> std::result::Result<T, ApiError>,
+) -> std::result::Result<T, ApiError> {
+    #[cfg(test)]
+    if let Some(hook) = state.before_direct_world_effect.as_ref() {
+        hook();
     }
-    let cas = CasStore::open(&state.data_dir)
-        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs CAS nicht verfuegbar"))?;
-    let meta = MetadataStore::open(state.data_dir.join("metadata.redb"))
-        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Metadata nicht verfuegbar"))?;
-    let layer = Arc::new(LayerManager::new(cas, meta));
-    layer
-        .init_base_root()
-        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Base-Root nicht initialisierbar"))?;
-    Ok(layer)
+    let _tick_barrier = sentinel_common::owner_tick_barrier();
+    let guard = state
+        .owner_registry
+        .issue(sentinel_common::StateTransferScope::World)
+        .map_err(|_| {
+            ApiError::ServiceUnavailable("World mutation authority is unavailable on this node")
+        })?;
+    state.owner_registry.validate(&guard).map_err(|_| {
+        ApiError::ServiceUnavailable("World mutation authority is unavailable on this node")
+    })?;
+    effect()
+}
+
+fn open_fs_layer_for_mutation(
+    state: &AppState,
+) -> std::result::Result<Arc<LayerManager>, ApiError> {
+    with_direct_world_mutation(state, || {
+        let layer = if let Some(layer) = state.fs_layer.as_ref() {
+            Arc::clone(layer)
+        } else {
+            let cas = CasStore::open(&state.data_dir)
+                .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs CAS nicht verfuegbar"))?;
+            let meta = MetadataStore::open(state.data_dir.join("metadata.redb")).map_err(|_| {
+                ApiError::ServiceUnavailable("sentinel-fs Metadata nicht verfuegbar")
+            })?;
+            Arc::new(LayerManager::new(cas, meta))
+        };
+        layer.init_base_root().map_err(|_| {
+            ApiError::ServiceUnavailable("sentinel-fs Base-Root nicht initialisierbar")
+        })?;
+        Ok(layer)
+    })
 }
 
 fn now_ms() -> u64 {
@@ -2319,38 +2513,41 @@ fn create_fs_trash_fixture(
     }
     validate_relative_path(&payload.relative_path)?;
     let fs_agent_dir = fs_agent_dir_for_name(state, agent_name)?;
-    let layer = open_fs_layer(state)?;
+    let layer = open_fs_layer_for_mutation(state)?;
     let metadata = layer.meta();
-    let (parent_inode, file_name) =
-        fs_parent_and_name(&layer, &fs_agent_dir, &payload.relative_path)?;
-    if let Some(existing_inode) = layer
-        .lookup_dirent(&fs_agent_dir, parent_inode, &file_name)
-        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Dirent-Lookup fehlgeschlagen"))?
-    {
+    let (inode, inode_data) = with_direct_world_mutation(state, || {
+        let (parent_inode, file_name) =
+            fs_parent_and_name(&layer, &fs_agent_dir, &payload.relative_path)?;
+        if let Some(existing_inode) = layer
+            .lookup_dirent(&fs_agent_dir, parent_inode, &file_name)
+            .map_err(|_| ApiError::ServiceUnavailable("Fixture-Dirent-Lookup fehlgeschlagen"))?
+        {
+            layer
+                .unlink(&fs_agent_dir, parent_inode, &file_name, existing_inode)
+                .map_err(|_| {
+                    ApiError::ServiceUnavailable("Vorhandene Fixture-Datei nicht entfernbar")
+                })?;
+        }
+        let inode = layer
+            .write_file(
+                &fs_agent_dir,
+                parent_inode,
+                &file_name,
+                payload.content.as_bytes(),
+                0o644,
+            )
+            .map_err(|_| ApiError::ServiceUnavailable("Fixture-Write fehlgeschlagen"))?;
+        let inode_data = layer
+            .lookup_inode(&fs_agent_dir, inode)
+            .map_err(|_| ApiError::ServiceUnavailable("Fixture-Inode nicht lesbar"))?
+            .ok_or(ApiError::ServiceUnavailable(
+                "Fixture-Inode fehlt nach Write",
+            ))?;
         layer
-            .unlink(&fs_agent_dir, parent_inode, &file_name, existing_inode)
-            .map_err(|_| {
-                ApiError::ServiceUnavailable("Vorhandene Fixture-Datei nicht entfernbar")
-            })?;
-    }
-    let inode = layer
-        .write_file(
-            &fs_agent_dir,
-            parent_inode,
-            &file_name,
-            payload.content.as_bytes(),
-            0o644,
-        )
-        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Write fehlgeschlagen"))?;
-    let inode_data = layer
-        .lookup_inode(&fs_agent_dir, inode)
-        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Inode nicht lesbar"))?
-        .ok_or(ApiError::ServiceUnavailable(
-            "Fixture-Inode fehlt nach Write",
-        ))?;
-    layer
-        .unlink(&fs_agent_dir, parent_inode, &file_name, inode)
-        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Unlink fehlgeschlagen"))?;
+            .unlink(&fs_agent_dir, parent_inode, &file_name, inode)
+            .map_err(|_| ApiError::ServiceUnavailable("Fixture-Unlink fehlgeschlagen"))?;
+        Ok((inode, inode_data))
+    })?;
     let trashed_chunks = u64::from(
         metadata
             .get_trash_timestamp(&inode_data.hash)
@@ -2372,12 +2569,14 @@ fn set_fs_trash_age(
     state: &AppState,
 ) -> std::result::Result<FsTrashAgeResponse, ApiError> {
     let chunk_hash = decode_chunk_hash(&payload.chunk_hash)?;
-    let layer = open_fs_layer(state)?;
+    let layer = open_fs_layer_for_mutation(state)?;
     let trashed_at_ms = now_ms().saturating_sub(payload.hours_ago * 3600 * 1000);
-    let updated = layer
-        .meta()
-        .set_trash_timestamp(&chunk_hash, Some(trashed_at_ms))
-        .map_err(|_| ApiError::ServiceUnavailable("Trash-Queue nicht schreibbar"))?;
+    let updated = with_direct_world_mutation(state, || {
+        layer
+            .meta()
+            .set_trash_timestamp(&chunk_hash, Some(trashed_at_ms))
+            .map_err(|_| ApiError::ServiceUnavailable("Trash-Queue nicht schreibbar"))
+    })?;
     if !updated {
         return Err(ApiError::NotFound("chunk_hash nicht in fs_trash_queue"));
     }
@@ -2392,11 +2591,13 @@ fn run_fs_trash_gc(
     payload: FsTrashGcRequest,
     state: &AppState,
 ) -> std::result::Result<FsTrashGcResponse, ApiError> {
-    let layer = open_fs_layer(state)?;
-    let stats = layer
-        .meta()
-        .gc_trash(layer.cas(), payload.grace_period_hours)
-        .map_err(|_| ApiError::ServiceUnavailable("gc_trash fehlgeschlagen"))?;
+    let layer = open_fs_layer_for_mutation(state)?;
+    let stats = with_direct_world_mutation(state, || {
+        layer
+            .meta()
+            .gc_trash(layer.cas(), payload.grace_period_hours)
+            .map_err(|_| ApiError::ServiceUnavailable("gc_trash fehlgeschlagen"))
+    })?;
     Ok(FsTrashGcResponse {
         accepted: true,
         grace_period_hours: payload.grace_period_hours,
@@ -2474,9 +2675,6 @@ fn inspect_agent_fs_browse(
     };
     let aggregate_id = resolve_aggregate_id(state, agent_id);
     let layer = open_fs_layer(state)?;
-    layer.ensure_agent_root(&aggregate_id).map_err(|_| {
-        ApiError::ServiceUnavailable("sentinel-fs Agent-Root nicht initialisierbar")
-    })?;
 
     match layer
         .lookup_inode(&aggregate_id, inode)
@@ -2549,9 +2747,6 @@ fn inspect_agent_fs_read(
         .map_err(|_| ApiError::BadRequest("inode muss Integer sein"))?;
     let aggregate_id = resolve_aggregate_id(state, agent_id);
     let layer = open_fs_layer(state)?;
-    layer.ensure_agent_root(&aggregate_id).map_err(|_| {
-        ApiError::ServiceUnavailable("sentinel-fs Agent-Root nicht initialisierbar")
-    })?;
 
     let data = layer
         .lookup_inode(&aggregate_id, inode)
@@ -2612,8 +2807,10 @@ fn run_fs_dedup_benchmark(
         uuid::Uuid::now_v7()
     );
     let fs_agent_dir = fs_agent_dir_for_name(state, agent_name)?;
-    let layer = open_fs_layer(state)?;
-    let parent_inode = ensure_issue379_benchmark_dir(&layer, &fs_agent_dir)?;
+    let layer = open_fs_layer_for_mutation(state)?;
+    let parent_inode = with_direct_world_mutation(state, || {
+        ensure_issue379_benchmark_dir(&layer, &fs_agent_dir)
+    })?;
     let content = dedup_benchmark_content(payload.bytes_per_write, &file_prefix);
     let content_hash = CasStore::hash(&content);
 
@@ -2623,15 +2820,18 @@ fn run_fs_dedup_benchmark(
         .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Storage-Stats nicht lesbar"))?;
     let storage_stats_before_us = elapsed_us(stats_before_started.elapsed());
     let seed_started = Instant::now();
-    layer
-        .write_file(
-            &fs_agent_dir,
-            parent_inode,
-            &format!("{file_prefix}-seed.bin"),
-            &content,
-            0o644,
-        )
-        .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Seed-Write fehlgeschlagen"))?;
+    with_direct_world_mutation(state, || {
+        layer
+            .write_file(
+                &fs_agent_dir,
+                parent_inode,
+                &format!("{file_prefix}-seed.bin"),
+                &content,
+                0o644,
+            )
+            .map(|_| ())
+            .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Seed-Write fehlgeschlagen"))
+    })?;
     let seed_write_us = elapsed_us(seed_started.elapsed());
 
     let mut cas_check_latencies = Vec::with_capacity(payload.writes as usize);
@@ -2650,9 +2850,12 @@ fn run_fs_dedup_benchmark(
         cas_check_latencies.push(elapsed_us(cas_check_started.elapsed()));
 
         let write_started = Instant::now();
-        layer
-            .write_file(&fs_agent_dir, parent_inode, name, &content, 0o644)
-            .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Write fehlgeschlagen"))?;
+        with_direct_world_mutation(state, || {
+            layer
+                .write_file(&fs_agent_dir, parent_inode, name, &content, 0o644)
+                .map(|_| ())
+                .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Write fehlgeschlagen"))
+        })?;
         write_file_latencies.push(elapsed_us(write_started.elapsed()));
         loop_latencies.push(elapsed_us(loop_started.elapsed()));
     }
@@ -2881,9 +3084,10 @@ fn run_fs_ransomware_test(
         "Issue #264 fs-ransomware-test v2 gestartet"
     );
     let fs_agent_dir = fs_agent_dir_for_name(state, agent_name)?;
-    let layer = open_fs_layer(state)?;
-    let (parent_inode, file_name) =
-        fs_parent_and_name(&layer, &fs_agent_dir, &payload.relative_path)?;
+    let layer = open_fs_layer_for_mutation(state)?;
+    let (parent_inode, file_name) = with_direct_world_mutation(state, || {
+        fs_parent_and_name(&layer, &fs_agent_dir, &payload.relative_path)
+    })?;
     let runtime = current_runtime_snapshot_for_agent_name(state, agent_name)?;
     let home_host_path = runtime.home_host_path;
     let target = Path::new(&home_host_path).join(payload.relative_path.trim());
@@ -2892,13 +3096,15 @@ fn run_fs_ransomware_test(
         payload.snapshot_label, agent_name
     )
     .into_bytes();
-    replace_layer_file(
-        &layer,
-        &fs_agent_dir,
-        parent_inode,
-        &file_name,
-        &before_content,
-    )?;
+    with_direct_world_mutation(state, || {
+        replace_layer_file(
+            &layer,
+            &fs_agent_dir,
+            parent_inode,
+            &file_name,
+            &before_content,
+        )
+    })?;
     let before_sha256 = sha256_hex(&before_content);
     wait_for_expected_runtime_bytes(
         &layer,
@@ -2931,13 +3137,15 @@ fn run_fs_ransomware_test(
         uuid::Uuid::now_v7()
     )
     .into_bytes();
-    replace_layer_file(
-        &layer,
-        &fs_agent_dir,
-        parent_inode,
-        &file_name,
-        &mutated_content,
-    )?;
+    with_direct_world_mutation(state, || {
+        replace_layer_file(
+            &layer,
+            &fs_agent_dir,
+            parent_inode,
+            &file_name,
+            &mutated_content,
+        )
+    })?;
     let mutated_sha256 = sha256_hex(&mutated_content);
     wait_for_expected_runtime_bytes(
         &layer,
@@ -3255,7 +3463,13 @@ fn run_write_anomaly_test(
         .join(".issue264-write-anomaly.bin")
         .display()
         .to_string();
-    let _ = std::fs::remove_file(&host_path);
+    with_direct_world_mutation(state, || match std::fs::remove_file(&host_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(ApiError::ServiceUnavailable(
+            "Write-Anomaly-Testdatei konnte nicht entfernt werden",
+        )),
+    })?;
     let script = r#"import os, sys, time
 path = sys.argv[1]
 bps = int(sys.argv[2])
@@ -3293,11 +3507,14 @@ with open(path, 'wb', buffering=0) as handle:
         .arg(duration_secs.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = child.spawn().map_err(|_| {
-        ApiError::ServiceUnavailable("Write-Anomaly-Test konnte nicht gestartet werden")
+    let (mut child, helper_pid) = with_direct_world_mutation(state, || {
+        let child = child.spawn().map_err(|_| {
+            ApiError::ServiceUnavailable("Write-Anomaly-Test konnte nicht gestartet werden")
+        })?;
+        let helper_pid = child.id();
+        let _ = sentinel_sandbox::cgroups::add_pid_to_cgroup(agent_name, helper_pid);
+        Ok((child, helper_pid))
     })?;
-    let helper_pid = child.id();
-    let _ = sentinel_sandbox::cgroups::add_pid_to_cgroup(agent_name, helper_pid);
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -3348,11 +3565,14 @@ fn run_landlock_test(
         &inner_command,
     );
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let child = command
-        .spawn()
-        .map_err(|_| ApiError::ServiceUnavailable("Landlock-Test konnte nicht gestartet werden"))?;
-    let helper_pid = child.id();
-    let _ = sentinel_sandbox::cgroups::add_pid_to_cgroup(agent_name, helper_pid);
+    let (child, helper_pid) = with_direct_world_mutation(state, || {
+        let child = command.spawn().map_err(|_| {
+            ApiError::ServiceUnavailable("Landlock-Test konnte nicht gestartet werden")
+        })?;
+        let helper_pid = child.id();
+        let _ = sentinel_sandbox::cgroups::add_pid_to_cgroup(agent_name, helper_pid);
+        Ok((child, helper_pid))
+    })?;
     let output = child
         .wait_with_output()
         .map_err(|_| ApiError::ServiceUnavailable("Landlock-Test lieferte kein Ergebnis"))?;
@@ -3609,12 +3829,20 @@ mod tests {
                 agent_id: 7,
                 aggregate_id: "AGENT-07".to_string(),
                 agent_name: "Test Agent".to_string(),
+                runtime_key: sentinel_common::RUNTIME_BWRAP_LANDLOCK.to_string(),
+                instance_id: None,
+                runtime_pid: Some(4242),
                 bwrap_pid: Some(4242),
                 home_host_path: "/ram/agents/Test Agent".to_string(),
                 fs_mount: None,
             },
         )])));
+        let owner_registry = Box::leak(Box::new(sentinel_common::OwnerRegistry::new_for_test(
+            sentinel_common::NodeId::new(),
+        )));
         let state = AppState {
+            owner_registry,
+            before_direct_world_effect: None,
             allowed_rooms: Arc::new(
                 ["empfang".to_string(), "flur_eg".to_string()]
                     .into_iter()
@@ -3703,6 +3931,7 @@ mod tests {
                         agent_id: 7,
                         aggregate_id: "AGENT-07".to_string(),
                         name: "Test Agent".to_string(),
+                        runtime_key: sentinel_common::RUNTIME_BWRAP_LANDLOCK.to_string(),
                         runtime_present: true,
                         projection_present: false,
                         tracked_pid: Some(4242),
@@ -3710,10 +3939,22 @@ mod tests {
                         tracked_pid_state: Some("Z".to_string()),
                         cgroup_live_pid_count: 0,
                         security_runtime_present: true,
+                        adapter_handle_present: true,
+                        adapter_instance_matches: true,
+                        runtime_resources_healthy: false,
+                        adapter_health_state: Some(
+                            sentinel_common::nano_runtime::NanoHealthState::Stopped,
+                        ),
+                        adapter_observation_error: None,
+                        logical_status: Some(sentinel_runtime::AgentStatus::Errored),
                         last_repair_status: Some("stale".to_string()),
                     }],
                 },
             )),
+            episode_projection_admission: Arc::new(std::sync::RwLock::new(
+                crate::episode_producer::EpisodeProjectionAdmissionSnapshot::default(),
+            )),
+            episode_projection_tx: mpsc::channel().0,
             security_runtime_state,
             cluster_control: None,
             cluster_meta: None,
@@ -3786,6 +4027,194 @@ mod tests {
     }
 
     #[test]
+    fn closed_owner_readiness_rejects_mutations_before_fs_or_command_side_effects() {
+        let (state, rx, _platform_rx, _runtime_rx) = test_state(None);
+        assert!(state.data_dir.read_dir().unwrap().next().is_none());
+        state.owner_registry.close_owner_readiness();
+
+        let fs_response = handle_http_request(
+            test_request(
+                OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,
+                serde_json::json!({
+                    "agent_name": "Test Agent",
+                    "relative_path": "must-not-exist.txt",
+                    "content": "blocked"
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(fs_response.status, 503);
+        assert!(state.data_dir.read_dir().unwrap().next().is_none());
+
+        let command_response = handle_http_request(
+            test_request(
+                OPERATOR_CHAOS_PATH,
+                serde_json::json!({
+                    "room_id": "empfang",
+                    "chaos_type": "AirConBroken",
+                    "duration_ticks": 45
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(command_response.status, 503);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn closed_owner_readiness_preserves_read_only_diagnostics() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        state.owner_registry.close_owner_readiness();
+
+        let response = handle_http_request(test_get_request(OPERATOR_PLATFORM_STATE_PATH), &state);
+        assert_eq!(response.status, 200);
+
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::StateHash { response_tx } => {
+                response_tx
+                    .send(crate::runtime_control::StateHashResponse {
+                        strict: "strict".to_string(),
+                        core: "core".to_string(),
+                        tick: 42,
+                        last_event_id: 7,
+                    })
+                    .unwrap();
+            }
+            _ => panic!("expected read-only StateHash command"),
+        });
+        let state_hash = handle_http_request(test_get_request(OPERATOR_STATE_HASH_PATH), &state);
+        responder.join().unwrap();
+        assert_eq!(state_hash.status, 200);
+    }
+
+    #[test]
+    fn follower_world_authority_rejects_post_before_fs_or_command_side_effects() {
+        let (mut state, rx, _platform_rx, _runtime_rx) = test_state(Some("operator-key"));
+        let authorized_request = |path: &str, body: serde_json::Value| {
+            let mut request = test_request(path, body);
+            request
+                .headers
+                .insert(OPERATOR_KEY_HEADER.to_string(), "operator-key".to_string());
+            request
+        };
+        let owner = sentinel_common::NodeId::new();
+        let follower = sentinel_common::NodeId::new();
+        let term = sentinel_common::OwnerTerm {
+            scope: sentinel_common::StateTransferScope::World,
+            owner_node: owner,
+            epoch: 1,
+            coordinator_generation: sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+        };
+        let global = sentinel_common::OwnerTermSnapshot::new(
+            sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+            1,
+            vec![term.clone()],
+        )
+        .unwrap();
+        let local = sentinel_common::LocalOwnerStateSnapshot::new(
+            follower,
+            sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+            1,
+            vec![sentinel_common::LocalOwnerBaseState {
+                scope: sentinel_common::StateTransferScope::World,
+                recipient_node: follower,
+                owner_term: term,
+                base_role: sentinel_common::LocalOwnerBaseRole::Follower,
+                activation_state: sentinel_common::ActivationState::NotRoutable,
+            }],
+        )
+        .unwrap();
+        let registry = Box::leak(Box::new(
+            sentinel_common::OwnerRegistry::new_cluster_for_test(follower),
+        ));
+        registry
+            .rebuild_from_owner_snapshot(&global, &local, vec![])
+            .unwrap();
+        assert!(registry.owner_readiness());
+        state.owner_registry = registry;
+        assert!(state.data_dir.read_dir().unwrap().next().is_none());
+
+        let owner_check = handle_http_request(
+            authorized_request(
+                OPERATOR_OWNER_CHECK_PATH,
+                serde_json::json!({ "scope": "world" }),
+            ),
+            &state,
+        );
+        assert_eq!(owner_check.status, 200);
+        let owner_check: serde_json::Value = serde_json::from_slice(&owner_check.body).unwrap();
+        assert_eq!(owner_check["own_write_validates"], false);
+
+        let control_query = handle_http_request(
+            authorized_request(
+                OPERATOR_CONTROL_QUERY_PATH,
+                serde_json::json!({
+                    "peer_alias": "seed",
+                    "kind": "ref",
+                    "block_ref": "sha256:test"
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(control_query.status, 503);
+        let control_query: serde_json::Value = serde_json::from_slice(&control_query.body).unwrap();
+        assert_eq!(control_query["error"], "control stream not configured");
+
+        let fs_response = handle_http_request(
+            authorized_request(
+                OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,
+                serde_json::json!({
+                    "agent_name": "Test Agent",
+                    "relative_path": "follower-must-not-exist.txt",
+                    "content": "blocked"
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(fs_response.status, 503);
+        assert!(state.data_dir.read_dir().unwrap().next().is_none());
+
+        let command_response = handle_http_request(
+            authorized_request(
+                OPERATOR_CHAOS_PATH,
+                serde_json::json!({
+                    "room_id": "empfang",
+                    "chaos_type": "AirConBroken",
+                    "duration_ticks": 45
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(command_response.status, 503);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn authority_change_before_direct_fs_effect_leaves_no_file() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        assert!(state.data_dir.read_dir().unwrap().next().is_none());
+        let registry = state.owner_registry;
+        state.before_direct_world_effect = Some(Arc::new(move || {
+            registry.close_owner_readiness();
+        }));
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,
+                serde_json::json!({
+                    "agent_name": "Test Agent",
+                    "relative_path": "authority-changed.txt",
+                    "content": "must-not-be-written"
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 503);
+        assert!(state.data_dir.read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
     fn invalid_room_returns_not_found() {
         let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
@@ -3844,6 +4273,280 @@ mod tests {
             }
             other => panic!("unerwartetes Kommando: {other:?}"),
         }
+    }
+
+    #[test]
+    fn episode_projection_diagnostics_are_authenticated_and_redacted() {
+        let (no_secret_state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let no_secret = handle_http_request(
+            test_get_request(OPERATOR_EPISODE_PROJECTION_PATH),
+            &no_secret_state,
+        );
+        assert_eq!(no_secret.status, 401);
+
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        *state.episode_projection_admission.write().unwrap() =
+            crate::episode_producer::EpisodeProjectionAdmissionSnapshot {
+                initialized: true,
+                integrity_error: false,
+                global_frontier_source_row_id: Some(9),
+                global_blockers: Vec::new(),
+                agents: vec![crate::episode_producer::EpisodeProjectionAgentDiagnostic {
+                    agent_id: 7,
+                    ready: false,
+                    frontier_source_row_id: Some(8),
+                    lag_rows: Some(1),
+                    blockers: vec![
+                        crate::episode_producer::EpisodeProjectionBlockerDiagnostic {
+                            source_row_id: 9,
+                            source_event_id: "event-9".to_string(),
+                            reason: sentinel_hippocampus::EpisodeProjectionQuarantineReason::UnknownAgent,
+                            quarantine_digest: "ab".repeat(32),
+                        },
+                    ],
+                }],
+            };
+
+        let unauthenticated =
+            handle_http_request(test_get_request(OPERATOR_EPISODE_PROJECTION_PATH), &state);
+        assert_eq!(unauthenticated.status, 401);
+
+        let mut wrong = test_get_request(OPERATOR_EPISODE_PROJECTION_PATH);
+        wrong
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "wrong-secret".to_string());
+        assert_eq!(handle_http_request(wrong, &state).status, 401);
+
+        let mut request = test_get_request(OPERATOR_EPISODE_PROJECTION_PATH);
+        request
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        let response = handle_http_request(request, &state);
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(body.contains("event-9"));
+        assert!(body.contains(&"ab".repeat(32)));
+        assert!(!body.contains("payload"));
+        assert!(!body.contains("diagnostic\""));
+    }
+
+    #[test]
+    fn episode_projection_resolution_requires_auth_and_forwards_cas_material() {
+        let (no_secret_state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let no_secret = handle_http_request(
+            test_request(
+                OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH,
+                serde_json::json!({
+                    "source_row_id": 9,
+                    "source_event_id": "event-9",
+                    "request_digest": "ab".repeat(32),
+                    "quarantine_digest": "cd".repeat(32)
+                }),
+            ),
+            &no_secret_state,
+        );
+        assert_eq!(no_secret.status, 401);
+
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        let (episode_tx, episode_rx) = mpsc::channel();
+        state.episode_projection_tx = episode_tx;
+        let request_body = serde_json::json!({
+            "source_row_id": 9,
+            "source_event_id": "event-9",
+            "request_digest": "ab".repeat(32),
+            "quarantine_digest": "cd".repeat(32)
+        });
+        let unauthenticated = handle_http_request(
+            test_request(
+                OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH,
+                request_body.clone(),
+            ),
+            &state,
+        );
+        assert_eq!(unauthenticated.status, 401);
+
+        let mut wrong = test_request(
+            OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH,
+            request_body.clone(),
+        );
+        wrong
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "wrong-secret".to_string());
+        assert_eq!(handle_http_request(wrong, &state).status, 401);
+
+        let mut request = test_request(OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH, request_body);
+        request
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        let handle = std::thread::spawn(move || handle_http_request(request, &state));
+        let command = episode_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match command {
+            EpisodeProjectionOperatorCommand::Resolve {
+                request,
+                response_tx,
+            } => {
+                assert_eq!(request.source_row_id, 9);
+                assert_eq!(request.source_event_id, "event-9");
+                assert_eq!(request.request_digest, "ab".repeat(32));
+                assert_eq!(request.quarantine_digest, "cd".repeat(32));
+                response_tx
+                    .send(Ok(
+                        crate::episode_producer::EpisodeProjectionResolveResponse {
+                            resolved: true,
+                            duplicate: false,
+                            source_row_id: 9,
+                            source_event_id: "event-9".to_string(),
+                            episode_id: 42,
+                        },
+                    ))
+                    .unwrap();
+            }
+            EpisodeProjectionOperatorCommand::Generation { .. } => {
+                panic!("unexpected generation command")
+            }
+        }
+        let response = handle.join().unwrap();
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["episode_id"], 42);
+        assert_eq!(body["resolved"], true);
+    }
+
+    #[test]
+    fn episode_projection_generation_endpoint_requires_auth_and_returns_redacted_status() {
+        let request_body = serde_json::json!({ "action": "status" });
+        let (no_secret_state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        assert_eq!(
+            handle_http_request(
+                test_request(
+                    OPERATOR_EPISODE_PROJECTION_GENERATION_PATH,
+                    request_body.clone(),
+                ),
+                &no_secret_state,
+            )
+            .status,
+            401
+        );
+
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        let (episode_tx, episode_rx) = mpsc::channel();
+        state.episode_projection_tx = episode_tx;
+        let mut wrong = test_request(
+            OPERATOR_EPISODE_PROJECTION_GENERATION_PATH,
+            request_body.clone(),
+        );
+        wrong
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "wrong-secret".to_string());
+        assert_eq!(handle_http_request(wrong, &state).status, 401);
+
+        let mut request = test_request(OPERATOR_EPISODE_PROJECTION_GENERATION_PATH, request_body);
+        request
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        let handle = std::thread::spawn(move || handle_http_request(request, &state));
+        match episode_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            EpisodeProjectionOperatorCommand::Generation {
+                request: EpisodeProjectionGenerationRequest::Status,
+                response_tx,
+            } => response_tx
+                .send(Ok(
+                    crate::episode_producer::EpisodeProjectionGenerationResponse {
+                        operation: "status".to_string(),
+                        generation_id: None,
+                        candidate_digest: None,
+                        status: sentinel_hippocampus::EpisodeProjectionGenerationStatus {
+                            active_generation_id: "ab".repeat(32),
+                            activation_epoch: 4,
+                            generations: Vec::new(),
+                        },
+                    },
+                ))
+                .unwrap(),
+            _ => panic!("unexpected episode projection operator command"),
+        }
+        let response = handle.join().unwrap();
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(body.contains("active_generation_id"));
+        assert!(!body.contains("payload"));
+        assert!(!body.contains("diagnostic"));
+    }
+
+    #[test]
+    fn episode_projection_generation_discard_is_authenticated_and_deny_unknown_fields() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        let (episode_tx, episode_rx) = mpsc::channel();
+        state.episode_projection_tx = episode_tx;
+        let generation_id = "11".repeat(32);
+        let active_generation_id = "22".repeat(32);
+        let candidate_digest = "33".repeat(32);
+
+        let mut unknown = test_request(
+            OPERATOR_EPISODE_PROJECTION_GENERATION_PATH,
+            serde_json::json!({
+                "action": "discard",
+                "generation_id": generation_id.clone(),
+                "expected_active_generation_id": active_generation_id.clone(),
+                "expected_candidate_digest": candidate_digest.clone(),
+                "candidate": {"untrusted": true}
+            }),
+        );
+        unknown
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        assert_eq!(handle_http_request(unknown, &state).status, 400);
+        assert!(episode_rx.try_recv().is_err());
+
+        let mut request = test_request(
+            OPERATOR_EPISODE_PROJECTION_GENERATION_PATH,
+            serde_json::json!({
+                "action": "discard",
+                "generation_id": generation_id.clone(),
+                "expected_active_generation_id": active_generation_id.clone(),
+                "expected_candidate_digest": candidate_digest.clone()
+            }),
+        );
+        request
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        let handle = std::thread::spawn(move || handle_http_request(request, &state));
+        match episode_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            EpisodeProjectionOperatorCommand::Generation {
+                request:
+                    EpisodeProjectionGenerationRequest::Discard {
+                        generation_id: received_generation,
+                        expected_active_generation_id: received_active,
+                        expected_candidate_digest: received_digest,
+                    },
+                response_tx,
+            } => {
+                assert_eq!(received_generation, generation_id);
+                assert_eq!(received_active, active_generation_id);
+                assert_eq!(received_digest, candidate_digest);
+                response_tx
+                    .send(Ok(
+                        crate::episode_producer::EpisodeProjectionGenerationResponse {
+                            operation: "discard".to_string(),
+                            generation_id: Some(received_generation),
+                            candidate_digest: Some(received_digest),
+                            status: sentinel_hippocampus::EpisodeProjectionGenerationStatus {
+                                active_generation_id: received_active,
+                                activation_epoch: 4,
+                                generations: Vec::new(),
+                            },
+                        },
+                    ))
+                    .unwrap();
+            }
+            _ => panic!("unexpected episode projection operator command"),
+        }
+        let response = handle.join().unwrap();
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(body.contains("discard"));
+        assert!(!body.contains("payload"));
+        assert!(!body.contains("diagnostic"));
     }
 
     #[test]
@@ -4512,6 +5215,87 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_runtime_lifecycle_maps_to_unprocessable_entity_422() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Pause {
+                agent_id,
+                response_tx,
+            } => response_tx
+                .send(AgentLifecycleResponse {
+                    accepted: false,
+                    agent_id,
+                    aggregate_id: format!("AGENT-{agent_id:02}"),
+                    action: "pause".to_string(),
+                    new_status: String::new(),
+                    affected_pids: 0,
+                    outcome: "unsupported_runtime_action".to_string(),
+                    note: "adapter rejected suspend".to_string(),
+                })
+                .unwrap(),
+            other => panic!("expected Pause, got {other:?}"),
+        });
+        let error = dispatch_agent_lifecycle(AgentLifecycleAction::Pause, 7, &state).unwrap_err();
+        responder.join().unwrap();
+        assert!(matches!(error, ApiError::UnprocessableEntity(_)));
+        assert_eq!(error.to_response().status, 422);
+    }
+
+    #[test]
+    fn failed_runtime_lifecycle_maps_to_service_unavailable_503() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Resume {
+                agent_id,
+                response_tx,
+            } => response_tx
+                .send(AgentLifecycleResponse {
+                    accepted: false,
+                    agent_id,
+                    aggregate_id: format!("AGENT-{agent_id:02}"),
+                    action: "resume".to_string(),
+                    new_status: String::new(),
+                    affected_pids: 0,
+                    outcome: "runtime_action_failed".to_string(),
+                    note: "adapter failed resume".to_string(),
+                })
+                .unwrap(),
+            other => panic!("expected Resume, got {other:?}"),
+        });
+        let error = dispatch_agent_lifecycle(AgentLifecycleAction::Resume, 7, &state).unwrap_err();
+        responder.join().unwrap();
+        assert!(matches!(error, ApiError::ServiceUnavailable(_)));
+        assert_eq!(error.to_response().status, 503);
+    }
+
+    #[test]
+    fn unconfirmed_ok_lifecycle_response_fails_closed() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Pause {
+                agent_id,
+                response_tx,
+            } => response_tx
+                .send(AgentLifecycleResponse {
+                    accepted: false,
+                    agent_id,
+                    aggregate_id: format!("AGENT-{agent_id:02}"),
+                    action: "pause".to_string(),
+                    new_status: String::new(),
+                    affected_pids: 0,
+                    outcome: "ok".to_string(),
+                    note: "unconfirmed".to_string(),
+                })
+                .unwrap(),
+            other => panic!("expected Pause, got {other:?}"),
+        });
+        let error = dispatch_agent_lifecycle(AgentLifecycleAction::Pause, 7, &state).unwrap_err();
+        responder.join().unwrap();
+        assert!(matches!(error, ApiError::ServiceUnavailable(_)));
+        assert_eq!(error.to_response().status, 503);
+    }
+
+    #[test]
     fn agent_lifecycle_not_found_maps_to_404() {
         let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
         let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
@@ -5160,7 +5944,8 @@ mod tests {
 
     #[test]
     fn fs_trash_fixture_and_inspect_roundtrip() {
-        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        attach_test_fs_layer(&mut state);
         let fixture = handle_http_request(
             test_request(
                 OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,

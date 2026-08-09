@@ -5,7 +5,7 @@ use std::io::Read;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -32,6 +32,53 @@ const INFO_FD_TIMEOUT_MS: libc::c_int = 5000;
 pub struct SpawnedSandbox {
     pub child: Child,
     pub child_pid: Option<u32>,
+}
+
+impl SpawnedSandbox {
+    /// Terminates both the sandboxed process and its bwrap supervisor.
+    pub fn terminate(&mut self) {
+        terminate_sandbox_process(&mut self.child, self.child_pid);
+    }
+}
+
+pub(crate) fn terminate_sandbox_process(child: &mut Child, child_pid: Option<u32>) {
+    if let Some(pid) = child_pid {
+        signal_pid(pid, "TERM");
+    }
+
+    match child.try_wait() {
+        Ok(Some(_status)) => {}
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(_) => {}
+    }
+
+    if let Some(pid) = child_pid {
+        for _ in 0..20 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        signal_pid(pid, "KILL");
+        for _ in 0..20 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        warn!(pid, "sandboxed child remained visible after SIGKILL");
+    }
+}
+
+fn signal_pid(pid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .args([format!("-{signal}"), pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Bubblewrap sandbox configuration fuer einen einzelnen Agenten.
@@ -185,11 +232,7 @@ impl BwrapConfig {
         args.push(INFO_FD.to_string());
         args.extend(command.iter().cloned());
 
-        info!(
-            "Spawning bwrap: {} args, command: {:?}",
-            args.len(),
-            command
-        );
+        log_bwrap_spawn(args.len());
 
         // Pipe for bwrap's --info-fd. Both ends CLOEXEC; the write end is
         // re-published at INFO_FD in the child via pre_exec (clearing CLOEXEC
@@ -213,11 +256,17 @@ impl BwrapConfig {
         }
         cmd.args(&args)
             .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped());
+            .stdout(std::process::Stdio::piped())
+            // Protocol failures are represented by typed, public-safe frames.
+            // Inheriting child stderr would bypass that redaction boundary.
+            .stderr(std::process::Stdio::null());
         // SAFETY: the closure runs in the forked child before exec and only
-        // calls async-signal-safe fcntl/dup2 on a captured raw fd.
+        // calls async-signal-safe setpgid/fcntl/dup2 operations.
         unsafe {
             cmd.pre_exec(move || {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if write_fd == INFO_FD {
                     let flags = libc::fcntl(write_fd, libc::F_GETFD);
                     if flags < 0
@@ -334,6 +383,12 @@ impl BwrapConfig {
 
         args
     }
+}
+
+fn log_bwrap_spawn(argument_count: usize) {
+    // Command content is intentionally excluded: executable paths and arguments
+    // may contain invocation data or credentials supplied by the caller.
+    info!(argument_count, "Spawning bwrap with direct argv");
 }
 
 fn hostname_for_agent(name: &str) -> String {
@@ -474,6 +529,41 @@ fn parse_child_pid(json: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct SharedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spawn_log_excludes_command_content() {
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = SharedLogWriter(std::sync::Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let secret_marker = "SECRET_ARGUMENT_MUST_NOT_APPEAR";
+
+        tracing::subscriber::with_default(subscriber, || {
+            let command = [secret_marker.to_string()];
+            log_bwrap_spawn(command.len());
+        });
+
+        let captured = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(captured.contains("argument_count=1"));
+        assert!(!captured.contains(secret_marker));
+    }
 
     #[test]
     fn bwrap_command_structure() {

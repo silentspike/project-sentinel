@@ -89,6 +89,7 @@ fn world_snapshot_codec_roundtrip() {
         },
         projection_offsets: vec![("room_live_view".to_string(), 49000)],
         fs_metadata: None,
+        nano_runtime_snapshots: Vec::new(),
     };
 
     // Serialize
@@ -172,6 +173,7 @@ fn empty_world_snapshot_roundtrip() {
         },
         projection_offsets: vec![],
         fs_metadata: None,
+        nano_runtime_snapshots: Vec::new(),
     };
 
     let bytes = encode_world_snapshot(&snapshot).unwrap();
@@ -231,6 +233,7 @@ fn world_snapshot_codec_rejects_trailing_bytes() {
         },
         projection_offsets: vec![],
         fs_metadata: None,
+        nano_runtime_snapshots: Vec::new(),
     };
 
     let mut bytes = encode_world_snapshot(&snapshot).unwrap();

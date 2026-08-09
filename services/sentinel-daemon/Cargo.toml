@@ -29,7 +29,6 @@ sentinel-zenoh = { path = "../../crates/sentinel-zenoh" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }
 sentinel-redb = { path = "../../crates/sentinel-redb" }
 sentinel-sandbox = { path = "../../crates/sentinel-sandbox" }
-sentinel-microvm = { path = "../../crates/sentinel-microvm" }
 sentinel-telemetry = { path = "../../crates/sentinel-telemetry" }
 sentinel-ebpf = { path = "../../crates/sentinel-ebpf" }
 sentinel-hippocampus = { path = "../../crates/sentinel-hippocampus" }
@@ -52,7 +51,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], def
 uuid = { workspace = true }
 bincode = { workspace = true }
 async-nats = { workspace = true, optional = true }
-futures = { version = "0.3", optional = true }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"], optional = true }
 
 [features]
 default = ["llm", "ebpf", "nats", "wasm", "fuse"]
@@ -66,6 +65,8 @@ fuse = ["sentinel-fs/fuse-tests"]
 [dev-dependencies]
 criterion = { workspace = true }
 tempfile = "3"
+syn = { version = "2", features = ["full", "visit"] }
+trybuild = "1"
 
 [[bench]]
 name = "platform_controlplane_bench"

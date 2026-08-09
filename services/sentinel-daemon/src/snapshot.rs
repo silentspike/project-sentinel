@@ -139,6 +139,7 @@ impl SnapshotManager {
         fs_mount: Option<&str>,
         tick: u64,
         sim_hour: f32,
+        nano_runtime_snapshots: Vec<sentinel_common::nano_runtime::NanoSnapshot>,
     ) -> anyhow::Result<String> {
         let start = std::time::Instant::now();
 
@@ -182,6 +183,7 @@ impl SnapshotManager {
             ecs: ecs_snapshot,
             projection_offsets,
             fs_metadata,
+            nano_runtime_snapshots,
         };
 
         // 6. Snapshot serialisieren + in Limbo speichern
