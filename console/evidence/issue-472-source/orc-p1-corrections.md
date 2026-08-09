@@ -1,9 +1,10 @@
 # Issue #472 lifecycle and Config Apply correction evidence
 
-Date: 2026-07-29
+Date: 2026-08-09
 
-Scope: source validation for PR #700 after the bundled ORC review at
-`fed35f0b0e23d0e99db6fd3310da8e3a56823b68`.
+Scope: source validation for PR #700. The exact reviewed code and dependency
+tree is `961e04a42829fb08dd1fc316dffccc48cc02f8ac`, based on
+`d12290fbb4d8bd95d815d5dc17891853d67889d2`.
 
 No daemon, deployment VM, installed binary, configuration, snapshot, runtime
 data, or benchmark target was accessed or changed. Live acceptance on `.240`
@@ -39,7 +40,7 @@ after #687. Cross-node and deep microVM migration remain owned by #553 and
 | P1-1 per-agent recovery obligations | Full compensation validates restored World, files, projection, logical runtime ownership, exact adapter handles, and instance resources before deleting the exact per-agent recovery rows and in-memory latches. Partial compensation leaves both durable and fail-closed. | `config_apply_compensation_restores_old_world_runtime_config_and_marker` creates a per-agent durable marker and latch, compensates, proves both are cleared only after validation, and proves a later exact spawn succeeds. `runtime_config_recovery_survives_restart_and_blocks_startup_until_reconciled` proves failed recovery remains blocked across restart. |
 | P1-2 status-bound `Degraded` | One classifier consumes durable/logical runtime status and exact adapter observation. Only `Suspended` plus adapter `Degraded` is the expected healthy suspended state. `Active` plus `Degraded` is typed non-serving and enters repair/backoff. Snapshot counters, last status, and reconcile use the same classifier. | `degraded_adapter_semantics_are_runtime_independent_and_status_bound` covers ECS-native, WASM, and bwrap. Reconcile negatives prove suspended agents are not replaced and active degraded agents are not accepted as healthy. |
 | P1-3 honest microVM boundary | The unused daemon dependency on `sentinel-microvm` is removed. Production registration contains three supported adapters and rejects microVM. Issue #472, CHANGELOG, DEV-007, gap Markdown, PR text, and this evidence use the same boundary. | Production registry/config negatives plus issue #775 and its Quality Gate. No microVM live claim is made. |
-| P2-1 claim correction | Source documents describe the versioned saga and three-adapter phase without saying “all four adapters”, “complete transactional”, or claiming productive microVM/live completion. | Added-line claim scan, issue/PR body readback, and AC mapping below. |
+| P2-1 claim correction | Source documents describe the versioned saga and three-adapter phase without saying "all four adapters", "complete transactional", or claiming productive microVM/live completion. | Added-line claim scan, issue/PR body readback, and AC mapping below. |
 
 Additional lifecycle corrections retained from the earlier reviews:
 
@@ -66,39 +67,39 @@ Additional lifecycle corrections retained from the earlier reviews:
 
 ## Remote Rust evidence
 
-All successful Rust results predating this bundled correction were run through
-`cargo remote -c --` with Rust `1.97.1`; local Cargo/Rust was not used and the
-global cargo-remote configuration was not changed.
-
-The new saga/health delta invalidates those earlier final-gate claims. The first
-focused rerun reached two test-code compile errors before executing tests:
+All Rust commands used the issue-owned remote target with Rust `1.97.1`; local
+Cargo/Rust was not used and the global cargo-remote configuration was not
+changed. The command family was explicit throughout:
 
 ```text
-error[E0599]: no method named `append` found for `EventStore`
-error[E0382]: borrow of moved value: `old_config`
+cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- fmt --all -- --check
+cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- check --workspace --all-targets
+cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- test --workspace
+cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- test -p sentinel-wasm
+cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- test -p sentinel-wasm --features wasm
+cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- clippy --workspace --all-targets -- -D warnings
+cargo remote -b 'RUST_BACKTRACE=1 RUSTDOCFLAGS=-Dwarnings' -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- doc --workspace --no-deps
+cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c release/sentinel-daemon -- build --workspace --release
+cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- deny check
+cargo remote -t /work/tmp/project-sentinel/cdx2-472-final -c .rustc_info.json -- audit --ignore RUSTSEC-2023-0071
 ```
 
-Both test-only defects were corrected to use the public `append_event` API and
-retain the later config value. A second focused rerun was stopped before tests
-when the build-host capacity window was reassigned. Therefore the current
-focused and final remote gates are **PENDING**, not PASS, until they execute on
-the final main-integrated head.
+The completed matrix on the reviewed code head is PASS:
 
-The issue-owned target
-`/work/tmp/project-sentinel/cdx2-472-saga-focused` was then removed locally and
-from the build host. It occupied 1.3 GiB remotely. Build-host readback:
-190 GiB total, 168 GiB used, 23 GiB available, with zero matching #472
-Cargo/Rust processes. No foreign target or process was changed.
+- focused Config Apply, recovery, authority, fence, and lifecycle tests;
+- format, workspace check, and full workspace tests, including daemon
+  `391 passed / 0 failed / 1 ignored`;
+- separate WASM default tests (`39` unit plus `10` acceptance) and
+  feature-enabled tests (`63` unit plus `62` acceptance plus `2` conformance);
+- workspace Clippy with warnings denied and Rustdoc with warnings denied;
+- workspace release build with Wasmtime and Wasmtime-WASI `46.0.2`;
+- cargo-deny advisories, bans, licenses, and sources;
+- cargo-audit with zero vulnerabilities and exactly three repository-approved
+  unmaintained warnings;
+- fenced-writer, unsafe-baseline, patch-registry, typos, diff, and scope gates.
 
-Required final reruns:
-
-- focused Config Apply phase/failure/restart and three-runtime health tests;
-- remote format and workspace check/tests;
-- separate feature-enabled WASM check/tests;
-- workspace Clippy with warnings denied and rustdoc with warnings denied;
-- release daemon build;
-- fenced-writer, unsafe-baseline, patch-registry, cargo-deny, typos,
-  diff/scope, and exact-head GitHub checks.
+The returned release daemon is `60,675,104` bytes with SHA-256
+`3bd6efb78b3216c9060b05abd538563c8c5e189ffd9f85823dab7389ed5f017a`.
 
 ## GitHub contract readback
 
@@ -109,11 +110,11 @@ Required final reruns:
   `30473925851` passed. Body SHA-256:
   `22cc4fb1d6a4cf9f422883ec5aad15f2da98a55d6bb4454190e68905e0c45904`.
 - PR #700 closing issue references: empty.
-- The reviewed remote head remains
-  `fed35f0b0e23d0e99db6fd3310da8e3a56823b68`; the correction commit is kept
-  locally at `f59348cf9f08b8eb9ec8dc1578015ad532536ee4`. The branch remains
-  intentionally unfrozen until final main integration and the invalidated
-  remote gates complete.
+- The exact reviewed code head is
+  `961e04a42829fb08dd1fc316dffccc48cc02f8ac`, based on
+  `d12290fbb4d8bd95d815d5dc17891853d67889d2`; its final source gates PASS.
+  This evidence-only commit follows that reviewed code head and does not
+  invalidate its source, dependency, or Rust-gate results.
 - Benchmark register: `/work/company/BENCHMARK-REGISTER.md`.
 - Hard-coded live CPU/RAM claims: none.
 
@@ -121,11 +122,11 @@ Required final reruns:
 
 | AC | Status | Evidence |
 |---|---|---|
-| AC-1 | PASS (source candidate); final gates pending | The production registry contains ECS-native, bwrap, and feature-enabled WASM; microVM is absent and fails closed. |
-| AC-2 | PASS (source candidate); final gates pending | Private typed ownership, compile-fail visibility, functional lifecycle tests, and supplementary AST inventory cover productive mutation classes. |
+| AC-1 | PASS (source) | The production registry contains ECS-native, bwrap, and feature-enabled WASM; microVM is absent and fails closed. |
+| AC-2 | PASS (source) | Private typed ownership, compile-fail visibility, functional lifecycle tests, and supplementary AST inventory cover productive mutation classes. |
 | AC-3 | PARTIAL; live NOT TESTED | Source covers bwrap selection, cgroup/eBPF ordering, retry cleanup, shutdown, and recreate-style snapshot/restore. `.240` is still required. |
 | AC-4 | PARTIAL; live NOT TESTED | Source covers non-bwrap daemon lifecycle without a Firecracker or process-memory claim. Real `.240` spawn/snapshot/restore/health/stop is still required. |
-| AC-5 | PASS (source candidate); final gates pending | The canonical saga, rollback/forward startup recovery, exact runtime snapshots, event/outbox decision, projection, participant, and per-agent obligations have focused tests. |
+| AC-5 | PASS (source) | The canonical saga, rollback/forward startup recovery, exact runtime snapshots, event/outbox decision, projection, participant, and per-agent obligations have focused tests. |
 | AC-6 | PARTIAL; live NOT TESTED | The merged #698 instance/stale-handle/retry contract is integrated; authorized SINGLE_NODE live evidence is still required. |
 | AC-7 | PASS (source candidate) | Issue, CHANGELOG, DEV-007, gap Markdown, PR text, and evidence use the same three-adapter/fail-closed-microVM boundary. TOGAF HTML is not modified in this correction. |
 
