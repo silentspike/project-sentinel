@@ -1,0 +1,23 @@
+error[E0603]: module `runtime_lifecycle` is private
+ --> tests/ui/runtime_registry_bypass.rs:1:36
+  |
+1 | use sentinel_daemon::orchestrator::runtime_lifecycle::RuntimeAdapterOwner;
+  |                                    ^^^^^^^^^^^^^^^^^ private module
+  |
+note: the module `runtime_lifecycle` is defined here
+ --> src/orchestrator.rs
+  |
+  | mod runtime_lifecycle;
+  | ^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: struct `DaemonNanoRuntimeRegistry` is private
+ --> tests/ui/runtime_registry_bypass.rs:2:36
+  |
+2 | use sentinel_daemon::orchestrator::DaemonNanoRuntimeRegistry;
+  |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^ private struct
+  |
+note: the struct `DaemonNanoRuntimeRegistry` is defined here
+ --> src/orchestrator.rs
+  |
+  | struct DaemonNanoRuntimeRegistry {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

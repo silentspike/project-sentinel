@@ -39,6 +39,14 @@ pub struct CapabilitiesConfig {
 pub struct RuntimeSelectionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nano_runtime: Option<String>,
+    /// Required when `nano_runtime = "wasm-wasmtime"`. This is explicit policy
+    /// data, not an adapter default or a daemon-global component guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_path: Option<String>,
+    /// Optional stable tool name for a WASM workload. The workload id is used
+    /// when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_tool_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,6 +206,39 @@ impl PersonalityConfig {
     }
 }
 
+impl RuntimeSelectionConfig {
+    pub fn validate(&self) -> Result<()> {
+        match self.nano_runtime.as_deref() {
+            Some(crate::nano_runtime::RUNTIME_WASM_WASMTIME) => {
+                if self.wasm_path.as_deref().is_none_or(str::is_empty) {
+                    return Err(anyhow!(
+                        "runtime wasm-wasmtime requires non-empty runtime.wasm_path"
+                    ));
+                }
+                if self.wasm_tool_name.as_deref().is_some_and(str::is_empty) {
+                    return Err(anyhow!("runtime.wasm_tool_name cannot be empty"));
+                }
+            }
+            Some(crate::nano_runtime::RUNTIME_BWRAP_LANDLOCK)
+            | Some(crate::nano_runtime::RUNTIME_ECS_NATIVE)
+            | None => {
+                if self.wasm_path.is_some() || self.wasm_tool_name.is_some() {
+                    return Err(anyhow!(
+                        "runtime.wasm_path and runtime.wasm_tool_name require nano_runtime = wasm-wasmtime"
+                    ));
+                }
+            }
+            Some(crate::nano_runtime::RUNTIME_MICROVM) => {
+                return Err(anyhow!(
+                    "runtime microvm is not production-selectable until the versioned guest launcher, workload readiness attestation, and durable crash-recovery contract are implemented"
+                ));
+            }
+            Some(other) => return Err(anyhow!("unsupported NanoRuntime '{other}'")),
+        }
+        Ok(())
+    }
+}
+
 /// Laedt eine einzelne Agent-Config aus einer TOML-Datei.
 pub fn load_agent_config(path: &Path) -> Result<AgentConfig> {
     load_agent_config_with_validation(path, AgentConfigValidation::default())
@@ -213,6 +254,7 @@ pub fn load_agent_config_with_validation(
     let config: AgentConfig = toml::from_str(&content)
         .with_context(|| format!("Failed to parse agent config: {}", path.display()))?;
     config.personality.validate()?;
+    config.runtime.validate()?;
     AgentId::new_with_bounds(config.identity.id, validation.agent_id_bounds)
         .with_context(|| format!("Invalid agent id in {}", path.display()))?;
     Ok(config)
@@ -324,6 +366,35 @@ shift_set = 1
     }
 
     #[test]
+    fn runtime_selection_requires_explicit_wasm_workload_metadata() {
+        let missing_path = RuntimeSelectionConfig {
+            nano_runtime: Some(crate::nano_runtime::RUNTIME_WASM_WASMTIME.to_string()),
+            ..RuntimeSelectionConfig::default()
+        };
+        assert!(missing_path.validate().is_err());
+
+        let wasm = RuntimeSelectionConfig {
+            nano_runtime: Some(crate::nano_runtime::RUNTIME_WASM_WASMTIME.to_string()),
+            wasm_path: Some("/opt/sentinel/wasm/agent.wasm".to_string()),
+            wasm_tool_name: Some("agent-tool".to_string()),
+        };
+        assert!(wasm.validate().is_ok());
+
+        let misplaced = RuntimeSelectionConfig {
+            nano_runtime: Some(crate::nano_runtime::RUNTIME_ECS_NATIVE.to_string()),
+            wasm_path: Some("/work/tmp/project-sentinel/not-used.wasm".to_string()),
+            wasm_tool_name: None,
+        };
+        assert!(misplaced.validate().is_err());
+
+        let unsupported = RuntimeSelectionConfig {
+            nano_runtime: Some("unknown-runtime".to_string()),
+            ..RuntimeSelectionConfig::default()
+        };
+        assert!(unsupported.validate().is_err());
+    }
+
+    #[test]
     fn validate_personality_valid() {
         let personality = PersonalityConfig {
             openness: 0.8,
@@ -405,6 +476,16 @@ shift_set = 1
                 panic!("Agent {} personality invalid: {}", agent.identity.id, e);
             });
         }
+    }
+
+    #[test]
+    fn microvm_selection_fails_closed_without_guest_attestation_contract() {
+        let runtime = RuntimeSelectionConfig {
+            nano_runtime: Some(crate::nano_runtime::RUNTIME_MICROVM.to_string()),
+            ..RuntimeSelectionConfig::default()
+        };
+        let error = runtime.validate().unwrap_err();
+        assert!(error.to_string().contains("not production-selectable"));
     }
 
     #[test]
