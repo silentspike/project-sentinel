@@ -1223,9 +1223,12 @@ mod tests {
             quarantines[0].reason,
             EpisodeProjectionQuarantineReason::MalformedRelevantPayload
         );
-        let encoded_quarantine = serde_json::to_string(&quarantines[0]).unwrap();
-        assert!(!encoded_quarantine.contains("payload"));
-        assert!(!encoded_quarantine.contains("not-json"));
+        let encoded_quarantine = serde_json::to_value(&quarantines[0]).unwrap();
+        let quarantine_fields = encoded_quarantine.as_object().unwrap();
+        assert!(!quarantine_fields.contains_key("payload"));
+        assert!(!quarantine_fields.contains_key("diagnostic"));
+        assert!(quarantine_fields.contains_key("diagnostic_digest"));
+        assert!(!encoded_quarantine.to_string().contains("{not-json"));
         assert_eq!(
             producer
                 .hippocampus()

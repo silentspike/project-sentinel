@@ -2592,8 +2592,11 @@ mod tests {
             );
         }
         for quarantine in [agent_quarantine, unresolved, building] {
-            let encoded = serde_json::to_string(&quarantine).unwrap();
-            assert!(!encoded.contains("payload"));
+            let encoded = serde_json::to_value(&quarantine).unwrap();
+            let fields = encoded.as_object().unwrap();
+            assert!(!fields.contains_key("payload"));
+            assert!(!fields.contains_key("diagnostic"));
+            assert!(fields.contains_key("diagnostic_digest"));
         }
     }
 
