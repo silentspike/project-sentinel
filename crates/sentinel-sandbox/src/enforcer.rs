@@ -19,10 +19,10 @@ use std::process::{Child, ChildStdin};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
 
-use crate::bwrap::BwrapConfig;
+use crate::bwrap::{terminate_sandbox_process, BwrapConfig, SpawnedSandbox};
 use crate::cgroups::{self, CgroupLimits, PsiMetrics};
 use crate::landlock;
 
@@ -307,6 +307,28 @@ impl AgentProcess {
         self.join_protocol_reader();
     }
 
+    /// Terminates and reaps the child, surfacing incomplete cleanup so the
+    /// NanoRuntime can retain ownership and retry instead of forgetting a live
+    /// sandbox process.
+    pub fn terminate_checked(&mut self) -> Result<()> {
+        self.terminate();
+        match self
+            .child
+            .try_wait()
+            .context("query sandbox supervisor after termination")?
+        {
+            Some(_) => {}
+            None => bail!(
+                "sandbox supervisor {} remained alive after termination",
+                self.pid
+            ),
+        }
+        if self.child_pid.is_some_and(pid_exists) {
+            bail!("sandboxed child remained alive after termination");
+        }
+        Ok(())
+    }
+
     pub(crate) fn terminate_process_group(&mut self) {
         self.protocol_stdin.take();
         self.protocol_stdout.take();
@@ -318,19 +340,29 @@ impl AgentProcess {
                 libc::kill(-group, libc::SIGKILL);
             }
         }
-        match self.child.try_wait() {
-            Ok(Some(_status)) => {}
-            Ok(None) => {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
-            Err(_) => {}
-        }
+        terminate_sandbox_process(&mut self.child, self.child_pid);
     }
 
     pub(crate) fn join_protocol_reader(&mut self) {
         if let Some(reader) = self.protocol_reader.take() {
             let _ = reader.join();
+        }
+    }
+}
+
+impl From<SpawnedSandbox> for AgentProcess {
+    fn from(spawned: SpawnedSandbox) -> Self {
+        let mut child = spawned.child;
+        let pid = child.id();
+        let protocol_stdin = child.stdin.take();
+        let (protocol_stdout, protocol_reader) = protocol_reader_parts(child.stdout.take());
+        Self {
+            pid,
+            child_pid: spawned.child_pid,
+            protocol_stdin,
+            protocol_stdout,
+            protocol_reader,
+            child,
         }
     }
 }
@@ -440,6 +472,9 @@ pub enum IsolationStatus {
 pub struct SandboxHandle {
     pub agent_name: String,
     pub cgroup_created: bool,
+    /// Captured at setup so eBPF deregistration remains possible after the
+    /// adapter has removed the cgroup directory.
+    pub cgroup_id: Option<u64>,
     pub io_available: bool,
     pub bwrap_pid: Option<u32>,
     pub landlock_applied: bool,
@@ -605,6 +640,7 @@ impl SandboxEnforcer {
         let mut handle = SandboxHandle {
             agent_name: name.to_string(),
             cgroup_created: false,
+            cgroup_id: None,
             io_available: false,
             bwrap_pid: None,
             landlock_applied: false,
@@ -616,6 +652,7 @@ impl SandboxEnforcer {
             let setup = cgroups::create_cgroup(name, limits)
                 .with_context(|| format!("Failed to create cgroup for agent {name}"))?;
             handle.cgroup_created = true;
+            handle.cgroup_id = cgroups::cgroup_id(name);
             handle.io_available = setup.io_available;
         } else {
             warn!("Skipping cgroup creation for {name} (cgroup root not available)");
@@ -687,12 +724,9 @@ impl SandboxEnforcer {
             command.to_vec()
         };
 
-        let spawned = config.spawn(&wrapped_command)?;
-        let mut child = spawned.child;
-        let pid = child.id();
-        let child_pid = spawned.child_pid;
-        let protocol_stdin = child.stdin.take();
-        let (protocol_stdout, protocol_reader) = protocol_reader_parts(child.stdout.take());
+        let process = AgentProcess::from(config.spawn(&wrapped_command)?);
+        let pid = process.pid;
+        let child_pid = process.child_pid;
 
         // Add bwrap process to agent's cgroup (supervisor PID — children inherit
         // the cgroup; this is correct for cgroups, unlike netns which needs the
@@ -708,14 +742,7 @@ impl SandboxEnforcer {
             pid, child_pid, "bwrap process started, returning AgentProcess handle"
         );
 
-        Ok(AgentProcess {
-            pid,
-            child_pid,
-            protocol_stdin,
-            protocol_stdout,
-            protocol_reader,
-            child,
-        })
+        Ok(process)
     }
 
     /// Verifies that the sandboxed agent process runs in its own network
@@ -757,6 +784,17 @@ impl SandboxEnforcer {
                 .with_context(|| format!("remove sandbox cgroup for {}", handle.agent_name))?;
         }
 
+        Ok(())
+    }
+
+    /// Reconcile setup that failed before a [`SandboxHandle`] could be
+    /// returned. This is intentionally limited to the deterministic cgroup
+    /// path; workload home ownership remains guarded by the NanoRuntime marker.
+    pub fn recover_partial_agent_setup(&self, agent_name: &str) -> Result<()> {
+        if std::path::Path::new(&cgroups::cgroup_path(agent_name)).exists() {
+            cleanup_cgroup_after_process_exit(agent_name)
+                .with_context(|| format!("recover partial sandbox setup for {agent_name}"))?;
+        }
         Ok(())
     }
 
@@ -946,6 +984,7 @@ mod tests {
         let handle = SandboxHandle {
             agent_name: "test".into(),
             cgroup_created: false,
+            cgroup_id: None,
             io_available: false,
             bwrap_pid: None,
             landlock_applied: false,

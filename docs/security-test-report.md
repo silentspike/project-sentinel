@@ -85,4 +85,7 @@ cargo test -p sentinel-sandbox --test breakout -- --ignored --test-threads=1
    Long term: evaluate separate `access_fs` flags for write vs. execute in future Landlock versions.
 2. **Seccomp (not implemented):** additional syscall filtering would further reduce the attack surface.
    Currently out of scope (no issue for it).
-3. **Network isolation:** currently `--share-net` (TOGAF default). Separate issue (#75) for network isolation.
+3. **Network isolation:** agents run in a dedicated loopback-only network
+   namespace via `--unshare-all`; `--share-net` is deliberately absent. The
+   daemon verifies the sandboxed child PID after spawn and terminates a
+   confirmed cage breach (#75).

@@ -360,8 +360,20 @@ impl RuntimeOrchestrator {
         new_shift_set: u8,
         protected: &std::collections::HashSet<AgentId>,
     ) -> Vec<AgentId> {
-        let to_remove: Vec<AgentId> = self
-            .agents
+        let to_remove = self.shift_removal_candidates(new_shift_set, protected);
+        self.commit_shift_transition(new_shift_set, &to_remove);
+        to_remove
+    }
+
+    /// Computes a shift transition without mutating logical runtime state. The
+    /// daemon uses this before adapter teardown so a failed NanoRuntime stop
+    /// cannot leave an untracked live workload behind.
+    pub fn shift_removal_candidates(
+        &self,
+        new_shift_set: u8,
+        protected: &std::collections::HashSet<AgentId>,
+    ) -> Vec<AgentId> {
+        self.agents
             .iter()
             .filter(|(_, handle)| {
                 // Behalte: Sonder-Schicht (0) ODER neue Schicht
@@ -369,9 +381,13 @@ impl RuntimeOrchestrator {
             })
             .filter(|(id, _)| !protected.contains(id))
             .map(|(id, _)| *id)
-            .collect();
+            .collect()
+    }
 
-        for agent_id in &to_remove {
+    /// Commits only adapter-confirmed shift removals and emits the existing
+    /// lifecycle event for exactly that set.
+    pub fn commit_shift_transition(&mut self, new_shift_set: u8, to_remove: &[AgentId]) {
+        for agent_id in to_remove {
             self.agents.remove(agent_id);
             tracing::info!(
                 agent_id = %agent_id,
@@ -389,7 +405,7 @@ impl RuntimeOrchestrator {
         let payload = DomainEventPayload::ShiftTransitionCompleted {
             new_shift_set,
             removed_count: to_remove.len() as u32,
-            removed_agents: to_remove.clone(),
+            removed_agents: to_remove.to_vec(),
         };
         self.emit_event(
             payload.event_type_str(),
@@ -400,10 +416,8 @@ impl RuntimeOrchestrator {
 
         // Notify integration sink
         if let Some(sink) = &self.event_sink {
-            sink.on_shift_transition(new_shift_set, &to_remove);
+            sink.on_shift_transition(new_shift_set, to_remove);
         }
-
-        to_remove
     }
 
     /// Gibt alle Agenten zurueck die Errored oder Suspended sind.

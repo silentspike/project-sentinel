@@ -74,7 +74,7 @@ flowchart TB
     S1["bwrap (user-namespaces)"]
     S2["Landlock LSM"]
     S3["cgroups v2"]
-    S4["netns + nftables"]
+    S4["full-cage netns (loopback only)"]
     S5["Wasmtime (tool runtime)"]
   end
 
@@ -219,13 +219,14 @@ story.
 | NATS JetStream + sentinel-judge         | yes            | yes       |
 | **bwrap + Landlock per-agent isolation**| no (warned)    | yes       |
 | **cgroups v2 per-agent resource caps**  | no (warned)    | yes       |
-| **netns + nftables agent network**      | no (warned)    | yes       |
+| **full-cage per-agent network namespace** | no (warned)  | yes       |
 | **eBPF probes (aya-rs)**                | no (warned)    | yes       |
 | **sentinel-fs CAS-FUSE**                | no (warned)    | yes       |
 | Zenoh SHM transport                     | no (TCP only)  | yes       |
 
-These kernel-bound features need user namespaces, `CAP_BPF`,
-`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, and a writeable bpf-fs / `/dev/fuse`.
+These kernel-bound features need user namespaces, cgroups v2, `CAP_BPF`,
+and a writeable bpf-fs / `/dev/fuse` as applicable. Full-cage networking
+does not require a host bridge, veth pair, nftables rule, or `CAP_NET_ADMIN`.
 A plain unprivileged container has none of those. The
 `SandboxEnforcer` (`crates/sentinel-sandbox/src/enforcer.rs`) detects
 the absence at boot and degrades gracefully — warnings in the daemon
@@ -267,16 +268,16 @@ console in one command, not to reproduce the full sandbox story.
   quality metrics.
 
 ### What the demo does not exercise
-The kernel-bound sandbox primitives (per-agent isolation) require
-`CAP_BPF`, `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, user namespaces, and a
-writeable bpf-fs / `/dev/fuse`. A plain unprivileged Docker container
-has none of those. The `SandboxEnforcer`
+The kernel-bound sandbox primitives (per-agent isolation) require user
+namespaces, cgroups v2, `CAP_BPF`, and a writeable bpf-fs / `/dev/fuse` as
+applicable. A plain unprivileged Docker container does not expose those
+facilities. The `SandboxEnforcer`
 (`crates/sentinel-sandbox/src/enforcer.rs`) detects the absence at boot
 and degrades gracefully — warnings in the daemon log are the expected
 demo signal.
 
 For the full stack with sandbox enforcement (bwrap + Landlock + cgroups
-+ netns + nftables + Wasmtime) see `deploy/systemd/*.service` and the
++ full-cage netns + Wasmtime) see `deploy/systemd/*.service` and the
 [TOGAF v22.1 architecture guide](docs/architecture/togaf-architecture-guide.html).
 
 ### Verified by external tests
@@ -300,7 +301,7 @@ target; the docker demo is a deliberate behavioral subset.
 | sentinel-nightrun batch consolidation, deterministic replay | ✅ implemented, manual trigger | yes | yes |
 | **bwrap + Landlock per-agent isolation** | ✅ implemented + 9/9 breakout-tested (`crates/sentinel-sandbox/`) | **no (kernel-caps)** | **yes** |
 | **cgroups v2 per-agent caps** | ✅ implemented | **no (kernel-caps)** | **yes** |
-| **netns + nftables agent network** | ✅ implemented | **no (kernel-caps)** | **yes** |
+| **full-cage per-agent network namespace** | ✅ implemented + post-spawn verified | **no (kernel-caps)** | **yes** |
 | **eBPF probes (aya-rs)** | ✅ implemented | **no (kernel-caps)** | **yes** |
 | **sentinel-fs CAS-FUSE** | ✅ implemented | **no (FUSE)** | **yes** |
 | TOGAF v22.1 architecture guide + per-cluster gap report | ✅ shipped in `docs/architecture/` | n/a | n/a |

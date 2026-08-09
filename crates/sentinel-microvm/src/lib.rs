@@ -23,6 +23,10 @@
 //! - KVM: `/dev/kvm` muss vorhanden und beschreibbar sein (sonst sauberer Fehler bei `spawn`).
 //! - Firecracker-Binary (Pfad via [`MicrovmConfig`], Default `firecracker` im PATH).
 //! - Gast-Kernel-Image (vmlinux) und rootfs (ext4) — Pfade via [`MicrovmConfig`].
+//! - Das rootfs enthaelt den konfigurierten Guest-PID-1-Launcher (Default
+//!   `/opt/sentinel/bin/sentinel-nano-init`). Er dekodiert den versionierten
+//!   `sentinel.workload_spec_hex`-Kernelparameter und startet exakt den angeforderten Workload;
+//!   siehe `docs/microvm-guest-workload-contract.md`.
 //!
 //! Greenfield-PoC (prio:low): keine produktive Kernel-/rootfs-Image-Pipeline; cross-node-Migration
 //! ist out-of-scope (Multi-Node-gated).

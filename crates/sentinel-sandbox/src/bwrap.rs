@@ -5,7 +5,7 @@ use std::io::Read;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -32,6 +32,53 @@ const INFO_FD_TIMEOUT_MS: libc::c_int = 5000;
 pub struct SpawnedSandbox {
     pub child: Child,
     pub child_pid: Option<u32>,
+}
+
+impl SpawnedSandbox {
+    /// Terminates both the sandboxed process and its bwrap supervisor.
+    pub fn terminate(&mut self) {
+        terminate_sandbox_process(&mut self.child, self.child_pid);
+    }
+}
+
+pub(crate) fn terminate_sandbox_process(child: &mut Child, child_pid: Option<u32>) {
+    if let Some(pid) = child_pid {
+        signal_pid(pid, "TERM");
+    }
+
+    match child.try_wait() {
+        Ok(Some(_status)) => {}
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(_) => {}
+    }
+
+    if let Some(pid) = child_pid {
+        for _ in 0..20 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        signal_pid(pid, "KILL");
+        for _ in 0..20 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        warn!(pid, "sandboxed child remained visible after SIGKILL");
+    }
+}
+
+fn signal_pid(pid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .args([format!("-{signal}"), pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Bubblewrap sandbox configuration fuer einen einzelnen Agenten.
