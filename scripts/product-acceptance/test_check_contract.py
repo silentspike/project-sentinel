@@ -13,6 +13,11 @@ MATRIX_REL = Path("scripts/product-acceptance/m0-contract.toml")
 PROFILE_REL = Path("config/work-profiles/web-project-v1.toml")
 CONTRACT_REL = Path("docs/virtual-company-work-execution.md")
 EVIDENCE_REL = Path("console/evidence/issue-693-live/contract-gate.md")
+DELIVERY_ISSUES_LINE = (
+    "delivery_issues = [75, 472, 650, 693, 694, 695, 696, 698, 701, 735, 762]"
+)
+SERIAL_CHAIN_LINE = "serial_chain = [472, 701, 694, 695, 696, 650]"
+PARALLEL_EDGES_LINE = "parallel_correctness_edges = [735, 762]"
 
 
 class ContractValidatorTests(unittest.TestCase):
@@ -60,10 +65,98 @@ class ContractValidatorTests(unittest.TestCase):
     def test_duplicate_delivery_issue_is_rejected(self) -> None:
         self.replace(
             MATRIX_REL,
-            "delivery_issues = [75, 472, 650, 693, 694, 695, 696, 698]",
-            "delivery_issues = [75, 75, 472, 650, 693, 694, 695, 696, 698]",
+            DELIVERY_ISSUES_LINE,
+            "delivery_issues = [75, 75, 472, 650, 693, 694, 695, 696, 698, 701, 735, 762]",
         )
         self.assert_error(self.validate(), "matrix.delivery_issues")
+
+    def test_delivery_issues_require_issue_701(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            DELIVERY_ISSUES_LINE,
+            DELIVERY_ISSUES_LINE.replace(", 701", ""),
+        )
+        self.assert_error(self.validate(), "matrix.delivery_issues")
+
+    def test_delivery_issues_require_issue_735(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            DELIVERY_ISSUES_LINE,
+            DELIVERY_ISSUES_LINE.replace(", 735", ""),
+        )
+        self.assert_error(self.validate(), "matrix.delivery_issues")
+
+    def test_delivery_issues_require_issue_762(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            DELIVERY_ISSUES_LINE,
+            DELIVERY_ISSUES_LINE.replace(", 762", ""),
+        )
+        self.assert_error(self.validate(), "matrix.delivery_issues")
+
+    def test_serial_chain_missing_entry_is_rejected(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            SERIAL_CHAIN_LINE,
+            "serial_chain = [472, 701, 694, 695, 650]",
+        )
+        self.assert_error(self.validate(), "matrix.serial_chain")
+
+    def test_serial_chain_reordered_entry_is_rejected(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            SERIAL_CHAIN_LINE,
+            "serial_chain = [472, 694, 701, 695, 696, 650]",
+        )
+        self.assert_error(self.validate(), "matrix.serial_chain")
+
+    def test_serial_chain_duplicate_entry_is_rejected(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            SERIAL_CHAIN_LINE,
+            "serial_chain = [472, 701, 701, 694, 695, 696, 650]",
+        )
+        self.assert_error(self.validate(), "matrix.serial_chain")
+
+    def test_serial_chain_extra_entry_is_rejected(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            SERIAL_CHAIN_LINE,
+            "serial_chain = [472, 701, 694, 695, 696, 650, 751]",
+        )
+        self.assert_error(self.validate(), "matrix.serial_chain")
+
+    def test_parallel_edges_missing_entry_is_rejected(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            PARALLEL_EDGES_LINE,
+            "parallel_correctness_edges = [735]",
+        )
+        self.assert_error(self.validate(), "matrix.parallel_correctness_edges")
+
+    def test_parallel_edges_reordered_entry_is_rejected(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            PARALLEL_EDGES_LINE,
+            "parallel_correctness_edges = [762, 735]",
+        )
+        self.assert_error(self.validate(), "matrix.parallel_correctness_edges")
+
+    def test_parallel_edges_duplicate_entry_is_rejected(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            PARALLEL_EDGES_LINE,
+            "parallel_correctness_edges = [735, 735, 762]",
+        )
+        self.assert_error(self.validate(), "matrix.parallel_correctness_edges")
+
+    def test_parallel_edges_extra_entry_is_rejected(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            PARALLEL_EDGES_LINE,
+            "parallel_correctness_edges = [735, 762, 751]",
+        )
+        self.assert_error(self.validate(), "matrix.parallel_correctness_edges")
 
     def test_requirement_id_category_mismatch_is_rejected(self) -> None:
         self.replace(MATRIX_REL, 'id = "M0-CONTRACT-001"', 'id = "M0-TOOLS-099"')
@@ -99,10 +192,58 @@ class ContractValidatorTests(unittest.TestCase):
     def test_blocked_requirement_needs_reason(self) -> None:
         self.replace(
             MATRIX_REL,
-            'blocker = "Issue #472 is open and its production-daemon selection path is not yet verified for M0."\n',
+            'blocker = "source_merged_live_pending: #472 source is merged; final integrated M0 live evidence is pending."\n',
             "",
         )
         self.assert_error(self.validate(), "blocked requirements need a reason")
+
+    def test_required_transport_edge_cannot_be_removed(self) -> None:
+        self.replace(MATRIX_REL, 'id = "M0-RUNTIME-003"', 'id = "M0-RUNTIME-099"')
+        self.assert_error(self.validate(), "missing required M0 edge 'M0-RUNTIME-003'")
+
+    def test_required_edge_owner_is_bound(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            'owner_issue = 735\ntest_id = "m0.memory.durable_episode_projection"',
+            'owner_issue = 650\ntest_id = "m0.memory.durable_episode_projection"',
+        )
+        self.assert_error(
+            self.validate(), "matrix.requirements[M0-MEMORY-002].owner_issue"
+        )
+
+    def test_required_edge_evidence_path_is_bound(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            'evidence = "console/evidence/issue-762-live/pressure-safe-shift.md"',
+            'evidence = "console/evidence/issue-650-live/ac-15-soak.md"',
+        )
+        self.assert_error(
+            self.validate(), "matrix.requirements[M0-STABILITY-002].evidence"
+        )
+
+    def test_issue_701_cannot_pass_without_verified_evidence(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            'evidence = "console/evidence/issue-701-live/bwrap-jsonl-channel.md"\nstatus = "blocked"',
+            'evidence = "console/evidence/issue-701-live/bwrap-jsonl-channel.md"\nstatus = "pass"',
+        )
+        self.assert_error(self.validate(), "pass requires a non-empty evidence file")
+
+    def test_issue_735_source_only_row_cannot_pass_without_live_evidence(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            'evidence = "console/evidence/issue-735-live/durable-episode-projection.md"\nstatus = "blocked"',
+            'evidence = "console/evidence/issue-735-live/durable-episode-projection.md"\nstatus = "pass"',
+        )
+        self.assert_error(self.validate(), "pass requires a non-empty evidence file")
+
+    def test_issue_762_source_only_row_cannot_pass_without_live_evidence(self) -> None:
+        self.replace(
+            MATRIX_REL,
+            'evidence = "console/evidence/issue-762-live/pressure-safe-shift.md"\nstatus = "blocked"',
+            'evidence = "console/evidence/issue-762-live/pressure-safe-shift.md"\nstatus = "pass"',
+        )
+        self.assert_error(self.validate(), "pass requires a non-empty evidence file")
 
     def test_unknown_contract_heading_is_rejected(self) -> None:
         self.replace(
