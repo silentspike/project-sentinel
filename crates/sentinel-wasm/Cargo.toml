@@ -17,8 +17,8 @@ sha2 = { workspace = true }
 tracing = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
 uuid = { workspace = true }
-wasmtime = { version = "45.0.3", features = ["component-model"], optional = true }
-wasmtime-wasi = { version = "45.0.3", optional = true }
+wasmtime = { version = "46.0.2", features = ["component-model"], optional = true }
+wasmtime-wasi = { version = "46.0.2", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

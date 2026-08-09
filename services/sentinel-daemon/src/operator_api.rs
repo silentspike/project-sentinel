@@ -4003,7 +4003,7 @@ mod tests {
                 recipient_node: follower,
                 owner_term: term,
                 base_role: sentinel_common::LocalOwnerBaseRole::Follower,
-                activation_state: sentinel_common::ActivationState::Routable,
+                activation_state: sentinel_common::ActivationState::NotRoutable,
             }],
         )
         .unwrap();
