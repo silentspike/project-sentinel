@@ -3,7 +3,9 @@ profile = "web-project-v1"
 profile_path = "config/work-profiles/web-project-v1.toml"
 contract_path = "docs/virtual-company-work-execution.md"
 epic = 650
-delivery_issues = [75, 472, 650, 693, 694, 695, 696, 698]
+delivery_issues = [75, 472, 650, 693, 694, 695, 696, 698, 701, 735, 762]
+serial_chain = [472, 701, 694, 695, 696, 650]
+parallel_correctness_edges = [735, 762]
 required_categories = [
   "contract",
   "deployment",
@@ -150,7 +152,7 @@ live_probe = "select-bwrap-without-fallback"
 evidence = "console/evidence/issue-472-live/m0-runtime-selection.md"
 status = "blocked"
 blocked_by = [472]
-blocker = "Issue #472 is open and its production-daemon selection path is not yet verified for M0."
+blocker = "source_merged_live_pending: #472 source is merged; final integrated M0 live evidence is pending."
 
 [[requirements]]
 id = "M0-RUNTIME-002"
@@ -163,6 +165,20 @@ test_id = "m0.runtime.idempotent_stop"
 live_probe = "stop-replay-and-resource-release"
 evidence = "console/evidence/issue-698-live/nano-runtime-stop.md"
 status = "not_tested"
+
+[[requirements]]
+id = "M0-RUNTIME-003"
+category = "runtime"
+title = "Bounded cancellable runtime transport"
+togaf_anchor = "Nano-container invocation transport"
+contract_section = "Agent Workbench Contract"
+owner_issue = 701
+test_id = "m0.runtime.cancellable_transport"
+live_probe = "jsonl-cancel-deadline-and-process-tree"
+evidence = "console/evidence/issue-701-live/bwrap-jsonl-channel.md"
+status = "blocked"
+blocked_by = [694]
+blocker = "Issue #701 source is merged; productive #694 integration and final live acceptance are pending."
 
 [[requirements]]
 id = "M0-TOOLS-001"
@@ -313,6 +329,20 @@ evidence = "console/evidence/issue-650-live/ac-12-recovery.md"
 status = "not_tested"
 
 [[requirements]]
+id = "M0-MEMORY-002"
+category = "memory"
+title = "Durable episode projection across restart and replay"
+togaf_anchor = "Durable event-to-memory lineage"
+contract_section = "Idempotency and Recovery"
+owner_issue = 735
+test_id = "m0.memory.durable_episode_projection"
+live_probe = "episode-projection-restart-and-replay"
+evidence = "console/evidence/issue-735-live/durable-episode-projection.md"
+status = "blocked"
+blocked_by = [735]
+blocker = "Issue #735 source delivery is not final; the required integrated live evidence is pending."
+
+[[requirements]]
 id = "M0-CONSOLE-001"
 category = "console"
 title = "Matching customer-to-acceptance Console lineage"
@@ -349,3 +379,17 @@ test_id = "m0.stability.product_soak"
 live_probe = "full-service-soak-and-consistency-scan"
 evidence = "console/evidence/issue-650-live/ac-15-soak.md"
 status = "not_tested"
+
+[[requirements]]
+id = "M0-STABILITY-002"
+category = "stability"
+title = "Pressure-safe shift admission and recovery"
+togaf_anchor = "Deterministic pressure-aware roster transitions"
+contract_section = "Acceptance and Rollout"
+owner_issue = 762
+test_id = "m0.stability.pressure_safe_shift"
+live_probe = "pressure-block-recovery-and-restart"
+evidence = "console/evidence/issue-762-live/pressure-safe-shift.md"
+status = "blocked"
+blocked_by = [762]
+blocker = "Issue #762 source is merged; AC-8 integrated live acceptance is pending."
