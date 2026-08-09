@@ -9,7 +9,7 @@ publish = false
 anyhow = { workspace = true }
 landlock = "0.4"
 libc = "0.2"
-nix = { version = "0.30", features = ["process", "signal"] }
+nix = { version = "0.30", features = ["fs", "process", "signal"] }
 sentinel-common = { path = "../sentinel-common" }
 sentinel-fs = { path = "../sentinel-fs" }
 sentinel-zenoh = { path = "../sentinel-zenoh" }

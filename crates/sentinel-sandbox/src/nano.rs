@@ -6,16 +6,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use sentinel_common::nano_runtime::{
     ensure_handle_instance, ensure_handle_runtime, NanoExecError, NanoExecErrorCode,
-    NanoExecRequest, NanoExecResult, NanoHandle, NanoHealth, NanoHealthState,
-    NanoIsolationPolicy, NanoIsolationReport, NanoRecoveryResult, NanoRuntime,
-    NanoRuntimeControlAction, NanoRuntimeControlResult, NanoRuntimeResources, NanoSnapshot,
-    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
+    NanoExecRequest, NanoExecResult, NanoHandle, NanoHealth, NanoHealthState, NanoIsolationPolicy,
+    NanoIsolationReport, NanoRecoveryResult, NanoRuntime, NanoRuntimeControlAction,
+    NanoRuntimeControlResult, NanoRuntimeResources, NanoSnapshot, NanoSnapshotSemantics,
+    NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
 };
 use sentinel_fs::artifact::ArtifactPlane;
 use sentinel_fs::home_manifest::{self, HomeManifest, RestorePolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::enforcer::{
+    ProtocolCancelOwner, ProtocolSupervisionFailure, ProtocolSupervisionSnapshot,
+};
 use crate::{cgroups, AgentProcess, CgroupLimits, SandboxEnforcer, SandboxHandle};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,17 +68,20 @@ enum BwrapSpawnStage {
 
 #[derive(Debug)]
 struct WorkbenchExchange {
+    instance_id: uuid::Uuid,
     invocation_id: String,
     request_digest: String,
-    deadline_unix_ms: u64,
     cancel_requested_at_ms: Option<u64>,
     cancel_digest: Option<String>,
+    deadline_cancel_digest: Option<String>,
     cancel_origin: Option<WorkbenchCancelOrigin>,
     messages: Vec<serde_json::Value>,
     retained_bytes: usize,
     result_seen: bool,
     terminal: Option<WorkbenchTerminal>,
     terminal_error: Option<NanoExecError>,
+    finalized: bool,
+    cleanup_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +102,6 @@ const DEFAULT_HOME_CAS_DIR: &str = "/ram/agents/.sentinel-home-cas";
 const DEFAULT_AGENT_HOME_ROOT: &str = "/ram/agents";
 const MAX_WORKBENCH_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKBENCH_OUTPUT_BYTES: usize = 256 * 1024;
-const WORKBENCH_CANCEL_GRACE_MS: u64 = 1_000;
 
 fn exec_error(
     code: NanoExecErrorCode,
@@ -291,11 +296,26 @@ impl BwrapNanoRuntime {
         let stopped = self.processes.contains_key(workload_id)
             || self.handles.contains_key(workload_id)
             || self.workloads.contains_key(workload_id);
-        if let Some(process) = self.processes.get_mut(workload_id) {
-            process.terminate_checked()?;
-        }
+        let (owned_process_reaped, cgroup_quiesced) =
+            if let Some(process) = self.processes.get_mut(workload_id) {
+                process.terminate_checked()?;
+                (
+                    true,
+                    process.protocol_supervision_snapshot().cgroup_quiesced,
+                )
+            } else {
+                (false, false)
+            };
         if let Some(handle) = self.handles.get(workload_id).cloned() {
+            let handle = teardown_handle_after_owned_process_reap(
+                handle,
+                owned_process_reaped,
+                cgroup_quiesced,
+            );
             self.enforcer.teardown_agent(&handle)?;
+        }
+        if let Some(process) = self.processes.get_mut(workload_id) {
+            process.join_protocol_reader();
         }
         if let Some((agent_name, owned_object_ids)) = self.workloads.get(workload_id).map(|state| {
             (
@@ -319,7 +339,7 @@ impl BwrapNanoRuntime {
         if !self.pending_spawns.contains_key(workload_id) {
             return Ok(false);
         }
-        if let Some(process) = self
+        let owned_process_reaped = if let Some(process) = self
             .pending_spawns
             .get_mut(workload_id)
             .and_then(|transaction| transaction.process.as_mut())
@@ -327,7 +347,10 @@ impl BwrapNanoRuntime {
             process
                 .terminate_checked()
                 .with_context(|| format!("rollback process for {workload_id}"))?;
-        }
+            true
+        } else {
+            false
+        };
         let handle = self
             .pending_spawns
             .get(workload_id)
@@ -344,14 +367,23 @@ impl BwrapNanoRuntime {
                 transaction.state.workload.workload_id.clone(),
             )
         };
-        if let Some(handle) = handle.as_ref() {
+        if let Some(handle) = handle {
+            let handle =
+                teardown_handle_after_owned_process_reap(handle, owned_process_reaped, false);
             self.enforcer
-                .teardown_agent(handle)
+                .teardown_agent(&handle)
                 .with_context(|| format!("rollback sandbox for {workload_id}"))?;
         } else if setup_started {
             self.enforcer
                 .recover_partial_agent_setup(&agent_name)
                 .with_context(|| format!("rollback partial setup for {workload_id}"))?;
+        }
+        if let Some(process) = self
+            .pending_spawns
+            .get_mut(workload_id)
+            .and_then(|transaction| transaction.process.as_mut())
+        {
+            process.join_protocol_reader();
         }
         if marker_written {
             self.remove_marker(&agent_name, &marker_workload_id)
@@ -385,6 +417,7 @@ impl BwrapNanoRuntime {
             || self.handles.contains_key(&workload.workload_id)
             || self.processes.contains_key(&workload.workload_id)
             || self.pending_spawns.contains_key(&workload.workload_id)
+            || self.exchanges.contains_key(&workload.workload_id)
         {
             return Err(anyhow!(
                 "bwrap workload '{}' is already active",
@@ -463,9 +496,11 @@ impl BwrapNanoRuntime {
             Vec::new()
         };
         if let Some(process) = self.processes.get(workload_id) {
-            pids.push(process.pid);
-            if let Some(child_pid) = process.child_pid {
-                pids.push(child_pid);
+            if !process.owned_process_reaped() {
+                pids.push(process.pid);
+                if let Some(child_pid) = process.child_pid {
+                    pids.push(child_pid);
+                }
             }
         }
         pids.sort_unstable();
@@ -654,9 +689,91 @@ impl BwrapNanoRuntime {
         let failure = NanoExecError::new(code, false, safe_message);
         if let Some(exchange) = self.exchanges.get_mut(workload_id) {
             exchange.terminal_error = Some(failure.clone());
+            exchange.cleanup_pending = true;
         }
-        let _ = self.teardown_runtime_resources(workload_id);
+        if self.teardown_runtime_resources(workload_id).is_err() {
+            return exec_error(
+                NanoExecErrorCode::ChannelDisconnected,
+                true,
+                "workbench cleanup remains pending",
+            );
+        }
+        if let Some(exchange) = self.exchanges.get_mut(workload_id) {
+            exchange.cleanup_pending = false;
+        }
         failure.into()
+    }
+
+    fn synchronize_protocol_supervision(
+        &mut self,
+        workload_id: &str,
+    ) -> Option<ProtocolSupervisionSnapshot> {
+        let snapshot = self
+            .processes
+            .get(workload_id)
+            .map(AgentProcess::protocol_supervision_snapshot)?;
+        if snapshot.cancel_owner == Some(ProtocolCancelOwner::Deadline) {
+            if let Some(exchange) = self.exchanges.get_mut(workload_id) {
+                if exchange.cancel_origin != Some(WorkbenchCancelOrigin::Deadline) {
+                    let cancel = deadline_cancel_frame(&exchange.invocation_id);
+                    let digest = frame_digest(&cancel);
+                    exchange.cancel_requested_at_ms = snapshot.cancel_requested_at_ms;
+                    if let Some(existing) = exchange.deadline_cancel_digest.as_deref() {
+                        debug_assert_eq!(existing, digest);
+                    } else {
+                        exchange.deadline_cancel_digest = Some(digest);
+                    }
+                    exchange.cancel_origin = Some(WorkbenchCancelOrigin::Deadline);
+                }
+            }
+        }
+        Some(snapshot)
+    }
+
+    fn retry_pending_exchange_cleanup(&mut self, workload_id: &str) -> Result<()> {
+        if !self
+            .exchanges
+            .get(workload_id)
+            .is_some_and(|exchange| exchange.cleanup_pending)
+        {
+            return Ok(());
+        }
+        self.teardown_runtime_resources(workload_id).map_err(|_| {
+            exec_error(
+                NanoExecErrorCode::ChannelDisconnected,
+                true,
+                "workbench cleanup remains pending",
+            )
+        })?;
+        if let Some(exchange) = self.exchanges.get_mut(workload_id) {
+            exchange.cleanup_pending = false;
+        }
+        Ok(())
+    }
+
+    fn validate_exchange_handle(&self, handle: &NanoHandle) -> Result<()> {
+        if handle.runtime_key != RUNTIME_BWRAP_LANDLOCK {
+            return Err(exec_error(
+                NanoExecErrorCode::UnsupportedRuntime,
+                false,
+                "workbench execution requires the bwrap runtime",
+            ));
+        }
+        let exchange = self.exchanges.get(&handle.workload_id).ok_or_else(|| {
+            exec_error(
+                NanoExecErrorCode::WorkloadUnavailable,
+                false,
+                "workbench exchange is unavailable",
+            )
+        })?;
+        if exchange.instance_id != handle.instance_id {
+            return Err(exec_error(
+                NanoExecErrorCode::WorkloadUnavailable,
+                false,
+                "workbench handle does not own the retained exchange",
+            ));
+        }
+        Ok(())
     }
 
     fn start_workbench_exchange(
@@ -664,6 +781,13 @@ impl BwrapNanoRuntime {
         handle: &NanoHandle,
         input: &str,
     ) -> Result<NanoExecResult> {
+        if handle.runtime_key != RUNTIME_BWRAP_LANDLOCK {
+            return Err(exec_error(
+                NanoExecErrorCode::UnsupportedRuntime,
+                false,
+                "workbench execution requires the bwrap runtime",
+            ));
+        }
         let frame = parse_control_frame(input)?;
         if frame.get("kind").and_then(|value| value.as_str()) != Some("execute") {
             return Err(exec_error(
@@ -705,15 +829,19 @@ impl BwrapNanoRuntime {
                     "workbench request lacks an absolute deadline",
                 )
             })?;
-        if deadline_unix_ms <= unix_time_ms() {
-            return Err(exec_error(
-                NanoExecErrorCode::DeadlineExceeded,
-                false,
-                "workbench request deadline has expired",
-            ));
-        }
         let request_digest = frame_digest(input);
-        if let Some(exchange) = self.exchanges.get(&handle.workload_id) {
+        if self.exchanges.contains_key(&handle.workload_id) {
+            self.validate_exchange_handle(handle)?;
+            self.retry_pending_exchange_cleanup(&handle.workload_id)?;
+            let supervision = self.synchronize_protocol_supervision(&handle.workload_id);
+            if let Some(failure) = supervision.and_then(|snapshot| snapshot.failure) {
+                let (code, message) = supervision_failure_contract(failure);
+                return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
+            }
+            let exchange = self
+                .exchanges
+                .get(&handle.workload_id)
+                .expect("exchange retained after cleanup retry");
             if exchange.invocation_id != invocation_id {
                 return Err(exec_error(
                     NanoExecErrorCode::InvocationConflict,
@@ -735,9 +863,16 @@ impl BwrapNanoRuntime {
                 handle,
                 true,
                 &invocation_id,
-                exchange_state(exchange),
-                exchange.messages.clone(),
+                exchange_state_with_supervision(exchange, supervision),
+                exchange_messages_with_supervision(exchange, supervision),
             );
+        }
+        if deadline_unix_ms <= unix_time_ms() {
+            return Err(exec_error(
+                NanoExecErrorCode::DeadlineExceeded,
+                false,
+                "workbench request deadline has expired",
+            ));
         }
         let channel_available = self
             .processes
@@ -750,43 +885,60 @@ impl BwrapNanoRuntime {
                 )
             })?
             .protocol_channel_available();
-        if !channel_available {
-            let _ = self.teardown_workload(&handle.workload_id);
-            return Err(exec_error(
-                NanoExecErrorCode::ChannelUnavailable,
-                false,
-                "workbench protocol channel is unavailable",
-            ));
-        }
-        let send_result = self
-            .processes
-            .get_mut(&handle.workload_id)
-            .expect("workload retained after channel validation")
-            .send_protocol_line(input);
-        if send_result.is_err() {
-            let _ = self.teardown_workload(&handle.workload_id);
-            return Err(exec_error(
-                NanoExecErrorCode::ChannelDisconnected,
-                false,
-                "workbench request channel disconnected",
-            ));
-        }
         self.exchanges.insert(
             handle.workload_id.clone(),
             WorkbenchExchange {
+                instance_id: handle.instance_id,
                 invocation_id: invocation_id.clone(),
                 request_digest,
-                deadline_unix_ms,
                 cancel_requested_at_ms: None,
                 cancel_digest: None,
+                deadline_cancel_digest: None,
                 cancel_origin: None,
                 messages: Vec::new(),
                 retained_bytes: 0,
                 result_seen: false,
                 terminal: None,
                 terminal_error: None,
+                finalized: false,
+                cleanup_pending: false,
             },
         );
+        if !channel_available {
+            return Err(self.fail_workbench_exchange(
+                &handle.workload_id,
+                NanoExecErrorCode::ChannelUnavailable,
+                "workbench protocol channel is unavailable",
+            ));
+        }
+        let supervision_started = self
+            .processes
+            .get_mut(&handle.workload_id)
+            .expect("workload retained after channel validation")
+            .start_protocol_supervision(&invocation_id, deadline_unix_ms);
+        if supervision_started.is_err() {
+            return Err(self.fail_workbench_exchange(
+                &handle.workload_id,
+                NanoExecErrorCode::ChannelUnavailable,
+                "workbench protocol supervision is unavailable",
+            ));
+        }
+        let send_result = self
+            .processes
+            .get_mut(&handle.workload_id)
+            .expect("workload retained after supervision start")
+            .send_protocol_line(input);
+        if send_result.is_err() {
+            self.processes
+                .get(&handle.workload_id)
+                .expect("workload retained after request send failure")
+                .mark_protocol_channel_disconnected();
+            return Err(self.fail_workbench_exchange(
+                &handle.workload_id,
+                NanoExecErrorCode::ChannelDisconnected,
+                "workbench request channel disconnected",
+            ));
+        }
         workbench_exec_result(handle, true, &invocation_id, "accepted", Vec::new())
     }
 
@@ -816,7 +968,14 @@ impl BwrapNanoRuntime {
                 )
             })?;
         let cancel_digest = frame_digest(input);
-        let exchange = self.exchanges.get_mut(&handle.workload_id).ok_or_else(|| {
+        self.validate_exchange_handle(handle)?;
+        self.retry_pending_exchange_cleanup(&handle.workload_id)?;
+        let supervision = self.synchronize_protocol_supervision(&handle.workload_id);
+        if let Some(failure) = supervision.and_then(|snapshot| snapshot.failure) {
+            let (code, message) = supervision_failure_contract(failure);
+            return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
+        }
+        let exchange = self.exchanges.get(&handle.workload_id).ok_or_else(|| {
             exec_error(
                 NanoExecErrorCode::WorkloadUnavailable,
                 false,
@@ -845,20 +1004,20 @@ impl BwrapNanoRuntime {
                 handle,
                 true,
                 invocation_id,
-                exchange_state(exchange),
-                exchange.messages.clone(),
+                exchange_state_with_supervision(exchange, supervision),
+                exchange_messages_with_supervision(exchange, supervision),
             );
         }
-        if let Some(failure) = exchange.terminal_error.as_ref() {
-            return Err(failure.clone().into());
+        if let Some(failure) = exchange.terminal_error.clone() {
+            return Err(failure.into());
         }
         if exchange.terminal.is_some() {
             return workbench_exec_result(
                 handle,
                 true,
                 invocation_id,
-                "completed",
-                exchange.messages.clone(),
+                exchange_state_with_supervision(exchange, supervision),
+                exchange_messages_with_supervision(exchange, supervision),
             );
         }
         let channel_available = self
@@ -872,31 +1031,92 @@ impl BwrapNanoRuntime {
                 "workbench protocol channel is unavailable",
             ));
         }
+        let requested_at_ms = unix_time_ms();
+        let cancel_owner = self
+            .processes
+            .get(&handle.workload_id)
+            .expect("workload retained after channel validation")
+            .begin_explicit_protocol_cancel(requested_at_ms);
+        let snapshot = self
+            .synchronize_protocol_supervision(&handle.workload_id)
+            .expect("workload retained after cancellation claim");
+        let Some(cancel_owner) = cancel_owner else {
+            if let Some(failure) = snapshot.failure {
+                let (code, message) = supervision_failure_contract(failure);
+                return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
+            }
+            let exchange = self
+                .exchanges
+                .get(&handle.workload_id)
+                .expect("terminalizing exchange retained after rejected cancel claim");
+            return workbench_exec_result(
+                handle,
+                true,
+                invocation_id,
+                exchange_state_with_supervision(exchange, Some(snapshot)),
+                exchange_messages_with_supervision(exchange, Some(snapshot)),
+            );
+        };
+        {
+            let exchange = self
+                .exchanges
+                .get_mut(&handle.workload_id)
+                .expect("exchange retained after cancellation claim");
+            exchange.cancel_digest = Some(cancel_digest);
+            exchange.cancel_requested_at_ms = snapshot.cancel_requested_at_ms;
+            exchange.cancel_origin = Some(match cancel_owner {
+                ProtocolCancelOwner::Explicit => WorkbenchCancelOrigin::Explicit,
+                ProtocolCancelOwner::Deadline => WorkbenchCancelOrigin::Deadline,
+            });
+        }
+        if cancel_owner == ProtocolCancelOwner::Deadline {
+            // The autonomous deadline path owns the one child cancellation
+            // frame, including the interval between claim and completed send.
+            let exchange = self
+                .exchanges
+                .get(&handle.workload_id)
+                .expect("deadline-owned cancellation retained");
+            return workbench_exec_result(
+                handle,
+                true,
+                invocation_id,
+                exchange_state_with_supervision(exchange, Some(snapshot)),
+                exchange_messages_with_supervision(exchange, Some(snapshot)),
+            );
+        }
         let send_result = self
             .processes
             .get_mut(&handle.workload_id)
-            .expect("workload retained after channel validation")
+            .expect("workload retained while cancellation is sent")
             .send_protocol_line(input);
         if send_result.is_err() {
+            self.processes
+                .get(&handle.workload_id)
+                .expect("workload retained after cancellation send failure")
+                .mark_protocol_channel_disconnected();
             return Err(self.fail_workbench_exchange(
                 &handle.workload_id,
                 NanoExecErrorCode::ChannelDisconnected,
                 "workbench cancellation channel disconnected",
             ));
         }
+        #[cfg(test)]
+        {
+            self.processes
+                .get(&handle.workload_id)
+                .expect("workload retained after cancellation send")
+                .mark_protocol_cancel_sent();
+        }
         let exchange = self
             .exchanges
-            .get_mut(&handle.workload_id)
+            .get(&handle.workload_id)
             .expect("exchange retained while cancellation is sent");
-        exchange.cancel_requested_at_ms = Some(unix_time_ms());
-        exchange.cancel_digest = Some(cancel_digest);
-        exchange.cancel_origin = Some(WorkbenchCancelOrigin::Explicit);
         workbench_exec_result(
             handle,
             true,
             invocation_id,
             "cancelling",
-            exchange.messages.clone(),
+            exchange_messages_with_supervision(exchange, Some(snapshot)),
         )
     }
 
@@ -925,6 +1145,8 @@ impl BwrapNanoRuntime {
                     "workbench poll frame lacks an invocation id",
                 )
             })?;
+        self.validate_exchange_handle(handle)?;
+        self.retry_pending_exchange_cleanup(&handle.workload_id)?;
         let exchange = self.exchanges.get(&handle.workload_id).ok_or_else(|| {
             exec_error(
                 NanoExecErrorCode::WorkloadUnavailable,
@@ -967,14 +1189,7 @@ impl BwrapNanoRuntime {
                     "workbench workload process disappeared before a terminal frame",
                 ));
             }
-            Some(false) => {
-                return Err(self.fail_workbench_exchange(
-                    &handle.workload_id,
-                    NanoExecErrorCode::ChannelUnavailable,
-                    "workbench protocol channel is unavailable",
-                ));
-            }
-            Some(true) => {}
+            Some(false) | Some(true) => {}
         }
         let drain = match self
             .processes
@@ -984,18 +1199,43 @@ impl BwrapNanoRuntime {
         {
             Ok(drain) => drain,
             Err(_) => {
-                return Err(self.fail_workbench_exchange(
-                    &handle.workload_id,
-                    NanoExecErrorCode::ProtocolViolation,
-                    "workbench output frame violated its configured bound",
-                ));
+                let supervision = self.synchronize_protocol_supervision(&handle.workload_id);
+                if let Some(failure) = supervision.and_then(|snapshot| snapshot.failure) {
+                    let (code, message) = supervision_failure_contract(failure);
+                    return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
+                }
+                let exchange = self
+                    .exchanges
+                    .get(&handle.workload_id)
+                    .expect("exchange retained while autonomous cleanup completes");
+                return workbench_exec_result(
+                    handle,
+                    true,
+                    invocation_id,
+                    exchange_state_with_supervision(exchange, supervision),
+                    exchange_messages_with_supervision(exchange, supervision),
+                );
             }
         };
-        let now_ms = unix_time_ms();
+        if drain.queue_overflowed {
+            let supervision = self.synchronize_protocol_supervision(&handle.workload_id);
+            if let Some(failure) = supervision.and_then(|snapshot| snapshot.failure) {
+                let (code, message) = supervision_failure_contract(failure);
+                return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
+            }
+            let exchange = self
+                .exchanges
+                .get(&handle.workload_id)
+                .expect("exchange retained while output cleanup completes");
+            return workbench_exec_result(
+                handle,
+                true,
+                invocation_id,
+                exchange_state_with_supervision(exchange, supervision),
+                exchange_messages_with_supervision(exchange, supervision),
+            );
+        }
         let mut violation = None;
-        let mut send_deadline_cancel = None;
-        let mut forced_cancel = None;
-        let mut terminal_requires_stop = false;
         {
             let exchange = self
                 .exchanges
@@ -1060,7 +1300,6 @@ impl BwrapNanoRuntime {
                             break;
                         }
                         exchange.terminal = Some(WorkbenchTerminal::Failed);
-                        terminal_requires_stop = true;
                     }
                     Some("cancelled") => {
                         if exchange.cancel_requested_at_ms.is_none()
@@ -1071,7 +1310,6 @@ impl BwrapNanoRuntime {
                             break;
                         }
                         exchange.terminal = Some(WorkbenchTerminal::Cancelled);
-                        terminal_requires_stop = true;
                     }
                     _ => {
                         violation = Some(NanoExecErrorCode::ProtocolViolation);
@@ -1080,83 +1318,43 @@ impl BwrapNanoRuntime {
                 }
                 exchange.messages.push(message);
             }
-            if violation.is_none() && drain.disconnected && exchange.terminal.is_none() {
-                violation = Some(NanoExecErrorCode::ChannelDisconnected);
-            }
-            if violation.is_none() && exchange.terminal.is_none() {
-                if let Some(cancelled_at) = exchange.cancel_requested_at_ms {
-                    if now_ms.saturating_sub(cancelled_at) >= WORKBENCH_CANCEL_GRACE_MS {
-                        forced_cancel = exchange.cancel_origin;
-                    }
-                } else if now_ms >= exchange.deadline_unix_ms {
-                    exchange.cancel_requested_at_ms = Some(now_ms);
-                    exchange.cancel_origin = Some(WorkbenchCancelOrigin::Deadline);
-                    let cancel = serde_json::json!({
-                        "kind": "cancel",
-                        "schema_version": 1,
-                        "invocation_id": exchange.invocation_id,
-                        "reason": "deadline_expired"
-                    });
-                    let cancel = serde_json::to_string(&cancel)?;
-                    exchange.cancel_digest = Some(frame_digest(&cancel));
-                    send_deadline_cancel = Some(cancel);
-                }
-            }
         }
-        if let Some(code) = violation {
-            let message = match code {
-                NanoExecErrorCode::OutputLimitExceeded => {
-                    "workbench output exceeded the configured limit"
-                }
-                NanoExecErrorCode::ChannelDisconnected => {
-                    "workbench output channel disconnected before a terminal frame"
-                }
-                NanoExecErrorCode::UnsupportedVersion => {
-                    "workbench child emitted an unsupported protocol version"
-                }
-                NanoExecErrorCode::InvocationConflict => {
-                    "workbench child emitted a foreign invocation id"
-                }
-                NanoExecErrorCode::InvalidFrame => "workbench child emitted an invalid JSON frame",
-                _ => "workbench child violated the protocol state machine",
-            };
+        if violation.is_some() {
+            let supervision = self.synchronize_protocol_supervision(&handle.workload_id);
+            if let Some(failure) = supervision.and_then(|snapshot| snapshot.failure) {
+                let (code, message) = supervision_failure_contract(failure);
+                return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
+            }
+            let exchange = self
+                .exchanges
+                .get(&handle.workload_id)
+                .expect("exchange retained while protocol cleanup completes");
+            return workbench_exec_result(
+                handle,
+                true,
+                invocation_id,
+                exchange_state_with_supervision(exchange, supervision),
+                exchange_messages_with_supervision(exchange, supervision),
+            );
+        }
+        let supervision = self.synchronize_protocol_supervision(&handle.workload_id);
+        let exchange_is_terminal = self
+            .exchanges
+            .get(&handle.workload_id)
+            .is_some_and(|exchange| exchange.terminal.is_some());
+        if let Some(failure) = supervision.and_then(|snapshot| snapshot.failure) {
+            let (code, message) = supervision_failure_contract(failure);
             return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
         }
-        if let Some(cancel) = send_deadline_cancel {
-            let send_result = self
-                .processes
+        let terminal_finalized = supervision.is_some_and(|snapshot| snapshot.terminal_finalized);
+        if exchange_is_terminal && terminal_finalized {
+            let exchange = self
+                .exchanges
                 .get_mut(&handle.workload_id)
-                .ok_or_else(|| {
-                    exec_error(
-                        NanoExecErrorCode::WorkloadUnavailable,
-                        false,
-                        "workbench workload process is unavailable",
-                    )
-                })?
-                .send_protocol_line(&cancel);
-            if send_result.is_err() {
-                return Err(self.fail_workbench_exchange(
-                    &handle.workload_id,
-                    NanoExecErrorCode::ChannelDisconnected,
-                    "workbench deadline cancellation channel disconnected",
-                ));
-            }
-        }
-        if let Some(origin) = forced_cancel {
-            let (code, message) = match origin {
-                WorkbenchCancelOrigin::Deadline => (
-                    NanoExecErrorCode::DeadlineExceeded,
-                    "workbench deadline expired without a terminal acknowledgement",
-                ),
-                WorkbenchCancelOrigin::Explicit => (
-                    NanoExecErrorCode::Cancelled,
-                    "workbench cancellation was not acknowledged within its grace period",
-                ),
-            };
-            return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
-        }
-        if terminal_requires_stop {
-            self.teardown_runtime_resources(&handle.workload_id)?;
+                .expect("terminal exchange retained before cleanup");
+            exchange.finalized = true;
+            exchange.cleanup_pending = true;
+            self.retry_pending_exchange_cleanup(&handle.workload_id)?;
         }
         let exchange = self
             .exchanges
@@ -1166,19 +1364,110 @@ impl BwrapNanoRuntime {
             handle,
             true,
             invocation_id,
-            exchange_state(exchange),
-            exchange.messages.clone(),
+            exchange_state_with_supervision(exchange, supervision),
+            exchange_messages_with_supervision(exchange, supervision),
         )
     }
 }
 
-fn exchange_state(exchange: &WorkbenchExchange) -> &'static str {
+fn teardown_handle_after_owned_process_reap(
+    mut handle: SandboxHandle,
+    owned_process_reaped: bool,
+    cgroup_quiesced: bool,
+) -> SandboxHandle {
+    if owned_process_reaped {
+        // The owned Child has already been waited. Never signal its numeric PID
+        // again: it may have been reused before cgroup cleanup begins.
+        handle.bwrap_pid = None;
+    }
+    if cgroup_quiesced {
+        handle.cgroup_created = false;
+    }
+    handle
+}
+
+fn exchange_state_with_supervision(
+    exchange: &WorkbenchExchange,
+    supervision: Option<ProtocolSupervisionSnapshot>,
+) -> &'static str {
     if exchange.terminal.is_some() {
-        "completed"
+        if exchange.finalized || supervision.is_some_and(|snapshot| snapshot.terminal_finalized) {
+            "completed"
+        } else if exchange.cancel_requested_at_ms.is_some() {
+            "cancelling"
+        } else {
+            "pending"
+        }
     } else if exchange.cancel_requested_at_ms.is_some() {
         "cancelling"
     } else {
         "pending"
+    }
+}
+
+fn exchange_messages_with_supervision(
+    exchange: &WorkbenchExchange,
+    supervision: Option<ProtocolSupervisionSnapshot>,
+) -> Vec<serde_json::Value> {
+    if exchange.terminal.is_some()
+        && !exchange.finalized
+        && !supervision.is_some_and(|snapshot| snapshot.terminal_finalized)
+    {
+        // A terminal child frame is provisional until the autonomous owner has
+        // closed the reader and quiesced the process tree. Do not expose the
+        // result/completed pair before the post-terminal validation window.
+        Vec::new()
+    } else {
+        exchange.messages.clone()
+    }
+}
+
+fn deadline_cancel_frame(invocation_id: &str) -> String {
+    serde_json::json!({
+        "kind": "cancel",
+        "schema_version": 1,
+        "invocation_id": invocation_id,
+        "reason": "deadline_expired"
+    })
+    .to_string()
+}
+
+fn supervision_failure_contract(
+    failure: ProtocolSupervisionFailure,
+) -> (NanoExecErrorCode, &'static str) {
+    match failure {
+        ProtocolSupervisionFailure::InvalidFrame => (
+            NanoExecErrorCode::InvalidFrame,
+            "workbench child emitted an invalid JSON frame",
+        ),
+        ProtocolSupervisionFailure::ProtocolViolation => (
+            NanoExecErrorCode::ProtocolViolation,
+            "workbench child violated the protocol state machine",
+        ),
+        ProtocolSupervisionFailure::UnsupportedVersion => (
+            NanoExecErrorCode::UnsupportedVersion,
+            "workbench child emitted an unsupported protocol version",
+        ),
+        ProtocolSupervisionFailure::InvocationConflict => (
+            NanoExecErrorCode::InvocationConflict,
+            "workbench child emitted a foreign invocation id",
+        ),
+        ProtocolSupervisionFailure::OutputLimitExceeded => (
+            NanoExecErrorCode::OutputLimitExceeded,
+            "workbench output exceeded the configured limit",
+        ),
+        ProtocolSupervisionFailure::ChannelDisconnected => (
+            NanoExecErrorCode::ChannelDisconnected,
+            "workbench output channel disconnected before a terminal frame",
+        ),
+        ProtocolSupervisionFailure::DeadlineExceeded => (
+            NanoExecErrorCode::DeadlineExceeded,
+            "workbench deadline expired without a terminal acknowledgement",
+        ),
+        ProtocolSupervisionFailure::Cancelled => (
+            NanoExecErrorCode::Cancelled,
+            "workbench cancellation was not acknowledged within its grace period",
+        ),
     }
 }
 
@@ -1299,6 +1588,8 @@ impl NanoRuntime for BwrapNanoRuntime {
         ensure_handle_runtime(handle, self.runtime_key())?;
         if let Some(state) = self.workloads.get(&handle.workload_id) {
             ensure_handle_instance(handle, state.instance_id)?;
+        } else if let Some(exchange) = self.exchanges.get(&handle.workload_id) {
+            ensure_handle_instance(handle, exchange.instance_id)?;
         }
         Ok(NanoStopResult::new(
             self.runtime_key(),
@@ -1835,12 +2126,14 @@ mod tests {
     ) -> NanoHandle {
         let workload = fixture_workload(workload_id, "agent-protocol-fixture");
         let pid = process.pid;
+        let instance_id = uuid::Uuid::new_v4();
         runtime.processes.insert(workload_id.to_string(), process);
         runtime.handles.insert(
             workload_id.to_string(),
             SandboxHandle {
                 agent_name: workload.agent_name.clone(),
                 cgroup_created: false,
+                cgroup_id: None,
                 io_available: false,
                 bwrap_pid: Some(pid),
                 landlock_applied: false,
@@ -1850,12 +2143,15 @@ mod tests {
         runtime.workloads.insert(
             workload_id.to_string(),
             BwrapWorkloadState {
+                instance_id,
                 workload,
                 command: Vec::new(),
                 owned_object_ids: Vec::new(),
+                suspended: false,
             },
         );
         NanoHandle {
+            instance_id,
             runtime_key: RUNTIME_BWRAP_LANDLOCK.to_string(),
             workload_id: workload_id.to_string(),
             agent_id: None,
@@ -1907,6 +2203,25 @@ mod tests {
             "invocation_id": invocation_id
         }))
         .unwrap()
+    }
+
+    fn wait_for_autonomous_quiescence(
+        runtime: &BwrapNanoRuntime,
+        workload_id: &str,
+    ) -> ProtocolSupervisionSnapshot {
+        for _ in 0..600 {
+            let snapshot = runtime.processes[workload_id].protocol_supervision_snapshot();
+            if (snapshot.failure.is_some() || snapshot.terminal_finalized)
+                && snapshot.process_reaped
+                && snapshot.reader_closed
+                && snapshot.stdin_closed
+                && snapshot.cgroup_quiesced
+            {
+                return snapshot;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("autonomous protocol supervisor did not quiesce {workload_id}");
     }
 
     fn assert_exec_error(error: &anyhow::Error, expected: NanoExecErrorCode) {
@@ -2275,6 +2590,135 @@ mod tests {
     }
 
     #[test]
+    fn retained_exchange_rejects_stale_incarnation_without_consuming_or_tearing_down() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2930";
+        let result =
+            format!(r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_id}"}}"#);
+        let completed = format!(
+            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_id}","stage":"completed"}}"#
+        );
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let handle = insert_protocol_fixture(
+            &mut runtime,
+            "protocol-stale-incarnation",
+            &[&result, &completed],
+        );
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap();
+
+        let mut stale = handle.clone();
+        stale.instance_id = uuid::Uuid::new_v4();
+        let error = runtime
+            .exec(
+                &stale,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::WorkloadUnavailable);
+        assert!(runtime.stop(&stale).is_err());
+        assert!(runtime.exchanges.contains_key(&handle.workload_id));
+
+        for _ in 0..100 {
+            let output = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_poll".to_string(),
+                        input: poll_frame(invocation_id),
+                    },
+                )
+                .unwrap();
+            if output.output.contains("completed") {
+                runtime.stop(&handle).unwrap();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("matching incarnation did not consume its retained exchange");
+    }
+
+    #[test]
+    fn byte_identical_start_replay_remains_stable_after_request_deadline() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2931";
+        let temp = tempfile::tempdir().unwrap();
+        let record_path = temp.path().join("protocol-input.jsonl");
+        let descendant_pid_path = temp.path().join("descendant.pid");
+        let claimed = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let process = AgentProcess::launch_recording_protocol_fixture(
+            &[],
+            &record_path,
+            &descendant_pid_path,
+        )
+        .unwrap();
+        process.install_deadline_send_barrier(
+            std::sync::Arc::clone(&claimed),
+            std::sync::Arc::clone(&release),
+        );
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "protocol-expired-replay", process);
+        let start = start_frame(invocation_id, unix_time_ms() + 20);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start.clone(),
+                },
+            )
+            .unwrap();
+        claimed.wait();
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start,
+                },
+            )
+            .unwrap();
+        let replay: serde_json::Value = serde_json::from_str(&replay.output).unwrap();
+        assert_eq!(replay["state"], "cancelling");
+        assert_ne!(replay["state"], "finalizing");
+        assert_eq!(wait_for_recorded_lines(&record_path, 1).lines().count(), 1);
+        release.wait();
+
+        let quiesced = wait_for_autonomous_quiescence(&runtime, "protocol-expired-replay");
+        assert_eq!(
+            quiesced.failure,
+            Some(ProtocolSupervisionFailure::DeadlineExceeded)
+        );
+        let recorded = wait_for_recorded_lines(&record_path, 2);
+        assert_eq!(
+            recorded.lines().count(),
+            2,
+            "byte-identical start replay must not emit another execute or deadline cancel frame"
+        );
+        let terminal = poll_until_error(&mut runtime, &handle, invocation_id);
+        assert_exec_error(&terminal, NanoExecErrorCode::DeadlineExceeded);
+        let terminal_replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(terminal_replay.to_string(), terminal.to_string());
+    }
+
+    #[test]
     fn bwrap_control_suspends_and_resumes_adapter_owned_process() {
         let temp = tempfile::tempdir().unwrap();
         let mut runtime =
@@ -2362,12 +2806,13 @@ mod tests {
         assert_exec_error(&error, NanoExecErrorCode::UnsupportedOperation);
         assert!(!error.to_string().contains("SECRET"));
 
+        let start = start_frame(invocation_id, unix_time_ms() + 10_000);
         let error = runtime
             .exec(
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_start".to_string(),
-                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                    input: start.clone(),
                 },
             )
             .unwrap_err();
@@ -2381,11 +2826,11 @@ mod tests {
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_start".to_string(),
-                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                    input: start,
                 },
             )
             .unwrap_err();
-        assert_exec_error(&error, NanoExecErrorCode::WorkloadUnavailable);
+        assert_exec_error(&error, NanoExecErrorCode::ChannelUnavailable);
     }
 
     #[test]
@@ -2464,7 +2909,235 @@ mod tests {
     }
 
     #[test]
-    fn unacknowledged_cancel_is_bounded_and_kills_the_process_tree() {
+    fn failed_protocol_cleanup_retains_exact_ownership_for_retry() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2932";
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime =
+            BwrapNanoRuntime::with_test_dirs(temp.path().join("cas"), temp.path().join("homes"));
+        let workload_id = "protocol-cleanup-retry";
+        let handle = insert_protocol_fixture(&mut runtime, workload_id, &["not-json"]);
+        let marker = runtime
+            .home_dir("agent-protocol-fixture")
+            .join(".nano-runtime");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"foreign-owner").unwrap();
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap();
+
+        let cleanup_error = poll_until_error(&mut runtime, &handle, invocation_id);
+        let typed = cleanup_error
+            .downcast_ref::<NanoExecError>()
+            .expect("cleanup failure must stay typed");
+        assert_eq!(typed.code, NanoExecErrorCode::ChannelDisconnected);
+        assert!(typed.retryable);
+        assert!(runtime.exchanges[workload_id].cleanup_pending);
+        assert!(runtime.workloads.contains_key(workload_id));
+        assert!(runtime.processes.contains_key(workload_id));
+        assert!(runtime.handles.contains_key(workload_id));
+        assert_eq!(
+            runtime.processes[workload_id].termination_signal_attempts(),
+            1,
+            "the owned process tree must be signaled exactly once before retry"
+        );
+        let signal_attempts = runtime.processes[workload_id].termination_signal_counter();
+        assert!(runtime
+            .signal_workload(workload_id, nix::sys::signal::Signal::SIGCONT)
+            .is_err());
+        assert_eq!(
+            signal_attempts.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a retained post-reap handle must not expose numeric PIDs to lifecycle signals"
+        );
+
+        std::fs::write(&marker, workload_id.as_bytes()).unwrap();
+        let terminal = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&terminal, NanoExecErrorCode::InvalidFrame);
+        assert!(!runtime.exchanges[workload_id].cleanup_pending);
+        assert!(!runtime.workloads.contains_key(workload_id));
+        assert_eq!(
+            signal_attempts.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "cleanup retry must not signal a reused numeric process target"
+        );
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(replay.to_string(), terminal.to_string());
+    }
+
+    #[test]
+    fn health_reap_publishes_no_signal_state_before_cgroup_only_cleanup() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2935";
+        let workload_id = "health-before-cleanup";
+        let temp = tempfile::tempdir().unwrap();
+        let descendant_pid_path = temp.path().join("health-reap-descendant.pid");
+        let observed = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let script = format!(
+            "IFS= read -r frame; sleep 30 & descendant=$!; printf '%s\\n' \"$descendant\" > '{}'; exit 0",
+            descendant_pid_path.display()
+        );
+        let process = AgentProcess::launch_raw_protocol_fixture(&script).unwrap();
+        process.install_pre_quiescence_barrier(
+            std::sync::Arc::clone(&observed),
+            std::sync::Arc::clone(&release),
+        );
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, workload_id, process);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap();
+
+        let descendant_pid: u32 = wait_for_recorded_lines(&descendant_pid_path, 1)
+            .trim()
+            .parse()
+            .unwrap();
+        let mut stopped = false;
+        for _ in 0..100 {
+            if runtime.health(&handle).unwrap().state == NanoHealthState::Stopped {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(stopped, "health did not observe the exited exact Child");
+        let signal_attempts = runtime.processes[workload_id].termination_signal_counter();
+        assert_eq!(runtime.processes[workload_id].reap_publications(), 1);
+        assert_eq!(
+            signal_attempts.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        let reaped = runtime.processes[workload_id].protocol_supervision_snapshot();
+        assert!(reaped.process_reaped);
+        assert!(reaped.stdin_closed);
+        assert!(
+            PathBuf::from(format!("/proc/{descendant_pid}")).exists(),
+            "cgroup-owned descendant exited before cleanup retry"
+        );
+
+        // Health advanced the supervision state; the autonomous owner now
+        // reaches its bounded cgroup-only quiescence boundary without polling.
+        observed.wait();
+
+        let first_cleanup = runtime.processes[workload_id].retry_supervised_cgroup_cleanup_with(
+            "health-before-cleanup-cgroup",
+            |_| Ok(vec![4242]),
+            |_| Err(anyhow!("injected first cgroup kill failure")),
+            |_| Ok(()),
+        );
+        assert!(first_cleanup.is_err());
+        assert!(runtime.processes.contains_key(workload_id));
+        assert!(
+            !runtime.processes[workload_id]
+                .protocol_supervision_snapshot()
+                .cgroup_quiesced
+        );
+        assert_eq!(
+            signal_attempts.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        runtime.processes[workload_id]
+            .retry_supervised_cgroup_cleanup_with(
+                "health-before-cleanup-cgroup",
+                |_| Ok(vec![4242]),
+                |_| {
+                    // This closure represents the authoritative cgroup.kill
+                    // participant; it does not address the reaped supervisor.
+                    let pid = i32::try_from(descendant_pid)
+                        .context("fixture descendant PID exceeds pid_t")?;
+                    nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid),
+                        nix::sys::signal::Signal::SIGKILL,
+                    )
+                    .context("kill fixture cgroup descendant")?;
+                    Ok(1)
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            signal_attempts.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        wait_until_pid_exits(descendant_pid);
+        assert!(!PathBuf::from(format!("/proc/{descendant_pid}")).exists());
+
+        release.wait();
+        let quiesced = wait_for_autonomous_quiescence(&runtime, workload_id);
+        assert_eq!(
+            quiesced.failure,
+            Some(ProtocolSupervisionFailure::ChannelDisconnected)
+        );
+        let terminal = poll_until_error(&mut runtime, &handle, invocation_id);
+        assert_exec_error(&terminal, NanoExecErrorCode::ChannelDisconnected);
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(replay.to_string(), terminal.to_string());
+        assert_eq!(
+            signal_attempts.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert!(!runtime.processes.contains_key(workload_id));
+        assert!(!runtime.handles.contains_key(workload_id));
+        assert!(!runtime.workloads.contains_key(workload_id));
+    }
+
+    #[test]
+    fn confirmed_owned_reap_removes_only_the_cloned_numeric_signal_target() {
+        let stored = SandboxHandle {
+            agent_name: "post-reap-signal-target".to_string(),
+            cgroup_created: true,
+            cgroup_id: Some(17),
+            io_available: true,
+            bwrap_pid: Some(42),
+            landlock_applied: true,
+            network_isolated: true,
+        };
+
+        let post_reap = teardown_handle_after_owned_process_reap(stored.clone(), true, false);
+        assert_eq!(post_reap.bwrap_pid, None);
+        assert_eq!(stored.bwrap_pid, Some(42), "stored ownership was mutated");
+
+        let pre_reap = teardown_handle_after_owned_process_reap(stored, false, false);
+        assert_eq!(pre_reap.bwrap_pid, Some(42));
+    }
+
+    #[test]
+    fn unacknowledged_cancel_kills_the_process_tree_without_a_later_poll() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2903";
         let temp = tempfile::tempdir().unwrap();
         let record_path = temp.path().join("protocol-input.jsonl");
@@ -2511,9 +3184,11 @@ mod tests {
                 },
             )
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(
-            WORKBENCH_CANCEL_GRACE_MS + 20,
-        ));
+        let quiesced = wait_for_autonomous_quiescence(&runtime, "protocol-cancel");
+        assert_eq!(
+            quiesced.failure,
+            Some(ProtocolSupervisionFailure::Cancelled)
+        );
         let error = runtime
             .exec(
                 &handle,
@@ -2560,7 +3235,12 @@ mod tests {
             r#"{{"kind":"cancelled","schema_version":1,"invocation_id":"{invocation_id}"}}"#
         );
         let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
-        let handle = insert_protocol_fixture(&mut runtime, "protocol-cancelled", &[&cancelled]);
+        let script = format!(
+            "IFS= read -r execute; IFS= read -r cancel; printf '%s\\n' '{}'; sleep 5",
+            cancelled
+        );
+        let process = AgentProcess::launch_raw_protocol_fixture(&script).unwrap();
+        let handle = insert_protocol_process(&mut runtime, "protocol-cancelled", process);
         runtime
             .exec(
                 &handle,
@@ -2618,6 +3298,88 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replay.output, terminal.output);
+    }
+
+    #[test]
+    fn completed_frame_is_not_published_before_post_terminal_validation() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2933";
+        let result = serde_json::json!({
+            "kind": "result",
+            "schema_version": 1,
+            "invocation_id": invocation_id
+        })
+        .to_string();
+        let completed = serde_json::json!({
+            "kind": "progress",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "stage": "completed"
+        })
+        .to_string();
+        let extra = serde_json::json!({
+            "kind": "progress",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "stage": "after-completed"
+        })
+        .to_string();
+        let observed = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let process =
+            AgentProcess::launch_protocol_fixture(&[&result, &completed, &extra]).unwrap();
+        process.install_post_terminal_barrier(
+            std::sync::Arc::clone(&observed),
+            std::sync::Arc::clone(&release),
+        );
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let handle = insert_protocol_process(&mut runtime, "completed-extra", process);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap();
+
+        observed.wait();
+        let pending = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap();
+        let pending: serde_json::Value = serde_json::from_str(&pending.output).unwrap();
+        assert_eq!(pending["state"], "pending");
+        assert_ne!(pending["state"], "finalizing");
+        assert!(matches!(
+            pending["state"].as_str(),
+            Some("accepted" | "pending" | "cancelling" | "completed")
+        ));
+        assert_eq!(pending["messages"], serde_json::json!([]));
+        release.wait();
+
+        let quiesced = wait_for_autonomous_quiescence(&runtime, "completed-extra");
+        assert_eq!(
+            quiesced.failure,
+            Some(ProtocolSupervisionFailure::ProtocolViolation)
+        );
+        let terminal = poll_until_error(&mut runtime, &handle, invocation_id);
+        assert_exec_error(&terminal, NanoExecErrorCode::ProtocolViolation);
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(replay.to_string(), terminal.to_string());
     }
 
     #[test]
@@ -2731,8 +3493,19 @@ mod tests {
                     },
                 )
                 .unwrap();
+            wait_for_autonomous_quiescence(&runtime, workload_id);
             let error = poll_until_error(&mut runtime, &handle, invocation_id);
             assert_exec_error(&error, expected);
+            let replay = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_poll".to_string(),
+                        input: poll_frame(invocation_id),
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(replay.to_string(), error.to_string());
             assert_eq!(
                 runtime.health(&handle).unwrap().state,
                 NanoHealthState::Stopped
@@ -2741,22 +3514,32 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_and_individual_frame_overflow_fail_closed() {
+    fn invalid_utf8_and_endless_no_newline_overflow_fail_closed_without_poll() {
+        let temp = tempfile::tempdir().unwrap();
+        let overflow_descendant = temp.path().join("overflow-descendant.pid");
+        let overflow_script = format!(
+            "IFS= read -r frame; sleep 30 & descendant=$!; printf '%s\\n' \"$descendant\" > '{}'; head -c 1048577 /dev/zero | tr '\\000' x; wait \"$descendant\"",
+            overflow_descendant.display()
+        );
         let cases = [
             (
                 "protocol-invalid-utf8",
                 "018f3f32-4f01-7f2c-a6c1-f6f4a81b2924",
-                r#"IFS= read -r frame; printf '\377\n'; sleep 5"#,
+                r#"IFS= read -r frame; printf '\377\n'; sleep 5"#.to_string(),
+                NanoExecErrorCode::InvalidFrame,
+                None,
             ),
             (
                 "protocol-frame-overflow",
                 "018f3f32-4f01-7f2c-a6c1-f6f4a81b2925",
-                r#"IFS= read -r frame; head -c 1048577 /dev/zero | tr '\000' x; printf '\n'; sleep 5"#,
+                overflow_script,
+                NanoExecErrorCode::OutputLimitExceeded,
+                Some(overflow_descendant),
             ),
         ];
 
-        for (workload_id, invocation_id, script) in cases {
-            let process = AgentProcess::launch_raw_protocol_fixture(script).unwrap();
+        for (workload_id, invocation_id, script, expected, descendant_path) in cases {
+            let process = AgentProcess::launch_raw_protocol_fixture(&script).unwrap();
             let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
             let handle = insert_protocol_process(&mut runtime, workload_id, process);
             runtime
@@ -2768,8 +3551,28 @@ mod tests {
                     },
                 )
                 .unwrap();
+            wait_for_autonomous_quiescence(&runtime, workload_id);
+            if let Some(descendant_path) = descendant_path {
+                let descendant_pid: u32 = std::fs::read_to_string(descendant_path)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                wait_until_pid_exits(descendant_pid);
+                assert!(!PathBuf::from(format!("/proc/{descendant_pid}")).exists());
+            }
             let error = poll_until_error(&mut runtime, &handle, invocation_id);
-            assert_exec_error(&error, NanoExecErrorCode::ProtocolViolation);
+            assert_exec_error(&error, expected);
+            let replay = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_poll".to_string(),
+                        input: poll_frame(invocation_id),
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(replay.to_string(), error.to_string());
             assert_eq!(
                 runtime.health(&handle).unwrap().state,
                 NanoHealthState::Stopped
@@ -2778,7 +3581,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_reader_queue_applies_backpressure_without_losing_frames() {
+    fn reader_queue_overflow_reaps_without_a_later_poll() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2915";
         let mut frames: Vec<String> = (0..=64)
             .map(|sequence| {
@@ -2810,8 +3613,17 @@ mod tests {
             .to_string(),
         );
         let frame_refs: Vec<&str> = frames.iter().map(String::as_str).collect();
-        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
-        let handle = insert_protocol_fixture(&mut runtime, "protocol-backpressure", &frame_refs);
+        let temp = tempfile::tempdir().unwrap();
+        let record_path = temp.path().join("queue-input.jsonl");
+        let descendant_pid_path = temp.path().join("queue-descendant.pid");
+        let process = AgentProcess::launch_recording_protocol_fixture(
+            &frame_refs,
+            &record_path,
+            &descendant_pid_path,
+        )
+        .unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "protocol-backpressure", process);
         runtime
             .exec(
                 &handle,
@@ -2822,24 +3634,45 @@ mod tests {
             )
             .unwrap();
 
-        for _ in 0..100 {
-            let output = runtime
-                .exec(
-                    &handle,
-                    NanoExecRequest {
-                        operation: "workbench_poll".to_string(),
-                        input: poll_frame(invocation_id),
-                    },
-                )
-                .unwrap();
-            let envelope: serde_json::Value = serde_json::from_str(&output.output).unwrap();
-            if envelope["state"] == "completed" {
-                assert_eq!(envelope["messages"].as_array().unwrap().len(), 67);
-                return;
+        for _ in 0..1_000 {
+            if runtime.processes["protocol-backpressure"].protocol_queue_overflowed() {
+                break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        panic!("bounded queue did not drain to a terminal exchange");
+        assert!(runtime.processes["protocol-backpressure"].protocol_queue_overflowed());
+        wait_for_autonomous_quiescence(&runtime, "protocol-backpressure");
+        let descendant_pid: u32 = std::fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_until_pid_exits(descendant_pid);
+        assert!(!PathBuf::from(format!("/proc/{descendant_pid}")).exists());
+        let error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::OutputLimitExceeded);
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(replay.to_string(), error.to_string());
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Stopped
+        );
     }
 
     #[test]
@@ -2891,10 +3724,19 @@ mod tests {
     }
 
     #[test]
-    fn deadline_expiry_sends_cancel_then_kills_after_the_fixed_grace() {
+    fn deadline_expiry_sends_one_cancel_and_reaps_without_a_later_poll() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2904";
-        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
-        let handle = insert_protocol_fixture(&mut runtime, "protocol-deadline", &[]);
+        let temp = tempfile::tempdir().unwrap();
+        let record_path = temp.path().join("protocol-input.jsonl");
+        let descendant_pid_path = temp.path().join("descendant.pid");
+        let process = AgentProcess::launch_recording_protocol_fixture(
+            &[],
+            &record_path,
+            &descendant_pid_path,
+        )
+        .unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "protocol-deadline", process);
         runtime
             .exec(
                 &handle,
@@ -2904,20 +3746,11 @@ mod tests {
                 },
             )
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        let pending = runtime
-            .exec(
-                &handle,
-                NanoExecRequest {
-                    operation: "workbench_poll".to_string(),
-                    input: poll_frame(invocation_id),
-                },
-            )
-            .unwrap();
-        assert!(pending.output.contains("cancelling"));
-        std::thread::sleep(std::time::Duration::from_millis(
-            WORKBENCH_CANCEL_GRACE_MS + 20,
-        ));
+        let quiesced = wait_for_autonomous_quiescence(&runtime, "protocol-deadline");
+        assert_eq!(
+            quiesced.failure,
+            Some(ProtocolSupervisionFailure::DeadlineExceeded)
+        );
         let error = runtime
             .exec(
                 &handle,
@@ -2939,16 +3772,126 @@ mod tests {
             .unwrap_err();
         assert_exec_error(&replay, NanoExecErrorCode::DeadlineExceeded);
         assert_eq!(replay.to_string(), error.to_string());
+        let recorded = wait_for_recorded_lines(&record_path, 2);
+        assert_eq!(
+            recorded.lines().count(),
+            2,
+            "deadline retry wrote more than one cancel frame"
+        );
+        let descendant_pid: u32 = std::fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_until_pid_exits(descendant_pid);
+        assert!(!PathBuf::from(format!("/proc/{descendant_pid}")).exists());
     }
 
     #[test]
-    fn protocol_eof_fails_closed_and_removes_the_workload() {
+    fn deadline_claim_is_stable_across_send_barrier_and_explicit_replay() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2934";
+        let temp = tempfile::tempdir().unwrap();
+        let record_path = temp.path().join("deadline-race-input.jsonl");
+        let descendant_pid_path = temp.path().join("deadline-race-descendant.pid");
+        let claimed = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let process = AgentProcess::launch_recording_protocol_fixture(
+            &[],
+            &record_path,
+            &descendant_pid_path,
+        )
+        .unwrap();
+        process.install_deadline_send_barrier(
+            std::sync::Arc::clone(&claimed),
+            std::sync::Arc::clone(&release),
+        );
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "deadline-send-race", process);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 20),
+                },
+            )
+            .unwrap();
+
+        claimed.wait();
+        let claimed_snapshot =
+            runtime.processes["deadline-send-race"].protocol_supervision_snapshot();
+        assert_eq!(
+            claimed_snapshot.cancel_owner,
+            Some(ProtocolCancelOwner::Deadline)
+        );
+        assert!(!claimed_snapshot.cancel_sent);
+        let cancel = serde_json::json!({
+            "kind": "cancel",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "reason": "operator_cancelled"
+        })
+        .to_string();
+        let first = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_cancel".to_string(),
+                    input: cancel.clone(),
+                },
+            )
+            .unwrap();
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_cancel".to_string(),
+                    input: cancel,
+                },
+            )
+            .unwrap();
+        assert_eq!(replay.output, first.output);
+
+        release.wait();
+        let quiesced = wait_for_autonomous_quiescence(&runtime, "deadline-send-race");
+        assert_eq!(
+            quiesced.failure,
+            Some(ProtocolSupervisionFailure::DeadlineExceeded)
+        );
+        let recorded = wait_for_recorded_lines(&record_path, 2);
+        assert_eq!(
+            recorded.lines().count(),
+            2,
+            "deadline ownership must emit exactly one child cancel frame"
+        );
+        let terminal = poll_until_error(&mut runtime, &handle, invocation_id);
+        assert_exec_error(&terminal, NanoExecErrorCode::DeadlineExceeded);
+        let terminal_replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(terminal_replay.to_string(), terminal.to_string());
+    }
+
+    #[test]
+    fn protocol_eof_reaps_without_poll_and_retains_a_stable_failure() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2905";
-        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let temp = tempfile::tempdir().unwrap();
+        let descendant_pid_path = temp.path().join("eof-descendant.pid");
+        let script = format!(
+            "IFS= read -r frame; sleep 30 </dev/null >/dev/null 2>&1 & descendant=$!; printf '%s\\n' \"$descendant\" > '{}'; exec 1>&-; wait \"$descendant\"",
+            descendant_pid_path.display()
+        );
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
         let handle = insert_protocol_process(
             &mut runtime,
             "protocol-eof",
-            AgentProcess::launch_protocol_eof_fixture().unwrap(),
+            AgentProcess::launch_raw_protocol_fixture(&script).unwrap(),
         );
         runtime
             .exec(
@@ -2959,24 +3902,24 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut failed_closed = None;
-        for _ in 0..100 {
-            match runtime.exec(
+        wait_for_autonomous_quiescence(&runtime, "protocol-eof");
+        let descendant_pid: u32 = std::fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_until_pid_exits(descendant_pid);
+        assert!(!PathBuf::from(format!("/proc/{descendant_pid}")).exists());
+        let failure = runtime
+            .exec(
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_poll".to_string(),
                     input: poll_frame(invocation_id),
                 },
-            ) {
-                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                Err(error) => {
-                    assert_exec_error(&error, NanoExecErrorCode::ChannelDisconnected);
-                    failed_closed = Some(error);
-                    break;
-                }
-            }
-        }
-        let failure = failed_closed.expect("EOF did not fail closed");
+            )
+            .unwrap_err();
+        assert_exec_error(&failure, NanoExecErrorCode::ChannelDisconnected);
         assert_eq!(
             runtime.health(&handle).unwrap().state,
             NanoHealthState::Stopped
