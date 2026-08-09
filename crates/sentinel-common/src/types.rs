@@ -651,14 +651,20 @@ pub struct WorldSnapshot {
     pub projection_offsets: Vec<(String, i64)>,
     #[serde(default)]
     pub fs_metadata: Option<FsMetadataDump>,
+    /// Runtime-owned per-workload snapshots captured through the production
+    /// NanoRuntime registry. Legacy world snapshots decode with an empty list
+    /// and use the compatibility respawn path.
+    #[serde(default)]
+    pub nano_runtime_snapshots: Vec<crate::nano_runtime::NanoSnapshot>,
 }
 
 impl WorldSnapshot {
     /// Aktuelle Schema-Version fuer bincode Kompatibilitaet.
-    /// v3 (#491): EcsSnapshot um `autonomy_cooldowns` + 4 Buffer-JSON-Felder erweitert.
-    /// Der Decoder faellt ueber `WorldSnapshotV2` (v2, Buffer-frei) und `WorldSnapshotV1`
+    /// v4 (#472): runtime-owned NanoRuntime snapshots added.
+    /// Der Decoder faellt ueber `WorldSnapshotV3` (v3, without NanoRuntime payloads),
+    /// `WorldSnapshotV2` (v2, Buffer-frei) und `WorldSnapshotV1`
     /// (pre-`fs_metadata`) zurueck. Replay (#491 PR-B) verlangt Anchor `schema_version >= 3`.
-    pub const SCHEMA_VERSION: u32 = 3;
+    pub const SCHEMA_VERSION: u32 = 4;
 }
 
 /// Per-container ECS snapshot (#497): exactly ONE agent's per-agent components — and nothing else.

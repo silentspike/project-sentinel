@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 use bevy_ecs::prelude::World;
@@ -6,16 +6,18 @@ use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::nano_runtime::{
     ensure_handle_instance, ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle,
     NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
-    NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_ECS_NATIVE,
+    NanoRuntimeControlAction, NanoRuntimeControlResult, NanoRuntimeResources, NanoSnapshot,
+    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_ECS_NATIVE,
 };
 use sentinel_common::AgentId;
 
 use crate::{AgentStatus, RuntimeOrchestrator};
 
 pub struct EcsNativeRuntime {
-    orchestrator: RuntimeOrchestrator,
-    world: World,
-    handles: HashMap<String, (AgentId, uuid::Uuid)>,
+    orchestrator: Option<RuntimeOrchestrator>,
+    world: Option<World>,
+    handles: HashMap<String, (Option<AgentId>, uuid::Uuid)>,
+    suspended: HashSet<String>,
     max_agents: usize,
 }
 
@@ -23,9 +25,23 @@ impl EcsNativeRuntime {
     pub fn new(max_agents: usize) -> Self {
         let (world, _schedule) = sentinel_ecs::create_simulation_world();
         Self {
-            orchestrator: RuntimeOrchestrator::new(max_agents),
-            world,
+            orchestrator: Some(RuntimeOrchestrator::new(max_agents)),
+            world: Some(world),
             handles: HashMap::new(),
+            suspended: HashSet::new(),
+            max_agents,
+        }
+    }
+
+    /// Production daemon mode: the daemon's canonical ECS world and logical
+    /// RuntimeOrchestrator remain the sole state owners. This adapter owns only
+    /// the per-incarnation NanoRuntime lifecycle handle.
+    pub fn external_lifecycle(max_agents: usize) -> Self {
+        Self {
+            orchestrator: None,
+            world: None,
+            handles: HashMap::new(),
+            suspended: HashSet::new(),
             max_agents,
         }
     }
@@ -58,8 +74,9 @@ impl EcsNativeRuntime {
         &mut self,
         snapshot: &sentinel_common::EcsSnapshot,
     ) -> Result<()> {
-        self.orchestrator = RuntimeOrchestrator::new(self.max_agents);
+        self.orchestrator = Some(RuntimeOrchestrator::new(self.max_agents));
         self.handles.clear();
+        self.suspended.clear();
 
         for (id, identity) in &snapshot.identities {
             let agent_id = AgentId(*id);
@@ -81,10 +98,12 @@ impl EcsNativeRuntime {
                 .map(|(_, pos)| pos.room_id.as_str())
                 .unwrap_or("empfang");
             self.orchestrator
+                .as_mut()
+                .expect("internal ECS-native runtime has orchestrator")
                 .spawn_agent(identity.clone(), shift, room_id)?;
             self.handles.insert(
                 format!("ecs-native-{}", agent_id.0),
-                (agent_id, uuid::Uuid::new_v4()),
+                (Some(agent_id), uuid::Uuid::new_v4()),
             );
         }
 
@@ -125,20 +144,22 @@ impl NanoRuntime for EcsNativeRuntime {
             workload.room_id.as_str()
         };
 
-        self.orchestrator
-            .spawn_agent(identity, shift, room_id)
-            .map_err(|error| anyhow!("ecs-native orchestrator spawn failed: {error}"))?;
-        sentinel_ecs::spawn_agent(
-            &mut self.world,
-            agent_id,
-            &workload.agent_name,
-            &workload.role,
-            workload.shift_set,
-            room_id,
-        );
+        if let (Some(orchestrator), Some(world)) = (&mut self.orchestrator, &mut self.world) {
+            orchestrator
+                .spawn_agent(identity, shift, room_id)
+                .map_err(|error| anyhow!("ecs-native orchestrator spawn failed: {error}"))?;
+            sentinel_ecs::spawn_agent(
+                world,
+                agent_id,
+                &workload.agent_name,
+                &workload.role,
+                workload.shift_set,
+                room_id,
+            );
+        }
         let instance_id = uuid::Uuid::new_v4();
         self.handles
-            .insert(workload.workload_id.clone(), (agent_id, instance_id));
+            .insert(workload.workload_id.clone(), (Some(agent_id), instance_id));
 
         Ok(NanoHandle {
             instance_id,
@@ -159,21 +180,46 @@ impl NanoRuntime for EcsNativeRuntime {
             ));
         };
         ensure_handle_instance(handle, instance_id)?;
-        if handle.agent_id.is_some_and(|id| id != agent_id) {
+        if handle.agent_id != agent_id {
             return Err(anyhow!(
                 "ecs-native handle agent does not match workload '{}'",
                 handle.workload_id
             ));
         }
 
-        self.orchestrator.despawn_agent(agent_id)?;
-        sentinel_ecs::despawn_agent_from_world(&mut self.world, agent_id);
+        if let (Some(agent_id), Some(orchestrator), Some(world)) =
+            (agent_id, &mut self.orchestrator, &mut self.world)
+        {
+            orchestrator.despawn_agent(agent_id)?;
+            sentinel_ecs::despawn_agent_from_world(world, agent_id);
+        }
         self.handles.remove(&handle.workload_id);
+        self.suspended.remove(&handle.workload_id);
         Ok(NanoStopResult::new(
             self.runtime_key(),
             &handle.workload_id,
             true,
         ))
+    }
+
+    fn resources(&self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        let (agent_id, instance_id) = self
+            .handles
+            .get(&handle.workload_id)
+            .copied()
+            .ok_or_else(|| anyhow!("unknown ecs-native workload '{}'", handle.workload_id))?;
+        ensure_handle_instance(handle, instance_id)?;
+        if handle.agent_id != agent_id {
+            return Err(anyhow!(
+                "ecs-native handle agent does not match workload '{}'",
+                handle.workload_id
+            ));
+        }
+        Ok(NanoRuntimeResources {
+            instance_id: Some(instance_id),
+            ..NanoRuntimeResources::default()
+        })
     }
 
     fn exec(&mut self, handle: &NanoHandle, request: NanoExecRequest) -> Result<NanoExecResult> {
@@ -197,12 +243,41 @@ impl NanoRuntime for EcsNativeRuntime {
     }
 
     fn snapshot(&mut self, handle: &NanoHandle) -> Result<NanoSnapshot> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        let (_, instance_id) = self
+            .handles
+            .get(&handle.workload_id)
+            .copied()
+            .ok_or_else(|| anyhow!("ecs-native handle references stopped workload"))?;
+        ensure_handle_instance(handle, instance_id)?;
+        if self.world.is_none() {
+            return Ok(NanoSnapshot {
+                runtime_key: self.runtime_key().to_string(),
+                workload_id: handle.workload_id.clone(),
+                agent_id: handle.agent_id,
+                semantics: NanoSnapshotSemantics::RuntimeMetadata,
+                payload: serde_json::json!({
+                    "external_canonical_world": true,
+                    "agent_id": handle.agent_id,
+                }),
+            });
+        }
         if let Some(agent_id) = handle.agent_id {
-            if !self.orchestrator.agents().contains_key(&agent_id) {
+            if !self
+                .orchestrator
+                .as_ref()
+                .expect("internal ECS-native runtime has orchestrator")
+                .agents()
+                .contains_key(&agent_id)
+            {
                 return Err(anyhow!("ecs-native handle references unknown {agent_id}"));
             }
         }
-        let ecs_snapshot = sentinel_ecs::snapshot_ecs_state(&mut self.world);
+        let ecs_snapshot = sentinel_ecs::snapshot_ecs_state(
+            self.world
+                .as_mut()
+                .expect("internal ECS-native runtime has world"),
+        );
         Ok(NanoSnapshot {
             runtime_key: self.runtime_key().to_string(),
             workload_id: handle.workload_id.clone(),
@@ -220,6 +295,28 @@ impl NanoRuntime for EcsNativeRuntime {
                 self.runtime_key()
             ));
         }
+        if self.world.is_none() && snapshot.semantics == NanoSnapshotSemantics::RuntimeMetadata {
+            let agent_id = snapshot
+                .agent_id
+                .ok_or_else(|| anyhow!("external ecs-native restore requires agent_id"))?;
+            if self.handles.contains_key(&snapshot.workload_id) {
+                return Err(anyhow!(
+                    "ecs-native workload '{}' is already active",
+                    snapshot.workload_id
+                ));
+            }
+            let instance_id = uuid::Uuid::new_v4();
+            self.suspended.remove(&snapshot.workload_id);
+            self.handles
+                .insert(snapshot.workload_id.clone(), (Some(agent_id), instance_id));
+            return Ok(NanoHandle {
+                instance_id,
+                runtime_key: self.runtime_key().to_string(),
+                workload_id: snapshot.workload_id,
+                agent_id: Some(agent_id),
+                pid: None,
+            });
+        }
         if snapshot.semantics != NanoSnapshotSemantics::EcsWorld {
             return Err(anyhow!(
                 "ecs-native restore requires EcsWorld snapshot, got {:?}",
@@ -230,20 +327,34 @@ impl NanoRuntime for EcsNativeRuntime {
         let workload_id = snapshot.workload_id;
         let snapshot_agent_id = snapshot.agent_id;
         let ecs_snapshot: sentinel_common::EcsSnapshot = serde_json::from_value(snapshot.payload)?;
-        sentinel_ecs::restore_ecs_state(&mut self.world, &ecs_snapshot);
+        sentinel_ecs::restore_ecs_state(
+            self.world
+                .as_mut()
+                .expect("internal ECS-native runtime has world"),
+            &ecs_snapshot,
+        );
         self.rebuild_orchestrator_from_ecs_snapshot(&ecs_snapshot)?;
 
         if let Some(agent_id) = snapshot_agent_id {
-            if !self.orchestrator.agents().contains_key(&agent_id) {
+            if !self
+                .orchestrator
+                .as_ref()
+                .expect("internal ECS-native runtime has orchestrator")
+                .agents()
+                .contains_key(&agent_id)
+            {
                 return Err(anyhow!(
                     "ecs-native snapshot handle references missing {agent_id}"
                 ));
             }
             let instance_id = uuid::Uuid::new_v4();
             self.handles
-                .retain(|_, (mapped_id, _)| *mapped_id != agent_id);
+                .retain(|_, (mapped_id, _)| *mapped_id != Some(agent_id));
             self.handles
-                .insert(workload_id.clone(), (agent_id, instance_id));
+                .insert(workload_id.clone(), (Some(agent_id), instance_id));
+        } else {
+            self.handles
+                .insert(workload_id.clone(), (None, uuid::Uuid::new_v4()));
         }
 
         let instance_id = self
@@ -263,23 +374,37 @@ impl NanoRuntime for EcsNativeRuntime {
 
     fn health(&mut self, handle: &NanoHandle) -> Result<NanoHealth> {
         ensure_handle_runtime(handle, self.runtime_key())?;
-        if !self.handles.contains_key(&handle.workload_id) {
+        let Some((mapped_agent_id, instance_id)) = self.handles.get(&handle.workload_id).copied()
+        else {
             return Ok(NanoHealth {
                 runtime_key: self.runtime_key().to_string(),
                 workload_id: handle.workload_id.clone(),
                 state: NanoHealthState::Stopped,
                 detail: "ecs-native workload stopped".to_string(),
             });
+        };
+        ensure_handle_instance(handle, instance_id)?;
+        if handle.agent_id != mapped_agent_id {
+            return Err(anyhow!(
+                "ecs-native handle agent does not match workload '{}'",
+                handle.workload_id
+            ));
         }
-        let agent_id = handle
-            .agent_id
-            .ok_or_else(|| anyhow!("ecs-native health requires agent_id"))?;
-        let state = self
-            .orchestrator
-            .agents()
-            .get(&agent_id)
-            .map(|handle| Self::health_state(handle.status))
-            .ok_or_else(|| anyhow!("ecs-native handle references stopped {agent_id}"))?;
+        let state = if self.suspended.contains(&handle.workload_id) {
+            NanoHealthState::Degraded
+        } else {
+            match (&self.orchestrator, mapped_agent_id) {
+                (Some(orchestrator), Some(agent_id)) => orchestrator
+                    .agents()
+                    .get(&agent_id)
+                    .map(|handle| Self::health_state(handle.status))
+                    .ok_or_else(|| anyhow!("ecs-native handle references stopped {agent_id}"))?,
+                (Some(orchestrator), None) if orchestrator.agents().is_empty() => {
+                    NanoHealthState::Stopped
+                }
+                _ => NanoHealthState::Healthy,
+            }
+        };
 
         Ok(NanoHealth {
             runtime_key: self.runtime_key().to_string(),
@@ -294,12 +419,32 @@ impl NanoRuntime for EcsNativeRuntime {
         handle: &NanoHandle,
         _policy: NanoIsolationPolicy,
     ) -> Result<NanoIsolationReport> {
+        self.resources(handle)?;
         Ok(NanoIsolationReport {
             runtime_key: self.runtime_key().to_string(),
             workload_id: handle.workload_id.clone(),
             applied: true,
             detail: "logical ECS isolation only; no process boundary".to_string(),
         })
+    }
+
+    fn control(
+        &mut self,
+        handle: &NanoHandle,
+        action: NanoRuntimeControlAction,
+    ) -> Result<NanoRuntimeControlResult> {
+        self.resources(handle)?;
+        let applied = match action {
+            NanoRuntimeControlAction::Suspend => self.suspended.insert(handle.workload_id.clone()),
+            NanoRuntimeControlAction::Resume => self.suspended.remove(&handle.workload_id),
+        };
+        Ok(NanoRuntimeControlResult::new(
+            self.runtime_key(),
+            &handle.workload_id,
+            action,
+            applied,
+            0,
+        ))
     }
 }
 
@@ -445,6 +590,76 @@ mod migration_tests {
         assert_eq!(
             migrated_ids, original_ids,
             "Migration muss alle Agent-Identities erhalten"
+        );
+    }
+
+    #[test]
+    fn external_lifecycle_uses_canonical_world_and_rejects_stale_incarnations() {
+        let mut runtime = EcsNativeRuntime::external_lifecycle(8);
+        assert!(runtime.world.is_none());
+        assert!(runtime.orchestrator.is_none());
+
+        let original = runtime
+            .spawn(workload_spec(7, "external-ecs-7"))
+            .expect("external lifecycle spawn");
+        let snapshot = runtime.snapshot(&original).expect("metadata snapshot");
+        assert_eq!(snapshot.semantics, NanoSnapshotSemantics::RuntimeMetadata);
+        assert_eq!(snapshot.agent_id, Some(AgentId(7)));
+        runtime.stop(&original).expect("stop original incarnation");
+
+        let restored = runtime
+            .restore(snapshot)
+            .expect("external lifecycle restore");
+        assert_ne!(restored.instance_id, original.instance_id);
+        assert_eq!(
+            runtime.resources(&restored).unwrap().instance_id,
+            Some(restored.instance_id)
+        );
+        assert!(runtime.resources(&original).is_err());
+        assert!(runtime.health(&original).is_err());
+        assert!(runtime.snapshot(&original).is_err());
+        assert!(runtime
+            .isolate(&original, NanoIsolationPolicy::default())
+            .is_err());
+    }
+
+    #[test]
+    fn external_lifecycle_suspend_resume_is_stateful_and_instance_fenced() {
+        let mut runtime = EcsNativeRuntime::external_lifecycle(8);
+        let handle = runtime
+            .spawn(workload_spec(8, "external-control-8"))
+            .unwrap();
+        let suspended = runtime
+            .control(&handle, NanoRuntimeControlAction::Suspend)
+            .unwrap();
+        assert_eq!(
+            suspended.outcome,
+            sentinel_common::nano_runtime::NanoRuntimeControlOutcome::Applied
+        );
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Degraded
+        );
+        assert_eq!(
+            runtime
+                .control(&handle, NanoRuntimeControlAction::Suspend)
+                .unwrap()
+                .outcome,
+            sentinel_common::nano_runtime::NanoRuntimeControlOutcome::AlreadyApplied
+        );
+        let stale = NanoHandle {
+            instance_id: uuid::Uuid::new_v4(),
+            ..handle.clone()
+        };
+        assert!(runtime
+            .control(&stale, NanoRuntimeControlAction::Resume)
+            .is_err());
+        runtime
+            .control(&handle, NanoRuntimeControlAction::Resume)
+            .unwrap();
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Healthy
         );
     }
 }

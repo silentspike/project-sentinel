@@ -164,7 +164,7 @@ skip = [
     # Reason: #632 decision investigate retained the paired macro version; 2.0.18 is the unskipped baseline.
     # Revisit: remove with thiserror 1.0.69 when its forcing parents accept thiserror 2.0.18.
     "thiserror-impl@1.0.69",
-    # Forcing chain: toml 0.9.12+spec-1.1.0 <- wasmtime-internal-cache@45.0.3.
+    # Forcing chain: toml 0.9.12+spec-1.1.0 <- wasmtime-internal-cache@46.0.2.
     # Reason: #632 decision investigate retained incompatible constraints; 1.0.6 is the unskipped baseline.
     # Revisit: remove when Wasmtime cache accepts toml 1.0.6 or leaves the graph.
     "toml@0.9.12+spec-1.1.0",
@@ -181,21 +181,13 @@ skip = [
     # Revisit: remove when proc-macro-crate accepts toml_edit 0.23.10 or leaves the graph.
     "toml_edit@0.20.2",
     # Forcing chain: wasm-encoder 0.244.0 <- wasm-metadata@0.244.0, wit-component@0.244.0.
-    # Reason: #632 decision investigate retained incompatible constraints; 0.250.0 is the unskipped baseline.
-    # Revisit: remove when both listed parents accept wasm-encoder 0.250.0 or leave the graph.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.251.0 is the unskipped baseline.
+    # Revisit: remove when both listed parents accept wasm-encoder 0.251.0 or leave the graph.
     "wasm-encoder@0.244.0",
-    # Forcing chain: wasm-encoder 0.248.0 <- wasm-compose@0.248.0, wasmtime-environ@45.0.3, wasmtime@45.0.3.
-    # Reason: #632 decision investigate retained incompatible constraints; 0.250.0 is the unskipped baseline.
-    # Revisit: remove when every listed parent accepts wasm-encoder 0.250.0 or leaves the graph.
-    "wasm-encoder@0.248.0",
     # Forcing chain: wasmparser 0.244.0 <- wasm-encoder/metadata@0.244.0, wit-component/parser@0.244.0.
-    # Reason: #632 decision investigate retained incompatible constraints; 0.250.0 is the unskipped baseline.
-    # Revisit: remove when the 0.244 component stack accepts wasmparser 0.250.0 or leaves the graph.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.251.0 is the unskipped baseline.
+    # Revisit: remove when the 0.244 component stack accepts wasmparser 0.251.0 or leaves the graph.
     "wasmparser@0.244.0",
-    # Forcing chain: wasmparser 0.248.0 <- wasm-compose/encoder/printer@0.248.0, Wasmtime 45, wit-parser@0.248.0.
-    # Reason: #632 decision investigate retained incompatible constraints; 0.250.0 is the unskipped baseline.
-    # Revisit: remove when the 0.248/Wasmtime stack accepts wasmparser 0.250.0 or leaves the graph.
-    "wasmparser@0.248.0",
     # Forcing chain: wast 35.0.2 <- witx@0.9.1.
     # Reason: #632 decision investigate retained incompatible constraints; 250.0.0 is the unskipped baseline.
     # Revisit: remove when witx accepts wast 250.0.0 or leaves the graph.
@@ -253,8 +245,8 @@ skip = [
     # Revisit: remove when toml_edit 0.20 accepts winnow 0.7.14 or leaves the graph.
     "winnow@0.5.40",
     # Forcing chain: wit-parser 0.244.0 <- wit-bindgen-core@0.51.0, wit-component@0.244.0.
-    # Reason: #632 decision investigate retained incompatible constraints; 0.248.0 is the unskipped baseline.
-    # Revisit: remove when both listed parents accept wit-parser 0.248.0 or leave the graph.
+    # Reason: #632 decision investigate retained incompatible constraints; 0.251.0 is the unskipped baseline.
+    # Revisit: remove when both listed parents accept wit-parser 0.251.0 or leave the graph.
     "wit-parser@0.244.0",
     # Forcing chain: x509-parser 0.17.0 <- wtransport@0.6.1.
     # Reason: #632 decision investigate retained incompatible constraints; 0.18.1 is the unskipped baseline.
