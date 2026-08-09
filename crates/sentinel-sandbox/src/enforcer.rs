@@ -218,6 +218,9 @@ pub enum IsolationStatus {
 pub struct SandboxHandle {
     pub agent_name: String,
     pub cgroup_created: bool,
+    /// Captured at setup so eBPF deregistration remains possible after the
+    /// adapter has removed the cgroup directory.
+    pub cgroup_id: Option<u64>,
     pub io_available: bool,
     pub bwrap_pid: Option<u32>,
     pub landlock_applied: bool,
@@ -383,6 +386,7 @@ impl SandboxEnforcer {
         let mut handle = SandboxHandle {
             agent_name: name.to_string(),
             cgroup_created: false,
+            cgroup_id: None,
             io_available: false,
             bwrap_pid: None,
             landlock_applied: false,
@@ -394,6 +398,7 @@ impl SandboxEnforcer {
             let setup = cgroups::create_cgroup(name, limits)
                 .with_context(|| format!("Failed to create cgroup for agent {name}"))?;
             handle.cgroup_created = true;
+            handle.cgroup_id = cgroups::cgroup_id(name);
             handle.io_available = setup.io_available;
         } else {
             warn!("Skipping cgroup creation for {name} (cgroup root not available)");
@@ -528,6 +533,17 @@ impl SandboxEnforcer {
         Ok(())
     }
 
+    /// Reconcile setup that failed before a [`SandboxHandle`] could be
+    /// returned. This is intentionally limited to the deterministic cgroup
+    /// path; workload home ownership remains guarded by the NanoRuntime marker.
+    pub fn recover_partial_agent_setup(&self, agent_name: &str) -> Result<()> {
+        if std::path::Path::new(&cgroups::cgroup_path(agent_name)).exists() {
+            cleanup_cgroup_after_process_exit(agent_name)
+                .with_context(|| format!("recover partial sandbox setup for {agent_name}"))?;
+        }
+        Ok(())
+    }
+
     /// Reads PSI metrics for an agent's cgroup.
     ///
     /// Used for Zenoh publish -> Bio-Engine pipeline.
@@ -640,6 +656,7 @@ mod tests {
         let handle = SandboxHandle {
             agent_name: "test".into(),
             cgroup_created: false,
+            cgroup_id: None,
             io_available: false,
             bwrap_pid: None,
             landlock_applied: false,

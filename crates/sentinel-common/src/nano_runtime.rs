@@ -74,6 +74,30 @@ pub struct NanoHandle {
     pub pid: Option<u32>,
 }
 
+/// Runtime-owned resources that the production orchestrator may observe without
+/// taking ownership away from the selected adapter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NanoRuntimeResources {
+    #[serde(default)]
+    pub instance_id: Option<Uuid>,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub child_pid: Option<u32>,
+    #[serde(default)]
+    pub cgroup_created: bool,
+    /// Stable cgroup inode captured while the adapter still owns the cgroup.
+    /// Consumers must not try to rediscover it after stop removes the path.
+    #[serde(default)]
+    pub cgroup_id: Option<u64>,
+    #[serde(default)]
+    pub io_available: bool,
+    #[serde(default)]
+    pub landlock_applied: bool,
+    #[serde(default)]
+    pub network_isolated: bool,
+}
+
 impl NanoHandle {
     pub fn new(
         runtime_key: &str,
@@ -106,6 +130,74 @@ pub struct NanoStopResult {
     pub runtime_key: String,
     pub workload_id: String,
     pub outcome: NanoStopOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NanoRuntimeControlAction {
+    Suspend,
+    Resume,
+}
+
+impl std::fmt::Display for NanoRuntimeControlAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Suspend => write!(f, "suspend"),
+            Self::Resume => write!(f, "resume"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NanoRuntimeControlOutcome {
+    Applied,
+    AlreadyApplied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NanoRuntimeControlResult {
+    pub runtime_key: String,
+    pub workload_id: String,
+    pub action: NanoRuntimeControlAction,
+    pub outcome: NanoRuntimeControlOutcome,
+    /// Number of runtime-owned execution units affected by the action. Logical
+    /// runtimes report zero while still recording the state transition.
+    pub affected_units: usize,
+}
+
+impl NanoRuntimeControlResult {
+    pub fn new(
+        runtime_key: &str,
+        workload_id: &str,
+        action: NanoRuntimeControlAction,
+        applied: bool,
+        affected_units: usize,
+    ) -> Self {
+        Self {
+            runtime_key: runtime_key.to_string(),
+            workload_id: workload_id.to_string(),
+            action,
+            outcome: if applied {
+                NanoRuntimeControlOutcome::Applied
+            } else {
+                NanoRuntimeControlOutcome::AlreadyApplied
+            },
+            affected_units,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NanoRuntimeControlError {
+    #[error(
+        "NanoRuntime '{runtime_key}' does not support '{action}' for workload '{workload_id}'"
+    )]
+    Unsupported {
+        runtime_key: String,
+        workload_id: String,
+        action: NanoRuntimeControlAction,
+    },
 }
 
 impl NanoStopResult {
@@ -164,6 +256,9 @@ pub struct NanoExecResult {
 #[serde(rename_all = "snake_case")]
 pub enum NanoSnapshotSemantics {
     EcsWorld,
+    /// Legacy schema name for WASM snapshots created before bound-result restore.
+    /// Restorers must never interpret this variant as authorization to replay a
+    /// stored input.
     WasmReexecute,
     BwrapConfigFs,
     RuntimeMetadata,
@@ -171,6 +266,16 @@ pub enum NanoSnapshotSemantics {
     /// deterministische Pfade zu Firecracker mem/state-Dateien je workload_id), NICHT die volatilen
     /// Guest-RAM-Bytes. Der echte Speicher-Snapshot liegt in den referenzierten Firecracker-Dateien.
     MicrovmMemory,
+    /// Safe bwrap compatibility snapshot: the bound workload specification and
+    /// command are sufficient to create a fresh sandbox/process incarnation.
+    /// It carries no process-memory or filesystem-content claim. Appended to
+    /// preserve bincode discriminants of existing schema-v4 snapshot variants.
+    BwrapRecreate,
+    /// Declarative WASM workload binding plus an already-bound execution result.
+    /// Restore creates a fresh runtime incarnation but never executes the stored
+    /// input. Any retry of an external effect requires a separate durable
+    /// idempotency key and receipt contract.
+    WasmBoundState,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -223,6 +328,14 @@ pub struct NanoIsolationReport {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NanoRecoveryResult {
+    pub runtime_key: String,
+    pub workload_id: String,
+    pub cleaned: bool,
+    pub detail: String,
+}
+
 pub trait NanoRuntime: Send {
     fn runtime_key(&self) -> &'static str;
     fn spawn(&mut self, workload: NanoWorkloadSpec) -> Result<NanoHandle>;
@@ -236,6 +349,57 @@ pub trait NanoRuntime: Send {
         handle: &NanoHandle,
         policy: NanoIsolationPolicy,
     ) -> Result<NanoIsolationReport>;
+
+    /// Reconcile durable resources left by a process crash before the workload
+    /// may be spawned again. Adapters without cross-process resources have a
+    /// safe no-op implementation; process-backed adapters override it.
+    fn reconcile_abandoned(&mut self, workload: &NanoWorkloadSpec) -> Result<NanoRecoveryResult> {
+        let runtime_key = workload
+            .runtime_key
+            .as_deref()
+            .unwrap_or(self.runtime_key());
+        anyhow::ensure!(
+            runtime_key == self.runtime_key(),
+            "workload '{}' selects runtime '{}', not '{}'",
+            workload.workload_id,
+            runtime_key,
+            self.runtime_key()
+        );
+        Ok(NanoRecoveryResult {
+            runtime_key: self.runtime_key().to_string(),
+            workload_id: workload.workload_id.clone(),
+            cleaned: false,
+            detail: "adapter has no durable abandoned resources".to_string(),
+        })
+    }
+
+    /// Apply a runtime-owned suspend/resume action. The default is a typed,
+    /// fail-closed rejection so a newly added adapter can never inherit a
+    /// silent no-op success.
+    fn control(
+        &mut self,
+        handle: &NanoHandle,
+        action: NanoRuntimeControlAction,
+    ) -> Result<NanoRuntimeControlResult> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        Err(NanoRuntimeControlError::Unsupported {
+            runtime_key: self.runtime_key().to_string(),
+            workload_id: handle.workload_id.clone(),
+            action,
+        }
+        .into())
+    }
+
+    /// Return process/isolation resources for monitoring side effects. The
+    /// adapter remains their sole lifecycle owner.
+    fn resources(&self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        Err(anyhow!(
+            "NanoRuntime '{}' does not expose instance-fenced resources for workload '{}'",
+            self.runtime_key(),
+            handle.workload_id
+        ))
+    }
 
     fn migrate(&mut self, target: &mut dyn NanoRuntime, handle: &NanoHandle) -> Result<NanoHandle>
     where
@@ -299,6 +463,39 @@ impl NanoRuntimeRegistry {
 
     pub fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
         self.get_mut(&handle.runtime_key)?.stop(handle)
+    }
+
+    pub fn resources(&mut self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
+        self.get_mut(&handle.runtime_key)?.resources(handle)
+    }
+
+    pub fn snapshot(&mut self, handle: &NanoHandle) -> Result<NanoSnapshot> {
+        self.get_mut(&handle.runtime_key)?.snapshot(handle)
+    }
+
+    pub fn restore(&mut self, snapshot: NanoSnapshot) -> Result<NanoHandle> {
+        let runtime_key = snapshot.runtime_key.clone();
+        self.get_mut(&runtime_key)?.restore(snapshot)
+    }
+
+    pub fn health(&mut self, handle: &NanoHandle) -> Result<NanoHealth> {
+        self.get_mut(&handle.runtime_key)?.health(handle)
+    }
+
+    pub fn control(
+        &mut self,
+        handle: &NanoHandle,
+        action: NanoRuntimeControlAction,
+    ) -> Result<NanoRuntimeControlResult> {
+        self.get_mut(&handle.runtime_key)?.control(handle, action)
+    }
+
+    pub fn reconcile_abandoned(
+        &mut self,
+        workload: &NanoWorkloadSpec,
+    ) -> Result<NanoRecoveryResult> {
+        let key = self.select_key(workload)?;
+        self.get_mut(&key)?.reconcile_abandoned(workload)
     }
 }
 
@@ -694,6 +891,49 @@ pub mod conformance {
         assert_eq!(
             registry.stop(&other_handle).unwrap().outcome,
             NanoStopOutcome::Stopped
+        );
+    }
+
+    #[test]
+    fn runtime_control_defaults_to_typed_fail_closed_rejection() {
+        let mut registry = NanoRuntimeRegistry::new(None);
+        registry.register(DummyRuntime::default()).unwrap();
+        let workload = NanoWorkloadSpec {
+            workload_id: "unsupported-control".to_string(),
+            runtime_key: Some("dummy-runtime".to_string()),
+            agent_id: None,
+            agent_name: "Agent".to_string(),
+            role: "Tester".to_string(),
+            room_id: "empfang".to_string(),
+            shift_set: 1,
+            command: Vec::new(),
+            capabilities: Vec::new(),
+            metadata: BTreeMap::new(),
+            ecs_snapshot: None,
+        };
+        let handle = registry
+            .get_mut("dummy-runtime")
+            .unwrap()
+            .spawn(workload)
+            .unwrap();
+
+        let error = registry
+            .control(&handle, NanoRuntimeControlAction::Suspend)
+            .unwrap_err();
+        let typed = error
+            .downcast_ref::<NanoRuntimeControlError>()
+            .expect("unsupported control must remain typed");
+        assert!(matches!(
+            typed,
+            NanoRuntimeControlError::Unsupported {
+                action: NanoRuntimeControlAction::Suspend,
+                ..
+            }
+        ));
+        assert_eq!(
+            registry.health(&handle).unwrap().state,
+            NanoHealthState::Healthy,
+            "unsupported control must not mutate the workload"
         );
     }
 
