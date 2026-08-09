@@ -197,11 +197,7 @@ impl BwrapConfig {
         args.push(INFO_FD.to_string());
         args.extend(command.iter().cloned());
 
-        info!(
-            "Spawning bwrap: {} args, command: {:?}",
-            args.len(),
-            command
-        );
+        log_bwrap_spawn(args.len());
 
         // Pipe for bwrap's --info-fd. Both ends CLOEXEC; the write end is
         // re-published at INFO_FD in the child via pre_exec (clearing CLOEXEC
@@ -215,11 +211,19 @@ impl BwrapConfig {
         let (read_fd, write_fd) = (fds[0], fds[1]);
 
         let mut cmd = Command::new("bwrap");
-        cmd.args(&args).stdin(std::process::Stdio::piped());
+        cmd.args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            // Protocol failures are represented by typed, public-safe frames.
+            // Inheriting child stderr would bypass that redaction boundary.
+            .stderr(std::process::Stdio::null());
         // SAFETY: the closure runs in the forked child before exec and only
-        // calls async-signal-safe fcntl/dup2 on a captured raw fd.
+        // calls async-signal-safe setpgid/fcntl/dup2 operations.
         unsafe {
             cmd.pre_exec(move || {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if write_fd == INFO_FD {
                     let flags = libc::fcntl(write_fd, libc::F_GETFD);
                     if flags < 0
@@ -336,6 +340,12 @@ impl BwrapConfig {
 
         args
     }
+}
+
+fn log_bwrap_spawn(argument_count: usize) {
+    // Command content is intentionally excluded: executable paths and arguments
+    // may contain invocation data or credentials supplied by the caller.
+    info!(argument_count, "Spawning bwrap with direct argv");
 }
 
 fn hostname_for_agent(name: &str) -> String {
@@ -476,6 +486,41 @@ fn parse_child_pid(json: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct SharedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spawn_log_excludes_command_content() {
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = SharedLogWriter(std::sync::Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let secret_marker = "SECRET_ARGUMENT_MUST_NOT_APPEAR";
+
+        tracing::subscriber::with_default(subscriber, || {
+            let command = [secret_marker.to_string()];
+            log_bwrap_spawn(command.len());
+        });
+
+        let captured = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(captured.contains("argument_count=1"));
+        assert!(!captured.contains(secret_marker));
+    }
 
     #[test]
     fn bwrap_command_structure() {
