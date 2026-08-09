@@ -915,29 +915,10 @@ impl BwrapNanoRuntime {
             .processes
             .get_mut(&handle.workload_id)
             .expect("workload retained after channel validation")
-            .start_protocol_supervision(&invocation_id, deadline_unix_ms);
-        if supervision_started.is_err() {
-            return Err(self.fail_workbench_exchange(
-                &handle.workload_id,
-                NanoExecErrorCode::ChannelUnavailable,
-                "workbench protocol supervision is unavailable",
-            ));
-        }
-        let send_result = self
-            .processes
-            .get_mut(&handle.workload_id)
-            .expect("workload retained after supervision start")
-            .send_protocol_line(input);
-        if send_result.is_err() {
-            self.processes
-                .get(&handle.workload_id)
-                .expect("workload retained after request send failure")
-                .mark_protocol_channel_disconnected();
-            return Err(self.fail_workbench_exchange(
-                &handle.workload_id,
-                NanoExecErrorCode::ChannelDisconnected,
-                "workbench request channel disconnected",
-            ));
+            .start_protocol_supervision(&invocation_id, deadline_unix_ms, input);
+        if let Err(failure) = supervision_started {
+            let (code, message) = supervision_failure_contract(failure);
+            return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
         }
         workbench_exec_result(handle, true, &invocation_id, "accepted", Vec::new())
     }
@@ -1191,6 +1172,11 @@ impl BwrapNanoRuntime {
             }
             Some(false) | Some(true) => {}
         }
+        let supervision = self.synchronize_protocol_supervision(&handle.workload_id);
+        if let Some(failure) = supervision.and_then(|snapshot| snapshot.failure) {
+            let (code, message) = supervision_failure_contract(failure);
+            return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
+        }
         let drain = match self
             .processes
             .get_mut(&handle.workload_id)
@@ -1217,12 +1203,16 @@ impl BwrapNanoRuntime {
                 );
             }
         };
+        // A reader only publishes a line after committing its shared
+        // supervision state. Synchronizing after the drain therefore imports
+        // autonomous deadline ownership before adapter-level `cancelled`
+        // validation, while a winning supervision failure retains priority.
+        let supervision = self.synchronize_protocol_supervision(&handle.workload_id);
+        if let Some(failure) = supervision.and_then(|snapshot| snapshot.failure) {
+            let (code, message) = supervision_failure_contract(failure);
+            return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
+        }
         if drain.queue_overflowed {
-            let supervision = self.synchronize_protocol_supervision(&handle.workload_id);
-            if let Some(failure) = supervision.and_then(|snapshot| snapshot.failure) {
-                let (code, message) = supervision_failure_contract(failure);
-                return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
-            }
             let exchange = self
                 .exchanges
                 .get(&handle.workload_id)
@@ -2271,6 +2261,19 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("protocol fixture did not record {expected} frame(s)");
+    }
+
+    fn wait_for_protocol_start_failure(
+        runtime: &BwrapNanoRuntime,
+        workload_id: &str,
+    ) -> ProtocolSupervisionFailure {
+        for _ in 0..1_000 {
+            if let Some(failure) = runtime.processes[workload_id].protocol_start_failure() {
+                return failure;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("protocol fixture did not publish its pre-execute failure");
     }
 
     fn poll_until_terminal(
@@ -3514,6 +3517,55 @@ mod tests {
     }
 
     #[test]
+    fn pre_execute_reader_failure_rejects_without_a_child_write() {
+        let cases = [
+            (
+                "protocol-preclosed",
+                "exec 1>&-; IFS= read -r frame && printf '%s\\n' \"$frame\" > '{record}'; sleep 5",
+                ProtocolSupervisionFailure::ChannelDisconnected,
+                NanoExecErrorCode::ChannelDisconnected,
+            ),
+            (
+                "protocol-preinvalid",
+                "printf 'not-json\\n'; IFS= read -r frame && printf '%s\\n' \"$frame\" > '{record}'; sleep 5",
+                ProtocolSupervisionFailure::InvalidFrame,
+                NanoExecErrorCode::InvalidFrame,
+            ),
+        ];
+
+        for (workload_id, script, expected_supervision, expected_error) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let record_path = temp.path().join("unexpected-input.jsonl");
+            let script = script.replace("{record}", &record_path.display().to_string());
+            let process = AgentProcess::launch_raw_protocol_fixture(&script).unwrap();
+            let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+            let handle = insert_protocol_process(&mut runtime, workload_id, process);
+            assert_eq!(
+                wait_for_protocol_start_failure(&runtime, workload_id),
+                expected_supervision
+            );
+
+            let error = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_start".to_string(),
+                        input: start_frame(
+                            "018f3f32-4f01-7f2c-a6c1-f6f4a81b2950",
+                            unix_time_ms() + 10_000,
+                        ),
+                    },
+                )
+                .unwrap_err();
+            assert_exec_error(&error, expected_error);
+            assert!(
+                !record_path.exists(),
+                "pre-execute reader failure still allowed a child write"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_utf8_and_endless_no_newline_overflow_fail_closed_without_poll() {
         let temp = tempfile::tempdir().unwrap();
         let overflow_descendant = temp.path().join("overflow-descendant.pid");
@@ -3818,6 +3870,15 @@ mod tests {
             .unwrap();
 
         claimed.wait();
+        let before_cancel = wait_for_recorded_lines(&record_path, 1);
+        assert_eq!(
+            before_cancel.lines().count(),
+            1,
+            "deadline action preceded or duplicated the initial execute frame"
+        );
+        let first: serde_json::Value =
+            serde_json::from_str(before_cancel.lines().next().unwrap()).unwrap();
+        assert_eq!(first["kind"], "execute");
         let claimed_snapshot =
             runtime.processes["deadline-send-race"].protocol_supervision_snapshot();
         assert_eq!(
@@ -3864,6 +3925,9 @@ mod tests {
             2,
             "deadline ownership must emit exactly one child cancel frame"
         );
+        let second: serde_json::Value =
+            serde_json::from_str(recorded.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(second["kind"], "cancel");
         let terminal = poll_until_error(&mut runtime, &handle, invocation_id);
         assert_exec_error(&terminal, NanoExecErrorCode::DeadlineExceeded);
         let terminal_replay = runtime
@@ -3876,6 +3940,82 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(terminal_replay.to_string(), terminal.to_string());
+    }
+
+    #[test]
+    fn acknowledged_deadline_cancel_is_retained_replayable_and_cleans_once() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2951";
+        let cancelled = serde_json::json!({
+            "kind": "cancelled",
+            "schema_version": 1,
+            "invocation_id": invocation_id
+        })
+        .to_string();
+        let temp = tempfile::tempdir().unwrap();
+        let record_path = temp.path().join("deadline-ack-input.jsonl");
+        let script = format!(
+            "record='{}'; IFS= read -r execute; printf '%s\\n' \"$execute\" >> \"$record\"; IFS= read -r cancel; printf '%s\\n' \"$cancel\" >> \"$record\"; printf '%s\\n' '{}'; sleep 5",
+            record_path.display(),
+            cancelled
+        );
+        let process = AgentProcess::launch_raw_protocol_fixture(&script).unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "deadline-ack", process);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 20),
+                },
+            )
+            .unwrap();
+
+        let mut terminal = None;
+        for _ in 0..400 {
+            let output = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_poll".to_string(),
+                        input: poll_frame(invocation_id),
+                    },
+                )
+                .unwrap();
+            if output.output.contains("completed") {
+                terminal = Some(output);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let terminal = terminal.expect("deadline acknowledgement did not become terminal");
+        let envelope: serde_json::Value = serde_json::from_str(&terminal.output).unwrap();
+        assert_eq!(envelope["state"], "completed");
+        assert_eq!(envelope["messages"][0]["kind"], "cancelled");
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap();
+        assert_eq!(replay.output, terminal.output);
+        let recorded = wait_for_recorded_lines(&record_path, 2);
+        assert_eq!(recorded.lines().count(), 2);
+        let kinds: Vec<_> = recorded
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"].clone())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![serde_json::json!("execute"), serde_json::json!("cancel")]
+        );
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Stopped
+        );
     }
 
     #[test]
@@ -3935,6 +4075,50 @@ mod tests {
             .unwrap_err();
         assert_exec_error(&replay, NanoExecErrorCode::ChannelDisconnected);
         assert_eq!(replay.to_string(), failure.to_string());
+    }
+
+    #[test]
+    fn valid_terminal_without_jsonl_newline_is_rejected_at_eof() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2952";
+        let terminal = serde_json::json!({
+            "kind": "error",
+            "schema_version": 1,
+            "invocation_id": invocation_id
+        })
+        .to_string();
+        let script = format!("IFS= read -r execute; printf '%s' '{}'", terminal);
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let handle = insert_protocol_process(
+            &mut runtime,
+            "protocol-unterminated-terminal",
+            AgentProcess::launch_raw_protocol_fixture(&script).unwrap(),
+        );
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap();
+        let quiesced = wait_for_autonomous_quiescence(&runtime, "protocol-unterminated-terminal");
+        assert_eq!(
+            quiesced.failure,
+            Some(ProtocolSupervisionFailure::InvalidFrame)
+        );
+        let error = poll_until_error(&mut runtime, &handle, invocation_id);
+        assert_exec_error(&error, NanoExecErrorCode::InvalidFrame);
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(replay.to_string(), error.to_string());
     }
 
     #[test]

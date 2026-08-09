@@ -106,6 +106,7 @@ struct ProtocolReaderState {
 struct ProtocolSupervisionState {
     reader: ProtocolReaderState,
     deadline_unix_ms: u64,
+    execute_sent: bool,
     cancel: Option<ProtocolCancelClaim>,
     outcome: ProtocolOutcome,
     reader_closed: bool,
@@ -118,6 +119,7 @@ impl Default for ProtocolSupervisionState {
         Self {
             reader: ProtocolReaderState::default(),
             deadline_unix_ms: 0,
+            execute_sent: false,
             cancel: None,
             outcome: ProtocolOutcome::Running,
             reader_closed: false,
@@ -488,14 +490,37 @@ impl AgentProcess {
         &mut self,
         invocation_id: &str,
         deadline_unix_ms: u64,
-    ) -> Result<()> {
+        execute_line: &str,
+    ) -> std::result::Result<(), ProtocolSupervisionFailure> {
         if self.protocol_supervisor.is_some() {
-            bail!("sandbox protocol supervision is already active");
+            return Err(ProtocolSupervisionFailure::ProtocolViolation);
         }
         {
             let mut state = self.supervision.lock();
+            if let ProtocolOutcome::FailurePending(failure)
+            | ProtocolOutcome::FinalFailure(failure) = state.outcome
+            {
+                return Err(failure);
+            }
+            if state.reader_closed
+                || !matches!(state.outcome, ProtocolOutcome::Running)
+                || state.execute_sent
+            {
+                return Err(ProtocolSupervisionFailure::ChannelDisconnected);
+            }
             state.reader.invocation_id = Some(invocation_id.to_string());
             state.deadline_unix_ms = deadline_unix_ms;
+            if write_protocol_line(&self.protocol_stdin, execute_line).is_err() {
+                state.outcome = ProtocolOutcome::FailurePending(
+                    ProtocolSupervisionFailure::ChannelDisconnected,
+                );
+                return Err(ProtocolSupervisionFailure::ChannelDisconnected);
+            }
+            // This release is the sole authority for child output and deadline
+            // actions. The initial execute record is fully written while the
+            // same state lock excludes the reader, and the deadline supervisor
+            // is created only after this publication.
+            state.execute_sent = true;
         }
 
         let pid = self.pid;
@@ -661,6 +686,20 @@ impl AgentProcess {
             self.termination.reaped.load(Ordering::Acquire),
             stdin_closed,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn protocol_start_failure(&self) -> Option<ProtocolSupervisionFailure> {
+        let state = self.supervision.lock();
+        match state.outcome {
+            ProtocolOutcome::FailurePending(failure) | ProtocolOutcome::FinalFailure(failure) => {
+                Some(failure)
+            }
+            _ if state.reader_closed && !state.execute_sent => {
+                Some(ProtocolSupervisionFailure::ChannelDisconnected)
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn owned_process_reaped(&self) -> bool {
@@ -1531,6 +1570,13 @@ fn protocol_line_receiver(
             if reached_eof && bytes.is_empty() {
                 break;
             }
+            if reached_eof {
+                // JSONL records are newline terminated. A syntactically valid
+                // JSON value at EOF is still an incomplete protocol record.
+                record_protocol_failure(&supervision, ProtocolSupervisionFailure::InvalidFrame);
+                let _ = sender.try_send(ProtocolFrame::Rejected);
+                return;
+            }
             let line = match String::from_utf8(bytes) {
                 Ok(line) => line,
                 Err(_) => {
@@ -1548,39 +1594,37 @@ fn protocol_line_receiver(
                         return;
                     }
                 };
+            let mut state = supervision.lock();
+            let committed = commit_protocol_reader_state(
+                &mut state,
+                next_reader_state,
+                terminal,
+                std::time::Instant::now(),
+            );
+            if !committed {
+                return;
+            }
             match sender.try_send(ProtocolFrame::Line(line)) {
                 Ok(()) => {
-                    let mut state = supervision.lock();
-                    let committed = commit_protocol_reader_state(
-                        &mut state,
-                        next_reader_state,
-                        terminal,
-                        std::time::Instant::now(),
-                    );
                     drop(state);
-                    if committed && terminal {
+                    if terminal {
                         #[cfg(test)]
                         supervision.wait_at_post_terminal_barrier();
                     }
                 }
                 Err(mpsc::TrySendError::Full(_)) => {
                     queue_overflowed.store(true, Ordering::Release);
-                    record_protocol_failure(
-                        &supervision,
+                    state.outcome = ProtocolOutcome::FailurePending(
                         ProtocolSupervisionFailure::OutputLimitExceeded,
                     );
                     return;
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => {
-                    record_protocol_failure(
-                        &supervision,
+                    state.outcome = ProtocolOutcome::FailurePending(
                         ProtocolSupervisionFailure::ChannelDisconnected,
                     );
                     return;
                 }
-            }
-            if reached_eof {
-                return;
             }
         }
     });
@@ -1592,6 +1636,11 @@ fn validate_protocol_output_line(
     line: &str,
 ) -> std::result::Result<(ProtocolReaderState, bool), ProtocolSupervisionFailure> {
     let state = supervision.lock();
+    if !state.execute_sent {
+        // Before the initial execute write is fully published, any child output
+        // is an invalid pre-execute record. Do not parse or retain it.
+        return Err(ProtocolSupervisionFailure::InvalidFrame);
+    }
     let mut next = state.reader.clone();
     if next.terminal {
         return Err(ProtocolSupervisionFailure::ProtocolViolation);
