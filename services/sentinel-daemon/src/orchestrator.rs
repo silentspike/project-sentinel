@@ -16496,9 +16496,6 @@ mod tests {
             state_hash_after.last_event_id,
             state_hash_before.last_event_id
         );
-        shutdown_clone.store(true, Ordering::SeqCst);
-        assert!(handle.join().unwrap().is_ok());
-
         assert!(
             event_store_readback
                 .get_all_events()
@@ -16511,6 +16508,8 @@ mod tests {
             security_runtime_readback.read().unwrap().contains_key(&1),
             "fenced queued despawn must leave the exact runtime observation intact"
         );
+        shutdown_clone.store(true, Ordering::SeqCst);
+        assert!(handle.join().unwrap().is_ok());
     }
 
     #[test]
