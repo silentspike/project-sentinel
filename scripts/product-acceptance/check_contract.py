@@ -38,7 +38,23 @@ REQUIRED_CATEGORIES = {
     "workspace",
 }
 
-DELIVERY_ISSUES = {75, 472, 650, 693, 694, 695, 696, 698}
+DELIVERY_ISSUES = {75, 472, 650, 693, 694, 695, 696, 698, 701, 735, 762}
+SERIAL_CHAIN = [472, 701, 694, 695, 696, 650]
+PARALLEL_CORRECTNESS_EDGES = [735, 762]
+REQUIRED_EDGE_REQUIREMENTS = {
+    "M0-RUNTIME-003": (
+        701,
+        "console/evidence/issue-701-live/bwrap-jsonl-channel.md",
+    ),
+    "M0-MEMORY-002": (
+        735,
+        "console/evidence/issue-735-live/durable-episode-projection.md",
+    ),
+    "M0-STABILITY-002": (
+        762,
+        "console/evidence/issue-762-live/pressure-safe-shift.md",
+    ),
+}
 ALLOWED_STATUSES = {"blocked", "not_tested", "pass"}
 
 REQUIRED_ROLES = {
@@ -145,6 +161,21 @@ def relative_path(
 def duplicate_values(values: list[str]) -> set[str]:
     counts = Counter(values)
     return {value for value, count in counts.items() if count > 1}
+
+
+def validate_exact_issue_sequence(
+    matrix: dict[str, Any], field: str, expected: list[int], errors: list[str]
+) -> None:
+    value = matrix.get(field)
+    if (
+        not isinstance(value, list)
+        or value != expected
+        or any(not isinstance(issue, int) or isinstance(issue, bool) for issue in value)
+    ):
+        errors.append(
+            f"matrix.{field}: expected exact ordered sequence "
+            + ", ".join(str(issue) for issue in expected)
+        )
 
 
 def table_ids(
@@ -452,6 +483,14 @@ def validate(repo_root: Path, matrix_path: Path | None = None) -> list[str]:
     if matrix.get("epic") != 650:
         errors.append("matrix.epic: expected 650")
 
+    validate_exact_issue_sequence(matrix, "serial_chain", SERIAL_CHAIN, errors)
+    validate_exact_issue_sequence(
+        matrix,
+        "parallel_correctness_edges",
+        PARALLEL_CORRECTNESS_EDGES,
+        errors,
+    )
+
     configured_issues = matrix.get("delivery_issues")
     if (
         not isinstance(configured_issues, list)
@@ -540,6 +579,28 @@ def validate(repo_root: Path, matrix_path: Path | None = None) -> list[str]:
             "matrix.requirements: missing categories "
             + ", ".join(sorted(missing_categories))
         )
+
+    requirements_by_id = {
+        requirement.get("id"): requirement
+        for requirement in requirements
+        if isinstance(requirement, dict) and isinstance(requirement.get("id"), str)
+    }
+    for requirement_id, (owner_issue, evidence) in REQUIRED_EDGE_REQUIREMENTS.items():
+        requirement = requirements_by_id.get(requirement_id)
+        if requirement is None:
+            errors.append(
+                f"matrix.requirements: missing required M0 edge {requirement_id!r}"
+            )
+            continue
+        if requirement.get("owner_issue") != owner_issue:
+            errors.append(
+                f"matrix.requirements[{requirement_id}].owner_issue: "
+                f"expected #{owner_issue}"
+            )
+        if requirement.get("evidence") != evidence:
+            errors.append(
+                f"matrix.requirements[{requirement_id}].evidence: expected {evidence!r}"
+            )
 
     return errors
 
