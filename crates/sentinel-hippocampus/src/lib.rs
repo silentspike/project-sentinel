@@ -31,4 +31,20 @@ pub use selection::{
 };
 pub use service::{ConsolidationResult, HippocampusService};
 pub use sleep::{SleepCycle, SleepPhase};
-pub use store::{HippocampusStore, NarrativeState, ReadOnlyHippocampusStore, RedbFactStore};
+pub use store::{
+    episode_projection_archive_snapshot_digest, episode_projection_generation_id,
+    episode_projection_source_cut_coverage, episode_projection_subject_coverage_digest,
+    EpisodeProjectionAdmission, EpisodeProjectionAdvance, EpisodeProjectionAgent,
+    EpisodeProjectionApplyOutcome, EpisodeProjectionControl, EpisodeProjectionCutoverReceipt,
+    EpisodeProjectionFrontier, EpisodeProjectionGenerationCandidate,
+    EpisodeProjectionGenerationDescriptor, EpisodeProjectionGenerationInfo,
+    EpisodeProjectionGenerationPhase, EpisodeProjectionGenerationStatus,
+    EpisodeProjectionGenerationSubject, EpisodeProjectionQuarantine,
+    EpisodeProjectionQuarantineReason, EpisodeProjectionReadiness, EpisodeProjectionReadinessBlock,
+    EpisodeProjectionResolution, EpisodeProjectionSourceClassification,
+    EpisodeProjectionSourceCoverageEntry, EpisodeProjectionSourceCutCoverage,
+    EpisodeProjectionSourceCutEvidence, EpisodeProjectionStartPolicy, EpisodeProjectionSubject,
+    EpisodeProjectionWrite, EpisodeSourceReceipt, HippocampusStore, NarrativeState,
+    ReadOnlyHippocampusStore, RedbFactStore, EPISODE_PROJECTION_MAX_LIVE_EPISODES_PER_SUBJECT,
+    EPISODE_PROJECTION_TICK_DURATION_MILLIS, EPISODE_PROJECTION_VERSION,
+};
