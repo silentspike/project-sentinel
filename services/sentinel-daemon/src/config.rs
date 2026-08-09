@@ -63,6 +63,10 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub operator_api: OperatorApiConfig,
 
+    /// Optional one-time, operator-authenticated EpisodeProducer legacy cutover.
+    #[serde(default)]
+    pub episode_projection_cutover: Option<EpisodeProjectionCutoverConfig>,
+
     /// Prometheus-eBPF Metrics-HTTP-Server (#525: loopback secure default).
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -260,6 +264,18 @@ pub struct OperatorApiConfig {
     /// Optionales Shared Secret fuer Dashboard-Proxy -> Daemon.
     #[serde(default)]
     pub shared_secret: Option<String>,
+}
+
+/// Sealed values generated from the exact legacy Hippocampus state and the
+/// selected immutable EventStore prefix. The operator secret is never stored
+/// here; it is required only for the first validation, after which the durable
+/// cutover receipt can reopen without this one-time configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct EpisodeProjectionCutoverConfig {
+    pub source_row_id: i64,
+    pub legacy_state_digest: String,
+    pub source_cut_digest: String,
+    pub authorization_digest: String,
 }
 
 impl Default for OperatorApiConfig {

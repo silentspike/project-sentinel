@@ -118,7 +118,10 @@ fn secure_credential_mode(
         && gid == 0
         && credentials_directory.is_some_and(|directory| path.parent() == Some(directory))
 }
-use crate::episode_producer::EpisodeProducer;
+use crate::episode_producer::{
+    EpisodeProducer, EpisodeProjectionCutoverSeal, EpisodeProjectionOperatorCommand,
+    SharedEpisodeProjectionAdmissionState,
+};
 use crate::evolution_task::{EvolutionJob, EvolutionResult, EvolutionSource};
 use crate::operator_api;
 use crate::runtime_control::{
@@ -134,6 +137,87 @@ use runtime_lifecycle::RuntimeAdapterOwner;
 const PERSONALITY_EVOLUTION_PER_AGENT_FIELD_KEEP: i64 = 2000;
 const PERSONALITY_EVOLUTION_GLOBAL_HIGH_WATER: i64 = 499_000;
 const PERSONALITY_EVOLUTION_GLOBAL_RETAIN: i64 = 490_000;
+
+fn episode_projection_allows_agent(
+    state: &SharedEpisodeProjectionAdmissionState,
+    agent_id: AgentId,
+) -> bool {
+    state
+        .read()
+        .map(|snapshot| snapshot.allows_agent(agent_id))
+        .unwrap_or(false)
+}
+
+fn open_episode_producer(
+    hippocampus: sentinel_hippocampus::HippocampusService,
+    agents: &[(u16, String)],
+    event_store: &sentinel_limbo::EventStore,
+    cutover: Option<&crate::config::EpisodeProjectionCutoverConfig>,
+    operator_secret: Option<&str>,
+    tick_duration_millis: u64,
+) -> anyhow::Result<EpisodeProducer> {
+    match cutover {
+        Some(cutover) => EpisodeProducer::new_with_cutover_seal_and_tick_duration(
+            hippocampus,
+            agents,
+            event_store,
+            EpisodeProjectionCutoverSeal {
+                source_row_id: cutover.source_row_id,
+                legacy_state_digest: cutover.legacy_state_digest.clone(),
+                source_cut_digest: cutover.source_cut_digest.clone(),
+                authorization_digest: cutover.authorization_digest.clone(),
+            },
+            operator_secret,
+            tick_duration_millis,
+        ),
+        None => EpisodeProducer::new_with_tick_duration(
+            hippocampus,
+            agents,
+            event_store,
+            tick_duration_millis,
+        ),
+    }
+}
+
+fn publish_episode_projection_health(
+    runtime_health: &crate::runtime_health::SharedRuntimeHealthState,
+    state: &SharedEpisodeProjectionAdmissionState,
+) {
+    let snapshot = match state.read() {
+        Ok(snapshot) => snapshot.clone(),
+        Err(_) => Default::default(),
+    };
+    if let Ok(mut health) = runtime_health.write() {
+        let blocked_agents = snapshot.agents.iter().filter(|agent| !agent.ready).count();
+        health.worker_states.insert(
+            "episode_projection".to_string(),
+            crate::runtime_health::RuntimeWorkerState {
+                running: snapshot.initialized
+                    && !snapshot.integrity_error
+                    && snapshot.global_blockers.is_empty(),
+                restart_count: 0,
+                last_error: (snapshot.integrity_error
+                    || !snapshot.global_blockers.is_empty()
+                    || blocked_agents > 0)
+                    .then(|| {
+                        format!(
+                            "integrity_error={} global_blockers={} blocked_agents={blocked_agents}",
+                            snapshot.integrity_error,
+                            snapshot.global_blockers.len()
+                        )
+                    }),
+                thread_name: "ecs-tick-loop".to_string(),
+            },
+        );
+        for agent in &mut health.agents {
+            if !snapshot.allows_agent(AgentId(agent.agent_id)) {
+                agent.last_repair_status = Some("episode_projection_blocked".to_string());
+            } else if agent.last_repair_status.as_deref() == Some("episode_projection_blocked") {
+                agent.last_repair_status = None;
+            }
+        }
+    }
+}
 
 fn retain_personality_evolution_agent_field(
     evo_db: &sentinel_limbo::rusqlite::Connection,
@@ -2110,7 +2194,18 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         .iter()
         .map(|a| (a.identity.id, a.identity.name.clone()))
         .collect();
-    let episode_producer = EpisodeProducer::new(hippocampus, &agent_name_pairs, &event_store);
+    let episode_producer = open_episode_producer(
+        hippocampus,
+        &agent_name_pairs,
+        &event_store,
+        config.episode_projection_cutover.as_ref(),
+        config.operator_api.shared_secret.as_deref(),
+        config.tick_rate_ms,
+    )
+    .context("Episode Producer fail-closed initialisieren")?;
+    let episode_projection_admission = episode_producer.admission_state();
+    let (episode_projection_tx, episode_projection_rx) =
+        mpsc::channel::<EpisodeProjectionOperatorCommand>();
     info!("Episode Producer initialisiert");
 
     // -- eBPF Monitoring initialisieren --
@@ -2428,6 +2523,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 Arc::clone(&state_store),
                 Arc::clone(&platform_state),
                 Arc::clone(&runtime_health),
+                Arc::clone(&episode_projection_admission),
+                episode_projection_tx.clone(),
                 Arc::clone(&security_runtime_state),
                 cluster_control.clone(),
                 cluster_meta.clone(),
@@ -2501,6 +2598,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 ebpf_collector,
                 ebpf_tx,
                 episode_producer,
+                episode_projection_rx,
                 nightrun_rx,
                 Some(evolution_job_tx),
                 Some(evolution_result_rx),
@@ -2562,6 +2660,41 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- LLM Bridge starten (Perception → Cortex Gateway → Action) --
     #[cfg(feature = "llm")]
     let _llm_bridge_handle = {
+        let (guarded_perception_tx, guarded_perception_rx) =
+            mpsc::sync_channel::<Perception>(128);
+        let perception_admission = Arc::clone(&episode_projection_admission);
+        tokio::task::spawn_blocking(move || {
+            while let Ok(perception) = perception_rx.recv() {
+                if episode_projection_allows_agent(&perception_admission, perception.agent_id) {
+                    if guarded_perception_tx.send(perception).is_err() {
+                        break;
+                    }
+                } else {
+                    sentinel_telemetry::MetricsRegistry::global()
+                        .counter("sentinel_episode_projection_admission_blocked_total")
+                        .increment();
+                    warn!(agent_id = %perception.agent_id, "Agent perception blocked by episode projection readiness");
+                }
+            }
+        });
+        let (guarded_action_tx, guarded_action_rx) =
+            mpsc::channel::<sentinel_common::AgentAction>();
+        let action_admission = Arc::clone(&episode_projection_admission);
+        let admitted_action_tx = action_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            while let Ok(action) = guarded_action_rx.recv() {
+                if episode_projection_allows_agent(&action_admission, action.agent_id) {
+                    if admitted_action_tx.send(action).is_err() {
+                        break;
+                    }
+                } else {
+                    sentinel_telemetry::MetricsRegistry::global()
+                        .counter("sentinel_episode_projection_action_blocked_total")
+                        .increment();
+                    warn!(agent_id = %action.agent_id, "Agent action blocked by episode projection readiness");
+                }
+            }
+        });
         let gateway_request_timeout_ms = std::env::var("SENTINEL_LLM_BRIDGE_REQUEST_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -2578,7 +2711,6 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         };
         let bridge_telemetry =
             std::sync::Arc::new(crate::llm_bridge::bridge::BridgeTelemetry::default());
-        let bridge_action_tx = action_tx.clone();
         let bridge_telem = std::sync::Arc::clone(&bridge_telemetry);
         info!(
             gateway_url = %bridge_config.gateway_url,
@@ -2588,8 +2720,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         );
         tokio::spawn(crate::llm_bridge::bridge::run_llm_bridge(
             bridge_config,
-            perception_rx,
-            bridge_action_tx,
+            guarded_perception_rx,
+            guarded_action_tx,
             bridge_telem,
             Arc::clone(&state_store),
             Arc::clone(&event_store), // #427: emit AgentLlmUsage per LLM call
@@ -6931,6 +7063,7 @@ fn ecs_tick_loop(
     mut ebpf_collector: EbpfCollector,
     ebpf_tx: tokio::sync::mpsc::Sender<MetricsSnapshot>,
     mut episode_producer: EpisodeProducer,
+    episode_projection_rx: mpsc::Receiver<EpisodeProjectionOperatorCommand>,
     nightrun_rx: mpsc::Receiver<sentinel_common::OperatorNightrunCommand>,
     evolution_job_tx: Option<tokio::sync::mpsc::Sender<EvolutionJob>>,
     evolution_result_rx: Option<mpsc::Receiver<EvolutionResult>>,
@@ -6965,6 +7098,7 @@ fn ecs_tick_loop(
     #[cfg(feature = "llm")]
     platform_llm_analyzer: crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle,
 ) -> Result<u64> {
+    let episode_projection_admission = episode_producer.admission_state();
     // Adaptive Tick-Rate Controller (PSI-basiert, TOGAF Adaptive Scheduling)
     let mut adaptive_tick = AdaptiveTickRate::new(adaptive_config);
 
@@ -7576,6 +7710,11 @@ fn ecs_tick_loop(
 
     // GOLF: Default-Goals fuer alle gespawnten Agents erstellen
     for agent_cfg in &shift_agents {
+        let agent_id = AgentId(agent_cfg.identity.id);
+        if !episode_projection_allows_agent(&episode_projection_admission, agent_id) {
+            warn!(agent_id = %agent_id, "GOLF initialization blocked by episode projection readiness");
+            continue;
+        }
         let existing = episode_producer
             .hippocampus()
             .get_goals(&agent_cfg.identity.name)
@@ -8541,6 +8680,7 @@ fn ecs_tick_loop(
             analysis_queue_stats,
             &adapter_observations,
         );
+        publish_episode_projection_health(&runtime_health, &episode_projection_admission);
 
         // Prune: Empfange Cutoff von Operator-API, arbeite 1 Batch/Tick ab
         while let Ok(cutoff) = prune_rx.try_recv() {
@@ -8661,6 +8801,14 @@ fn ecs_tick_loop(
                         .find(|a| AgentId(a.identity.id) == *agent_id)
                         .map(|a| a.identity.name.as_str());
                     if let Some(name) = agent_name {
+                        if !episode_projection_allows_agent(
+                            &episode_projection_admission,
+                            *agent_id,
+                        ) {
+                            shift_agents_failed += 1;
+                            warn!(agent_id = %agent_id, "Shift consolidation blocked by episode projection readiness");
+                            continue;
+                        }
                         let agent_started = Instant::now();
                         match episode_producer.hippocampus().consolidate_agent(name) {
                             Ok(result) => {
@@ -8913,6 +9061,12 @@ fn ecs_tick_loop(
                 // Pro ueberlebte Schicht erhoehen wir den Progress aktiver Goals
                 // um einen kleinen Betrag (0.05 = ~20 Schichten bis Completion).
                 for agent_id in &removed {
+                    if !episode_projection_allows_agent(
+                        &episode_projection_admission,
+                        *agent_id,
+                    ) {
+                        continue;
+                    }
                     let agent_name = all_agents
                         .iter()
                         .find(|a| AgentId(a.identity.id) == *agent_id)
@@ -8972,6 +9126,13 @@ fn ecs_tick_loop(
                     let agent_id = AgentId(agent_cfg.identity.id);
                     // Set 0 (Sonder) bleibt, nicht nochmal spawnen
                     if runtime_orch.get_agent_mut(agent_id).is_some() {
+                        continue;
+                    }
+                    if !episode_projection_allows_agent(
+                        &episode_projection_admission,
+                        agent_id,
+                    ) {
+                        warn!(agent_id = %agent_id, "Agent spawn blocked by episode projection readiness");
                         continue;
                     }
                     if spawn_agent_full(
@@ -9109,6 +9270,15 @@ fn ecs_tick_loop(
                 let name = &agent_cfg.identity.name;
                 if nightrun_cmd.dry_run {
                     info!(agent = %name, "Nightrun dry-run: wuerde konsolidieren");
+                    continue;
+                }
+                let agent_id = AgentId(agent_cfg.identity.id);
+                if !episode_projection_allows_agent(
+                    &episode_projection_admission,
+                    agent_id,
+                ) {
+                    agents_failed_total += 1;
+                    warn!(agent_id = %agent_id, "Operator nightrun blocked by episode projection readiness");
                     continue;
                 }
                 let agent_started = Instant::now();
@@ -10321,12 +10491,63 @@ fn ecs_tick_loop(
             }
         }
 
+        while let Ok(command) = episode_projection_rx.try_recv() {
+            match command {
+                EpisodeProjectionOperatorCommand::Resolve {
+                    request,
+                    response_tx,
+                } => {
+                    let result = if unfenced_world_background_work_allowed(
+                        owner_registry,
+                        &restore_fence,
+                    ) {
+                        episode_producer
+                            .resolve_quarantine(
+                                &event_store_for_episodes,
+                                tick_count,
+                                tick_rate.as_secs_f64(),
+                                &request,
+                            )
+                            .map_err(|error| error.to_string())
+                    } else {
+                        Err("episode projection resolution is fenced".to_string())
+                    };
+                    let _ = response_tx.send(result);
+                    publish_episode_projection_health(
+                        &runtime_health,
+                        &episode_projection_admission,
+                    );
+                }
+                EpisodeProjectionOperatorCommand::Generation {
+                    request,
+                    response_tx,
+                } => {
+                    let result = if unfenced_world_background_work_allowed(
+                        owner_registry,
+                        &restore_fence,
+                    ) {
+                        episode_producer
+                            .handle_generation_request(&event_store_for_episodes, &request)
+                            .map_err(|error| error.to_string())
+                    } else {
+                        Err("episode projection generation mutation is fenced".to_string())
+                    };
+                    let _ = response_tx.send(result);
+                    publish_episode_projection_health(
+                        &runtime_health,
+                        &episode_projection_admission,
+                    );
+                }
+            }
+        }
+
         // Episode Producer (alle 30 Ticks = ~30s bei 1s Tick-Rate)
         if unfenced_world_background_work_allowed(owner_registry, &restore_fence)
             && episode_producer.should_run(tick_count)
         {
             let tick_rate_s = tick_rate.as_secs_f64();
             episode_producer.tick(&event_store_for_episodes, tick_count, tick_rate_s);
+            publish_episode_projection_health(&runtime_health, &episode_projection_admission);
         }
 
         // Periodischer Runtime-Snapshot (alle 600 Ticks = ~10 Minuten bei 1s Tick-Rate).
@@ -10499,6 +10720,172 @@ mod tests {
     use std::sync::Arc;
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn episode_projection_cutover_restarts_after_secret_and_config_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hippocampus_path = tmp.path().join("hippocampus.redb");
+        let events_path = tmp.path().join("events.db");
+        let event_store = EventStore::open(events_path.to_str().unwrap()).unwrap();
+        let secret = "episode-projection-cutover-secret-0001";
+        let agents = vec![(1_u16, "Thomas".to_string())];
+
+        let service = sentinel_hippocampus::HippocampusService::open(
+            hippocampus_path.to_str().unwrap(),
+        )
+        .unwrap();
+        service
+            .record_episode(sentinel_hippocampus::Episode {
+                id: 77,
+                agent_name: "Thomas".to_string(),
+                summary: "legacy episode".to_string(),
+                relevance: 0.5,
+                emotion: 0.5,
+                repetitions: 1,
+                hours_ago: 1.0,
+                participants: Vec::new(),
+                tags: Vec::new(),
+            })
+            .unwrap();
+        let legacy_state_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                service
+                    .store()
+                    .episode_projection_legacy_state_material()
+                    .unwrap()
+            )
+        );
+        let source_cut_digest =
+            crate::episode_producer::event_store_source_cut_digest(&event_store, 0).unwrap();
+        let authorization_digest = crate::episode_producer::cutover_authorization_digest(
+            0,
+            &legacy_state_digest,
+            &source_cut_digest,
+            secret,
+        );
+        let cutover = crate::config::EpisodeProjectionCutoverConfig {
+            source_row_id: 0,
+            legacy_state_digest,
+            source_cut_digest,
+            authorization_digest,
+        };
+        drop(
+            open_episode_producer(
+                service,
+                &agents,
+                &event_store,
+                Some(&cutover),
+                Some(secret),
+                1000,
+            )
+                .unwrap(),
+        );
+
+        let restart_without_one_time_material = sentinel_hippocampus::HippocampusService::open(
+            hippocampus_path.to_str().unwrap(),
+        )
+        .unwrap();
+        drop(
+            open_episode_producer(
+                restart_without_one_time_material,
+                &agents,
+                &event_store,
+                None,
+                None,
+                1000,
+            )
+            .unwrap(),
+        );
+
+        let restart_with_non_secret_seal = sentinel_hippocampus::HippocampusService::open(
+            hippocampus_path.to_str().unwrap(),
+        )
+        .unwrap();
+        drop(
+            open_episode_producer(
+                restart_with_non_secret_seal,
+                &agents,
+                &event_store,
+                Some(&cutover),
+                None,
+                1000,
+            )
+            .unwrap(),
+        );
+
+        let mut stale = cutover.clone();
+        stale.source_cut_digest = "ff".repeat(32);
+        let stale_restart = sentinel_hippocampus::HippocampusService::open(
+            hippocampus_path.to_str().unwrap(),
+        )
+        .unwrap();
+        let error = open_episode_producer(
+            stale_restart,
+            &agents,
+            &event_store,
+            Some(&stale),
+            None,
+            1000,
+        )
+        .err()
+        .expect("stale cutover config must fail closed");
+        assert!(error.to_string().contains("persisted cutover seal mismatch"));
+    }
+
+    #[test]
+    fn episode_projection_health_and_agent_admission_fail_closed_independently() {
+        let admission = Arc::new(RwLock::new(
+            crate::episode_producer::EpisodeProjectionAdmissionSnapshot {
+                initialized: true,
+                integrity_error: false,
+                global_frontier_source_row_id: Some(9),
+                global_blockers: Vec::new(),
+                agents: vec![
+                    crate::episode_producer::EpisodeProjectionAgentDiagnostic {
+                        agent_id: 1,
+                        ready: false,
+                        frontier_source_row_id: Some(8),
+                        lag_rows: Some(1),
+                        blockers: Vec::new(),
+                    },
+                    crate::episode_producer::EpisodeProjectionAgentDiagnostic {
+                        agent_id: 2,
+                        ready: true,
+                        frontier_source_row_id: Some(9),
+                        lag_rows: Some(0),
+                        blockers: Vec::new(),
+                    },
+                ],
+            },
+        ));
+        assert!(!episode_projection_allows_agent(&admission, AgentId(1)));
+        assert!(episode_projection_allows_agent(&admission, AgentId(2)));
+
+        let mut first = reconcile_health_fixture(RUNTIME_ECS_NATIVE, None, false, 0);
+        first.agent_id = 1;
+        let mut second = reconcile_health_fixture(RUNTIME_ECS_NATIVE, None, false, 0);
+        second.agent_id = 2;
+        second.last_repair_status = Some("episode_projection_blocked".to_string());
+        let health = Arc::new(RwLock::new(runtime_health::RuntimeHealthSnapshot {
+            agents: vec![first, second],
+            ..Default::default()
+        }));
+        publish_episode_projection_health(&health, &admission);
+
+        let health_snapshot = health.read().unwrap();
+        let worker = health_snapshot.worker_states.get("episode_projection").unwrap();
+        assert!(worker.running);
+        assert!(worker
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("blocked_agents=1")));
+        assert_eq!(
+            health_snapshot.agents[0].last_repair_status.as_deref(),
+            Some("episode_projection_blocked")
+        );
+        assert_eq!(health_snapshot.agents[1].last_repair_status, None);
+    }
 
     fn reconcile_health_fixture(
         runtime_key: &str,
@@ -11277,7 +11664,7 @@ mod tests {
         let path = tmp.path().join("test-hippocampus.redb");
         let hippocampus =
             sentinel_hippocampus::HippocampusService::open(path.to_str().unwrap()).unwrap();
-        EpisodeProducer::new(hippocampus, &[], event_store)
+        EpisodeProducer::new(hippocampus, &[], event_store).unwrap()
     }
 
     fn test_agent_config(id: u16, name: &str, role: &str, shift_set: u8) -> AgentConfig {
@@ -12255,6 +12642,7 @@ mod tests {
             ebpf_collector,
             ebpf_tx,
             test_episode_producer(temp_root, &event_store),
+            mpsc::channel::<EpisodeProjectionOperatorCommand>().1,
             mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
             None,
             None,
@@ -14286,6 +14674,7 @@ mod tests {
             ebpf_collector,
             ebpf_tx,
             test_episode_producer(&tmp, &event_store),
+            mpsc::channel::<EpisodeProjectionOperatorCommand>().1,
             mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
             None,
             None,
@@ -14816,6 +15205,7 @@ mod tests {
             ebpf_collector,
             ebpf_tx,
             test_episode_producer(&tmp, &event_store),
+            mpsc::channel::<EpisodeProjectionOperatorCommand>().1,
             mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
             None,
             None,
@@ -16096,6 +16486,7 @@ mod tests {
             ebpf_collector,
             ebpf_tx,
             ep,
+            mpsc::channel::<EpisodeProjectionOperatorCommand>().1,
             mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
             None,
             None,
@@ -16192,6 +16583,7 @@ mod tests {
                 ebpf_collector,
                 ebpf_tx,
                 ep,
+                mpsc::channel::<EpisodeProjectionOperatorCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
                 None,
                 None,
@@ -16305,6 +16697,7 @@ mod tests {
                 ebpf_collector,
                 ebpf_tx,
                 ep,
+                mpsc::channel::<EpisodeProjectionOperatorCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
                 None,
                 None,
@@ -16437,6 +16830,7 @@ mod tests {
                 ebpf_collector,
                 ebpf_tx,
                 episode_producer,
+                mpsc::channel::<EpisodeProjectionOperatorCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
                 None,
                 None,
@@ -16579,6 +16973,7 @@ mod tests {
                 ebpf_collector,
                 ebpf_tx,
                 episode_producer,
+                mpsc::channel::<EpisodeProjectionOperatorCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
                 None,
                 None,
@@ -16710,6 +17105,7 @@ mod tests {
                 ebpf_collector,
                 ebpf_tx,
                 ep,
+                mpsc::channel::<EpisodeProjectionOperatorCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
                 None,
                 None,

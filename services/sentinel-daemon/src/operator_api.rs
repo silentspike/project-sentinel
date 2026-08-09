@@ -31,6 +31,11 @@ use sentinel_common::{
 };
 
 use crate::config::OperatorApiConfig;
+use crate::episode_producer::{
+    EpisodeProjectionGenerationRequest, EpisodeProjectionOperatorCommand,
+    EpisodeProjectionResolveRequest,
+    SharedEpisodeProjectionAdmissionState,
+};
 use crate::platform_controlplane::{
     PlatformAnalysisCommand, PlatformControlCommand, PlatformStateSnapshot,
     PlatformTriggerTestCommand,
@@ -67,6 +72,11 @@ const OPERATOR_PLATFORM_TRIGGER_TEST_PATH: &str = "/operator/platform-trigger-te
 const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-test";
 const OPERATOR_PLATFORM_STATE_PATH: &str = "/operator/platform-state";
 const OPERATOR_RUNTIME_HEALTH_PATH: &str = "/operator/runtime-health";
+const OPERATOR_EPISODE_PROJECTION_PATH: &str = "/operator/episode-projection";
+const OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH: &str =
+    "/operator/episode-projection/resolve";
+const OPERATOR_EPISODE_PROJECTION_GENERATION_PATH: &str =
+    "/operator/episode-projection/generation";
 const OPERATOR_RUNTIME_RECONCILE_PATH: &str = "/operator/runtime/reconcile";
 const OPERATOR_RUNTIME_ANALYSIS_FLOOD_TEST_PATH: &str = "/operator/runtime/analysis-flood-test";
 const OPERATOR_RUNTIME_PANIC_TEST_PATH: &str = "/operator/runtime/panic-test";
@@ -493,6 +503,8 @@ struct AppState {
     state_store: Arc<StateStore>,
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
+    episode_projection_admission: SharedEpisodeProjectionAdmissionState,
+    episode_projection_tx: mpsc::Sender<EpisodeProjectionOperatorCommand>,
     security_runtime_state: SharedSecurityRuntimeState,
     cluster_control: Option<Arc<crate::cluster_control::ClusterControl>>,
     /// The durable cluster-meta store (ADR-3) — the chef's authority for `OwnerCommit`
@@ -717,6 +729,8 @@ pub async fn start_server(
     state_store: Arc<sentinel_redb::StateStore>,
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
+    episode_projection_admission: SharedEpisodeProjectionAdmissionState,
+    episode_projection_tx: mpsc::Sender<EpisodeProjectionOperatorCommand>,
     security_runtime_state: SharedSecurityRuntimeState,
     cluster_control: Option<Arc<crate::cluster_control::ClusterControl>>,
     cluster_meta: Option<Arc<sentinel_redb::ClusterMetaStore>>,
@@ -753,6 +767,8 @@ pub async fn start_server(
         state_store,
         platform_state,
         runtime_health,
+        episode_projection_admission,
+        episode_projection_tx,
         security_runtime_state,
         cluster_control,
         cluster_meta,
@@ -800,9 +816,15 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
 
     // GET-Endpoints ohne Auth (read-only)
     if request.method == "GET" {
-        if is_protected_read_path(path_only)
-            && !is_authorized(&request.headers, state.shared_secret.as_deref())
-        {
+        let authorized = if path_only == OPERATOR_EPISODE_PROJECTION_PATH {
+            episode_projection_is_authorized(
+                &request.headers,
+                state.shared_secret.as_deref(),
+            )
+        } else {
+            is_authorized(&request.headers, state.shared_secret.as_deref())
+        };
+        if is_protected_read_path(path_only) && !authorized {
             return ApiError::Unauthorized.to_response();
         }
         return match path_only {
@@ -840,6 +862,13 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Err(_) => {
                     ApiError::ServiceUnavailable("Runtime-Health nicht verfuegbar").to_response()
                 }
+            },
+            OPERATOR_EPISODE_PROJECTION_PATH => match state.episode_projection_admission.read() {
+                Ok(snapshot) => json_response(200, snapshot.clone()),
+                Err(_) => ApiError::ServiceUnavailable(
+                    "Episode projection diagnostics unavailable",
+                )
+                .to_response(),
             },
             OPERATOR_SECURITY_FS_TRASH_PATH => match inspect_fs_trash(query.get("hash"), state) {
                 Ok(payload) => json_response(200, payload),
@@ -889,7 +918,15 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
     if request.method != "POST" {
         return ApiError::MethodNotAllowed.to_response();
     }
-    if !is_authorized(&request.headers, state.shared_secret.as_deref()) {
+    let authorized = if matches!(
+        path_only,
+        OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH | OPERATOR_EPISODE_PROJECTION_GENERATION_PATH
+    ) {
+        episode_projection_is_authorized(&request.headers, state.shared_secret.as_deref())
+    } else {
+        is_authorized(&request.headers, state.shared_secret.as_deref())
+    };
+    if !authorized {
         return ApiError::Unauthorized.to_response();
     }
     let read_only_diagnostic_post = matches!(
@@ -909,6 +946,81 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
     }
 
     match path_only {
+        OPERATOR_EPISODE_PROJECTION_GENERATION_PATH => {
+            let request: EpisodeProjectionGenerationRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        return ApiError::BadRequest(
+                            "Invalid episode projection generation request",
+                        )
+                        .to_response();
+                    }
+                };
+            let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+            if state
+                .episode_projection_tx
+                .send(EpisodeProjectionOperatorCommand::Generation {
+                    request,
+                    response_tx,
+                })
+                .is_err()
+            {
+                return ApiError::ServiceUnavailable(
+                    "Episode projection operator channel unavailable",
+                )
+                .to_response();
+            }
+            match response_rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(Ok(response)) => json_response(200, response),
+                Ok(Err(error)) => {
+                    warn!(%error, "Episode projection generation mutation rejected");
+                    ApiError::Conflict("Episode projection generation mutation rejected")
+                        .to_response()
+                }
+                Err(_) => ApiError::ServiceUnavailable(
+                    "Episode projection generation mutation timeout",
+                )
+                .to_response(),
+            }
+        }
+        OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH => {
+            let request: EpisodeProjectionResolveRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        return ApiError::BadRequest(
+                            "Invalid request JSON (expected source_row_id, source_event_id, request_digest, quarantine_digest)",
+                        )
+                        .to_response();
+                    }
+                };
+            let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+            if state
+                .episode_projection_tx
+                .send(EpisodeProjectionOperatorCommand::Resolve {
+                    request,
+                    response_tx,
+                })
+                .is_err()
+            {
+                return ApiError::ServiceUnavailable(
+                    "Episode projection operator channel unavailable",
+                )
+                .to_response();
+            }
+            match response_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(response)) => json_response(200, response),
+                Ok(Err(error)) => {
+                    warn!(%error, "Episode projection resolution rejected");
+                    ApiError::Conflict("Episode projection resolution rejected").to_response()
+                }
+                Err(_) => ApiError::ServiceUnavailable(
+                    "Episode projection resolution timeout",
+                )
+                .to_response(),
+            }
+        }
         OPERATOR_LLM_COMPLETION_RESOLVE_PATH => {
             let payload: ResolveLlmCompletionRequest = match serde_json::from_slice(&request.body) {
                 Ok(payload) => payload,
@@ -2175,8 +2287,16 @@ fn is_security_path(path: &str) -> bool {
 fn is_protected_read_path(path: &str) -> bool {
     path == OPERATOR_APICP_SNAPSHOT_PATH
         || path == OPERATOR_RUNTIME_HEALTH_PATH
+        || path == OPERATOR_EPISODE_PROJECTION_PATH
         || path == OPERATOR_STATE_HASH_PATH
         || is_security_path(path)
+}
+
+fn episode_projection_is_authorized(
+    headers: &HashMap<String, String>,
+    shared_secret: Option<&str>,
+) -> bool {
+    shared_secret.is_some() && is_authorized(headers, shared_secret)
 }
 
 fn open_fs_layer(state: &AppState) -> std::result::Result<Arc<LayerManager>, ApiError> {
@@ -3838,6 +3958,10 @@ mod tests {
                     }],
                 },
             )),
+            episode_projection_admission: Arc::new(std::sync::RwLock::new(
+                crate::episode_producer::EpisodeProjectionAdmissionSnapshot::default(),
+            )),
+            episode_projection_tx: mpsc::channel().0,
             security_runtime_state,
             cluster_control: None,
             cluster_meta: None,
@@ -4156,6 +4280,204 @@ mod tests {
             }
             other => panic!("unerwartetes Kommando: {other:?}"),
         }
+    }
+
+    #[test]
+    fn episode_projection_diagnostics_are_authenticated_and_redacted() {
+        let (no_secret_state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let no_secret = handle_http_request(
+            test_get_request(OPERATOR_EPISODE_PROJECTION_PATH),
+            &no_secret_state,
+        );
+        assert_eq!(no_secret.status, 401);
+
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        *state.episode_projection_admission.write().unwrap() =
+            crate::episode_producer::EpisodeProjectionAdmissionSnapshot {
+                initialized: true,
+                integrity_error: false,
+                global_frontier_source_row_id: Some(9),
+                global_blockers: Vec::new(),
+                agents: vec![crate::episode_producer::EpisodeProjectionAgentDiagnostic {
+                    agent_id: 7,
+                    ready: false,
+                    frontier_source_row_id: Some(8),
+                    lag_rows: Some(1),
+                    blockers: vec![
+                        crate::episode_producer::EpisodeProjectionBlockerDiagnostic {
+                            source_row_id: 9,
+                            source_event_id: "event-9".to_string(),
+                            reason: sentinel_hippocampus::EpisodeProjectionQuarantineReason::UnknownAgent,
+                            quarantine_digest: "ab".repeat(32),
+                        },
+                    ],
+                }],
+            };
+
+        let unauthenticated = handle_http_request(
+            test_get_request(OPERATOR_EPISODE_PROJECTION_PATH),
+            &state,
+        );
+        assert_eq!(unauthenticated.status, 401);
+
+        let mut wrong = test_get_request(OPERATOR_EPISODE_PROJECTION_PATH);
+        wrong
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "wrong-secret".to_string());
+        assert_eq!(handle_http_request(wrong, &state).status, 401);
+
+        let mut request = test_get_request(OPERATOR_EPISODE_PROJECTION_PATH);
+        request
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        let response = handle_http_request(request, &state);
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(body.contains("event-9"));
+        assert!(body.contains(&"ab".repeat(32)));
+        assert!(!body.contains("payload"));
+        assert!(!body.contains("diagnostic\""));
+    }
+
+    #[test]
+    fn episode_projection_resolution_requires_auth_and_forwards_cas_material() {
+        let (no_secret_state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let no_secret = handle_http_request(
+            test_request(
+                OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH,
+                serde_json::json!({
+                    "source_row_id": 9,
+                    "source_event_id": "event-9",
+                    "request_digest": "ab".repeat(32),
+                    "quarantine_digest": "cd".repeat(32)
+                }),
+            ),
+            &no_secret_state,
+        );
+        assert_eq!(no_secret.status, 401);
+
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        let (episode_tx, episode_rx) = mpsc::channel();
+        state.episode_projection_tx = episode_tx;
+        let request_body = serde_json::json!({
+            "source_row_id": 9,
+            "source_event_id": "event-9",
+            "request_digest": "ab".repeat(32),
+            "quarantine_digest": "cd".repeat(32)
+        });
+        let unauthenticated = handle_http_request(
+            test_request(OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH, request_body.clone()),
+            &state,
+        );
+        assert_eq!(unauthenticated.status, 401);
+
+        let mut wrong = test_request(
+            OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH,
+            request_body.clone(),
+        );
+        wrong
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "wrong-secret".to_string());
+        assert_eq!(handle_http_request(wrong, &state).status, 401);
+
+        let mut request = test_request(OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH, request_body);
+        request
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        let handle = std::thread::spawn(move || handle_http_request(request, &state));
+        let command = episode_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match command {
+            EpisodeProjectionOperatorCommand::Resolve {
+                request,
+                response_tx,
+            } => {
+                assert_eq!(request.source_row_id, 9);
+                assert_eq!(request.source_event_id, "event-9");
+                assert_eq!(request.request_digest, "ab".repeat(32));
+                assert_eq!(request.quarantine_digest, "cd".repeat(32));
+                response_tx
+                    .send(Ok(crate::episode_producer::EpisodeProjectionResolveResponse {
+                        resolved: true,
+                        duplicate: false,
+                        source_row_id: 9,
+                        source_event_id: "event-9".to_string(),
+                        episode_id: 42,
+                    }))
+                    .unwrap();
+            }
+            EpisodeProjectionOperatorCommand::Generation { .. } => {
+                panic!("unexpected generation command")
+            }
+        }
+        let response = handle.join().unwrap();
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["episode_id"], 42);
+        assert_eq!(body["resolved"], true);
+    }
+
+    #[test]
+    fn episode_projection_generation_endpoint_requires_auth_and_returns_redacted_status() {
+        let request_body = serde_json::json!({ "action": "status" });
+        let (no_secret_state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        assert_eq!(
+            handle_http_request(
+                test_request(
+                    OPERATOR_EPISODE_PROJECTION_GENERATION_PATH,
+                    request_body.clone(),
+                ),
+                &no_secret_state,
+            )
+            .status,
+            401
+        );
+
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        let (episode_tx, episode_rx) = mpsc::channel();
+        state.episode_projection_tx = episode_tx;
+        let mut wrong = test_request(
+            OPERATOR_EPISODE_PROJECTION_GENERATION_PATH,
+            request_body.clone(),
+        );
+        wrong
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "wrong-secret".to_string());
+        assert_eq!(handle_http_request(wrong, &state).status, 401);
+
+        let mut request = test_request(
+            OPERATOR_EPISODE_PROJECTION_GENERATION_PATH,
+            request_body,
+        );
+        request
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        let handle = std::thread::spawn(move || handle_http_request(request, &state));
+        match episode_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            EpisodeProjectionOperatorCommand::Generation {
+                request: EpisodeProjectionGenerationRequest::Status,
+                response_tx,
+            } => response_tx
+                .send(Ok(
+                    crate::episode_producer::EpisodeProjectionGenerationResponse {
+                        operation: "status".to_string(),
+                        generation_id: None,
+                        candidate_digest: None,
+                        status: sentinel_hippocampus::EpisodeProjectionGenerationStatus {
+                            active_generation_id: "ab".repeat(32),
+                            activation_epoch: 4,
+                            generations: Vec::new(),
+                        },
+                    },
+                ))
+                .unwrap(),
+            _ => panic!("unexpected episode projection operator command"),
+        }
+        let response = handle.join().unwrap();
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(body.contains("active_generation_id"));
+        assert!(!body.contains("payload"));
+        assert!(!body.contains("diagnostic"));
     }
 
     #[test]
