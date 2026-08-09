@@ -18,7 +18,6 @@ path = "src/main.rs"
 # Wiederverwendung bestehender Crates
 sentinel-console-plane = { path = "../../crates/sentinel-console-plane" }
 sentinel-common = { path = "../../crates/sentinel-common" }
-sentinel-projection = { path = "../../crates/sentinel-projection" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }
 # #421: deterministischer Company-Generator (lib, blake3, KEIN LLM) fuer POST /api/config/generate
 sentinel-gaia = { path = "../sentinel-gaia" }
@@ -36,9 +35,8 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
 # HTTP(S)-Server (axum + TLS via rustls) — WebTransport braucht secure context
-axum = "0.8"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "matched-path", "original-uri", "query", "tokio", "tower-log", "tracing"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 rustls = "0.23"
 rcgen = "0.13"
@@ -52,10 +50,10 @@ rmp-serde = "1.3"
 zstd = "0.13"
 base64 = "0.22"
 # WebTransport/QUIC
-wtransport = "0.6"
+wtransport = { version = "0.6", default-features = false, features = ["ring"] }
 # Event-Stream-Push (#432): NATS JetStream Subscribe + Stream-Iteration
 async-nats = { workspace = true }
-futures = "0.3"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
