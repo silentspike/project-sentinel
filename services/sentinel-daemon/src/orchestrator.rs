@@ -1545,12 +1545,13 @@ where
 fn attempt_periodic_runtime_snapshot<F>(
     tick_count: u64,
     registry: &sentinel_common::OwnerRegistry,
+    shift_transition_pending: bool,
     save: F,
 ) -> Option<anyhow::Result<()>>
 where
     F: FnOnce() -> anyhow::Result<()>,
 {
-    if tick_count == 0 || !tick_count.is_multiple_of(600) {
+    if tick_count == 0 || !tick_count.is_multiple_of(600) || shift_transition_pending {
         return None;
     }
     attempt_world_owned_runtime_snapshot(registry, save)
@@ -1570,12 +1571,37 @@ where
 fn attempt_shutdown_runtime_snapshot<F>(
     registry: &sentinel_common::OwnerRegistry,
     restore_fence: &RestoreFence,
+    shift_transition_pending: bool,
     save: F,
 ) -> Option<anyhow::Result<()>>
 where
     F: FnOnce() -> anyhow::Result<()>,
 {
+    if shift_transition_pending {
+        return None;
+    }
     attempt_shutdown_world_persistence(registry, restore_fence, save)
+}
+
+fn attempt_shift_complete_world_snapshot<T, F>(
+    shift_transition_pending: bool,
+    create: F,
+) -> Option<anyhow::Result<T>>
+where
+    F: FnOnce() -> anyhow::Result<T>,
+{
+    (!shift_transition_pending).then(create)
+}
+
+fn try_recv_shift_exclusive<T>(
+    shift_transition_pending: bool,
+    receiver: &mpsc::Receiver<T>,
+) -> std::result::Result<T, mpsc::TryRecvError> {
+    if shift_transition_pending {
+        Err(mpsc::TryRecvError::Empty)
+    } else {
+        receiver.try_recv()
+    }
 }
 
 fn rebuild_owner_registry_from_store(
@@ -5342,6 +5368,12 @@ fn load_bound_world_snapshot(
         "bound world snapshot identity conflict: row={snapshot_id} payload={}",
         snapshot.snapshot_id
     );
+    anyhow::ensure!(
+        snapshot.tick == snapshot.ecs.sim_tick,
+        "bound world snapshot tick conflict: snapshot_tick={} ecs_sim_tick={}",
+        snapshot.tick,
+        snapshot.ecs.sim_tick
+    );
     Ok(snapshot)
 }
 
@@ -6968,6 +7000,36 @@ struct StartupConfigApplyTestProbe {
     fail_validation_for: Option<AgentId>,
     fence_after_first_restore_command: bool,
     restore_queue_observer: Option<mpsc::Sender<(usize, bool)>>,
+    shift_pressure_sequence: Option<Arc<Mutex<std::collections::VecDeque<bool>>>>,
+    shift_transition_observer: Option<mpsc::SyncSender<StartupShiftTransitionObservation>>,
+    shutdown_after_shift_completion: bool,
+    queue_manual_snapshot_before_loop: bool,
+    max_tick_iterations: Option<u64>,
+    snapshot_closure_observer: Option<mpsc::Sender<(u64, StartupSnapshotClosureKind)>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum StartupShiftTransitionObservation {
+    PressureBlocked {
+        current_shift: u8,
+        pending_target: Option<u8>,
+        resident_ids: Vec<AgentId>,
+    },
+    Completed {
+        current_shift: u8,
+        pending_target: Option<u8>,
+        resident_ids: Vec<AgentId>,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupSnapshotClosureKind {
+    PeriodicWorld,
+    ManualWorld,
+    PeriodicRuntime,
+    ShutdownRuntime,
 }
 
 fn fence_owner_readiness_for_startup_config_apply(
@@ -7233,6 +7295,7 @@ fn ecs_tick_loop(
                 marker.decision
             )
         })?;
+        runtime_orch.set_tick(snapshot.tick);
         Some(snapshot)
     } else {
         None
@@ -7261,13 +7324,9 @@ fn ecs_tick_loop(
     } else {
         None
     };
-    let startup_serving_shift = restored_serving_shift.unwrap_or(initial_shift);
-    let shift_agents = agents_for_local_residency(&all_agents, startup_serving_shift);
+    let mut startup_serving_shift = restored_serving_shift.unwrap_or(initial_shift);
+    let mut shift_agents = agents_for_local_residency(&all_agents, startup_serving_shift);
     let prepared_agents = agents_for_prepared_residency(&all_agents);
-    let prepared_agent_ids: HashSet<_> = prepared_agents
-        .iter()
-        .map(|agent| AgentId(agent.identity.id))
-        .collect();
 
     if restored_serving_shift.is_some_and(|restored| restored != initial_shift) {
         info!(
@@ -7559,55 +7618,18 @@ fn ecs_tick_loop(
             "Startup config apply recovery fully validated and finalized"
         );
 
-        // The snapshot is the recovery authority. Only after its saga is fully
-        // finalized may current wall-clock shift policy replace that residency.
-        let desired_shift_ids = shift_agents
-            .iter()
-            .map(|config| AgentId(config.identity.id))
-            .collect::<HashSet<_>>();
-        let snapshot_resident_ids = world_agent_ids(&mut world);
-        for agent_id in snapshot_resident_ids {
-            if !desired_shift_ids.contains(&agent_id) && !prepared_agent_ids.contains(&agent_id) {
-                teardown_agent_full(
-                    agent_id,
-                    &mut world,
-                    &mut runtime_orch,
-                    &sandbox,
-                    &mut sandbox_handles,
-                    &mut ebpf_collector,
-                    &mut agent_processes,
-                    &mut nano_runtimes,
-                    &security_runtime_state,
-                )
-                .with_context(|| {
-                    format!("reconcile recovered runtime {agent_id} to current shift")
-                })?;
-            }
-        }
-        for agent_cfg in &shift_agents {
-            let agent_id = AgentId(agent_cfg.identity.id);
-            if nano_runtimes.handle(agent_id).is_none() {
-                if crate::config_apply::find_agent_entity(&mut world, agent_id).is_some() {
-                    despawn_agent_from_world(&mut world, agent_id);
-                }
-                anyhow::ensure!(
-                    spawn_agent_full(
-                        &mut runtime_orch,
-                        &mut world,
-                        agent_cfg,
-                        &sandbox,
-                        &mut sandbox_handles,
-                        &mut ebpf_collector,
-                        &mut agent_processes,
-                        &mut nano_runtimes,
-                        &agent_command,
-                        &security_runtime_state,
-                        event_store_for_isolation.as_ref(),
-                        fs_mount.as_deref(),
-                    ),
-                    "spawn current-shift runtime {agent_id} after config apply recovery"
-                );
-            }
+        // The recovered snapshot remains the serving authority after the config-apply
+        // saga is finalized. Reconstruct the normal-loop predicate from that exact
+        // roster; wall-clock policy may replace it only through pressure admission.
+        startup_serving_shift = restored_nonzero_serving_shift(&runtime_orch)?
+            .context("startup config apply recovery has no nonzero serving shift")?;
+        shift_agents = agents_for_local_residency(&all_agents, startup_serving_shift);
+        if startup_serving_shift != initial_shift {
+            info!(
+                restored_shift = startup_serving_shift,
+                target_shift = initial_shift,
+                "Config-apply recovery roster remains active until normal pressure admission"
+            );
         }
     }
     #[cfg(test)]
@@ -7699,6 +7721,18 @@ fn ecs_tick_loop(
     // the existing completion payload exact within the running daemon.
     let mut pending_shift_target: Option<u8> = None;
     let mut pending_shift_removed = Vec::<AgentId>::new();
+    // A pressure rejection does not create a durable/in-process transition
+    // receipt, but it still fences every snapshot effect for the remainder of
+    // the current tick. If shutdown wins before the next tick starts, this bit
+    // also prevents a partial-tick shutdown snapshot.
+    let mut shift_snapshot_blocked_this_tick = false;
+    // A pressure-blocked shift has no pending receipt, but its predicate remains
+    // incomplete until a later cadence completes it or observes that it
+    // disappeared. Keep every mutually exclusive operator command queued across
+    // intermediate ticks; the tick-local closure fence alone is insufficient.
+    let mut pressure_deferred_shift = false;
+    #[cfg(test)]
+    let mut test_tick_iterations = 0u64;
 
     // sim_hour aus redb restaurieren (Fallback: 8.0 fuer Erststart)
     let mut sim_hour: f32 = state_store_for_sim
@@ -7746,6 +7780,18 @@ fn ecs_tick_loop(
 
         if shutdown.load(Ordering::SeqCst) {
             break;
+        }
+        shift_snapshot_blocked_this_tick = false;
+        #[cfg(test)]
+        if let Some(max_tick_iterations) = startup_config_apply_probe
+            .as_ref()
+            .and_then(|probe| probe.max_tick_iterations)
+        {
+            test_tick_iterations = test_tick_iterations.saturating_add(1);
+            anyhow::ensure!(
+                test_tick_iterations <= max_tick_iterations,
+                "startup config apply test exceeded {max_tick_iterations} tick iterations without reaching shutdown"
+            );
         }
 
         // Owner snapshot installs and activation rebuilds take the same guard. They
@@ -8647,20 +8693,53 @@ fn ecs_tick_loop(
 
         // Shift-Erkennung (alle 60 Ticks = ~1 Minute bei 1s Tick-Rate)
         if world_background_allowed && tick_count > 0 && tick_count.is_multiple_of(60) {
-            let new_shift = if (time_scale - 1.0).abs() < f32::EPSILON {
+            let policy_shift = if (time_scale - 1.0).abs() < f32::EPSILON {
                 detect_current_shift() // Production: System-Uhrzeit
             } else {
                 detect_shift_from_sim_hour(sim_hour) // Beschleunigt: sim_hour
             };
+            // Once an attempt has crossed admission, its target is the retry
+            // predicate. A later wall-clock boundary cannot retarget a mixed
+            // roster before the original replacement is complete and published.
+            let new_shift = pending_shift_target.unwrap_or(policy_shift);
             if new_shift != current_shift {
                 'shift_effects: {
+                    let pressure_blocked = adaptive_tick.should_block_spawn();
+                    #[cfg(test)]
+                    let pressure_blocked = startup_config_apply_probe
+                        .as_ref()
+                        .and_then(|probe| probe.shift_pressure_sequence.as_ref())
+                        .and_then(|sequence| {
+                            sequence
+                                .lock()
+                                .ok()
+                                .and_then(|mut sequence| sequence.pop_front())
+                        })
+                        .unwrap_or(pressure_blocked);
                     let admission = match shift_transition_admission(
                         current_shift,
                         new_shift,
-                        adaptive_tick.should_block_spawn(),
+                        pressure_blocked,
                     ) {
                         ShiftTransitionAdmission::Admitted(admission) => admission,
                         ShiftTransitionAdmission::PressureBlocked => {
+                            shift_snapshot_blocked_this_tick = true;
+                            pressure_deferred_shift = true;
+                            #[cfg(test)]
+                            if let Some(observer) = startup_config_apply_probe
+                                .as_ref()
+                                .and_then(|probe| probe.shift_transition_observer.as_ref())
+                            {
+                                let mut resident_ids = nano_runtimes.agent_ids();
+                                resident_ids.sort_by_key(|agent_id| agent_id.0);
+                                observer
+                                    .send(StartupShiftTransitionObservation::PressureBlocked {
+                                        current_shift,
+                                        pending_target: pending_shift_target,
+                                        resident_ids,
+                                    })
+                                    .context("report pressure-blocked startup shift transition")?;
+                            }
                             warn!(
                             old = current_shift,
                             new = new_shift,
@@ -8680,6 +8759,11 @@ fn ecs_tick_loop(
                         );
                         break 'shift_effects;
                     }
+                    // Establish the in-process transition fence before the first
+                    // adapter, ECS, logical, consolidation, or spawn effect. Even a
+                    // zero-removal/partial-spawn attempt must not become snapshot
+                    // authority for restart.
+                    pending_shift_target.get_or_insert(new_shift);
                     info!(
                         old = current_shift,
                         new = new_shift,
@@ -8715,7 +8799,6 @@ fn ecs_tick_loop(
                         removed.push(agent_id);
                     }
                     if !removed.is_empty() {
-                        pending_shift_target.get_or_insert(new_shift);
                         pending_shift_removed.extend(removed.iter().copied());
                         pending_shift_removed.sort_by_key(|agent_id| agent_id.0);
                         pending_shift_removed.dedup();
@@ -9177,6 +9260,24 @@ fn ecs_tick_loop(
                     runtime_orch.publish_shift_transition_completion(new_shift, completion_removed);
                     pending_shift_target = None;
                     pending_shift_removed.clear();
+                    pressure_deferred_shift = false;
+                    #[cfg(test)]
+                    if let Some(probe) = startup_config_apply_probe.as_ref() {
+                        if let Some(observer) = probe.shift_transition_observer.as_ref() {
+                            let mut resident_ids = nano_runtimes.agent_ids();
+                            resident_ids.sort_by_key(|agent_id| agent_id.0);
+                            observer
+                                .send(StartupShiftTransitionObservation::Completed {
+                                    current_shift,
+                                    pending_target: pending_shift_target,
+                                    resident_ids,
+                                })
+                                .context("report completed startup shift transition")?;
+                        }
+                        if probe.shutdown_after_shift_completion {
+                            shutdown.store(true, Ordering::SeqCst);
+                        }
+                    }
                     info!(
                         removed = completed_removed_count,
                         spawned = spawned_count,
@@ -9189,8 +9290,21 @@ fn ecs_tick_loop(
                     // Replay-Fenster nie ueber die Schichtgrenze laeuft (vgl. SPIKE-529).
                     snapshot_manager.mark_shift_snapshot_pending();
                 }
+            } else {
+                pressure_deferred_shift = false;
             }
         }
+
+        let shift_snapshot_fenced =
+            pending_shift_target.is_some() || shift_snapshot_blocked_this_tick;
+        // A pressure-rejected shift has no pending transition receipt yet, but
+        // it still owns the old roster predicate until the next cadence either
+        // completes that shift or observes that the predicate disappeared.
+        // Keep mutually exclusive operator mutations in-channel throughout
+        // that interval; dequeuing and requeuing would weaken FIFO/exactly-once
+        // command handling.
+        let shift_exclusive_mutations_fenced =
+            pending_shift_target.is_some() || pressure_deferred_shift;
 
         // Nightrun-Trigger verarbeiten (via Operator-API)
         while let Ok(nightrun_cmd) = nightrun_rx.try_recv() {
@@ -9534,29 +9648,44 @@ fn ecs_tick_loop(
                     let data_dir = std::path::Path::new(&events_db_path_str)
                         .parent()
                         .unwrap_or(std::path::Path::new("/opt/sentinel/data"));
-                    let snapshot_result = nano_runtimes.snapshot_all().and_then(|snapshots| {
-                        snapshot_manager.create_and_store(
-                            &mut world,
-                            &ss,
-                            &es,
-                            data_dir,
-                            fs_layer.as_deref(),
-                            fs_mount.as_deref(),
-                            tick_count,
-                            sim_hour,
-                            snapshots,
-                        )
-                    });
-                    match snapshot_result {
-                        Ok(id) => {
-                            debug!(snapshot_id = %id, "World Snapshot erstellt");
-                            // Maintenance: Promotion + Cleanup
-                            if let Err(e) = snapshot_manager.maintain(&es, fs_layer.as_deref()) {
-                                warn!(error = %e, "Snapshot Maintenance fehlgeschlagen");
+                    if let Some(snapshot_result) =
+                        attempt_shift_complete_world_snapshot(shift_snapshot_fenced, || {
+                            #[cfg(test)]
+                            if let Some(observer) = startup_config_apply_probe
+                                .as_ref()
+                                .and_then(|probe| probe.snapshot_closure_observer.as_ref())
+                            {
+                                observer
+                                    .send((tick_count, StartupSnapshotClosureKind::PeriodicWorld))
+                                    .context("report periodic World snapshot closure")?;
                             }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "World Snapshot Erstellung fehlgeschlagen");
+                            nano_runtimes.snapshot_all().and_then(|snapshots| {
+                                snapshot_manager.create_and_store(
+                                    &mut world,
+                                    &ss,
+                                    &es,
+                                    data_dir,
+                                    fs_layer.as_deref(),
+                                    fs_mount.as_deref(),
+                                    tick_count,
+                                    sim_hour,
+                                    snapshots,
+                                )
+                            })
+                        })
+                    {
+                        match snapshot_result {
+                            Ok(id) => {
+                                debug!(snapshot_id = %id, "World Snapshot erstellt");
+                                // Maintenance: Promotion + Cleanup
+                                if let Err(e) = snapshot_manager.maintain(&es, fs_layer.as_deref())
+                                {
+                                    warn!(error = %e, "Snapshot Maintenance fehlgeschlagen");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "World Snapshot Erstellung fehlgeschlagen");
+                            }
                         }
                     }
                 }
@@ -9564,7 +9693,10 @@ fn ecs_tick_loop(
         }
 
         // Time Machine: Manuelle Snapshot-Trigger via Operator-API
-        while let Ok(_snap_cmd) = snapshot_rx.try_recv() {
+        while let Ok(_snap_cmd) = try_recv_shift_exclusive(
+            shift_snapshot_fenced || pressure_deferred_shift,
+            &snapshot_rx,
+        ) {
             if !world_background_allowed {
                 warn!("Queued manual snapshot dropped without effect while World is fenced");
                 continue;
@@ -9579,22 +9711,36 @@ fn ecs_tick_loop(
                 let data_dir = std::path::Path::new(&events_db_path_str)
                     .parent()
                     .unwrap_or(std::path::Path::new("/opt/sentinel/data"));
-                let snapshot_result = nano_runtimes.snapshot_all().and_then(|snapshots| {
-                    snapshot_manager.create_and_store(
-                        &mut world,
-                        &ss,
-                        &es,
-                        data_dir,
-                        fs_layer.as_deref(),
-                        fs_mount.as_deref(),
-                        tick_count,
-                        sim_hour,
-                        snapshots,
-                    )
-                });
-                match snapshot_result {
-                    Ok(id) => info!(snapshot_id = %id, "Manueller World Snapshot erstellt"),
-                    Err(e) => warn!(error = %e, "Manueller Snapshot fehlgeschlagen"),
+                if let Some(snapshot_result) =
+                    attempt_shift_complete_world_snapshot(shift_snapshot_fenced, || {
+                        #[cfg(test)]
+                        if let Some(observer) = startup_config_apply_probe
+                            .as_ref()
+                            .and_then(|probe| probe.snapshot_closure_observer.as_ref())
+                        {
+                            observer
+                                .send((tick_count, StartupSnapshotClosureKind::ManualWorld))
+                                .context("report manual World snapshot closure")?;
+                        }
+                        nano_runtimes.snapshot_all().and_then(|snapshots| {
+                            snapshot_manager.create_and_store(
+                                &mut world,
+                                &ss,
+                                &es,
+                                data_dir,
+                                fs_layer.as_deref(),
+                                fs_mount.as_deref(),
+                                tick_count,
+                                sim_hour,
+                                snapshots,
+                            )
+                        })
+                    })
+                {
+                    match snapshot_result {
+                        Ok(id) => info!(snapshot_id = %id, "Manueller World Snapshot erstellt"),
+                        Err(e) => warn!(error = %e, "Manueller Snapshot fehlgeschlagen"),
+                    }
                 }
             }
         }
@@ -9602,7 +9748,9 @@ fn ecs_tick_loop(
         // Time Machine: Hot-Swap Restore via Operator-API
         #[cfg(test)]
         let mut restore_commands_started = 0usize;
-        while let Ok(restore_cmd) = restore_rx.try_recv() {
+        while let Ok(restore_cmd) =
+            try_recv_shift_exclusive(shift_exclusive_mutations_fenced, &restore_rx)
+        {
             if !unfenced_world_background_work_allowed(owner_registry, &restore_fence) {
                 warn!(
                     cmd = ?restore_cmd,
@@ -9680,7 +9828,9 @@ fn ecs_tick_loop(
 
         // Runtime Config-Apply (#425): Firma zur Laufzeit aendern — Live-Diff oder Fresh-Load.
         // Laeuft zwischen Ticks (nach schedule.run) → tick-synchron.
-        while let Ok(apply_cmd) = config_apply_rx.try_recv() {
+        while let Ok(apply_cmd) =
+            try_recv_shift_exclusive(shift_exclusive_mutations_fenced, &config_apply_rx)
+        {
             if !unfenced_world_background_work_allowed(owner_registry, &restore_fence) {
                 warn!("Queued config apply mutation dropped without effect while World is fenced");
                 continue;
@@ -10385,7 +10535,9 @@ fn ecs_tick_loop(
         // lokaler Snapshot->Restore-Handoff einer ECS-native-Instanz (Time-Machine-Audit).
         // Migriert wird die aus dem Live-Welt-Snapshot abgeleitete Instanz — die Live-Daemon-Welt
         // bleibt unangetastet (LOKAL). Cross-node/Netzwerk-Migration ist out-of-scope (Multi-Node-gated).
-        while let Ok(migrate_cmd) = migrate_rx.try_recv() {
+        while let Ok(migrate_cmd) =
+            try_recv_shift_exclusive(shift_exclusive_mutations_fenced, &migrate_rx)
+        {
             if !unfenced_world_background_work_allowed(owner_registry, &restore_fence) {
                 warn!("Queued migration mutation dropped without effect while World is fenced");
                 continue;
@@ -10485,11 +10637,31 @@ fn ecs_tick_loop(
         // Periodischer Runtime-Snapshot (alle 600 Ticks = ~10 Minuten bei 1s Tick-Rate).
         // Owner authority alone is insufficient while restore recovery fences the World.
         if unfenced_world_background_work_allowed(owner_registry, &restore_fence) {
-            if let Some(snapshot_result) =
-                attempt_periodic_runtime_snapshot(tick_count, owner_registry, || {
+            if tick_count > 0 && tick_count.is_multiple_of(600) && shift_snapshot_fenced {
+                warn!(
+                    tick = tick_count,
+                    target_shift = ?pending_shift_target,
+                    pressure_blocked_this_tick = shift_snapshot_blocked_this_tick,
+                    "Periodischer Runtime-Snapshot bleibt bis zum Schichtabschluss aus; letzter guter Snapshot bleibt autoritativ"
+                );
+            }
+            if let Some(snapshot_result) = attempt_periodic_runtime_snapshot(
+                tick_count,
+                owner_registry,
+                shift_snapshot_fenced,
+                || {
+                    #[cfg(test)]
+                    if let Some(observer) = startup_config_apply_probe
+                        .as_ref()
+                        .and_then(|probe| probe.snapshot_closure_observer.as_ref())
+                    {
+                        observer
+                            .send((tick_count, StartupSnapshotClosureKind::PeriodicRuntime))
+                            .context("report periodic runtime snapshot closure")?;
+                    }
                     runtime_orch.save_state()
-                })
-            {
+                },
+            ) {
                 if let Err(e) = snapshot_result {
                     warn!(error = %e, tick = tick_count, "Periodischer Snapshot fehlgeschlagen");
                 } else {
@@ -10593,10 +10765,31 @@ fn ecs_tick_loop(
     //    nicht 0. Beim Restart erkennt shift_transition() ob Schichtwechsel stattfand
     //    und entfernt/spawnt Agents entsprechend.)
     let t = Instant::now();
-    let runtime_snapshot_result =
-        attempt_shutdown_runtime_snapshot(owner_registry, &restore_fence, || {
+    let shift_snapshot_fenced = pending_shift_target.is_some() || shift_snapshot_blocked_this_tick;
+    if shift_snapshot_fenced {
+        warn!(
+            target_shift = ?pending_shift_target,
+            pressure_blocked_last_tick = shift_snapshot_blocked_this_tick,
+            "Shutdown-Runtime-Snapshot bleibt bei unvollstaendigem Schichtwechsel aus; letzter guter Snapshot bleibt autoritativ"
+        );
+    }
+    let runtime_snapshot_result = attempt_shutdown_runtime_snapshot(
+        owner_registry,
+        &restore_fence,
+        shift_snapshot_fenced,
+        || {
+            #[cfg(test)]
+            if let Some(observer) = startup_config_apply_probe
+                .as_ref()
+                .and_then(|probe| probe.snapshot_closure_observer.as_ref())
+            {
+                observer
+                    .send((tick_count, StartupSnapshotClosureKind::ShutdownRuntime))
+                    .context("report shutdown runtime snapshot closure")?;
+            }
             runtime_orch.save_state()
-        });
+        },
+    );
     let runtime_snapshot_attempted = runtime_snapshot_result.is_some();
     if let Some(runtime_snapshot_result) = runtime_snapshot_result {
         if let Err(e) = runtime_snapshot_result {
@@ -10823,12 +11016,12 @@ mod tests {
             .unwrap();
 
         let attempts = Cell::new(0usize);
-        let periodic = attempt_periodic_runtime_snapshot(600, &follower, || {
+        let periodic = attempt_periodic_runtime_snapshot(600, &follower, false, || {
             attempts.set(attempts.get() + 1);
             Ok(())
         });
         let restore_fence = RestoreFence::default();
-        let shutdown = attempt_shutdown_runtime_snapshot(&follower, &restore_fence, || {
+        let shutdown = attempt_shutdown_runtime_snapshot(&follower, &restore_fence, false, || {
             attempts.set(attempts.get() + 1);
             Ok(())
         });
@@ -10851,7 +11044,7 @@ mod tests {
             attempts.set(attempts.get() + 1);
             Ok(())
         });
-        let runtime = attempt_shutdown_runtime_snapshot(&owner, &restore_fence, || {
+        let runtime = attempt_shutdown_runtime_snapshot(&owner, &restore_fence, false, || {
             attempts.set(attempts.get() + 1);
             Ok(())
         });
@@ -12386,6 +12579,24 @@ mod tests {
         let (_operator_tx, operator_rx) = mpsc::channel();
         let (perception_tx, _perception_rx) = mpsc::sync_channel(8);
         let (ebpf_collector, ebpf_tx) = test_ebpf();
+        let exercise_shift = probe
+            .as_ref()
+            .is_some_and(|probe| probe.shift_pressure_sequence.is_some());
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        if probe
+            .as_ref()
+            .is_some_and(|probe| probe.queue_manual_snapshot_before_loop)
+        {
+            snapshot_tx
+                .send(sentinel_common::OperatorSnapshotCommand { tier: None })
+                .context("queue startup config apply test snapshot")?;
+        }
+        drop(snapshot_tx);
+        let shutdown = Arc::new(AtomicBool::new(!exercise_shift));
+        let adaptive_config = crate::adaptive_tick::AdaptiveConfig {
+            enabled: false,
+            ..Default::default()
+        };
         ecs_tick_loop(
             Arc::clone(&state_store),
             Arc::clone(&event_store),
@@ -12398,10 +12609,14 @@ mod tests {
             Some(marker),
             owner_registry,
             initial_shift,
-            Duration::from_millis(100),
-            1.0,
+            if exercise_shift {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_millis(100)
+            },
+            if exercise_shift { 2.0 } else { 1.0 },
             true,
-            Arc::new(AtomicBool::new(true)),
+            shutdown,
             test_controlplane(temp_root),
             RuntimeOrchestrator::new(8).with_event_store(Arc::clone(&event_store)),
             test_sandbox(),
@@ -12411,7 +12626,7 @@ mod tests {
             mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
             None,
             None,
-            mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
+            snapshot_rx,
             mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
             mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
             mpsc::channel::<sentinel_common::OperatorMigrateCommand>().1,
@@ -12422,7 +12637,7 @@ mod tests {
             crate::config::RetentionConfig::default(),
             String::new(),
             Vec::new(),
-            crate::adaptive_tick::AdaptiveConfig::default(),
+            adaptive_config,
             sentinel_ecs::RoomDistanceMap::default(),
             sentinel_ecs::RoomInfoMap::default(),
             None,
@@ -14480,7 +14695,7 @@ mod tests {
             #[cfg(feature = "llm")]
             crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
         );
-        assert_eq!(result.unwrap(), 0);
+        assert_eq!(result.unwrap(), pre_snapshot.tick);
         assert!(owner_registry.owner_readiness());
         let serving_ecs = startup_world_rx
             .recv_timeout(Duration::from_secs(1))
@@ -14642,7 +14857,7 @@ mod tests {
     }
 
     #[test]
-    fn config_apply_startup_recovers_snapshot_residency_before_current_shift() {
+    fn config_apply_restart_retains_roster_under_pressure_then_transitions_once() {
         sentinel_common::feature_flags::RuntimeFlags::init();
         let tmp = tempfile::tempdir().unwrap();
         let config_dir = tmp.path().join("config");
@@ -14664,11 +14879,14 @@ mod tests {
             "shift-old",
         )
         .unwrap();
-        let snapshot = config_apply_snapshot_for_agents(
+        let mut snapshot = config_apply_snapshot_for_agents(
             "config-apply-shift-pre",
             std::slice::from_ref(&old_shift),
-            142,
+            600,
         );
+        snapshot.sim_hour = 15.0;
+        snapshot.ecs.sim_hour = 15.0;
+        snapshot.redb.sim_meta = vec![("sim_hour".to_string(), 15.0f32.to_le_bytes().to_vec())];
         save_world_snapshot_fixture(event_store.as_ref(), &snapshot);
         state_store.restore_all_tables(&snapshot.redb).unwrap();
         drop(sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap());
@@ -14685,7 +14903,7 @@ mod tests {
             &agents,
             &old_building,
             &staged_building,
-            142,
+            600,
         )
         .unwrap();
         event_store
@@ -14700,7 +14918,7 @@ mod tests {
                 pre_snapshot_id: &snapshot.snapshot_id,
                 pre_snapshot_digest: &world_snapshot_digest(&snapshot),
                 pre_runtime_snapshots: &snapshot.nano_runtime_snapshots,
-                started_tick: 142,
+                started_tick: 600,
             })
             .unwrap();
         event_store
@@ -14725,28 +14943,36 @@ mod tests {
         let (world_tx, world_rx) = mpsc::sync_channel(1);
         let (residency_tx, residency_rx) = mpsc::sync_channel(1);
         let (readiness_tx, readiness_rx) = mpsc::sync_channel(1);
+        let (transition_tx, transition_rx) = mpsc::sync_channel(2);
+        let (snapshot_closure_tx, snapshot_closure_rx) = mpsc::channel();
+        let pressure_sequence =
+            Arc::new(Mutex::new(std::collections::VecDeque::from([true, false])));
         let owner_registry = fenced_startup_owner_registry();
-        assert_eq!(
-            run_startup_config_apply_fixture(
-                &tmp,
-                Arc::clone(&event_store),
-                Arc::clone(&state_store),
-                config_dir.clone(),
-                &projection_path,
-                agents,
-                marker,
-                &owner_registry,
-                2,
-                Some(StartupConfigApplyTestProbe {
-                    world_observer: Some(world_tx),
-                    residency_observer: Some(residency_tx),
-                    readiness_before_open_observer: Some(readiness_tx),
-                    ..Default::default()
-                }),
-            )
-            .unwrap(),
-            0
-        );
+        let final_tick = run_startup_config_apply_fixture(
+            &tmp,
+            Arc::clone(&event_store),
+            Arc::clone(&state_store),
+            config_dir.clone(),
+            &projection_path,
+            agents,
+            marker,
+            &owner_registry,
+            2,
+            Some(StartupConfigApplyTestProbe {
+                world_observer: Some(world_tx),
+                residency_observer: Some(residency_tx),
+                readiness_before_open_observer: Some(readiness_tx),
+                shift_pressure_sequence: Some(pressure_sequence),
+                shift_transition_observer: Some(transition_tx),
+                shutdown_after_shift_completion: true,
+                queue_manual_snapshot_before_loop: true,
+                max_tick_iterations: Some(180),
+                snapshot_closure_observer: Some(snapshot_closure_tx),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert!(final_tick >= 660);
         assert!(!readiness_rx.recv_timeout(Duration::from_secs(1)).unwrap());
         assert!(owner_registry.owner_readiness());
         let world = world_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -14756,11 +14982,93 @@ mod tests {
             .map(|(_, identity)| identity.agent_id)
             .collect::<Vec<_>>();
         resident_ids.sort_by_key(|agent_id| agent_id.0);
-        assert_eq!(resident_ids, vec![AgentId(43)]);
+        assert_eq!(resident_ids, vec![AgentId(42)]);
         assert_eq!(
             residency_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            (vec![AgentId(43)], vec![AgentId(43)])
+            (vec![AgentId(42)], vec![AgentId(42)])
         );
+        assert_eq!(
+            transition_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            StartupShiftTransitionObservation::PressureBlocked {
+                current_shift: 1,
+                pending_target: None,
+                resident_ids: vec![AgentId(42)],
+            }
+        );
+        assert_eq!(
+            transition_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            StartupShiftTransitionObservation::Completed {
+                current_shift: 2,
+                pending_target: None,
+                resident_ids: vec![AgentId(43)],
+            }
+        );
+        assert!(transition_rx.try_recv().is_err());
+        let snapshot_closures = snapshot_closure_rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            snapshot_closures.iter().all(|(tick, _kind)| *tick != 600),
+            "pressure-blocked snapshot-cadence tick must enter no snapshot closure"
+        );
+        let snapshots = event_store.list_world_snapshots().unwrap();
+        let tick_600_snapshots = snapshots
+            .iter()
+            .filter(|candidate| candidate.tick == 600)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tick_600_snapshots.len(),
+            1,
+            "pressure-blocked snapshot-cadence tick must retain only the bound pre-snapshot"
+        );
+        assert_eq!(
+            tick_600_snapshots[0].id, snapshot.snapshot_id,
+            "pressure-blocked snapshot-cadence tick must create no new World snapshot"
+        );
+        let completion_tick = final_tick.saturating_sub(1);
+        let completion_snapshots = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.tick == completion_tick)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completion_snapshots.len(),
+            2,
+            "recovery tick must release the forced post-shift anchor and retained manual snapshot"
+        );
+        assert_eq!(
+            snapshot_closures
+                .iter()
+                .filter(|(tick, kind)| {
+                    *tick == completion_tick
+                        && matches!(
+                            kind,
+                            StartupSnapshotClosureKind::PeriodicWorld
+                                | StartupSnapshotClosureKind::ManualWorld
+                        )
+                })
+                .count(),
+            2,
+            "recovery tick must enter both released World snapshot closures exactly once"
+        );
+        let forced_anchor = completion_snapshots[0];
+        let forced_anchor_bytes = event_store
+            .load_world_snapshot(&forced_anchor.id)
+            .unwrap()
+            .expect("forced shift anchor bytes");
+        let forced_anchor = sentinel_common::decode_world_snapshot(&forced_anchor_bytes).unwrap();
+        let mut anchor_ecs_ids = forced_anchor
+            .ecs
+            .identities
+            .iter()
+            .map(|(_, identity)| identity.agent_id)
+            .collect::<Vec<_>>();
+        anchor_ecs_ids.sort_by_key(|agent_id| agent_id.0);
+        let mut anchor_runtime_ids = forced_anchor
+            .nano_runtime_snapshots
+            .iter()
+            .filter_map(|snapshot| snapshot.agent_id)
+            .collect::<Vec<_>>();
+        anchor_runtime_ids.sort_by_key(|agent_id| agent_id.0);
+        assert_eq!(anchor_ecs_ids, vec![AgentId(43)]);
+        assert_eq!(anchor_runtime_ids, vec![AgentId(43)]);
         assert_eq!(
             event_store
                 .runtime_config_apply_recovery()
@@ -14774,6 +15082,25 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn bound_world_snapshot_rejects_tick_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store = EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap();
+        let agent = test_ecs_agent_config(44, "Tick Conflict", "Operator", 1);
+        let mut snapshot = config_apply_snapshot_for_agents(
+            "config-apply-tick-conflict",
+            std::slice::from_ref(&agent),
+            599,
+        );
+        snapshot.ecs.sim_tick = 598;
+        save_world_snapshot_fixture(&event_store, &snapshot);
+
+        let error = load_bound_world_snapshot(&snapshot.snapshot_id, None, &event_store)
+            .expect_err("mismatched canonical and ECS ticks must fail closed");
+        assert!(format!("{error:#}")
+            .contains("bound world snapshot tick conflict: snapshot_tick=599 ecs_sim_tick=598"));
     }
 
     #[test]
@@ -15010,7 +15337,7 @@ mod tests {
             #[cfg(feature = "llm")]
             crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
         );
-        assert_eq!(result.unwrap(), 0);
+        assert_eq!(result.unwrap(), applied_snapshot.tick);
         assert!(owner_registry.owner_readiness());
         let serving_ecs = startup_world_rx
             .recv_timeout(Duration::from_secs(1))
@@ -16994,7 +17321,6 @@ mod tests {
         process_stops: usize,
         consolidations: usize,
         spawns: usize,
-        snapshots: usize,
     }
 
     #[test]
@@ -17010,7 +17336,6 @@ mod tests {
         assert_eq!(effects.process_stops, 0);
         assert_eq!(effects.consolidations, 0);
         assert_eq!(effects.spawns, 0);
-        assert_eq!(effects.snapshots, 0);
     }
 
     #[test]
@@ -17033,7 +17358,6 @@ mod tests {
         effects.consolidations += 1;
         effects.spawns += 1;
         assert!(admission.complete(&mut current_shift, true));
-        effects.snapshots += 1;
 
         assert_eq!(current_shift, 2);
         assert_eq!(
@@ -17044,7 +17368,6 @@ mod tests {
         assert_eq!(effects.process_stops, 1);
         assert_eq!(effects.consolidations, 1);
         assert_eq!(effects.spawns, 1);
-        assert_eq!(effects.snapshots, 1);
     }
 
     #[test]
@@ -17068,6 +17391,409 @@ mod tests {
         };
         assert!(admission.complete(&mut reconstructed_current_shift, true));
         assert_eq!(reconstructed_current_shift, 2);
+    }
+
+    #[test]
+    fn pending_shift_preserves_last_good_snapshot_for_periodic_and_shutdown_restart() {
+        use std::cell::Cell;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap());
+        let mut runtime_orch = RuntimeOrchestrator::new(4).with_event_store(Arc::clone(&store));
+        runtime_orch
+            .spawn_agent(
+                AgentIdentity {
+                    agent_id: AgentId(1),
+                    name: "Old".to_string(),
+                    role: "Operator".to_string(),
+                },
+                ShiftInfo {
+                    shift_set: 1,
+                    shift_start_hour: 6,
+                    shift_end_hour: 14,
+                    is_on_duty: true,
+                },
+                "empfang",
+            )
+            .unwrap();
+        runtime_orch.save_state().unwrap();
+
+        let pending_shift_target = Some(2);
+        runtime_orch.commit_shift_logical_removals(&[AgentId(1)]);
+        let owner = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+        let restore_fence = RestoreFence::default();
+        let attempts = Cell::new(0usize);
+        let periodic =
+            attempt_periodic_runtime_snapshot(600, &owner, pending_shift_target.is_some(), || {
+                attempts.set(attempts.get() + 1);
+                runtime_orch.save_state()
+            });
+        let shutdown = attempt_shutdown_runtime_snapshot(
+            &owner,
+            &restore_fence,
+            pending_shift_target.is_some(),
+            || {
+                attempts.set(attempts.get() + 1);
+                runtime_orch.save_state()
+            },
+        );
+
+        assert!(periodic.is_none());
+        assert!(shutdown.is_none());
+        assert_eq!(attempts.get(), 0);
+        let restored = RuntimeOrchestrator::restore(store, 4).unwrap();
+        assert_eq!(
+            restored.agents().keys().copied().collect::<HashSet<_>>(),
+            HashSet::from([AgentId(1)])
+        );
+
+        assert!(attempt_periodic_runtime_snapshot(600, &owner, false, || {
+            attempts.set(attempts.get() + 1);
+            Ok(())
+        })
+        .is_some());
+        assert!(
+            attempt_shutdown_runtime_snapshot(&owner, &restore_fence, false, || {
+                attempts.set(attempts.get() + 1);
+                Ok(())
+            })
+            .is_some()
+        );
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn pending_shift_never_enters_periodic_or_manual_world_snapshot_closures() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0usize);
+        let periodic = attempt_shift_complete_world_snapshot(true, || {
+            attempts.set(attempts.get() + 1);
+            Ok("periodic")
+        });
+        let manual = attempt_shift_complete_world_snapshot(true, || {
+            attempts.set(attempts.get() + 1);
+            Ok("manual")
+        });
+
+        assert!(periodic.is_none());
+        assert!(manual.is_none());
+        assert_eq!(attempts.get(), 0);
+    }
+
+    #[test]
+    fn pressure_deferred_shift_retains_operator_queues_until_completion() {
+        let (restore_tx, restore_rx) = mpsc::channel();
+        let (config_apply_tx, config_apply_rx) = mpsc::channel();
+        let (migrate_tx, migrate_rx) = mpsc::channel();
+        restore_tx.send("restore").unwrap();
+        config_apply_tx.send("config-apply").unwrap();
+        migrate_tx.send("migrate").unwrap();
+
+        let mut current_shift = 1;
+        let mut pending_shift_target = None;
+        assert_eq!(
+            shift_transition_admission(current_shift, 2, true),
+            ShiftTransitionAdmission::PressureBlocked
+        );
+        let mut pressure_deferred_shift = true;
+
+        // The initial pressure rejection creates no pending target. The
+        // persistent pressure-deferred fence must nevertheless retain all
+        // three commands through every intermediate non-cadence tick.
+        assert!(pending_shift_target.is_none());
+        for _intermediate_tick in [61, 90, 119] {
+            let fenced = pending_shift_target.is_some() || pressure_deferred_shift;
+            assert!(matches!(
+                try_recv_shift_exclusive(fenced, &restore_rx),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                try_recv_shift_exclusive(fenced, &config_apply_rx),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                try_recv_shift_exclusive(fenced, &migrate_rx),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
+
+        let ShiftTransitionAdmission::Admitted(admission) =
+            shift_transition_admission(current_shift, 2, false)
+        else {
+            panic!("pressure recovery must admit the retained shift predicate");
+        };
+        pending_shift_target.get_or_insert(admission.target_shift());
+        let fenced = pending_shift_target.is_some() || pressure_deferred_shift;
+        assert!(matches!(
+            try_recv_shift_exclusive(fenced, &restore_rx),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            try_recv_shift_exclusive(fenced, &config_apply_rx),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            try_recv_shift_exclusive(fenced, &migrate_rx),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        assert!(admission.complete(&mut current_shift, true));
+        pending_shift_target = None;
+        pressure_deferred_shift = false;
+        let fenced = pending_shift_target.is_some() || pressure_deferred_shift;
+
+        assert_eq!(
+            try_recv_shift_exclusive(fenced, &restore_rx).unwrap(),
+            "restore"
+        );
+        assert_eq!(
+            try_recv_shift_exclusive(fenced, &config_apply_rx).unwrap(),
+            "config-apply"
+        );
+        assert_eq!(
+            try_recv_shift_exclusive(fenced, &migrate_rx).unwrap(),
+            "migrate"
+        );
+        assert!(matches!(
+            try_recv_shift_exclusive(fenced, &restore_rx),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            try_recv_shift_exclusive(fenced, &config_apply_rx),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            try_recv_shift_exclusive(fenced, &migrate_rx),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn pressure_deferred_shift_releases_operator_queues_when_predicate_disappears() {
+        let (restore_tx, restore_rx) = mpsc::channel();
+        let (config_apply_tx, config_apply_rx) = mpsc::channel();
+        let (migrate_tx, migrate_rx) = mpsc::channel();
+        restore_tx.send("restore").unwrap();
+        config_apply_tx.send("config-apply").unwrap();
+        migrate_tx.send("migrate").unwrap();
+
+        let current_shift = 1;
+        let pending_shift_target: Option<u8> = None;
+        assert_eq!(
+            shift_transition_admission(current_shift, 2, true),
+            ShiftTransitionAdmission::PressureBlocked
+        );
+        let mut pressure_deferred_shift = true;
+        let fenced = pending_shift_target.is_some() || pressure_deferred_shift;
+        assert!(matches!(
+            try_recv_shift_exclusive(fenced, &restore_rx),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            try_recv_shift_exclusive(fenced, &config_apply_rx),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            try_recv_shift_exclusive(fenced, &migrate_rx),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        // The next cadence observes no shift predicate. This is the production
+        // `new_shift == current_shift` branch, which releases the retained
+        // commands without ever creating a pending transition receipt.
+        assert_eq!(
+            shift_transition_admission(current_shift, current_shift, false),
+            ShiftTransitionAdmission::NoChange
+        );
+        pressure_deferred_shift = false;
+        let fenced = pending_shift_target.is_some() || pressure_deferred_shift;
+        assert_eq!(
+            try_recv_shift_exclusive(fenced, &restore_rx).unwrap(),
+            "restore"
+        );
+        assert_eq!(
+            try_recv_shift_exclusive(fenced, &config_apply_rx).unwrap(),
+            "config-apply"
+        );
+        assert_eq!(
+            try_recv_shift_exclusive(fenced, &migrate_rx).unwrap(),
+            "migrate"
+        );
+        assert!(matches!(
+            try_recv_shift_exclusive(fenced, &restore_rx),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            try_recv_shift_exclusive(fenced, &config_apply_rx),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            try_recv_shift_exclusive(fenced, &migrate_rx),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn completed_shift_forced_anchor_enters_snapshot_with_complete_roster() {
+        use std::cell::Cell;
+
+        let mut snapshot_manager =
+            crate::snapshot::SnapshotManager::new(crate::config::RetentionConfig::default());
+        snapshot_manager.mark_shift_snapshot_pending();
+        assert!(snapshot_manager.should_create_snapshot(61));
+
+        let resident_ids = HashSet::from([AgentId(2), AgentId(3)]);
+        let attempts = Cell::new(0usize);
+        let snapshot = attempt_shift_complete_world_snapshot(false, || {
+            attempts.set(attempts.get() + 1);
+            anyhow::ensure!(
+                resident_ids == HashSet::from([AgentId(2), AgentId(3)]),
+                "post-completion roster is incomplete"
+            );
+            Ok(resident_ids.clone())
+        })
+        .expect("cleared receipt releases forced shift anchor")
+        .unwrap();
+
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(snapshot, HashSet::from([AgentId(2), AgentId(3)]));
+    }
+
+    #[test]
+    fn zero_removal_partial_spawn_stays_pending_until_ready_and_published() {
+        use std::cell::Cell;
+
+        let mut current_shift = 1;
+        let mut pending_shift_target = None;
+        let mut pending_shift_removed = Vec::<AgentId>::new();
+        let mut runtime_orch = RuntimeOrchestrator::new(4);
+        runtime_orch
+            .spawn_agent(
+                AgentIdentity {
+                    agent_id: AgentId(1),
+                    name: "Old".to_string(),
+                    role: "Operator".to_string(),
+                },
+                ShiftInfo {
+                    shift_set: 1,
+                    shift_start_hour: 6,
+                    shift_end_hour: 14,
+                    is_on_duty: true,
+                },
+                "empfang",
+            )
+            .unwrap();
+        let ShiftTransitionAdmission::Admitted(admission) =
+            shift_transition_admission(current_shift, 2, false)
+        else {
+            panic!("healthy pressure must admit the target shift");
+        };
+
+        pending_shift_target.get_or_insert(admission.target_shift());
+        let removed = Vec::<AgentId>::new();
+        pending_shift_removed.extend(removed);
+        runtime_orch
+            .spawn_agent(
+                AgentIdentity {
+                    agent_id: AgentId(2),
+                    name: "Partial Target".to_string(),
+                    role: "Operator".to_string(),
+                },
+                ShiftInfo {
+                    shift_set: 2,
+                    shift_start_hour: 14,
+                    shift_end_hour: 22,
+                    is_on_duty: true,
+                },
+                "empfang",
+            )
+            .unwrap();
+        assert_eq!(pending_shift_target, Some(2));
+        assert!(pending_shift_removed.is_empty());
+        assert_eq!(
+            runtime_orch
+                .agents()
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([AgentId(1), AgentId(2)])
+        );
+
+        let owner = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+        let restore_fence = RestoreFence::default();
+        let snapshot_attempts = Cell::new(0usize);
+        assert!(attempt_periodic_runtime_snapshot(
+            600,
+            &owner,
+            pending_shift_target.is_some(),
+            || {
+                snapshot_attempts.set(snapshot_attempts.get() + 1);
+                Ok(())
+            },
+        )
+        .is_none());
+        assert!(attempt_shutdown_runtime_snapshot(
+            &owner,
+            &restore_fence,
+            pending_shift_target.is_some(),
+            || {
+                snapshot_attempts.set(snapshot_attempts.get() + 1);
+                Ok(())
+            },
+        )
+        .is_none());
+        assert_eq!(snapshot_attempts.get(), 0);
+
+        assert!(!admission.complete(&mut current_shift, false));
+        assert_eq!(current_shift, 1);
+        assert_eq!(pending_shift_target, Some(2));
+        let later_policy_shift = 3;
+        let retry_target = pending_shift_target.unwrap_or(later_policy_shift);
+        assert_eq!(retry_target, 2);
+        let ShiftTransitionAdmission::Admitted(retry) =
+            shift_transition_admission(current_shift, retry_target, false)
+        else {
+            panic!("retry must retain the old predicate");
+        };
+        assert_eq!(retry.target_shift(), 2);
+
+        runtime_orch
+            .spawn_agent(
+                AgentIdentity {
+                    agent_id: AgentId(3),
+                    name: "Final Target".to_string(),
+                    role: "Operator".to_string(),
+                },
+                ShiftInfo {
+                    shift_set: 2,
+                    shift_start_hour: 14,
+                    shift_end_hour: 22,
+                    is_on_duty: true,
+                },
+                "empfang",
+            )
+            .unwrap();
+        runtime_orch.commit_shift_logical_removals(&[AgentId(1)]);
+        pending_shift_removed.push(AgentId(1));
+        assert!(retry.complete(&mut current_shift, true));
+        let published_removed = pending_shift_removed.clone();
+        runtime_orch.publish_shift_transition_completion(current_shift, &published_removed);
+        pending_shift_target = None;
+        pending_shift_removed.clear();
+        assert_eq!(current_shift, 2);
+        assert_eq!(published_removed, vec![AgentId(1)]);
+        assert!(pending_shift_target.is_none());
+        assert!(pending_shift_removed.is_empty());
+        assert_eq!(
+            runtime_orch
+                .agents()
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([AgentId(2), AgentId(3)])
+        );
     }
 
     #[test]
@@ -17183,6 +17909,9 @@ mod tests {
         let admission = shift_block
             .find("shift_transition_admission(")
             .expect("pressure admission");
+        let pending = shift_block
+            .find("pending_shift_target.get_or_insert(new_shift)")
+            .expect("transition snapshot fence");
         let stop = shift_block
             .find("stop_agent_runtime_layer(")
             .expect("adapter stop");
@@ -17201,13 +17930,19 @@ mod tests {
         let snapshot = shift_block
             .find("mark_shift_snapshot_pending(")
             .expect("snapshot scheduling");
+        let exclusive_fence = shift_block
+            .find("let shift_exclusive_mutations_fenced")
+            .expect("unified pressure-deferred and pending-target fence");
 
         assert!(admission < stop);
+        assert!(admission < pending);
+        assert!(pending < stop);
         assert!(stop < logical_commit);
         assert!(logical_commit < readiness);
         assert!(readiness < guard_completion);
         assert!(guard_completion < publication);
         assert!(publication < snapshot);
+        assert!(snapshot < exclusive_fence);
         assert!(!shift_block.contains("commit_shift_transition("));
 
         let blocked_branch = shift_block
@@ -17215,8 +17950,43 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("ShiftTransitionAdmission::NoChange").next())
             .expect("pressure-blocked branch");
+        assert!(blocked_branch.contains("shift_snapshot_blocked_this_tick = true"));
+        assert!(blocked_branch.contains("pressure_deferred_shift = true"));
         assert!(blocked_branch.contains("break 'shift_effects"));
         assert!(!blocked_branch.contains("continue;"));
+
+        assert!(
+            source.contains("pending_shift_target.is_some() || shift_snapshot_blocked_this_tick")
+        );
+
+        let periodic_snapshot = source
+            .find("// Time Machine: Periodische World Snapshots")
+            .expect("periodic world snapshot block");
+        let forced_snapshot_attempt = source[periodic_snapshot..]
+            .find("attempt_shift_complete_world_snapshot(")
+            .map(|offset| periodic_snapshot + offset)
+            .expect("pending-aware forced snapshot attempt");
+        assert!(shift_end < forced_snapshot_attempt);
+        assert!(source.contains(
+            "shift_snapshot_fenced || pressure_deferred_shift,\n            &snapshot_rx,"
+        ));
+        assert!(source.contains(
+            "let shift_exclusive_mutations_fenced =\n            pending_shift_target.is_some() || pressure_deferred_shift;"
+        ));
+        for receiver in ["restore_rx", "config_apply_rx", "migrate_rx"] {
+            assert!(
+                source.contains(&format!(
+                    "try_recv_shift_exclusive(shift_exclusive_mutations_fenced, &{receiver})"
+                )),
+                "{receiver} must retain commands while a shift transition is pending or pressure-deferred"
+            );
+        }
+        assert!(source.contains(
+            "attempt_periodic_runtime_snapshot(\n                tick_count,\n                owner_registry,\n                shift_snapshot_fenced,"
+        ));
+        assert!(source.contains(
+            "attempt_shutdown_runtime_snapshot(\n        owner_registry,\n        &restore_fence,\n        shift_snapshot_fenced,"
+        ));
     }
 
     #[test]
