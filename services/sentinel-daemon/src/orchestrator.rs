@@ -649,6 +649,77 @@ fn nightrun_run_id(prefix: &str, tick_count: u64, from_shift: u8, to_shift: u8) 
     format!("{prefix}-tick-{tick_count}-shift-{from_shift}-to-{to_shift}")
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ShiftTransitionAdmission {
+    NoChange,
+    PressureBlocked,
+    Admitted(ShiftTransitionGuard),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ShiftTransitionGuard {
+    from_shift: u8,
+    to_shift: u8,
+}
+
+impl ShiftTransitionGuard {
+    fn target_shift(&self) -> u8 {
+        self.to_shift
+    }
+
+    /// Consumes the transition predicate only after the replacement roster has
+    /// reached the existing successful spawn point. A stale guard cannot advance
+    /// a shift that another path already changed.
+    fn complete(self, current_shift: &mut u8, replacement_ready: bool) -> bool {
+        if !replacement_ready || *current_shift != self.from_shift {
+            return false;
+        }
+        *current_shift = self.to_shift;
+        true
+    }
+}
+
+/// The mandatory admission boundary for every normal-loop shift effect.
+///
+/// Returning no guard under pressure keeps removal, teardown, consolidation,
+/// replacement spawn, snapshot scheduling, and `current_shift` mutation
+/// unreachable from the blocked branch.
+fn shift_transition_admission(
+    current_shift: u8,
+    new_shift: u8,
+    memory_pressure_blocks_spawn: bool,
+) -> ShiftTransitionAdmission {
+    if new_shift == current_shift {
+        ShiftTransitionAdmission::NoChange
+    } else if memory_pressure_blocks_spawn {
+        ShiftTransitionAdmission::PressureBlocked
+    } else {
+        ShiftTransitionAdmission::Admitted(ShiftTransitionGuard {
+            from_shift: current_shift,
+            to_shift: new_shift,
+        })
+    }
+}
+
+/// Reconstructs the last non-special serving shift from the restored logical
+/// runtime roster. Mixed on-duty shifts are ambiguous and fail closed instead of
+/// silently selecting the wall-clock target.
+fn restored_nonzero_serving_shift(runtime_orch: &RuntimeOrchestrator) -> Result<Option<u8>> {
+    let mut shifts = runtime_orch
+        .agents()
+        .values()
+        .filter(|handle| handle.shift.is_on_duty && handle.shift.shift_set != 0)
+        .map(|handle| handle.shift.shift_set)
+        .collect::<Vec<_>>();
+    shifts.sort_unstable();
+    shifts.dedup();
+    anyhow::ensure!(
+        shifts.len() <= 1,
+        "restored runtime contains ambiguous on-duty shifts: {shifts:?}"
+    );
+    Ok(shifts.into_iter().next())
+}
+
 fn append_nightrun_event(
     event_store: &EventStore,
     payload: DomainEventPayload,
@@ -7185,23 +7256,25 @@ fn ecs_tick_loop(
 
     // -- Agent-Spawning (Orchestrator + ECS + Sandbox) --
     let is_restored = runtime_orch.agent_count() > 0;
-    let shift_agents = agents_for_local_residency(&all_agents, initial_shift);
+    let restored_serving_shift = if is_restored && startup_config_apply.is_none() {
+        restored_nonzero_serving_shift(&runtime_orch)?
+    } else {
+        None
+    };
+    let startup_serving_shift = restored_serving_shift.unwrap_or(initial_shift);
+    let shift_agents = agents_for_local_residency(&all_agents, startup_serving_shift);
     let prepared_agents = agents_for_prepared_residency(&all_agents);
     let prepared_agent_ids: HashSet<_> = prepared_agents
         .iter()
         .map(|agent| AgentId(agent.identity.id))
         .collect();
 
-    if is_restored && startup_config_apply.is_none() {
-        // Nach Restore: Shift-Transition durchfuehren falls Schicht gewechselt hat
-        // (z.B. Daemon um 13:59 gestoppt, um 14:05 neu gestartet)
-        let removed = runtime_orch.shift_transition_except(initial_shift, &prepared_agent_ids);
-        if !removed.is_empty() {
-            info!(
-                removed_count = removed.len(),
-                "Stale Agents nach Restore entfernt (Schichtwechsel waehrend Downtime)"
-            );
-        }
+    if restored_serving_shift.is_some_and(|restored| restored != initial_shift) {
+        info!(
+            restored_shift = startup_serving_shift,
+            target_shift = initial_shift,
+            "Restaurierter Serving-Shift bleibt bis zur normalen Pressure-Admission aktiv"
+        );
     }
 
     // Prepared targets are resident ECS-native containers but remain frozen and have
@@ -7615,12 +7688,17 @@ fn ecs_tick_loop(
         prepared_frozen_count = prepared_agents.len(),
         orchestrator_count = runtime_orch.agent_count(),
         restored = is_restored,
-        shift_set = initial_shift,
+        shift_set = startup_serving_shift,
         "ECS World initialisiert"
     );
 
     let mut tick_count: u64 = runtime_orch.current_tick();
-    let mut current_shift = initial_shift;
+    let mut current_shift = startup_serving_shift;
+    // In-process receipt of adapter-confirmed logical removals across a failed
+    // replacement retry. RC1 owns durable PendingAdmission; this issue only keeps
+    // the existing completion payload exact within the running daemon.
+    let mut pending_shift_target: Option<u8> = None;
+    let mut pending_shift_removed = Vec::<AgentId>::new();
 
     // sim_hour aus redb restaurieren (Fallback: 8.0 fuer Erststart)
     let mut sim_hour: f32 = state_store_for_sim
@@ -8575,135 +8653,295 @@ fn ecs_tick_loop(
                 detect_shift_from_sim_hour(sim_hour) // Beschleunigt: sim_hour
             };
             if new_shift != current_shift {
-                info!(
-                    old = current_shift,
-                    new = new_shift,
-                    "Schichtwechsel erkannt"
-                );
-
-                // Determine removals without mutating logical state. Each owning
-                // adapter must confirm stop before the runtime/ECS commit.
-                let protected_prepared: HashSet<_> = agents_for_prepared_residency(&all_agents)
-                    .iter()
-                    .map(|agent| AgentId(agent.identity.id))
-                    .collect();
-                let candidates =
-                    runtime_orch.shift_removal_candidates(new_shift, &protected_prepared);
-                let mut removed = Vec::new();
-                for agent_id in candidates {
-                    if let Err(error) = stop_agent_runtime_layer(
-                        agent_id,
-                        &mut nano_runtimes,
-                        &sandbox,
-                        &mut sandbox_handles,
-                        &mut ebpf_collector,
-                        &mut agent_processes,
+                'shift_effects: {
+                    let admission = match shift_transition_admission(
+                        current_shift,
+                        new_shift,
+                        adaptive_tick.should_block_spawn(),
                     ) {
-                        error!(agent_id = %agent_id, error = %error, "Schichtwechsel-Teardown fehlgeschlagen; Agent bleibt logisch aktiv");
-                        continue;
-                    }
-                    remove_security_runtime_snapshot(&security_runtime_state, agent_id);
-
-                    if !despawn_agent_from_world(&mut world, agent_id) {
-                        warn!(agent_id = %agent_id, "ECS Entity fuer entfernten Agent nicht gefunden");
-                    }
-                    removed.push(agent_id);
-                }
-                runtime_orch.commit_shift_transition(new_shift, &removed);
-
-                // Memory-Konsolidierung fuer entfernte Agents (nutzt den
-                // bereits geoeffneten HippocampusService Handle, vermeidet
-                // redb Lock-Konflikte mit Night-Run)
-                let redb_store = world
-                    .get_resource::<sentinel_ecs::RedbStateStore>()
-                    .map(|r| r.store.clone());
-                let nightrun_event_store = world
-                    .get_resource::<sentinel_ecs::LimboEventStore>()
-                    .map(|es| Arc::clone(&es.0));
-                let shift_run_id = nightrun_run_id("shift", tick_count, current_shift, new_shift);
-                let shift_started = Instant::now();
-                let mut shift_hash_chain = NightrunHashChain::new(&shift_run_id, &shift_run_id);
-                let mut shift_event_emission_enabled = false;
-                if let Some(ref event_store) = nightrun_event_store {
-                    let payload = DomainEventPayload::NightRunStarted {
-                        run_id: shift_run_id.clone(),
-                        trigger_shift_set: current_shift,
-                        agents_queued: removed.len() as u32,
-                    };
-                    match append_nightrun_event(
-                        event_store,
-                        payload,
-                        "nightrun",
-                        &shift_run_id,
-                        tick_count,
-                        Some(&mut shift_hash_chain),
-                    ) {
-                        Ok(_) => {
-                            shift_event_emission_enabled = true;
-                        }
-                        Err(e) => {
+                        ShiftTransitionAdmission::Admitted(admission) => admission,
+                        ShiftTransitionAdmission::PressureBlocked => {
                             warn!(
-                                run_id = %shift_run_id,
-                                error = %e,
-                                "Schichtwechsel-Nightrun-Start-Event fehlgeschlagen"
-                            );
+                            old = current_shift,
+                            new = new_shift,
+                            mem_psi = format!("{:.1}", adaptive_tick.mem_avg10()),
+                            "Memory PSI ueber Schwellwert - Schichtwechsel bleibt vor allen Effekten blockiert"
+                        );
+                            break 'shift_effects;
+                        }
+                        ShiftTransitionAdmission::NoChange => break 'shift_effects,
+                    };
+                    let new_shift = admission.target_shift();
+                    if pending_shift_target.is_some_and(|target| target != new_shift) {
+                        error!(
+                            pending = ?pending_shift_target,
+                            requested = new_shift,
+                            "Schichtwechsel-Ziel weicht von unvollstaendigem Ersatzroster ab"
+                        );
+                        break 'shift_effects;
+                    }
+                    info!(
+                        old = current_shift,
+                        new = new_shift,
+                        "Schichtwechsel erkannt"
+                    );
+
+                    // Determine removals without mutating logical state. Each owning
+                    // adapter must confirm stop before the runtime/ECS commit.
+                    let protected_prepared: HashSet<_> = agents_for_prepared_residency(&all_agents)
+                        .iter()
+                        .map(|agent| AgentId(agent.identity.id))
+                        .collect();
+                    let candidates =
+                        runtime_orch.shift_removal_candidates(new_shift, &protected_prepared);
+                    let mut removed = Vec::new();
+                    for agent_id in candidates {
+                        if let Err(error) = stop_agent_runtime_layer(
+                            agent_id,
+                            &mut nano_runtimes,
+                            &sandbox,
+                            &mut sandbox_handles,
+                            &mut ebpf_collector,
+                            &mut agent_processes,
+                        ) {
+                            error!(agent_id = %agent_id, error = %error, "Schichtwechsel-Teardown fehlgeschlagen; Agent bleibt logisch aktiv");
+                            continue;
+                        }
+                        remove_security_runtime_snapshot(&security_runtime_state, agent_id);
+
+                        if !despawn_agent_from_world(&mut world, agent_id) {
+                            warn!(agent_id = %agent_id, "ECS Entity fuer entfernten Agent nicht gefunden");
+                        }
+                        removed.push(agent_id);
+                    }
+                    if !removed.is_empty() {
+                        pending_shift_target.get_or_insert(new_shift);
+                        pending_shift_removed.extend(removed.iter().copied());
+                        pending_shift_removed.sort_by_key(|agent_id| agent_id.0);
+                        pending_shift_removed.dedup();
+                    }
+                    runtime_orch.commit_shift_logical_removals(&removed);
+
+                    // Memory-Konsolidierung fuer entfernte Agents (nutzt den
+                    // bereits geoeffneten HippocampusService Handle, vermeidet
+                    // redb Lock-Konflikte mit Night-Run)
+                    let redb_store = world
+                        .get_resource::<sentinel_ecs::RedbStateStore>()
+                        .map(|r| r.store.clone());
+                    let nightrun_event_store = world
+                        .get_resource::<sentinel_ecs::LimboEventStore>()
+                        .map(|es| Arc::clone(&es.0));
+                    let shift_run_id =
+                        nightrun_run_id("shift", tick_count, current_shift, new_shift);
+                    let shift_started = Instant::now();
+                    let mut shift_hash_chain = NightrunHashChain::new(&shift_run_id, &shift_run_id);
+                    let mut shift_event_emission_enabled = false;
+                    if let Some(ref event_store) = nightrun_event_store {
+                        let payload = DomainEventPayload::NightRunStarted {
+                            run_id: shift_run_id.clone(),
+                            trigger_shift_set: current_shift,
+                            agents_queued: removed.len() as u32,
+                        };
+                        match append_nightrun_event(
+                            event_store,
+                            payload,
+                            "nightrun",
+                            &shift_run_id,
+                            tick_count,
+                            Some(&mut shift_hash_chain),
+                        ) {
+                            Ok(_) => {
+                                shift_event_emission_enabled = true;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    run_id = %shift_run_id,
+                                    error = %e,
+                                    "Schichtwechsel-Nightrun-Start-Event fehlgeschlagen"
+                                );
+                            }
                         }
                     }
-                }
-                let mut shift_episodes_processed = 0u32;
-                let mut shift_episodes_consolidated = 0u32;
-                let mut shift_agents_consolidated = 0u32;
-                let mut shift_agents_failed = 0u32;
-                let mut shift_nmda_scores: Vec<f64> = Vec::new();
-                for agent_id in &removed {
-                    let agent_name = all_agents
-                        .iter()
-                        .find(|a| AgentId(a.identity.id) == *agent_id)
-                        .map(|a| a.identity.name.as_str());
-                    if let Some(name) = agent_name {
-                        let agent_started = Instant::now();
-                        match episode_producer.hippocampus().consolidate_agent(name) {
-                            Ok(result) => {
-                                let episodes_processed = result.episodes_processed as u32;
-                                let episodes_consolidated = result.episodes_consolidated as u32;
-                                if episodes_processed > 0 {
-                                    let nmda_scores = nmda_consolidated_scores(&result);
-                                    let agent_stats = nmda_score_stats(&result.episode_scores);
-                                    shift_episodes_processed += episodes_processed;
-                                    shift_episodes_consolidated += episodes_consolidated;
-                                    shift_agents_consolidated += 1;
-                                    shift_nmda_scores.extend(result.episode_scores.iter().copied());
+                    let mut shift_episodes_processed = 0u32;
+                    let mut shift_episodes_consolidated = 0u32;
+                    let mut shift_agents_consolidated = 0u32;
+                    let mut shift_agents_failed = 0u32;
+                    let mut shift_nmda_scores: Vec<f64> = Vec::new();
+                    for agent_id in &removed {
+                        let agent_name = all_agents
+                            .iter()
+                            .find(|a| AgentId(a.identity.id) == *agent_id)
+                            .map(|a| a.identity.name.as_str());
+                        if let Some(name) = agent_name {
+                            let agent_started = Instant::now();
+                            match episode_producer.hippocampus().consolidate_agent(name) {
+                                Ok(result) => {
+                                    let episodes_processed = result.episodes_processed as u32;
+                                    let episodes_consolidated = result.episodes_consolidated as u32;
+                                    if episodes_processed > 0 {
+                                        let nmda_scores = nmda_consolidated_scores(&result);
+                                        let agent_stats = nmda_score_stats(&result.episode_scores);
+                                        shift_episodes_processed += episodes_processed;
+                                        shift_episodes_consolidated += episodes_consolidated;
+                                        shift_agents_consolidated += 1;
+                                        shift_nmda_scores
+                                            .extend(result.episode_scores.iter().copied());
 
-                                    info!(
-                                        agent = name,
-                                        episodes_processed,
-                                        episodes_consolidated,
-                                        selection_rate = format!(
-                                            "{:.3}",
-                                            nmda_selection_rate(
-                                                episodes_processed,
-                                                episodes_consolidated
-                                            )
-                                        ),
-                                        nmda_threshold = NMDA_CONSOLIDATION_THRESHOLD,
-                                        nmda_score_min = ?agent_stats.min,
-                                        nmda_score_avg = ?agent_stats.avg,
-                                        nmda_score_max = ?agent_stats.max,
-                                        "Schichtwechsel-NMDA-Agent-Selektion"
-                                    );
+                                        info!(
+                                            agent = name,
+                                            episodes_processed,
+                                            episodes_consolidated,
+                                            selection_rate = format!(
+                                                "{:.3}",
+                                                nmda_selection_rate(
+                                                    episodes_processed,
+                                                    episodes_consolidated
+                                                )
+                                            ),
+                                            nmda_threshold = NMDA_CONSOLIDATION_THRESHOLD,
+                                            nmda_score_min = ?agent_stats.min,
+                                            nmda_score_avg = ?agent_stats.avg,
+                                            nmda_score_max = ?agent_stats.max,
+                                            "Schichtwechsel-NMDA-Agent-Selektion"
+                                        );
 
+                                        if shift_event_emission_enabled {
+                                            if let Some(ref event_store) = nightrun_event_store {
+                                                let payload =
+                                                    DomainEventPayload::AgentConsolidated {
+                                                        run_id: shift_run_id.clone(),
+                                                        agent_name: name.to_string(),
+                                                        episodes_processed,
+                                                        episodes_consolidated,
+                                                        duration_ms: agent_started
+                                                            .elapsed()
+                                                            .as_millis()
+                                                            as u64,
+                                                    };
+                                                let aggregate_id =
+                                                    format!("AGENT-{:02}", agent_id.0);
+                                                if let Err(e) = append_nightrun_event(
+                                                    event_store,
+                                                    payload,
+                                                    &aggregate_id,
+                                                    &shift_run_id,
+                                                    tick_count,
+                                                    Some(&mut shift_hash_chain),
+                                                ) {
+                                                    shift_event_emission_enabled = false;
+                                                    warn!(
+                                                        run_id = %shift_run_id,
+                                                        agent = name,
+                                                        error = %e,
+                                                        "Schichtwechsel-AgentConsolidated-Event fehlgeschlagen"
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        if episodes_consolidated > 0 {
+                                            let narrative: String = result
+                                                .consolidated_summaries
+                                                .iter()
+                                                .map(|(s, _score)| s.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join("; ");
+
+                                            let agent_role = all_agents
+                                                .iter()
+                                                .find(|a| AgentId(a.identity.id) == *agent_id)
+                                                .map(|a| a.identity.role.as_str())
+                                                .unwrap_or("Mitarbeiter");
+                                            let queued = queue_evolution_job(
+                                                &evolution_job_tx,
+                                                EvolutionJob {
+                                                    agent_id: *agent_id,
+                                                    agent_name: name.to_string(),
+                                                    agent_role: agent_role.to_string(),
+                                                    narrative: narrative.clone(),
+                                                    source: EvolutionSource::ShiftTransition,
+                                                },
+                                            );
+                                            if !queued {
+                                                write_evolution_narrative_only(
+                                                    &state_store_for_sim,
+                                                    *agent_id,
+                                                    name,
+                                                    EvolutionSource::ShiftTransition,
+                                                    &narrative,
+                                                );
+                                            }
+
+                                            if let Some(ref store) = redb_store {
+                                                // NMDA scores nach redb schreiben
+                                                if !nmda_scores.is_empty() {
+                                                    let avg_score: f64 =
+                                                        nmda_scores.iter().sum::<f64>()
+                                                            / nmda_scores.len() as f64;
+                                                    match store
+                                                        .set_nmda_scores(*agent_id, &nmda_scores)
+                                                    {
+                                                        Ok(()) => {
+                                                            info!(
+                                                                agent = name,
+                                                                nmda_count = nmda_scores.len(),
+                                                                nmda_avg =
+                                                                    format!("{avg_score:.4}"),
+                                                                "NMDA scores nach redb geschrieben"
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(
+                                                                agent = name,
+                                                                error = %e,
+                                                                "NMDA scores redb-Write fehlgeschlagen"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+
+                                                // Facts aus Hippocampus FactRetriever nach state.redb bridgen
+                                                let facts = episode_producer
+                                                    .hippocampus()
+                                                    .retrieve_facts(name);
+                                                if !facts.is_empty() {
+                                                    let facts_json = serde_json::to_vec(&facts)
+                                                        .unwrap_or_default();
+                                                    match store
+                                                        .set_agent_facts(*agent_id, &facts_json)
+                                                    {
+                                                        Ok(()) => {
+                                                            info!(
+                                                            agent = name,
+                                                            facts_count = facts.len(),
+                                                            "AGENT_FACTS nach state.redb geschrieben"
+                                                        );
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(
+                                                                agent = name,
+                                                                error = %e,
+                                                                "AGENT_FACTS redb-Write fehlgeschlagen"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    shift_agents_failed += 1;
                                     if shift_event_emission_enabled {
                                         if let Some(ref event_store) = nightrun_event_store {
-                                            let payload = DomainEventPayload::AgentConsolidated {
-                                                run_id: shift_run_id.clone(),
-                                                agent_name: name.to_string(),
-                                                episodes_processed,
-                                                episodes_consolidated,
-                                                duration_ms: agent_started.elapsed().as_millis()
-                                                    as u64,
-                                            };
+                                            let payload =
+                                                DomainEventPayload::AgentConsolidationFailed {
+                                                    run_id: shift_run_id.clone(),
+                                                    agent_name: name.to_string(),
+                                                    error: e.to_string(),
+                                                };
                                             let aggregate_id = format!("AGENT-{:02}", agent_id.0);
-                                            if let Err(e) = append_nightrun_event(
+                                            if let Err(event_err) = append_nightrun_event(
                                                 event_store,
                                                 payload,
                                                 &aggregate_id,
@@ -8715,327 +8953,242 @@ fn ecs_tick_loop(
                                                 warn!(
                                                     run_id = %shift_run_id,
                                                     agent = name,
-                                                    error = %e,
-                                                    "Schichtwechsel-AgentConsolidated-Event fehlgeschlagen"
+                                                    error = %event_err,
+                                                    "Schichtwechsel-AgentConsolidationFailed-Event fehlgeschlagen"
                                                 );
                                             }
                                         }
                                     }
-
-                                    if episodes_consolidated > 0 {
-                                        let narrative: String = result
-                                            .consolidated_summaries
-                                            .iter()
-                                            .map(|(s, _score)| s.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join("; ");
-
-                                        let agent_role = all_agents
-                                            .iter()
-                                            .find(|a| AgentId(a.identity.id) == *agent_id)
-                                            .map(|a| a.identity.role.as_str())
-                                            .unwrap_or("Mitarbeiter");
-                                        let queued = queue_evolution_job(
-                                            &evolution_job_tx,
-                                            EvolutionJob {
-                                                agent_id: *agent_id,
-                                                agent_name: name.to_string(),
-                                                agent_role: agent_role.to_string(),
-                                                narrative: narrative.clone(),
-                                                source: EvolutionSource::ShiftTransition,
-                                            },
-                                        );
-                                        if !queued {
-                                            write_evolution_narrative_only(
-                                                &state_store_for_sim,
-                                                *agent_id,
-                                                name,
-                                                EvolutionSource::ShiftTransition,
-                                                &narrative,
-                                            );
-                                        }
-
-                                        if let Some(ref store) = redb_store {
-                                            // NMDA scores nach redb schreiben
-                                            if !nmda_scores.is_empty() {
-                                                let avg_score: f64 =
-                                                    nmda_scores.iter().sum::<f64>()
-                                                        / nmda_scores.len() as f64;
-                                                match store.set_nmda_scores(*agent_id, &nmda_scores)
-                                                {
-                                                    Ok(()) => {
-                                                        info!(
-                                                            agent = name,
-                                                            nmda_count = nmda_scores.len(),
-                                                            nmda_avg = format!("{avg_score:.4}"),
-                                                            "NMDA scores nach redb geschrieben"
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(
-                                                            agent = name,
-                                                            error = %e,
-                                                            "NMDA scores redb-Write fehlgeschlagen"
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            // Facts aus Hippocampus FactRetriever nach state.redb bridgen
-                                            let facts =
-                                                episode_producer.hippocampus().retrieve_facts(name);
-                                            if !facts.is_empty() {
-                                                let facts_json =
-                                                    serde_json::to_vec(&facts).unwrap_or_default();
-                                                match store.set_agent_facts(*agent_id, &facts_json)
-                                                {
-                                                    Ok(()) => {
-                                                        info!(
-                                                            agent = name,
-                                                            facts_count = facts.len(),
-                                                            "AGENT_FACTS nach state.redb geschrieben"
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(
-                                                            agent = name,
-                                                            error = %e,
-                                                            "AGENT_FACTS redb-Write fehlgeschlagen"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                    warn!(agent = name, error = %e, "Schichtwechsel-Konsolidierung fehlgeschlagen");
                                 }
-                            }
-                            Err(e) => {
-                                shift_agents_failed += 1;
-                                if shift_event_emission_enabled {
-                                    if let Some(ref event_store) = nightrun_event_store {
-                                        let payload =
-                                            DomainEventPayload::AgentConsolidationFailed {
-                                                run_id: shift_run_id.clone(),
-                                                agent_name: name.to_string(),
-                                                error: e.to_string(),
-                                            };
-                                        let aggregate_id = format!("AGENT-{:02}", agent_id.0);
-                                        if let Err(event_err) = append_nightrun_event(
-                                            event_store,
-                                            payload,
-                                            &aggregate_id,
-                                            &shift_run_id,
-                                            tick_count,
-                                            Some(&mut shift_hash_chain),
-                                        ) {
-                                            shift_event_emission_enabled = false;
-                                            warn!(
-                                                run_id = %shift_run_id,
-                                                agent = name,
-                                                error = %event_err,
-                                                "Schichtwechsel-AgentConsolidationFailed-Event fehlgeschlagen"
-                                            );
-                                        }
-                                    }
-                                }
-                                warn!(agent = name, error = %e, "Schichtwechsel-Konsolidierung fehlgeschlagen");
                             }
                         }
                     }
-                }
-                let shift_stats = nmda_score_stats(&shift_nmda_scores);
-                if shift_episodes_processed > 0 {
-                    info!(
-                        old_shift = current_shift,
-                        new_shift,
-                        agents_removed = removed.len(),
-                        episodes_processed = shift_episodes_processed,
-                        episodes_consolidated = shift_episodes_consolidated,
-                        selection_rate = format!(
-                            "{:.3}",
-                            nmda_selection_rate(
-                                shift_episodes_processed,
-                                shift_episodes_consolidated
-                            )
-                        ),
-                        nmda_threshold = NMDA_CONSOLIDATION_THRESHOLD,
-                        nmda_max_consolidation_episodes = NMDA_MAX_CONSOLIDATION_EPISODES,
-                        nmda_score_min = ?shift_stats.min,
-                        nmda_score_avg = ?shift_stats.avg,
-                        nmda_score_max = ?shift_stats.max,
-                        "Schichtwechsel-NMDA-Selektion abgeschlossen"
-                    );
-                }
-                if shift_event_emission_enabled {
-                    if let Some(ref event_store) = nightrun_event_store {
-                        let hash_chain_final = shift_hash_chain.current_hash();
-                        let payload = DomainEventPayload::NightRunCompleted {
-                            run_id: shift_run_id.clone(),
-                            trigger_shift_set: current_shift,
-                            agents_consolidated: shift_agents_consolidated,
-                            agents_failed: shift_agents_failed,
-                            agents_skipped: 0,
-                            total_episodes: shift_episodes_processed,
-                            total_episodes_consolidated: shift_episodes_consolidated,
-                            nmda_selection_rate: Some(nmda_selection_rate(
-                                shift_episodes_processed,
-                                shift_episodes_consolidated,
-                            )),
-                            nmda_threshold: Some(NMDA_CONSOLIDATION_THRESHOLD),
-                            nmda_max_consolidation_episodes: Some(
-                                NMDA_MAX_CONSOLIDATION_EPISODES as u32,
+                    let shift_stats = nmda_score_stats(&shift_nmda_scores);
+                    if shift_episodes_processed > 0 {
+                        info!(
+                            old_shift = current_shift,
+                            new_shift,
+                            agents_removed = removed.len(),
+                            episodes_processed = shift_episodes_processed,
+                            episodes_consolidated = shift_episodes_consolidated,
+                            selection_rate = format!(
+                                "{:.3}",
+                                nmda_selection_rate(
+                                    shift_episodes_processed,
+                                    shift_episodes_consolidated
+                                )
                             ),
-                            nmda_score_min: shift_stats.min,
-                            nmda_score_avg: shift_stats.avg,
-                            nmda_score_max: shift_stats.max,
-                            duration_ms: shift_started.elapsed().as_millis() as u64,
-                            hash_chain: Some(hash_chain_final.clone()),
-                        };
-                        if let Err(e) = append_nightrun_event(
-                            event_store,
-                            payload,
-                            "nightrun",
-                            &shift_run_id,
-                            tick_count,
-                            None,
-                        ) {
-                            warn!(
-                                run_id = %shift_run_id,
-                                hash_chain = %hash_chain_final,
-                                error = %e,
-                                "Schichtwechsel-Nightrun-Completed-Event fehlgeschlagen"
-                            );
-                        }
+                            nmda_threshold = NMDA_CONSOLIDATION_THRESHOLD,
+                            nmda_max_consolidation_episodes = NMDA_MAX_CONSOLIDATION_EPISODES,
+                            nmda_score_min = ?shift_stats.min,
+                            nmda_score_avg = ?shift_stats.avg,
+                            nmda_score_max = ?shift_stats.max,
+                            "Schichtwechsel-NMDA-Selektion abgeschlossen"
+                        );
                     }
-                }
-
-                // GOLF: Goal-Progress fuer konsolidierte Agents aktualisieren
-                // Pro ueberlebte Schicht erhoehen wir den Progress aktiver Goals
-                // um einen kleinen Betrag (0.05 = ~20 Schichten bis Completion).
-                for agent_id in &removed {
-                    let agent_name = all_agents
-                        .iter()
-                        .find(|a| AgentId(a.identity.id) == *agent_id)
-                        .map(|a| a.identity.name.as_str());
-                    if let Some(name) = agent_name {
-                        let goals = episode_producer
-                            .hippocampus()
-                            .get_goals(name)
-                            .unwrap_or_default();
-                        let active_goals: Vec<_> = goals.iter().filter(|g| g.is_active()).collect();
-                        for goal in &active_goals {
-                            let new_progress = (goal.progress + 0.05).min(1.0);
-                            match episode_producer.hippocampus().update_goal_progress(
-                                name,
-                                goal.id,
-                                new_progress,
+                    if shift_event_emission_enabled {
+                        if let Some(ref event_store) = nightrun_event_store {
+                            let hash_chain_final = shift_hash_chain.current_hash();
+                            let payload = DomainEventPayload::NightRunCompleted {
+                                run_id: shift_run_id.clone(),
+                                trigger_shift_set: current_shift,
+                                agents_consolidated: shift_agents_consolidated,
+                                agents_failed: shift_agents_failed,
+                                agents_skipped: 0,
+                                total_episodes: shift_episodes_processed,
+                                total_episodes_consolidated: shift_episodes_consolidated,
+                                nmda_selection_rate: Some(nmda_selection_rate(
+                                    shift_episodes_processed,
+                                    shift_episodes_consolidated,
+                                )),
+                                nmda_threshold: Some(NMDA_CONSOLIDATION_THRESHOLD),
+                                nmda_max_consolidation_episodes: Some(
+                                    NMDA_MAX_CONSOLIDATION_EPISODES as u32,
+                                ),
+                                nmda_score_min: shift_stats.min,
+                                nmda_score_avg: shift_stats.avg,
+                                nmda_score_max: shift_stats.max,
+                                duration_ms: shift_started.elapsed().as_millis() as u64,
+                                hash_chain: Some(hash_chain_final.clone()),
+                            };
+                            if let Err(e) = append_nightrun_event(
+                                event_store,
+                                payload,
+                                "nightrun",
+                                &shift_run_id,
                                 tick_count,
+                                None,
                             ) {
-                                Ok(true) => {
-                                    info!(
-                                        agent = name,
-                                        goal_id = goal.id,
-                                        goal_type = %goal.goal_type,
-                                        progress = format!("{:.2}", new_progress),
-                                        "GOLF: Goal-Progress aktualisiert"
-                                    );
-                                }
-                                Ok(false) => {} // Goal not found (unlikely)
-                                Err(e) => {
-                                    warn!(
-                                        agent = name,
-                                        goal_id = goal.id,
-                                        error = %e,
-                                        "GOLF: Goal-Progress Update fehlgeschlagen"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Memory-Pressure Check: Agent-Spawn blockieren wenn Mem PSI > Threshold
-                if adaptive_tick.should_block_spawn() {
-                    warn!(
-                        mem_psi = format!("{:.1}", adaptive_tick.mem_avg10()),
-                        "Memory PSI ueber Schwellwert — Agent-Spawn verzoegert bis Druck sinkt"
-                    );
-                    // Schichtwechsel registrieren aber Spawn auf naechsten Zyklus verschieben
-                    current_shift = new_shift;
-                    continue;
-                }
-
-                // Neue Schicht-Agents spawnen (mit Sandbox-Setup)
-                let new_agents = agents_for_local_residency(&all_agents, new_shift);
-                let mut spawned_count = 0u32;
-                for agent_cfg in &new_agents {
-                    let agent_id = AgentId(agent_cfg.identity.id);
-                    // Set 0 (Sonder) bleibt, nicht nochmal spawnen
-                    if runtime_orch.get_agent_mut(agent_id).is_some() {
-                        continue;
-                    }
-                    if spawn_agent_full(
-                        &mut runtime_orch,
-                        &mut world,
-                        agent_cfg,
-                        &sandbox,
-                        &mut sandbox_handles,
-                        &mut ebpf_collector,
-                        &mut agent_processes,
-                        &mut nano_runtimes,
-                        &agent_command,
-                        &security_runtime_state,
-                        event_store.as_ref(),
-                        fs_mount.as_deref(),
-                    ) {
-                        // GOLF: Default-Goals fuer neuen Schicht-Agent erstellen
-                        let existing = episode_producer
-                            .hippocampus()
-                            .get_goals(&agent_cfg.identity.name)
-                            .unwrap_or_default();
-                        if existing.is_empty() {
-                            let goals = sentinel_hippocampus::default_goals_for_role(
-                                &agent_cfg.identity.name,
-                                &agent_cfg.identity.role,
-                                tick_count,
-                            );
-                            if let Err(e) = episode_producer
-                                .hippocampus()
-                                .create_goals(&agent_cfg.identity.name, &goals)
-                            {
                                 warn!(
-                                    agent = %agent_cfg.identity.name,
+                                    run_id = %shift_run_id,
+                                    hash_chain = %hash_chain_final,
                                     error = %e,
-                                    "GOLF: Default-Goals konnten nicht erstellt werden"
-                                );
-                            } else {
-                                info!(
-                                    agent = %agent_cfg.identity.name,
-                                    goal_count = goals.len(),
-                                    "GOLF: Default-Goals erstellt"
+                                    "Schichtwechsel-Nightrun-Completed-Event fehlgeschlagen"
                                 );
                             }
                         }
-                        spawned_count += 1;
                     }
+
+                    // GOLF: Goal-Progress fuer konsolidierte Agents aktualisieren
+                    // Pro ueberlebte Schicht erhoehen wir den Progress aktiver Goals
+                    // um einen kleinen Betrag (0.05 = ~20 Schichten bis Completion).
+                    for agent_id in &removed {
+                        let agent_name = all_agents
+                            .iter()
+                            .find(|a| AgentId(a.identity.id) == *agent_id)
+                            .map(|a| a.identity.name.as_str());
+                        if let Some(name) = agent_name {
+                            let goals = episode_producer
+                                .hippocampus()
+                                .get_goals(name)
+                                .unwrap_or_default();
+                            let active_goals: Vec<_> =
+                                goals.iter().filter(|g| g.is_active()).collect();
+                            for goal in &active_goals {
+                                let new_progress = (goal.progress + 0.05).min(1.0);
+                                match episode_producer.hippocampus().update_goal_progress(
+                                    name,
+                                    goal.id,
+                                    new_progress,
+                                    tick_count,
+                                ) {
+                                    Ok(true) => {
+                                        info!(
+                                            agent = name,
+                                            goal_id = goal.id,
+                                            goal_type = %goal.goal_type,
+                                            progress = format!("{:.2}", new_progress),
+                                            "GOLF: Goal-Progress aktualisiert"
+                                        );
+                                    }
+                                    Ok(false) => {} // Goal not found (unlikely)
+                                    Err(e) => {
+                                        warn!(
+                                            agent = name,
+                                            goal_id = goal.id,
+                                            error = %e,
+                                            "GOLF: Goal-Progress Update fehlgeschlagen"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Neue Schicht-Agents spawnen (mit Sandbox-Setup)
+                    let new_agents = agents_for_local_residency(&all_agents, new_shift);
+                    let mut spawned_count = 0u32;
+                    for agent_cfg in &new_agents {
+                        let agent_id = AgentId(agent_cfg.identity.id);
+                        // Set 0 (Sonder) bleibt, nicht nochmal spawnen
+                        if runtime_orch.get_agent_mut(agent_id).is_some() {
+                            continue;
+                        }
+                        if spawn_agent_full(
+                            &mut runtime_orch,
+                            &mut world,
+                            agent_cfg,
+                            &sandbox,
+                            &mut sandbox_handles,
+                            &mut ebpf_collector,
+                            &mut agent_processes,
+                            &mut nano_runtimes,
+                            &agent_command,
+                            &security_runtime_state,
+                            event_store.as_ref(),
+                            fs_mount.as_deref(),
+                        ) {
+                            // GOLF: Default-Goals fuer neuen Schicht-Agent erstellen
+                            let existing = episode_producer
+                                .hippocampus()
+                                .get_goals(&agent_cfg.identity.name)
+                                .unwrap_or_default();
+                            if existing.is_empty() {
+                                let goals = sentinel_hippocampus::default_goals_for_role(
+                                    &agent_cfg.identity.name,
+                                    &agent_cfg.identity.role,
+                                    tick_count,
+                                );
+                                if let Err(e) = episode_producer
+                                    .hippocampus()
+                                    .create_goals(&agent_cfg.identity.name, &goals)
+                                {
+                                    warn!(
+                                        agent = %agent_cfg.identity.name,
+                                        error = %e,
+                                        "GOLF: Default-Goals konnten nicht erstellt werden"
+                                    );
+                                } else {
+                                    info!(
+                                        agent = %agent_cfg.identity.name,
+                                        goal_count = goals.len(),
+                                        "GOLF: Default-Goals erstellt"
+                                    );
+                                }
+                            }
+                            spawned_count += 1;
+                        }
+                    }
+
+                    // AgentSpawned Events BEHALTEN — Projection braucht sie bei Schichtwechsel.
+                    // upsert_agent() in Projection ist idempotent.
+
+                    let missing_replacement_ids = new_agents
+                        .iter()
+                        .filter_map(|agent_cfg| {
+                            let agent_id = AgentId(agent_cfg.identity.id);
+                            let logical_ready = runtime_orch.agents().contains_key(&agent_id);
+                            let adapter_ready = nano_runtimes.handle(agent_id).is_some();
+                            let ecs_ready =
+                                crate::config_apply::find_agent_entity(&mut world, agent_id)
+                                    .is_some();
+                            (!logical_ready || !adapter_ready || !ecs_ready).then_some(agent_id)
+                        })
+                        .collect::<Vec<_>>();
+                    let remaining_old_ids =
+                        runtime_orch.shift_removal_candidates(new_shift, &protected_prepared);
+                    let replacement_ready =
+                        missing_replacement_ids.is_empty() && remaining_old_ids.is_empty();
+                    if !replacement_ready {
+                        error!(
+                            old = current_shift,
+                            new = new_shift,
+                            missing_agents = ?missing_replacement_ids,
+                            remaining_old_agents = ?remaining_old_ids,
+                            "Schichtwechsel-Ersatzroster unvollstaendig; Praedikat bleibt fuer Wiederholung aktiv"
+                        );
+                        break 'shift_effects;
+                    }
+                    if !admission.complete(&mut current_shift, true) {
+                        error!(
+                            current = current_shift,
+                            new = new_shift,
+                            "Schichtwechsel-Guard veraltet; Praedikat wurde nicht konsumiert"
+                        );
+                        break 'shift_effects;
+                    }
+                    let completion_removed = if pending_shift_target == Some(new_shift) {
+                        pending_shift_removed.as_slice()
+                    } else {
+                        removed.as_slice()
+                    };
+                    let completed_removed_count = completion_removed.len();
+                    runtime_orch.publish_shift_transition_completion(new_shift, completion_removed);
+                    pending_shift_target = None;
+                    pending_shift_removed.clear();
+                    info!(
+                        removed = completed_removed_count,
+                        spawned = spawned_count,
+                        active = runtime_orch.agent_count(),
+                        "Schichtwechsel abgeschlossen"
+                    );
+                    // #529: Post-Shift-Anker erzwingen. Der periodische Snapshot-Block weiter unten
+                    // (im selben Tick, nach Despawn+Respawn) erfasst dann den Post-Shift-Zustand, sodass
+                    // jeder Restore auf ein Ziel >= diesem Shift-Tick den Post-Shift-Anker waehlt und das
+                    // Replay-Fenster nie ueber die Schichtgrenze laeuft (vgl. SPIKE-529).
+                    snapshot_manager.mark_shift_snapshot_pending();
                 }
-
-                // AgentSpawned Events BEHALTEN — Projection braucht sie bei Schichtwechsel.
-                // upsert_agent() in Projection ist idempotent.
-
-                info!(
-                    removed = removed.len(),
-                    spawned = spawned_count,
-                    active = runtime_orch.agent_count(),
-                    "Schichtwechsel abgeschlossen"
-                );
-
-                current_shift = new_shift;
-                // #529: Post-Shift-Anker erzwingen. Der periodische Snapshot-Block weiter unten
-                // (im selben Tick, nach Despawn+Respawn) erfasst dann den Post-Shift-Zustand, sodass
-                // jeder Restore auf ein Ziel >= diesem Shift-Tick den Post-Shift-Anker waehlt und das
-                // Replay-Fenster nie ueber die Schichtgrenze laeuft (vgl. SPIKE-529).
-                snapshot_manager.mark_shift_snapshot_pending();
             }
         }
 
@@ -16833,6 +16986,237 @@ mod tests {
         assert_eq!(shift_hours(2), (14, 22));
         assert_eq!(shift_hours(3), (22, 6));
         assert_eq!(shift_hours(99), (6, 14)); // Fallback
+    }
+
+    #[derive(Default)]
+    struct ShiftEffectProbe {
+        removals: usize,
+        process_stops: usize,
+        consolidations: usize,
+        spawns: usize,
+        snapshots: usize,
+    }
+
+    #[test]
+    fn shift_pressure_admission_blocks_every_effect_and_preserves_predicate() {
+        let current_shift = 1;
+        let effects = ShiftEffectProbe::default();
+
+        let admission = shift_transition_admission(current_shift, 2, true);
+
+        assert_eq!(admission, ShiftTransitionAdmission::PressureBlocked);
+        assert_eq!(current_shift, 1);
+        assert_eq!(effects.removals, 0);
+        assert_eq!(effects.process_stops, 0);
+        assert_eq!(effects.consolidations, 0);
+        assert_eq!(effects.spawns, 0);
+        assert_eq!(effects.snapshots, 0);
+    }
+
+    #[test]
+    fn shift_pressure_recovery_transitions_once_and_duplicate_is_noop() {
+        let mut current_shift = 1;
+        let mut effects = ShiftEffectProbe::default();
+
+        assert_eq!(
+            shift_transition_admission(current_shift, 2, true),
+            ShiftTransitionAdmission::PressureBlocked
+        );
+
+        let ShiftTransitionAdmission::Admitted(admission) =
+            shift_transition_admission(current_shift, 2, false)
+        else {
+            panic!("recovered pressure must admit the pending shift");
+        };
+        effects.removals += 1;
+        effects.process_stops += 1;
+        effects.consolidations += 1;
+        effects.spawns += 1;
+        assert!(admission.complete(&mut current_shift, true));
+        effects.snapshots += 1;
+
+        assert_eq!(current_shift, 2);
+        assert_eq!(
+            shift_transition_admission(current_shift, 2, false),
+            ShiftTransitionAdmission::NoChange
+        );
+        assert_eq!(effects.removals, 1);
+        assert_eq!(effects.process_stops, 1);
+        assert_eq!(effects.consolidations, 1);
+        assert_eq!(effects.spawns, 1);
+        assert_eq!(effects.snapshots, 1);
+    }
+
+    #[test]
+    fn shift_pressure_restart_reconstructs_same_blocked_decision() {
+        let current_shift_before_restart = 1;
+        assert_eq!(
+            shift_transition_admission(current_shift_before_restart, 2, true),
+            ShiftTransitionAdmission::PressureBlocked
+        );
+
+        let mut reconstructed_current_shift = current_shift_before_restart;
+        assert_eq!(
+            shift_transition_admission(reconstructed_current_shift, 2, true),
+            ShiftTransitionAdmission::PressureBlocked
+        );
+
+        let ShiftTransitionAdmission::Admitted(admission) =
+            shift_transition_admission(reconstructed_current_shift, 2, false)
+        else {
+            panic!("pressure recovery after restart must admit the same shift");
+        };
+        assert!(admission.complete(&mut reconstructed_current_shift, true));
+        assert_eq!(reconstructed_current_shift, 2);
+    }
+
+    #[test]
+    fn shift_failed_replacement_keeps_transition_visible() {
+        let mut current_shift = 1;
+        let ShiftTransitionAdmission::Admitted(admission) =
+            shift_transition_admission(current_shift, 2, false)
+        else {
+            panic!("healthy pressure must admit the shift");
+        };
+
+        assert!(!admission.complete(&mut current_shift, false));
+        assert_eq!(current_shift, 1);
+        assert!(matches!(
+            shift_transition_admission(current_shift, 2, false),
+            ShiftTransitionAdmission::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn restored_startup_retains_prior_serving_roster_until_pressure_admission() {
+        let old = test_ecs_agent_config(1, "Old", "Operator", 1);
+        let target = test_ecs_agent_config(2, "Target", "Operator", 2);
+        let special = test_ecs_agent_config(46, "Special", "Special", 0);
+        let all_agents = vec![old.clone(), target, special.clone()];
+        let mut runtime_orch = RuntimeOrchestrator::new(10);
+        for config in [&old, &special] {
+            let (start, end) = shift_hours(config.identity.shift_set);
+            runtime_orch
+                .spawn_agent(
+                    AgentIdentity {
+                        agent_id: AgentId(config.identity.id),
+                        name: config.identity.name.clone(),
+                        role: config.identity.role.clone(),
+                    },
+                    ShiftInfo {
+                        shift_set: config.identity.shift_set,
+                        shift_start_hour: start,
+                        shift_end_hour: end,
+                        is_on_duty: true,
+                    },
+                    &config.preferences.favorite_room,
+                )
+                .unwrap();
+        }
+
+        let reconstructed = restored_nonzero_serving_shift(&runtime_orch)
+            .unwrap()
+            .expect("old nonzero serving shift");
+        let startup_ids = agents_for_local_residency(&all_agents, reconstructed)
+            .into_iter()
+            .map(|config| config.identity.id)
+            .collect::<HashSet<_>>();
+        let runtime_ids_before = runtime_orch
+            .agents()
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+
+        assert_eq!(reconstructed, 1);
+        assert_eq!(startup_ids, HashSet::from([1, 46]));
+        assert_eq!(
+            shift_transition_admission(reconstructed, 2, true),
+            ShiftTransitionAdmission::PressureBlocked
+        );
+        assert_eq!(
+            runtime_orch
+                .agents()
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            runtime_ids_before
+        );
+    }
+
+    #[test]
+    fn restored_startup_rejects_ambiguous_nonzero_serving_shifts() {
+        let mut runtime_orch = RuntimeOrchestrator::new(10);
+        for (id, shift_set) in [(1, 1), (2, 2)] {
+            runtime_orch
+                .spawn_agent(
+                    AgentIdentity {
+                        agent_id: AgentId(id),
+                        name: format!("Agent-{id}"),
+                        role: "Operator".to_string(),
+                    },
+                    ShiftInfo {
+                        shift_set,
+                        shift_start_hour: 0,
+                        shift_end_hour: 0,
+                        is_on_duty: true,
+                    },
+                    "empfang",
+                )
+                .unwrap();
+        }
+
+        assert!(restored_nonzero_serving_shift(&runtime_orch).is_err());
+    }
+
+    #[test]
+    fn shift_source_orders_logical_removal_and_completion_around_readiness() {
+        let source = include_str!("orchestrator.rs");
+        let shift_start = source
+            .find("// Shift-Erkennung")
+            .expect("production shift block");
+        let shift_end = source[shift_start..]
+            .find("// Nightrun-Trigger")
+            .map(|offset| shift_start + offset)
+            .expect("production shift block end");
+        let shift_block = &source[shift_start..shift_end];
+
+        let admission = shift_block
+            .find("shift_transition_admission(")
+            .expect("pressure admission");
+        let stop = shift_block
+            .find("stop_agent_runtime_layer(")
+            .expect("adapter stop");
+        let logical_commit = shift_block
+            .find("commit_shift_logical_removals(")
+            .expect("logical removal commit");
+        let readiness = shift_block
+            .find("let missing_replacement_ids")
+            .expect("replacement readiness");
+        let guard_completion = shift_block
+            .find("admission.complete(")
+            .expect("guard completion");
+        let publication = shift_block
+            .find("publish_shift_transition_completion(")
+            .expect("completion publication");
+        let snapshot = shift_block
+            .find("mark_shift_snapshot_pending(")
+            .expect("snapshot scheduling");
+
+        assert!(admission < stop);
+        assert!(stop < logical_commit);
+        assert!(logical_commit < readiness);
+        assert!(readiness < guard_completion);
+        assert!(guard_completion < publication);
+        assert!(publication < snapshot);
+        assert!(!shift_block.contains("commit_shift_transition("));
+
+        let blocked_branch = shift_block
+            .split("ShiftTransitionAdmission::PressureBlocked =>")
+            .nth(1)
+            .and_then(|tail| tail.split("ShiftTransitionAdmission::NoChange").next())
+            .expect("pressure-blocked branch");
+        assert!(blocked_branch.contains("break 'shift_effects"));
+        assert!(!blocked_branch.contains("continue;"));
     }
 
     #[test]
