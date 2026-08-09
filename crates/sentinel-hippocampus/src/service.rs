@@ -102,11 +102,11 @@ impl HippocampusService {
         };
         self.store.store_narrative(agent, &narrative_state)?;
 
-        // Archive all processed episodes BEFORE clearing (preserve for long-term)
-        self.store.append_archive(agent, &episodes)?;
-
-        // Clear processed episodes (safe — already archived above)
-        self.store.clear_episodes(agent)?;
+        // Archive and clear in one redb transaction. Projection receipts may
+        // point at the archive after consolidation, so split commits are not
+        // safe across crashes.
+        self.store
+            .archive_and_clear_episodes(agent, &episodes)?;
 
         Ok(ConsolidationResult {
             agent_name: agent.to_string(),
