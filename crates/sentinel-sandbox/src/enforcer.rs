@@ -11,16 +11,319 @@
 //! 3. `start_agent_process()` — startet bwrap (spaeter: mit Landlock im Child)
 //! 4. `teardown_agent()` — beendet bwrap-Reste + entfernt cgroup
 
+use std::io::{BufRead, BufReader, Write};
+#[cfg(test)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, ChildStdin};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
 
-use crate::bwrap::{terminate_sandbox_process, BwrapConfig, SpawnedSandbox};
+use crate::bwrap::{BwrapConfig, SpawnedSandbox};
 use crate::cgroups::{self, CgroupLimits, PsiMetrics};
 use crate::landlock;
+
+const PROTOCOL_LINE_LIMIT_BYTES: usize = 1024 * 1024;
+const PROTOCOL_OUTPUT_LIMIT_BYTES: usize = 256 * 1024;
+const PROTOCOL_QUEUE_DEPTH: usize = 64;
+const PROTOCOL_CANCEL_GRACE_MS: u64 = 1_000;
+const PROTOCOL_WRITE_TIMEOUT_MS: u64 = 250;
+
+const PROTOCOL_TERMINAL_SETTLE_MS: u64 = 25;
+
+enum ProtocolFrame {
+    Line(String),
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtocolSupervisionFailure {
+    InvalidFrame,
+    ProtocolViolation,
+    UnsupportedVersion,
+    InvocationConflict,
+    OutputLimitExceeded,
+    ChannelDisconnected,
+    DeadlineExceeded,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtocolCancelOwner {
+    Explicit,
+    Deadline,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProtocolCancelClaim {
+    owner: ProtocolCancelOwner,
+    claimed_at: std::time::Instant,
+    requested_at_unix_ms: u64,
+    send_started: bool,
+    #[cfg(test)]
+    sent: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProtocolOutcome {
+    Running,
+    ProcessExitedPending { observed_at: std::time::Instant },
+    TerminalPending { observed_at: std::time::Instant },
+    FailurePending(ProtocolSupervisionFailure),
+    FinalTerminal,
+    FinalFailure(ProtocolSupervisionFailure),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProtocolSupervisionSnapshot {
+    pub(crate) failure: Option<ProtocolSupervisionFailure>,
+    pub(crate) cancel_requested_at_ms: Option<u64>,
+    pub(crate) cancel_owner: Option<ProtocolCancelOwner>,
+    #[cfg(test)]
+    pub(crate) cancel_sent: bool,
+    pub(crate) terminal_finalized: bool,
+    #[cfg(test)]
+    pub(crate) process_reaped: bool,
+    #[cfg(test)]
+    pub(crate) reader_closed: bool,
+    #[cfg(test)]
+    pub(crate) stdin_closed: bool,
+    pub(crate) cgroup_quiesced: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProtocolReaderState {
+    invocation_id: Option<String>,
+    retained_bytes: usize,
+    result_seen: bool,
+    terminal: bool,
+}
+
+struct ProtocolSupervisionState {
+    reader: ProtocolReaderState,
+    deadline_unix_ms: u64,
+    execute_sent: bool,
+    cancel: Option<ProtocolCancelClaim>,
+    outcome: ProtocolOutcome,
+    reader_closed: bool,
+    stop: bool,
+    cgroup_quiesced: bool,
+}
+
+impl Default for ProtocolSupervisionState {
+    fn default() -> Self {
+        Self {
+            reader: ProtocolReaderState::default(),
+            deadline_unix_ms: 0,
+            execute_sent: false,
+            cancel: None,
+            outcome: ProtocolOutcome::Running,
+            reader_closed: false,
+            stop: false,
+            cgroup_quiesced: false,
+        }
+    }
+}
+
+struct ProtocolSupervision {
+    state: Mutex<ProtocolSupervisionState>,
+    #[cfg(test)]
+    deadline_send_barrier: Mutex<Option<ProtocolDeadlineSendBarrier>>,
+    #[cfg(test)]
+    post_terminal_barrier: Mutex<Option<ProtocolPostTerminalBarrier>>,
+    #[cfg(test)]
+    pre_quiescence_barrier: Mutex<Option<ProtocolPreQuiescenceBarrier>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ProtocolDeadlineSendBarrier {
+    claimed: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ProtocolPostTerminalBarrier {
+    observed: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ProtocolPreQuiescenceBarrier {
+    observed: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+impl Default for ProtocolSupervision {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(ProtocolSupervisionState::default()),
+            #[cfg(test)]
+            deadline_send_barrier: Mutex::new(None),
+            #[cfg(test)]
+            post_terminal_barrier: Mutex::new(None),
+            #[cfg(test)]
+            pre_quiescence_barrier: Mutex::new(None),
+        }
+    }
+}
+
+impl ProtocolSupervision {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ProtocolSupervisionState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn snapshot(&self, _process_reaped: bool, _stdin_closed: bool) -> ProtocolSupervisionSnapshot {
+        let state = self.lock();
+        let (failure, terminal_finalized) = match state.outcome {
+            ProtocolOutcome::FinalFailure(failure) => (Some(failure), false),
+            ProtocolOutcome::FinalTerminal => (None, true),
+            _ => (None, false),
+        };
+        ProtocolSupervisionSnapshot {
+            failure,
+            cancel_requested_at_ms: state.cancel.map(|claim| claim.requested_at_unix_ms),
+            cancel_owner: state.cancel.map(|claim| claim.owner),
+            #[cfg(test)]
+            cancel_sent: state.cancel.is_some_and(|claim| claim.sent),
+            terminal_finalized,
+            #[cfg(test)]
+            process_reaped: _process_reaped,
+            #[cfg(test)]
+            reader_closed: state.reader_closed,
+            #[cfg(test)]
+            stdin_closed: _stdin_closed,
+            cgroup_quiesced: state.cgroup_quiesced,
+        }
+    }
+
+    #[cfg(test)]
+    fn install_deadline_send_barrier(
+        &self,
+        claimed: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        *self
+            .deadline_send_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ProtocolDeadlineSendBarrier { claimed, release });
+    }
+
+    #[cfg(test)]
+    fn wait_at_deadline_send_barrier(&self) {
+        let barrier = self
+            .deadline_send_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.claimed.wait();
+            barrier.release.wait();
+        }
+    }
+
+    #[cfg(test)]
+    fn install_post_terminal_barrier(
+        &self,
+        observed: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        *self
+            .post_terminal_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ProtocolPostTerminalBarrier { observed, release });
+    }
+
+    #[cfg(test)]
+    fn wait_at_post_terminal_barrier(&self) {
+        let barrier = self
+            .post_terminal_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.observed.wait();
+            barrier.release.wait();
+        }
+    }
+
+    #[cfg(test)]
+    fn install_pre_quiescence_barrier(
+        &self,
+        observed: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        *self
+            .pre_quiescence_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ProtocolPreQuiescenceBarrier { observed, release });
+    }
+
+    #[cfg(test)]
+    fn wait_at_pre_quiescence_barrier(&self) {
+        let barrier = self
+            .pre_quiescence_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(barrier) = barrier {
+            barrier.observed.wait();
+            barrier.release.wait();
+        }
+    }
+}
+
+struct ProcessTermination {
+    started: AtomicBool,
+    reaped: AtomicBool,
+    signal_attempts: Arc<AtomicUsize>,
+    #[cfg(test)]
+    reap_publications: AtomicUsize,
+}
+
+struct ProtocolReaderCloseGuard(Arc<ProtocolSupervision>);
+
+impl Drop for ProtocolReaderCloseGuard {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.reader_closed = true;
+        if matches!(
+            state.outcome,
+            ProtocolOutcome::Running | ProtocolOutcome::ProcessExitedPending { .. }
+        ) {
+            state.outcome =
+                ProtocolOutcome::FailurePending(ProtocolSupervisionFailure::ChannelDisconnected);
+        }
+    }
+}
+
+impl Default for ProcessTermination {
+    fn default() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            reaped: AtomicBool::new(false),
+            signal_attempts: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            reap_publications: AtomicUsize::new(0),
+        }
+    }
+}
+
+pub(crate) struct ProtocolDrain {
+    pub(crate) lines: Vec<String>,
+    pub(crate) queue_overflowed: bool,
+}
 
 /// Handle fuer einen laufenden Agent-Prozess in bwrap.
 ///
@@ -36,91 +339,709 @@ pub struct AgentProcess {
     /// das bwrap-Exit bleibt das primaere fail-closed-Signal (#75).
     pub child_pid: Option<u32>,
     /// Child handle — NICHT droppen solange Agent laufen soll.
-    child: Child,
+    child: Arc<Mutex<Child>>,
+    protocol_stdin: Arc<Mutex<Option<ChildStdin>>>,
+    protocol_stdout: Option<Receiver<ProtocolFrame>>,
+    protocol_queue_overflowed: Arc<AtomicBool>,
+    protocol_reader: Option<std::thread::JoinHandle<()>>,
+    protocol_supervisor: Option<std::thread::JoinHandle<()>>,
+    supervision: Arc<ProtocolSupervision>,
+    termination: Arc<ProcessTermination>,
+    supervised_cgroup: Option<String>,
 }
 
 impl AgentProcess {
+    fn from_child(mut child: Child, child_pid: Option<u32>) -> Self {
+        let pid = child.id();
+        let protocol_stdin = child.stdin.take().and_then(|stdin| {
+            let configured = nix::fcntl::fcntl(&stdin, nix::fcntl::FcntlArg::F_GETFL)
+                .map(nix::fcntl::OFlag::from_bits_truncate)
+                .and_then(|flags| {
+                    nix::fcntl::fcntl(
+                        &stdin,
+                        nix::fcntl::FcntlArg::F_SETFL(flags | nix::fcntl::OFlag::O_NONBLOCK),
+                    )
+                })
+                .is_ok();
+            if !configured {
+                None
+            } else {
+                Some(stdin)
+            }
+        });
+        let protocol_stdin = Arc::new(Mutex::new(protocol_stdin));
+        let supervision = Arc::new(ProtocolSupervision::default());
+        let (protocol_stdout, protocol_queue_overflowed, protocol_reader) =
+            protocol_reader_parts(child.stdout.take(), Arc::clone(&supervision));
+        Self {
+            pid,
+            child_pid,
+            child: Arc::new(Mutex::new(child)),
+            protocol_stdin,
+            protocol_stdout,
+            protocol_queue_overflowed,
+            protocol_reader,
+            protocol_supervisor: None,
+            supervision,
+            termination: Arc::new(ProcessTermination::default()),
+            supervised_cgroup: None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn launch_fixture() -> Result<Self> {
-        let child = std::process::Command::new("/usr/bin/sleep")
+        let mut command = std::process::Command::new("/usr/bin/sleep");
+        command
             .arg("30")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command.process_group(0);
+        let child = command.spawn().context("start sandbox lifecycle fixture")?;
+        Ok(Self::from_child(child, None))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_protocol_fixture(lines: &[&str]) -> Result<Self> {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "IFS= read -r frame; if [ \"$#\" -gt 0 ]; then printf '%s\\n' \"$@\"; fi; sleep 5",
+                "fixture",
+            ])
+            .args(lines)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        command.process_group(0);
+        let child = command.spawn().context("start sandbox protocol fixture")?;
+        Ok(Self::from_child(child, None))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_raw_protocol_fixture(script: &str) -> Result<Self> {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        command.process_group(0);
+        let child = command
             .spawn()
-            .context("start sandbox lifecycle fixture")?;
-        let pid = child.id();
-        Ok(Self {
-            pid,
-            child_pid: None,
-            child,
-        })
+            .context("start raw sandbox protocol fixture")?;
+        Ok(Self::from_child(child, None))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_recording_protocol_fixture(
+        lines: &[&str],
+        record_path: &Path,
+        descendant_pid_path: &Path,
+    ) -> Result<Self> {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "record=$1; descendant_file=$2; shift 2; sleep 30 & descendant=$!; printf '%s\\n' \"$descendant\" > \"$descendant_file\"; emitted=0; while IFS= read -r frame; do printf '%s\\n' \"$frame\" >> \"$record\"; if [ \"$emitted\" -eq 0 ]; then if [ \"$#\" -gt 0 ]; then printf '%s\\n' \"$@\"; fi; emitted=1; fi; done; wait \"$descendant\"",
+                "fixture",
+            ])
+            .arg(record_path)
+            .arg(descendant_pid_path)
+            .args(lines)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        command.process_group(0);
+        let child = command
+            .spawn()
+            .context("start recording sandbox protocol fixture")?;
+        Ok(Self::from_child(child, None))
     }
 
     /// Nimmt den stdin-Handle fuer stream-json Kommunikation (einmalig).
     pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
-        self.child.stdin.take()
+        self.protocol_stdin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Sends one bounded JSONL protocol frame to the sandboxed child.
+    pub fn send_protocol_line(&mut self, line: &str) -> Result<()> {
+        write_protocol_line(&self.protocol_stdin, line)
+    }
+
+    pub(crate) fn protocol_channel_available(&self) -> bool {
+        self.protocol_stdin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+            && self.protocol_stdout.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn protocol_queue_overflowed(&self) -> bool {
+        self.protocol_queue_overflowed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn start_protocol_supervision(
+        &mut self,
+        invocation_id: &str,
+        deadline_unix_ms: u64,
+        execute_line: &str,
+    ) -> std::result::Result<(), ProtocolSupervisionFailure> {
+        if self.protocol_supervisor.is_some() {
+            return Err(ProtocolSupervisionFailure::ProtocolViolation);
+        }
+        {
+            let mut state = self.supervision.lock();
+            if let ProtocolOutcome::FailurePending(failure)
+            | ProtocolOutcome::FinalFailure(failure) = state.outcome
+            {
+                return Err(failure);
+            }
+            if state.reader_closed
+                || !matches!(state.outcome, ProtocolOutcome::Running)
+                || state.execute_sent
+            {
+                return Err(ProtocolSupervisionFailure::ChannelDisconnected);
+            }
+            state.reader.invocation_id = Some(invocation_id.to_string());
+            state.deadline_unix_ms = deadline_unix_ms;
+            if write_protocol_line(&self.protocol_stdin, execute_line).is_err() {
+                state.outcome = ProtocolOutcome::FailurePending(
+                    ProtocolSupervisionFailure::ChannelDisconnected,
+                );
+                return Err(ProtocolSupervisionFailure::ChannelDisconnected);
+            }
+            // This release is the sole authority for child output and deadline
+            // actions. The initial execute record is fully written while the
+            // same state lock excludes the reader, and the deadline supervisor
+            // is created only after this publication.
+            state.execute_sent = true;
+        }
+
+        let pid = self.pid;
+        let child = Arc::clone(&self.child);
+        let stdin = Arc::clone(&self.protocol_stdin);
+        let supervision = Arc::clone(&self.supervision);
+        let termination = Arc::clone(&self.termination);
+        let supervised_cgroup = self.supervised_cgroup.clone();
+        let invocation_id = invocation_id.to_string();
+        self.protocol_supervisor = Some(std::thread::spawn(move || loop {
+            let now_ms = unix_time_ms();
+            let now = std::time::Instant::now();
+            let mut send_deadline_cancel = false;
+            let needs_quiescence;
+            {
+                let mut state = supervision.lock();
+                if state.stop {
+                    return;
+                }
+                if matches!(state.outcome, ProtocolOutcome::Running)
+                    && state.cancel.is_none()
+                    && state.deadline_unix_ms != 0
+                    && now_ms >= state.deadline_unix_ms
+                {
+                    state.cancel = Some(ProtocolCancelClaim {
+                        owner: ProtocolCancelOwner::Deadline,
+                        claimed_at: now,
+                        requested_at_unix_ms: now_ms.max(1),
+                        send_started: false,
+                        #[cfg(test)]
+                        sent: false,
+                    });
+                }
+                if let Some(claim) = state.cancel.as_mut() {
+                    if claim.owner == ProtocolCancelOwner::Deadline && !claim.send_started {
+                        claim.send_started = true;
+                        send_deadline_cancel = true;
+                    }
+                }
+                if matches!(state.outcome, ProtocolOutcome::Running) {
+                    expire_protocol_cancel_if_due(&mut state, now);
+                }
+                needs_quiescence = match state.outcome {
+                    ProtocolOutcome::FailurePending(_) => true,
+                    ProtocolOutcome::ProcessExitedPending { observed_at }
+                    | ProtocolOutcome::TerminalPending { observed_at } => {
+                        now.saturating_duration_since(observed_at)
+                            >= std::time::Duration::from_millis(PROTOCOL_TERMINAL_SETTLE_MS)
+                    }
+                    _ => false,
+                };
+                if matches!(
+                    state.outcome,
+                    ProtocolOutcome::FinalFailure(_) | ProtocolOutcome::FinalTerminal
+                ) {
+                    return;
+                }
+            }
+
+            if send_deadline_cancel {
+                #[cfg(test)]
+                supervision.wait_at_deadline_send_barrier();
+                let cancel = serde_json::json!({
+                    "kind": "cancel",
+                    "schema_version": 1,
+                    "invocation_id": invocation_id.as_str(),
+                    "reason": "deadline_expired"
+                })
+                .to_string();
+                let sent = write_protocol_line(&stdin, &cancel).is_ok();
+                let mut state = supervision.lock();
+                #[cfg(test)]
+                if let Some(claim) = state.cancel.as_mut() {
+                    if claim.owner == ProtocolCancelOwner::Deadline {
+                        claim.sent = sent;
+                    }
+                }
+                if !sent && matches!(state.outcome, ProtocolOutcome::Running) {
+                    state.outcome = ProtocolOutcome::FailurePending(
+                        ProtocolSupervisionFailure::ChannelDisconnected,
+                    );
+                }
+                drop(state);
+                continue;
+            }
+
+            if needs_quiescence {
+                #[cfg(test)]
+                supervision.wait_at_pre_quiescence_barrier();
+                let process_reaped =
+                    terminate_owned_process_once(pid, &child, &stdin, &termination).is_ok();
+                let cgroup_quiesced = match supervised_cgroup.as_deref() {
+                    Some(cgroup) => cleanup_cgroup_after_process_exit(cgroup).is_ok(),
+                    None => true,
+                };
+                let mut state = supervision.lock();
+                state.cgroup_quiesced |= cgroup_quiesced;
+                if process_reaped && state.reader_closed && state.cgroup_quiesced {
+                    state.outcome = match state.outcome {
+                        ProtocolOutcome::FailurePending(failure) => {
+                            ProtocolOutcome::FinalFailure(failure)
+                        }
+                        ProtocolOutcome::TerminalPending { .. } => ProtocolOutcome::FinalTerminal,
+                        outcome => outcome,
+                    };
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }));
+        Ok(())
+    }
+
+    /// Records the first explicit cancellation request. A deadline that won the
+    /// race remains the single cancellation owner and will not emit a duplicate.
+    pub(crate) fn begin_explicit_protocol_cancel(
+        &self,
+        requested_at_ms: u64,
+    ) -> Option<ProtocolCancelOwner> {
+        let mut state = self.supervision.lock();
+        if let Some(claim) = state.cancel {
+            return Some(claim.owner);
+        }
+        if !matches!(state.outcome, ProtocolOutcome::Running) {
+            return None;
+        }
+        state.cancel = Some(ProtocolCancelClaim {
+            owner: ProtocolCancelOwner::Explicit,
+            claimed_at: std::time::Instant::now(),
+            requested_at_unix_ms: requested_at_ms.max(1),
+            send_started: true,
+            #[cfg(test)]
+            sent: false,
+        });
+        Some(ProtocolCancelOwner::Explicit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_protocol_cancel_sent(&self) {
+        if let Some(claim) = self.supervision.lock().cancel.as_mut() {
+            claim.sent = true;
+        }
+    }
+
+    pub(crate) fn mark_protocol_channel_disconnected(&self) {
+        let mut state = self.supervision.lock();
+        if matches!(state.outcome, ProtocolOutcome::Running) {
+            state.outcome =
+                ProtocolOutcome::FailurePending(ProtocolSupervisionFailure::ChannelDisconnected);
+        }
+    }
+
+    fn set_supervised_cgroup(&mut self, cgroup: &str) {
+        self.supervised_cgroup = Some(cgroup.to_string());
+    }
+
+    pub(crate) fn protocol_supervision_snapshot(&self) -> ProtocolSupervisionSnapshot {
+        let stdin_closed = self
+            .protocol_stdin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none();
+        self.supervision.snapshot(
+            self.termination.reaped.load(Ordering::Acquire),
+            stdin_closed,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn protocol_start_failure(&self) -> Option<ProtocolSupervisionFailure> {
+        let state = self.supervision.lock();
+        match state.outcome {
+            ProtocolOutcome::FailurePending(failure) | ProtocolOutcome::FinalFailure(failure) => {
+                Some(failure)
+            }
+            _ if state.reader_closed && !state.execute_sent => {
+                Some(ProtocolSupervisionFailure::ChannelDisconnected)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn owned_process_reaped(&self) -> bool {
+        self.termination.reaped.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_deadline_send_barrier(
+        &self,
+        claimed: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.supervision
+            .install_deadline_send_barrier(claimed, release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_post_terminal_barrier(
+        &self,
+        observed: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.supervision
+            .install_post_terminal_barrier(observed, release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_pre_quiescence_barrier(
+        &self,
+        observed: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.supervision
+            .install_pre_quiescence_barrier(observed, release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retry_supervised_cgroup_cleanup_with<List, Kill, Remove>(
+        &self,
+        name: &str,
+        list_pids: List,
+        kill_pids: Kill,
+        remove: Remove,
+    ) -> Result<()>
+    where
+        List: Fn(&str) -> Result<Vec<u32>>,
+        Kill: Fn(&str) -> Result<usize>,
+        Remove: Fn(&str) -> Result<()>,
+    {
+        if !self.termination.reaped.load(Ordering::Acquire) {
+            bail!("sandbox supervisor must be reaped before cgroup-only retry");
+        }
+        cleanup_cgroup_after_process_exit_with(name, list_pids, kill_pids, remove)?;
+        self.supervision.lock().cgroup_quiesced = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn termination_signal_attempts(&self) -> usize {
+        self.termination.signal_attempts.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn termination_signal_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.termination.signal_attempts)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reap_publications(&self) -> usize {
+        self.termination.reap_publications.load(Ordering::Acquire)
+    }
+
+    /// Drains complete JSONL frames already emitted by the child. Reading is
+    /// performed by a dedicated thread so registry polling never blocks.
+    pub(crate) fn drain_protocol_lines(&mut self) -> Result<ProtocolDrain> {
+        let receiver = self
+            .protocol_stdout
+            .as_ref()
+            .context("sandbox protocol stdout is unavailable")?;
+        let mut lines = Vec::new();
+        loop {
+            match receiver.try_recv() {
+                Ok(ProtocolFrame::Line(line)) => lines.push(line),
+                Ok(ProtocolFrame::Rejected) => {
+                    anyhow::bail!("sandbox protocol stdout emitted an invalid or oversized frame")
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+        Ok(ProtocolDrain {
+            lines,
+            queue_overflowed: self.protocol_queue_overflowed.load(Ordering::Acquire),
+        })
     }
 
     /// Prueft ob der Prozess noch laeuft.
     pub fn is_running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        if self.termination.reaped.load(Ordering::Acquire) {
+            return false;
+        }
+        if self
+            .termination
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Another exact-child observer or terminator owns the transition.
+            // Health is conservative while that owner publishes its result.
+            return false;
+        }
+        let observed = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_wait();
+        match observed {
+            Ok(None) => {
+                self.termination.started.store(false, Ordering::Release);
+                true
+            }
+            Ok(Some(_)) => {
+                // `try_wait` reaped the exact owned Child. Publish the permanent
+                // no-more-numeric-signal state before another cleanup owner can
+                // proceed, and close input so the reader/supervisor can finish.
+                self.protocol_stdin
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let mut supervision = self.supervision.lock();
+                if matches!(supervision.outcome, ProtocolOutcome::Running) {
+                    supervision.outcome = ProtocolOutcome::ProcessExitedPending {
+                        observed_at: std::time::Instant::now(),
+                    };
+                }
+                drop(supervision);
+                #[cfg(test)]
+                self.termination
+                    .reap_publications
+                    .fetch_add(1, Ordering::AcqRel);
+                self.termination.reaped.store(true, Ordering::Release);
+                false
+            }
+            Err(_) => {
+                self.termination.started.store(false, Ordering::Release);
+                false
+            }
+        }
     }
 
     /// Terminates and reaps the child process owned by this handle.
     pub fn terminate(&mut self) {
-        terminate_sandbox_process(&mut self.child, self.child_pid);
+        let _ = self.terminate_process_group();
+        self.join_protocol_reader();
     }
 
     /// Terminates and reaps the child, surfacing incomplete cleanup so the
     /// NanoRuntime can retain ownership and retry instead of forgetting a live
-    /// sandbox process.
+    /// sandbox process. The protocol reader is joined separately after cgroup
+    /// cleanup, because a descendant outside the process group may still hold
+    /// stdout while remaining inside the adapter-owned cgroup.
     pub fn terminate_checked(&mut self) -> Result<()> {
-        self.terminate();
-        match self
-            .child
-            .try_wait()
-            .context("query sandbox supervisor after termination")?
-        {
-            Some(_) => {}
-            None => bail!(
-                "sandbox supervisor {} remained alive after termination",
-                self.pid
-            ),
+        self.terminate_process_group()
+    }
+
+    pub(crate) fn terminate_process_group(&mut self) -> Result<()> {
+        self.protocol_stdout.take();
+        terminate_owned_process_once(
+            self.pid,
+            &self.child,
+            &self.protocol_stdin,
+            &self.termination,
+        )
+    }
+
+    pub(crate) fn join_protocol_reader(&mut self) {
+        self.supervision.lock().stop = true;
+        if let Some(reader) = self.protocol_reader.take() {
+            let _ = reader.join();
         }
-        if self.child_pid.is_some_and(pid_exists) {
-            bail!("sandboxed child remained alive after termination");
+        if let Some(supervisor) = self.protocol_supervisor.take() {
+            let _ = supervisor.join();
         }
-        Ok(())
     }
 }
 
 impl From<SpawnedSandbox> for AgentProcess {
     fn from(spawned: SpawnedSandbox) -> Self {
-        let pid = spawned.child.id();
-        Self {
-            pid,
-            child_pid: spawned.child_pid,
-            child: spawned.child,
-        }
+        Self::from_child(spawned.child, spawned.child_pid)
     }
 }
 
 impl Drop for AgentProcess {
     fn drop(&mut self) {
-        // Reap the child process to prevent zombies.
-        // try_wait() is non-blocking — if the child is still running,
-        // --die-with-parent will handle cleanup when the daemon exits.
-        match self.child.try_wait() {
-            Ok(Some(_status)) => {} // Already exited, reaped by try_wait
-            Ok(None) => {
-                // Still running — let --die-with-parent handle it.
-                // We intentionally do NOT kill the child here, because
-                // the daemon might be shutting down gracefully.
+        // The runtime's normal teardown joins the reader after cgroup cleanup.
+        // Drop still closes pipes and kills/reaps the owned process group, but
+        // does not risk blocking forever on a descendant that escaped that
+        // group while remaining in the production cgroup.
+        let _ = self.terminate_process_group();
+    }
+}
+
+fn write_protocol_line(protocol_stdin: &Arc<Mutex<Option<ChildStdin>>>, line: &str) -> Result<()> {
+    if line.len() > PROTOCOL_LINE_LIMIT_BYTES {
+        bail!("sandbox protocol input exceeded its configured bound");
+    }
+    if line
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        bail!("sandbox protocol input must contain exactly one JSONL record");
+    }
+    let mut protocol_stdin = protocol_stdin
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stdin = protocol_stdin
+        .as_mut()
+        .context("sandbox protocol stdin is unavailable")?;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(PROTOCOL_WRITE_TIMEOUT_MS);
+    write_nonblocking_until(stdin, line.as_bytes(), deadline)
+        .and_then(|_| write_nonblocking_until(stdin, b"\n", deadline))
+        .context("write sandbox protocol frame")
+}
+
+fn write_nonblocking_until(
+    output: &mut ChildStdin,
+    mut bytes: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        match output.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "sandbox protocol pipe accepted no data",
+                ));
             }
-            Err(_) => {} // Error checking status, nothing we can do
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "sandbox protocol pipe remained backpressured",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
         }
     }
+    Ok(())
+}
+
+fn terminate_owned_process_once(
+    pid: u32,
+    child: &Arc<Mutex<Child>>,
+    protocol_stdin: &Arc<Mutex<Option<ChildStdin>>>,
+    termination: &Arc<ProcessTermination>,
+) -> Result<()> {
+    let mut owns_transition = false;
+    for _ in 0..=40 {
+        if termination.reaped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if termination
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            owns_transition = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    if !owns_transition {
+        bail!("sandbox process termination remained in progress");
+    }
+
+    termination.signal_attempts.fetch_add(1, Ordering::AcqRel);
+    protocol_stdin
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let signal_group = (|| -> Result<()> {
+        let group = i32::try_from(pid).context("sandbox supervisor PID exceeds pid_t")?;
+        // The first owner signals the process group exactly once. Once the
+        // supervisor is reaped, retries must never address this numeric PID.
+        match nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(group),
+            nix::sys::signal::Signal::SIGKILL,
+        ) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Err(error) => Err(error).context("kill owned sandbox process group"),
+        }
+    })();
+    if let Err(error) = signal_group {
+        termination.started.store(false, Ordering::Release);
+        return Err(error);
+    }
+    let supervisor_reap = (|| -> Result<()> {
+        let mut child = child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if child
+            .try_wait()
+            .context("query sandbox supervisor")?
+            .is_none()
+        {
+            child
+                .kill()
+                .context("kill exact owned sandbox supervisor")?;
+            child
+                .wait()
+                .context("reap exact owned sandbox supervisor")?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = supervisor_reap {
+        termination.started.store(false, Ordering::Release);
+        return Err(error);
+    }
+
+    // Publish the permanent no-more-signal state before any later cleanup can
+    // fail. A retry may validate remaining descendants/cgroups, but it cannot
+    // signal a potentially reused supervisor process-group id.
+    #[cfg(test)]
+    termination.reap_publications.fetch_add(1, Ordering::AcqRel);
+    termination.reaped.store(true, Ordering::Release);
+    Ok(())
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn pid_exists(pid: u32) -> bool {
@@ -470,7 +1391,7 @@ impl SandboxEnforcer {
             command.to_vec()
         };
 
-        let process = AgentProcess::from(config.spawn(&wrapped_command)?);
+        let mut process = AgentProcess::from(config.spawn(&wrapped_command)?);
         let pid = process.pid;
         let child_pid = process.child_pid;
 
@@ -478,6 +1399,7 @@ impl SandboxEnforcer {
         // the cgroup; this is correct for cgroups, unlike netns which needs the
         // sandboxed child PID).
         if self.cgroup_available {
+            process.set_supervised_cgroup(name);
             if let Err(e) = cgroups::add_pid_to_cgroup(name, pid) {
                 warn!("Failed to add bwrap PID {pid} to cgroup {name}: {e}");
             }
@@ -576,6 +1498,255 @@ impl SandboxEnforcer {
     pub fn oom_score_set(&self) -> bool {
         self.oom_set.load(Ordering::Relaxed)
     }
+}
+
+fn protocol_reader_parts(
+    stdout: Option<std::process::ChildStdout>,
+    supervision: Arc<ProtocolSupervision>,
+) -> (
+    Option<Receiver<ProtocolFrame>>,
+    Arc<AtomicBool>,
+    Option<std::thread::JoinHandle<()>>,
+) {
+    let queue_overflowed = Arc::new(AtomicBool::new(false));
+    match stdout {
+        Some(stdout) => {
+            let (receiver, reader) =
+                protocol_line_receiver(stdout, Arc::clone(&queue_overflowed), supervision);
+            (Some(receiver), queue_overflowed, Some(reader))
+        }
+        None => (None, queue_overflowed, None),
+    }
+}
+
+fn protocol_line_receiver(
+    stdout: std::process::ChildStdout,
+    queue_overflowed: Arc<AtomicBool>,
+    supervision: Arc<ProtocolSupervision>,
+) -> (Receiver<ProtocolFrame>, std::thread::JoinHandle<()>) {
+    let (sender, receiver) = mpsc::sync_channel(PROTOCOL_QUEUE_DEPTH);
+    let reader = std::thread::spawn(move || {
+        let _closed = ProtocolReaderCloseGuard(Arc::clone(&supervision));
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut bytes = Vec::new();
+            let mut reached_eof = false;
+            loop {
+                let available = match reader.fill_buf() {
+                    Ok(available) => available,
+                    Err(_) => {
+                        record_protocol_failure(
+                            &supervision,
+                            ProtocolSupervisionFailure::ChannelDisconnected,
+                        );
+                        return;
+                    }
+                };
+                if available.is_empty() {
+                    reached_eof = true;
+                    break;
+                }
+                let newline = available.iter().position(|byte| *byte == b'\n');
+                let consumed = newline.map_or(available.len(), |index| index + 1);
+                let payload = if newline.is_some() {
+                    &available[..consumed - 1]
+                } else {
+                    &available[..consumed]
+                };
+                if bytes.len().saturating_add(payload.len()) > PROTOCOL_LINE_LIMIT_BYTES {
+                    record_protocol_failure(
+                        &supervision,
+                        ProtocolSupervisionFailure::OutputLimitExceeded,
+                    );
+                    let _ = sender.try_send(ProtocolFrame::Rejected);
+                    return;
+                }
+                bytes.extend_from_slice(payload);
+                reader.consume(consumed);
+                if newline.is_some() {
+                    break;
+                }
+            }
+            if reached_eof && bytes.is_empty() {
+                break;
+            }
+            if reached_eof {
+                // JSONL records are newline terminated. A syntactically valid
+                // JSON value at EOF is still an incomplete protocol record.
+                record_protocol_failure(&supervision, ProtocolSupervisionFailure::InvalidFrame);
+                let _ = sender.try_send(ProtocolFrame::Rejected);
+                return;
+            }
+            let line = match String::from_utf8(bytes) {
+                Ok(line) => line,
+                Err(_) => {
+                    record_protocol_failure(&supervision, ProtocolSupervisionFailure::InvalidFrame);
+                    let _ = sender.try_send(ProtocolFrame::Rejected);
+                    return;
+                }
+            };
+            let (next_reader_state, terminal) =
+                match validate_protocol_output_line(&supervision, &line) {
+                    Ok(validated) => validated,
+                    Err(failure) => {
+                        record_protocol_failure(&supervision, failure);
+                        let _ = sender.try_send(ProtocolFrame::Rejected);
+                        return;
+                    }
+                };
+            let mut state = supervision.lock();
+            let committed = commit_protocol_reader_state(
+                &mut state,
+                next_reader_state,
+                terminal,
+                std::time::Instant::now(),
+            );
+            if !committed {
+                return;
+            }
+            match sender.try_send(ProtocolFrame::Line(line)) {
+                Ok(()) => {
+                    drop(state);
+                    if terminal {
+                        #[cfg(test)]
+                        supervision.wait_at_post_terminal_barrier();
+                    }
+                }
+                Err(mpsc::TrySendError::Full(_)) => {
+                    queue_overflowed.store(true, Ordering::Release);
+                    state.outcome = ProtocolOutcome::FailurePending(
+                        ProtocolSupervisionFailure::OutputLimitExceeded,
+                    );
+                    return;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    state.outcome = ProtocolOutcome::FailurePending(
+                        ProtocolSupervisionFailure::ChannelDisconnected,
+                    );
+                    return;
+                }
+            }
+        }
+    });
+    (receiver, reader)
+}
+
+fn validate_protocol_output_line(
+    supervision: &ProtocolSupervision,
+    line: &str,
+) -> std::result::Result<(ProtocolReaderState, bool), ProtocolSupervisionFailure> {
+    let state = supervision.lock();
+    if !state.execute_sent {
+        // Before the initial execute write is fully published, any child output
+        // is an invalid pre-execute record. Do not parse or retain it.
+        return Err(ProtocolSupervisionFailure::InvalidFrame);
+    }
+    let mut next = state.reader.clone();
+    if next.terminal {
+        return Err(ProtocolSupervisionFailure::ProtocolViolation);
+    }
+    next.retained_bytes = next.retained_bytes.saturating_add(line.len());
+    if next.retained_bytes > PROTOCOL_OUTPUT_LIMIT_BYTES {
+        return Err(ProtocolSupervisionFailure::OutputLimitExceeded);
+    }
+    let message: serde_json::Value =
+        serde_json::from_str(line).map_err(|_| ProtocolSupervisionFailure::InvalidFrame)?;
+    if message
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err(ProtocolSupervisionFailure::UnsupportedVersion);
+    }
+    let expected_invocation = next
+        .invocation_id
+        .as_deref()
+        .ok_or(ProtocolSupervisionFailure::ProtocolViolation)?;
+    if message
+        .get("invocation_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_invocation)
+    {
+        return Err(ProtocolSupervisionFailure::InvocationConflict);
+    }
+
+    let terminal = match message.get("kind").and_then(serde_json::Value::as_str) {
+        Some("result") if !next.result_seen => {
+            next.result_seen = true;
+            false
+        }
+        Some("progress")
+            if message.get("stage").and_then(serde_json::Value::as_str) == Some("completed") =>
+        {
+            if !next.result_seen {
+                return Err(ProtocolSupervisionFailure::ProtocolViolation);
+            }
+            next.terminal = true;
+            true
+        }
+        Some("progress") if !next.result_seen => false,
+        Some("error") if !next.result_seen => {
+            next.terminal = true;
+            true
+        }
+        Some("cancelled") if !next.result_seen && state.cancel.is_some() => {
+            next.terminal = true;
+            true
+        }
+        _ => return Err(ProtocolSupervisionFailure::ProtocolViolation),
+    };
+    Ok((next, terminal))
+}
+
+fn record_protocol_failure(supervision: &ProtocolSupervision, failure: ProtocolSupervisionFailure) {
+    let mut state = supervision.lock();
+    if matches!(
+        state.outcome,
+        ProtocolOutcome::Running
+            | ProtocolOutcome::ProcessExitedPending { .. }
+            | ProtocolOutcome::TerminalPending { .. }
+    ) {
+        state.outcome = ProtocolOutcome::FailurePending(failure);
+    }
+}
+
+fn commit_protocol_reader_state(
+    state: &mut ProtocolSupervisionState,
+    reader: ProtocolReaderState,
+    terminal: bool,
+    observed_at: std::time::Instant,
+) -> bool {
+    if !matches!(
+        state.outcome,
+        ProtocolOutcome::Running | ProtocolOutcome::ProcessExitedPending { .. }
+    ) {
+        return false;
+    }
+    state.reader = reader;
+    if terminal {
+        state.outcome = ProtocolOutcome::TerminalPending { observed_at };
+    }
+    true
+}
+
+fn expire_protocol_cancel_if_due(
+    state: &mut ProtocolSupervisionState,
+    now: std::time::Instant,
+) -> bool {
+    let Some(claim) = state.cancel else {
+        return false;
+    };
+    if !matches!(state.outcome, ProtocolOutcome::Running)
+        || now.saturating_duration_since(claim.claimed_at)
+            < std::time::Duration::from_millis(PROTOCOL_CANCEL_GRACE_MS)
+    {
+        return false;
+    }
+    state.outcome = ProtocolOutcome::FailurePending(match claim.owner {
+        ProtocolCancelOwner::Deadline => ProtocolSupervisionFailure::DeadlineExceeded,
+        ProtocolCancelOwner::Explicit => ProtocolSupervisionFailure::Cancelled,
+    });
+    true
 }
 
 /// Returns the expected path for the landlock-wrapper binary.
@@ -748,6 +1919,150 @@ mod tests {
         .unwrap();
 
         assert_eq!(calls.into_inner(), vec!["list", "remove"]);
+    }
+
+    #[test]
+    fn acknowledgement_at_grace_has_one_stable_winner_across_barriers() {
+        fn cancelling_state() -> ProtocolSupervisionState {
+            ProtocolSupervisionState {
+                reader: ProtocolReaderState {
+                    invocation_id: Some("invocation".to_string()),
+                    ..ProtocolReaderState::default()
+                },
+                cancel: Some(ProtocolCancelClaim {
+                    owner: ProtocolCancelOwner::Explicit,
+                    claimed_at: std::time::Instant::now()
+                        - std::time::Duration::from_millis(PROTOCOL_CANCEL_GRACE_MS),
+                    requested_at_unix_ms: 1,
+                    send_started: true,
+                    #[cfg(test)]
+                    sent: true,
+                }),
+                ..ProtocolSupervisionState::default()
+            }
+        }
+
+        let terminal_wins = Arc::new(ProtocolSupervision {
+            state: Mutex::new(cancelling_state()),
+            deadline_send_barrier: Mutex::new(None),
+            post_terminal_barrier: Mutex::new(None),
+            pre_quiescence_barrier: Mutex::new(None),
+        });
+        let terminal_start = Arc::new(std::sync::Barrier::new(2));
+        let terminal_committed = Arc::new(std::sync::Barrier::new(2));
+        let terminal_worker = {
+            let supervision = Arc::clone(&terminal_wins);
+            let start = Arc::clone(&terminal_start);
+            let committed = Arc::clone(&terminal_committed);
+            std::thread::spawn(move || {
+                start.wait();
+                let mut reader = supervision.lock().reader.clone();
+                reader.terminal = true;
+                assert!(commit_protocol_reader_state(
+                    &mut supervision.lock(),
+                    reader,
+                    true,
+                    std::time::Instant::now(),
+                ));
+                committed.wait();
+            })
+        };
+        terminal_start.wait();
+        terminal_committed.wait();
+        assert!(!expire_protocol_cancel_if_due(
+            &mut terminal_wins.lock(),
+            std::time::Instant::now(),
+        ));
+        terminal_worker.join().unwrap();
+        assert!(matches!(
+            terminal_wins.lock().outcome,
+            ProtocolOutcome::TerminalPending { .. }
+        ));
+
+        let timeout_wins = Arc::new(ProtocolSupervision {
+            state: Mutex::new(cancelling_state()),
+            deadline_send_barrier: Mutex::new(None),
+            post_terminal_barrier: Mutex::new(None),
+            pre_quiescence_barrier: Mutex::new(None),
+        });
+        let timeout_start = Arc::new(std::sync::Barrier::new(2));
+        let timeout_committed = Arc::new(std::sync::Barrier::new(2));
+        let timeout_worker = {
+            let supervision = Arc::clone(&timeout_wins);
+            let start = Arc::clone(&timeout_start);
+            let committed = Arc::clone(&timeout_committed);
+            std::thread::spawn(move || {
+                start.wait();
+                assert!(expire_protocol_cancel_if_due(
+                    &mut supervision.lock(),
+                    std::time::Instant::now(),
+                ));
+                committed.wait();
+            })
+        };
+        timeout_start.wait();
+        timeout_committed.wait();
+        let mut reader = timeout_wins.lock().reader.clone();
+        reader.terminal = true;
+        assert!(!commit_protocol_reader_state(
+            &mut timeout_wins.lock(),
+            reader,
+            true,
+            std::time::Instant::now(),
+        ));
+        timeout_worker.join().unwrap();
+        assert!(matches!(
+            timeout_wins.lock().outcome,
+            ProtocolOutcome::FailurePending(ProtocolSupervisionFailure::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn post_reap_cgroup_kill_and_remove_retries_never_resignal_numeric_pid() {
+        for fail_kill in [true, false] {
+            let mut process = AgentProcess::launch_fixture().unwrap();
+            process.terminate_checked().unwrap();
+            let signal_attempts = process.termination_signal_counter();
+            assert_eq!(signal_attempts.load(Ordering::Acquire), 1);
+
+            let attempts = std::cell::Cell::new(0usize);
+            let first = process.retry_supervised_cgroup_cleanup_with(
+                "retry-cgroup",
+                |_| Ok(if fail_kill { vec![4242] } else { Vec::new() }),
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    if fail_kill && attempts.get() == 1 {
+                        bail!("injected first cgroup kill failure");
+                    }
+                    Ok(1)
+                },
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    if !fail_kill && attempts.get() == 1 {
+                        bail!("injected first cgroup remove failure");
+                    }
+                    Ok(())
+                },
+            );
+            assert!(first.is_err());
+            assert!(!process.protocol_supervision_snapshot().cgroup_quiesced);
+            assert_eq!(signal_attempts.load(Ordering::Acquire), 1);
+
+            process
+                .retry_supervised_cgroup_cleanup_with(
+                    "retry-cgroup",
+                    |_| Ok(if fail_kill { vec![4242] } else { Vec::new() }),
+                    |_| Ok(1),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert!(process.protocol_supervision_snapshot().cgroup_quiesced);
+            assert_eq!(
+                signal_attempts.load(Ordering::Acquire),
+                1,
+                "cgroup-only retry must not signal a reused numeric process target"
+            );
+        }
     }
 
     #[test]
