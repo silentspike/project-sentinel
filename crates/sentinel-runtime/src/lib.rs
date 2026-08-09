@@ -360,8 +360,20 @@ impl RuntimeOrchestrator {
         new_shift_set: u8,
         protected: &std::collections::HashSet<AgentId>,
     ) -> Vec<AgentId> {
-        let to_remove: Vec<AgentId> = self
-            .agents
+        let to_remove = self.shift_removal_candidates(new_shift_set, protected);
+        self.commit_shift_transition(new_shift_set, &to_remove);
+        to_remove
+    }
+
+    /// Computes a shift transition without mutating logical runtime state. The
+    /// daemon uses this before adapter teardown so a failed NanoRuntime stop
+    /// cannot leave an untracked live workload behind.
+    pub fn shift_removal_candidates(
+        &self,
+        new_shift_set: u8,
+        protected: &std::collections::HashSet<AgentId>,
+    ) -> Vec<AgentId> {
+        self.agents
             .iter()
             .filter(|(_, handle)| {
                 // Behalte: Sonder-Schicht (0) ODER neue Schicht
@@ -369,27 +381,45 @@ impl RuntimeOrchestrator {
             })
             .filter(|(id, _)| !protected.contains(id))
             .map(|(id, _)| *id)
-            .collect();
+            .collect()
+    }
 
-        for agent_id in &to_remove {
+    /// Commits only adapter-confirmed shift removals and emits the existing
+    /// lifecycle event for exactly that set.
+    pub fn commit_shift_transition(&mut self, new_shift_set: u8, to_remove: &[AgentId]) {
+        self.commit_shift_logical_removals(to_remove);
+        self.publish_shift_transition_completion(new_shift_set, to_remove);
+    }
+
+    /// Removes only adapter-confirmed agents from logical runtime state.
+    ///
+    /// This deliberately emits no shift-completion event or integration callback.
+    /// The daemon uses the split phase while replacement runtime and ECS layers are
+    /// still being established.
+    pub fn commit_shift_logical_removals(&mut self, to_remove: &[AgentId]) {
+        for agent_id in to_remove {
             self.agents.remove(agent_id);
             tracing::info!(
                 agent_id = %agent_id,
                 "Agent removed during shift transition"
             );
         }
+    }
 
+    /// Publishes the existing transition-completion event and integration callback
+    /// after the owner has verified the complete replacement roster.
+    pub fn publish_shift_transition_completion(&mut self, new_shift_set: u8, removed: &[AgentId]) {
         tracing::info!(
             new_shift_set,
-            removed_count = to_remove.len(),
+            removed_count = removed.len(),
             "Shift transition completed"
         );
 
         // Emit lifecycle event (AC-2)
         let payload = DomainEventPayload::ShiftTransitionCompleted {
             new_shift_set,
-            removed_count: to_remove.len() as u32,
-            removed_agents: to_remove.clone(),
+            removed_count: removed.len() as u32,
+            removed_agents: removed.to_vec(),
         };
         self.emit_event(
             payload.event_type_str(),
@@ -400,10 +430,8 @@ impl RuntimeOrchestrator {
 
         // Notify integration sink
         if let Some(sink) = &self.event_sink {
-            sink.on_shift_transition(new_shift_set, &to_remove);
+            sink.on_shift_transition(new_shift_set, removed);
         }
-
-        to_remove
     }
 
     /// Gibt alle Agenten zurueck die Errored oder Suspended sind.
@@ -895,6 +923,74 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "shift_transition_completed");
         assert_eq!(events[0].tick, 100);
+    }
+
+    #[test]
+    fn split_shift_commit_does_not_publish_completion_before_explicit_finish() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct ShiftSink {
+            transitions: Mutex<Vec<(u8, Vec<AgentId>)>>,
+        }
+
+        impl RuntimeEventSink for ShiftSink {
+            fn on_agent_spawned(
+                &self,
+                _agent_id: AgentId,
+                _identity: &AgentIdentity,
+                _shift: &ShiftInfo,
+            ) {
+            }
+
+            fn on_agent_despawned(&self, _agent_id: AgentId) {}
+
+            fn on_agent_status_changed(
+                &self,
+                _agent_id: AgentId,
+                _old: AgentStatus,
+                _new: AgentStatus,
+            ) {
+            }
+
+            fn on_shift_transition(&self, new_shift_set: u8, removed: &[AgentId]) {
+                self.transitions
+                    .lock()
+                    .unwrap()
+                    .push((new_shift_set, removed.to_vec()));
+            }
+        }
+
+        let (_dir, store) = temp_event_store();
+        let sink = Arc::new(ShiftSink::default());
+        let mut orchestrator = RuntimeOrchestrator::new(10)
+            .with_event_store(store.clone())
+            .with_event_sink(sink.clone());
+        orchestrator.set_tick(100);
+        orchestrator
+            .spawn_agent(
+                create_identity(1, "Thomas", "CEO"),
+                create_shift(1, 6, 14),
+                "empfang",
+            )
+            .unwrap();
+
+        let removed = vec![AgentId(1)];
+        orchestrator.commit_shift_logical_removals(&removed);
+
+        assert_eq!(orchestrator.agent_count(), 0);
+        assert!(store
+            .get_events_by_aggregate("runtime", 10)
+            .unwrap()
+            .is_empty());
+        assert!(sink.transitions.lock().unwrap().is_empty());
+
+        orchestrator.publish_shift_transition_completion(2, &removed);
+
+        let events = store.get_events_by_aggregate("runtime", 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "shift_transition_completed");
+        assert_eq!(sink.transitions.lock().unwrap().as_slice(), &[(2, removed)]);
     }
 
     #[test]

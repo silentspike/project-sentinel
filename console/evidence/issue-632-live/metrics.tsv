@@ -1,0 +1,5 @@
+metric	before	after	delta	unit
+lockfile_packages	717	713	-4	packages
+duplicate_names	41	39	-2	names
+duplicate_version_rows	94	89	-5	version_rows
+release_root_artifact_bytes	99555680	99541736	-13944	bytes

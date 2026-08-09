@@ -20,7 +20,7 @@ sentinel-limbo = { path = "../../crates/sentinel-limbo" }
 anyhow = { workspace = true }
 async-nats = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-futures = "0.3"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 fs2 = "0.4"
 libc = "0.2"
 serde = { workspace = true }

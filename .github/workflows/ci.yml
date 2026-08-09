@@ -31,6 +31,7 @@ jobs:
       console: ${{ steps.filter.outputs.console }}
       schemas: ${{ steps.filter.outputs.schemas }}
       config: ${{ steps.filter.outputs.config }}
+      bans: ${{ steps.filter.outputs.bans }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
@@ -41,8 +42,13 @@ jobs:
               - 'crates/**'
               - 'services/**'
               - 'Cargo.toml'
+              - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
+              - '.c[a]rgo/config'
+              - '.c[a]rgo/config.toml'
+              - '**/.c[a]rgo/config'
+              - '**/.c[a]rgo/config.toml'
             go:
               - 'cmd/**'
               - 'services/sentinel-judge/**'
@@ -56,6 +62,16 @@ jobs:
               - 'schemas/**'
             config:
               - 'config/**'
+            bans:
+              - 'Cargo.toml'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - '**/Cargo.lock'
+              - 'deny.toml'
+              - '.c[a]rgo/config'
+              - '.c[a]rgo/config.toml'
+              - '**/.c[a]rgo/config'
+              - '**/.c[a]rgo/config.toml'
 
   # ──────────────────────────────────────────────
   # Always runs - fast checks (<30s)
@@ -81,6 +97,11 @@ jobs:
       - name: Fenced-writer enforcement (#496)
         run: python3 scripts/check-fenced-writers.py
 
+      - name: Dependency patch registry enforcement (#634)
+        run: |
+          python3 scripts/check-patch-registry.py
+          python3 -m unittest discover -s scripts/tests -p 'test_check_patch_registry.py'
+
       - name: Projection provisioning contract (#644)
         run: bash scripts/check-projection-provisioning.sh
 
@@ -100,6 +121,20 @@ jobs:
 
       - name: Typo detection
         uses: crate-ci/typos@631208b7aac2daa8b707f55e7331f9112b0e062d # v1.44.0
+
+  # ----------------------------------------------
+  # Required through ci-pass when Cargo policy inputs change
+  # ----------------------------------------------
+  bans:
+    needs: changes
+    if: needs.changes.outputs.bans == 'true'
+    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Enforce duplicate-version bans
+        uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979 # v2.0.15
+        with:
+          command: check bans
 
   # ──────────────────────────────────────────────
   # Rust static analysis - fmt + clippy + machete
@@ -371,13 +406,14 @@ jobs:
   # ──────────────────────────────────────────────
   ci-pass:
     if: always()
-    needs: [lint, rust-static, rust-doc, rust-test, rust-ebpf, go, console, schemas]
+    needs: [lint, bans, rust-static, rust-doc, rust-test, rust-ebpf, go, console, schemas]
     runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - name: Evaluate results
         run: |
           results=(
             "${{ needs.lint.result }}"
+            "${{ needs.bans.result }}"
             "${{ needs.rust-static.result }}"
             "${{ needs.rust-doc.result }}"
             "${{ needs.rust-test.result }}"

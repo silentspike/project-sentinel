@@ -7,7 +7,7 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::sandbox::SandboxConfig;
 
@@ -21,6 +21,10 @@ pub enum ToolType {
     Search,
     /// WASM-Modul, geladen aus `ToolDefinition::wasm_path`.
     Wasm,
+}
+
+fn tool_exceeds_wall_clock_limit(_: ToolType, duration: Duration, limit: Duration) -> bool {
+    duration > limit
 }
 
 /// Definition eines einzelnen Tools.
@@ -110,6 +114,11 @@ impl ToolRuntime {
         Ok(())
     }
 
+    /// Removes a tool definition after its last owning workload stops.
+    pub fn unregister_tool(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
     /// Gibt alle registrierten Tools zurueck.
     pub fn list_tools(&self) -> Vec<&ToolDefinition> {
         self.tools.values().collect()
@@ -168,9 +177,10 @@ impl ToolRuntime {
 
         let duration = start.elapsed();
 
-        // Post-hoc timeout check fuer native Tools.
-        // WASM-Module werden via fuel-Mechanismus begrenzt.
-        if duration > ctx.sandbox.max_execution_time {
+        // Fuel bounds executed WASM instructions, but synchronous WASI/host
+        // calls may block without consuming fuel. Keep the wall-clock fence
+        // mode-independent so every tool result is rejected after its deadline.
+        if tool_exceeds_wall_clock_limit(tool.tool_type, duration, ctx.sandbox.max_execution_time) {
             return Err(anyhow!(
                 "Tool '{}' exceeded timeout ({:?} > {:?})",
                 name,
@@ -649,6 +659,24 @@ mod tests {
         // Payload enthaelt den serialisierten ToolResult
         assert!(event.payload.contains("file_read"));
         assert!(event.payload.contains("AGENT-01"));
+    }
+
+    #[test]
+    fn native_duration_above_wall_limit_is_rejected() {
+        assert!(tool_exceeds_wall_clock_limit(
+            ToolType::FileRead,
+            Duration::from_millis(501),
+            Duration::from_millis(500),
+        ));
+    }
+
+    #[test]
+    fn wasm_duration_above_wall_limit_is_rejected() {
+        assert!(tool_exceeds_wall_clock_limit(
+            ToolType::Wasm,
+            Duration::from_secs(2),
+            Duration::from_millis(500),
+        ));
     }
 
     // ---- Chat Tool Tests ----

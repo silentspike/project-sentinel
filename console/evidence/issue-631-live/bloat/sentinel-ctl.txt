@@ -1,0 +1,23 @@
+File  .text     Size Crate
+4.0%  16.8% 459.9KiB rustls
+3.7%  15.5% 422.7KiB reqwest
+3.6%  15.2% 415.6KiB std
+2.9%  12.1% 331.4KiB clap_builder
+2.5%  10.6% 290.1KiB ring
+0.8%   3.3%  91.5KiB hyper
+0.7%   3.0%  83.2KiB webpki
+0.7%   2.8%  77.0KiB tokio
+0.7%   2.7%  74.8KiB hyper_util
+0.6%   2.6%  70.6KiB [Unknown]
+0.6%   2.4%  65.4KiB sentinel_ctl
+0.4%   1.8%  48.2KiB url
+0.4%   1.6%  45.1KiB serde_json
+0.3%   1.4%  39.5KiB idna
+0.3%   1.1%  31.1KiB http
+0.1%   0.5%  14.9KiB proc_macro2
+0.1%   0.5%  14.1KiB bytes
+0.1%   0.5%  12.3KiB rustls_pki_types
+0.1%   0.4%  10.7KiB cc
+0.1%   0.4%  10.5KiB iri_string
+0.7%   2.9%  79.0KiB And 39 more crates. Use -n N to show more.
+23.9% 100.0%   2.7MiB .text section size, the file size is 11.2MiB

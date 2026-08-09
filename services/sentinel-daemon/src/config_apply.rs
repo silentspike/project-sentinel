@@ -93,6 +93,9 @@ pub fn validate_config_apply(
                 agent.identity.id
             ));
         }
+        if let Err(e) = agent.runtime.validate() {
+            errors.push(format!("agent {} runtime invalid: {e}", agent.identity.id));
+        }
         if let Err(e) = AgentId::new_with_bounds(agent.identity.id, validation.agent_id_bounds) {
             errors.push(format!("agent {} id out of bounds: {e}", agent.identity.id));
         }

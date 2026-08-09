@@ -9,18 +9,22 @@ publish = false
 anyhow = { workspace = true }
 landlock = "0.4"
 libc = "0.2"
+nix = { version = "0.30", features = ["fs", "process", "signal"] }
 sentinel-common = { path = "../sentinel-common" }
 sentinel-fs = { path = "../sentinel-fs" }
 sentinel-zenoh = { path = "../sentinel-zenoh" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 sentinel-common = { path = "../sentinel-common", features = ["test-util"] }
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 
 [[bin]]
 name = "breakout-helper"
