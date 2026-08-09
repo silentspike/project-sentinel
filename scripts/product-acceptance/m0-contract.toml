@@ -340,7 +340,7 @@ live_probe = "episode-projection-restart-and-replay"
 evidence = "console/evidence/issue-735-live/durable-episode-projection.md"
 status = "blocked"
 blocked_by = [735]
-blocker = "Issue #735 source delivery is not final; the required integrated live evidence is pending."
+blocker = "Issue #735 source is merged; integrated live acceptance is pending."
 
 [[requirements]]
 id = "M0-CONSOLE-001"
