@@ -12992,7 +12992,7 @@ mod tests {
         let agent_id = AgentId(42);
         let handle = NanoHandle::new(
             RUNTIME_BWRAP_LANDLOCK,
-            "AGENT-42",
+            "AGENT-42".to_string(),
             Some(agent_id),
             Some(1234),
         );
