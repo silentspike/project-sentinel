@@ -686,9 +686,7 @@ fn valid_wire_id(value: &str) -> bool {
 }
 
 fn valid_versioned_ref(value: &VersionedRefV1) -> bool {
-    valid_wire_id(&value.id)
-        && value.generation > 0
-        && value.digest != ContentDigest::zero()
+    valid_wire_id(&value.id) && value.generation > 0 && value.digest != ContentDigest::zero()
 }
 
 fn valid_principal(value: &PrincipalV1) -> bool {

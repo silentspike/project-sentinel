@@ -203,6 +203,167 @@ fn fixture_manifest(id: &str, generation: u64) -> ReleaseManifestV1 {
     .unwrap()
 }
 
+fn insert_complete_release_fixture(
+    aggregate: &mut DeliveryAggregateV1,
+    mut candidate: ReleaseCandidateV1,
+    manifest_id: &str,
+    release_id: &str,
+    release_generation: u64,
+    release_state: ReleaseState,
+    activated_at_ms: Option<u64>,
+    rollout_receipt_id: &str,
+) -> (ReleaseCandidateV1, ReleaseManifestV1, ReleaseV1) {
+    candidate.state = CandidateState::GatePassed;
+    let candidate_ref = VersionedRefV1 {
+        id: candidate.candidate_id.clone(),
+        generation: candidate.generation,
+        digest: candidate.candidate_digest.clone(),
+    };
+
+    let mut qa_plan = plan(&candidate);
+    qa_plan.plan_id = format!("plan-{release_id}");
+    qa_plan.generation = release_generation;
+    qa_plan.plan_digest = ContentDigest::zero();
+    qa_plan = qa_plan.seal().unwrap();
+    let plan_ref = VersionedRefV1 {
+        id: qa_plan.plan_id.clone(),
+        generation: qa_plan.generation,
+        digest: qa_plan.plan_digest.clone(),
+    };
+
+    let gate_id = format!("gate-{release_id}");
+    let mut manifest = ReleaseManifestV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        manifest_id: manifest_id.to_string(),
+        generation: release_generation,
+        tenant_id: candidate.tenant_id.clone(),
+        agreement: candidate.agreement.clone(),
+        project: candidate.project.clone(),
+        candidate: candidate_ref.clone(),
+        work_items_digest: candidate.work_items_digest.clone(),
+        source_digest: candidate.source_digest.clone(),
+        artifacts: candidate.artifacts.clone(),
+        toolchain_digest: candidate.toolchain_digest.clone(),
+        runtime_profile_digest: candidate.runtime_profile_digest.clone(),
+        qa_gate: VersionedRefV1 {
+            id: gate_id.clone(),
+            generation: release_generation,
+            digest: ContentDigest::zero(),
+        },
+        qa_evidence_digest: digest(&format!("qa-evidence-{release_id}")),
+        sbom_digest: digest(&format!("sbom-{release_id}")),
+        dependency_snapshot_digest: digest(&format!("dependencies-{release_id}")),
+        provenance_digest: digest(&format!("provenance-{release_id}")),
+        release_actor: principal("release-manager", AuthorityRole::ReleaseManager),
+        cost: candidate.cost.clone(),
+        rollback_release: None,
+        manifest_digest: ContentDigest::zero(),
+        created_at_ms: 100,
+    };
+    let gate = QaReleaseGateReceiptV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        gate_id,
+        generation: release_generation,
+        candidate: candidate_ref,
+        plan: plan_ref,
+        case_inventory_digest: digest(&format!("cases-{release_id}")),
+        deterministic_evidence_digest: digest(&format!("deterministic-{release_id}")),
+        model_evidence_digest: None,
+        calibration_digest: None,
+        source_evidence_digest: digest(&format!("sources-{release_id}")),
+        flake_disposition_digest: None,
+        policy_digest: qa_plan.release_policy_digest.clone(),
+        release_manifest_digest: manifest.gate_input_digest().unwrap(),
+        actor: principal("qa-1", AuthorityRole::Qa),
+        passed: true,
+        issued_at_ms: 100,
+        expires_at_ms: 1_000,
+    };
+    let gate_digest =
+        ContentDigest::of_domain("qa-release-gate", DELIVERY_SCHEMA_V1, &gate).unwrap();
+    manifest.qa_gate.digest = gate_digest.clone();
+    manifest = manifest.seal().unwrap();
+
+    let mut qa_run = run(&qa_plan, principal("qa-1", AuthorityRole::Qa));
+    qa_run.run_id = format!("run-{release_id}");
+    qa_run.generation = release_generation;
+    qa_run.request_digest = digest(&format!("run-request-{release_id}"));
+    qa_run.state = QaRunState::CompletedPass;
+    qa_run.gate_receipt = Some(VersionedRefV1 {
+        id: gate.gate_id.clone(),
+        generation: gate.generation,
+        digest: gate_digest,
+    });
+
+    let release = ReleaseV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        release_id: release_id.to_string(),
+        generation: release_generation,
+        manifest: VersionedRefV1 {
+            id: manifest.manifest_id.clone(),
+            generation: manifest.generation,
+            digest: manifest.manifest_digest.clone(),
+        },
+        state: release_state,
+        activated_at_ms,
+        rollout_receipt: Some(reference(rollout_receipt_id, 1)),
+    };
+
+    aggregate
+        .candidates
+        .insert(candidate.candidate_id.clone(), candidate.clone());
+    aggregate
+        .qa_plans
+        .insert(qa_plan.plan_id.clone(), qa_plan);
+    aggregate.qa_runs.insert(qa_run.run_id.clone(), qa_run);
+    aggregate.gates.insert(gate.gate_id.clone(), gate);
+    aggregate
+        .manifests
+        .insert(manifest.manifest_id.clone(), manifest.clone());
+    aggregate
+        .releases
+        .insert(release.release_id.clone(), release.clone());
+
+    (candidate, manifest, release)
+}
+
+fn insert_accepted_delivery_fixture(
+    aggregate: &mut DeliveryAggregateV1,
+    release: &ReleaseV1,
+    delivery_id: &str,
+    acceptance_id: &str,
+) -> AcceptanceV1 {
+    let mut delivery = preview_receipt(delivery_id, release, 100, 1_000);
+    delivery.state = DeliveryState::Delivered;
+    delivery = delivery.seal().unwrap();
+    delivery.state = DeliveryState::Accepted;
+    let delivery_ref = VersionedRefV1 {
+        id: delivery.delivery_id.clone(),
+        generation: delivery.generation,
+        digest: delivery.receipt_digest.clone(),
+    };
+    aggregate
+        .deliveries
+        .insert(delivery.delivery_id.clone(), delivery);
+
+    let acceptance = AcceptanceV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        acceptance_id: acceptance_id.to_string(),
+        generation: 1,
+        delivery: delivery_ref,
+        release: versioned_release(release),
+        customer: principal("customer-1", AuthorityRole::Customer),
+        acceptance_digest: ContentDigest::zero(),
+        accepted_at_ms: 200,
+    }
+    .seal()
+    .unwrap();
+    aggregate
+        .acceptances
+        .insert(acceptance.acceptance_id.clone(), acceptance.clone());
+    acceptance
+}
+
 fn run(plan: &QaEvaluationPlanV1, qa: PrincipalV1) -> QaEvaluationRunReceiptV1 {
     QaEvaluationRunReceiptV1 {
         schema_version: DELIVERY_SCHEMA_V1,
@@ -906,6 +1067,10 @@ struct ConflictOnceStore {
 }
 
 impl DeliveryAggregateStorePort for ConflictOnceStore {
+    fn health(&self) -> Result<(), DeliveryError> {
+        self.inner.health()
+    }
+
     fn load(
         &self,
         tenant_id: &str,
@@ -1118,19 +1283,17 @@ fn seeded_store(temp: &TempDir, mut aggregate: DeliveryAggregateV1) -> DeliveryS
 }
 
 fn active_release_aggregate() -> (DeliveryAggregateV1, ReleaseV1) {
-    let release = ReleaseV1 {
-        schema_version: DELIVERY_SCHEMA_V1,
-        release_id: "release-preview".to_string(),
-        generation: 1,
-        manifest: reference("manifest-preview", 1),
-        state: ReleaseState::Active,
-        activated_at_ms: Some(100),
-        rollout_receipt: Some(reference("rollout-preview", 1)),
-    };
     let mut aggregate = DeliveryAggregateV1::new("tenant-a", "project-1");
-    aggregate
-        .releases
-        .insert(release.release_id.clone(), release.clone());
+    let (_, _, release) = insert_complete_release_fixture(
+        &mut aggregate,
+        candidate(5, &["developer"]),
+        "manifest-preview",
+        "release-preview",
+        1,
+        ReleaseState::Active,
+        Some(100),
+        "rollout-preview",
+    );
     aggregate.active_release_id = Some(release.release_id.clone());
     (aggregate, release)
 }
@@ -1282,10 +1445,6 @@ fn delivery_preview_ttl_is_server_timed_versioned_and_hard_bounded() {
 fn customer_action_rejects_local_conflicts_before_any_external_effect() {
     let temp = TempDir::new().unwrap();
     let (mut aggregate, release) = active_release_aggregate();
-    let manifest = fixture_manifest("manifest-preview", 1);
-    aggregate
-        .manifests
-        .insert(manifest.manifest_id.clone(), manifest);
     let mut delivery = preview_receipt("delivery-local-validation", &release, 100, 1_000);
     delivery.state = DeliveryState::Delivered;
     delivery = delivery.seal().unwrap();
@@ -1788,7 +1947,12 @@ fn qa_assignment_rechecks_current_candidate_participants_before_mutation() {
     let core = DeliveryCore::new_test_only(store(&temp), integration, FakeEffects);
     let candidate = candidate(5, &["developer"]);
     core.register_candidate(
-        &context("developer", AuthorityRole::Developer, "register-before-drift", 100),
+        &context(
+            "developer",
+            AuthorityRole::Developer,
+            "register-before-drift",
+            100,
+        ),
         candidate.clone(),
     )
     .unwrap();
@@ -1811,7 +1975,10 @@ fn qa_assignment_rechecks_current_candidate_participants_before_mutation() {
     );
     assert!(matches!(result, Err(DeliveryError::StaleEvidence(_))));
     let aggregate = core.load("tenant-a", "project-1").unwrap().unwrap();
-    assert_eq!(aggregate.candidates[&candidate.candidate_id].state, CandidateState::Draft);
+    assert_eq!(
+        aggregate.candidates[&candidate.candidate_id].state,
+        CandidateState::Draft
+    );
     assert!(aggregate.qa_plans.is_empty());
     assert!(aggregate.qa_runs.is_empty());
 }
@@ -3100,89 +3267,18 @@ fn exact_gate_manifest_delivery_and_explicit_customer_acceptance_form_one_lineag
 #[test]
 fn manifest_and_release_ids_are_immutable_before_rollout_effect() {
     let temp = TempDir::new().unwrap();
-    let mut candidate = candidate(5, &["developer"]);
-    candidate.state = CandidateState::GatePassed;
-    let candidate_ref = VersionedRefV1 {
-        id: candidate.candidate_id.clone(),
-        generation: candidate.generation,
-        digest: candidate.candidate_digest.clone(),
-    };
-    let qa = principal("qa-1", AuthorityRole::Qa);
-    let release_manager = principal("release-manager", AuthorityRole::ReleaseManager);
-    let mut manifest = ReleaseManifestV1 {
-        schema_version: DELIVERY_SCHEMA_V1,
-        manifest_id: "manifest-immutable".to_string(),
-        generation: 1,
-        tenant_id: "tenant-a".to_string(),
-        agreement: candidate.agreement.clone(),
-        project: candidate.project.clone(),
-        candidate: candidate_ref.clone(),
-        work_items_digest: candidate.work_items_digest.clone(),
-        source_digest: candidate.source_digest.clone(),
-        artifacts: candidate.artifacts.clone(),
-        toolchain_digest: candidate.toolchain_digest.clone(),
-        runtime_profile_digest: candidate.runtime_profile_digest.clone(),
-        qa_gate: VersionedRefV1 {
-            id: "gate-immutable".to_string(),
-            generation: 1,
-            digest: ContentDigest::zero(),
-        },
-        qa_evidence_digest: digest("qa-evidence"),
-        sbom_digest: digest("sbom"),
-        dependency_snapshot_digest: digest("dependencies"),
-        provenance_digest: digest("provenance"),
-        release_actor: release_manager.clone(),
-        cost: candidate.cost.clone(),
-        rollback_release: None,
-        manifest_digest: ContentDigest::zero(),
-        created_at_ms: 100,
-    };
-    let gate = QaReleaseGateReceiptV1 {
-        schema_version: DELIVERY_SCHEMA_V1,
-        gate_id: "gate-immutable".to_string(),
-        generation: 1,
-        candidate: candidate_ref,
-        plan: reference("plan-immutable", 1),
-        case_inventory_digest: digest("cases"),
-        deterministic_evidence_digest: digest("deterministic"),
-        model_evidence_digest: None,
-        calibration_digest: None,
-        source_evidence_digest: digest("sources"),
-        flake_disposition_digest: None,
-        policy_digest: digest("policy"),
-        release_manifest_digest: manifest.gate_input_digest().unwrap(),
-        actor: qa,
-        passed: true,
-        issued_at_ms: 100,
-        expires_at_ms: 1_000,
-    };
-    manifest.qa_gate.digest =
-        ContentDigest::of_domain("qa-release-gate", DELIVERY_SCHEMA_V1, &gate).unwrap();
-    manifest = manifest.seal().unwrap();
-    let release = ReleaseV1 {
-        schema_version: DELIVERY_SCHEMA_V1,
-        release_id: "release-immutable".to_string(),
-        generation: 1,
-        manifest: VersionedRefV1 {
-            id: manifest.manifest_id.clone(),
-            generation: manifest.generation,
-            digest: manifest.manifest_digest.clone(),
-        },
-        state: ReleaseState::Approved,
-        activated_at_ms: None,
-        rollout_receipt: None,
-    };
     let mut aggregate = DeliveryAggregateV1::new("tenant-a", "project-1");
-    aggregate
-        .candidates
-        .insert(candidate.candidate_id.clone(), candidate.clone());
-    aggregate.gates.insert(gate.gate_id.clone(), gate);
-    aggregate
-        .manifests
-        .insert(manifest.manifest_id.clone(), manifest.clone());
-    aggregate
-        .releases
-        .insert(release.release_id.clone(), release.clone());
+    let (candidate, manifest, mut release) = insert_complete_release_fixture(
+        &mut aggregate,
+        candidate(5, &["developer"]),
+        "manifest-immutable",
+        "release-immutable",
+        1,
+        ReleaseState::Approved,
+        None,
+        "rollout-immutable",
+    );
+    release.rollout_receipt = None;
     let core = core_with_seeded_aggregate(&temp, aggregate);
     assert!(matches!(
         core.promote(
@@ -3213,37 +3309,25 @@ fn manifest_and_release_ids_are_immutable_before_rollout_effect() {
 fn rollback_local_adoption_is_idempotent_after_successful_commit() {
     let temp = TempDir::new().unwrap();
     let mut aggregate = DeliveryAggregateV1::new("tenant-a", "project-1");
-    let previous = ReleaseV1 {
-        schema_version: DELIVERY_SCHEMA_V1,
-        release_id: "release-previous".to_string(),
-        generation: 3,
-        manifest: reference("manifest-previous", 3),
-        state: ReleaseState::Superseded,
-        activated_at_ms: Some(100),
-        rollout_receipt: Some(reference("rollout-previous", 1)),
-    };
-    let failed = ReleaseV1 {
-        schema_version: DELIVERY_SCHEMA_V1,
-        release_id: "release-failed".to_string(),
-        generation: 4,
-        manifest: reference("manifest-failed", 4),
-        state: ReleaseState::Active,
-        activated_at_ms: Some(200),
-        rollout_receipt: Some(reference("rollout-failed", 1)),
-    };
-    aggregate
-        .releases
-        .insert(previous.release_id.clone(), previous.clone());
-    aggregate
-        .releases
-        .insert(failed.release_id.clone(), failed.clone());
-    aggregate.manifests.insert(
-        "manifest-previous".to_string(),
-        fixture_manifest("manifest-previous", 3),
+    let (_, _, previous) = insert_complete_release_fixture(
+        &mut aggregate,
+        candidate(3, &["developer"]),
+        "manifest-previous",
+        "release-previous",
+        3,
+        ReleaseState::Superseded,
+        Some(100),
+        "rollout-previous",
     );
-    aggregate.manifests.insert(
-        "manifest-failed".to_string(),
-        fixture_manifest("manifest-failed", 4),
+    let (_, _, failed) = insert_complete_release_fixture(
+        &mut aggregate,
+        candidate(4, &["developer"]),
+        "manifest-failed",
+        "release-failed",
+        4,
+        ReleaseState::Active,
+        Some(200),
+        "rollout-failed",
     );
     aggregate.active_release_id = Some(failed.release_id.clone());
     let command = context(
@@ -3403,37 +3487,25 @@ fn rollback_local_adoption_is_idempotent_after_successful_commit() {
 fn rollback_reconciles_durable_effect_after_local_revision_conflict_without_reexecution() {
     let temp = TempDir::new().unwrap();
     let mut aggregate = DeliveryAggregateV1::new("tenant-a", "project-1");
-    let previous = ReleaseV1 {
-        schema_version: DELIVERY_SCHEMA_V1,
-        release_id: "release-previous".to_string(),
-        generation: 3,
-        manifest: reference("manifest-previous", 3),
-        state: ReleaseState::Superseded,
-        activated_at_ms: Some(100),
-        rollout_receipt: Some(reference("rollout-previous", 1)),
-    };
-    let failed = ReleaseV1 {
-        schema_version: DELIVERY_SCHEMA_V1,
-        release_id: "release-failed".to_string(),
-        generation: 4,
-        manifest: reference("manifest-failed", 4),
-        state: ReleaseState::Active,
-        activated_at_ms: Some(200),
-        rollout_receipt: Some(reference("rollout-failed", 1)),
-    };
-    aggregate
-        .releases
-        .insert(previous.release_id.clone(), previous.clone());
-    aggregate
-        .releases
-        .insert(failed.release_id.clone(), failed.clone());
-    aggregate.manifests.insert(
-        "manifest-previous".to_string(),
-        fixture_manifest("manifest-previous", 3),
+    let (_, _, previous) = insert_complete_release_fixture(
+        &mut aggregate,
+        candidate(3, &["developer"]),
+        "manifest-previous",
+        "release-previous",
+        3,
+        ReleaseState::Superseded,
+        Some(100),
+        "rollout-previous",
     );
-    aggregate.manifests.insert(
-        "manifest-failed".to_string(),
-        fixture_manifest("manifest-failed", 4),
+    let (_, _, failed) = insert_complete_release_fixture(
+        &mut aggregate,
+        candidate(4, &["developer"]),
+        "manifest-failed",
+        "release-failed",
+        4,
+        ReleaseState::Active,
+        Some(200),
+        "rollout-failed",
     );
     aggregate.active_release_id = Some(failed.release_id.clone());
     let command = context(
@@ -3489,38 +3561,24 @@ fn rollback_reconciles_durable_effect_after_local_revision_conflict_without_reex
 #[test]
 fn closeout_requires_bound_memory_receipt_and_survives_restart() {
     let temp = TempDir::new().unwrap();
-    let customer = principal("customer-1", AuthorityRole::Customer);
-    let release = ReleaseV1 {
-        schema_version: DELIVERY_SCHEMA_V1,
-        release_id: "release-1".to_string(),
-        generation: 1,
-        manifest: reference("manifest-1", 1),
-        state: ReleaseState::Active,
-        activated_at_ms: Some(100),
-        rollout_receipt: Some(reference("rollout-1", 1)),
-    };
-    let release_ref = versioned_release(&release);
-    let delivery_ref = reference("delivery-1", 1);
-    let acceptance = AcceptanceV1 {
-        schema_version: DELIVERY_SCHEMA_V1,
-        acceptance_id: "acceptance-1".to_string(),
-        generation: 1,
-        delivery: delivery_ref,
-        release: release_ref.clone(),
-        customer,
-        acceptance_digest: ContentDigest::zero(),
-        accepted_at_ms: 200,
-    }
-    .seal()
-    .unwrap();
     let mut aggregate = DeliveryAggregateV1::new("tenant-a", "project-1");
-    aggregate
-        .acceptances
-        .insert(acceptance.acceptance_id.clone(), acceptance.clone());
-    aggregate
-        .manifests
-        .insert("manifest-1".to_string(), fixture_manifest("manifest-1", 1));
-    aggregate.releases.insert("release-1".to_string(), release);
+    let (_, _, release) = insert_complete_release_fixture(
+        &mut aggregate,
+        candidate(1, &["developer"]),
+        "manifest-1",
+        "release-1",
+        1,
+        ReleaseState::Active,
+        Some(100),
+        "rollout-1",
+    );
+    let release_ref = versioned_release(&release);
+    let acceptance = insert_accepted_delivery_fixture(
+        &mut aggregate,
+        &release,
+        "delivery-1",
+        "acceptance-1",
+    );
     let core = core_with_seeded_aggregate(&temp, aggregate);
     let command = context(
         "release-manager",
@@ -3964,10 +4022,7 @@ fn renewed_authority_receipt_does_not_change_external_operation_identity() {
     changed.issuer = "replacement-effect-authority".to_string();
     changed_effect_authorities.push(changed);
     let mut changed = effect_authority;
-    changed.principal = principal(
-        "replacement-release-manager",
-        AuthorityRole::ReleaseManager,
-    );
+    changed.principal = principal("replacement-release-manager", AuthorityRole::ReleaseManager);
     changed_effect_authorities.push(changed);
     for changed in changed_effect_authorities {
         let changed_identity = changed.stable_identity_digest().unwrap();

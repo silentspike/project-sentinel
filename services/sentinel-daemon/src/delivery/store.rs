@@ -15,8 +15,8 @@ use serde_json::Value;
 use super::{
     digest::ContentDigest,
     error::DeliveryError,
-    ports::{PublicationReceiptV1, PublicationRequestV1},
     lineage::validate_delivery_aggregate_references,
+    ports::{PublicationReceiptV1, PublicationRequestV1},
     state::DeliveryAggregateV1,
 };
 
@@ -105,6 +105,10 @@ struct DeliveryEventEnvelopeV1 {
 /// Narrow persistence seam for the #696 delivery aggregate and its local
 /// idempotency/journal boundary.
 pub trait DeliveryAggregateStorePort: Send + Sync {
+    /// Validate the complete local aggregate/journal/idempotency/outbox
+    /// authority before a caller crosses an external-effect boundary.
+    fn health(&self) -> Result<(), DeliveryError>;
+
     fn load(
         &self,
         tenant_id: &str,
@@ -253,11 +257,7 @@ impl DeliveryStore {
             )
         } else {
             (
-                OFlags::RDWR
-                    | OFlags::CREATE
-                    | OFlags::EXCL
-                    | OFlags::NOFOLLOW
-                    | OFlags::CLOEXEC,
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::from_raw_mode(0o600),
             )
         };
@@ -282,7 +282,9 @@ impl DeliveryStore {
         })?;
         let store = Self::open_file(redb_file, pinned_file)?;
         let path_metadata = std::fs::symlink_metadata(config.path()).map_err(|error| {
-            DeliveryError::Storage(format!("delivery store path disappeared after open: {error}"))
+            DeliveryError::Storage(format!(
+                "delivery store path disappeared after open: {error}"
+            ))
         })?;
         validate_store_file_metadata(&path_metadata)?;
         if metadata_identity(&path_metadata) != metadata_identity(&pinned_metadata)
@@ -312,7 +314,9 @@ impl DeliveryStore {
     fn open_path(path: &Path) -> Result<Self, DeliveryError> {
         let db = Database::create(path)?;
         let pinned_file = File::open(path).map_err(|error| {
-            DeliveryError::Storage(format!("cannot retain delivery test store descriptor: {error}"))
+            DeliveryError::Storage(format!(
+                "cannot retain delivery test store descriptor: {error}"
+            ))
         })?;
         Self::initialize_open_database(db, pinned_file)
     }
@@ -989,6 +993,10 @@ fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
 }
 
 impl DeliveryAggregateStorePort for DeliveryStore {
+    fn health(&self) -> Result<(), DeliveryError> {
+        DeliveryStore::health(self)
+    }
+
     fn load(
         &self,
         tenant_id: &str,

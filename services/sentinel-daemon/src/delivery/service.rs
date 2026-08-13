@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
+    canonical_release_reference, canonical_release_reference_digest,
     digest::ContentDigest,
     error::DeliveryError,
     ports::{
@@ -33,7 +34,7 @@ use super::{
         DeliveryAggregateStorePort, DeliveryCommitReceiptV1, DeliveryCommitRequestV1,
         DeliveryPublicationStatePort, DeliveryStore, DeliveryStoreConfigV1,
     },
-    canonical_release_reference, canonical_release_reference_digest, PublicDeliveryLineageDtoV1,
+    PublicDeliveryLineageDtoV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,9 +146,10 @@ where
         )?;
         let aggregate = self.required_aggregate(tenant_id, project_id)?;
         if role == AuthorityRole::Customer
-            && !aggregate.deliveries.values().any(|delivery| {
-                delivery.customer_principal_id == context.principal.principal_id
-            })
+            && !aggregate
+                .deliveries
+                .values()
+                .any(|delivery| delivery.customer_principal_id == context.principal.principal_id)
         {
             return Err(DeliveryError::AuthorityDenied(
                 "customer has no delivery in the requested project".to_string(),
@@ -192,7 +194,7 @@ where
                 digest: candidate.candidate_digest.clone(),
             },
             authority_generation: candidate_authority.authority_generation,
-            authority_identity_digest: candidate_authority.snapshot_digest,
+            authority_identity_digest: candidate_authority.snapshot_digest.clone(),
             query_digest: ContentDigest::zero(),
         }
         .seal()?;
@@ -1357,11 +1359,7 @@ where
             &release_authority.principal,
             AuthorityRole::ReleaseManager,
         )?;
-        require_candidate_participant(
-            &authority,
-            &gate.actor,
-            AuthorityRole::Qa,
-        )?;
+        require_candidate_participant(&authority, &gate.actor, AuthorityRole::Qa)?;
         if release.manifest.id != manifest.manifest_id
             || release.manifest.generation != manifest.generation
             || release.manifest.digest != manifest.manifest_digest
@@ -1413,9 +1411,7 @@ where
             &authority_after,
             context.now_ms,
         )?;
-        let authority_after_effect =
-            self.integration
-                .candidate_authority(&candidate_query)?;
+        let authority_after_effect = self.integration.candidate_authority(&candidate_query)?;
         if authority_after_effect != authority {
             return Err(DeliveryError::StaleEvidence(
                 "candidate authority changed between rollout and local adoption".to_string(),
@@ -1892,8 +1888,7 @@ where
                 .releases
                 .get_mut(&rollback.from_release.id)
                 .ok_or_else(|| DeliveryError::NotFound("rollback source release".to_string()))?;
-            if canonical_release_reference_digest(&*from)? != rollback.from_release.digest
-            {
+            if canonical_release_reference_digest(&*from)? != rollback.from_release.digest {
                 return Err(DeliveryError::StaleEvidence(
                     "rollback source digest mismatch".to_string(),
                 ));
@@ -1906,8 +1901,7 @@ where
                 .releases
                 .get_mut(&rollback.to_release.id)
                 .ok_or_else(|| DeliveryError::NotFound("rollback target release".to_string()))?;
-            if canonical_release_reference_digest(&*to)? != rollback.to_release.digest
-            {
+            if canonical_release_reference_digest(&*to)? != rollback.to_release.digest {
                 return Err(DeliveryError::StaleEvidence(
                     "rollback target digest mismatch".to_string(),
                 ));
@@ -2314,7 +2308,8 @@ where
         context: &CommandContextV1,
         candidate: ReleaseCandidateV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
-        self.core.command_readiness(DeliveryCommandV1::RegisterCandidate)?;
+        self.core
+            .command_readiness(DeliveryCommandV1::RegisterCandidate)?;
         self.core.register_candidate(context, candidate)
     }
 
@@ -2340,7 +2335,8 @@ where
         run_id: &str,
         next: QaRunState,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
-        self.core.command_readiness(DeliveryCommandV1::TransitionQa)?;
+        self.core
+            .command_readiness(DeliveryCommandV1::TransitionQa)?;
         self.core
             .transition_qa(context, tenant_id, project_id, run_id, next)
     }
@@ -2412,8 +2408,14 @@ where
         release: ReleaseV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
         self.core.command_readiness(DeliveryCommandV1::Promote)?;
-        self.core
-            .promote(context, tenant_id, project_id, candidate_id, manifest, release)
+        self.core.promote(
+            context,
+            tenant_id,
+            project_id,
+            candidate_id,
+            manifest,
+            release,
+        )
     }
 
     pub fn issue_delivery(

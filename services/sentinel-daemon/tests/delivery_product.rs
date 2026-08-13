@@ -244,18 +244,19 @@ impl DeliveryIntegrationPort for DeterministicIntegration {
         query: &CandidateAuthorityQueryV1,
     ) -> Result<CandidateAuthoritySnapshotV1, DeliveryError> {
         let phase = self.lineage_phase.fetch_add(1, Ordering::SeqCst);
-        let generation = if matches!(self.workflow_fault, WorkflowFault::GenerationMismatch) {
+        let generation = if matches!(self.workflow_fault, WorkflowFault::GenerationMismatch)
+            && phase >= 1
+        {
             12
         } else {
             11
         };
-        let candidate_digest = if matches!(self.workflow_fault, WorkflowFault::CandidateSwap)
-            && phase >= 1
-        {
-            digest("candidate-swap")
-        } else {
-            query.candidate_digest.clone()
-        };
+        let candidate_digest =
+            if matches!(self.workflow_fault, WorkflowFault::CandidateSwap) && phase >= 1 {
+                digest("candidate-swap")
+            } else {
+                query.candidate_digest.clone()
+            };
         CandidateAuthoritySnapshotV1 {
             schema_version: DELIVERY_SCHEMA_V1,
             authority_generation: generation,
@@ -276,26 +277,60 @@ impl DeliveryIntegrationPort for DeterministicIntegration {
     ) -> Result<WorkflowLineageSnapshotV1, DeliveryError> {
         self.lineage_phase.store(2, Ordering::SeqCst);
         let kinds = [
-            (WorkflowLineageKindV1::CustomerRequest, WorkflowLineageStateV1::Requested, None),
-            (WorkflowLineageKindV1::Agreement, WorkflowLineageStateV1::Approved, None),
-            (WorkflowLineageKindV1::Project, WorkflowLineageStateV1::Active, None),
-            (WorkflowLineageKindV1::WorkItem, WorkflowLineageStateV1::Completed, None),
-            (WorkflowLineageKindV1::Participant, WorkflowLineageStateV1::Active, Some(AuthorityRole::Developer)),
-            (WorkflowLineageKindV1::Decision, WorkflowLineageStateV1::Approved, None),
-            (WorkflowLineageKindV1::Handoff, WorkflowLineageStateV1::HandedOff, None),
-            (WorkflowLineageKindV1::Blocker, WorkflowLineageStateV1::Clear, None),
+            (
+                WorkflowLineageKindV1::CustomerRequest,
+                WorkflowLineageStateV1::Requested,
+                None,
+            ),
+            (
+                WorkflowLineageKindV1::Agreement,
+                WorkflowLineageStateV1::Approved,
+                None,
+            ),
+            (
+                WorkflowLineageKindV1::Project,
+                WorkflowLineageStateV1::Active,
+                None,
+            ),
+            (
+                WorkflowLineageKindV1::WorkItem,
+                WorkflowLineageStateV1::Completed,
+                None,
+            ),
+            (
+                WorkflowLineageKindV1::Participant,
+                WorkflowLineageStateV1::Active,
+                Some(AuthorityRole::Developer),
+            ),
+            (
+                WorkflowLineageKindV1::Decision,
+                WorkflowLineageStateV1::Approved,
+                None,
+            ),
+            (
+                WorkflowLineageKindV1::Handoff,
+                WorkflowLineageStateV1::HandedOff,
+                None,
+            ),
+            (
+                WorkflowLineageKindV1::Blocker,
+                WorkflowLineageStateV1::Clear,
+                None,
+            ),
         ];
         let nodes = kinds
             .into_iter()
             .enumerate()
-            .map(|(index, (kind, state, participant_role))| WorkflowLineageNodeV1 {
-                node_ordinal: (index + 1) as u32,
-                kind,
-                state,
-                generation: 1,
-                digest: digest(&format!("workflow-node-{}", index + 1)),
-                participant_role,
-            })
+            .map(
+                |(index, (kind, state, participant_role))| WorkflowLineageNodeV1 {
+                    node_ordinal: (index + 1) as u32,
+                    kind,
+                    state,
+                    generation: 1,
+                    digest: digest(&format!("workflow-node-{}", index + 1)),
+                    participant_role,
+                },
+            )
             .collect::<Vec<_>>();
         let edges = nodes
             .windows(2)
@@ -454,10 +489,7 @@ impl DeliveryPublicationPort for DeterministicPublisher {
     ) -> Result<PublicationReceiptV1, DeliveryError> {
         let mut state = self.0.lock().expect("publisher state");
         state.invocations += 1;
-        let key = (
-            request.operation_id.clone(),
-            request.request_digest.clone(),
-        );
+        let key = (request.operation_id.clone(), request.request_digest.clone());
         if let Some(receipt) = state.receipts.get(&key) {
             return Ok(receipt.clone());
         }
@@ -542,7 +574,12 @@ fn configured_core_starts_with_typed_unavailable_ports_and_no_fake_readiness() {
             ..
         })
     ));
-    assert_eq!(product.pending_publication_count().expect("no bypass outbox"), 0);
+    assert_eq!(
+        product
+            .pending_publication_count()
+            .expect("no bypass outbox"),
+        0
+    );
     let service_source = include_str!("../src/delivery/service.rs");
     assert!(!service_source.contains("pub fn core(&self)"));
     assert!(!service_source.contains("pub fn with_ports("));
@@ -635,8 +672,7 @@ fn configured_core_starts_with_typed_unavailable_ports_and_no_fake_readiness() {
     }
 
     let publication_temp = TempDir::new().expect("publication tempdir");
-    let (publication_developer, publication_auditor) =
-        seed_committed_lineage(&publication_temp);
+    let (publication_developer, publication_auditor) = seed_committed_lineage(&publication_temp);
     let publication_gated = ConfiguredDeliveryCore::open(
         &config(&publication_temp),
         DeterministicIntegration {
@@ -712,11 +748,7 @@ fn configured_core_starts_with_typed_unavailable_ports_and_no_fake_readiness() {
             ..
         })
     ));
-    assert_lineage_readable(
-        &effects_gated,
-        effects_auditor,
-        "read-with-effects-down",
-    );
+    assert_lineage_readable(&effects_gated, effects_auditor, "read-with-effects-down");
 }
 
 #[cfg(unix)]
@@ -727,13 +759,11 @@ fn productive_store_rejects_escape_symlinks_and_permissive_files_then_reopens_06
     let parent = TempDir::new().expect("parent tempdir");
     let root = parent.path().join("delivery-root");
     std::fs::create_dir(&root).expect("root");
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-        .expect("root mode");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("root mode");
     assert!(DeliveryStoreConfigV1::new(&root, "../escape.redb").is_err());
     let current_uid = std::fs::metadata(&root).expect("root metadata").uid();
     if let Some(foreign_root) = ["/var/tmp", "/"].into_iter().find(|candidate| {
-        std::fs::metadata(candidate)
-            .is_ok_and(|metadata| metadata.uid() != current_uid)
+        std::fs::metadata(candidate).is_ok_and(|metadata| metadata.uid() != current_uid)
     }) {
         assert!(DeliveryStoreConfigV1::new(foreign_root, "delivery.redb").is_err());
     }
@@ -869,7 +899,10 @@ fn production_shape_persists_publishes_and_returns_only_authorized_redacted_line
             "tenant-b",
             "project-private-1",
         );
-        assert!(matches!(cross_tenant, Err(DeliveryError::AuthorityDenied(_))));
+        assert!(matches!(
+            cross_tenant,
+            Err(DeliveryError::AuthorityDenied(_))
+        ));
         let json = serde_json::to_string(&lineage).expect("lineage JSON");
         assert!(lineage.server_redacted);
         assert_eq!(lineage.project_label, "Project");
@@ -933,7 +966,12 @@ fn production_shape_persists_publishes_and_returns_only_authorized_redacted_line
         .expect("lineage after restart");
     assert_eq!(lineage.revision, 1);
     assert_eq!(lineage.nodes.len(), 10);
-    assert_eq!(reopened.publish_pending().expect("published receipt persisted"), 0);
+    assert_eq!(
+        reopened
+            .publish_pending()
+            .expect("published receipt persisted"),
+        0
+    );
 }
 
 #[test]
@@ -1233,18 +1271,18 @@ fn publisher_replay_after_crash_before_local_receipt_has_one_effective_event() {
     assert_eq!(restarted.publish_pending().expect("reconcile publish"), 1);
     assert_eq!(publisher.counts(), (2, 1));
     assert_eq!(
-        publisher
-            .0
-            .lock()
-            .expect("publisher state")
-            .receipts
-            .get(&(
-                pending[0].request.operation_id.clone(),
-                pending[0].request.request_digest.clone(),
-            )),
+        publisher.0.lock().expect("publisher state").receipts.get(&(
+            pending[0].request.operation_id.clone(),
+            pending[0].request.request_digest.clone(),
+        )),
         Some(&first_receipt),
     );
-    assert_eq!(restarted.pending_publication_count().expect("published outbox"), 0);
+    assert_eq!(
+        restarted
+            .pending_publication_count()
+            .expect("published outbox"),
+        0
+    );
 }
 
 #[test]
@@ -1297,10 +1335,9 @@ fn publication_fails_before_external_io_when_local_authority_is_corrupt() {
         integration,
         DeterministicEffects,
         publisher.clone(),
-    )
-    .expect("reopen without adopting corrupt authority");
+    );
     assert!(matches!(
-        restarted.publish_pending(),
+        restarted,
         Err(DeliveryError::CorruptStore(_))
     ));
     assert_eq!(
@@ -1339,9 +1376,35 @@ fn cross_record_reference_validator_rejects_every_required_missing_endpoint() {
     missing_gate.qa_runs.insert(run.run_id.clone(), run);
     assert_corrupt(&missing_gate, "QA run gate is missing");
 
-    let manifest = manifest_for(&candidate);
-    let mut missing_manifest_candidate =
+    let mut approval_outside_staged_review =
         DeliveryAggregateV1::new("tenant-a", "project-private-1");
+    approval_outside_staged_review
+        .candidates
+        .insert(candidate.candidate_id.clone(), candidate.clone());
+    approval_outside_staged_review.approvals.insert(
+        "approval-without-gate".to_string(),
+        ApprovalV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            approval_id: "approval-without-gate".to_string(),
+            generation: 1,
+            candidate: VersionedRefV1 {
+                id: candidate.candidate_id.clone(),
+                generation: candidate.generation,
+                digest: candidate.candidate_digest.clone(),
+            },
+            gate: reference("gate-not-staged", 1),
+            approver: principal("qa-private", AuthorityRole::Qa),
+            policy_digest: digest("release-policy"),
+            approved_at_ms: 1,
+        },
+    );
+    assert_corrupt(
+        &approval_outside_staged_review,
+        "approval gate is missing outside staged QA review",
+    );
+
+    let manifest = manifest_for(&candidate);
+    let mut missing_manifest_candidate = DeliveryAggregateV1::new("tenant-a", "project-private-1");
     missing_manifest_candidate
         .manifests
         .insert(manifest.manifest_id.clone(), manifest.clone());
@@ -1379,8 +1442,7 @@ fn cross_record_reference_validator_rejects_every_required_missing_endpoint() {
     }
     .seal()
     .expect("delivery seal");
-    let mut missing_delivery_release =
-        DeliveryAggregateV1::new("tenant-a", "project-private-1");
+    let mut missing_delivery_release = DeliveryAggregateV1::new("tenant-a", "project-private-1");
     missing_delivery_release
         .deliveries
         .insert(delivery.delivery_id.clone(), delivery.clone());
@@ -1402,8 +1464,7 @@ fn cross_record_reference_validator_rejects_every_required_missing_endpoint() {
     }
     .seal()
     .expect("acceptance seal");
-    let mut missing_acceptance_delivery =
-        DeliveryAggregateV1::new("tenant-a", "project-private-1");
+    let mut missing_acceptance_delivery = DeliveryAggregateV1::new("tenant-a", "project-private-1");
     missing_acceptance_delivery
         .acceptances
         .insert(acceptance.acceptance_id.clone(), acceptance.clone());
@@ -1423,8 +1484,7 @@ fn cross_record_reference_validator_rejects_every_required_missing_endpoint() {
         effect_receipt: Some(reference("rollback-effect", 1)),
         created_at_ms: 3,
     };
-    let mut missing_rollback_source =
-        DeliveryAggregateV1::new("tenant-a", "project-private-1");
+    let mut missing_rollback_source = DeliveryAggregateV1::new("tenant-a", "project-private-1");
     missing_rollback_source
         .rollbacks
         .insert(rollback.rollback_id.clone(), rollback.clone());
@@ -1432,8 +1492,7 @@ fn cross_record_reference_validator_rejects_every_required_missing_endpoint() {
         &missing_rollback_source,
         "rollback source release is missing",
     );
-    let mut missing_rollback_target =
-        DeliveryAggregateV1::new("tenant-a", "project-private-1");
+    let mut missing_rollback_target = DeliveryAggregateV1::new("tenant-a", "project-private-1");
     missing_rollback_target
         .releases
         .insert("release-from".to_string(), release("release-from"));
@@ -1464,8 +1523,7 @@ fn cross_record_reference_validator_rejects_every_required_missing_endpoint() {
         closed_by: principal("release-manager", AuthorityRole::ReleaseManager),
         created_at_ms: 4,
     };
-    let mut missing_closeout_release =
-        DeliveryAggregateV1::new("tenant-a", "project-private-1");
+    let mut missing_closeout_release = DeliveryAggregateV1::new("tenant-a", "project-private-1");
     missing_closeout_release
         .closeouts
         .insert(closeout.closeout_id.clone(), closeout);
@@ -1549,6 +1607,7 @@ fn health_and_lineage_reject_tampered_content_and_wrong_or_substituted_reference
         .load("tenant-a", "project-private-1")
         .expect("load aggregate")
         .expect("aggregate");
+    let valid_persisted = persisted.clone();
     persisted
         .candidates
         .get_mut("candidate-private-1")
@@ -1557,57 +1616,35 @@ fn health_and_lineage_reject_tampered_content_and_wrong_or_substituted_reference
     store
         .replace_aggregate_test_only(&persisted)
         .expect("inject corrupt aggregate");
-    assert!(matches!(store.health(), Err(DeliveryError::CorruptStore(_))));
-    drop(store);
-    let reopened = ConfiguredDeliveryCore::open(
-        &config(&temp),
-        integration,
-        DeterministicEffects,
-        DeterministicPublisher::default(),
-    )
-    .expect("open does not adopt corrupt authority");
     assert!(matches!(
-        reopened.read_public_lineage(
-            &CommandContextV1 {
-                principal: auditor.clone(),
-                idempotency_key: "read-tampered".to_string(),
-                now_ms: 101,
-            },
-            "tenant-a",
-            "project-private-1",
-        ),
+        store.health(),
         Err(DeliveryError::CorruptStore(_))
     ));
-    drop(reopened);
-
-    let store = DeliveryStore::open(&config(&temp)).expect("reopen for reference substitution");
+    store
+        .replace_aggregate_test_only(&valid_persisted)
+        .expect("restore valid aggregate");
+    store.health().expect("restored aggregate is healthy");
     store
         .replace_aggregate_test_only(&substituted)
         .expect("inject cross-record substitution");
-    assert!(matches!(store.health(), Err(DeliveryError::CorruptStore(_))));
+    assert!(matches!(
+        store.health(),
+        Err(DeliveryError::CorruptStore(_))
+    ));
     drop(store);
     let reopened = ConfiguredDeliveryCore::open(
         &config(&temp),
         DeterministicIntegration {
-            principals: vec![auditor.clone()],
+            principals: vec![auditor],
             execution_ready: true,
             workflow_fault: WorkflowFault::None,
             lineage_phase: Arc::default(),
         },
         DeterministicEffects,
         DeterministicPublisher::default(),
-    )
-    .expect("reopen substituted store");
+    );
     assert!(matches!(
-        reopened.read_public_lineage(
-            &CommandContextV1 {
-                principal: auditor,
-                idempotency_key: "read-substituted".to_string(),
-                now_ms: 102,
-            },
-            "tenant-a",
-            "project-private-1",
-        ),
+        reopened,
         Err(DeliveryError::CorruptStore(_))
     ));
 }
@@ -1674,7 +1711,10 @@ fn candidate_write_rejects_unsupported_currency_without_state_or_outbox_mutation
     unsupported.cost.currency = "JPY".to_string();
     unsupported.candidate_digest = ContentDigest::zero();
     let unsupported = unsupported.seal().expect("reseal candidate");
-    assert_eq!(product.pending_publication_count().expect("empty outbox"), 0);
+    assert_eq!(
+        product.pending_publication_count().expect("empty outbox"),
+        0
+    );
     let error = product
         .register_candidate(
             &CommandContextV1 {
@@ -1686,7 +1726,12 @@ fn candidate_write_rejects_unsupported_currency_without_state_or_outbox_mutation
         )
         .expect_err("unsupported currency must be rejected before commit");
     assert!(matches!(error, DeliveryError::Validation(_)));
-    assert_eq!(product.pending_publication_count().expect("unchanged outbox"), 0);
+    assert_eq!(
+        product
+            .pending_publication_count()
+            .expect("unchanged outbox"),
+        0
+    );
     drop(product);
     let store = DeliveryStore::open(&config(&temp)).expect("reopen unchanged store");
     assert!(store
