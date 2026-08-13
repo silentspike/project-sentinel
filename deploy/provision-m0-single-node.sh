@@ -126,6 +126,7 @@ def artifact_authority() -> dict[str, tuple[str, str]]:
         "/opt/sentinel/scripts/init-sysctl.sh": ("deploy/scripts/init-sysctl.sh", "script"),
         "/opt/sentinel/scripts/init-tmpfs.sh": ("deploy/scripts/init-tmpfs.sh", "script"),
         "/opt/sentinel/scripts/sentinel-health-monitor.sh": ("deploy/scripts/sentinel-health-monitor.sh", "script"),
+        "/opt/sentinel/scripts/m0-readiness.py": ("scripts/product-acceptance/m0-readiness/readiness.py", "script"),
         "/opt/sentinel/share/runtime-base.env": ("deploy/runtime-base.env", "config"),
         "/etc/apt/preferences.d/sentinel-runtime": ("deploy/apt/sentinel-runtime.pref", "config"),
         "/etc/sysctl.d/99-sentinel-bwrap.conf": ("deploy/vm-config/99-sentinel-bwrap.conf", "config"),
