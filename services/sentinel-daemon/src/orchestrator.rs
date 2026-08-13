@@ -26,8 +26,9 @@ use sentinel_common::agent_config::{load_all_agents_with_validation, AgentConfig
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::events::{DomainEvent, DomainEventPayload};
 use sentinel_common::nano_runtime::{
-    NanoHandle, NanoRuntimeControlAction, NanoRuntimeControlError, NanoRuntimeControlResult,
-    NanoRuntimeResources, NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
+    NanoExecRequest, NanoExecResult, NanoHandle, NanoRuntimeControlAction,
+    NanoRuntimeControlError, NanoRuntimeControlResult, NanoRuntimeResources, NanoStopResult,
+    NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
 };
 #[cfg(test)]
 use sentinel_common::nano_runtime::{RUNTIME_ECS_NATIVE, RUNTIME_MICROVM, RUNTIME_WASM_WASMTIME};
@@ -137,6 +138,7 @@ use runtime_lifecycle::RuntimeAdapterOwner;
 const PERSONALITY_EVOLUTION_PER_AGENT_FIELD_KEEP: i64 = 2000;
 const PERSONALITY_EVOLUTION_GLOBAL_HIGH_WATER: i64 = 499_000;
 const PERSONALITY_EVOLUTION_GLOBAL_RETAIN: i64 = 490_000;
+const MAX_WORKBENCH_COMMANDS_PER_TICK: usize = 16;
 
 fn episode_projection_allows_agent(
     state: &SharedEpisodeProjectionAdmissionState,
@@ -641,6 +643,145 @@ impl DaemonNanoRuntimeRegistry {
     #[cfg(test)]
     fn registered_keys(&self) -> Vec<String> {
         self.adapter_owner.keys()
+    }
+}
+
+struct DaemonWorkbenchRuntimeClient<'a> {
+    runtimes: &'a mut DaemonNanoRuntimeRegistry,
+    owner_registry: &'a sentinel_common::OwnerRegistry,
+}
+
+impl DaemonWorkbenchRuntimeClient<'_> {
+    fn revalidate_world_authority(&self) -> Result<()> {
+        let guard = self
+            .owner_registry
+            .issue(sentinel_common::StateTransferScope::World)
+            .context("workbench World authority is unavailable")?;
+        guard
+            .validate()
+            .context("workbench World authority became stale")
+    }
+}
+
+impl crate::workbench::WorkbenchRuntimeClient for DaemonWorkbenchRuntimeClient<'_> {
+    fn exchange(&mut self, agent_id: AgentId, request: NanoExecRequest) -> Result<NanoExecResult> {
+        let handle = self
+            .runtimes
+            .handles
+            .get(&agent_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("NanoRuntime handle does not exist for {agent_id}"))?;
+        anyhow::ensure!(
+            handle.runtime_key == RUNTIME_BWRAP_LANDLOCK,
+            "workbench requires '{RUNTIME_BWRAP_LANDLOCK}', selected '{}'",
+            handle.runtime_key
+        );
+
+        self.revalidate_world_authority()?;
+        if matches!(request.operation.as_str(), "workbench_start" | "workbench_recover") {
+            let resources = self.runtimes.adapter_owner.resources(&handle)?;
+            anyhow::ensure!(
+                resources.instance_id == Some(handle.instance_id)
+                    && resources.cgroup_created
+                    && resources.landlock_applied
+                    && resources.network_isolated
+                    && resources.child_pid.is_some(),
+                "workbench runtime isolation is not fully attested for exact instance {}: observed_instance={:?}, cgroup={}, landlock={}, network={}, child_pid={}",
+                handle.instance_id,
+                resources.instance_id,
+                resources.cgroup_created,
+                resources.landlock_applied,
+                resources.network_isolated,
+                resources.child_pid.is_some()
+            );
+            self.revalidate_world_authority()?;
+        }
+
+        let result = self.runtimes.adapter_owner.exec(&handle, request)?;
+        self.revalidate_world_authority()?;
+        Ok(result)
+    }
+}
+
+fn process_workbench_dispatch(
+    service: &crate::workbench::WorkbenchService,
+    runtimes: &mut DaemonNanoRuntimeRegistry,
+    owner_registry: &sentinel_common::OwnerRegistry,
+    event_store: &EventStore,
+    tick: u64,
+) {
+    for _ in 0..MAX_WORKBENCH_COMMANDS_PER_TICK {
+        let Ok(command) = service.receiver.try_recv() else {
+            break;
+        };
+        let now_ms = now_ms_i64().max(0) as u64;
+        let mut runtime = DaemonWorkbenchRuntimeClient {
+            runtimes,
+            owner_registry,
+        };
+        let coordinator = crate::workbench::WorkbenchCoordinator::new(
+            &service.store,
+            &service.profile,
+            &service.profile_digest,
+        );
+        let (result, response) = match command {
+            crate::workbench::WorkbenchDispatchCommand::Submit {
+                request,
+                authority,
+                response,
+            } => (
+                coordinator.submit(&mut runtime, &request, authority.as_ref(), now_ms),
+                response,
+            ),
+            crate::workbench::WorkbenchDispatchCommand::Poll {
+                invocation_id,
+                authority,
+                response,
+            } => (
+                coordinator.poll(
+                    &mut runtime,
+                    &invocation_id,
+                    authority.as_ref(),
+                    now_ms,
+                ),
+                response,
+            ),
+            crate::workbench::WorkbenchDispatchCommand::Recover {
+                invocation_id,
+                authority,
+                response,
+            } => (
+                coordinator.recover_executing(
+                    &mut runtime,
+                    &invocation_id,
+                    authority.as_ref(),
+                    now_ms,
+                ),
+                response,
+            ),
+            crate::workbench::WorkbenchDispatchCommand::Cancel {
+                invocation_id,
+                reason,
+                authority,
+                response,
+            } => (
+                coordinator.cancel(
+                    &mut runtime,
+                    &invocation_id,
+                    &reason,
+                    authority.as_ref(),
+                    now_ms,
+                ),
+                response,
+            ),
+        };
+        let result = result.and_then(|update| {
+            crate::workbench::publish_workbench_records(event_store, &update.records, tick)?;
+            Ok(update)
+        });
+        if response.send(result).is_err() {
+            warn!("workbench requester disconnected before receiving its durable outcome");
+        }
     }
 }
 
@@ -1782,7 +1923,6 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let data_dir = &config.data_dir;
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("data_dir erstellen: {}", data_dir.display()))?;
-
     let agents_dir = config.config_dir.join("agents");
     let agent_validation = config.agent_config_validation()?;
     let mut all_agents = load_all_agents_with_validation(&agents_dir, agent_validation)
@@ -2174,6 +2314,26 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             None
         }
     };
+
+    let workbench_artifact_roots = all_agents
+        .iter()
+        .map(|agent| {
+            let raw_agent_id = agent.identity.id;
+            let agent_id = AgentId(raw_agent_id);
+            let host_root = match active_fs_mount.as_deref() {
+                Some(mount) => std::path::PathBuf::from(mount)
+                    .join(format!("AGENT-{raw_agent_id:02}")),
+                None => std::path::PathBuf::from("/ram/agents").join(&agent.identity.name),
+            };
+            (agent_id, host_root.join("artifacts"))
+        })
+        .collect();
+    crate::workbench::install_workbench_service(
+        data_dir,
+        &config.config_dir,
+        workbench_artifact_roots,
+    )
+    .context("initialize durable agent workbench service")?;
 
     // -- Sandbox Enforcer (Landlock + cgroups v2 + bwrap) --
     let (mut sandbox, sandbox_warnings) = SandboxEnforcer::detect();
@@ -7954,6 +8114,8 @@ fn ecs_tick_loop(
             Vec::new()
         };
     let mut restore_fence = RestoreFence::default();
+    let workbench_service = crate::workbench::take_workbench_service()
+        .context("take configured agent workbench service for ECS runtime ownership")?;
     // #491 (TM-3): zuletzt aufgezeichnetes PSI-Band (cpu_above, mem_above). None = noch nichts
     // emittiert -> erster Tick setzt die Baseline. Nur Aenderungen werden als Event geschrieben.
     let mut psi_band: Option<(bool, bool)> = None;
@@ -7976,6 +8138,26 @@ fn ecs_tick_loop(
                 "startup config apply test exceeded {max_tick_iterations} tick iterations without reaching shutdown"
             );
         }
+
+        if let Some(service) = workbench_service.as_ref() {
+            process_workbench_dispatch(
+                service,
+                &mut nano_runtimes,
+                owner_registry,
+                &event_store,
+                tick_count,
+            );
+        }
+        let workbench_inflight = match workbench_service.as_ref() {
+            Some(service) => match service.store.has_inflight() {
+                Ok(inflight) => inflight,
+                Err(error) => {
+                    error!(error = %error, "Workbench-Fence konnte nicht gelesen werden; World-Mutationen bleiben fail-closed");
+                    true
+                }
+            },
+            None => false,
+        };
 
         // Owner snapshot installs and activation rebuilds take the same guard. They
         // therefore happen strictly between ECS ticks, while closing readiness still
@@ -8888,6 +9070,13 @@ fn ecs_tick_loop(
             let new_shift = pending_shift_target.unwrap_or(policy_shift);
             if new_shift != current_shift {
                 'shift_effects: {
+                    if workbench_inflight {
+                        warn!(
+                            target_shift = new_shift,
+                            "Schichtwechsel bleibt vor dem ersten Effekt durch eine aktive Workbench-Invocation gefencet"
+                        );
+                        break 'shift_effects;
+                    }
                     let pressure_blocked = adaptive_tick.should_block_spawn();
                     #[cfg(test)]
                     let pressure_blocked = startup_config_apply_probe
@@ -9498,8 +9687,9 @@ fn ecs_tick_loop(
             }
         }
 
-        let shift_snapshot_fenced =
-            pending_shift_target.is_some() || shift_snapshot_blocked_this_tick;
+        let shift_snapshot_fenced = pending_shift_target.is_some()
+            || shift_snapshot_blocked_this_tick
+            || workbench_inflight;
         // A pressure-rejected shift has no pending transition receipt yet, but
         // it still owns the old roster predicate until the next cadence either
         // completes that shift or observes that the predicate disappeared.
@@ -9507,7 +9697,7 @@ fn ecs_tick_loop(
         // that interval; dequeuing and requeuing would weaken FIFO/exactly-once
         // command handling.
         let shift_exclusive_mutations_fenced =
-            pending_shift_target.is_some() || pressure_deferred_shift;
+            pending_shift_target.is_some() || pressure_deferred_shift || workbench_inflight;
 
         // Nightrun-Trigger verarbeiten (via Operator-API)
         while let Ok(nightrun_cmd) = nightrun_rx.try_recv() {
@@ -11069,7 +11259,13 @@ fn ecs_tick_loop(
     //    nicht 0. Beim Restart erkennt shift_transition() ob Schichtwechsel stattfand
     //    und entfernt/spawnt Agents entsprechend.)
     let t = Instant::now();
-    let shift_snapshot_fenced = pending_shift_target.is_some() || shift_snapshot_blocked_this_tick;
+    let workbench_inflight = match workbench_service.as_ref() {
+        Some(service) => service.store.has_inflight().unwrap_or(true),
+        None => false,
+    };
+    let shift_snapshot_fenced = pending_shift_target.is_some()
+        || shift_snapshot_blocked_this_tick
+        || workbench_inflight;
     if shift_snapshot_fenced {
         warn!(
             target_shift = ?pending_shift_target,
@@ -12644,6 +12840,9 @@ mod tests {
 
     struct RecreateFixtureRuntime {
         active: Option<NanoHandle>,
+        resource_calls: Arc<AtomicUsize>,
+        exec_calls: Arc<AtomicUsize>,
+        isolated_resources: bool,
     }
 
     impl NanoRuntime for RecreateFixtureRuntime {
@@ -12674,10 +12873,17 @@ mod tests {
 
         fn exec(
             &mut self,
-            _handle: &NanoHandle,
+            handle: &NanoHandle,
             _request: sentinel_common::nano_runtime::NanoExecRequest,
         ) -> Result<sentinel_common::nano_runtime::NanoExecResult> {
-            unreachable!("fixture exec")
+            anyhow::ensure!(self.active.as_ref() == Some(handle), "stale fixture handle");
+            self.exec_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(NanoExecResult {
+                runtime_key: RUNTIME_BWRAP_LANDLOCK.to_string(),
+                workload_id: handle.workload_id.clone(),
+                success: true,
+                output: "fixture".to_string(),
+            })
         }
 
         fn snapshot(
@@ -12733,8 +12939,14 @@ mod tests {
         }
 
         fn resources(&self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
+            anyhow::ensure!(self.active.as_ref() == Some(handle), "stale fixture handle");
+            self.resource_calls.fetch_add(1, Ordering::SeqCst);
             Ok(NanoRuntimeResources {
                 instance_id: Some(handle.instance_id),
+                child_pid: self.isolated_resources.then_some(1234),
+                cgroup_created: self.isolated_resources,
+                landlock_applied: self.isolated_resources,
+                network_isolated: self.isolated_resources,
                 ..NanoRuntimeResources::default()
             })
         }
@@ -12745,7 +12957,12 @@ mod tests {
         let agent_id = AgentId(41);
         let mut registry = NanoRuntimeRegistry::new(Some(RUNTIME_BWRAP_LANDLOCK.to_string()));
         registry
-            .register(RecreateFixtureRuntime { active: None })
+            .register(RecreateFixtureRuntime {
+                active: None,
+                resource_calls: Arc::new(AtomicUsize::new(0)),
+                exec_calls: Arc::new(AtomicUsize::new(0)),
+                isolated_resources: false,
+            })
             .unwrap();
         let handle = NanoHandle::new(
             RUNTIME_BWRAP_LANDLOCK,
@@ -12770,6 +12987,76 @@ mod tests {
         let (restored, resources) = daemon_registry.restore(snapshots[0].clone()).unwrap();
         assert_ne!(restored.instance_id, handle.instance_id);
         assert_eq!(resources.instance_id, Some(restored.instance_id));
+    }
+
+    #[test]
+    fn workbench_start_attests_resources_but_terminal_poll_uses_exact_handle_only() {
+        let agent_id = AgentId(42);
+        let handle = NanoHandle::new(
+            RUNTIME_BWRAP_LANDLOCK,
+            "AGENT-42",
+            Some(agent_id),
+            Some(1234),
+        );
+        let resource_calls = Arc::new(AtomicUsize::new(0));
+        let exec_calls = Arc::new(AtomicUsize::new(0));
+        let adapter = RecreateFixtureRuntime {
+            active: Some(handle.clone()),
+            resource_calls: Arc::clone(&resource_calls),
+            exec_calls: Arc::clone(&exec_calls),
+            isolated_resources: true,
+        };
+        let mut registry = NanoRuntimeRegistry::new(None);
+        registry.register(adapter).unwrap();
+        let mut runtimes = DaemonNanoRuntimeRegistry {
+            adapter_owner: RuntimeAdapterOwner::from_registry(registry),
+            handles: HashMap::from([(agent_id, handle.clone())]),
+            recovery_blocked_agents: HashSet::new(),
+        };
+        let owner = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+
+        let mut client = DaemonWorkbenchRuntimeClient {
+            runtimes: &mut runtimes,
+            owner_registry: &owner,
+        };
+        crate::workbench::WorkbenchRuntimeClient::exchange(
+            &mut client,
+            agent_id,
+            NanoExecRequest {
+                operation: "workbench_start".to_string(),
+                input: "start".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
+        crate::workbench::WorkbenchRuntimeClient::exchange(
+            &mut client,
+            agent_id,
+            NanoExecRequest {
+                operation: "workbench_poll".to_string(),
+                input: "poll".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 2);
+
+        client
+            .runtimes
+            .handles
+            .get_mut(&agent_id)
+            .unwrap()
+            .instance_id = uuid::Uuid::new_v4();
+        assert!(crate::workbench::WorkbenchRuntimeClient::exchange(
+            &mut client,
+            agent_id,
+            NanoExecRequest {
+                operation: "workbench_recover".to_string(),
+                input: "recover".to_string(),
+            },
+        )
+        .is_err());
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -18579,6 +18866,9 @@ mod tests {
         let admission = shift_block
             .find("shift_transition_admission(")
             .expect("pressure admission");
+        let workbench_fence = shift_block
+            .find("if workbench_inflight")
+            .expect("active workbench fence before shift effects");
         let pending = shift_block
             .find("pending_shift_target.get_or_insert(new_shift)")
             .expect("transition snapshot fence");
@@ -18604,6 +18894,7 @@ mod tests {
             .find("let shift_exclusive_mutations_fenced")
             .expect("unified pressure-deferred and pending-target fence");
 
+        assert!(workbench_fence < admission);
         assert!(admission < stop);
         assert!(admission < pending);
         assert!(pending < stop);
@@ -18625,9 +18916,9 @@ mod tests {
         assert!(blocked_branch.contains("break 'shift_effects"));
         assert!(!blocked_branch.contains("continue;"));
 
-        assert!(
-            source.contains("pending_shift_target.is_some() || shift_snapshot_blocked_this_tick")
-        );
+        assert!(source.contains(
+            "pending_shift_target.is_some()\n            || shift_snapshot_blocked_this_tick\n            || workbench_inflight"
+        ));
 
         let periodic_snapshot = source
             .find("// Time Machine: Periodische World Snapshots")
@@ -18641,8 +18932,16 @@ mod tests {
             "shift_snapshot_fenced || pressure_deferred_shift,\n            &snapshot_rx,"
         ));
         assert!(source.contains(
-            "let shift_exclusive_mutations_fenced =\n            pending_shift_target.is_some() || pressure_deferred_shift;"
+            "let shift_exclusive_mutations_fenced =\n            pending_shift_target.is_some() || pressure_deferred_shift || workbench_inflight;"
         ));
+        let dispatch = source
+            .find("            process_workbench_dispatch(")
+            .expect("workbench dispatch callsite");
+        let owner_barrier = source[dispatch..]
+            .find("let owner_tick_barrier = sentinel_common::owner_tick_barrier()")
+            .map(|offset| dispatch + offset)
+            .expect("owner tick barrier after workbench adapter I/O");
+        assert!(dispatch < owner_barrier);
         for receiver in ["restore_rx", "config_apply_rx", "migrate_rx"] {
             assert!(
                 source.contains(&format!(

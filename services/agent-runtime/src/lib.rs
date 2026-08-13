@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::{sysconf, Pid, SysconfVar};
 use sentinel_common::{
     WorkbenchArtifactRef, WorkbenchErrorClass, WorkbenchErrorInfo, WorkbenchMessage,
     WorkbenchOutcome, WorkbenchRequest, WorkbenchResourceUsage, WorkbenchTool,
@@ -34,13 +36,28 @@ const SAFE_ENVIRONMENT: [(&str, &str); 4] = [
 pub struct WorkbenchExecutor {
     workspace_root: PathBuf,
     artifact_root: PathBuf,
+    input_root: PathBuf,
 }
 
 impl WorkbenchExecutor {
     pub fn new(workspace_root: impl Into<PathBuf>, artifact_root: impl Into<PathBuf>) -> Self {
+        let workspace_root = workspace_root.into();
+        Self {
+            input_root: workspace_root.join(".inputs"),
+            workspace_root,
+            artifact_root: artifact_root.into(),
+        }
+    }
+
+    pub fn with_input_root(
+        workspace_root: impl Into<PathBuf>,
+        artifact_root: impl Into<PathBuf>,
+        input_root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             workspace_root: workspace_root.into(),
             artifact_root: artifact_root.into(),
+            input_root: input_root.into(),
         }
     }
 
@@ -289,7 +306,7 @@ impl WorkbenchExecutor {
 
         match &request.tool {
             WorkbenchTool::InspectFile { path, max_bytes } => {
-                let path = self.resolve_existing(path)?;
+                let path = self.resolve_read_path(request, path)?;
                 let metadata = fs::metadata(&path).map_err(workspace_io_error)?;
                 if !metadata.is_file() {
                     return Err(ExecutionError::workspace(
@@ -410,7 +427,21 @@ impl WorkbenchExecutor {
             &self.artifact_root,
             &[request.project_id.as_str(), request.work_item_id.as_str()],
         )?;
-        Ok(Self::new(workspace_root, artifact_root))
+        let input_root = if request.inputs.is_empty() {
+            self.input_root
+                .join(&request.project_id)
+                .join(&request.work_item_id)
+        } else {
+            open_contained_directory(
+                &self.input_root,
+                &[request.project_id.as_str(), request.work_item_id.as_str()],
+            )?
+        };
+        Ok(Self::with_input_root(
+            workspace_root,
+            artifact_root,
+            input_root,
+        ))
     }
 
     fn validate_declared_inputs(
@@ -421,7 +452,7 @@ impl WorkbenchExecutor {
     ) -> Result<(), ExecutionError> {
         for input in &request.inputs {
             ensure_invocation_active(request, cancelled, started)?;
-            let path = self.resolve_existing(&input.mount_path)?;
+            let path = self.resolve_input(&input.mount_path)?;
             let metadata = fs::metadata(&path).map_err(workspace_io_error)?;
             if !metadata.is_file() || metadata.permissions().mode() & 0o222 != 0 {
                 return Err(ExecutionError::workspace(
@@ -459,9 +490,35 @@ impl WorkbenchExecutor {
         started: Instant,
     ) -> Result<ExecutionSuccess, ExecutionError> {
         let workspace = fs::canonicalize(&self.workspace_root).map_err(workspace_io_error)?;
+        let input_root = (!request.inputs.is_empty())
+            .then(|| fs::canonicalize(&self.input_root).map_err(workspace_io_error))
+            .transpose()?;
+        let args = args
+            .iter()
+            .map(|argument| {
+                if let Some(input) = request
+                    .inputs
+                    .iter()
+                    .find(|input| input.mount_path == *argument)
+                {
+                    let input_root = input_root.as_ref().expect("declared input root resolved");
+                    return Ok(input_root.join(checked_relative(&input.mount_path)?));
+                }
+                let path = checked_relative(argument)?;
+                if path.components().next().is_some_and(|component| {
+                    component.as_os_str() == std::ffi::OsStr::new(".inputs")
+                }) {
+                    return Err(ExecutionError::workspace(
+                        "foreign_input_scope_denied",
+                        "command arguments cannot address undeclared input scopes",
+                    ));
+                }
+                Ok(PathBuf::from(argument))
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
         let mut command = Command::new(program);
         command
-            .args(args)
+            .args(&args)
             .current_dir(workspace)
             .env_clear()
             .envs(SAFE_ENVIRONMENT)
@@ -584,6 +641,16 @@ impl WorkbenchExecutor {
         let stderr = stderr_reader.join().unwrap_or_default();
         if let Some(error) = forced_error {
             return Err(error);
+        }
+        if stdout.total > request.resource_limits.stdout_bytes
+            || stderr.total > request.resource_limits.stderr_bytes
+        {
+            return Err(ExecutionError::new(
+                WorkbenchErrorClass::Resource,
+                "command_output_limit_exceeded",
+                "the invocation exceeded its command output limit",
+                false,
+            ));
         }
         let status = status.ok_or_else(|| {
             ExecutionError::runtime(
@@ -871,6 +938,26 @@ impl WorkbenchExecutor {
         }
         Ok(destination)
     }
+
+    fn resolve_input(&self, relative: &str) -> Result<PathBuf, ExecutionError> {
+        resolve_existing_beneath(&self.input_root, relative, "input")
+    }
+
+    fn resolve_read_path(
+        &self,
+        request: &WorkbenchRequest,
+        relative: &str,
+    ) -> Result<PathBuf, ExecutionError> {
+        if request
+            .inputs
+            .iter()
+            .any(|input| input.mount_path == relative)
+        {
+            self.resolve_input(relative)
+        } else {
+            self.resolve_existing(relative)
+        }
+    }
 }
 
 fn create_contained_directory(base: &Path, components: &[&str]) -> Result<PathBuf, ExecutionError> {
@@ -912,8 +999,67 @@ fn create_contained_directory(base: &Path, components: &[&str]) -> Result<PathBu
     Ok(canonical)
 }
 
+fn open_contained_directory(base: &Path, components: &[&str]) -> Result<PathBuf, ExecutionError> {
+    reject_symlink(base)?;
+    let root = fs::canonicalize(base).map_err(workspace_io_error)?;
+    let mut current = root.clone();
+    for component in components {
+        if component.is_empty()
+            || !component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(ExecutionError::workspace(
+                "invalid_input_binding",
+                "input scope contains an invalid identifier",
+            ));
+        }
+        current.push(component);
+        reject_symlink(&current)?;
+        if !fs::metadata(&current).map_err(workspace_io_error)?.is_dir() {
+            return Err(ExecutionError::workspace(
+                "input_scope_conflict",
+                "input scope is not a directory",
+            ));
+        }
+    }
+    let canonical = fs::canonicalize(&current).map_err(workspace_io_error)?;
+    if !canonical.starts_with(&root) {
+        return Err(ExecutionError::workspace(
+            "input_scope_escape",
+            "input scope escaped its assigned root",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn resolve_existing_beneath(
+    root: &Path,
+    relative: &str,
+    boundary: &str,
+) -> Result<PathBuf, ExecutionError> {
+    let root = fs::canonicalize(root).map_err(workspace_io_error)?;
+    let relative = checked_relative(relative)?;
+    let mut current = root.clone();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        reject_symlink(&current)?;
+    }
+    let resolved = fs::canonicalize(&current).map_err(workspace_io_error)?;
+    if !resolved.starts_with(&root) {
+        return Err(ExecutionError::workspace(
+            "boundary_escape",
+            &format!("{boundary} path escaped its assigned root"),
+        ));
+    }
+    Ok(resolved)
+}
+
 fn reject_input_mutation(request: &WorkbenchRequest, relative: &str) -> Result<(), ExecutionError> {
-    if request
+    let path = checked_relative(relative)?;
+    if path.components().next().is_some_and(|component| {
+        component.as_os_str() == std::ffi::OsStr::new(".inputs")
+    }) || request
         .inputs
         .iter()
         .any(|input| input.mount_path == relative)
@@ -1024,8 +1170,11 @@ impl ProcessGroupUsage {
 }
 
 fn sample_process_group(process_group: u32) -> ProcessGroupUsage {
-    let clock_ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let clock_ticks = sysconf(SysconfVar::CLK_TCK).ok().flatten().unwrap_or(0);
+    let page_size = sysconf(SysconfVar::PAGE_SIZE)
+        .ok()
+        .flatten()
+        .unwrap_or(0);
     if clock_ticks <= 0 || page_size <= 0 {
         return ProcessGroupUsage::default();
     }
@@ -1489,10 +1638,7 @@ fn file_write_success(bytes: &[u8]) -> ExecutionSuccess {
 
 fn terminate_process_group(pid: u32, child: &mut std::process::Child) {
     if let Ok(pid) = i32::try_from(pid) {
-        // SAFETY: a negative PID targets only the process group created for this child.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
     }
     let _ = child.kill();
 }
@@ -1961,6 +2107,33 @@ mod tests {
             WorkbenchOutcome::Succeeded
         );
 
+        let mut excessive_output = request(
+            WorkbenchTool::RunCommand {
+                program: "printf".to_string(),
+                args: vec!["1234".to_string()],
+            },
+            "command.run_allowlisted",
+        );
+        excessive_output.command_policy = vec![CommandRule {
+            program: "printf".to_string(),
+            required_arg_prefix: Vec::new(),
+            max_args: 1,
+        }];
+        excessive_output.resource_limits.stdout_bytes = 2;
+        excessive_output.input_digest = excessive_output.canonical_digest().unwrap();
+        let excessive_output = executor.execute(
+            excessive_output,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let WorkbenchMessage::Result { outcome, error, .. } = excessive_output else {
+            panic!("command execution must return a result")
+        };
+        assert_eq!(outcome, WorkbenchOutcome::Failed);
+        assert_eq!(
+            error.expect("output-limit failure").code,
+            "command_output_limit_exceeded"
+        );
+
         let cancelled = Arc::new(AtomicBool::new(true));
         let write = request(
             WorkbenchTool::WriteFile {
@@ -1990,23 +2163,24 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().join("workspace");
         let artifacts = directory.path().join("artifacts");
-        let assigned = scoped(&workspace);
-        fs::create_dir_all(assigned.join("inputs")).unwrap();
-        let input_path = assigned.join("inputs/brief.md");
+        let inputs = directory.path().join("inputs");
+        let input_scope = scoped(&inputs);
+        fs::create_dir_all(&input_scope).unwrap();
+        let input_path = input_scope.join("brief.md");
         fs::write(&input_path, "bounded brief").unwrap();
         fs::set_permissions(&input_path, fs::Permissions::from_mode(0o444)).unwrap();
         let digest = hex_sha256(b"bounded brief");
         let input = sentinel_common::WorkbenchInputRef {
             artifact_id: format!("sha256:{digest}"),
             sha256: digest,
-            mount_path: "inputs/brief.md".to_string(),
+            mount_path: "brief.md".to_string(),
             media_type: "text/markdown".to_string(),
         };
-        let executor = WorkbenchExecutor::new(&workspace, &artifacts);
+        let executor = WorkbenchExecutor::with_input_root(&workspace, &artifacts, &inputs);
 
         let mut inspect = request(
             WorkbenchTool::InspectFile {
-                path: "inputs/brief.md".to_string(),
+                path: "brief.md".to_string(),
                 max_bytes: 1024,
             },
             "file.inspect",
@@ -2020,7 +2194,7 @@ mod tests {
 
         let mut overwrite = request(
             WorkbenchTool::WriteFile {
-                path: "inputs/brief.md".to_string(),
+                path: "brief.md".to_string(),
                 content: "changed".to_string(),
                 expected_sha256: None,
             },
@@ -2033,6 +2207,65 @@ mod tests {
             WorkbenchOutcome::Failed
         );
         assert_eq!(fs::read_to_string(input_path).unwrap(), "bounded brief");
+    }
+
+    #[test]
+    fn declared_input_parent_cannot_be_replaced_or_address_foreign_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let artifacts = directory.path().join("artifacts");
+        let inputs = directory.path().join("inputs");
+        let assigned = scoped(&inputs);
+        let foreign = inputs.join("other-project/WORK-1");
+        fs::create_dir_all(&assigned).unwrap();
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(assigned.join("brief.md"), "assigned").unwrap();
+        fs::write(foreign.join("brief.md"), "foreign").unwrap();
+        fs::set_permissions(
+            assigned.join("brief.md"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        let executor = WorkbenchExecutor::with_input_root(&workspace, &artifacts, &inputs);
+        let digest = hex_sha256(b"assigned");
+        let mut replace_parent = request(
+            WorkbenchTool::WriteFile {
+                path: ".inputs".to_string(),
+                content: "replacement".to_string(),
+                expected_sha256: None,
+            },
+            "file.write",
+        );
+        replace_parent.inputs = vec![sentinel_common::WorkbenchInputRef {
+            artifact_id: format!("sha256:{digest}"),
+            sha256: digest,
+            mount_path: "brief.md".to_string(),
+            media_type: "text/markdown".to_string(),
+        }];
+        replace_parent.input_digest = replace_parent.canonical_digest().unwrap();
+        assert_eq!(
+            outcome(&executor.execute(replace_parent, Arc::new(AtomicBool::new(false)))),
+            WorkbenchOutcome::Failed
+        );
+        assert_eq!(fs::read_to_string(assigned.join("brief.md")).unwrap(), "assigned");
+
+        let mut foreign_command = request(
+            WorkbenchTool::RunCommand {
+                program: "cat".to_string(),
+                args: vec![".inputs/other-project/WORK-1/brief.md".to_string()],
+            },
+            "command.run_allowlisted",
+        );
+        foreign_command.command_policy = vec![CommandRule {
+            program: "cat".to_string(),
+            required_arg_prefix: Vec::new(),
+            max_args: 1,
+        }];
+        foreign_command.input_digest = foreign_command.canonical_digest().unwrap();
+        assert_eq!(
+            outcome(&executor.execute(foreign_command, Arc::new(AtomicBool::new(false)))),
+            WorkbenchOutcome::Failed
+        );
     }
 
     #[test]
