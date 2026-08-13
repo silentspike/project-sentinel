@@ -56,16 +56,17 @@ type ConfigSnapshot struct {
 
 // Config holds the current gateway configuration (mutable at runtime).
 type Config struct {
-	mu                      sync.RWMutex
-	primaryProvider         string
-	temperature             float64
-	maxTokens               int
-	rateLimit               float64
-	agentOverrides          map[string]string // agent_id -> provider_name
-	agentRuntimeModelPolicy modelpolicy.Policy
-	policyValidator         func(modelpolicy.Policy) error
-	providerValidator       func(string) error
-	localLoopEnabled        bool
+	mu                       sync.RWMutex
+	primaryProvider          string
+	temperature              float64
+	maxTokens                int
+	rateLimit                float64
+	agentOverrides           map[string]string // agent_id -> provider_name
+	agentRuntimeModelPolicy  modelpolicy.Policy
+	policyValidator          func(modelpolicy.Policy) error
+	providerValidator        func(string) error
+	apicpActivationValidator func() error
+	localLoopEnabled         bool
 
 	// Traffic Control (#288)
 	synthesisEnabled      bool
@@ -84,6 +85,14 @@ type Config struct {
 	qualityThreshold        int
 	qualityMaxRegen         int
 	narrativeNudge          string
+}
+
+// APICPRestartRequiredError reports that API-CP activation cannot safely bind
+// a new operator authority in the running process.
+type APICPRestartRequiredError struct{}
+
+func (*APICPRestartRequiredError) Error() string {
+	return "apicp activation requires a gateway restart with prevalidated operator authority"
 }
 
 // NewConfig creates a Config with sensible defaults.
@@ -129,6 +138,14 @@ func (c *Config) SetProviderValidator(validator func(string) error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.providerValidator = validator
+}
+
+// SetAPICPActivationValidator binds a disabled-to-enabled transition to the
+// startup-only operator credential lifecycle.
+func (c *Config) SetAPICPActivationValidator(validator func() error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.apicpActivationValidator = validator
 }
 
 // AgentProvider returns the override provider for a specific agent, if any.
@@ -428,6 +445,11 @@ func (c *Config) Update(updates map[string]interface{}) error {
 			return err
 		}
 	}
+	if !c.apicpEnabled && candidate.apicpEnabled && c.apicpActivationValidator != nil {
+		if err := c.apicpActivationValidator(); err != nil {
+			return err
+		}
+	}
 	c.commitUnlocked(candidate)
 	return nil
 }
@@ -441,9 +463,10 @@ func (c *Config) cloneUnlocked() *Config {
 		primaryProvider: c.primaryProvider, temperature: c.temperature, maxTokens: c.maxTokens,
 		rateLimit: c.rateLimit, agentOverrides: overrides,
 		agentRuntimeModelPolicy: c.agentRuntimeModelPolicy.Clone(), policyValidator: c.policyValidator,
-		providerValidator: c.providerValidator,
-		localLoopEnabled:  c.localLoopEnabled,
-		synthesisEnabled:  c.synthesisEnabled, sequencingEnabled: c.sequencingEnabled,
+		providerValidator:        c.providerValidator,
+		apicpActivationValidator: c.apicpActivationValidator,
+		localLoopEnabled:         c.localLoopEnabled,
+		synthesisEnabled:         c.synthesisEnabled, sequencingEnabled: c.sequencingEnabled,
 		tickSyncEnabled: c.tickSyncEnabled, apicpEnabled: c.apicpEnabled,
 		tickSyncTimeoutMs: c.tickSyncTimeoutMs, p3TimeoutMs: c.p3TimeoutMs,
 		maxForwardConcurrency: c.maxForwardConcurrency, interceptMode: c.interceptMode,

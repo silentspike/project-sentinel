@@ -48,6 +48,7 @@ type Config struct {
 	SyncInterval time.Duration
 	SharedSecret string
 	HTTPClient   *http.Client
+	Enabled      func() bool
 }
 
 // Observation records a single API call for learning.
@@ -114,6 +115,7 @@ type Observer struct {
 	stopOnce              sync.Once
 	synthCount            int64
 	lastEvolutionVersions map[string]string
+	enabled               func() bool
 }
 
 // NewObserver creates an API-CP observer with daemon-backed snapshot sync.
@@ -138,15 +140,24 @@ func NewObserver(cfg Config, logger *slog.Logger) *Observer {
 		logger:                logger,
 		stopCh:                make(chan struct{}),
 		lastEvolutionVersions: make(map[string]string),
+		enabled:               cfg.Enabled,
 	}
 
-	if o.syncURL != "" {
+	if o.syncURL != "" && strings.TrimSpace(o.sharedSecret) == "" {
+		o.logger.Error("api-cp remote sync disabled: operator authority is unavailable")
+		o.syncURL = ""
+	}
+	if o.remoteSyncEnabled() {
 		if !o.loadRemote() {
 			go o.bootstrapLoadRetry()
 		}
 		go o.syncLoop()
 	}
 	return o
+}
+
+func (o *Observer) remoteSyncEnabled() bool {
+	return o.syncURL != "" && o.sharedSecret != "" && (o.enabled == nil || o.enabled())
 }
 
 // Record adds an observation for a completed API call.
@@ -526,7 +537,7 @@ func (o *Observer) syncLoop() {
 }
 
 func (o *Observer) loadRemote() bool {
-	if o.syncURL == "" {
+	if !o.remoteSyncEnabled() {
 		return true
 	}
 
@@ -591,7 +602,7 @@ func (o *Observer) bootstrapLoadRetry() {
 }
 
 func (o *Observer) syncToRemote() {
-	if o.syncURL == "" {
+	if !o.remoteSyncEnabled() {
 		return
 	}
 

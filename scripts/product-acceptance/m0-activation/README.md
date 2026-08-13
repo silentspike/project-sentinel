@@ -6,7 +6,10 @@ M0 runtime phase. It has two commands:
 - `activate` validates the raw provision-receipt digest, manifest digest, Git
   SHA, dynamic artifact count and artifact-set digest, stopped unit set, and
   repository-defined topology before it reloads
-  systemd and queues only `sentinel.target` with `--no-block`. A separate bounded activation
+  systemd and queues only `sentinel.target` with `--no-block`. The target first
+  requires the root-owned `sentinel-auth-init.service`; its idempotent migration
+  must reach terminal `active/exited` success before any file-credential consumer
+  starts. A separate bounded activation
   deadline allows asynchronous service startup and recovery while every
   readback and preflight call is bounded by freshly computed remaining time.
   The controller polls without busy-waiting until long-lived units are ready,

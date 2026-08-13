@@ -1,8 +1,9 @@
 [Unit]
 Description=Sentinel Cortex Gateway — LLM Pipeline + Synthesis Engine
 Documentation=https://github.com/silentspike/project-sentinel/issues/288
-After=network-online.target sentinel-daemon.service
+After=network-online.target sentinel-auth-init.service sentinel-daemon.service
 Wants=network-online.target
+Requires=sentinel-auth-init.service
 StartLimitBurst=5
 StartLimitIntervalSec=300
 
@@ -39,10 +40,12 @@ LoadCredential=caller-agent-runtime:/etc/sentinel/credentials/caller-agent-runti
 LoadCredential=caller-platform:/etc/sentinel/credentials/caller-platform
 LoadCredential=caller-evolution:/etc/sentinel/credentials/caller-evolution
 LoadCredential=caller-judge:/etc/sentinel/credentials/caller-judge
+LoadCredential=operator-api:/etc/sentinel/credentials/operator-api
 Environment=CORTEX_AGENT_RUNTIME_CREDENTIAL_FILE=%d/caller-agent-runtime
 Environment=CORTEX_PLATFORM_CREDENTIAL_FILE=%d/caller-platform
 Environment=CORTEX_EVOLUTION_CREDENTIAL_FILE=%d/caller-evolution
 Environment=CORTEX_JUDGE_CREDENTIAL_FILE=%d/caller-judge
+Environment=SENTINEL_OPERATOR_API_KEY_FILE=%d/operator-api
 Environment=SENTINEL_CORTEX_CONFIG=/opt/sentinel/config/cortex-gateway.toml
 
 StandardOutput=journal
