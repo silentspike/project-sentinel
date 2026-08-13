@@ -55,7 +55,9 @@ pub fn validate_delivery_aggregate_references(
                 .case_results
                 .iter()
                 .flat_map(|result| result.attempt_history.iter())
-                .any(|attempt| attempt.computed_digest().ok() != Some(attempt.attempt_digest.clone()))
+                .any(|attempt| {
+                    attempt.computed_digest().ok() != Some(attempt.attempt_digest.clone())
+                })
         {
             return Err(corrupt("QA evidence graph self-digest is invalid"));
         }
@@ -104,7 +106,10 @@ pub fn validate_delivery_aggregate_references(
         }
     }
     for closeout in aggregate.closeouts.values() {
-        if !aggregate.releases.contains_key(&closeout.accepted_release.id) {
+        if !aggregate
+            .releases
+            .contains_key(&closeout.accepted_release.id)
+        {
             return Err(corrupt("closeout accepted release is missing"));
         }
     }
@@ -133,11 +138,7 @@ pub fn validate_delivery_aggregate_references(
                 .gates
                 .get(&gate_ref.id)
                 .ok_or_else(|| corrupt("QA run gate is missing"))?;
-            let digest = ContentDigest::of_domain(
-                "qa-release-gate",
-                DELIVERY_SCHEMA_V1,
-                gate,
-            )?;
+            let digest = ContentDigest::of_domain("qa-release-gate", DELIVERY_SCHEMA_V1, gate)?;
             if gate_ref.generation != gate.generation || gate_ref.digest != digest {
                 return Err(corrupt("QA run gate reference is stale"));
             }
@@ -169,11 +170,7 @@ pub fn validate_delivery_aggregate_references(
             .qa_plans
             .get(&gate.plan.id)
             .ok_or_else(|| corrupt("QA gate plan is missing"))?;
-        let gate_digest = ContentDigest::of_domain(
-            "qa-release-gate",
-            DELIVERY_SCHEMA_V1,
-            gate,
-        )?;
+        let gate_digest = ContentDigest::of_domain("qa-release-gate", DELIVERY_SCHEMA_V1, gate)?;
         if gate.candidate.generation != candidate.generation
             || gate.candidate.digest != candidate.candidate_digest
             || gate.plan.generation != plan.generation
@@ -239,17 +236,23 @@ pub fn validate_delivery_aggregate_references(
             .candidates
             .get(&approval.candidate.id)
             .ok_or_else(|| corrupt("approval candidate is missing"))?;
-        let gate = aggregate
-            .gates
-            .get(&approval.gate.id)
-            .ok_or_else(|| corrupt("approval gate is missing"))?;
-        let gate_digest = ContentDigest::of_domain("qa-release-gate", DELIVERY_SCHEMA_V1, gate)?;
         if approval.candidate.generation != candidate.generation
             || approval.candidate.digest != candidate.candidate_digest
-            || approval.gate.generation != gate.generation
-            || approval.gate.digest != gate_digest
         {
-            return Err(corrupt("approval reference is stale"));
+            return Err(corrupt("approval candidate reference is stale"));
+        }
+        if let Some(gate) = aggregate.gates.get(&approval.gate.id) {
+            let gate_digest =
+                ContentDigest::of_domain("qa-release-gate", DELIVERY_SCHEMA_V1, gate)?;
+            if approval.gate.generation != gate.generation
+                || approval.gate.digest != gate_digest
+            {
+                return Err(corrupt("approval gate reference is stale"));
+            }
+        } else if candidate.state != CandidateState::QaRunning {
+            return Err(corrupt(
+                "approval gate is missing outside staged QA review",
+            ));
         }
     }
     for manifest in aggregate.manifests.values() {
@@ -261,11 +264,7 @@ pub fn validate_delivery_aggregate_references(
             .gates
             .get(&manifest.qa_gate.id)
             .ok_or_else(|| corrupt("release manifest QA gate is missing"))?;
-        let gate_digest = ContentDigest::of_domain(
-            "qa-release-gate",
-            DELIVERY_SCHEMA_V1,
-            gate,
-        )?;
+        let gate_digest = ContentDigest::of_domain("qa-release-gate", DELIVERY_SCHEMA_V1, gate)?;
         if manifest.candidate.generation != candidate.generation
             || manifest.candidate.digest != candidate.candidate_digest
             || manifest.qa_gate.generation != gate.generation
@@ -385,10 +384,7 @@ pub fn canonical_release_reference_digest(
     let rollout = release.rollout_receipt.as_ref().ok_or_else(|| {
         DeliveryError::CorruptStore("release rollout receipt is missing".to_string())
     })?;
-    if rollout.id.is_empty()
-        || rollout.generation == 0
-        || rollout.digest == ContentDigest::zero()
-    {
+    if rollout.id.is_empty() || rollout.generation == 0 || rollout.digest == ContentDigest::zero() {
         return Err(DeliveryError::CorruptStore(
             "release rollout receipt is invalid".to_string(),
         ));
@@ -406,9 +402,7 @@ pub fn canonical_release_reference_digest(
     )
 }
 
-pub fn canonical_release_reference(
-    release: &ReleaseV1,
-) -> Result<VersionedRefV1, DeliveryError> {
+pub fn canonical_release_reference(release: &ReleaseV1) -> Result<VersionedRefV1, DeliveryError> {
     Ok(VersionedRefV1 {
         id: release.release_id.clone(),
         generation: release.generation,
@@ -602,7 +596,10 @@ impl PublicDeliveryLineageDtoV1 {
                     None,
                 )?;
                 lookup.insert(
-                    format!("artifact:{}:{}", candidate.candidate_id, artifact.artifact_id),
+                    format!(
+                        "artifact:{}:{}",
+                        candidate.candidate_id, artifact.artifact_id
+                    ),
                     artifact_id,
                 );
             }
@@ -658,7 +655,11 @@ impl PublicDeliveryLineageDtoV1 {
                 &mut nodes,
                 DeliveryLineageStageV1::Review,
                 "Independent review",
-                if review.approved { "approved" } else { "recorded" },
+                if review.approved {
+                    "approved"
+                } else {
+                    "recorded"
+                },
                 ContentDigest::of_domain("review-lineage", DELIVERY_SCHEMA_V1, review)?,
                 review.generation,
                 AuthorityRole::Qa,
@@ -686,7 +687,11 @@ impl PublicDeliveryLineageDtoV1 {
                 &mut nodes,
                 DeliveryLineageStageV1::Finding,
                 "Review finding",
-                if finding.resolved_by.is_some() { "resolved" } else { "unresolved" },
+                if finding.resolved_by.is_some() {
+                    "resolved"
+                } else {
+                    "unresolved"
+                },
                 ContentDigest::of_domain("finding-lineage", DELIVERY_SCHEMA_V1, finding)?,
                 finding.generation,
                 AuthorityRole::Qa,
@@ -833,7 +838,8 @@ impl PublicDeliveryLineageDtoV1 {
 
         for rollback in aggregate.rollbacks.values() {
             let key = format!("rollback:{}", rollback.rollback_id);
-            let digest = ContentDigest::of_domain("rollback-lineage", DELIVERY_SCHEMA_V1, rollback)?;
+            let digest =
+                ContentDigest::of_domain("rollback-lineage", DELIVERY_SCHEMA_V1, rollback)?;
             let id = push_node(
                 &mut nodes,
                 DeliveryLineageStageV1::Rollback,
@@ -850,7 +856,8 @@ impl PublicDeliveryLineageDtoV1 {
 
         for closeout in aggregate.closeouts.values() {
             let key = format!("closeout:{}", closeout.closeout_id);
-            let digest = ContentDigest::of_domain("closeout-lineage", DELIVERY_SCHEMA_V1, closeout)?;
+            let digest =
+                ContentDigest::of_domain("closeout-lineage", DELIVERY_SCHEMA_V1, closeout)?;
             let id = push_node(
                 &mut nodes,
                 DeliveryLineageStageV1::Closeout,
@@ -878,7 +885,9 @@ impl PublicDeliveryLineageDtoV1 {
             .nodes
             .iter()
             .find(|node| node.kind == WorkflowLineageKindV1::Project)
-            .ok_or_else(|| DeliveryError::CorruptStore("workflow project node missing".to_string()))?;
+            .ok_or_else(|| {
+                DeliveryError::CorruptStore("workflow project node missing".to_string())
+            })?;
         for candidate in aggregate.candidates.values() {
             required_link(
                 &mut edges,
@@ -891,7 +900,10 @@ impl PublicDeliveryLineageDtoV1 {
                     &mut edges,
                     &lookup,
                     &format!("candidate:{}", candidate.candidate_id),
-                    &format!("artifact:{}:{}", candidate.candidate_id, artifact.artifact_id),
+                    &format!(
+                        "artifact:{}:{}",
+                        candidate.candidate_id, artifact.artifact_id
+                    ),
                 )?;
             }
         }
@@ -937,9 +949,14 @@ impl PublicDeliveryLineageDtoV1 {
             }
         }
         for release in aggregate.releases.values() {
-            let manifest = aggregate.manifests.get(&release.manifest.id).ok_or_else(|| {
-                DeliveryError::CorruptStore("required release manifest edge is missing".to_string())
-            })?;
+            let manifest = aggregate
+                .manifests
+                .get(&release.manifest.id)
+                .ok_or_else(|| {
+                    DeliveryError::CorruptStore(
+                        "required release manifest edge is missing".to_string(),
+                    )
+                })?;
             required_link(
                 &mut edges,
                 &lookup,
@@ -960,16 +977,36 @@ impl PublicDeliveryLineageDtoV1 {
             )?;
         }
         for review in aggregate.reviews.values() {
-            required_link(&mut edges, &lookup, &format!("candidate:{}", review.candidate.id), &format!("review:{}", review.review_id))?;
+            required_link(
+                &mut edges,
+                &lookup,
+                &format!("candidate:{}", review.candidate.id),
+                &format!("review:{}", review.review_id),
+            )?;
         }
         for test in aggregate.test_runs.values() {
-            required_link(&mut edges, &lookup, &format!("candidate:{}", test.candidate.id), &format!("test:{}", test.test_run_id))?;
+            required_link(
+                &mut edges,
+                &lookup,
+                &format!("candidate:{}", test.candidate.id),
+                &format!("test:{}", test.test_run_id),
+            )?;
         }
         for finding in aggregate.findings.values() {
-            required_link(&mut edges, &lookup, &format!("candidate:{}", finding.candidate.id), &format!("finding:{}", finding.finding_id))?;
+            required_link(
+                &mut edges,
+                &lookup,
+                &format!("candidate:{}", finding.candidate.id),
+                &format!("finding:{}", finding.finding_id),
+            )?;
         }
         for approval in aggregate.approvals.values() {
-            required_link(&mut edges, &lookup, &format!("candidate:{}", approval.candidate.id), &format!("approval:{}", approval.approval_id))?;
+            required_link(
+                &mut edges,
+                &lookup,
+                &format!("candidate:{}", approval.candidate.id),
+                &format!("approval:{}", approval.approval_id),
+            )?;
         }
         for delivery in aggregate.deliveries.values() {
             required_link(
@@ -1137,13 +1174,13 @@ fn validate_workflow_lineage(
             || !ordinals.insert(node.node_ordinal)
             || node.generation == 0
             || node.digest == ContentDigest::zero()
-            || (node.kind == WorkflowLineageKindV1::Participant
-                && node.participant_role.is_none())
-            || (node.kind != WorkflowLineageKindV1::Participant
-                && node.participant_role.is_some())
+            || (node.kind == WorkflowLineageKindV1::Participant && node.participant_role.is_none())
+            || (node.kind != WorkflowLineageKindV1::Participant && node.participant_role.is_some())
             || !workflow_state_allowed(node.kind, node.state)
         {
-            return Err(corrupt("node inventory is malformed or contains private labels"));
+            return Err(corrupt(
+                "node inventory is malformed or contains private labels",
+            ));
         }
         kinds.insert(node.kind);
         kind_ordinals
@@ -1217,7 +1254,9 @@ fn validate_workflow_lineage(
     }
     let reachable = reachable_ordinals(request, &adjacency);
     if reachable != ordinals {
-        return Err(corrupt("workflow topology is disconnected from the request"));
+        return Err(corrupt(
+            "workflow topology is disconnected from the request",
+        ));
     }
     let project_reachable = reachable_ordinals(project, &adjacency);
     if snapshot.nodes.iter().any(|node| {
@@ -1228,7 +1267,9 @@ fn validate_workflow_lineage(
                 | WorkflowLineageKindV1::Project
         ) && !project_reachable.contains(&node.node_ordinal)
     }) {
-        return Err(corrupt("dynamic workflow node is not bound below the project"));
+        return Err(corrupt(
+            "dynamic workflow node is not bound below the project",
+        ));
     }
     Ok(())
 }
@@ -1247,25 +1288,33 @@ fn reachable_ordinals(start: u32, adjacency: &BTreeMap<u32, Vec<u32>>) -> BTreeS
 fn workflow_state_allowed(kind: WorkflowLineageKindV1, state: WorkflowLineageStateV1) -> bool {
     matches!(
         (kind, state),
-        (WorkflowLineageKindV1::CustomerRequest, WorkflowLineageStateV1::Requested)
-            | (WorkflowLineageKindV1::Agreement, WorkflowLineageStateV1::Approved)
-            | (
-                WorkflowLineageKindV1::Project,
-                WorkflowLineageStateV1::Active | WorkflowLineageStateV1::Completed
-            )
-            | (
-                WorkflowLineageKindV1::WorkItem,
-                WorkflowLineageStateV1::Active
-                    | WorkflowLineageStateV1::Completed
-                    | WorkflowLineageStateV1::Blocked
-            )
-            | (WorkflowLineageKindV1::Participant, WorkflowLineageStateV1::Active)
-            | (WorkflowLineageKindV1::Decision, WorkflowLineageStateV1::Approved)
-            | (WorkflowLineageKindV1::Handoff, WorkflowLineageStateV1::HandedOff)
-            | (
-                WorkflowLineageKindV1::Blocker,
-                WorkflowLineageStateV1::Blocked | WorkflowLineageStateV1::Clear
-            )
+        (
+            WorkflowLineageKindV1::CustomerRequest,
+            WorkflowLineageStateV1::Requested
+        ) | (
+            WorkflowLineageKindV1::Agreement,
+            WorkflowLineageStateV1::Approved
+        ) | (
+            WorkflowLineageKindV1::Project,
+            WorkflowLineageStateV1::Active | WorkflowLineageStateV1::Completed
+        ) | (
+            WorkflowLineageKindV1::WorkItem,
+            WorkflowLineageStateV1::Active
+                | WorkflowLineageStateV1::Completed
+                | WorkflowLineageStateV1::Blocked
+        ) | (
+            WorkflowLineageKindV1::Participant,
+            WorkflowLineageStateV1::Active
+        ) | (
+            WorkflowLineageKindV1::Decision,
+            WorkflowLineageStateV1::Approved
+        ) | (
+            WorkflowLineageKindV1::Handoff,
+            WorkflowLineageStateV1::HandedOff
+        ) | (
+            WorkflowLineageKindV1::Blocker,
+            WorkflowLineageStateV1::Blocked | WorkflowLineageStateV1::Clear
+        )
     )
 }
 
