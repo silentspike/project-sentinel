@@ -39,6 +39,7 @@ class FakeRunner:
     def __init__(self, fixture: "Fixture") -> None:
         self.fixture = fixture
         self.calls: list[tuple[str, ...]] = []
+        self.environments: list[dict[str, str]] = []
         self.states = {
             unit: {"LoadState": "loaded", "ActiveState": "inactive",
                    "SubState": "dead", "Result": "success"}
@@ -52,16 +53,26 @@ class FakeRunner:
         self.nightrun_fails_after_start = False
         self.mutate_during_preflight: str | None = None
         self.journey_effects: dict[str, int] = {}
+        self.after_target_start = False
+        self.show_failure_unit: str | None = None
+        self.target_start_returncode = 0
+        self.journey_mutation: str | None = None
+        self.journey_mutation_final_only = False
 
-    def __call__(self, argv: tuple[str, ...], timeout: float) -> control.Result:
+    def __call__(
+        self, argv: tuple[str, ...], timeout: float, environment: dict[str, str]
+    ) -> control.Result:
         del timeout
         self.calls.append(argv)
+        self.environments.append(dict(environment))
         if self.fail_command is not None and argv[:len(self.fail_command)] == self.fail_command:
             return control.Result(1, b"private /work/path secret")
         if argv[0] == str(control.SYSTEMCTL):
             verb = argv[1]
             if verb == "show":
                 unit = argv[2]
+                if self.after_target_start and unit == self.show_failure_unit:
+                    return control.Result(1)
                 state = self.states[unit]
                 properties = argv[3].removeprefix("--property=").split(",")
                 data = "".join(f"{key}={state[key]}\n" for key in properties)
@@ -69,6 +80,7 @@ class FakeRunner:
             if verb == "daemon-reload":
                 return control.Result(0)
             if verb == "start":
+                self.after_target_start = True
                 for unit in control.ALL_UNITS:
                     if self.partial_start_at == unit:
                         break
@@ -76,7 +88,7 @@ class FakeRunner:
                 if self.nightrun_fails_after_start:
                     self.states["sentinel-nightrun.service"]["Result"] = "failed"
                     self.readiness_failure = True
-                return control.Result(0)
+                return control.Result(self.target_start_returncode)
             if verb == "stop":
                 unit = argv[2]
                 if self.rollback_failure == unit:
@@ -107,6 +119,11 @@ class FakeRunner:
             if "--stop-after-checkpoint" in argv:
                 checkpoint = argv[argv.index("--stop-after-checkpoint") + 1]
             self._journey(checkpoint)
+            if self.journey_mutation is not None and (
+                not self.journey_mutation_final_only or checkpoint is None
+            ):
+                self._mutate_journey_state(self.journey_mutation)
+                self.journey_mutation = None
             return control.Result(0, b"public journey result\n")
         raise AssertionError(f"unexpected command: {argv}")
 
@@ -120,25 +137,119 @@ class FakeRunner:
         self.states[unit].update(ActiveState="active", SubState=sub, Result="success")
 
     def _journey(self, checkpoint: str | None) -> None:
-        completed = []
-        for item in self.fixture.plan["steps"]:
-            completed.append(item["id"])
-            self.journey_effects[item["id"]] = 1
-            if item.get("checkpoint") == checkpoint:
+        module = self.fixture.journey_contract.module
+        if self.fixture.ledger.exists():
+            ledger = json.loads(self.fixture.ledger.read_text())
+        else:
+            ledger = {
+                "schema_version": self.fixture.plan["schema_version"],
+                "journey_id": self.fixture.plan["journey_id"],
+                "plan_digest": module.digest(self.fixture.plan),
+                "target_origin": module.validate_base_url("http://127.0.0.1:8084"),
+                "chain_tip": module.ZERO_DIGEST,
+                "completed": {},
+            }
+        replayed: set[str] = set()
+        for step in self.fixture.plan["steps"]:
+            step_id = step["id"]
+            if step_id in ledger["completed"]:
+                replayed.add(step_id)
+            else:
+                captures = {}
+                for name, specification in step.get("capture", {}).items():
+                    capture_type = specification["type"]
+                    if capture_type == "digest":
+                        value: object = hashlib.sha256(name.encode("ascii")).hexdigest()
+                    elif capture_type == "state":
+                        value = "accepted"
+                    elif capture_type == "boolean":
+                        value = True
+                    elif capture_type == "integer":
+                        value = 1
+                    else:
+                        value = f"{name}-1"
+                    captures[name] = value
+                record = {
+                    "captures": captures,
+                    "checkpoint": step.get("checkpoint"),
+                    "kind": step.get("kind", "positive"),
+                    "method": step["method"],
+                    "operation_id": module.stable_operation_id(
+                        self.fixture.plan["journey_id"], step_id
+                    ),
+                    "path": step["path"],
+                    "phase": step["phase"],
+                    "prior_record_digest": ledger["chain_tip"],
+                    "query": "",
+                    "replay_contract": "server_response_verified",
+                    "request_digest": hashlib.sha256(
+                        f"request:{step_id}".encode("ascii")
+                    ).hexdigest(),
+                    "status": step.get("expected_status", [200])[0],
+                }
+                record["record_digest"] = module.record_digest(record)
+                ledger["completed"][step_id] = record
+                ledger["chain_tip"] = record["record_digest"]
+                self.journey_effects[step_id] = 1
+            if checkpoint is not None and step.get("checkpoint") == checkpoint:
                 break
-        if checkpoint is None:
-            completed = [item["id"] for item in self.fixture.plan["steps"]]
-        ledger = {"completed": completed, "stable": True}
         self.fixture.ledger.write_bytes(encoded(ledger))
-        evidence = {
-            "result": "checkpoint_reached" if checkpoint else "complete",
-            "stopped_at": checkpoint, "record_chain_tip": hashlib.sha256(
-                "|".join(completed).encode("ascii")
-            ).hexdigest(),
-            "replay_verified_steps": completed if checkpoint is None else [],
-            "steps": [{"id": item} for item in completed],
-        }
+        evidence = module.build_evidence(
+            self.fixture.plan, ledger,
+            "checkpoint_reached" if checkpoint else "complete",
+            checkpoint, replayed,
+        )
         self.fixture.evidence.write_bytes(encoded(evidence))
+
+    def _mutate_journey_state(self, mutation: str) -> None:
+        ledger = json.loads(self.fixture.ledger.read_text())
+        evidence = json.loads(self.fixture.evidence.read_text())
+        if mutation == "empty_ledger":
+            self.fixture.ledger.write_bytes(encoded({}))
+        elif mutation == "empty_evidence":
+            self.fixture.evidence.write_bytes(encoded({}))
+        elif mutation == "noncanonical_ledger":
+            self.fixture.ledger.write_bytes(self.fixture.ledger.read_bytes() + b" \n")
+        elif mutation == "noncanonical_evidence":
+            self.fixture.evidence.write_bytes(self.fixture.evidence.read_bytes() + b" \n")
+        elif mutation == "reordered_evidence":
+            evidence["steps"] = list(reversed(evidence["steps"]))
+            self.fixture.evidence.write_bytes(encoded(evidence))
+        elif mutation == "reordered_ledger":
+            keys = list(ledger["completed"])
+            if len(keys) < 2:
+                raise AssertionError("reordered ledger fixture needs two records")
+            ledger["completed"][keys[0]], ledger["completed"][keys[1]] = (
+                ledger["completed"][keys[1]], ledger["completed"][keys[0]]
+            )
+            self.fixture.ledger.write_bytes(encoded(ledger))
+        elif mutation == "foreign_plan":
+            ledger["plan_digest"] = "f" * 64
+            self.fixture.ledger.write_bytes(encoded(ledger))
+        elif mutation == "changed_plan_file":
+            plan = copy.deepcopy(self.fixture.plan)
+            plan["journey_id"] = "journey-forged"
+            self.fixture.plan_path.write_bytes(encoded(plan))
+        elif mutation == "foreign_origin":
+            ledger["target_origin"] = "http://127.0.0.1:9999"
+            self.fixture.ledger.write_bytes(encoded(ledger))
+        elif mutation == "semantic_record":
+            module = self.fixture.journey_contract.module
+            prior = module.ZERO_DIGEST
+            for index, step in enumerate(self.fixture.plan["steps"]):
+                step_id = step["id"]
+                if step_id not in ledger["completed"]:
+                    break
+                record = ledger["completed"][step_id]
+                if index == 0:
+                    record["path"] = "/operator/forbidden"
+                record["prior_record_digest"] = prior
+                record["record_digest"] = module.record_digest(record)
+                prior = record["record_digest"]
+            ledger["chain_tip"] = prior
+            self.fixture.ledger.write_bytes(encoded(ledger))
+        else:
+            raise AssertionError(f"unknown journey mutation: {mutation}")
 
 
 class Fixture:
@@ -187,6 +298,7 @@ class Fixture:
         self.control_sha = control.digest_bytes(self.control_path.read_bytes())
         for path in (self.manifest, self.provision, self.plan_path, self.control_path):
             path.chmod(0o600)
+        self.journey_contract = control.load_journey_contract(self.plan_path)
 
     def preflight(self) -> control.PreflightArgs:
         return control.PreflightArgs(
@@ -226,8 +338,15 @@ class ControlTests(unittest.TestCase):
             control, "CONTROL_LOCK", self.root / ".m0-activation-control.lock"
         )
         self.lock_patch.start()
+        self.environment_patch = mock.patch.dict(os.environ, {
+            "OPERATOR_TOKEN": "operator-secret-value",
+            "CUSTOMER_TOKEN": "customer-secret-value",
+            "AGENT_TOKEN": "agent-secret-value",
+        })
+        self.environment_patch.start()
 
     def tearDown(self) -> None:
+        self.environment_patch.stop()
         self.lock_patch.stop()
         shutil.rmtree(self.root, ignore_errors=True)
 
@@ -245,6 +364,30 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(mutations[1], (str(control.SYSTEMCTL), "start", control.TARGET))
         self.assertEqual(len(mutations), 2)
         self.assertFalse(result["m0_acceptance_pass"])
+
+    def test_child_environment_is_exact_and_secret_values_never_enter_argv(self) -> None:
+        hostile = {
+            "LD_PRELOAD": "/private/inject.so",
+            "PYTHONPATH": "/private/python",
+            "PYTHONSTARTUP": "/private/start.py",
+            "HTTP_PROXY": "http://proxy.invalid",
+            "PROVIDER_API_KEY": "foreign-provider-secret",
+            "UNRELATED_TOKEN": "foreign-secret",
+        }
+        with mock.patch.dict(os.environ, hostile, clear=False):
+            self.fixture.restart(self.runner)
+        credential_names = {"OPERATOR_TOKEN", "CUSTOMER_TOKEN", "AGENT_TOKEN"}
+        for argv, environment in zip(self.runner.calls, self.runner.environments):
+            expected = dict(control.BASE_CHILD_ENV)
+            if argv[:2] == (str(control.PYTHON), str(control.JOURNEY_PROGRAM)):
+                expected.update({name: os.environ[name] for name in credential_names})
+            self.assertEqual(environment, expected)
+            joined = "\0".join(argv)
+            for secret in (*hostile.values(), *(os.environ[name] for name in credential_names)):
+                self.assertNotIn(secret, joined)
+        persisted = self.fixture.restart_receipt.read_text()
+        for secret in (*hostile.values(), *(os.environ[name] for name in credential_names)):
+            self.assertNotIn(secret, persisted)
 
     def test_repository_target_topology_is_the_controller_authority(self) -> None:
         target = (HERE.parents[2] / "deploy/systemd/sentinel.target").read_text()
@@ -374,9 +517,38 @@ class ControlTests(unittest.TestCase):
         with self.assertRaisesRegex(control.ControlError, "target_start_failed"):
             self.fixture.activate(self.runner)
         stops = [call for call in self.runner.calls if call[1] == "stop"]
-        self.assertEqual(stops, [(str(control.SYSTEMCTL), "stop", control.TARGET)])
+        self.assertEqual(
+            stops,
+            [
+                (str(control.SYSTEMCTL), "stop", unit)
+                for unit in control.ROLLBACK_ORDER
+            ],
+        )
 
-    def test_partial_start_and_readiness_failure_roll_back_only_started_units(self) -> None:
+    def test_partial_failed_start_and_readback_error_stop_full_topology_target_first(self) -> None:
+        cases = ("partial_failed_start", "post_start_readback_error")
+        for case in cases:
+            with self.subTest(case=case):
+                fixture = Fixture(self.root / case)
+                runner = FakeRunner(fixture)
+                if case == "partial_failed_start":
+                    runner.partial_start_at = control.TOPOLOGY[4]
+                    runner.target_start_returncode = 1
+                    reason = "target_start_failed"
+                else:
+                    runner.show_failure_unit = control.TOPOLOGY[4]
+                    reason = "activation_rollback_failed"
+                with self.assertRaisesRegex(control.ControlError, reason):
+                    fixture.activate(runner)
+                stopped = [call[2] for call in runner.calls if call[1] == "stop"]
+                self.assertEqual(stopped, list(control.ROLLBACK_ORDER))
+                self.assertEqual(stopped[0], control.TARGET)
+                self.assertTrue(all(
+                    runner.states[unit]["ActiveState"] == "inactive"
+                    for unit in control.ALL_UNITS
+                ))
+
+    def test_partial_start_and_readiness_failure_roll_back_full_owned_topology(self) -> None:
         for partial, readiness in ((control.SERVICES[3], False), (None, True)):
             with self.subTest(partial=partial, readiness=readiness):
                 self.fixture.activation.unlink(missing_ok=True)
@@ -386,10 +558,9 @@ class ControlTests(unittest.TestCase):
                 with self.assertRaises(control.ControlError):
                     self.fixture.activate(runner)
                 stopped = [call[2] for call in runner.calls if call[1] == "stop"]
-                self.assertTrue(set(stopped).issubset(set(control.ALL_UNITS)))
+                self.assertEqual(stopped, list(control.ROLLBACK_ORDER))
                 self.assertNotIn("foreign.service", stopped)
-                expected_order = [unit for unit in control.ROLLBACK_ORDER if unit in stopped]
-                self.assertEqual(stopped, expected_order)
+                self.assertEqual(stopped[0], control.TARGET)
                 self.assertTrue(all(
                     runner.states[unit]["ActiveState"] == "inactive" for unit in stopped
                 ))
@@ -412,6 +583,48 @@ class ControlTests(unittest.TestCase):
             self.runner.journey_effects,
             {step["id"]: 1 for step in self.fixture.plan["steps"]},
         )
+
+    def test_journey_ssot_rejects_tampered_ledger_and_evidence_before_restart(self) -> None:
+        mutations = (
+            "empty_ledger", "empty_evidence", "noncanonical_ledger",
+            "noncanonical_evidence", "reordered_evidence", "reordered_ledger",
+            "foreign_plan", "changed_plan_file", "foreign_origin",
+            "semantic_record",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                fixture = Fixture(self.root / mutation)
+                runner = FakeRunner(fixture)
+                runner.journey_mutation = mutation
+                with self.assertRaises(control.ControlError):
+                    fixture.restart(runner)
+                self.assertFalse(any(call[1] == "restart" for call in runner.calls))
+
+    def test_final_empty_evidence_cannot_claim_authoritative_replay(self) -> None:
+        self.runner.journey_mutation = "empty_evidence"
+        self.runner.journey_mutation_final_only = True
+        with self.assertRaises(control.ControlError):
+            self.fixture.restart(self.runner)
+        self.assertFalse(self.fixture.restart_receipt.exists())
+
+    def test_bounded_process_kills_oversized_and_timed_out_children(self) -> None:
+        scripts = (
+            ("oversized", "import os; os.write(1, b'x' * (4 * 1024 * 1024 + 1))",
+             2.0, "command_output_oversized"),
+            ("timeout", "import time; time.sleep(10)", 0.05, "command_timeout"),
+        )
+        for name, source, timeout, reason in scripts:
+            with self.subTest(name=name):
+                helper = self.root / f"{name}.py"
+                helper.write_text(source, encoding="ascii")
+                helper.chmod(0o600)
+                with mock.patch.object(control, "PREFLIGHT_PROGRAM", helper):
+                    argv = (str(control.PYTHON), str(helper))
+                    environment = control.child_environment(argv)
+                    started = __import__("time").monotonic()
+                    with self.assertRaisesRegex(control.ControlError, reason):
+                        control.production_runner(argv, timeout, environment)
+                    self.assertLess(__import__("time").monotonic() - started, 3.0)
 
     def test_restart_control_rejects_unsafe_unit_digest_and_executable(self) -> None:
         bad = copy.deepcopy(self.fixture.control_value)
