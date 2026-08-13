@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 from urllib import parse
 import uuid
 
@@ -41,6 +42,7 @@ class FakeState:
         self.entered = threading.Event()
         self.redirect_location: str | None = None
         self.response_overrides: dict[str, dict[str, object]] = {}
+        self.response_sequences: dict[str, list[tuple[int, dict[str, object]]]] = {}
         self.seen_operations: set[tuple[str, str]] = set()
         self.targets: list[str] = []
 
@@ -120,15 +122,35 @@ class FakeHandler(BaseHTTPRequestHandler):
             return
 
         expected_tokens = {
-            "/operator/readiness": "operator-secret-value",
-            "/customer/workflow/commands": "customer-secret-value",
-            "/operator/workflow/commands": "operator-secret-value",
-            "/agent/workflow/commands": "agent-secret-value",
-            "/operator/delivery/commands": "operator-secret-value",
-            "/customer/delivery/commands": "customer-secret-value",
+            "/operator/readiness": {
+                "operator-secret-value",
+                "project-secret-value",
+                "release-secret-value",
+            },
+            "/operator/observe": {
+                "operator-secret-value",
+                "project-secret-value",
+            },
+            "/customer/workflow/commands": {"customer-secret-value"},
+            "/operator/workflow/commands": {
+                "operator-secret-value",
+                "project-secret-value",
+                "release-secret-value",
+            },
+            "/agent/workflow/commands": {
+                "agent-secret-value",
+                "developer-secret-value",
+            },
+            "/operator/delivery/commands": {
+                "operator-secret-value",
+                "release-secret-value",
+            },
+            "/customer/delivery/commands": {"customer-secret-value"},
         }
         expected = expected_tokens.get(path)
-        if expected is not None and authorization != f"Bearer {expected}":
+        if expected is not None and authorization not in {
+            f"Bearer {token}" for token in expected
+        }:
             self.write_json(403, {"code": "authority_denied"})
             return
         if path == "/operator/forbidden" and authorization == "Bearer customer-secret-value":
@@ -138,15 +160,24 @@ class FakeHandler(BaseHTTPRequestHandler):
             self.write_json(503, {"code": "execution_unavailable"})
             return
 
+        replayed = False
         if body is not None and isinstance(body.get("operation_id"), str):
             operation_key = (path, body["operation_id"])
-            if operation_key not in state.seen_operations:
+            replayed = operation_key in state.seen_operations
+            if not replayed:
                 state.seen_operations.add(operation_key)
                 state.effective_mutations[path] += 1
+
+        sequence = state.response_sequences.get(path)
+        if sequence:
+            status, payload = sequence.pop(0)
+            self.write_json(status, payload)
+            return
 
         responses = {
             "/readiness": {"ready": True, "status": "ready"},
             "/operator/readiness": {"ready": True, "status": "ready"},
+            "/operator/observe": {"state": "ready", "generation": 1},
             "/customer/workflow/commands": {
                 "request_id": "request-1",
                 "request_digest": DIGEST_A,
@@ -174,6 +205,9 @@ class FakeHandler(BaseHTTPRequestHandler):
         response = self.server.state.response_overrides.get(
             path, responses.get(path, {"ok": True})
         )
+        if body is not None:
+            marker = "duplicate" if "/delivery/" in path else "replayed"
+            response = {marker: replayed, **response}
         if body is not None:
             for key in ("request_id", "request_digest", "artifact_digest", "delivery_id"):
                 if key in body:
@@ -381,6 +415,57 @@ def canonical_plan() -> dict[str, object]:
     }
 
 
+def canonical_plan_v2() -> dict[str, object]:
+    plan = json.loads(json.dumps(canonical_plan()))
+    plan["schema_version"] = 2
+    aliases = {
+        "readiness": "operator_observer",
+        "submit": "customer_primary",
+        "plan_project": "operator_project",
+        "authority_negative": "customer_primary",
+        "execute": "agent_developer",
+        "qa_release": "operator_release",
+        "delivery": "operator_release",
+        "acceptance": "customer_primary",
+    }
+    for step in plan["steps"]:
+        step["credential_alias"] = aliases[step["id"]]
+        step.pop("role")
+        if step["kind"] == "positive":
+            marker = "duplicate" if "/delivery/" in step["path"] else "replayed"
+            step["initial_assertions"] = [
+                {"pointer": f"/{marker}", "equals": False}
+            ]
+            step["replay_assertions"] = [
+                {"pointer": f"/{marker}", "equals": True}
+            ]
+    observe = {
+        "id": "observe_project",
+        "phase": "governed_project",
+        "kind": "observe",
+        "method": "GET",
+        "path": "/operator/observe",
+        "credential_alias": "operator_project",
+        "route_role": "operator",
+        "query": {"project_id": {"$ref": "plan_project.project_id"}},
+        "expected_status": [200],
+        "assertions": [{"pointer": "/state", "equals": "ready"}],
+        "capture": {
+            "state": {"pointer": "/state", "type": "state"},
+            "generation": {"pointer": "/generation", "type": "integer"},
+        },
+        "observe": {
+            "max_attempts": 3,
+            "interval_ms": 0,
+            "max_elapsed_ms": 1_000,
+            "retry_statuses": [404, 409],
+            "replay": "exact_status_and_captures",
+        },
+    }
+    plan["steps"].insert(4, observe)
+    return plan
+
+
 class JourneyRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_safe_root = runner.SAFE_ROOT
@@ -403,12 +488,41 @@ class JourneyRunnerTests(unittest.TestCase):
             "customer": "M0_TEST_CUSTOMER_CREDENTIAL",
             "agent": "M0_TEST_AGENT_CREDENTIAL",
         }
+        self.v2_credentials = {
+            "operator_observer": {
+                "role": "operator",
+                "env": "M0_TEST_OPERATOR_CREDENTIAL",
+            },
+            "operator_project": {
+                "role": "operator",
+                "env": "M0_TEST_PROJECT_CREDENTIAL",
+            },
+            "operator_release": {
+                "role": "operator",
+                "env": "M0_TEST_RELEASE_CREDENTIAL",
+            },
+            "customer_primary": {
+                "role": "customer",
+                "env": "M0_TEST_CUSTOMER_CREDENTIAL",
+            },
+            "agent_developer": {
+                "role": "agent",
+                "env": "M0_TEST_DEVELOPER_CREDENTIAL",
+            },
+        }
+        all_environment_names = {
+            *self.credentials.values(),
+            *(binding["env"] for binding in self.v2_credentials.values()),
+        }
         self.old_environment = {
-            name: os.environ.get(name) for name in self.credentials.values()
+            name: os.environ.get(name) for name in all_environment_names
         }
         os.environ["M0_TEST_OPERATOR_CREDENTIAL"] = "operator-secret-value"
         os.environ["M0_TEST_CUSTOMER_CREDENTIAL"] = "customer-secret-value"
         os.environ["M0_TEST_AGENT_CREDENTIAL"] = "agent-secret-value"
+        os.environ["M0_TEST_PROJECT_CREDENTIAL"] = "project-secret-value"
+        os.environ["M0_TEST_RELEASE_CREDENTIAL"] = "release-secret-value"
+        os.environ["M0_TEST_DEVELOPER_CREDENTIAL"] = "developer-secret-value"
 
     def tearDown(self) -> None:
         self.server.shutdown()
@@ -432,6 +546,19 @@ class JourneyRunnerTests(unittest.TestCase):
             canonical_plan() if plan is None else plan,
             self.base_url,
             self.credentials,
+            self.ledger,
+            self.evidence,
+            1.0,
+            checkpoint,
+        )
+
+    def run_plan_v2(
+        self, plan: dict[str, object] | None = None, checkpoint: str | None = None
+    ) -> dict[str, object]:
+        return runner.run_journey(
+            canonical_plan_v2() if plan is None else plan,
+            self.base_url,
+            self.v2_credentials,
             self.ledger,
             self.evidence,
             1.0,
@@ -467,6 +594,311 @@ class JourneyRunnerTests(unittest.TestCase):
         )
         self.assertEqual(evidence["target_origin"], self.base_url)
         self.assertEqual(evidence["record_chain_tip"], records["acceptance"]["record_digest"])
+
+    def test_v1_ledger_shape_remains_byte_compatible(self) -> None:
+        self.run_plan(checkpoint="after_customer_request")
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        self.assertEqual(ledger["schema_version"], 1)
+        self.assertEqual(
+            ledger["plan_digest"],
+            "d7f98844941c3dbce00413f7069ed9d7dbd85bb30a40dca4ac135b4f2e119890",
+        )
+        self.assertEqual(
+            set(ledger["completed"]["submit"]),
+            {
+                "captures",
+                "checkpoint",
+                "kind",
+                "method",
+                "operation_id",
+                "path",
+                "phase",
+                "prior_record_digest",
+                "query",
+                "record_digest",
+                "replay_contract",
+                "request_digest",
+                "status",
+            },
+        )
+        self.assertEqual(
+            ledger["completed"]["submit"]["replay_contract"],
+            "server_response_verified",
+        )
+        self.assertEqual(
+            ledger["completed"]["submit"]["request_digest"],
+            "bc5293a26f492d4d49ce97c95ad2866dc076f7448246258999fb72ffd8980f9d",
+        )
+
+    def test_v2_aliases_and_replay_markers_preserve_one_effective_mutation(self) -> None:
+        first = self.run_plan_v2(checkpoint="after_governed_project")
+        completed = self.run_plan_v2()
+        replayed = self.run_plan_v2()
+        self.assertEqual(first["schema_version"], 2)
+        self.assertEqual(completed["result"], "complete")
+        self.assertEqual(
+            self.state.effective_mutations["/customer/workflow/commands"], 1
+        )
+        self.assertEqual(
+            self.state.effective_mutations["/operator/workflow/commands"], 1
+        )
+        self.assertEqual(
+            self.state.effective_mutations["/operator/delivery/commands"], 2
+        )
+        self.assertIn("qa_release", replayed["replay_verified_steps"])
+        self.assertIn("delivery", replayed["replay_verified_steps"])
+        records = {item["id"]: item for item in completed["steps"]}
+        self.assertEqual(
+            records["submit"]["auth_alias_digest"],
+            runner.credential_alias_digest("customer_primary"),
+        )
+        self.assertEqual(records["submit"]["auth_role"], "customer")
+        self.assertEqual(records["submit"]["replay_contract"], "idempotent_command_v2")
+        self.assertRegex(records["submit"]["response_contract_digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            records["observe_project"]["replay_contract"], "bounded_observe_v2"
+        )
+        persisted = self.ledger.read_text() + self.evidence.read_text()
+        for secret_or_environment in (
+            "customer-secret-value",
+            "project-secret-value",
+            "release-secret-value",
+            "developer-secret-value",
+            "M0_TEST_CUSTOMER_CREDENTIAL",
+            "M0_TEST_PROJECT_CREDENTIAL",
+        ):
+            self.assertNotIn(secret_or_environment, persisted)
+
+    def test_v2_credential_alias_validation_is_route_bound_and_secret_separated(self) -> None:
+        parsed = runner.validate_credentials(
+            [
+                "developer:agent=M0_TEST_DEVELOPER_CREDENTIAL",
+                "qa:agent=M0_TEST_AGENT_CREDENTIAL",
+            ],
+            2,
+        )
+        self.assertEqual(parsed["developer"]["role"], "agent")
+        self.assertEqual(parsed["qa"]["role"], "agent")
+
+        credentials = json.loads(json.dumps(self.v2_credentials))
+        credentials["operator_project"]["role"] = "customer"
+        with self.assertRaisesRegex(runner.JourneyError, "authenticated route"):
+            runner.run_journey(
+                canonical_plan_v2(),
+                self.base_url,
+                credentials,
+                self.ledger,
+                self.evidence,
+                1.0,
+            )
+        self.assertEqual(sum(self.state.calls.values()), 0)
+
+        credentials = json.loads(json.dumps(self.v2_credentials))
+        credentials["operator_project"]["env"] = credentials["operator_release"]["env"]
+        with self.assertRaisesRegex(runner.JourneyError, "references must be role-separated"):
+            runner.run_journey(
+                canonical_plan_v2(),
+                self.base_url,
+                credentials,
+                self.ledger,
+                self.evidence,
+                1.0,
+            )
+
+        credentials = json.loads(json.dumps(self.v2_credentials))
+        os.environ["M0_TEST_PROJECT_CREDENTIAL"] = "release-secret-value"
+        with self.assertRaisesRegex(runner.JourneyError, "values must be role-separated"):
+            runner.run_journey(
+                canonical_plan_v2(),
+                self.base_url,
+                credentials,
+                self.ledger,
+                self.evidence,
+                1.0,
+            )
+        os.environ["M0_TEST_PROJECT_CREDENTIAL"] = "project-secret-value"
+
+        credentials.pop("operator_project")
+        with self.assertRaisesRegex(runner.JourneyError, "missing for alias"):
+            runner.run_journey(
+                canonical_plan_v2(),
+                self.base_url,
+                credentials,
+                self.ledger,
+                self.evidence,
+                1.0,
+            )
+
+    def test_v2_observe_is_bounded_and_replayed_against_exact_captures(self) -> None:
+        self.state.response_sequences["/operator/observe"] = [
+            (404, {"code": "not_ready"}),
+            (200, {"state": "pending", "generation": 1}),
+            (200, {"state": "ready", "generation": 1}),
+        ]
+        completed = self.run_plan_v2()
+        records = {item["id"]: item for item in completed["steps"]}
+        self.assertEqual(records["observe_project"]["attempt_count"], 3)
+        self.assertEqual(records["observe_project"]["captures"]["state"], "ready")
+        calls = self.state.calls["/operator/observe"]
+        self.run_plan_v2()
+        self.assertEqual(self.state.calls["/operator/observe"], calls + 1)
+
+        self.state.response_overrides["/operator/observe"] = {
+            "state": "changed",
+            "generation": 1,
+        }
+        with self.assertRaisesRegex(runner.JourneyError, "observe bounds exhausted"):
+            self.run_plan_v2()
+
+    def test_v2_observe_503_is_immediate_and_attempt_bounds_fail_closed(self) -> None:
+        self.state.response_sequences["/operator/observe"] = [
+            (503, {"code": "adapter_unavailable"}),
+            (200, {"state": "ready", "generation": 1}),
+        ]
+        with self.assertRaisesRegex(runner.JourneyError, "adapter is unavailable"):
+            self.run_plan_v2()
+        self.assertEqual(self.state.calls["/operator/observe"], 1)
+
+        case = self.directory / "observe-bounds"
+        case.mkdir(mode=0o700)
+        plan = canonical_plan_v2()
+        plan["journey_id"] = "journey-observe-bounds"
+        plan["steps"][4]["observe"]["max_attempts"] = 2
+        self.state.response_sequences["/operator/observe"] = [
+            (404, {"code": "not_ready"}),
+            (409, {"code": "not_ready"}),
+            (200, {"state": "ready", "generation": 1}),
+        ]
+        with self.assertRaisesRegex(runner.JourneyError, "observe bounds exhausted"):
+            runner.run_journey(
+                plan,
+                self.base_url,
+                self.v2_credentials,
+                case / "ledger.json",
+                case / "evidence.json",
+                1.0,
+            )
+        self.assertEqual(self.state.calls["/operator/observe"], 3)
+
+    def test_v2_observe_contract_rejects_unbounded_or_ambiguous_forms(self) -> None:
+        mutations = (
+            lambda contract: contract.update(max_attempts=0),
+            lambda contract: contract.update(max_attempts=21),
+            lambda contract: contract.update(interval_ms=-1),
+            lambda contract: contract.update(interval_ms=2_001),
+            lambda contract: contract.update(max_elapsed_ms=49),
+            lambda contract: contract.update(max_elapsed_ms=30_001),
+            lambda contract: contract.update(retry_statuses=[404, 404]),
+            lambda contract: contract.update(retry_statuses=[500]),
+            lambda contract: contract.update(replay="best_effort"),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                plan = canonical_plan_v2()
+                mutate(plan["steps"][4]["observe"])
+                with self.assertRaisesRegex(runner.JourneyError, "observe"):
+                    runner.validate_plan(plan)
+
+        plan = canonical_plan_v2()
+        plan["steps"][1].pop("replay_assertions")
+        with self.assertRaisesRegex(runner.JourneyError, "initial_assertions"):
+            runner.validate_plan(plan)
+
+    def test_v2_replay_marker_must_attest_server_adoption(self) -> None:
+        self.run_plan_v2(checkpoint="after_customer_request")
+        self.state.response_overrides["/customer/workflow/commands"] = {
+            "replayed": False,
+            "request_id": "request-1",
+            "request_digest": DIGEST_A,
+        }
+        with self.assertRaisesRegex(runner.JourneyError, "assertion did not match"):
+            self.run_plan_v2()
+        self.assertEqual(
+            self.state.effective_mutations["/customer/workflow/commands"], 1
+        )
+
+    def test_v1_and_v2_resume_artifacts_are_strictly_separated(self) -> None:
+        self.run_plan(checkpoint="after_customer_request")
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        ledger["plan_digest"] = runner.digest(canonical_plan_v2())
+        runner.atomic_json_write(self.ledger, ledger)
+        calls = sum(self.state.calls.values())
+        with self.assertRaisesRegex(runner.JourneyError, "does not match"):
+            self.run_plan_v2()
+        self.assertEqual(sum(self.state.calls.values()), calls)
+
+    def test_v2_ledger_alias_and_response_bindings_reject_tampering(self) -> None:
+        self.run_plan_v2(checkpoint="after_customer_request")
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        ledger["completed"]["submit"]["auth_alias_digest"] = "f" * 64
+        ledger["completed"]["submit"]["record_digest"] = runner.record_digest(
+            ledger["completed"]["submit"]
+        )
+        ledger["chain_tip"] = ledger["completed"]["submit"]["record_digest"]
+        runner.atomic_json_write(self.ledger, ledger)
+        calls = sum(self.state.calls.values())
+        with self.assertRaisesRegex(runner.JourneyError, "v2 binding"):
+            self.run_plan_v2()
+        self.assertEqual(sum(self.state.calls.values()), calls)
+
+    def test_v2_assertion_pointers_cannot_target_sensitive_response_fields(self) -> None:
+        plan = canonical_plan_v2()
+        plan["steps"][1]["initial_assertions"] = [
+            {"pointer": "/private_token", "present": True}
+        ]
+        with self.assertRaisesRegex(runner.JourneyError, "targets sensitive data"):
+            self.run_plan_v2(plan)
+        self.assertEqual(sum(self.state.calls.values()), 0)
+
+    def test_v2_pointers_and_equals_literals_reject_root_escapes_and_secrets(self) -> None:
+        mutations = (
+            (
+                lambda step: step.update(
+                    initial_assertions=[{"pointer": "", "present": True}]
+                ),
+                "non-root JSON pointer",
+            ),
+            (
+                lambda step: step["capture"]["request_id"].update(pointer=""),
+                "non-root JSON pointer",
+            ),
+            (
+                lambda step: step.update(
+                    initial_assertions=[{"pointer": "/invalid~2field", "present": True}]
+                ),
+                "invalid JSON pointer escape",
+            ),
+            (
+                lambda step: step.update(
+                    initial_assertions=[
+                        {
+                            "pointer": "/result",
+                            "equals": {"private_token": "public-looking-value"},
+                        }
+                    ]
+                ),
+                "contains a sensitive or invalid key",
+            ),
+        )
+        for mutate, expected in mutations:
+            with self.subTest(expected=expected):
+                plan = canonical_plan_v2()
+                mutate(plan["steps"][1])
+                with self.assertRaisesRegex(runner.JourneyError, expected):
+                    runner.validate_plan(plan)
+
+        plan = canonical_plan_v2()
+        plan["steps"][1]["initial_assertions"] = [
+            {
+                "pointer": "",
+                "equals": {
+                    "request_id": "request-1",
+                    "private_token": "response-secret-value",
+                },
+            }
+        ]
+        with self.assertRaisesRegex(runner.JourneyError, "non-root JSON pointer"):
+            runner.validate_plan(plan)
 
     def test_role_credentials_are_separated_and_never_persisted(self) -> None:
         self.run_plan()
@@ -734,8 +1166,103 @@ class JourneyRunnerTests(unittest.TestCase):
         evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
         evidence["record_chain_tip"] = "f" * 64
         runner.atomic_json_write(self.evidence, evidence)
-        with self.assertRaisesRegex(runner.JourneyError, "evidence does not match"):
+        with self.assertRaisesRegex(runner.JourneyError, "journey evidence"):
             self.run_plan()
+        self.assertEqual(sum(self.state.calls.values()), prior_calls)
+
+    def test_restart_repairs_ledger_before_evidence_crash_without_duplicate_effect(self) -> None:
+        original_write = runner.atomic_json_write
+        failure_injected = False
+
+        def fail_after_submit_ledger(path: Path, value: object) -> None:
+            nonlocal failure_injected
+            if path == self.evidence and self.ledger.exists() and not failure_injected:
+                ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+                if "submit" in ledger["completed"]:
+                    failure_injected = True
+                    raise runner.JourneyError("injected evidence write failure")
+            original_write(path, value)
+
+        with mock.patch.object(runner, "atomic_json_write", fail_after_submit_ledger):
+            with self.assertRaisesRegex(runner.JourneyError, "injected evidence"):
+                self.run_plan_v2(checkpoint="after_customer_request")
+        self.assertTrue(failure_injected)
+        self.assertEqual(
+            self.state.effective_mutations["/customer/workflow/commands"], 1
+        )
+        stale = json.loads(self.evidence.read_text(encoding="utf-8"))
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        self.assertLess(stale["record_count"], len(ledger["completed"]))
+
+        original_observe = runner.observe_step
+        reconciliation_checked = False
+
+        def verify_repaired_before_http(*args: object, **kwargs: object) -> object:
+            nonlocal reconciliation_checked
+            if not reconciliation_checked:
+                repaired = json.loads(self.evidence.read_text(encoding="utf-8"))
+                current_ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+                self.assertEqual(repaired["record_count"], len(current_ledger["completed"]))
+                self.assertEqual(repaired["record_chain_tip"], current_ledger["chain_tip"])
+                reconciliation_checked = True
+            return original_observe(*args, **kwargs)
+
+        with mock.patch.object(runner, "observe_step", verify_repaired_before_http):
+            resumed = self.run_plan_v2(checkpoint="after_customer_request")
+        self.assertTrue(reconciliation_checked)
+        self.assertEqual(resumed["result"], "checkpoint_reached")
+        self.assertEqual(
+            self.state.effective_mutations["/customer/workflow/commands"], 1
+        )
+
+    def test_restart_repairs_missing_and_exact_stale_evidence_only(self) -> None:
+        self.run_plan_v2(checkpoint="after_customer_request")
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        self.evidence.unlink()
+        self.run_plan_v2(checkpoint="after_customer_request")
+        self.assertEqual(
+            self.state.effective_mutations["/customer/workflow/commands"], 1
+        )
+        repaired = json.loads(self.evidence.read_text(encoding="utf-8"))
+        self.assertEqual(repaired["record_chain_tip"], ledger["chain_tip"])
+
+        readiness = ledger["completed"]["readiness"]
+        stale = {
+            **repaired,
+            "record_chain_tip": readiness["record_digest"],
+            "record_count": 1,
+            "result": "in_progress",
+            "stopped_at": None,
+            "replay_verified_steps": [],
+            "steps": [{"id": "readiness", **readiness}],
+        }
+        runner.atomic_json_write(self.evidence, stale)
+        self.run_plan_v2(checkpoint="after_customer_request")
+        repaired = json.loads(self.evidence.read_text(encoding="utf-8"))
+        self.assertEqual(repaired["record_count"], len(ledger["completed"]))
+        self.assertEqual(
+            self.state.effective_mutations["/customer/workflow/commands"], 1
+        )
+
+    def test_restart_rejects_non_prefix_and_semantically_manipulated_evidence(self) -> None:
+        self.run_plan_v2(checkpoint="after_customer_request")
+        evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
+        prior_calls = sum(self.state.calls.values())
+
+        non_prefix = json.loads(json.dumps(evidence))
+        non_prefix["record_count"] = 1
+        non_prefix["record_chain_tip"] = non_prefix["steps"][1]["record_digest"]
+        non_prefix["steps"] = [non_prefix["steps"][1]]
+        runner.atomic_json_write(self.evidence, non_prefix)
+        with self.assertRaisesRegex(runner.JourneyError, "does not match"):
+            self.run_plan_v2()
+        self.assertEqual(sum(self.state.calls.values()), prior_calls)
+
+        manipulated = json.loads(json.dumps(evidence))
+        manipulated["steps"][1]["captures"]["request_id"] = "forged-request"
+        runner.atomic_json_write(self.evidence, manipulated)
+        with self.assertRaisesRegex(runner.JourneyError, "does not match"):
+            self.run_plan_v2()
         self.assertEqual(sum(self.state.calls.values()), prior_calls)
 
     def test_record_chain_truncation_fails_before_http(self) -> None:
