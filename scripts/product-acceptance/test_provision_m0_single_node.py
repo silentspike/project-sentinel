@@ -141,6 +141,19 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.reason(result), reason)
 
+    def assert_public_pre_mutation_failure(
+        self, result: subprocess.CompletedProcess[str], reason: str
+    ) -> None:
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(
+            result.stderr,
+            encoded({"schema_version": 1, "status": "FAIL", "reason": reason}).decode("ascii"),
+        )
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn(str(self.case), result.stderr)
+        self.assertEqual(list(self.fixture.target.iterdir()), [])
+        self.assertFalse((self.fixture.stage / "provision-receipt.json").exists())
+
     def test_complete_fake_root_install_and_receipt(self) -> None:
         result = self.fixture.run()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -179,6 +192,42 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
             for row in self.fixture.artifacts
         }
         self.assertEqual(before, after)
+
+    def test_symlinked_stage_lock_is_public_safe_and_has_no_target_effect(self) -> None:
+        self.fixture.stage.mkdir(mode=0o700)
+        (self.fixture.stage / ".provision.lock").symlink_to(self.fixture.manifest_path)
+        self.assert_public_pre_mutation_failure(
+            self.fixture.run(), "stage_lock_unsafe"
+        )
+
+    def test_unsafe_and_stale_stage_operation_fail_without_target_effect(self) -> None:
+        for state, reason in (
+            ("symlink", "stage_operation_unsafe"),
+            ("stale", "stage_operation_stale"),
+        ):
+            with self.subTest(state=state):
+                fixture = Fixture(self.case / "cases" / f"operation-{state}")
+                fixture.stage.mkdir(mode=0o700)
+                operation = fixture.stage / "operation"
+                if state == "symlink":
+                    operation.symlink_to(fixture.source)
+                else:
+                    operation.mkdir(mode=0o700)
+                result = fixture.run()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    result.stderr,
+                    encoded({"schema_version": 1, "status": "FAIL", "reason": reason}).decode("ascii"),
+                )
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertNotIn(str(fixture.base), result.stderr)
+                self.assertEqual(list(fixture.target.iterdir()), [])
+                self.assertFalse((fixture.stage / "provision-receipt.json").exists())
+
+    def test_unexpected_pre_mutation_error_is_static_and_public_safe(self) -> None:
+        self.assert_public_pre_mutation_failure(
+            self.fixture.run("--inject-pre-mutation-error"), "internal_failure"
+        )
 
     def test_missing_nats_and_other_required_artifact_fail(self) -> None:
         for source in ("external/nats-server", "config/agents/AGENT-60-KATRIN-DELIVERY.toml"):
