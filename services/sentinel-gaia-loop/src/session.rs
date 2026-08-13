@@ -837,13 +837,14 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
         let mut config = cfg(&config_dir);
         config.claude_bin = PathBuf::from("/bin/sh");
-        let runner = ClaudeSessionRunner::new(config)
-            .with_operator_broker(GaiaOperatorBrokerCapability::new(
+        let runner = ClaudeSessionRunner::new(config).with_operator_broker(
+            GaiaOperatorBrokerCapability::new(
                 PathBuf::from("/run/sentinel/gaia-broker/session.sock"),
                 "gaia-broker-session-1".to_string(),
                 "opaque-capability-0123456789abcdef".to_string(),
                 PathBuf::from("/run/credentials/sentinel-dashboard-backend.service"),
-            ));
+            ),
+        );
         let wrapped = runner.child_command().unwrap();
         assert_eq!(wrapped.as_std().get_program(), BWRAP_BIN);
         let wrapped_args = wrapped
@@ -852,11 +853,10 @@ mod tests {
             .map(|value| value.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(wrapped_args.windows(2).any(|pair| {
-            pair
-                == [
-                    "--tmpfs".to_string(),
-                    "/run/credentials/sentinel-dashboard-backend.service".to_string(),
-                ]
+            pair == [
+                "--tmpfs".to_string(),
+                "/run/credentials/sentinel-dashboard-backend.service".to_string(),
+            ]
         }));
         assert_eq!(wrapped_args.last().map(String::as_str), Some("/bin/sh"));
         assert!(!wrapped_args.iter().any(|arg| arg.contains("operator-api")));
