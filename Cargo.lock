@@ -4878,6 +4878,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-workflow"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "sentinel-common",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "sentinel-zenoh"
 version = "0.1.0"
 dependencies = [
