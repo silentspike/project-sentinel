@@ -14,6 +14,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 import uuid
 
 
@@ -95,6 +96,10 @@ class Fixture:
             data = f"m0-release-fixture:{source}\n".encode("ascii")
             path.write_bytes(data)
             path.chmod(SOURCE_MODES[kind])
+        authority_path = self.source / PACKAGE.INVENTORY_RELATIVE
+        authority_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        authority_path.write_bytes(PREFLIGHT_PATH.read_bytes())
+        authority_path.chmod(0o600)
         self.nats.chmod(0o700)
         self._commit_source()
 
@@ -296,6 +301,41 @@ class ReleasePackageTests(unittest.TestCase):
         tracked.chmod(0o600)
         self.assert_error("git_source_dirty", self.fixture.build)
 
+    def test_git_provenance_ignores_hostile_path_and_repository_fsmonitor(self) -> None:
+        hostile = self.case / "hostile-bin"
+        hostile.mkdir(mode=0o700)
+        fake_marker = self.case / "fake-git-invoked"
+        fake_git = hostile / "git"
+        fake_git.write_text(f"#!/bin/sh\nprintf invoked > '{fake_marker}'\nexit 0\n", encoding="ascii")
+        fake_git.chmod(0o700)
+
+        fsmonitor_marker = self.case / "fsmonitor-invoked"
+        fsmonitor = self.case / "hostile-fsmonitor"
+        fsmonitor.write_text(
+            f"#!/bin/sh\nprintf invoked > '{fsmonitor_marker}'\nexit 0\n",
+            encoding="ascii",
+        )
+        fsmonitor.chmod(0o700)
+        self.fixture.assert_git("config", "core.fsmonitor", str(fsmonitor))
+
+        with mock.patch.dict(os.environ, {"PATH": str(hostile)}, clear=False):
+            result = self.fixture.build()
+        self.assertEqual(result["status"], "COMPLETE")
+        self.assertFalse(fake_marker.exists())
+        self.assertFalse(fsmonitor_marker.exists())
+
+    def test_source_inventory_must_match_the_running_tool_authority(self) -> None:
+        authority = self.fixture.source / PACKAGE.INVENTORY_RELATIVE
+        authority.write_bytes(authority.read_bytes() + b"\n# divergent inventory authority\n")
+        authority.chmod(0o600)
+        self.fixture.assert_git("add", "-f", PACKAGE.INVENTORY_RELATIVE)
+        self.fixture.assert_git("commit", "--quiet", "-m", "test: divergent authority")
+        self.fixture.git_sha = self.fixture.assert_git("rev-parse", "HEAD").stdout.strip()
+
+        self.assert_error("inventory_authority_mismatch", self.fixture.build)
+        self.assertFalse(self.fixture.package.exists())
+        self.assertEqual(list(self.fixture.stage.iterdir()), [])
+
     def test_wrong_source_owner_and_public_cli_failure_are_fail_closed(self) -> None:
         source = self.fixture.nats
         fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -347,6 +387,24 @@ class ReleasePackageTests(unittest.TestCase):
         )
         self.assertNotIn(str(self.case), result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_cli_requires_owner_and_mode_preserving_transport_and_reverify(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "verify", "--help"],
+            cwd=REPO_ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        help_text = " ".join(result.stdout.split())
+        self.assertIn("owner- and mode-sensitive", help_text)
+        self.assertIn("transport must preserve ownership, modes", help_text)
+        self.assertIn("run verify as the executing owner before provisioning", help_text)
+        self.assertNotIn("scp", help_text.lower())
 
     def test_tamper_extra_type_swap_and_hardlink_package_fail(self) -> None:
         attacks = ("tamper", "extra", "type", "hardlink")
