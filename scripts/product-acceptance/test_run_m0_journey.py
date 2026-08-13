@@ -21,7 +21,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 import run_m0_journey as runner  # noqa: E402
 
 
-TEST_ROOT = Path("/work/tmp/project-sentinel/cdx1-650-runner-tests")
+TEST_SAFE_ROOT = (
+    Path(os.environ["RUNNER_TEMP"]) / "project-sentinel-cdx1-650"
+    if "RUNNER_TEMP" in os.environ
+    else Path("/work/tmp/project-sentinel")
+)
+TEST_ROOT = TEST_SAFE_ROOT / "cdx1-650-runner-tests"
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
 
@@ -378,6 +383,10 @@ def canonical_plan() -> dict[str, object]:
 
 class JourneyRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.original_safe_root = runner.SAFE_ROOT
+        runner.SAFE_ROOT = TEST_SAFE_ROOT
+        TEST_SAFE_ROOT.mkdir(parents=True, exist_ok=True)
+        TEST_SAFE_ROOT.chmod(0o700)
         TEST_ROOT.mkdir(parents=True, exist_ok=True)
         TEST_ROOT.chmod(0o700)
         self.directory = TEST_ROOT / f"case-{uuid.uuid4().hex}"
@@ -412,6 +421,9 @@ class JourneyRunnerTests(unittest.TestCase):
                 os.environ[name] = value
         shutil.rmtree(self.directory)
         runner.lock_path_for("journey-fixture-1").unlink(missing_ok=True)
+        runner.SAFE_ROOT = self.original_safe_root
+        if "RUNNER_TEMP" in os.environ:
+            shutil.rmtree(TEST_SAFE_ROOT)
 
     def run_plan(
         self, plan: dict[str, object] | None = None, checkpoint: str | None = None
