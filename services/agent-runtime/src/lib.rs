@@ -2121,10 +2121,15 @@ mod tests {
         excessive_output.resource_limits.stdout_bytes = 2;
         excessive_output.input_digest = excessive_output.canonical_digest().unwrap();
         let excessive_output = executor.execute(excessive_output, Arc::new(AtomicBool::new(false)));
-        let WorkbenchMessage::Result { outcome, error, .. } = excessive_output else {
+        let WorkbenchMessage::Result {
+            outcome: excessive_outcome,
+            error,
+            ..
+        } = excessive_output
+        else {
             panic!("command execution must return a result")
         };
-        assert_eq!(outcome, WorkbenchOutcome::Failed);
+        assert_eq!(excessive_outcome, WorkbenchOutcome::Failed);
         assert_eq!(
             error.expect("output-limit failure").code,
             "command_output_limit_exceeded"
