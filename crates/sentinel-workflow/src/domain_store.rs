@@ -263,10 +263,12 @@ fn validate_columns(
     Ok(())
 }
 
+type TableColumnRow = (String, String, i64, Option<String>, i64);
+
 fn table_columns(
     connection: &Connection,
     table: &str,
-) -> Result<Vec<(String, String, i64, Option<String>, i64)>, WorkflowError> {
+) -> Result<Vec<TableColumnRow>, WorkflowError> {
     connection
         .prepare(&format!("PRAGMA table_info('{table}')"))
         .map_err(WorkflowError::from)?
