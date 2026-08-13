@@ -1,5 +1,6 @@
 [Unit]
 Description=Sentinel Nightrun Timer — Schichtwechsel 06:00/14:00/22:00
+After=sentinel-daemon.service
 
 [Timer]
 OnCalendar=*-*-* 06:00:00

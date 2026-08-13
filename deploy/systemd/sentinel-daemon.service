@@ -1,20 +1,23 @@
 [Unit]
 Description=Sentinel Daemon — ECS Orchestrator
 Documentation=https://github.com/silentspike/project-sentinel/issues/94
-After=network-online.target
+After=network-online.target nats-server.service
 Wants=network-online.target
+Requires=nats-server.service
 StartLimitBurst=5
 StartLimitIntervalSec=300
 
 [Service]
-Type=simple
+Type=exec
 User=root
 Group=root
 WorkingDirectory=/opt/sentinel
 EnvironmentFile=-/etc/sentinel/env
 ExecStart=/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml
+ExecStartPost=/usr/bin/python3 /opt/sentinel/scripts/m0-readiness.py daemon --credential-file %d/operator-api --timeout-seconds 120
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=180
 TimeoutStopSec=15
 MemoryMax=2G
 CPUAffinity=0-3
@@ -22,9 +25,11 @@ OOMScoreAdjust=-1000
 LoadCredential=caller-agent-runtime:/etc/sentinel/credentials/caller-agent-runtime
 LoadCredential=caller-platform:/etc/sentinel/credentials/caller-platform
 LoadCredential=caller-evolution:/etc/sentinel/credentials/caller-evolution
+LoadCredential=operator-api:/etc/sentinel/credentials/operator-api
 Environment=SENTINEL_AGENT_RUNTIME_CREDENTIAL_FILE=%d/caller-agent-runtime
 Environment=SENTINEL_PLATFORM_CREDENTIAL_FILE=%d/caller-platform
 Environment=SENTINEL_EVOLUTION_CREDENTIAL_FILE=%d/caller-evolution
+Environment=SENTINEL_OPERATOR_CREDENTIAL_FILE=%d/operator-api
 # Cutover invariant: remain false until the independent hierarchy projection
 # has backfilled to the recorded boundary.
 Environment=SENTINEL_LLM_USAGE_V2_ENABLED=false

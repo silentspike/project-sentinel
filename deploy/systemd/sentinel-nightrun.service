@@ -1,15 +1,16 @@
 [Unit]
 Description=Sentinel Nightrun — Schichtwechsel-Konsolidierung
 Documentation=https://github.com/silentspike/project-sentinel/issues/17
-After=network.target
-Wants=sentinel-nightrun.timer
+After=sentinel-daemon.service
 
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/sentinel
-# Trigger Nightrun via Daemon Operator-API (vermeidet redb Lock-Konflikt).
-# Der Daemon fuehrt die Konsolidierung mit seinem bestehenden DB-Handle aus.
-ExecStart=/usr/bin/curl -sf -X POST http://127.0.0.1:8084/operator/nightrun -H "Content-Type: application/json" -d "{}"
+ExecCondition=/usr/bin/systemctl --quiet is-active sentinel-daemon.service
+LoadCredential=operator-api:/etc/sentinel/credentials/operator-api
+# The bounded helper reads the credential from its systemd-owned file. No
+# bearer value is exposed through argv or the journal.
+ExecStart=/usr/bin/python3 /opt/sentinel/scripts/m0-readiness.py nightrun --credential-file %d/operator-api --timeout-seconds 45
 TimeoutStartSec=60
 MemoryMax=64M
 
