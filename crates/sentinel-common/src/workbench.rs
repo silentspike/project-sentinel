@@ -17,6 +17,19 @@ pub const WORKBENCH_SCHEMA_VERSION: u16 = 1;
 pub const WORKBENCH_RUNTIME_BWRAP: &str = "bwrap-landlock";
 /// Exact isolated runtime version accepted by the v1 startup attestation.
 pub const WORKBENCH_AGENT_RUNTIME_VERSION: &str = "0.1.0";
+/// Maximum serialized transient caller result. The #701 adapter retains at most
+/// 256 KiB across the whole exchange, so this leaves room for progress frames
+/// and JSON envelope overhead.
+pub const WORKBENCH_MAX_CALLER_RESULT_BYTES: usize = 224 * 1024;
+/// Inspect output is JSON escaped in the immediate caller result. A 32 KiB input
+/// remains below the caller-result budget even when every byte uses the longest
+/// JSON escape form.
+pub const WORKBENCH_MAX_INSPECT_BYTES: u64 = 32 * 1024;
+const MAX_COMMAND_ARGUMENTS: usize = 64;
+const MAX_COMMAND_ARGUMENT_BYTES: usize = 4096;
+const MAX_PROGRAM_BYTES: usize = 128;
+const MAX_PATCH_REPLACEMENTS: usize = 128;
+const MAX_PATCH_FRAGMENT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -212,7 +225,11 @@ impl WorkbenchRequest {
         Ok(self)
     }
 
-    pub fn validate_at(&self, now_unix_ms: u64) -> Result<(), WorkbenchValidationError> {
+    /// Validate the complete canonical request shape for an idempotent replay.
+    ///
+    /// The original deadline remains digest-bound and must be nonzero, but a
+    /// durable replay does not require that deadline to still be in the future.
+    pub fn validate_for_replay(&self) -> Result<(), WorkbenchValidationError> {
         if self.schema_version != WORKBENCH_SCHEMA_VERSION {
             return Err(WorkbenchValidationError::UnsupportedVersion(
                 self.schema_version,
@@ -247,7 +264,7 @@ impl WorkbenchRequest {
         if self.assignment_version == 0 || self.credential_generation == 0 || self.attempt == 0 {
             return Err(WorkbenchValidationError::InvalidGeneration);
         }
-        if self.deadline_unix_ms <= now_unix_ms {
+        if self.deadline_unix_ms == 0 {
             return Err(WorkbenchValidationError::DeadlineExpired);
         }
         self.resource_limits.validate()?;
@@ -267,15 +284,24 @@ impl WorkbenchRequest {
                 self.tool.required_capability().to_string(),
             ));
         }
+        let mut input_artifact_ids = BTreeSet::new();
+        let mut input_mount_paths = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
             validate_identifier("artifact_id", &input.artifact_id)?;
             validate_sha256("input sha256", &input.sha256)?;
             validate_relative_path(&input.mount_path)?;
-            if input.media_type.is_empty() {
+            let mount_path = std::path::Path::new(&input.mount_path);
+            if !input_artifact_ids.insert(input.artifact_id.as_str())
+                || input_mount_paths.iter().any(|existing: &&std::path::Path| {
+                    mount_path.starts_with(*existing) || existing.starts_with(mount_path)
+                })
+                || input.media_type.is_empty()
+            {
                 return Err(WorkbenchValidationError::InvalidIdentifier(
-                    "media_type".to_string(),
+                    "input_descriptor".to_string(),
                 ));
             }
+            input_mount_paths.push(mount_path);
         }
         for rule in &self.command_policy {
             rule.validate()?;
@@ -300,12 +326,21 @@ impl WorkbenchRequest {
         }
         Ok(())
     }
+
+    pub fn validate_at(&self, now_unix_ms: u64) -> Result<(), WorkbenchValidationError> {
+        self.validate_for_replay()?;
+        if self.deadline_unix_ms <= now_unix_ms {
+            return Err(WorkbenchValidationError::DeadlineExpired);
+        }
+        Ok(())
+    }
 }
 
 fn validate_command_argument(argument: &str) -> Result<(), WorkbenchValidationError> {
     let path = std::path::Path::new(argument);
     if argument.is_empty()
-        || argument.contains('\0')
+        || argument.len() > MAX_COMMAND_ARGUMENT_BYTES
+        || argument.bytes().any(|byte| byte.is_ascii_control())
         || argument.starts_with('~')
         || path.is_absolute()
         || path.components().any(|component| {
@@ -319,13 +354,30 @@ fn validate_command_argument(argument: &str) -> Result<(), WorkbenchValidationEr
     {
         return Err(WorkbenchValidationError::CommandArgumentEscape);
     }
+    if argument.starts_with('-') {
+        if !argument
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(WorkbenchValidationError::CommandArgumentEscape);
+        }
+    } else if !is_canonical_relative_path(argument) {
+        return Err(WorkbenchValidationError::CommandArgumentEscape);
+    }
     Ok(())
 }
 
 impl CommandRule {
-    fn validate(&self) -> Result<(), WorkbenchValidationError> {
+    pub fn validate(&self) -> Result<(), WorkbenchValidationError> {
         validate_program(&self.program)?;
-        if self.required_arg_prefix.len() > usize::from(self.max_args) {
+        if self.max_args == 0
+            || usize::from(self.max_args) > MAX_COMMAND_ARGUMENTS
+            || self.required_arg_prefix.len() > usize::from(self.max_args)
+            || self
+                .required_arg_prefix
+                .iter()
+                .any(|argument| validate_command_argument(argument).is_err())
+        {
             return Err(WorkbenchValidationError::InvalidCommandRule);
         }
         Ok(())
@@ -361,7 +413,7 @@ fn validate_tool_paths(tool: &WorkbenchTool) -> Result<(), WorkbenchValidationEr
     match tool {
         WorkbenchTool::InspectFile { path, max_bytes } => {
             validate_relative_path(path)?;
-            if *max_bytes == 0 {
+            if *max_bytes == 0 || *max_bytes > WORKBENCH_MAX_INSPECT_BYTES {
                 return Err(WorkbenchValidationError::InvalidResourceLimits);
             }
             Ok(())
@@ -385,8 +437,12 @@ fn validate_tool_paths(tool: &WorkbenchTool) -> Result<(), WorkbenchValidationEr
             validate_relative_path(path)?;
             validate_sha256("expected_sha256", expected_sha256)?;
             if replacements.is_empty()
+                || replacements.len() > MAX_PATCH_REPLACEMENTS
                 || replacements.iter().any(|replacement| {
-                    replacement.old.is_empty() || replacement.expected_occurrences == 0
+                    replacement.old.is_empty()
+                        || replacement.old.len() > MAX_PATCH_FRAGMENT_BYTES
+                        || replacement.new.len() > MAX_PATCH_FRAGMENT_BYTES
+                        || replacement.expected_occurrences == 0
                 })
             {
                 return Err(WorkbenchValidationError::InvalidPatch);
@@ -403,9 +459,18 @@ fn validate_tool_paths(tool: &WorkbenchTool) -> Result<(), WorkbenchValidationEr
             if paths.is_empty() {
                 return Err(WorkbenchValidationError::EmptyArtifact);
             }
-            paths
-                .iter()
-                .try_for_each(|path| validate_relative_path(path))
+            let mut unique = Vec::with_capacity(paths.len());
+            for path in paths {
+                validate_relative_path(path)?;
+                let candidate = std::path::Path::new(path);
+                if unique.iter().any(|existing: &&std::path::Path| {
+                    candidate.starts_with(*existing) || existing.starts_with(candidate)
+                }) {
+                    return Err(WorkbenchValidationError::InvalidPath);
+                }
+                unique.push(candidate);
+            }
+            Ok(())
         }
         WorkbenchTool::RunTests { suite_id, .. } => validate_identifier("suite_id", suite_id),
         WorkbenchTool::RunCommand { .. } => Ok(()),
@@ -428,25 +493,36 @@ fn validate_media_type(value: &str) -> Result<(), WorkbenchValidationError> {
 }
 
 fn validate_relative_path(path: &str) -> Result<(), WorkbenchValidationError> {
-    let path = std::path::Path::new(path);
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        return Err(WorkbenchValidationError::InvalidPath);
-    }
-    if path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)
-        )
-    }) {
+    if !is_canonical_relative_path(path) {
         return Err(WorkbenchValidationError::InvalidPath);
     }
     Ok(())
 }
 
+fn is_canonical_relative_path(value: &str) -> bool {
+    let path = std::path::Path::new(value);
+    if value.is_empty() || path.is_absolute() {
+        return false;
+    }
+    let mut canonical = String::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return false;
+        };
+        let Some(component) = component.to_str() else {
+            return false;
+        };
+        if !canonical.is_empty() {
+            canonical.push('/');
+        }
+        canonical.push_str(component);
+    }
+    !canonical.is_empty() && canonical == value
+}
+
 fn validate_program(program: &str) -> Result<(), WorkbenchValidationError> {
     if program.is_empty()
+        || program.len() > MAX_PROGRAM_BYTES
         || program.contains('/')
         || !program
             .bytes()
@@ -734,7 +810,21 @@ mod tests {
                 request: Box::new(request.clone())
             }
         );
+        request.validate_for_replay().unwrap();
         request.validate_at(1_900_000_000_000).unwrap();
+        assert_eq!(
+            request.validate_at(request.deadline_unix_ms),
+            Err(WorkbenchValidationError::DeadlineExpired)
+        );
+        request.validate_for_replay().unwrap();
+
+        let mut zero_deadline = request;
+        zero_deadline.deadline_unix_ms = 0;
+        zero_deadline.input_digest = zero_deadline.canonical_digest().unwrap();
+        assert_eq!(
+            zero_deadline.validate_for_replay(),
+            Err(WorkbenchValidationError::DeadlineExpired)
+        );
     }
 
     #[test]
@@ -788,6 +878,55 @@ mod tests {
     }
 
     #[test]
+    fn relative_paths_and_descriptors_are_canonical_and_unique() {
+        for alias in [
+            ".",
+            "./src/index.html",
+            "src/./index.html",
+            "src//index.html",
+        ] {
+            let mut aliased = request();
+            aliased.tool = WorkbenchTool::WriteFile {
+                path: alias.to_string(),
+                content: "x".to_string(),
+                expected_sha256: None,
+            };
+            aliased.input_digest = aliased.canonical_digest().unwrap();
+            assert_eq!(
+                aliased.validate_at(1_900_000_000_000),
+                Err(WorkbenchValidationError::InvalidPath)
+            );
+        }
+
+        let mut duplicate_inputs = request();
+        let input = WorkbenchInputRef {
+            artifact_id: format!("sha256:{}", "c".repeat(64)),
+            sha256: "c".repeat(64),
+            mount_path: "inputs/source.js".to_string(),
+            media_type: "text/javascript".to_string(),
+        };
+        duplicate_inputs.inputs = vec![input.clone(), input];
+        duplicate_inputs.input_digest = duplicate_inputs.canonical_digest().unwrap();
+        assert!(matches!(
+            duplicate_inputs.validate_at(1_900_000_000_000),
+            Err(WorkbenchValidationError::InvalidIdentifier(name)) if name == "input_descriptor"
+        ));
+
+        let mut overlapping_artifact = request();
+        overlapping_artifact.capabilities = BTreeSet::from(["artifact.commit".to_string()]);
+        overlapping_artifact.tool = WorkbenchTool::PackageArtifact {
+            artifact_kind: "source_tree".to_string(),
+            media_type: "application/json".to_string(),
+            paths: vec!["dist".to_string(), "dist/app.js".to_string()],
+        };
+        overlapping_artifact.input_digest = overlapping_artifact.canonical_digest().unwrap();
+        assert_eq!(
+            overlapping_artifact.validate_at(1_900_000_000_000),
+            Err(WorkbenchValidationError::InvalidPath)
+        );
+    }
+
+    #[test]
     fn workspace_binding_and_command_argument_escape_fail_closed() {
         let mut mismatched = request();
         mismatched.workspace_id = "project-01:work-99".to_string();
@@ -833,6 +972,16 @@ mod tests {
 
         request.tool = WorkbenchTool::RunCommand {
             program: "node".to_string(),
+            args: vec!["--check".to_string(), "src/./app.js".to_string()],
+        };
+        request.input_digest = request.canonical_digest().unwrap();
+        assert_eq!(
+            request.validate_at(1_900_000_000_000),
+            Err(WorkbenchValidationError::CommandArgumentEscape)
+        );
+
+        request.tool = WorkbenchTool::RunCommand {
+            program: "node".to_string(),
             args: vec![
                 "--check".to_string(),
                 "--require=/proc/self/environ".to_string(),
@@ -841,7 +990,7 @@ mod tests {
         request.input_digest = request.canonical_digest().unwrap();
         assert_eq!(
             request.validate_at(1_900_000_000_000),
-            Err(WorkbenchValidationError::CommandDenied)
+            Err(WorkbenchValidationError::CommandArgumentEscape)
         );
 
         request.tool = WorkbenchTool::RunCommand {
@@ -873,5 +1022,39 @@ mod tests {
         request.output_artifact_kinds.insert("binary".to_string());
         request.input_digest = request.canonical_digest().unwrap();
         request.validate_at(1_900_000_000_000).unwrap();
+    }
+
+    #[test]
+    fn inspect_and_patch_payloads_have_tool_specific_memory_bounds() {
+        let mut inspect = request();
+        inspect.capabilities = BTreeSet::from(["file.inspect".to_string()]);
+        inspect.tool = WorkbenchTool::InspectFile {
+            path: "src/index.html".to_string(),
+            max_bytes: WORKBENCH_MAX_INSPECT_BYTES + 1,
+        };
+        inspect.input_digest = inspect.canonical_digest().unwrap();
+        assert_eq!(
+            inspect.validate_at(1_900_000_000_000),
+            Err(WorkbenchValidationError::InvalidResourceLimits)
+        );
+
+        let mut patch = request();
+        patch.capabilities = BTreeSet::from(["patch.apply".to_string()]);
+        patch.tool = WorkbenchTool::ApplyPatch {
+            path: "src/index.html".to_string(),
+            expected_sha256: "c".repeat(64),
+            replacements: (0..=MAX_PATCH_REPLACEMENTS)
+                .map(|_| TextReplacement {
+                    old: "a".to_string(),
+                    new: "b".to_string(),
+                    expected_occurrences: 1,
+                })
+                .collect(),
+        };
+        patch.input_digest = patch.canonical_digest().unwrap();
+        assert_eq!(
+            patch.validate_at(1_900_000_000_000),
+            Err(WorkbenchValidationError::InvalidPatch)
+        );
     }
 }

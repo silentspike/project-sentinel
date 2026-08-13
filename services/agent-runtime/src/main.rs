@@ -25,6 +25,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const MAX_WORKBENCH_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_READER_EVENTS: usize = 1;
 const STARTUP_ATTESTATION_SCHEMA_VERSION: u16 = 1;
 const ATTESTATION_NONCE_ENV: &str = "SENTINEL_WORKBENCH_ATTESTATION_NONCE";
 const ATTESTATION_WRAPPER_VERSION_ENV: &str = "SENTINEL_WORKBENCH_WRAPPER_VERSION";
@@ -63,15 +64,6 @@ enum BoundedJsonlRecord {
 }
 
 fn main() {
-    if write_startup_attestation().is_err() {
-        eprintln!("agent-runtime: startup isolation attestation failed");
-        std::process::exit(126);
-    }
-    eprintln!(
-        "agent-runtime: workbench started (pid={})",
-        std::process::id()
-    );
-
     let workspace_root = std::env::var_os("SENTINEL_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/workspace"));
@@ -86,10 +78,26 @@ fn main() {
         artifact_root,
         input_root,
     ));
+    if executor
+        .reconcile_root_completion_receipts_before_serving()
+        .is_err()
+    {
+        eprintln!("agent-runtime: startup completion receipt recovery failed");
+        std::process::exit(126);
+    }
+    if write_startup_attestation().is_err() {
+        eprintln!("agent-runtime: startup isolation attestation failed");
+        std::process::exit(126);
+    }
+    eprintln!(
+        "agent-runtime: workbench started (pid={})",
+        std::process::id()
+    );
+
     let active: ActiveInvocations = Arc::new(Mutex::new(BTreeMap::new()));
     let output_lock = Arc::new(Mutex::new(()));
     let running = Arc::new(AtomicBool::new(true));
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_READER_EVENTS);
 
     thread::spawn(move || read_commands(sender));
     write_heartbeat();
@@ -205,57 +213,12 @@ fn parse_host_pid_from_nspid(status: &str) -> Option<u32> {
         .filter(|pid| *pid > 0)
 }
 
-#[cfg(test)]
-mod startup_attestation_tests {
-    use super::*;
-
-    #[test]
-    fn startup_attestation_nonce_and_host_pid_are_strict() {
-        assert!(valid_attestation_nonce(
-            "018f3f32-4f01-4f2c-a6c1-f6f4a81b2903"
-        ));
-        assert!(!valid_attestation_nonce(
-            "018F3F32-4F01-4F2C-A6C1-F6F4A81B2903"
-        ));
-        assert!(!valid_attestation_nonce("../attestation"));
-        assert_eq!(
-            parse_host_pid_from_nspid("Name:\tagent-runtime\nNSpid:\t4242\t1\n"),
-            Some(4242)
-        );
-        assert_eq!(parse_host_pid_from_nspid("NSpid:\t0\n"), None);
-    }
-
-    #[test]
-    fn bounded_jsonl_reader_discards_overflow_and_recovers_at_record_boundary() {
-        let mut bytes = vec![b'x'; MAX_WORKBENCH_FRAME_BYTES + 1];
-        bytes.push(b'\n');
-        bytes.extend_from_slice(
-            b"{\"kind\":\"health\",\"schema_version\":1,\"request_id\":\"next\"}\n",
-        );
-        let mut input = io::Cursor::new(bytes);
-
-        assert!(matches!(
-            read_bounded_jsonl_record(&mut input).unwrap(),
-            BoundedJsonlRecord::Oversized
-        ));
-        let BoundedJsonlRecord::Record(record) = read_bounded_jsonl_record(&mut input).unwrap()
-        else {
-            panic!("the record after an oversized frame must remain readable");
-        };
-        assert!(matches!(
-            serde_json::from_slice::<WorkbenchCommand>(&record).unwrap(),
-            WorkbenchCommand::Health { request_id, .. } if request_id == "next"
-        ));
-        assert!(matches!(
-            read_bounded_jsonl_record(&mut input).unwrap(),
-            BoundedJsonlRecord::Eof
-        ));
-    }
+fn read_commands(sender: mpsc::SyncSender<ReaderEvent>) {
+    let stdin = io::stdin();
+    read_commands_from(stdin.lock(), sender);
 }
 
-fn read_commands(sender: mpsc::Sender<ReaderEvent>) {
-    let stdin = io::stdin();
-    let mut input = stdin.lock();
+fn read_commands_from(mut input: impl BufRead, sender: mpsc::SyncSender<ReaderEvent>) {
     loop {
         let event = match read_bounded_jsonl_record(&mut input) {
             Ok(BoundedJsonlRecord::Record(bytes)) if !bytes.iter().all(u8::is_ascii_whitespace) => {
@@ -647,4 +610,81 @@ fn unix_time_ms() -> u64 {
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod startup_attestation_tests {
+    use super::*;
+
+    #[test]
+    fn startup_attestation_nonce_and_host_pid_are_strict() {
+        assert!(valid_attestation_nonce(
+            "018f3f32-4f01-4f2c-a6c1-f6f4a81b2903"
+        ));
+        assert!(!valid_attestation_nonce(
+            "018F3F32-4F01-4F2C-A6C1-F6F4A81B2903"
+        ));
+        assert!(!valid_attestation_nonce("../attestation"));
+        assert_eq!(
+            parse_host_pid_from_nspid("Name:\tagent-runtime\nNSpid:\t4242\t1\n"),
+            Some(4242)
+        );
+        assert_eq!(parse_host_pid_from_nspid("NSpid:\t0\n"), None);
+    }
+
+    #[test]
+    fn bounded_jsonl_reader_discards_overflow_and_recovers_at_record_boundary() {
+        let mut bytes = vec![b'x'; MAX_WORKBENCH_FRAME_BYTES + 1];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(
+            b"{\"kind\":\"health\",\"schema_version\":1,\"request_id\":\"next\"}\n",
+        );
+        let mut input = io::Cursor::new(bytes);
+
+        assert!(matches!(
+            read_bounded_jsonl_record(&mut input).unwrap(),
+            BoundedJsonlRecord::Oversized
+        ));
+        let BoundedJsonlRecord::Record(record) = read_bounded_jsonl_record(&mut input).unwrap()
+        else {
+            panic!("the record after an oversized frame must remain readable");
+        };
+        assert!(matches!(
+            serde_json::from_slice::<WorkbenchCommand>(&record).unwrap(),
+            WorkbenchCommand::Health { request_id, .. } if request_id == "next"
+        ));
+        assert!(matches!(
+            read_bounded_jsonl_record(&mut input).unwrap(),
+            BoundedJsonlRecord::Eof
+        ));
+    }
+
+    #[test]
+    fn command_reader_applies_single_flight_backpressure_without_losing_order() {
+        let mut flood = Vec::new();
+        for index in 0..128 {
+            writeln!(
+                flood,
+                "{{\"kind\":\"health\",\"schema_version\":1,\"request_id\":\"request-{index}\"}}"
+            )
+            .unwrap();
+        }
+        let input = io::Cursor::new(flood);
+        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_READER_EVENTS);
+        let reader = thread::spawn(move || read_commands_from(input, sender));
+
+        for index in 0..128 {
+            let ReaderEvent::Command(WorkbenchCommand::Health { request_id, .. }) =
+                receiver.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("reader did not preserve the bounded command order");
+            };
+            assert_eq!(request_id, format!("request-{index}"));
+        }
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ReaderEvent::Eof
+        ));
+        reader.join().unwrap();
+    }
 }

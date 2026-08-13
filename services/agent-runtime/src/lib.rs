@@ -1,6 +1,6 @@
 //! Capability-scoped tool executor used inside the bwrap agent sandbox.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
@@ -14,22 +14,25 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use nix::errno::Errno;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::{sysconf, Pid, SysconfVar};
 use sentinel_common::{
     WorkbenchArtifactRef, WorkbenchErrorClass, WorkbenchErrorInfo, WorkbenchMessage,
     WorkbenchOutcome, WorkbenchRequest, WorkbenchResourceUsage, WorkbenchTool,
-    WORKBENCH_SCHEMA_VERSION,
+    WORKBENCH_MAX_CALLER_RESULT_BYTES, WORKBENCH_MAX_INSPECT_BYTES, WORKBENCH_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const COMMAND_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const MAX_COMPLETION_RECEIPT_BYTES: u64 = 1024 * 1024;
 const MAX_ARTIFACT_MANIFEST_BYTES: u64 = 1024 * 1024;
 const COMPLETION_RECEIPT_DIRECTORY: &str = ".workbench-receipts";
 const COMPLETION_RECEIPT_DIRECTORY_MODE: u32 = 0o700;
 const COMPLETION_RECEIPT_FILE_MODE: u32 = 0o600;
+const COMPLETION_RECEIPT_SCHEMA_VERSION: u16 = 1;
 const SAFE_ENVIRONMENT: [(&str, &str); 4] = [
     ("HOME", "/workspace"),
     ("LANG", "C.UTF-8"),
@@ -47,6 +50,23 @@ struct ReceiptFileIdentity {
     device: u64,
     inode: u64,
     size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundedFileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedCompletionReceipt {
+    schema_version: u16,
+    invocation_id: String,
+    input_digest: String,
+    result_digest: String,
+    result: WorkbenchMessage,
 }
 
 impl PinnedDirectory {
@@ -238,9 +258,38 @@ fn read_validated_receipt(
     name: &OsStr,
     after_open: impl FnOnce(),
 ) -> std::io::Result<Vec<u8>> {
+    read_validated_receipt_with_identity(directory, name, 1, None, after_open)
+}
+
+fn read_validated_receipt_for_reconciliation(
+    directory: &PinnedDirectory,
+    name: &OsStr,
+    expected_links: u64,
+    expected_identity: ReceiptFileIdentity,
+) -> std::io::Result<Vec<u8>> {
+    read_validated_receipt_with_identity(
+        directory,
+        name,
+        expected_links,
+        Some(expected_identity),
+        || {},
+    )
+}
+
+fn read_validated_receipt_with_identity(
+    directory: &PinnedDirectory,
+    name: &OsStr,
+    expected_links: u64,
+    expected_identity: Option<ReceiptFileIdentity>,
+    after_open: impl FnOnce(),
+) -> std::io::Result<Vec<u8>> {
     let mut file = directory.open_private_file(name)?;
     let before = file.metadata()?;
-    let identity = validate_receipt_file(&before, false)?;
+    validate_receipt_metadata(&before, expected_links, false)?;
+    let identity = receipt_file_identity(&before);
+    if expected_identity.is_some_and(|expected| expected != identity) {
+        return Err(invalid_receipt_data());
+    }
     after_open();
     let mut bytes = Vec::with_capacity(identity.size.try_into().unwrap_or(0));
     (&mut file)
@@ -250,13 +299,13 @@ fn read_validated_receipt(
         return Err(invalid_receipt_data());
     }
     let after = file.metadata()?;
-    validate_receipt_file(&after, false)?;
+    validate_receipt_metadata(&after, expected_links, false)?;
     if receipt_file_identity(&after) != identity {
         return Err(invalid_receipt_data());
     }
     let installed = directory.open_private_file(name)?;
     let installed_metadata = installed.metadata()?;
-    validate_receipt_file(&installed_metadata, false)?;
+    validate_receipt_metadata(&installed_metadata, expected_links, false)?;
     if receipt_file_identity(&installed_metadata) != identity {
         return Err(invalid_receipt_data());
     }
@@ -279,6 +328,8 @@ pub struct WorkbenchExecutor {
     workspace_root: PathBuf,
     artifact_root: PathBuf,
     input_root: PathBuf,
+    #[cfg(test)]
+    fail_next_patch_reservation: Arc<AtomicBool>,
 }
 
 impl WorkbenchExecutor {
@@ -288,6 +339,8 @@ impl WorkbenchExecutor {
             input_root: workspace_root.join(".inputs"),
             workspace_root,
             artifact_root: artifact_root.into(),
+            #[cfg(test)]
+            fail_next_patch_reservation: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -300,7 +353,25 @@ impl WorkbenchExecutor {
             workspace_root: workspace_root.into(),
             artifact_root: artifact_root.into(),
             input_root: input_root.into(),
+            #[cfg(test)]
+            fail_next_patch_reservation: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Reconcile the unscoped runtime receipt authority before serving.
+    ///
+    /// This must run exactly once on the root executor before startup
+    /// attestation, readiness, or protocol input. Project-scoped artifact
+    /// reconciliation deliberately does not own completion receipts.
+    pub fn reconcile_root_completion_receipts_before_serving(
+        &self,
+    ) -> Result<(), WorkbenchErrorInfo> {
+        self.reconcile_completion_receipts().map_err(|_| {
+            recovery_error(
+                "completion_receipt_invalid",
+                "the completion receipt store failed its integrity boundary",
+            )
+        })
     }
 
     pub fn execute(
@@ -353,11 +424,11 @@ impl WorkbenchExecutor {
         let result = self
             .scoped_for(&request)
             .and_then(|executor| executor.execute_validated(&request, &cancelled, started));
-        match result {
+        let message = match result {
             Ok(success) => WorkbenchMessage::Result {
                 schema_version: WORKBENCH_SCHEMA_VERSION,
-                invocation_id: request.invocation_id,
-                input_digest: request.input_digest,
+                invocation_id: request.invocation_id.clone(),
+                input_digest: request.input_digest.clone(),
                 outcome: WorkbenchOutcome::Succeeded,
                 resources: WorkbenchResourceUsage {
                     duration_ms: elapsed_ms(started),
@@ -381,33 +452,51 @@ impl WorkbenchExecutor {
                 };
                 failure_message(&request, started, outcome, error)
             }
+        };
+        if serialized_caller_result_size(&message)
+            .is_some_and(|size| size <= WORKBENCH_MAX_CALLER_RESULT_BYTES)
+        {
+            message
+        } else {
+            failure_message(
+                &request,
+                started,
+                WorkbenchOutcome::Failed,
+                ExecutionError::new(
+                    WorkbenchErrorClass::Resource,
+                    "caller_result_too_large",
+                    "the transient caller result exceeded its size boundary",
+                    false,
+                ),
+            )
         }
     }
 
-    /// Persist the redacted terminal result before it is emitted to the daemon.
+    /// Persist a durable-safe terminal projection before transient output is emitted.
     ///
     /// The immutable receipt closes the daemon-crash window between a completed
-    /// tool effect and its durable orchestration transition. Transient tool
-    /// output is intentionally removed; recovery returns only the auditable
-    /// outcome, resources, artifacts, and safe error classification. The M0
-    /// command child does not attest this receipt: receipt authority belongs to
-    /// this runtime process after its own result validation. The M0 profile is
-    /// limited to direct allowlisted argv; this local receipt is not evidence
-    /// that an external side effect has an idempotency or provider receipt.
+    /// tool effect and its durable orchestration transition. Transient output
+    /// and inspected file content are removed; retry receives only the same
+    /// outcome, resources, artifacts, and safe error without repeating effect.
+    /// The M0 command child does not attest this receipt: receipt authority
+    /// belongs to this runtime process after its own result validation. The M0
+    /// profile is limited to direct allowlisted argv; this local receipt is not
+    /// evidence that an external side effect has an idempotency or provider
+    /// receipt.
     pub fn persist_completion_receipt(
         &self,
         message: &WorkbenchMessage,
     ) -> Result<(), WorkbenchErrorInfo> {
-        let safe = safe_terminal_receipt(message)?;
+        let sealed = seal_terminal_result(message)?;
         let WorkbenchMessage::Result {
             invocation_id,
             input_digest,
             ..
-        } = &safe
+        } = &sealed.result
         else {
-            unreachable!("safe_terminal_receipt accepts only results");
+            unreachable!("seal_terminal_result accepts only results");
         };
-        let bytes = serde_json::to_vec(&safe).map_err(|_| {
+        let bytes = serde_json::to_vec(&sealed).map_err(|_| {
             recovery_error(
                 "completion_receipt_encode_failed",
                 "the completion receipt could not be encoded",
@@ -450,7 +539,7 @@ impl WorkbenchExecutor {
                     .remove_entry_if_identity(&temporary, temporary_identity, 1)
                     .map_err(receipt_error)?;
                 let existing = self.recover_completion(invocation_id, input_digest)?;
-                if existing != safe {
+                if existing != sealed.result {
                     return Err(recovery_error(
                         "completion_receipt_conflict",
                         "the immutable completion receipt conflicts with this result",
@@ -513,20 +602,20 @@ impl WorkbenchExecutor {
                 receipt_error(error)
             }
         })?;
-        let message: WorkbenchMessage = serde_json::from_slice(&bytes).map_err(|_| {
+        let sealed: SealedCompletionReceipt = serde_json::from_slice(&bytes).map_err(|_| {
             recovery_error(
                 "completion_receipt_invalid",
                 "the completion receipt could not be decoded",
             )
         })?;
-        let safe = safe_terminal_receipt(&message)?;
+        let result = validate_sealed_completion_receipt(sealed)?;
         let WorkbenchMessage::Result {
             invocation_id: stored_invocation,
             input_digest: stored_digest,
             ..
-        } = &safe
+        } = &result
         else {
-            unreachable!("safe_terminal_receipt accepts only results");
+            unreachable!("validated sealed receipt contains only results");
         };
         if stored_invocation != invocation_id || stored_digest != input_digest {
             return Err(recovery_error(
@@ -534,7 +623,7 @@ impl WorkbenchExecutor {
                 "the completion receipt does not match the requested invocation",
             ));
         }
-        Ok(safe)
+        Ok(result)
     }
 
     fn open_completion_receipt_directory(
@@ -580,34 +669,28 @@ impl WorkbenchExecutor {
         match &request.tool {
             WorkbenchTool::InspectFile { path, max_bytes } => {
                 let path = self.resolve_read_path(request, path)?;
-                let metadata = fs::metadata(&path).map_err(workspace_io_error)?;
-                if !metadata.is_file() {
-                    return Err(ExecutionError::workspace(
-                        "not_a_file",
-                        "the requested workspace path is not a regular file",
-                    ));
-                }
                 let limit = (*max_bytes)
                     .min(request.resource_limits.file_bytes)
+                    .min(WORKBENCH_MAX_INSPECT_BYTES)
                     .try_into()
                     .unwrap_or(usize::MAX);
                 let bytes = read_bounded_file(&path, limit)?;
                 ensure_invocation_active(request, cancelled, started)?;
+                let size = bytes.len();
+                let digest = hex_sha256(&bytes);
+                let content = String::from_utf8(bytes).map_err(|_| {
+                    ExecutionError::tool(
+                        "non_utf8_input",
+                        "M0 file inspection accepts UTF-8 text only",
+                    )
+                })?;
                 let mut output = BTreeMap::new();
-                output.insert("sha256".to_string(), hex_sha256(&bytes));
-                output.insert("size_bytes".to_string(), metadata.len().to_string());
-                output.insert(
-                    "content".to_string(),
-                    String::from_utf8(bytes.clone()).map_err(|_| {
-                        ExecutionError::tool(
-                            "non_utf8_input",
-                            "M0 file inspection accepts UTF-8 text only",
-                        )
-                    })?,
-                );
+                output.insert("sha256".to_string(), digest);
+                output.insert("size_bytes".to_string(), size.to_string());
+                output.insert("content".to_string(), content);
                 Ok(ExecutionSuccess {
                     output,
-                    bytes_read: bytes.len() as u64,
+                    bytes_read: size as u64,
                     ..ExecutionSuccess::default()
                 })
             }
@@ -620,9 +703,19 @@ impl WorkbenchExecutor {
                 let bytes = content.as_bytes();
                 ensure_file_budget(bytes.len() as u64, request.resource_limits.file_bytes)?;
                 let destination = self.resolve_for_write(path)?;
-                verify_expected_digest(&destination, expected_sha256.as_deref())?;
+                let expected_identity = verify_expected_digest(
+                    &destination,
+                    expected_sha256.as_deref(),
+                    request.resource_limits.file_bytes,
+                )?;
                 ensure_invocation_active(request, cancelled, started)?;
-                atomic_write(&destination, bytes, &request.invocation_id, request.attempt)?;
+                atomic_write_bound(
+                    &destination,
+                    bytes,
+                    &request.invocation_id,
+                    request.attempt,
+                    expected_identity,
+                )?;
                 Ok(file_write_success(bytes))
             }
             WorkbenchTool::ApplyPatch {
@@ -632,9 +725,23 @@ impl WorkbenchExecutor {
             } => {
                 reject_input_mutation(request, path)?;
                 let destination = self.resolve_existing(path)?;
-                verify_expected_digest(&destination, Some(expected_sha256))?;
-                let original = fs::read(&destination).map_err(workspace_io_error)?;
-                let mut updated = String::from_utf8(original.clone()).map_err(|_| {
+                let read_limit = request
+                    .resource_limits
+                    .file_bytes
+                    .try_into()
+                    .unwrap_or(usize::MAX);
+                let (original, original_identity) =
+                    read_bounded_file_with_identity(&destination, read_limit)?;
+                if hex_sha256(&original) != expected_sha256.as_str() {
+                    return Err(ExecutionError::new(
+                        WorkbenchErrorClass::Recovery,
+                        "digest_conflict",
+                        "the current file digest differs from the bound precondition",
+                        false,
+                    ));
+                }
+                let original_size = original.len();
+                let mut updated = String::from_utf8(original).map_err(|_| {
                     ExecutionError::tool(
                         "non_utf8_input",
                         "M0 patch application accepts UTF-8 text only",
@@ -647,25 +754,58 @@ impl WorkbenchExecutor {
                             "patch replacements must bind non-empty source text and occurrence count",
                         ));
                     }
-                    let count = updated.matches(&replacement.old).count() as u32;
-                    if count != replacement.expected_occurrences {
+                    let count = updated.matches(&replacement.old).count();
+                    if u32::try_from(count).ok() != Some(replacement.expected_occurrences) {
                         return Err(ExecutionError::tool(
                             "patch_context_conflict",
                             "patch source text did not match the expected occurrence count",
                         ));
                     }
-                    updated = updated.replace(&replacement.old, &replacement.new);
+                    let removed = replacement
+                        .old
+                        .len()
+                        .checked_mul(count)
+                        .ok_or_else(|| patch_expansion_error())?;
+                    let added = replacement
+                        .new
+                        .len()
+                        .checked_mul(count)
+                        .ok_or_else(|| patch_expansion_error())?;
+                    let projected = updated
+                        .len()
+                        .checked_sub(removed)
+                        .and_then(|size| size.checked_add(added))
+                        .ok_or_else(patch_expansion_error)?;
+                    if u64::try_from(projected).unwrap_or(u64::MAX)
+                        > request.resource_limits.file_bytes
+                    {
+                        return Err(patch_expansion_error());
+                    }
+                    let mut replaced = String::new();
+                    self.reserve_patch_output(&mut replaced, projected)?;
+                    let mut cursor = 0;
+                    for (offset, _) in updated.match_indices(&replacement.old) {
+                        replaced.push_str(&updated[cursor..offset]);
+                        replaced.push_str(&replacement.new);
+                        cursor = offset + replacement.old.len();
+                    }
+                    replaced.push_str(&updated[cursor..]);
+                    if replaced.len() != projected {
+                        return Err(patch_expansion_error());
+                    }
+                    updated = replaced;
                 }
                 ensure_file_budget(updated.len() as u64, request.resource_limits.file_bytes)?;
                 ensure_invocation_active(request, cancelled, started)?;
-                atomic_write(
+                atomic_write_bound(
                     &destination,
                     updated.as_bytes(),
                     &request.invocation_id,
                     request.attempt,
+                    Some(original_identity),
                 )?;
                 let mut success = file_write_success(updated.as_bytes());
-                success.bytes_read = original.len() as u64;
+                success.bytes_read = original_size as u64;
                 Ok(success)
             }
             WorkbenchTool::RunCommand { program, args } => {
@@ -691,6 +831,23 @@ impl WorkbenchExecutor {
         }
     }
 
+    fn reserve_patch_output(
+        &self,
+        output: &mut String,
+        projected: usize,
+    ) -> Result<(), ExecutionError> {
+        #[cfg(test)]
+        if self
+            .fail_next_patch_reservation
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(patch_allocation_error());
+        }
+        output
+            .try_reserve_exact(projected)
+            .map_err(|_| patch_allocation_error())
+    }
+
     fn scoped_for(&self, request: &WorkbenchRequest) -> Result<Self, ExecutionError> {
         let workspace_root = create_contained_directory(
             &self.workspace_root,
@@ -710,11 +867,13 @@ impl WorkbenchExecutor {
                 &[request.project_id.as_str(), request.work_item_id.as_str()],
             )?
         };
-        Ok(Self::with_input_root(
-            workspace_root,
-            artifact_root,
-            input_root,
-        ))
+        let scoped = Self::with_input_root(workspace_root, artifact_root, input_root);
+        #[cfg(test)]
+        let scoped = Self {
+            fail_next_patch_reservation: self.fail_next_patch_reservation.clone(),
+            ..scoped
+        };
+        Ok(scoped)
     }
 
     fn validate_declared_inputs(
@@ -824,24 +983,16 @@ impl WorkbenchExecutor {
         let stdout_reader = drain_bounded(stdout, request.resource_limits.stdout_bytes);
         let stderr_reader = drain_bounded(stderr, request.resource_limits.stderr_bytes);
         let absolute_deadline = UNIX_EPOCH + Duration::from_millis(request.deadline_unix_ms);
-        let wall_deadline = UNIX_EPOCH
-            .checked_add(Duration::from_millis(
-                unix_time_ms().saturating_add(
-                    request
-                        .resource_limits
-                        .wall_time_ms
-                        .saturating_sub(elapsed_ms(started)),
-                ),
-            ))
-            .unwrap_or(absolute_deadline);
-        let deadline = absolute_deadline.min(wall_deadline);
+        let relative_deadline = started
+            .checked_add(Duration::from_millis(request.resource_limits.wall_time_ms))
+            .unwrap_or_else(Instant::now);
         let mut observed = ProcessGroupUsage::default();
 
         let (status, forced_error) = loop {
             if cancelled.load(Ordering::Acquire) {
-                terminate_process_group(pid, &mut child);
+                terminate_process_group(pid, &mut child)?;
                 break (
-                    child.wait().ok(),
+                    None,
                     Some(ExecutionError::runtime(
                         "cancelled",
                         "invocation was cancelled",
@@ -849,10 +1000,15 @@ impl WorkbenchExecutor {
                     )),
                 );
             }
-            if SystemTime::now() >= deadline {
-                terminate_process_group(pid, &mut child);
+            if command_deadline_expired(
+                absolute_deadline,
+                relative_deadline,
+                SystemTime::now(),
+                Instant::now(),
+            ) {
+                terminate_process_group(pid, &mut child)?;
                 break (
-                    child.wait().ok(),
+                    None,
                     Some(ExecutionError::new(
                         WorkbenchErrorClass::Resource,
                         "deadline_expired",
@@ -882,9 +1038,9 @@ impl WorkbenchExecutor {
                 None
             };
             if let Some((code, message)) = limit_error {
-                terminate_process_group(pid, &mut child);
+                terminate_process_group(pid, &mut child)?;
                 break (
-                    child.wait().ok(),
+                    None,
                     Some(ExecutionError::new(
                         WorkbenchErrorClass::Resource,
                         code,
@@ -893,13 +1049,16 @@ impl WorkbenchExecutor {
                     )),
                 );
             }
-            match child.try_wait() {
-                Ok(Some(status)) => break (Some(status), None),
-                Ok(None) => thread::sleep(COMMAND_POLL_INTERVAL),
+            match owned_process_group_leader_exited(pid) {
+                Ok(true) => {
+                    let status = quiesce_process_group_after_leader_exit(pid, &mut child)?;
+                    break (Some(status), None);
+                }
+                Ok(false) => thread::sleep(COMMAND_POLL_INTERVAL),
                 Err(_) => {
-                    terminate_process_group(pid, &mut child);
+                    terminate_process_group(pid, &mut child)?;
                     break (
-                        child.wait().ok(),
+                        None,
                         Some(ExecutionError::runtime(
                             "command_wait_failed",
                             "command state could not be observed",
@@ -989,7 +1148,15 @@ impl WorkbenchExecutor {
                 )?;
             }
             entries.sort_by(|left, right| left.path.cmp(&right.path));
-            entries.dedup_by(|left, right| left.path == right.path);
+            if entries
+                .windows(2)
+                .any(|entries| entries[0].path == entries[1].path)
+            {
+                return Err(ExecutionError::tool(
+                    "duplicate_artifact_path",
+                    "artifact packaging resolved duplicate manifest paths",
+                ));
+            }
             if entries.is_empty() {
                 return Err(ExecutionError::tool(
                     "empty_artifact",
@@ -1106,8 +1273,6 @@ impl WorkbenchExecutor {
             }
         }
 
-        self.reconcile_completion_receipts()?;
-
         let blob_directory = self.artifact_root.join("blobs");
         fs::create_dir_all(&blob_directory).map_err(workspace_io_error)?;
         reject_symlink(&blob_directory)?;
@@ -1171,6 +1336,8 @@ impl WorkbenchExecutor {
             })
             .collect::<Result<Vec<_>, _>>()?;
         names.sort();
+        let mut temporary_cleanup = Vec::new();
+        let mut linked_destinations = BTreeMap::new();
         for name in names
             .iter()
             .filter(|name| name.to_str().is_some_and(is_completion_receipt_temporary))
@@ -1207,16 +1374,17 @@ impl WorkbenchExecutor {
                     if receipt_file_identity(&installed_metadata) != identity {
                         return Err(completion_receipt_reconcile_error());
                     }
+                    if names.binary_search(&destination).is_err()
+                        || linked_destinations.insert(destination, identity).is_some()
+                    {
+                        return Err(completion_receipt_reconcile_error());
+                    }
                 }
                 _ => return Err(completion_receipt_reconcile_error()),
             }
-            directory
-                .remove_entry_if_identity(name, identity, metadata.nlink())
-                .map_err(|_| completion_receipt_reconcile_error())?;
-            directory
-                .sync()
-                .map_err(|_| completion_receipt_reconcile_error())?;
+            temporary_cleanup.push((name.clone(), identity, metadata.nlink()));
         }
+        let mut validated_receipts = BTreeMap::new();
         for name in names
             .iter()
             .filter(|name| !name.to_str().is_some_and(is_completion_receipt_temporary))
@@ -1230,20 +1398,40 @@ impl WorkbenchExecutor {
             if !valid_receipt_invocation_id(invocation_id) {
                 return Err(completion_receipt_reconcile_error());
             }
-            let bytes = read_validated_receipt(&directory, name, || {})
-                .map_err(|_| completion_receipt_reconcile_error())?;
-            let message: WorkbenchMessage =
+            let bytes = if let Some(identity) = linked_destinations.get(name) {
+                read_validated_receipt_for_reconciliation(&directory, name, 2, *identity)
+            } else {
+                read_validated_receipt(&directory, name, || {})
+            }
+            .map_err(|_| completion_receipt_reconcile_error())?;
+            let sealed: SealedCompletionReceipt =
                 serde_json::from_slice(&bytes).map_err(|_| completion_receipt_reconcile_error())?;
-            let safe = safe_terminal_receipt(&message)
+            let result = validate_sealed_completion_receipt(sealed)
                 .map_err(|_| completion_receipt_reconcile_error())?;
             let WorkbenchMessage::Result {
                 invocation_id: stored_invocation,
                 ..
-            } = safe
+            } = result
             else {
-                unreachable!("safe_terminal_receipt accepts only results");
+                unreachable!("validated sealed receipt contains only results");
             };
             if stored_invocation != invocation_id {
+                return Err(completion_receipt_reconcile_error());
+            }
+            validated_receipts.insert(name.clone(), bytes);
+        }
+        for (name, identity, links) in &temporary_cleanup {
+            directory
+                .remove_entry_if_identity(name, *identity, *links)
+                .map_err(|_| completion_receipt_reconcile_error())?;
+        }
+        directory
+            .sync()
+            .map_err(|_| completion_receipt_reconcile_error())?;
+        for (name, identity) in linked_destinations {
+            let bytes = read_validated_receipt_for_reconciliation(&directory, &name, 1, identity)
+                .map_err(|_| completion_receipt_reconcile_error())?;
+            if validated_receipts.get(&name) != Some(&bytes) {
                 return Err(completion_receipt_reconcile_error());
             }
         }
@@ -1432,16 +1620,12 @@ fn reject_input_mutation(request: &WorkbenchRequest, relative: &str) -> Result<(
     Ok(())
 }
 
-fn safe_terminal_receipt(
+fn seal_terminal_result(
     message: &WorkbenchMessage,
-) -> Result<WorkbenchMessage, WorkbenchErrorInfo> {
+) -> Result<SealedCompletionReceipt, WorkbenchErrorInfo> {
     let WorkbenchMessage::Result {
-        schema_version,
         invocation_id,
         input_digest,
-        outcome,
-        resources,
-        artifacts,
         error,
         ..
     } = message
@@ -1451,17 +1635,69 @@ fn safe_terminal_receipt(
             "only a terminal workbench result can be persisted",
         ));
     };
+    if error
+        .as_ref()
+        .is_some_and(|error| error.code == "command_cleanup_failed")
+    {
+        return Err(WorkbenchErrorInfo {
+            class: WorkbenchErrorClass::Runtime,
+            code: "command_cleanup_failed".to_string(),
+            safe_message: "the command process tree is not proven quiescent".to_string(),
+            retryable: false,
+        });
+    }
     validate_receipt_key(invocation_id, input_digest)?;
-    Ok(WorkbenchMessage::Result {
-        schema_version: *schema_version,
+    let mut durable_result = message.clone();
+    let WorkbenchMessage::Result { output, .. } = &mut durable_result else {
+        unreachable!("terminal receipt validation already rejected non-results");
+    };
+    output.clear();
+    let result_bytes = serde_json::to_vec(&durable_result).map_err(|_| {
+        recovery_error(
+            "caller_result_encode_failed",
+            "the durable-safe caller result could not be encoded",
+        )
+    })?;
+    if result_bytes.len() > WORKBENCH_MAX_CALLER_RESULT_BYTES {
+        return Err(recovery_error(
+            "caller_result_too_large",
+            "the durable-safe caller result exceeded its size boundary",
+        ));
+    }
+    Ok(SealedCompletionReceipt {
+        schema_version: COMPLETION_RECEIPT_SCHEMA_VERSION,
         invocation_id: invocation_id.clone(),
         input_digest: input_digest.clone(),
-        outcome: *outcome,
-        resources: resources.clone(),
-        artifacts: artifacts.clone(),
-        output: BTreeMap::new(),
-        error: error.clone(),
+        result_digest: hex_sha256(&result_bytes),
+        result: durable_result,
     })
+}
+
+fn serialized_caller_result_size(message: &WorkbenchMessage) -> Option<usize> {
+    serde_json::to_vec(message).ok().map(|bytes| bytes.len())
+}
+
+fn validate_sealed_completion_receipt(
+    sealed: SealedCompletionReceipt,
+) -> Result<WorkbenchMessage, WorkbenchErrorInfo> {
+    if sealed.schema_version != COMPLETION_RECEIPT_SCHEMA_VERSION {
+        return Err(recovery_error(
+            "completion_receipt_version_unsupported",
+            "the completion receipt version is unsupported",
+        ));
+    }
+    let validated = seal_terminal_result(&sealed.result)?;
+    if sealed.invocation_id != validated.invocation_id
+        || sealed.input_digest != validated.input_digest
+        || sealed.result_digest != validated.result_digest
+        || sealed.result != validated.result
+    {
+        return Err(recovery_error(
+            "completion_receipt_binding_mismatch",
+            "the completion receipt result binding is invalid",
+        ));
+    }
+    Ok(validated.result)
 }
 
 fn validate_receipt_key(invocation_id: &str, input_digest: &str) -> Result<(), WorkbenchErrorInfo> {
@@ -1494,15 +1730,10 @@ fn is_completion_receipt_temporary(name: &str) -> bool {
 }
 
 fn completion_receipt_temp_invocation(name: &str) -> Option<&str> {
-    let Some(value) = name
+    let value = name
         .strip_prefix('.')
-        .and_then(|name| name.strip_suffix(".tmp"))
-    else {
-        return None;
-    };
-    let Some((invocation_id, token)) = value.split_once('.') else {
-        return None;
-    };
+        .and_then(|name| name.strip_suffix(".tmp"))?;
+    let (invocation_id, token) = value.split_once('.')?;
     (valid_receipt_invocation_id(invocation_id)
         && !token.is_empty()
         && token.len() <= 64
@@ -1751,10 +1982,12 @@ impl StoredArtifactManifest {
             ));
         }
         let mut referenced = BTreeMap::new();
+        let mut entry_paths = BTreeSet::new();
         for entry in self.entries {
             if checked_relative(&entry.path).is_err()
                 || !is_lower_hex_digest(&entry.sha256)
                 || entry.blob_id != format!("sha256:{}", entry.sha256)
+                || !entry_paths.insert(entry.path.clone())
             {
                 return Err(ExecutionError::new(
                     WorkbenchErrorClass::Recovery,
@@ -1888,20 +2121,31 @@ fn ensure_invocation_active(
     Ok(())
 }
 
-fn checked_relative(path: &str) -> Result<&Path, ExecutionError> {
-    let path = Path::new(path);
-    if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
+fn checked_relative(value: &str) -> Result<&Path, ExecutionError> {
+    let path = Path::new(value);
+    let mut canonical = String::new();
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            return Err(ExecutionError::workspace(
+                "invalid_path",
+                "tool path must use its canonical workspace-relative representation",
+            ));
+        };
+        let Some(component) = component.to_str() else {
+            return Err(ExecutionError::workspace(
+                "invalid_path",
+                "tool path must use its canonical workspace-relative representation",
+            ));
+        };
+        if !canonical.is_empty() {
+            canonical.push('/');
+        }
+        canonical.push_str(component);
+    }
+    if canonical.is_empty() || canonical != value {
         return Err(ExecutionError::workspace(
             "invalid_path",
-            "tool path must be workspace-relative",
+            "tool path must use its canonical workspace-relative representation",
         ));
     }
     Ok(path)
@@ -1918,11 +2162,16 @@ fn reject_symlink(path: &Path) -> Result<(), ExecutionError> {
     Ok(())
 }
 
-fn verify_expected_digest(path: &Path, expected: Option<&str>) -> Result<(), ExecutionError> {
+fn verify_expected_digest(
+    path: &Path,
+    expected: Option<&str>,
+    file_limit: u64,
+) -> Result<Option<BoundedFileIdentity>, ExecutionError> {
     let Some(expected) = expected else {
-        return Ok(());
+        return Ok(None);
     };
-    let bytes = fs::read(path).map_err(workspace_io_error)?;
+    let (bytes, identity) =
+        read_bounded_file_with_identity(path, file_limit.try_into().unwrap_or(usize::MAX))?;
     if hex_sha256(&bytes) != expected {
         return Err(ExecutionError::new(
             WorkbenchErrorClass::Recovery,
@@ -1931,7 +2180,7 @@ fn verify_expected_digest(path: &Path, expected: Option<&str>) -> Result<(), Exe
             false,
         ));
     }
-    Ok(())
+    Ok(Some(identity))
 }
 
 fn atomic_write(
@@ -1940,9 +2189,21 @@ fn atomic_write(
     invocation_id: &str,
     attempt: u32,
 ) -> Result<(), ExecutionError> {
+    atomic_write_bound(destination, bytes, invocation_id, attempt, None)
+}
+
+fn atomic_write_bound(
+    destination: &Path,
+    bytes: &[u8],
+    invocation_id: &str,
+    attempt: u32,
+    expected_identity: Option<BoundedFileIdentity>,
+) -> Result<(), ExecutionError> {
+    if let Some(expected_identity) = expected_identity {
+        verify_bounded_file_path_identity(destination, expected_identity)?;
+    }
     if destination.exists() {
-        let current = fs::read(destination).map_err(workspace_io_error)?;
-        if current == bytes {
+        if existing_file_equals(destination, bytes)? {
             return Ok(());
         }
     }
@@ -1962,6 +2223,9 @@ fn atomic_write(
             .map_err(workspace_io_error)?;
         file.write_all(bytes).map_err(workspace_io_error)?;
         file.sync_all().map_err(workspace_io_error)?;
+        if let Some(expected_identity) = expected_identity {
+            verify_bounded_file_path_identity(destination, expected_identity)?;
+        }
         fs::rename(&temporary, destination).map_err(workspace_io_error)?;
         File::open(parent)
             .and_then(|directory| directory.sync_all())
@@ -1980,8 +2244,7 @@ fn immutable_write(
     attempt: u32,
 ) -> Result<(), ExecutionError> {
     if destination.exists() {
-        let current = fs::read(destination).map_err(workspace_io_error)?;
-        if current == bytes {
+        if existing_file_equals(destination, bytes)? {
             return Ok(());
         }
         return Err(ExecutionError::new(
@@ -1995,8 +2258,20 @@ fn immutable_write(
 }
 
 fn read_bounded_file(path: &Path, limit: usize) -> Result<Vec<u8>, ExecutionError> {
-    let metadata = fs::metadata(path).map_err(workspace_io_error)?;
-    if metadata.len() > limit as u64 {
+    read_bounded_file_with_identity(path, limit).map(|(bytes, _)| bytes)
+}
+
+fn read_bounded_file_with_identity(
+    path: &Path,
+    limit: usize,
+) -> Result<(Vec<u8>, BoundedFileIdentity), ExecutionError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+        .map_err(workspace_io_error)?;
+    let before = file.metadata().map_err(workspace_io_error)?;
+    if !before.is_file() || before.len() > u64::try_from(limit).unwrap_or(u64::MAX) {
         return Err(ExecutionError::new(
             WorkbenchErrorClass::Resource,
             "file_limit_exceeded",
@@ -2004,7 +2279,71 @@ fn read_bounded_file(path: &Path, limit: usize) -> Result<Vec<u8>, ExecutionErro
             false,
         ));
     }
-    fs::read(path).map_err(workspace_io_error)
+    let expected_size = usize::try_from(before.len()).map_err(|_| file_read_allocation_error())?;
+    let read_boundary = before.len().saturating_add(1);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected_size.saturating_add(1))
+        .map_err(|_| file_read_allocation_error())?;
+    (&mut file)
+        .take(read_boundary)
+        .read_to_end(&mut bytes)
+        .map_err(workspace_io_error)?;
+    let after = file.metadata().map_err(workspace_io_error)?;
+    let identity = BoundedFileIdentity {
+        device: after.dev(),
+        inode: after.ino(),
+        size: after.len(),
+    };
+    if bytes.len() > limit
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || after.len() != bytes.len() as u64
+    {
+        return Err(ExecutionError::new(
+            WorkbenchErrorClass::Resource,
+            "file_limit_exceeded",
+            "the requested file exceeded or changed within the invocation read limit",
+            false,
+        ));
+    }
+    verify_bounded_file_path_identity(path, identity)?;
+    Ok((bytes, identity))
+}
+
+fn verify_bounded_file_path_identity(
+    path: &Path,
+    expected: BoundedFileIdentity,
+) -> Result<(), ExecutionError> {
+    let metadata = fs::symlink_metadata(path).map_err(workspace_io_error)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.dev() != expected.device
+        || metadata.ino() != expected.inode
+        || metadata.len() != expected.size
+    {
+        return Err(ExecutionError::new(
+            WorkbenchErrorClass::Recovery,
+            "file_identity_changed",
+            "the bound file identity changed before the effect committed",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn existing_file_equals(path: &Path, expected: &[u8]) -> Result<bool, ExecutionError> {
+    let metadata = fs::symlink_metadata(path).map_err(workspace_io_error)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(workspace_io_error(std::io::Error::other(
+            "existing destination is not a regular file",
+        )));
+    }
+    if metadata.len() != expected.len() as u64 {
+        return Ok(false);
+    }
+    Ok(read_bounded_file(path, expected.len())? == expected)
 }
 
 fn ensure_file_budget(actual: u64, limit: u64) -> Result<(), ExecutionError> {
@@ -2019,6 +2358,33 @@ fn ensure_file_budget(actual: u64, limit: u64) -> Result<(), ExecutionError> {
     Ok(())
 }
 
+fn patch_expansion_error() -> ExecutionError {
+    ExecutionError::new(
+        WorkbenchErrorClass::Resource,
+        "file_limit_exceeded",
+        "patch expansion exceeds the invocation file limit",
+        false,
+    )
+}
+
+fn patch_allocation_error() -> ExecutionError {
+    ExecutionError::new(
+        WorkbenchErrorClass::Resource,
+        "patch_allocation_failed",
+        "patch output memory could not be reserved within the invocation boundary",
+        false,
+    )
+}
+
+fn file_read_allocation_error() -> ExecutionError {
+    ExecutionError::new(
+        WorkbenchErrorClass::Resource,
+        "file_read_allocation_failed",
+        "file input memory could not be reserved within the invocation boundary",
+        false,
+    )
+}
+
 fn file_write_success(bytes: &[u8]) -> ExecutionSuccess {
     ExecutionSuccess {
         output: BTreeMap::from([
@@ -2030,11 +2396,151 @@ fn file_write_success(bytes: &[u8]) -> ExecutionSuccess {
     }
 }
 
-fn terminate_process_group(pid: u32, child: &mut std::process::Child) {
-    if let Ok(pid) = i32::try_from(pid) {
-        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+fn command_deadline_expired(
+    absolute_deadline: SystemTime,
+    relative_deadline: Instant,
+    wall_now: SystemTime,
+    monotonic_now: Instant,
+) -> bool {
+    wall_now >= absolute_deadline || monotonic_now >= relative_deadline
+}
+
+fn terminate_process_group(
+    process_group: u32,
+    child: &mut std::process::Child,
+) -> Result<(), ExecutionError> {
+    validate_owned_process_group_leader(process_group)?;
+    let process_group_i32 = i32::try_from(process_group).map_err(|_| command_cleanup_error())?;
+    match killpg(Pid::from_raw(process_group_i32), Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(_) => return Err(command_cleanup_error()),
     }
-    let _ = child.kill();
+    wait_for_owned_process_group_leader_and_descendants(process_group)?;
+    child.wait().map_err(|_| command_cleanup_error())?;
+    verify_reaped_process_group_quiescence(process_group)
+}
+
+fn quiesce_process_group_after_leader_exit(
+    process_group: u32,
+    child: &mut std::process::Child,
+) -> Result<std::process::ExitStatus, ExecutionError> {
+    if !owned_process_group_leader_exited(process_group)? {
+        return Err(command_cleanup_error());
+    }
+    let process_group_i32 = i32::try_from(process_group).map_err(|_| command_cleanup_error())?;
+    match killpg(Pid::from_raw(process_group_i32), Signal::SIGKILL) {
+        Ok(()) => {}
+        Err(Errno::ESRCH) if process_group_member_count(process_group)? <= 1 => {}
+        Err(_) => return Err(command_cleanup_error()),
+    }
+    wait_for_owned_process_group_leader_and_descendants(process_group)?;
+    let status = child.wait().map_err(|_| command_cleanup_error())?;
+    verify_reaped_process_group_quiescence(process_group)?;
+    Ok(status)
+}
+
+fn wait_for_owned_process_group_leader_and_descendants(
+    process_group: u32,
+) -> Result<(), ExecutionError> {
+    let deadline = Instant::now() + COMMAND_CLEANUP_GRACE;
+    loop {
+        if owned_process_group_leader_exited(process_group)?
+            && process_group_member_count(process_group)? <= 1
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(command_cleanup_error());
+        }
+        thread::sleep(COMMAND_POLL_INTERVAL);
+    }
+}
+
+fn verify_reaped_process_group_quiescence(process_group: u32) -> Result<(), ExecutionError> {
+    let deadline = Instant::now() + COMMAND_CLEANUP_GRACE;
+    loop {
+        if process_group_member_count(process_group)? == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            // The exact child has already been reaped. Never signal this numeric
+            // process-group identifier again because it is now reusable.
+            return Err(command_cleanup_error());
+        }
+        thread::sleep(COMMAND_POLL_INTERVAL);
+    }
+}
+
+fn owned_process_group_leader_exited(process_group: u32) -> Result<bool, ExecutionError> {
+    let (state, actual_group) = read_process_state_and_group(process_group)?;
+    if actual_group != process_group {
+        return Err(command_cleanup_error());
+    }
+    Ok(matches!(state, 'Z' | 'X'))
+}
+
+fn validate_owned_process_group_leader(process_group: u32) -> Result<(), ExecutionError> {
+    let (_, actual_group) = read_process_state_and_group(process_group)?;
+    if actual_group != process_group {
+        return Err(command_cleanup_error());
+    }
+    Ok(())
+}
+
+fn read_process_state_and_group(process: u32) -> Result<(char, u32), ExecutionError> {
+    let stat =
+        fs::read_to_string(format!("/proc/{process}/stat")).map_err(|_| command_cleanup_error())?;
+    let after_name = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest.trim())
+        .ok_or_else(command_cleanup_error)?;
+    let mut fields = after_name.split_whitespace();
+    let state = fields
+        .next()
+        .and_then(|value| value.chars().next())
+        .ok_or_else(command_cleanup_error)?;
+    let _parent = fields.next().ok_or_else(command_cleanup_error)?;
+    let group = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(command_cleanup_error)?;
+    Ok((state, group))
+}
+
+fn process_group_member_count(process_group: u32) -> Result<u32, ExecutionError> {
+    let entries = fs::read_dir("/proc").map_err(|_| command_cleanup_error())?;
+    let mut count = 0_u32;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(after_name) = stat.rsplit_once(')').map(|(_, rest)| rest.trim()) else {
+            continue;
+        };
+        let group = after_name
+            .split_whitespace()
+            .nth(2)
+            .and_then(|value| value.parse::<u32>().ok());
+        if group == Some(process_group) {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+fn command_cleanup_error() -> ExecutionError {
+    ExecutionError::runtime(
+        "command_cleanup_failed",
+        "the command process group could not be proven quiescent",
+        false,
+    )
 }
 
 #[derive(Default)]
@@ -2231,11 +2737,27 @@ mod tests {
             schema_version: WORKBENCH_SCHEMA_VERSION,
             invocation_id: request.invocation_id.clone(),
             input_digest: request.input_digest.clone(),
-            outcome: WorkbenchOutcome::Succeeded,
-            resources: WorkbenchResourceUsage::default(),
-            artifacts: Vec::new(),
+            outcome: WorkbenchOutcome::Failed,
+            resources: WorkbenchResourceUsage {
+                duration_ms: 17,
+                bytes_read: 23,
+                ..WorkbenchResourceUsage::default()
+            },
+            artifacts: vec![WorkbenchArtifactRef {
+                artifact_id: format!("sha256:{}", "d".repeat(64)),
+                sha256: "d".repeat(64),
+                artifact_kind: "source_tree".to_string(),
+                media_type: "application/json".to_string(),
+                size_bytes: 31,
+                manifest_path: "receipt-safe.manifest.json".to_string(),
+            }],
             output: BTreeMap::from([("content".to_string(), "PRIVATE".to_string())]),
-            error: None,
+            error: Some(WorkbenchErrorInfo {
+                class: WorkbenchErrorClass::Tool,
+                code: "safe_failure".to_string(),
+                safe_message: "the tool failed safely".to_string(),
+                retryable: false,
+            }),
         };
         (result, request.invocation_id, request.input_digest)
     }
@@ -2404,6 +2926,286 @@ mod tests {
     }
 
     #[test]
+    fn inspect_result_fits_transient_budget_under_worst_case_json_escaping() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let artifacts = directory.path().join("artifacts");
+        fs::create_dir_all(scoped(&workspace).join("src")).unwrap();
+        fs::write(
+            scoped(&workspace).join("src/control.txt"),
+            vec![0_u8; WORKBENCH_MAX_INSPECT_BYTES as usize],
+        )
+        .unwrap();
+        let executor = WorkbenchExecutor::new(&workspace, &artifacts);
+        let result = executor.execute(
+            request(
+                WorkbenchTool::InspectFile {
+                    path: "src/control.txt".to_string(),
+                    max_bytes: WORKBENCH_MAX_INSPECT_BYTES,
+                },
+                "file.inspect",
+            ),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(outcome(&result), WorkbenchOutcome::Succeeded);
+        assert!(
+            serialized_caller_result_size(&result).unwrap() <= WORKBENCH_MAX_CALLER_RESULT_BYTES
+        );
+
+        fs::write(scoped(&workspace).join("src/control.txt"), [0xff]).unwrap();
+        let non_utf8 = executor.execute(
+            request(
+                WorkbenchTool::InspectFile {
+                    path: "src/control.txt".to_string(),
+                    max_bytes: WORKBENCH_MAX_INSPECT_BYTES,
+                },
+                "file.inspect",
+            ),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let WorkbenchMessage::Result {
+            error: Some(error), ..
+        } = non_utf8
+        else {
+            panic!("non-UTF-8 inspection did not fail closed");
+        };
+        assert_eq!(error.code, "non_utf8_input");
+
+        let transient_content = "INSPECT-TRANSIENT-CONTENT-ONLY";
+        fs::write(
+            scoped(&workspace).join("src/control.txt"),
+            transient_content,
+        )
+        .unwrap();
+        let inspect_request = request(
+            WorkbenchTool::InspectFile {
+                path: "src/control.txt".to_string(),
+                max_bytes: WORKBENCH_MAX_INSPECT_BYTES,
+            },
+            "file.inspect",
+        );
+        let immediate = executor.execute(inspect_request.clone(), Arc::new(AtomicBool::new(false)));
+        let WorkbenchMessage::Result { output, .. } = &immediate else {
+            panic!("inspection did not return a result");
+        };
+        assert_eq!(
+            output.get("content").map(String::as_str),
+            Some(transient_content)
+        );
+        executor.persist_completion_receipt(&immediate).unwrap();
+        let replay = executor
+            .recover_completion(
+                &inspect_request.invocation_id,
+                &inspect_request.input_digest,
+            )
+            .unwrap();
+        let WorkbenchMessage::Result { output, .. } = replay else {
+            panic!("inspection replay did not return a durable-safe result");
+        };
+        assert!(output.is_empty());
+        let receipt = artifacts
+            .join(COMPLETION_RECEIPT_DIRECTORY)
+            .join(format!("{}.json", inspect_request.invocation_id));
+        assert!(!fs::read(receipt)
+            .unwrap()
+            .windows(transient_content.len())
+            .any(|bytes| bytes == transient_content.as_bytes()));
+    }
+
+    #[test]
+    fn patch_reads_and_allocations_are_bounded_without_mutation_and_executor_remains_usable() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let artifacts = directory.path().join("artifacts");
+        fs::create_dir_all(scoped(&workspace).join("src")).unwrap();
+        let original = "a".repeat(1024 * 1024);
+        let path = scoped(&workspace).join("src/index.txt");
+        fs::write(&path, &original).unwrap();
+        let executor = WorkbenchExecutor::new(&workspace, &artifacts);
+        let result = executor.execute(
+            request(
+                WorkbenchTool::ApplyPatch {
+                    path: "src/index.txt".to_string(),
+                    expected_sha256: hex_sha256(original.as_bytes()),
+                    replacements: vec![sentinel_common::TextReplacement {
+                        old: "a".to_string(),
+                        new: "b".repeat(64 * 1024),
+                        expected_occurrences: 1024 * 1024,
+                    }],
+                },
+                "patch.apply",
+            ),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let WorkbenchMessage::Result {
+            error: Some(error), ..
+        } = result
+        else {
+            panic!("expansion bomb did not return a typed terminal error");
+        };
+        assert_eq!(error.code, "file_limit_exceeded");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        let oversized = "x".repeat(1025);
+        fs::write(&path, &oversized).unwrap();
+        let mut oversized_request = request(
+            WorkbenchTool::ApplyPatch {
+                path: "src/index.txt".to_string(),
+                expected_sha256: hex_sha256(oversized.as_bytes()),
+                replacements: vec![sentinel_common::TextReplacement {
+                    old: "x".to_string(),
+                    new: "y".to_string(),
+                    expected_occurrences: 1025,
+                }],
+            },
+            "patch.apply",
+        );
+        oversized_request.resource_limits.file_bytes = 1024;
+        oversized_request.input_digest = oversized_request.canonical_digest().unwrap();
+        let oversized_result =
+            executor.execute(oversized_request, Arc::new(AtomicBool::new(false)));
+        let WorkbenchMessage::Result {
+            error: Some(error), ..
+        } = oversized_result
+        else {
+            panic!("oversized existing patch input did not fail closed");
+        };
+        assert_eq!(error.code, "file_limit_exceeded");
+        assert_eq!(fs::read_to_string(&path).unwrap(), oversized);
+
+        let allocation_input = "allocation-bound";
+        fs::write(&path, allocation_input).unwrap();
+        executor
+            .fail_next_patch_reservation
+            .store(true, Ordering::Release);
+        let allocation_result = executor.execute(
+            request(
+                WorkbenchTool::ApplyPatch {
+                    path: "src/index.txt".to_string(),
+                    expected_sha256: hex_sha256(allocation_input.as_bytes()),
+                    replacements: vec![sentinel_common::TextReplacement {
+                        old: "bound".to_string(),
+                        new: "safe".to_string(),
+                        expected_occurrences: 1,
+                    }],
+                },
+                "patch.apply",
+            ),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let WorkbenchMessage::Result {
+            error: Some(error), ..
+        } = allocation_result
+        else {
+            panic!("injected patch allocation failure did not fail closed");
+        };
+        assert_eq!(error.code, "patch_allocation_failed");
+        assert_eq!(fs::read_to_string(&path).unwrap(), allocation_input);
+
+        let (_, original_identity) = read_bounded_file_with_identity(&path, 1024).unwrap();
+        let displaced = scoped(&workspace).join("src/displaced.txt");
+        fs::rename(&path, &displaced).unwrap();
+        fs::write(&path, allocation_input).unwrap();
+        let identity_error = atomic_write_bound(
+            &path,
+            b"replacement",
+            "018f3f32-4f01-7f2c-a6c1-f6f4a81b2801",
+            1,
+            Some(original_identity),
+        )
+        .unwrap_err();
+        assert_eq!(identity_error.code, "file_identity_changed");
+        assert_eq!(fs::read_to_string(&path).unwrap(), allocation_input);
+
+        let next_effect = executor.execute(
+            request(
+                WorkbenchTool::WriteFile {
+                    path: "src/next.txt".to_string(),
+                    content: "healthy".to_string(),
+                    expected_sha256: None,
+                },
+                "file.write",
+            ),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(outcome(&next_effect), WorkbenchOutcome::Succeeded);
+    }
+
+    #[test]
+    fn relative_command_deadline_is_monotonic_across_wall_clock_rollback() {
+        let started = Instant::now();
+        let relative_deadline = started + Duration::from_millis(10);
+        let absolute_deadline = UNIX_EPOCH + Duration::from_secs(10_000);
+        assert!(command_deadline_expired(
+            absolute_deadline,
+            relative_deadline,
+            UNIX_EPOCH,
+            relative_deadline + Duration::from_millis(1),
+        ));
+    }
+
+    #[test]
+    fn command_terminalization_quiesces_descendants_on_normal_cancel_and_deadline_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("workspace")).unwrap();
+        let executor = WorkbenchExecutor::new(
+            directory.path().join("workspace"),
+            directory.path().join("artifacts"),
+        );
+        let normal = request(
+            WorkbenchTool::RunCommand {
+                program: "sh".to_string(),
+                args: Vec::new(),
+            },
+            "command.run_allowlisted",
+        );
+        let normal_result = executor.run_command(
+            &normal,
+            "sh",
+            &[
+                "-c".to_string(),
+                "sleep 30 </dev/null >/dev/null 2>&1 &".to_string(),
+            ],
+            None,
+            &AtomicBool::new(false),
+            Instant::now(),
+        );
+        assert!(normal_result.is_ok());
+
+        let cancelled = AtomicBool::new(true);
+        let cancelled_result = executor.run_command(
+            &normal,
+            "sh",
+            &["-c".to_string(), "sleep 30 & wait".to_string()],
+            None,
+            &cancelled,
+            Instant::now(),
+        );
+        let cancelled_error = match cancelled_result {
+            Ok(_) => panic!("cancelled command unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(cancelled_error.code, "cancelled");
+
+        let mut expired = normal;
+        expired.deadline_unix_ms = unix_time_ms().saturating_add(20);
+        expired.resource_limits.wall_time_ms = 20;
+        let deadline_result = executor.run_command(
+            &expired,
+            "sh",
+            &["-c".to_string(), "sleep 30 & wait".to_string()],
+            None,
+            &AtomicBool::new(false),
+            Instant::now(),
+        );
+        let deadline_error = match deadline_result {
+            Ok(_) => panic!("expired command unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(deadline_error.code, "deadline_expired");
+    }
+
+    #[test]
     fn restart_rejects_a_manifest_whose_content_no_longer_matches_its_name() {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().join("workspace");
@@ -2504,10 +3306,11 @@ mod tests {
         let workspace = directory.path().join("workspace");
         let executor = WorkbenchExecutor::new(&workspace, directory.path().join("artifacts"));
 
+        let transient_command_output = "TRANSIENT-COMMAND-OUTPUT-ONLY";
         let mut command = request(
             WorkbenchTool::RunCommand {
                 program: "printf".to_string(),
-                args: vec!["ok".to_string()],
+                args: vec![transient_command_output.to_string()],
             },
             "command.run_allowlisted",
         );
@@ -2517,10 +3320,37 @@ mod tests {
             max_args: 1,
         }];
         command.input_digest = command.canonical_digest().unwrap();
+        let immediate = executor.execute(command.clone(), Arc::new(AtomicBool::new(false)));
+        let WorkbenchMessage::Result {
+            outcome: immediate_outcome,
+            output,
+            ..
+        } = &immediate
+        else {
+            panic!("command execution must return a result");
+        };
+        assert_eq!(*immediate_outcome, WorkbenchOutcome::Succeeded);
         assert_eq!(
-            outcome(&executor.execute(command, Arc::new(AtomicBool::new(false)))),
-            WorkbenchOutcome::Succeeded
+            output.get("stdout").map(String::as_str),
+            Some(transient_command_output)
         );
+        executor.persist_completion_receipt(&immediate).unwrap();
+        let replay = executor
+            .recover_completion(&command.invocation_id, &command.input_digest)
+            .unwrap();
+        let WorkbenchMessage::Result { output, .. } = replay else {
+            panic!("command replay did not return a durable-safe result");
+        };
+        assert!(output.is_empty());
+        let receipt = directory
+            .path()
+            .join("artifacts")
+            .join(COMPLETION_RECEIPT_DIRECTORY)
+            .join(format!("{}.json", command.invocation_id));
+        assert!(!fs::read(receipt)
+            .unwrap()
+            .windows(transient_command_output.len())
+            .any(|bytes| bytes == transient_command_output.as_bytes()));
 
         let mut excessive_output = request(
             WorkbenchTool::RunCommand {
@@ -2573,6 +3403,51 @@ mod tests {
             redact_output(b"visible\nAuthorization: Bearer abc\ntoken=abc"),
             "visible\n[REDACTED]\n[REDACTED]"
         );
+    }
+
+    #[test]
+    fn executor_paths_and_recovered_manifest_entries_are_canonical_and_unique() {
+        assert!(checked_relative("src/index.html").is_ok());
+        for alias in [
+            ".",
+            "./src/index.html",
+            "src/./index.html",
+            "src//index.html",
+        ] {
+            assert!(checked_relative(alias).is_err(), "accepted alias {alias}");
+        }
+
+        let digest = "d".repeat(64);
+        let manifest = StoredArtifactManifest {
+            schema_version: 1,
+            invocation_id: "018f3f32-4f01-7f2c-a6c1-f6f4a81b2801".to_string(),
+            input_digest: "a".repeat(64),
+            project_id: "project-01".to_string(),
+            work_item_id: "work-04".to_string(),
+            workspace_id: "project-01:work-04".to_string(),
+            agent_id: 7,
+            artifact_kind: "source_tree".to_string(),
+            media_type: "application/json".to_string(),
+            runtime_key: sentinel_common::WORKBENCH_RUNTIME_BWRAP.to_string(),
+            tool_profile: "web-authoring-v1".to_string(),
+            tool_profile_digest: "b".repeat(64),
+            policy_digest: "c".repeat(64),
+            entries: vec![
+                StoredArtifactManifestEntry {
+                    path: "src/index.html".to_string(),
+                    blob_id: format!("sha256:{digest}"),
+                    sha256: digest.clone(),
+                    size_bytes: 8,
+                },
+                StoredArtifactManifestEntry {
+                    path: "src/index.html".to_string(),
+                    blob_id: format!("sha256:{digest}"),
+                    sha256: digest,
+                    size_bytes: 8,
+                },
+            ],
+        };
+        assert!(manifest.referenced_blobs().is_err());
     }
 
     #[test]
@@ -2685,40 +3560,54 @@ mod tests {
     }
 
     #[test]
-    fn completion_receipt_is_immutable_digest_bound_and_redacted() {
+    fn completion_receipt_is_immutable_digest_bound_and_durable_safe() {
         let directory = tempfile::tempdir().unwrap();
         let executor = WorkbenchExecutor::new(
             directory.path().join("workspace"),
             directory.path().join("artifacts"),
         );
-        let request = request(
-            WorkbenchTool::InspectFile {
-                path: "index.html".to_string(),
-                max_bytes: 1024,
-            },
-            "file.inspect",
-        );
-        let result = WorkbenchMessage::Result {
-            schema_version: WORKBENCH_SCHEMA_VERSION,
-            invocation_id: request.invocation_id.clone(),
-            input_digest: request.input_digest.clone(),
-            outcome: WorkbenchOutcome::Succeeded,
-            resources: WorkbenchResourceUsage::default(),
-            artifacts: Vec::new(),
-            output: BTreeMap::from([("content".to_string(), "PRIVATE".to_string())]),
-            error: None,
-        };
+        let (result, invocation_id, input_digest) = completion_result();
 
         executor.persist_completion_receipt(&result).unwrap();
         executor.persist_completion_receipt(&result).unwrap();
         let recovered = executor
-            .recover_completion(&request.invocation_id, &request.input_digest)
+            .recover_completion(&invocation_id, &input_digest)
             .unwrap();
         let encoded = serde_json::to_string(&recovered).unwrap();
         assert!(!encoded.contains("PRIVATE"));
-        assert!(encoded.contains(&request.input_digest));
+        assert!(encoded.contains(&input_digest));
+        let receipt = directory
+            .path()
+            .join("artifacts")
+            .join(COMPLETION_RECEIPT_DIRECTORY)
+            .join(format!("{invocation_id}.json"));
+        assert!(!fs::read(&receipt)
+            .unwrap()
+            .windows("PRIVATE".len())
+            .any(|bytes| bytes == b"PRIVATE"));
+        let WorkbenchMessage::Result {
+            outcome,
+            resources,
+            artifacts,
+            output,
+            error,
+            ..
+        } = &recovered
+        else {
+            panic!("receipt replay did not return a terminal result");
+        };
+        assert_eq!(*outcome, WorkbenchOutcome::Failed);
+        assert_eq!(resources.duration_ms, 17);
+        assert_eq!(resources.bytes_read, 23);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].size_bytes, 31);
+        assert_eq!(
+            error.as_ref().map(|error| error.code.as_str()),
+            Some("safe_failure")
+        );
+        assert!(output.is_empty());
         assert!(executor
-            .recover_completion(&request.invocation_id, &"c".repeat(64))
+            .recover_completion(&invocation_id, &"c".repeat(64))
             .unwrap_err()
             .code
             .contains("mismatch"));
@@ -2734,6 +3623,36 @@ mod tests {
                 .unwrap_err()
                 .code,
             "completion_receipt_conflict"
+        );
+    }
+
+    #[test]
+    fn unresolved_command_cleanup_cannot_publish_a_terminal_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let executor = WorkbenchExecutor::new(
+            directory.path().join("workspace"),
+            directory.path().join("artifacts"),
+        );
+        let (mut result, invocation_id, input_digest) = completion_result();
+        let WorkbenchMessage::Result { outcome, error, .. } = &mut result else {
+            unreachable!();
+        };
+        *outcome = WorkbenchOutcome::Failed;
+        *error = Some(command_cleanup_error().info());
+
+        assert_eq!(
+            executor
+                .persist_completion_receipt(&result)
+                .unwrap_err()
+                .code,
+            "command_cleanup_failed"
+        );
+        assert_eq!(
+            executor
+                .recover_completion(&invocation_id, &input_digest)
+                .unwrap_err()
+                .code,
+            "completion_receipt_not_found"
         );
     }
 
@@ -2761,6 +3680,29 @@ mod tests {
         assert!(executor
             .recover_completion(&invocation_id, &input_digest)
             .is_err());
+    }
+
+    #[test]
+    fn completion_receipt_rejects_tampered_or_reintroduced_transient_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_root = directory.path().join("artifacts");
+        let executor = WorkbenchExecutor::new(directory.path().join("workspace"), &artifact_root);
+        let (result, invocation_id, input_digest) = completion_result();
+        executor.persist_completion_receipt(&result).unwrap();
+        let receipt = artifact_root
+            .join(COMPLETION_RECEIPT_DIRECTORY)
+            .join(format!("{invocation_id}.json"));
+        let mut sealed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        sealed["result"]["output"]["content"] = serde_json::json!("TAMPERED");
+        fs::write(&receipt, serde_json::to_vec(&sealed).unwrap()).unwrap();
+        assert_eq!(
+            executor
+                .recover_completion(&invocation_id, &input_digest)
+                .unwrap_err()
+                .code,
+            "completion_receipt_binding_mismatch"
+        );
     }
 
     #[test]
@@ -2815,6 +3757,7 @@ mod tests {
         let artifact_root = directory.path().join("artifacts");
         let executor = WorkbenchExecutor::new(directory.path().join("workspace"), &artifact_root);
         let (result, invocation_id, input_digest) = completion_result();
+        let durable_result = seal_terminal_result(&result).unwrap().result;
         executor.persist_completion_receipt(&result).unwrap();
         let receipt_directory = artifact_root.join(COMPLETION_RECEIPT_DIRECTORY);
         let receipt = receipt_directory.join(format!("{invocation_id}.json"));
@@ -2827,7 +3770,7 @@ mod tests {
             executor
                 .recover_completion(&invocation_id, &input_digest)
                 .unwrap(),
-            safe_terminal_receipt(&result).unwrap()
+            durable_result
         );
     }
 }

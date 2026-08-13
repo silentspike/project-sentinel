@@ -4,7 +4,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,8 @@ use sentinel_common::{
     WORKBENCH_RUNTIME_BWRAP, WORKBENCH_SCHEMA_VERSION,
 };
 use serde::Deserialize;
+
+use agent_runtime::WorkbenchExecutor;
 
 const STARTUP_ATTESTATION_SCHEMA_VERSION: u16 = 1;
 const STARTUP_ATTESTATION_MAX_BYTES: u64 = 4 * 1024;
@@ -212,6 +215,149 @@ fn cancellable_command_request() -> WorkbenchRequest {
     request
 }
 
+fn prepare_completion_receipt_crash_state(
+    workspace: &Path,
+    artifacts: &Path,
+) -> (WorkbenchRequest, PathBuf, PathBuf) {
+    let request = write_request();
+    let executor = WorkbenchExecutor::new(workspace, artifacts);
+    let result = executor.execute(request.clone(), Arc::new(AtomicBool::new(false)));
+    assert!(matches!(
+        result,
+        WorkbenchMessage::Result {
+            outcome: WorkbenchOutcome::Succeeded,
+            ..
+        }
+    ));
+    executor.persist_completion_receipt(&result).unwrap();
+    let receipt_directory = artifacts.join(".workbench-receipts");
+    let receipt = receipt_directory.join(format!("{}.json", request.invocation_id));
+    let temporary = receipt_directory.join(format!(".{}.deadbeef.tmp", request.invocation_id));
+    fs::hard_link(&receipt, &temporary).unwrap();
+    (request, receipt, temporary)
+}
+
+#[test]
+fn startup_reconciles_root_receipt_hardlink_before_recover_and_readiness() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let artifacts = directory.path().join("artifacts");
+    let (request, receipt, temporary) =
+        prepare_completion_receipt_crash_state(&workspace, &artifacts);
+    assert_eq!(fs::metadata(&receipt).unwrap().nlink(), 2);
+
+    let (mut child, mut input, mut output) = spawn_attested_runtime(&workspace, &artifacts);
+    assert!(!temporary.exists());
+    assert_eq!(fs::metadata(&receipt).unwrap().nlink(), 1);
+    writeln!(
+        input,
+        "{}",
+        serde_json::to_string(&WorkbenchCommand::Recover {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+        })
+        .unwrap()
+    )
+    .unwrap();
+    input.flush().unwrap();
+
+    let mut recovered = false;
+    let mut completed = false;
+    while !completed {
+        let mut line = String::new();
+        read_runtime_line(&mut child, &mut output, &mut line);
+        match serde_json::from_str::<WorkbenchMessage>(&line).unwrap() {
+            WorkbenchMessage::Result {
+                invocation_id,
+                input_digest,
+                outcome: WorkbenchOutcome::Succeeded,
+                resources,
+                output,
+                ..
+            } if invocation_id == request.invocation_id => {
+                assert_eq!(input_digest, request.input_digest);
+                assert_eq!(resources.bytes_written, 15);
+                assert!(output.is_empty());
+                recovered = true;
+            }
+            WorkbenchMessage::Progress {
+                invocation_id,
+                stage: sentinel_common::WorkbenchProgressStage::Completed,
+                ..
+            } if invocation_id == request.invocation_id => completed = true,
+            _ => {}
+        }
+    }
+    assert!(recovered);
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    assert!(receipt.exists());
+}
+
+#[test]
+fn conflicting_root_receipt_temp_keeps_runtime_unavailable_and_preserves_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let artifacts = directory.path().join("artifacts");
+    let (_request, receipt, temporary) =
+        prepare_completion_receipt_crash_state(&workspace, &artifacts);
+    fs::remove_file(&temporary).unwrap();
+    let conflict = artifacts
+        .join(".workbench-receipts")
+        .join("conflicting-evidence");
+    fs::write(&conflict, b"conflicting receipt evidence").unwrap();
+    fs::set_permissions(&conflict, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(&conflict, &temporary).unwrap();
+    let receipt_identity = (
+        fs::metadata(&receipt).unwrap().dev(),
+        fs::metadata(&receipt).unwrap().ino(),
+    );
+    let temporary_identity = (
+        fs::metadata(&temporary).unwrap().dev(),
+        fs::metadata(&temporary).unwrap().ino(),
+    );
+
+    let nonce = next_attestation_nonce();
+    let attestation_path =
+        PathBuf::from(format!("/tmp/.sentinel-workbench-attestation-{nonce}.json"));
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-runtime"))
+        .env("SENTINEL_WORKSPACE_ROOT", &workspace)
+        .env("SENTINEL_ARTIFACT_ROOT", &artifacts)
+        .env("SENTINEL_WORKBENCH_ATTESTATION_NONCE", &nonce)
+        .env(
+            "SENTINEL_WORKBENCH_WRAPPER_VERSION",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .env(
+            "SENTINEL_WORKBENCH_LANDLOCK_ABI",
+            TEST_LANDLOCK_ABI.to_string(),
+        )
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(126));
+    assert!(output.stdout.is_empty());
+    assert!(!attestation_path.exists());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("startup completion receipt recovery failed"));
+    assert_eq!(
+        (
+            fs::metadata(&receipt).unwrap().dev(),
+            fs::metadata(&receipt).unwrap().ino()
+        ),
+        receipt_identity
+    );
+    assert_eq!(
+        (
+            fs::metadata(&temporary).unwrap().dev(),
+            fs::metadata(&temporary).unwrap().ino(),
+        ),
+        temporary_identity
+    );
+    assert!(conflict.exists());
+}
+
 #[test]
 fn jsonl_process_handles_health_rejection_and_execution() {
     let directory = tempfile::tempdir().unwrap();
@@ -245,6 +391,8 @@ fn jsonl_process_handles_health_rejection_and_execution() {
     let mut malformed_rejected = false;
     let mut healthy = false;
     let mut succeeded = false;
+    let mut immediate_output = None;
+    let mut immediate_resources = None;
     let mut completed = false;
     while !completed {
         let mut line = String::new();
@@ -260,10 +408,13 @@ fn jsonl_process_handles_health_rejection_and_execution() {
             } if request_id == "health-1" => healthy = true,
             WorkbenchMessage::Result {
                 outcome: WorkbenchOutcome::Succeeded,
+                resources,
                 output,
                 ..
             } => {
                 assert!(!output.values().any(|value| value.contains("secret")));
+                immediate_output = Some(output);
+                immediate_resources = Some(resources);
                 succeeded = true;
             }
             WorkbenchMessage::Progress {
@@ -297,10 +448,15 @@ fn jsonl_process_handles_health_rejection_and_execution() {
                 invocation_id,
                 input_digest,
                 outcome: WorkbenchOutcome::Succeeded,
+                resources,
                 output,
                 ..
             } if invocation_id == request.invocation_id => {
                 assert_eq!(input_digest, request.input_digest);
+                assert!(immediate_output
+                    .as_ref()
+                    .is_some_and(|output| !output.is_empty()));
+                assert_eq!(Some(resources), immediate_resources);
                 assert!(output.is_empty());
                 recovered = true;
             }
@@ -468,10 +624,12 @@ fn adapter_deadline_cancel_is_receipted_as_timed_out() {
 #[test]
 fn receipt_failure_is_one_terminal_error_without_completed_after_it() {
     let directory = tempfile::tempdir().unwrap();
-    let artifact_file = directory.path().join("artifact-root-is-a-file");
-    std::fs::write(&artifact_file, "not a directory").unwrap();
+    let artifact_root = directory.path().join("artifacts");
+    fs::create_dir(&artifact_root).unwrap();
     let (mut child, mut input, mut output) =
-        spawn_attested_runtime(&directory.path().join("workspace"), &artifact_file);
+        spawn_attested_runtime(&directory.path().join("workspace"), &artifact_root);
+    fs::remove_dir(&artifact_root).unwrap();
+    fs::write(&artifact_root, "not a directory").unwrap();
     let request = write_request();
     writeln!(
         input,
