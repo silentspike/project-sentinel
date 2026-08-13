@@ -1,8 +1,8 @@
 [Unit]
 Description=Sentinel Judge — Quality Analysis Service (NATS + LLM)
 Documentation=https://github.com/silentspike/project-sentinel/issues/26
-After=nats-server.service sentinel-nats-bridge.service sentinel-gateway.service
-Requires=nats-server.service
+After=nats-server.service sentinel-daemon.service sentinel-nats-bridge.service sentinel-gateway.service
+Requires=nats-server.service sentinel-daemon.service
 StartLimitBurst=5
 StartLimitIntervalSec=300
 

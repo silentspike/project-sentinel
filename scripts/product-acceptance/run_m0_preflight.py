@@ -105,7 +105,13 @@ HTTP_CONTRACTS = (
     ("judge_ready", "http://127.0.0.1:8082/ready", None, "ready", True),
     ("bridge_health", "http://127.0.0.1:8083/health", None, "status", "ok"),
     ("bridge_ready", "http://127.0.0.1:8083/ready", None, "status", "ok"),
-    ("nats_health", "http://127.0.0.1:8222/healthz", None, "status", "ok"),
+    (
+        "nats_health",
+        "http://127.0.0.1:8222/healthz?js-enabled-only=true",
+        None,
+        "status",
+        "ok",
+    ),
     ("runtime_health", "http://127.0.0.1:8084/operator/runtime-health", "operator", None, None),
     ("platform_state", "http://127.0.0.1:8084/operator/platform-state", "operator", None, None),
     ("episode_projection", "http://127.0.0.1:8084/operator/episode-projection", "operator", None, None),
@@ -282,6 +288,10 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
     ),
     "/opt/sentinel/scripts/sentinel-health-monitor.sh": (
         "deploy/scripts/sentinel-health-monitor.sh",
+        "script",
+    ),
+    "/opt/sentinel/scripts/m0-readiness.py": (
+        "scripts/product-acceptance/m0-readiness/readiness.py",
         "script",
     ),
     str(M0_PROFILE_PATH): ("config/work-profiles/web-project-v1.toml", "config"),
@@ -1571,7 +1581,7 @@ def validate_identity(roster: dict[int, dict[str, Any]], payloads: dict[str, dic
         ):
             if item.get(field) is not True:
                 raise PreflightError("runtime_agent_not_ready")
-        if item.get("adapter_health_state") != "Healthy" or item.get("logical_status") not in {"Active", "Sleeping"}:
+        if item.get("adapter_health_state") != "healthy" or item.get("logical_status") not in {"Active", "Sleeping"}:
             raise PreflightError("runtime_agent_not_ready")
         if item.get("adapter_observation_error") is not None or item.get("last_repair_status") != "healthy":
             raise PreflightError("runtime_agent_not_ready")
