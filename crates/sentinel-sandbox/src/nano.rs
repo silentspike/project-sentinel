@@ -394,8 +394,7 @@ fn validate_artifact_manifest(
         None,
     )?;
     let mut bytes = Vec::new();
-    manifest_file
-        .by_ref()
+    std::io::Read::by_ref(&mut manifest_file)
         .take(MAX_WORKBENCH_ARTIFACT_MANIFEST_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| {
@@ -467,7 +466,7 @@ fn validate_artifact_manifest(
             Some(entry.size_bytes),
         )?;
         let mut blob_bytes = Vec::new();
-        blob.by_ref()
+        std::io::Read::by_ref(&mut blob)
             .take(entry.size_bytes.saturating_add(1))
             .read_to_end(&mut blob_bytes)
             .map_err(|_| {
@@ -630,12 +629,12 @@ fn validate_artifact_file_metadata(
     max_bytes: u64,
     exact_size: Option<u64>,
 ) -> Result<()> {
-    let mode = metadata.mode() & 0o777;
+    let mode = metadata.mode() & 0o7777;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
         || metadata.nlink() != 1
         || metadata.uid() != current_process_uid()?
-        || mode & 0o022 != 0
+        || mode & 0o7022 != 0
         || metadata.len() > max_bytes
         || exact_size.is_some_and(|size| metadata.len() != size)
     {
@@ -667,7 +666,7 @@ fn revalidate_scoped_artifact_file(directory: &File, name: &str, file: &File) ->
     validate_artifact_file_metadata(&opened, opened.len(), Some(opened.len()))?;
     validate_artifact_file_metadata(&path_metadata, opened.len(), Some(opened.len()))?;
     if ArtifactFileIdentity::from_metadata(&path_metadata)
-            != ArtifactFileIdentity::from_metadata(&opened)
+        != ArtifactFileIdentity::from_metadata(&opened)
     {
         return Err(exec_error(
             NanoExecErrorCode::ProtocolViolation,
@@ -3091,10 +3090,8 @@ mod tests {
     #[test]
     fn workbench_spawn_without_exact_isolation_attestation_rolls_back_all_ownership() {
         let temp = tempfile::tempdir().unwrap();
-        let mut runtime = BwrapNanoRuntime::with_test_dirs(
-            temp.path().join("cas"),
-            temp.path().join("homes"),
-        );
+        let mut runtime =
+            BwrapNanoRuntime::with_test_dirs(temp.path().join("cas"), temp.path().join("homes"));
         let workload_id = "AGENT-42";
         let mut state = transactional_fixture_state(workload_id, "workbench-agent");
         state.command = vec!["/usr/bin/agent-runtime".to_string()];
@@ -3118,7 +3115,7 @@ mod tests {
 
     #[test]
     fn sandbox_artifact_scope_rejects_symlink_components_and_foreign_agent_base() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{symlink, PermissionsExt};
 
         let directory = tempfile::tempdir().unwrap();
         let agent_root = directory.path().join("AGENT-07");
@@ -3129,41 +3126,28 @@ mod tests {
         std::fs::create_dir_all(foreign_scope.join("work-04")).unwrap();
 
         symlink(&foreign_scope, artifacts.join("project-01")).unwrap();
-        assert!(bind_workbench_artifact_scope(
-            &agent_root,
-            "AGENT-07",
-            "project-01",
-            "work-04",
-        )
-        .is_err());
+        assert!(
+            bind_workbench_artifact_scope(&agent_root, "AGENT-07", "project-01", "work-04",)
+                .is_err()
+        );
         std::fs::remove_file(artifacts.join("project-01")).unwrap();
 
         let project = artifacts.join("project-01");
         std::fs::create_dir(&project).unwrap();
         symlink(foreign_scope.join("work-04"), project.join("work-04")).unwrap();
-        assert!(bind_workbench_artifact_scope(
-            &agent_root,
-            "AGENT-07",
-            "project-01",
-            "work-04",
-        )
-        .is_err());
+        assert!(
+            bind_workbench_artifact_scope(&agent_root, "AGENT-07", "project-01", "work-04",)
+                .is_err()
+        );
 
         let foreign_agent = directory.path().join("AGENT-08");
-        std::fs::create_dir_all(
-            foreign_agent
-                .join("artifacts/project-01")
-                .join("work-04"),
-        )
-        .unwrap();
+        std::fs::create_dir_all(foreign_agent.join("artifacts/project-01").join("work-04"))
+            .unwrap();
         std::fs::write(foreign_agent.join(".nano-runtime"), "AGENT-08").unwrap();
-        assert!(bind_workbench_artifact_scope(
-            &foreign_agent,
-            "AGENT-07",
-            "project-01",
-            "work-04",
-        )
-        .is_err());
+        assert!(
+            bind_workbench_artifact_scope(&foreign_agent, "AGENT-07", "project-01", "work-04",)
+                .is_err()
+        );
 
         let safe_scope = directory.path().join("safe-files");
         std::fs::create_dir(&safe_scope).unwrap();
@@ -3177,22 +3161,24 @@ mod tests {
         assert!(open_scoped_artifact_file(&pinned, "manifest.json", 16, None).is_err());
         std::fs::remove_file(hardlink).unwrap();
 
+        for mode in [0o4644, 0o2644, 0o1644] {
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(open_scoped_artifact_file(&pinned, "manifest.json", 16, None).is_err());
+        }
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
+
         let replacement = safe_scope.join("replacement.json");
         std::fs::write(&replacement, b"[]").unwrap();
-        assert!(open_scoped_artifact_file_with(
-            &pinned,
-            "manifest.json",
-            16,
-            None,
-            |path| {
+        assert!(
+            open_scoped_artifact_file_with(&pinned, "manifest.json", 16, None, |path| {
                 std::fs::rename(&replacement, &manifest)?;
                 OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                     .open(path)
-            },
-        )
-        .is_err());
+            },)
+            .is_err()
+        );
     }
 
     fn insert_protocol_fixture(
@@ -3287,6 +3273,44 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    fn successful_result_frame(
+        invocation_id: &str,
+        input_digest: &str,
+        output: serde_json::Value,
+    ) -> String {
+        serde_json::json!({
+            "kind": "result",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "input_digest": input_digest,
+            "outcome": "succeeded",
+            "resources": {
+                "duration_ms": 1,
+                "cpu_time_ms": 0,
+                "peak_memory_bytes": 0,
+                "peak_process_count": 0,
+                "bytes_read": 0,
+                "bytes_written": 0,
+                "artifact_bytes": 0
+            },
+            "artifacts": [],
+            "output": output,
+            "error": null
+        })
+        .to_string()
+    }
+
+    fn completed_progress_frame(invocation_id: &str) -> String {
+        serde_json::json!({
+            "kind": "progress",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "stage": "completed",
+            "elapsed_ms": 1
+        })
+        .to_string()
     }
 
     #[test]
@@ -3787,11 +3811,10 @@ mod tests {
     #[test]
     fn foreign_poll_is_rejected_before_matching_output_is_consumed() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2910";
+        let start = start_frame(invocation_id, unix_time_ms() + 10_000);
         let result =
-            format!(r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_id}"}}"#);
-        let completed = format!(
-            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_id}","stage":"completed"}}"#
-        );
+            successful_result_frame(invocation_id, &frame_digest(&start), serde_json::json!({}));
+        let completed = completed_progress_frame(invocation_id);
         let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
         let handle = insert_protocol_fixture(
             &mut runtime,
@@ -3803,7 +3826,7 @@ mod tests {
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_start".to_string(),
-                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                    input: start,
                 },
             )
             .unwrap();
@@ -3843,18 +3866,20 @@ mod tests {
     fn concurrent_workloads_cannot_cross_wire_protocol_frames() {
         let invocation_a = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2918";
         let invocation_b = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2919";
-        let result_a = format!(
-            r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_a}","output":{{"marker":"A"}}}}"#
+        let start_a = start_frame(invocation_a, unix_time_ms() + 10_000);
+        let start_b = start_frame(invocation_b, unix_time_ms() + 10_000);
+        let result_a = successful_result_frame(
+            invocation_a,
+            &frame_digest(&start_a),
+            serde_json::json!({"marker": "A"}),
         );
-        let completed_a = format!(
-            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_a}","stage":"completed"}}"#
+        let completed_a = completed_progress_frame(invocation_a);
+        let result_b = successful_result_frame(
+            invocation_b,
+            &frame_digest(&start_b),
+            serde_json::json!({"marker": "B"}),
         );
-        let result_b = format!(
-            r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_b}","output":{{"marker":"B"}}}}"#
-        );
-        let completed_b = format!(
-            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_b}","stage":"completed"}}"#
-        );
+        let completed_b = completed_progress_frame(invocation_b);
         let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
         let handle_a = insert_protocol_fixture(
             &mut runtime,
@@ -3869,13 +3894,13 @@ mod tests {
         let mut registry = sentinel_common::nano_runtime::NanoRuntimeRegistry::new(None);
         registry.register(runtime).unwrap();
 
-        for (handle, invocation_id) in [(&handle_a, invocation_a), (&handle_b, invocation_b)] {
+        for (handle, start) in [(&handle_a, start_a), (&handle_b, start_b)] {
             registry
                 .exec(
                     handle,
                     NanoExecRequest {
                         operation: "workbench_start".to_string(),
-                        input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                        input: start,
                     },
                 )
                 .unwrap();
@@ -4001,11 +4026,10 @@ mod tests {
     #[test]
     fn retained_exchange_rejects_stale_incarnation_without_consuming_or_tearing_down() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2930";
+        let start = start_frame(invocation_id, unix_time_ms() + 10_000);
         let result =
-            format!(r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_id}"}}"#);
-        let completed = format!(
-            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_id}","stage":"completed"}}"#
-        );
+            successful_result_frame(invocation_id, &frame_digest(&start), serde_json::json!({}));
+        let completed = completed_progress_frame(invocation_id);
         let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
         let handle = insert_protocol_fixture(
             &mut runtime,
@@ -4017,7 +4041,7 @@ mod tests {
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_start".to_string(),
-                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                    input: start,
                 },
             )
             .unwrap();
@@ -4712,19 +4736,10 @@ mod tests {
     #[test]
     fn completed_frame_is_not_published_before_post_terminal_validation() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2933";
-        let result = serde_json::json!({
-            "kind": "result",
-            "schema_version": 1,
-            "invocation_id": invocation_id
-        })
-        .to_string();
-        let completed = serde_json::json!({
-            "kind": "progress",
-            "schema_version": 1,
-            "invocation_id": invocation_id,
-            "stage": "completed"
-        })
-        .to_string();
+        let start = start_frame(invocation_id, unix_time_ms() + 10_000);
+        let result =
+            successful_result_frame(invocation_id, &frame_digest(&start), serde_json::json!({}));
+        let completed = completed_progress_frame(invocation_id);
         let extra = serde_json::json!({
             "kind": "progress",
             "schema_version": 1,
@@ -4747,7 +4762,7 @@ mod tests {
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_start".to_string(),
-                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                    input: start,
                 },
             )
             .unwrap();

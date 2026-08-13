@@ -72,13 +72,10 @@ fn main() {
     };
     let attested_abi = match attestation {
         Some((_, expected_abi)) => {
-            let Some(abi) = sentinel_sandbox::landlock::workbench_fully_enforced_abi(
-                enforcement,
-                expected_abi,
-            ) else {
-                eprintln!(
-                    "[landlock-wrapper] Workbench Landlock contract was not fully enforced"
-                );
+            let Some(abi) =
+                sentinel_sandbox::landlock::workbench_fully_enforced_abi(enforcement, expected_abi)
+            else {
+                eprintln!("[landlock-wrapper] Workbench Landlock contract was not fully enforced");
                 process::exit(126);
             };
             Some(abi)
@@ -90,7 +87,7 @@ fn main() {
                 eprintln!("[landlock-wrapper] Landlock not enforced");
                 process::exit(126);
             }
-        }
+        },
     };
     eprintln!("[landlock-wrapper] Landlock enforced for {agent_name}");
 

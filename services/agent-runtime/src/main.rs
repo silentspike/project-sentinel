@@ -15,15 +15,16 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_runtime::WorkbenchExecutor;
-use serde::Serialize;
 use sentinel_common::{
     WorkbenchCommand, WorkbenchErrorClass, WorkbenchErrorInfo, WorkbenchMessage,
     WorkbenchProgressStage, WORKBENCH_AGENT_RUNTIME_VERSION, WORKBENCH_SCHEMA_VERSION,
 };
+use serde::Serialize;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const MAX_WORKBENCH_FRAME_BYTES: usize = 1024 * 1024;
 const STARTUP_ATTESTATION_SCHEMA_VERSION: u16 = 1;
 const ATTESTATION_NONCE_ENV: &str = "SENTINEL_WORKBENCH_ATTESTATION_NONCE";
 const ATTESTATION_WRAPPER_VERSION_ENV: &str = "SENTINEL_WORKBENCH_WRAPPER_VERSION";
@@ -50,6 +51,14 @@ type ActiveInvocations = Arc<Mutex<BTreeMap<String, ActiveInvocation>>>;
 enum ReaderEvent {
     Command(WorkbenchCommand),
     Malformed,
+    Oversized,
+    Eof,
+}
+
+enum BoundedJsonlRecord {
+    Record(Vec<u8>),
+    Malformed,
+    Oversized,
     Eof,
 }
 
@@ -105,6 +114,17 @@ fn main() {
                     ),
                 },
             ),
+            Ok(ReaderEvent::Oversized) => emit(
+                &output_lock,
+                &WorkbenchMessage::Error {
+                    schema_version: WORKBENCH_SCHEMA_VERSION,
+                    invocation_id: None,
+                    error: protocol_error(
+                        "frame_too_large",
+                        "the workbench command exceeded the 1 MiB frame boundary",
+                    ),
+                },
+            ),
             Ok(ReaderEvent::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 running.store(false, Ordering::Release);
             }
@@ -149,9 +169,7 @@ fn write_startup_attestation() -> io::Result<()> {
     };
     let bytes = serde_json::to_vec(&attestation)
         .map_err(|_| io::Error::other("encode startup attestation"))?;
-    let path = PathBuf::from(format!(
-        "/tmp/.sentinel-workbench-attestation-{nonce}.json"
-    ));
+    let path = PathBuf::from(format!("/tmp/.sentinel-workbench-attestation-{nonce}.json"));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -206,26 +224,92 @@ mod startup_attestation_tests {
         );
         assert_eq!(parse_host_pid_from_nspid("NSpid:\t0\n"), None);
     }
+
+    #[test]
+    fn bounded_jsonl_reader_discards_overflow_and_recovers_at_record_boundary() {
+        let mut bytes = vec![b'x'; MAX_WORKBENCH_FRAME_BYTES + 1];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(
+            b"{\"kind\":\"health\",\"schema_version\":1,\"request_id\":\"next\"}\n",
+        );
+        let mut input = io::Cursor::new(bytes);
+
+        assert!(matches!(
+            read_bounded_jsonl_record(&mut input).unwrap(),
+            BoundedJsonlRecord::Oversized
+        ));
+        let BoundedJsonlRecord::Record(record) = read_bounded_jsonl_record(&mut input).unwrap()
+        else {
+            panic!("the record after an oversized frame must remain readable");
+        };
+        assert!(matches!(
+            serde_json::from_slice::<WorkbenchCommand>(&record).unwrap(),
+            WorkbenchCommand::Health { request_id, .. } if request_id == "next"
+        ));
+        assert!(matches!(
+            read_bounded_jsonl_record(&mut input).unwrap(),
+            BoundedJsonlRecord::Eof
+        ));
+    }
 }
 
 fn read_commands(sender: mpsc::Sender<ReaderEvent>) {
     let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let event = match line {
-            Ok(line) if !line.trim().is_empty() => {
-                match serde_json::from_str::<WorkbenchCommand>(&line) {
+    let mut input = stdin.lock();
+    loop {
+        let event = match read_bounded_jsonl_record(&mut input) {
+            Ok(BoundedJsonlRecord::Record(bytes)) if !bytes.iter().all(u8::is_ascii_whitespace) => {
+                match serde_json::from_slice::<WorkbenchCommand>(&bytes) {
                     Ok(command) => ReaderEvent::Command(command),
                     Err(_) => ReaderEvent::Malformed,
                 }
             }
-            Ok(_) => ReaderEvent::Malformed,
-            Err(_) => break,
+            Ok(BoundedJsonlRecord::Record(_) | BoundedJsonlRecord::Malformed) => {
+                ReaderEvent::Malformed
+            }
+            Ok(BoundedJsonlRecord::Oversized) => ReaderEvent::Oversized,
+            Ok(BoundedJsonlRecord::Eof) | Err(_) => break,
         };
         if sender.send(event).is_err() {
             return;
         }
     }
     let _ = sender.send(ReaderEvent::Eof);
+}
+
+fn read_bounded_jsonl_record(input: &mut impl BufRead) -> io::Result<BoundedJsonlRecord> {
+    let mut record = Vec::with_capacity(4096);
+    let mut oversized = false;
+    loop {
+        let buffer = input.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(if oversized {
+                BoundedJsonlRecord::Oversized
+            } else if record.is_empty() {
+                BoundedJsonlRecord::Eof
+            } else {
+                BoundedJsonlRecord::Malformed
+            });
+        }
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let take = newline.unwrap_or(buffer.len());
+        if !oversized {
+            if record.len().saturating_add(take) > MAX_WORKBENCH_FRAME_BYTES {
+                oversized = true;
+                record.clear();
+            } else {
+                record.extend_from_slice(&buffer[..take]);
+            }
+        }
+        input.consume(take + usize::from(newline.is_some()));
+        if newline.is_some() {
+            return Ok(if oversized {
+                BoundedJsonlRecord::Oversized
+            } else {
+                BoundedJsonlRecord::Record(record)
+            });
+        }
+    }
 }
 
 fn handle_command(
