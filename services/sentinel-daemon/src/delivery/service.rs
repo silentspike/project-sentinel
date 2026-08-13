@@ -10,9 +10,10 @@ use super::{
         expected_effect_saga_contract_digest, expected_integration_contract_digest,
         expected_publication_contract_digest, expected_workbench_execution_saga_contract_digest,
         AdapterReadiness, AuthorityReceiptV1, AuthorityValidationRequestV1,
-        CandidateAuthorityQueryV1, DeliveryEffectKind, DeliveryEffectPort, DeliveryEffectRequestV1,
-        DeliveryIntegrationPort, DeliveryPublicationPort, WorkbenchEvidenceReceiptV1,
-        WorkbenchEvidenceRequestV1, WorkflowLineageQueryV1,
+        CandidateAuthorityQueryV1, CandidateAuthoritySnapshotV1, DeliveryEffectKind,
+        DeliveryEffectPort, DeliveryEffectRequestV1, DeliveryIntegrationPort,
+        DeliveryPublicationPort, WorkbenchEvidenceReceiptV1, WorkbenchEvidenceRequestV1,
+        WorkflowLineageQueryV1,
     },
     schema::{
         AcceptanceV1, ApprovalV1, AuthorityRole, CandidateState, CustomerAction,
@@ -169,20 +170,17 @@ where
             candidate_digest: candidate.candidate_digest.clone(),
         };
         let candidate_authority = self.integration.candidate_authority(&candidate_query)?;
-        if candidate_authority.schema_version != DELIVERY_SCHEMA_V1
-            || candidate_authority.authority_generation == 0
-            || candidate_authority.authority_generation
-                != authority.contract_authority_generation
-            || candidate_authority.agreement != candidate.agreement
-            || candidate_authority.project != candidate.project
-            || candidate_authority.work_items_digest != candidate.work_items_digest
-            || candidate_authority.current_candidate_generation != candidate.generation
-            || candidate_authority.current_candidate_digest != candidate.candidate_digest
-            || candidate_authority.snapshot_digest != candidate_authority.computed_digest()?
-        {
-            return Err(DeliveryError::StaleEvidence(
-                "workflow authority does not match the lineage candidate".to_string(),
-            ));
+        validate_candidate_authority(
+            &candidate_authority,
+            candidate,
+            authority.contract_authority_generation,
+        )?;
+        if role == AuthorityRole::Customer {
+            require_candidate_participant(
+                &candidate_authority,
+                &authority.principal,
+                AuthorityRole::Customer,
+            )?;
         }
         let query = WorkflowLineageQueryV1 {
             schema_version: DELIVERY_SCHEMA_V1,
@@ -240,7 +238,7 @@ where
         validate_ref("candidate agreement", &candidate.agreement)?;
         validate_ref("candidate project", &candidate.project)?;
         validate_cost_ref("candidate cost", &candidate.cost)?;
-        self.require_current_authority(
+        let developer_authority = self.require_current_authority(
             context,
             &candidate.tenant_id,
             AuthorityRole::Developer,
@@ -278,15 +276,36 @@ where
                 work_items_digest: candidate.work_items_digest.clone(),
                 candidate_digest: candidate.candidate_digest.clone(),
             })?;
-        if authority.agreement != candidate.agreement
-            || authority.project != candidate.project
-            || authority.work_items_digest != candidate.work_items_digest
-            || authority.current_candidate_generation != candidate.generation
-            || authority.current_candidate_digest != candidate.candidate_digest
-            || authority.snapshot_digest != authority.computed_digest()?
-        {
-            return Err(DeliveryError::StaleEvidence(
-                "workflow authority does not match the candidate".to_string(),
+        validate_candidate_authority(
+            &authority,
+            &candidate,
+            developer_authority.contract_authority_generation,
+        )?;
+        require_candidate_participant(
+            &authority,
+            &developer_authority.principal,
+            AuthorityRole::Developer,
+        )?;
+        if candidate.implementer_principal_ids.is_empty() {
+            return Err(DeliveryError::Validation(
+                "candidate has no authoritative implementer".to_string(),
+            ));
+        }
+        for implementer_id in &candidate.implementer_principal_ids {
+            require_candidate_participant_id(
+                &authority,
+                &candidate.tenant_id,
+                implementer_id,
+                AuthorityRole::Developer,
+            )?;
+        }
+        if candidate.artifacts.iter().any(|artifact| {
+            !candidate
+                .implementer_principal_ids
+                .contains(&artifact.owner_principal_id)
+        }) {
+            return Err(DeliveryError::AuthorityDenied(
+                "candidate artifact owner is not an authoritative implementer".to_string(),
             ));
         }
         let mut aggregate = self
@@ -335,7 +354,7 @@ where
         validate_record_header(run.schema_version, "run_id", &run.run_id, run.generation)?;
         validate_ref("QA plan candidate", &plan.candidate)?;
         validate_ref("QA run plan", &run.plan)?;
-        self.require_current_authority(
+        let release_manager_authority = self.require_current_authority(
             context,
             tenant_id,
             AuthorityRole::ReleaseManager,
@@ -389,10 +408,33 @@ where
             ));
         }
         let mut aggregate = self.required_aggregate(tenant_id, project_id)?;
+        let candidate_snapshot = aggregate
+            .candidates
+            .get(candidate_id)
+            .cloned()
+            .ok_or_else(|| DeliveryError::NotFound(format!("candidate {candidate_id}")))?;
+        let candidate_authority = self
+            .integration
+            .candidate_authority(&candidate_authority_query(&candidate_snapshot))?;
+        validate_candidate_authority(
+            &candidate_authority,
+            &candidate_snapshot,
+            release_manager_authority.contract_authority_generation,
+        )?;
+        require_candidate_participant(
+            &candidate_authority,
+            &release_manager_authority.principal,
+            AuthorityRole::ReleaseManager,
+        )?;
+        require_candidate_participant(
+            &candidate_authority,
+            &qa_authority.principal,
+            AuthorityRole::Qa,
+        )?;
         let candidate = aggregate
             .candidates
             .get_mut(candidate_id)
-            .ok_or_else(|| DeliveryError::NotFound(format!("candidate {candidate_id}")))?;
+            .expect("candidate existence was checked above");
         if candidate
             .implementer_principal_ids
             .contains(&qa.principal_id)
@@ -1303,22 +1345,23 @@ where
                 "release gate is missing, expired, self-approved, or bound elsewhere".to_string(),
             ));
         }
-        let authority = self
-            .integration
-            .candidate_authority(&CandidateAuthorityQueryV1 {
-                tenant_id: tenant_id.to_string(),
-                agreement: candidate.agreement.clone(),
-                project: candidate.project.clone(),
-                work_items_digest: candidate.work_items_digest.clone(),
-                candidate_digest: candidate.candidate_digest.clone(),
-            })?;
-        if authority.current_candidate_generation != candidate.generation
-            || authority.current_candidate_digest != candidate.candidate_digest
-        {
-            return Err(DeliveryError::StaleEvidence(
-                "candidate is no longer current".to_string(),
-            ));
-        }
+        let candidate_query = candidate_authority_query(&candidate);
+        let authority = self.integration.candidate_authority(&candidate_query)?;
+        validate_candidate_authority(
+            &authority,
+            &candidate,
+            release_authority.contract_authority_generation,
+        )?;
+        require_candidate_participant(
+            &authority,
+            &release_authority.principal,
+            AuthorityRole::ReleaseManager,
+        )?;
+        require_candidate_participant(
+            &authority,
+            &gate.actor,
+            AuthorityRole::Qa,
+        )?;
         if release.manifest.id != manifest.manifest_id
             || release.manifest.generation != manifest.generation
             || release.manifest.digest != manifest.manifest_digest
@@ -1372,13 +1415,7 @@ where
         )?;
         let authority_after_effect =
             self.integration
-                .candidate_authority(&CandidateAuthorityQueryV1 {
-                    tenant_id: tenant_id.to_string(),
-                    agreement: candidate.agreement.clone(),
-                    project: candidate.project.clone(),
-                    work_items_digest: candidate.work_items_digest.clone(),
-                    candidate_digest: candidate.candidate_digest.clone(),
-                })?;
+                .candidate_authority(&candidate_query)?;
         if authority_after_effect != authority {
             return Err(DeliveryError::StaleEvidence(
                 "candidate authority changed between rollout and local adoption".to_string(),
@@ -1455,7 +1492,7 @@ where
                     .to_string(),
             ));
         }
-        self.require_current_authority(
+        let release_manager_authority = self.require_current_authority(
             context,
             &receipt.tenant_id,
             AuthorityRole::ReleaseManager,
@@ -1481,15 +1518,50 @@ where
         let release = aggregate
             .releases
             .get(&receipt.release.id)
+            .cloned()
             .ok_or_else(|| DeliveryError::NotFound(format!("release {}", receipt.release.id)))?;
         if release.state != ReleaseState::Active
             || release.generation != receipt.release.generation
-            || receipt.release.digest != canonical_release_reference_digest(release)?
+            || receipt.release.digest != canonical_release_reference_digest(&release)?
         {
             return Err(DeliveryError::StaleEvidence(
                 "delivery is not bound to the active release".to_string(),
             ));
         }
+        let manifest = aggregate
+            .manifests
+            .get(&release.manifest.id)
+            .ok_or_else(|| DeliveryError::CorruptStore("release manifest missing".to_string()))?;
+        let candidate = aggregate
+            .candidates
+            .get(&manifest.candidate.id)
+            .ok_or_else(|| DeliveryError::CorruptStore("release candidate missing".to_string()))?;
+        let candidate_authority = self
+            .integration
+            .candidate_authority(&candidate_authority_query(candidate))?;
+        validate_candidate_authority(
+            &candidate_authority,
+            candidate,
+            release_manager_authority.contract_authority_generation,
+        )?;
+        require_candidate_participant(
+            &candidate_authority,
+            &release_manager_authority.principal,
+            AuthorityRole::ReleaseManager,
+        )?;
+        let customer_participant = require_candidate_participant_id(
+            &candidate_authority,
+            &receipt.tenant_id,
+            &receipt.customer_principal_id,
+            AuthorityRole::Customer,
+        )?;
+        self.current_authority_for(
+            &customer_participant,
+            &receipt.tenant_id,
+            AuthorityRole::Customer,
+            "delivery_recipient",
+            context.now_ms,
+        )?;
         transition_delivery(receipt.state, DeliveryState::Delivered)?;
         receipt.state = DeliveryState::Delivered;
         receipt = receipt.seal()?;
@@ -2011,6 +2083,11 @@ where
         &self,
         publisher: &P,
     ) -> Result<usize, DeliveryError> {
+        // Publication is an external effect. Validate the complete local
+        // aggregate/journal/outbox authority before exposing any request to the
+        // publisher; a decodable but corrupt outbox row must fail closed without
+        // an upstream call.
+        self.store.health()?;
         let pending = self.store.pending_publications()?;
         let mut published = 0;
         for entry in pending {
@@ -2220,6 +2297,16 @@ where
         self.core.command_readiness(command)
     }
 
+    /// Read-only lineage needs the verified local authority plus the exact
+    /// workflow/authentication integration contract. Workbench execution,
+    /// delivery effects, and event publication are independent capabilities
+    /// and must not hide already committed history when unavailable.
+    pub fn lineage_readiness(&self) -> Result<(), DeliveryError> {
+        self.core.store.health()?;
+        self.core.require_integration()?;
+        Ok(())
+    }
+
     /// Productive local commit. Publication readiness is deliberately not
     /// required: the durable local outbox remains the safe hand-off boundary.
     pub fn register_candidate(
@@ -2401,7 +2488,7 @@ where
         tenant_id: &str,
         project_id: &str,
     ) -> Result<PublicDeliveryLineageDtoV1, DeliveryError> {
-        self.readiness()?;
+        self.lineage_readiness()?;
         self.core
             .read_public_lineage_authorized(context, tenant_id, project_id)
     }
@@ -2613,6 +2700,85 @@ fn validate_cost_ref(name: &str, value: &super::schema::CostRefV1) -> Result<(),
         )));
     }
     Ok(())
+}
+
+fn candidate_authority_query(candidate: &ReleaseCandidateV1) -> CandidateAuthorityQueryV1 {
+    CandidateAuthorityQueryV1 {
+        tenant_id: candidate.tenant_id.clone(),
+        agreement: candidate.agreement.clone(),
+        project: candidate.project.clone(),
+        work_items_digest: candidate.work_items_digest.clone(),
+        candidate_digest: candidate.candidate_digest.clone(),
+    }
+}
+
+fn validate_candidate_authority(
+    authority: &CandidateAuthoritySnapshotV1,
+    candidate: &ReleaseCandidateV1,
+    expected_authority_generation: u64,
+) -> Result<(), DeliveryError> {
+    let mut participant_ids = BTreeSet::new();
+    let participant_inventory_valid = !authority.participant_principals.is_empty()
+        && authority.participant_principals.iter().all(|principal| {
+            principal.tenant_id == candidate.tenant_id
+                && canonical_id(&principal.principal_id)
+                && principal.authority_generation > 0
+                && !principal.roles.is_empty()
+                && participant_ids.insert(principal.principal_id.clone())
+        });
+    if authority.schema_version != DELIVERY_SCHEMA_V1
+        || authority.authority_generation != expected_authority_generation
+        || authority.agreement != candidate.agreement
+        || authority.project != candidate.project
+        || authority.work_items_digest != candidate.work_items_digest
+        || authority.current_candidate_generation != candidate.generation
+        || authority.current_candidate_digest != candidate.candidate_digest
+        || authority.snapshot_digest != authority.computed_digest()?
+        || !participant_inventory_valid
+    {
+        return Err(DeliveryError::StaleEvidence(
+            "workflow candidate authority is stale, malformed, or differently bound".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_candidate_participant(
+    authority: &CandidateAuthoritySnapshotV1,
+    principal: &PrincipalV1,
+    role: AuthorityRole,
+) -> Result<(), DeliveryError> {
+    if authority.participant_principals.iter().any(|participant| {
+        participant.tenant_id == principal.tenant_id
+            && participant.principal_id == principal.principal_id
+            && participant.authority_generation == principal.authority_generation
+            && participant.has_role(role.clone())
+    }) {
+        Ok(())
+    } else {
+        Err(DeliveryError::AuthorityDenied(
+            "authenticated principal is not a current workflow participant".to_string(),
+        ))
+    }
+}
+
+fn require_candidate_participant_id(
+    authority: &CandidateAuthoritySnapshotV1,
+    tenant_id: &str,
+    principal_id: &str,
+    role: AuthorityRole,
+) -> Result<PrincipalV1, DeliveryError> {
+    if let Some(participant) = authority.participant_principals.iter().find(|participant| {
+        participant.tenant_id == tenant_id
+            && participant.principal_id == principal_id
+            && participant.has_role(role.clone())
+    }) {
+        Ok(participant.clone())
+    } else {
+        Err(DeliveryError::AuthorityDenied(
+            "referenced principal is not a current workflow participant".to_string(),
+        ))
+    }
 }
 
 fn validate_data_control(name: &str, value: &DataControlV1) -> Result<(), DeliveryError> {

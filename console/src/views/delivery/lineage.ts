@@ -99,10 +99,49 @@ export function validateLineage(snapshot: PublicDeliveryLineageDto): string[] {
       failures.push(`invalid cost: ${node.id}`);
     }
   }
+  const edgeKeys = new Set<string>();
+  const outgoing = new Map<string, string[]>();
+  const indegree = new Map([...ids].map((id) => [id, 0]));
   for (const edge of snapshot.edges) {
     if (!ids.has(edge.from) || !ids.has(edge.to)) {
       failures.push(`dangling edge: ${edge.from}->${edge.to}`);
+      continue;
     }
+    const edgeKey = `${edge.from}\u0000${edge.to}`;
+    if (edgeKeys.has(edgeKey)) {
+      failures.push(`duplicate edge: ${edge.from}->${edge.to}`);
+      continue;
+    }
+    edgeKeys.add(edgeKey);
+    if (edge.from === edge.to) {
+      failures.push(`self edge: ${edge.from}`);
+      continue;
+    }
+    outgoing.set(edge.from, [...(outgoing.get(edge.from) ?? []), edge.to]);
+    indegree.set(edge.to, (indegree.get(edge.to) ?? 0) + 1);
+  }
+  if (ids.size === 0) {
+    failures.push("empty lineage graph");
+  } else if (![...ids].some((id) => (indegree.get(id) ?? 0) === 0)) {
+    failures.push("cyclic lineage graph");
+  } else {
+    const roots = [...ids].filter((id) => (indegree.get(id) ?? 0) === 0);
+    if (roots.length !== 1) failures.push("disconnected lineage graph");
+    const reachable = new Set<string>();
+    const visiting = new Set<string>();
+    const visit = (id: string): boolean => {
+      if (visiting.has(id)) return false;
+      if (reachable.has(id)) return true;
+      visiting.add(id);
+      for (const child of outgoing.get(id) ?? []) {
+        if (!visit(child)) return false;
+      }
+      visiting.delete(id);
+      reachable.add(id);
+      return true;
+    };
+    if (!roots.every(visit)) failures.push("cyclic lineage graph");
+    if (reachable.size !== ids.size) failures.push("disconnected lineage graph");
   }
   const publicText = [
     snapshot.projectLabel,

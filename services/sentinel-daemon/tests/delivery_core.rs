@@ -465,6 +465,7 @@ struct FakeControls {
     renew_receipts: AtomicUsize,
     execution_saga_digest_mode: AtomicUsize,
     workbench_receipt_fault: AtomicUsize,
+    candidate_authority_fault: AtomicUsize,
     replacement_principal: Mutex<Option<String>>,
     harness_outcome: Mutex<QaHarnessOutcome>,
     replay_workbench_receipt: Mutex<Option<WorkbenchEvidenceReceiptV1>>,
@@ -483,6 +484,7 @@ impl Default for FakeControls {
             renew_receipts: AtomicUsize::new(0),
             execution_saga_digest_mode: AtomicUsize::new(0),
             workbench_receipt_fault: AtomicUsize::new(0),
+            candidate_authority_fault: AtomicUsize::new(0),
             replacement_principal: Mutex::new(None),
             harness_outcome: Mutex::new(QaHarnessOutcome::Pass),
             replay_workbench_receipt: Mutex::new(None),
@@ -550,7 +552,7 @@ impl DeliveryIntegrationPort for FakeIntegration {
         &self,
         query: &CandidateAuthorityQueryV1,
     ) -> Result<CandidateAuthoritySnapshotV1, DeliveryError> {
-        CandidateAuthoritySnapshotV1 {
+        let mut snapshot = CandidateAuthoritySnapshotV1 {
             schema_version: 1,
             authority_generation: 7,
             agreement: query.agreement.clone(),
@@ -558,10 +560,29 @@ impl DeliveryIntegrationPort for FakeIntegration {
             work_items_digest: query.work_items_digest.clone(),
             current_candidate_generation: query.project.generation + 1,
             current_candidate_digest: query.candidate_digest.clone(),
-            participant_principals: vec![],
+            participant_principals: vec![
+                principal("developer", AuthorityRole::Developer),
+                principal("qa-1", AuthorityRole::Qa),
+                principal("release-manager", AuthorityRole::ReleaseManager),
+                principal("customer-1", AuthorityRole::Customer),
+                principal("auditor", AuthorityRole::Auditor),
+            ],
             snapshot_digest: ContentDigest::zero(),
+        };
+        match self
+            .controls
+            .candidate_authority_fault
+            .load(Ordering::SeqCst)
+        {
+            1 => snapshot.participant_principals.clear(),
+            2 => snapshot.authority_generation += 1,
+            3 => snapshot.schema_version += 1,
+            4 => snapshot
+                .participant_principals
+                .push(principal("developer", AuthorityRole::Developer)),
+            _ => {}
         }
-        .seal()
+        snapshot.seal()
     }
 
     fn authorize(
@@ -1730,6 +1751,72 @@ fn stale_adapter_contract_and_replaced_actor_fail_closed() {
 }
 
 #[test]
+fn candidate_registration_rejects_malformed_or_unbound_workflow_authority() {
+    for (fault, label) in [
+        (1, "missing participants"),
+        (2, "authority generation mismatch"),
+        (3, "schema mismatch"),
+        (4, "duplicate participant"),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let (integration, controls) = FakeIntegration::controlled();
+        controls
+            .candidate_authority_fault
+            .store(fault, Ordering::SeqCst);
+        let core = DeliveryCore::new_test_only(store(&temp), integration, FakeEffects);
+        let result = core.register_candidate(
+            &context(
+                "developer",
+                AuthorityRole::Developer,
+                &format!("candidate-authority-fault-{fault}"),
+                100,
+            ),
+            candidate(5, &["developer"]),
+        );
+        assert!(
+            matches!(result, Err(DeliveryError::StaleEvidence(_))),
+            "{label}: {result:?}"
+        );
+        assert!(core.load("tenant-a", "project-1").unwrap().is_none());
+    }
+}
+
+#[test]
+fn qa_assignment_rechecks_current_candidate_participants_before_mutation() {
+    let temp = TempDir::new().unwrap();
+    let (integration, controls) = FakeIntegration::controlled();
+    let core = DeliveryCore::new_test_only(store(&temp), integration, FakeEffects);
+    let candidate = candidate(5, &["developer"]);
+    core.register_candidate(
+        &context("developer", AuthorityRole::Developer, "register-before-drift", 100),
+        candidate.clone(),
+    )
+    .unwrap();
+    controls
+        .candidate_authority_fault
+        .store(1, Ordering::SeqCst);
+    let plan = plan(&candidate);
+    let result = core.assign_qa(
+        &context(
+            "release-manager",
+            AuthorityRole::ReleaseManager,
+            "assign-after-participant-drift",
+            110,
+        ),
+        "tenant-a",
+        "project-1",
+        &candidate.candidate_id,
+        plan.clone(),
+        run(&plan, principal("qa-1", AuthorityRole::Qa)),
+    );
+    assert!(matches!(result, Err(DeliveryError::StaleEvidence(_))));
+    let aggregate = core.load("tenant-a", "project-1").unwrap().unwrap();
+    assert_eq!(aggregate.candidates[&candidate.candidate_id].state, CandidateState::Draft);
+    assert!(aggregate.qa_plans.is_empty());
+    assert!(aggregate.qa_runs.is_empty());
+}
+
+#[test]
 fn workbench_effect_reconciles_after_authority_toctou_without_reexecution() {
     let temp = TempDir::new().unwrap();
     let (integration, controls) = FakeIntegration::controlled();
@@ -2870,6 +2957,30 @@ fn exact_gate_manifest_delivery_and_explicit_customer_acceptance_form_one_lineag
     }
     .seal()
     .unwrap();
+    let mut outsider_delivery = delivery.clone();
+    outsider_delivery.delivery_id = "delivery-outsider".to_string();
+    outsider_delivery.customer_principal_id = "customer-outsider".to_string();
+    outsider_delivery.receipt_digest = ContentDigest::zero();
+    let outsider_delivery = outsider_delivery.seal().unwrap();
+    assert!(matches!(
+        core.issue_delivery(
+            &context(
+                "release-manager",
+                AuthorityRole::ReleaseManager,
+                "deliver-outsider",
+                190,
+            ),
+            "project-1",
+            outsider_delivery,
+        ),
+        Err(DeliveryError::AuthorityDenied(_))
+    ));
+    assert!(core
+        .load("tenant-a", "project-1")
+        .unwrap()
+        .unwrap()
+        .deliveries
+        .is_empty());
     core.issue_delivery(
         &context(
             "release-manager",
@@ -3646,6 +3757,88 @@ fn wire_records_reject_unknown_fields_and_unknown_closed_values() {
 }
 
 #[test]
+fn external_request_seals_reject_incomplete_authority_and_reference_bindings() {
+    let qa = principal("qa-1", AuthorityRole::Qa);
+    let valid_workbench = WorkbenchEvidenceRequestV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        tenant_id: "tenant-a".to_string(),
+        project: reference("project-1", 4),
+        candidate: reference("candidate-1", 1),
+        qa_plan: reference("plan-1", 1),
+        qa_run: reference("run-1", 1),
+        assigned_qa: qa.clone(),
+        authority_receipt_digest: digest("authority-receipt"),
+        authority_identity_digest: digest("authority-identity"),
+        invocation: reference("invocation-1", 1),
+        request_digest: ContentDigest::zero(),
+    };
+    for mut invalid in [
+        {
+            let mut value = valid_workbench.clone();
+            value.authority_receipt_digest = ContentDigest::zero();
+            value
+        },
+        {
+            let mut value = valid_workbench.clone();
+            value.qa_run.generation = 0;
+            value
+        },
+        {
+            let mut value = valid_workbench.clone();
+            value.assigned_qa.tenant_id = "tenant-b".to_string();
+            value
+        },
+    ] {
+        invalid.request_digest = ContentDigest::zero();
+        assert!(matches!(invalid.seal(), Err(DeliveryError::Validation(_))));
+    }
+
+    let valid_effect = DeliveryEffectRequestV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        operation_id: "rollback:tenant-a:project-1:request-1".to_string(),
+        kind: DeliveryEffectKind::Rollback,
+        tenant_id: "tenant-a".to_string(),
+        project: reference("project-1", 4),
+        candidate: Some(reference("candidate-1", 1)),
+        subject: reference("release-current", 2),
+        target: Some(reference("release-previous", 1)),
+        actor: principal("release-manager", AuthorityRole::ReleaseManager),
+        actor_authority_receipt_digest: digest("effect-authority-receipt"),
+        actor_authority_identity_digest: digest("effect-authority-identity"),
+        request_digest: ContentDigest::zero(),
+    };
+    for invalid in [
+        {
+            let mut value = valid_effect.clone();
+            value.actor_authority_receipt_digest = ContentDigest::zero();
+            value
+        },
+        {
+            let mut value = valid_effect.clone();
+            value.candidate.as_mut().unwrap().digest = ContentDigest::zero();
+            value
+        },
+        {
+            let mut value = valid_effect.clone();
+            value.actor.tenant_id = "tenant-b".to_string();
+            value
+        },
+        {
+            let mut value = valid_effect.clone();
+            value.actor = principal("qa-1", AuthorityRole::Qa);
+            value
+        },
+        {
+            let mut value = valid_effect.clone();
+            value.target = Some(value.subject.clone());
+            value
+        },
+    ] {
+        assert!(matches!(invalid.seal(), Err(DeliveryError::Validation(_))));
+    }
+}
+
+#[test]
 fn renewed_authority_receipt_does_not_change_external_operation_identity() {
     let qa = principal("qa-1", AuthorityRole::Qa);
     let authority = AuthorityReceiptV1 {
@@ -3695,6 +3888,22 @@ fn renewed_authority_receipt_does_not_change_external_operation_identity() {
         "renewing the same authority must retain the workbench idempotency key"
     );
 
+    let effect_actor = principal("release-manager", AuthorityRole::ReleaseManager);
+    let effect_authority = AuthorityReceiptV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        request_digest: digest("effect-authority-request"),
+        principal: effect_actor.clone(),
+        contract_version: DELIVERY_SCHEMA_V1,
+        contract_authority_generation: 7,
+        contract_digest: expected_integration_contract_digest(),
+        issued_at_ms: 10,
+        expires_at_ms: 100,
+        issuer: "test-authority".to_string(),
+        receipt_digest: ContentDigest::zero(),
+    }
+    .seal()
+    .unwrap();
+    let effect_authority_identity = effect_authority.stable_identity_digest().unwrap();
     let mut effect = DeliveryEffectRequestV1 {
         schema_version: DELIVERY_SCHEMA_V1,
         operation_id: "rollback:tenant-a:project-1:rollback-1".to_string(),
@@ -3704,15 +3913,20 @@ fn renewed_authority_receipt_does_not_change_external_operation_identity() {
         candidate: Some(reference("candidate-1", 1)),
         subject: reference("release-from", 2),
         target: Some(reference("release-to", 1)),
-        actor: qa,
-        actor_authority_receipt_digest: authority.receipt_digest.clone(),
-        actor_authority_identity_digest: authority_identity.clone(),
+        actor: effect_actor,
+        actor_authority_receipt_digest: effect_authority.receipt_digest.clone(),
+        actor_authority_identity_digest: effect_authority_identity.clone(),
         request_digest: ContentDigest::zero(),
     }
     .seal()
     .unwrap();
     let old_effect_digest = effect.request_digest.clone();
-    effect.actor_authority_receipt_digest = renewed.receipt_digest;
+    let mut renewed_effect_authority = effect_authority.clone();
+    renewed_effect_authority.issued_at_ms = 20;
+    renewed_effect_authority.expires_at_ms = 200;
+    renewed_effect_authority.receipt_digest = ContentDigest::zero();
+    renewed_effect_authority = renewed_effect_authority.seal().unwrap();
+    effect.actor_authority_receipt_digest = renewed_effect_authority.receipt_digest;
     assert_eq!(
         old_effect_digest,
         effect.computed_digest().unwrap(),
@@ -3735,8 +3949,29 @@ fn renewed_authority_receipt_does_not_change_external_operation_identity() {
     for changed in changed_authorities {
         let changed_identity = changed.stable_identity_digest().unwrap();
         assert_ne!(authority_identity, changed_identity);
-        workbench.authority_identity_digest = changed_identity.clone();
+        workbench.authority_identity_digest = changed_identity;
         assert_ne!(old_workbench_digest, workbench.computed_digest().unwrap());
+    }
+
+    let mut changed_effect_authorities = Vec::new();
+    let mut changed = effect_authority.clone();
+    changed.contract_authority_generation += 1;
+    changed_effect_authorities.push(changed);
+    let mut changed = effect_authority.clone();
+    changed.contract_digest = digest("replacement-effect-contract");
+    changed_effect_authorities.push(changed);
+    let mut changed = effect_authority.clone();
+    changed.issuer = "replacement-effect-authority".to_string();
+    changed_effect_authorities.push(changed);
+    let mut changed = effect_authority;
+    changed.principal = principal(
+        "replacement-release-manager",
+        AuthorityRole::ReleaseManager,
+    );
+    changed_effect_authorities.push(changed);
+    for changed in changed_effect_authorities {
+        let changed_identity = changed.stable_identity_digest().unwrap();
+        assert_ne!(effect_authority_identity, changed_identity);
         effect.actor_authority_identity_digest = changed_identity;
         assert_ne!(old_effect_digest, effect.computed_digest().unwrap());
     }
