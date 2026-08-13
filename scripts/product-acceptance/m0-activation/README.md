@@ -5,7 +5,7 @@ M0 runtime phase. It has two commands:
 
 - `activate` validates the raw provision-receipt digest, manifest digest, Git
   SHA, stopped unit set, and repository-defined topology before it reloads
-  systemd and starts only `sentinel.target`. A separate bounded activation
+  systemd and queues only `sentinel.target` with `--no-block`. A separate bounded activation
   deadline allows asynchronous service startup and recovery while each command
   retains its short timeout. The controller polls without busy-waiting until
   long-lived units are ready, fails immediately on terminal unit or oneshot

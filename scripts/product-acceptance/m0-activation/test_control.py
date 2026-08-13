@@ -52,6 +52,7 @@ class FakeRunner:
     def __init__(self, fixture: "Fixture") -> None:
         self.fixture = fixture
         self.calls: list[tuple[str, ...]] = []
+        self.timeouts: list[float] = []
         self.environments: list[dict[str, str]] = []
         self.states = {
             unit: {"LoadState": "loaded", "ActiveState": "inactive",
@@ -83,8 +84,8 @@ class FakeRunner:
     def __call__(
         self, argv: tuple[str, ...], timeout: float, environment: dict[str, str]
     ) -> control.Result:
-        del timeout
         self.calls.append(argv)
+        self.timeouts.append(timeout)
         self.environments.append(dict(environment))
         if self.fail_command is not None and argv[:len(self.fail_command)] == self.fail_command:
             return control.Result(1, b"private /work/path secret")
@@ -430,7 +431,10 @@ class ControlTests(unittest.TestCase):
         mutations = [call for call in self.runner.calls if call[1] in
                      {"start", "stop", "restart", "daemon-reload"}]
         self.assertEqual(mutations[0], (str(control.SYSTEMCTL), "daemon-reload"))
-        self.assertEqual(mutations[1], (str(control.SYSTEMCTL), "start", control.TARGET))
+        self.assertEqual(
+            mutations[1],
+            (str(control.SYSTEMCTL), "start", "--no-block", control.TARGET),
+        )
         self.assertEqual(len(mutations), 2)
         self.assertFalse(result["m0_acceptance_pass"])
 
@@ -564,6 +568,22 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(clock.now, 149.0)
         self.assertGreater(clock.now, control.MAX_TIMEOUT_SECONDS)
 
+    def test_no_block_target_job_can_complete_after_command_timeout(self) -> None:
+        clock = FakeClock()
+        self.runner.ready_after_rounds[control.TARGET] = 149
+        result = self.fixture.activate(
+            self.runner, activation_deadline=300.0,
+            monotonic=clock.monotonic, sleeper=clock.sleep,
+        )
+        self.assertEqual(result["status"], "ACTIVE")
+        self.assertGreater(clock.now, control.MAX_TIMEOUT_SECONDS)
+        start_index = self.runner.calls.index(
+            (str(control.SYSTEMCTL), "start", "--no-block", control.TARGET)
+        )
+        self.assertEqual(self.runner.timeouts[start_index], 0.15)
+        with self.assertRaisesRegex(control.ControlError, "command_not_allowed"):
+            control.validate_command((str(control.SYSTEMCTL), "start", control.TARGET))
+
     def test_activation_never_ready_timer_stops_at_monotonic_deadline(self) -> None:
         clock = FakeClock()
         timer = "sentinel-nightrun.timer"
@@ -686,7 +706,9 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(self.runner.calls[reload_index + 1:], [])
 
     def test_failed_target_start_stops_the_attempted_target(self) -> None:
-        self.runner.fail_command = (str(control.SYSTEMCTL), "start", control.TARGET)
+        self.runner.fail_command = (
+            str(control.SYSTEMCTL), "start", "--no-block", control.TARGET,
+        )
         with self.assertRaisesRegex(control.ControlError, "target_start_failed"):
             self.fixture.activate(self.runner)
         stops = [call for call in self.runner.calls if call[1] == "stop"]

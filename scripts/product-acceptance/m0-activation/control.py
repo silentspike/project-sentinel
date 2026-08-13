@@ -390,7 +390,7 @@ def validate_command(argv: tuple[str, ...]) -> None:
     verb = argv[1]
     if verb == "daemon-reload" and len(argv) == 2:
         return
-    if verb == "start" and argv[2:] == (TARGET,):
+    if verb == "start" and argv[2:] == ("--no-block", TARGET):
         return
     if verb == "show" and len(argv) == 5 and argv[2] in INSPECT_UNITS:
         return
@@ -783,7 +783,9 @@ def _activate(
     readiness_digest: str | None = None
     rollback_failed = False
     try:
-        result = invoke(runner, (str(SYSTEMCTL), "start", TARGET), timeout)
+        result = invoke(
+            runner, (str(SYSTEMCTL), "start", "--no-block", TARGET), timeout
+        )
         start_failed = result.returncode != 0
         if start_failed:
             fail("target_start_failed")
