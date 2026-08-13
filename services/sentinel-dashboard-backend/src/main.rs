@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
     // rustls Crypto-Provider (0.23) einmalig installieren (wird von axum-server + wtransport genutzt).
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let mut config = Config::from_env();
+    let mut config = Config::from_production_env()?;
 
     // Shared certificate for HTTPS and WebTransport. Default mode is generated self-signed
     // plus hash pinning; provided-cert mode disables pinning by leaving cert_hash_b64 empty.
