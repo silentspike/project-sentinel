@@ -35,6 +35,36 @@ def encoded(value: object) -> bytes:
     return control.canonical(value)
 
 
+def preflight_check(status: str, reason: str, evidence: dict[str, object]) -> dict[str, object]:
+    digest_input: object = evidence
+    if status == "FAIL":
+        digest_input = {"id": "runtime", "reason": reason}
+    return {
+        "id": "runtime", "status": status, "reason": reason,
+        "evidence_digest": control.wire_digest(digest_input), "evidence": evidence,
+    }
+
+
+def preflight_payload(passed: bool, reason: str = "ok") -> dict[str, object]:
+    check = preflight_check("PASS", "ok", {"ready": True}) if passed else preflight_check(
+        "FAIL", reason, {}
+    )
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "claim": "runtime_preflight_pass" if passed else "runtime_preflight_fail",
+        "runtime_preflight_pass": passed,
+        "m0_acceptance_pass": False,
+        "checks": [check],
+    }
+    seal_preflight(value)
+    return value
+
+
+def seal_preflight(value: dict[str, object]) -> None:
+    value.pop("result_digest", None)
+    value["result_digest"] = control.wire_digest(value)
+
+
 class FakeClock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -75,11 +105,13 @@ class FakeRunner:
         self.ready_after_rounds: dict[str, int] = {}
         self.show_rounds: dict[str, int] = {}
         self.terminal_failure_unit: str | None = None
+        self.terminal_failure_result = "exit-code"
         self.active_oneshot: str | None = None
         self.oneshot_finish_after_rounds: dict[str, int] = {}
         self.oneshot_failure = False
         self.preflight_failures_remaining = 0
         self.preflight_failure_reason = "http_readiness_failed"
+        self.preflight_override: tuple[int, dict[str, object]] | None = None
 
     def __call__(
         self, argv: tuple[str, ...], timeout: float, environment: dict[str, str]
@@ -133,7 +165,8 @@ class FakeRunner:
                         self._ready(unit)
                 if self.terminal_failure_unit is not None:
                     self.states[self.terminal_failure_unit].update(
-                        ActiveState="failed", SubState="failed", Result="failed"
+                        ActiveState="failed", SubState="failed",
+                        Result=self.terminal_failure_result,
                     )
                 if self.active_oneshot is not None:
                     self._ready(self.active_oneshot)
@@ -159,30 +192,17 @@ class FakeRunner:
                 self.fixture.ledger.write_bytes(b"{}\n")
             elif self.mutate_during_preflight == "evidence":
                 self.fixture.evidence.write_bytes(b"{}\n")
+            if self.preflight_override is not None:
+                returncode, value = self.preflight_override
+                return control.Result(returncode, encoded(value))
             if self.readiness_failure:
                 return control.Result(1, encoded({"runtime_preflight_pass": False}))
             if self.preflight_failures_remaining > 0:
                 self.preflight_failures_remaining -= 1
-                return control.Result(1, encoded({
-                    "schema_version": 1,
-                    "claim": "runtime_preflight_fail",
-                    "runtime_preflight_pass": False,
-                    "m0_acceptance_pass": False,
-                    "checks": [{
-                        "id": "temporal_readiness",
-                        "status": "FAIL",
-                        "reason": self.preflight_failure_reason,
-                        "evidence_digest": "e" * 64,
-                        "evidence": {},
-                    }],
-                    "result_digest": "f" * 64,
-                }))
-            return control.Result(0, encoded({
-                "schema_version": 1, "claim": "runtime_preflight_pass",
-                "runtime_preflight_pass": True, "m0_acceptance_pass": False,
-                "checks": [],
-                "result_digest": "d" * 64,
-            }))
+                return control.Result(
+                    1, encoded(preflight_payload(False, self.preflight_failure_reason))
+                )
+            return control.Result(0, encoded(preflight_payload(True)))
         if argv[:2] == (str(control.PYTHON), str(control.JOURNEY_PROGRAM)):
             checkpoint = None
             if "--stop-after-checkpoint" in argv:
@@ -334,17 +354,25 @@ class Fixture:
         self.ledger = self.root / "journey-ledger.json"
         self.evidence = self.root / "journey-evidence.json"
         self.git_sha = "a" * 40
+        artifact_digests = [f"{index:064x}" for index in range(111)]
         self.manifest_value = {
             "version": "1.0", "created_at": "2026-08-13T00:00:00Z",
             "git_sha": self.git_sha,
-            "artifacts": [{"path": f"/artifact/{index}"} for index in range(111)],
+            "artifacts": [
+                {
+                    "path": f"/artifact/{index}", "source": f"artifact/{index}",
+                    "sha256": artifact_digests[index], "type": "config",
+                }
+                for index in range(111)
+            ],
         }
         self.manifest.write_bytes(encoded(self.manifest_value))
         self.manifest_sha = control.digest_bytes(self.manifest.read_bytes())
         unsigned = {
             "schema_version": 1, "status": "COMPLETE", "git_sha": self.git_sha,
             "manifest_sha256": self.manifest_sha, "artifact_count": 111,
-            "changed_count": 111, "artifact_set_digest": "b" * 64,
+            "changed_count": 111,
+            "artifact_set_digest": control.digest(sorted(artifact_digests)),
             "services_started": False,
         }
         self.provision.write_bytes(encoded(unsigned))
@@ -368,6 +396,23 @@ class Fixture:
         for path in (self.manifest, self.provision, self.plan_path, self.control_path):
             path.chmod(0o600)
         self.journey_contract = control.load_journey_contract(self.plan_path)
+
+    def rewrite_provision(self, artifact_count: int, changed_count: int | None = None) -> None:
+        self.manifest_value["artifacts"] = self.manifest_value["artifacts"][:artifact_count]
+        self.manifest.write_bytes(encoded(self.manifest_value))
+        self.manifest_sha = control.digest_bytes(self.manifest.read_bytes())
+        digests = [item["sha256"] for item in self.manifest_value["artifacts"]]
+        receipt = {
+            "schema_version": 1, "status": "COMPLETE", "git_sha": self.git_sha,
+            "manifest_sha256": self.manifest_sha, "artifact_count": artifact_count,
+            "changed_count": artifact_count if changed_count is None else changed_count,
+            "artifact_set_digest": control.digest(sorted(digests)),
+            "services_started": False,
+        }
+        self.provision.write_bytes(encoded(receipt))
+        self.provision_sha = control.digest_bytes(self.provision.read_bytes())
+        self.manifest.chmod(0o600)
+        self.provision.chmod(0o600)
 
     def preflight(self) -> control.PreflightArgs:
         return control.PreflightArgs(
@@ -474,7 +519,7 @@ class ControlTests(unittest.TestCase):
             ("manifest_digest", self.fixture.provision_sha, "0" * 64, self.fixture.git_sha,
              "manifest_digest_mismatch"),
             ("git", self.fixture.provision_sha, self.fixture.manifest_sha, "c" * 40,
-             "provision_receipt_authority_mismatch"),
+             "manifest_authority_mismatch"),
         )
         for _, receipt_sha, manifest_sha, git_sha, reason in cases:
             with self.subTest(reason=reason):
@@ -509,8 +554,38 @@ class ControlTests(unittest.TestCase):
             )
         self.assertEqual(self.runner.calls, [])
 
+    def test_provision_authority_uses_dynamic_manifest_count_and_digest(self) -> None:
+        fixture = Fixture(self.root / "dynamic-provision")
+        fixture.rewrite_provision(7, changed_count=3)
+        result = control.validate_provision_authority(
+            fixture.provision, fixture.provision_sha, fixture.manifest,
+            fixture.manifest_sha, fixture.git_sha,
+        )
+        self.assertEqual(result["artifact_count"], 7)
+        self.assertEqual(result["changed_count"], 3)
+
+        for field, value in (
+            ("artifact_count", 8),
+            ("changed_count", 8),
+            ("artifact_set_digest", "0" * 64),
+        ):
+            with self.subTest(field=field):
+                bad = Fixture(self.root / f"bad-provision-{field}")
+                bad.rewrite_provision(7, changed_count=3)
+                receipt = json.loads(bad.provision.read_text())
+                receipt[field] = value
+                bad.provision.write_bytes(encoded(receipt))
+                bad.provision_sha = control.digest_bytes(bad.provision.read_bytes())
+                with self.assertRaisesRegex(
+                    control.ControlError, "provision_receipt_authority_mismatch"
+                ):
+                    control.validate_provision_authority(
+                        bad.provision, bad.provision_sha, bad.manifest,
+                        bad.manifest_sha, bad.git_sha,
+                    )
+
     def test_running_or_failed_unit_stops_before_daemon_reload(self) -> None:
-        for field, value in (("ActiveState", "active"), ("Result", "failed")):
+        for field, value in (("ActiveState", "active"), ("Result", "exit-code")):
             with self.subTest(field=field):
                 self.fixture.activation.unlink(missing_ok=True)
                 runner = FakeRunner(self.fixture)
@@ -568,6 +643,90 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(clock.now, 149.0)
         self.assertGreater(clock.now, control.MAX_TIMEOUT_SECONDS)
 
+    def test_activation_deadline_rechecks_slow_readback_and_preflight(self) -> None:
+        readback_clock = FakeClock()
+        readback_runner = FakeRunner(self.fixture)
+        readback_delayed = False
+
+        def slow_readback(
+            argv: tuple[str, ...], timeout: float, environment: dict[str, str]
+        ) -> control.Result:
+            nonlocal readback_delayed
+            result = readback_runner(argv, timeout, environment)
+            if (
+                readback_runner.after_target_start
+                and argv[1] == "show"
+                and not readback_delayed
+            ):
+                readback_delayed = True
+                readback_clock.sleep(6.0)
+            return result
+
+        with self.assertRaisesRegex(control.ControlError, "activation_timeout"):
+            self.fixture.activate(
+                slow_readback, activation_deadline=5.0,
+                monotonic=readback_clock.monotonic, sleeper=readback_clock.sleep,
+            )
+        self.assertEqual(readback_clock.now, 6.0)
+
+        fixture = Fixture(self.root / "slow-preflight")
+        preflight_clock = FakeClock()
+        preflight_runner = FakeRunner(fixture)
+        preflight_timeouts: list[float] = []
+        delayed_oneshot = False
+
+        def slow_preflight(
+            argv: tuple[str, ...], timeout: float, environment: dict[str, str]
+        ) -> control.Result:
+            nonlocal delayed_oneshot
+            result = preflight_runner(argv, timeout, environment)
+            if (
+                preflight_runner.after_target_start
+                and argv[:3] == (
+                    str(control.SYSTEMCTL), "show", "sentinel-nightrun.service"
+                )
+                and not delayed_oneshot
+            ):
+                delayed_oneshot = True
+                preflight_clock.sleep(4.9)
+            elif argv[:2] == (str(control.PYTHON), str(control.PREFLIGHT_PROGRAM)):
+                preflight_timeouts.append(timeout)
+                preflight_clock.sleep(0.2)
+            return result
+
+        with self.assertRaisesRegex(control.ControlError, "activation_timeout"):
+            fixture.activate(
+                slow_preflight, activation_deadline=5.0,
+                monotonic=preflight_clock.monotonic, sleeper=preflight_clock.sleep,
+            )
+        self.assertEqual(len(preflight_timeouts), 1)
+        self.assertLessEqual(preflight_timeouts[0], 0.11)
+        self.assertGreater(preflight_clock.now, 5.0)
+
+    def test_preflight_wire_contract_rejects_semantic_and_digest_forgery(self) -> None:
+        cases: list[tuple[str, dict[str, object]]] = []
+        pass_with_fail = preflight_payload(True)
+        pass_with_fail["checks"].append(preflight_check("FAIL", "http_timeout", {}))
+        seal_preflight(pass_with_fail)
+        cases.append(("pass_with_fail", pass_with_fail))
+        pass_with_fatal = preflight_payload(True)
+        pass_with_fatal["fatal_reason"] = "http_timeout"
+        seal_preflight(pass_with_fatal)
+        cases.append(("pass_with_fatal", pass_with_fatal))
+        non_bool = preflight_payload(True)
+        non_bool["runtime_preflight_pass"] = 1
+        seal_preflight(non_bool)
+        cases.append(("non_bool", non_bool))
+        wrong_digest = preflight_payload(True)
+        wrong_digest["result_digest"] = "0" * 64
+        cases.append(("wrong_digest", wrong_digest))
+        for name, value in cases:
+            with self.subTest(name=name):
+                runner = FakeRunner(self.fixture)
+                runner.preflight_override = (0, value)
+                with self.assertRaisesRegex(control.ControlError, "readiness_failed"):
+                    control.run_preflight_attempt(runner, self.fixture.preflight())
+
     def test_no_block_target_job_can_complete_after_command_timeout(self) -> None:
         clock = FakeClock()
         self.runner.ready_after_rounds[control.TARGET] = 149
@@ -608,6 +767,8 @@ class ControlTests(unittest.TestCase):
                 monotonic=clock.monotonic, sleeper=clock.sleep,
             )
         self.assertEqual(clock.sleeps, [])
+        receipt = json.loads(self.fixture.activation.read_text())
+        self.assertEqual(receipt["reason"], "activation_unit_failed")
 
     def test_post_start_failure_rolls_back_running_oneshots(self) -> None:
         self.runner.active_oneshot = "sentinel-nightrun.service"
@@ -920,6 +1081,40 @@ class ControlTests(unittest.TestCase):
         runner.restart_never_ready = True
         with self.assertRaisesRegex(control.ControlError, "restart_timeout"):
             fixture.restart(runner)
+
+    def test_wait_service_binds_each_readback_and_terminal_result(self) -> None:
+        unit = control.SERVICES[0]
+        slow_clock = FakeClock()
+        slow_runner = FakeRunner(self.fixture)
+        slow_runner.states[unit].update(
+            ActiveState="activating", SubState="start", Result="success"
+        )
+
+        def delayed(
+            argv: tuple[str, ...], timeout: float, environment: dict[str, str]
+        ) -> control.Result:
+            result = slow_runner(argv, timeout, environment)
+            slow_clock.sleep(6.0)
+            return result
+
+        with self.assertRaisesRegex(control.ControlError, "restart_timeout"):
+            control.wait_service(
+                delayed, unit, 5.0,
+                monotonic=slow_clock.monotonic, sleeper=slow_clock.sleep,
+            )
+        self.assertEqual(slow_runner.timeouts[-1], 5.0)
+
+        terminal_runner = FakeRunner(self.fixture)
+        terminal_runner.states[unit].update(
+            ActiveState="inactive", SubState="dead", Result="signal"
+        )
+        terminal_clock = FakeClock()
+        with self.assertRaisesRegex(control.ControlError, "restart_unit_failed"):
+            control.wait_service(
+                terminal_runner, unit, 5.0,
+                monotonic=terminal_clock.monotonic, sleeper=terminal_clock.sleep,
+            )
+        self.assertEqual(terminal_clock.sleeps, [])
 
     def test_journey_failure_runs_no_restart_or_preflight(self) -> None:
         self.runner.fail_command = (str(control.PYTHON), str(control.JOURNEY_PROGRAM))

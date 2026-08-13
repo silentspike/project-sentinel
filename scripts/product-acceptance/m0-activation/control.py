@@ -142,6 +142,10 @@ def digest(value: Any) -> str:
     return digest_bytes(canonical(value))
 
 
+def wire_digest(value: Any) -> str:
+    return digest_bytes(canonical(value).removesuffix(b"\n"))
+
+
 def public_failure(code: str) -> bytes:
     return canonical({"schema_version": SCHEMA_VERSION, "status": "FAIL", "reason": code})
 
@@ -583,6 +587,38 @@ def validate_provision_authority(
         fail("provision_receipt_digest_mismatch")
     if digest_bytes(manifest_raw) != expected_manifest_sha:
         fail("manifest_digest_mismatch")
+    manifest = strict_json(manifest_raw, "manifest")
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"version", "created_at", "git_sha", "artifacts"}
+        or manifest.get("version") != "1.0"
+        or not isinstance(manifest.get("created_at"), str)
+        or manifest.get("git_sha") != expected_git_sha
+        or not isinstance(manifest.get("artifacts"), list)
+        or not manifest["artifacts"]
+    ):
+        fail("manifest_authority_mismatch")
+    artifact_digests: list[str] = []
+    paths: set[str] = set()
+    sources: set[str] = set()
+    for artifact in manifest["artifacts"]:
+        if (
+            not isinstance(artifact, dict)
+            or set(artifact) != {"path", "source", "sha256", "type"}
+            or not all(isinstance(artifact[key], str) for key in artifact)
+            or not artifact["path"].startswith("/")
+            or not artifact["source"]
+            or artifact["type"] not in {"binary", "config", "script", "systemd"}
+            or not DIGEST_RE.fullmatch(artifact["sha256"])
+            or artifact["path"] in paths
+            or artifact["source"] in sources
+        ):
+            fail("manifest_artifact_invalid")
+        paths.add(artifact["path"])
+        sources.add(artifact["source"])
+        artifact_digests.append(artifact["sha256"])
+    artifact_count = len(artifact_digests)
+    artifact_set_digest = digest(sorted(artifact_digests))
     if not isinstance(receipt, dict) or set(receipt) != {
         "schema_version", "status", "git_sha", "manifest_sha256",
         "artifact_count", "changed_count", "artifact_set_digest",
@@ -594,23 +630,13 @@ def validate_provision_authority(
         or receipt["status"] != "COMPLETE"
         or receipt["git_sha"] != expected_git_sha
         or receipt["manifest_sha256"] != expected_manifest_sha
-        or receipt["artifact_count"] != 111
+        or receipt["artifact_count"] != artifact_count
         or not isinstance(receipt["changed_count"], int)
-        or not 0 <= receipt["changed_count"] <= 111
+        or not 0 <= receipt["changed_count"] <= artifact_count
         or receipt["services_started"] is not False
-        or not isinstance(receipt["artifact_set_digest"], str)
-        or not DIGEST_RE.fullmatch(receipt["artifact_set_digest"])
+        or receipt["artifact_set_digest"] != artifact_set_digest
     ):
         fail("provision_receipt_authority_mismatch")
-    manifest = strict_json(manifest_raw, "manifest")
-    if (
-        not isinstance(manifest, dict)
-        or manifest.get("version") != "1.0"
-        or manifest.get("git_sha") != expected_git_sha
-        or not isinstance(manifest.get("artifacts"), list)
-        or len(manifest["artifacts"]) != 111
-    ):
-        fail("manifest_authority_mismatch")
     return receipt
 
 
@@ -626,19 +652,25 @@ class PreflightArgs:
     timeout: float
 
 
-def preflight_command(value: PreflightArgs) -> tuple[str, ...]:
+def preflight_command(value: PreflightArgs, timeout: float | None = None) -> tuple[str, ...]:
+    effective_timeout = value.timeout if timeout is None else min(value.timeout, timeout)
+    if effective_timeout <= 0:
+        fail("readiness_failed")
     return (
         str(PYTHON), str(PREFLIGHT_PROGRAM), "--manifest", str(value.manifest),
         "--contract", str(value.contract), "--profile", str(value.profile),
         "--agents-dir", str(value.agents_dir), "--operator-credential-file",
         str(value.operator_credential_file), "--expected-git-sha",
         value.expected_git_sha, "--expected-manifest-sha256",
-        value.expected_manifest_sha256, "--timeout-seconds", str(value.timeout),
+        value.expected_manifest_sha256, "--timeout-seconds", str(effective_timeout),
     )
 
 
-def run_preflight_attempt(runner: Runner, value: PreflightArgs) -> tuple[str | None, bool]:
-    result = invoke(runner, preflight_command(value), value.timeout)
+def run_preflight_attempt(
+    runner: Runner, value: PreflightArgs, timeout: float | None = None,
+) -> tuple[str | None, bool]:
+    effective_timeout = value.timeout if timeout is None else min(value.timeout, timeout)
+    result = invoke(runner, preflight_command(value, effective_timeout), effective_timeout)
     output = strict_json(result.stdout, "preflight")
     expected_keys = {
         "schema_version", "claim", "runtime_preflight_pass",
@@ -652,19 +684,18 @@ def run_preflight_attempt(runner: Runner, value: PreflightArgs) -> tuple[str | N
         or output.get("schema_version") != 1
         or output.get("m0_acceptance_pass") is not False
         or not isinstance(output.get("checks"), list)
+        or not output["checks"]
         or not isinstance(output.get("result_digest"), str)
         or not DIGEST_RE.fullmatch(output["result_digest"])
+        or type(output.get("runtime_preflight_pass")) is not bool
     ):
         fail("readiness_failed")
-    passed = output.get("runtime_preflight_pass") is True
-    if passed:
-        if result.returncode != 0 or output.get("claim") != "runtime_preflight_pass":
-            fail("readiness_failed")
-        return output["result_digest"], False
-    if result.returncode == 0 or output.get("claim") != "runtime_preflight_fail":
+    supplied_digest = output["result_digest"]
+    payload = dict(output)
+    del payload["result_digest"]
+    if supplied_digest != wire_digest(payload):
         fail("readiness_failed")
-    if "fatal_reason" in output:
-        fail("readiness_failed")
+    statuses: list[str] = []
     failed_reasons: list[str] = []
     for check in output["checks"]:
         if (
@@ -672,14 +703,43 @@ def run_preflight_attempt(runner: Runner, value: PreflightArgs) -> tuple[str | N
             or set(check) != {"id", "status", "reason", "evidence_digest", "evidence"}
             or check.get("status") not in {"PASS", "FAIL"}
             or not isinstance(check.get("id"), str)
+            or not check["id"]
             or not isinstance(check.get("reason"), str)
             or not isinstance(check.get("evidence_digest"), str)
             or not DIGEST_RE.fullmatch(check["evidence_digest"])
             or not isinstance(check.get("evidence"), dict)
         ):
             fail("readiness_failed")
-        if check["status"] == "FAIL":
+        statuses.append(check["status"])
+        if check["status"] == "PASS":
+            if check["reason"] != "ok" or check["evidence_digest"] != wire_digest(
+                check["evidence"]
+            ):
+                fail("readiness_failed")
+        else:
+            if (
+                not check["reason"]
+                or check["evidence"] != {}
+                or check["evidence_digest"] != wire_digest({
+                    "id": check["id"], "reason": check["reason"],
+                })
+            ):
+                fail("readiness_failed")
             failed_reasons.append(check["reason"])
+    passed = output["runtime_preflight_pass"]
+    if passed:
+        if (
+            result.returncode != 0
+            or output.get("claim") != "runtime_preflight_pass"
+            or "fatal_reason" in output
+            or any(status != "PASS" for status in statuses)
+        ):
+            fail("readiness_failed")
+        return supplied_digest, False
+    if result.returncode == 0 or output.get("claim") != "runtime_preflight_fail":
+        fail("readiness_failed")
+    if "fatal_reason" in output:
+        fail("readiness_failed")
     if (
         not failed_reasons
         or any(reason not in TEMPORAL_PREFLIGHT_REASONS for reason in failed_reasons)
@@ -699,7 +759,7 @@ def unit_terminal_failure(unit: str, values: dict[str, str]) -> bool:
     return (
         values["LoadState"] != "loaded"
         or values["ActiveState"] == "failed"
-        or (unit != TARGET and values.get("Result") == "failed")
+        or (unit != TARGET and values.get("Result") != "success")
     )
 
 
@@ -717,26 +777,33 @@ def wait_for_activation(
     deadline: float, monotonic: Callable[[], float],
     sleeper: Callable[[float], None],
 ) -> str:
-    while True:
+    def remaining_timeout() -> float:
         remaining = deadline - monotonic()
         if remaining <= 0:
             fail("activation_timeout")
-        per_command_timeout = min(command_timeout, remaining)
+        return min(command_timeout, remaining)
+
+    while True:
         all_ready = True
         for unit in ALL_UNITS:
-            values = systemctl_show(runner, unit, per_command_timeout)
+            values = systemctl_show(runner, unit, remaining_timeout())
             if unit_terminal_failure(unit, values):
                 fail("activation_unit_failed")
+            remaining_timeout()
             if not unit_ready(unit, values):
                 all_ready = False
         for unit in ONESHOTS:
-            values = systemctl_show(runner, unit, per_command_timeout)
+            values = systemctl_show(runner, unit, remaining_timeout())
             if unit_terminal_failure(unit, values):
                 fail("activation_oneshot_failed")
+            remaining_timeout()
             if not oneshot_terminal_success(values):
                 all_ready = False
         if all_ready:
-            readiness_digest, retryable = run_preflight_attempt(runner, preflight)
+            readiness_digest, retryable = run_preflight_attempt(
+                runner, preflight, remaining_timeout()
+            )
+            remaining_timeout()
             if readiness_digest is not None:
                 return readiness_digest
             if not retryable:
@@ -773,7 +840,10 @@ def _activate(
     )
     for unit in INSPECT_UNITS:
         values = systemctl_show(runner, unit, timeout)
-        if values["ActiveState"] != "inactive" or values.get("Result") == "failed":
+        if (
+            values["ActiveState"] != "inactive"
+            or (unit != TARGET and values.get("Result") != "success")
+        ):
             fail("unit_not_stopped_cleanly")
     reload_result = invoke(runner, (str(SYSTEMCTL), "daemon-reload"), timeout)
     if reload_result.returncode != 0:
@@ -1021,15 +1091,25 @@ def validate_journey_state(
     return digest_bytes(ledger_raw), digest_bytes(evidence_raw), evidence_value
 
 
-def wait_service(runner: Runner, unit: str, timeout: float) -> None:
-    deadline = time.monotonic() + timeout
+def wait_service(
+    runner: Runner, unit: str, timeout: float,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> None:
+    deadline = monotonic() + timeout
     while True:
-        values = systemctl_show(runner, unit, min(timeout, 5.0))
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            fail("restart_timeout")
+        values = systemctl_show(runner, unit, min(remaining, 5.0))
+        if unit_terminal_failure(unit, values):
+            fail("restart_unit_failed")
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            fail("restart_timeout")
         if unit_ready(unit, values):
             return
-        if time.monotonic() >= deadline:
-            fail("restart_timeout")
-        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        sleeper(min(0.05, remaining))
 
 
 def _restart_journey(
