@@ -35,6 +35,19 @@ def encoded(value: object) -> bytes:
     return control.canonical(value)
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, duration: float) -> None:
+        self.sleeps.append(duration)
+        self.now += duration
+
+
 class FakeRunner:
     def __init__(self, fixture: "Fixture") -> None:
         self.fixture = fixture
@@ -58,6 +71,14 @@ class FakeRunner:
         self.target_start_returncode = 0
         self.journey_mutation: str | None = None
         self.journey_mutation_final_only = False
+        self.ready_after_rounds: dict[str, int] = {}
+        self.show_rounds: dict[str, int] = {}
+        self.terminal_failure_unit: str | None = None
+        self.active_oneshot: str | None = None
+        self.oneshot_finish_after_rounds: dict[str, int] = {}
+        self.oneshot_failure = False
+        self.preflight_failures_remaining = 0
+        self.preflight_failure_reason = "http_readiness_failed"
 
     def __call__(
         self, argv: tuple[str, ...], timeout: float, environment: dict[str, str]
@@ -73,6 +94,25 @@ class FakeRunner:
                 unit = argv[2]
                 if self.after_target_start and unit == self.show_failure_unit:
                     return control.Result(1)
+                if self.after_target_start and unit in self.ready_after_rounds:
+                    self.show_rounds[unit] = self.show_rounds.get(unit, 0) + 1
+                    if self.show_rounds[unit] >= self.ready_after_rounds[unit]:
+                        self._ready(unit)
+                if (
+                    self.after_target_start
+                    and unit in self.oneshot_finish_after_rounds
+                    and self.states[unit]["ActiveState"] in {"active", "activating"}
+                ):
+                    self.show_rounds[unit] = self.show_rounds.get(unit, 0) + 1
+                    if self.show_rounds[unit] >= self.oneshot_finish_after_rounds[unit]:
+                        if self.oneshot_failure:
+                            self.states[unit].update(
+                                ActiveState="failed", SubState="failed", Result="failed"
+                            )
+                        else:
+                            self.states[unit].update(
+                                ActiveState="inactive", SubState="dead", Result="success"
+                            )
                 state = self.states[unit]
                 properties = argv[3].removeprefix("--property=").split(",")
                 data = "".join(f"{key}={state[key]}\n" for key in properties)
@@ -84,7 +124,18 @@ class FakeRunner:
                 for unit in control.ALL_UNITS:
                     if self.partial_start_at == unit:
                         break
-                    self._ready(unit)
+                    if unit in self.ready_after_rounds:
+                        self.states[unit].update(
+                            ActiveState="activating", SubState="start", Result="success"
+                        )
+                    else:
+                        self._ready(unit)
+                if self.terminal_failure_unit is not None:
+                    self.states[self.terminal_failure_unit].update(
+                        ActiveState="failed", SubState="failed", Result="failed"
+                    )
+                if self.active_oneshot is not None:
+                    self._ready(self.active_oneshot)
                 if self.nightrun_fails_after_start:
                     self.states["sentinel-nightrun.service"]["Result"] = "failed"
                     self.readiness_failure = True
@@ -109,9 +160,26 @@ class FakeRunner:
                 self.fixture.evidence.write_bytes(b"{}\n")
             if self.readiness_failure:
                 return control.Result(1, encoded({"runtime_preflight_pass": False}))
+            if self.preflight_failures_remaining > 0:
+                self.preflight_failures_remaining -= 1
+                return control.Result(1, encoded({
+                    "schema_version": 1,
+                    "claim": "runtime_preflight_fail",
+                    "runtime_preflight_pass": False,
+                    "m0_acceptance_pass": False,
+                    "checks": [{
+                        "id": "temporal_readiness",
+                        "status": "FAIL",
+                        "reason": self.preflight_failure_reason,
+                        "evidence_digest": "e" * 64,
+                        "evidence": {},
+                    }],
+                    "result_digest": "f" * 64,
+                }))
             return control.Result(0, encoded({
                 "schema_version": 1, "claim": "runtime_preflight_pass",
                 "runtime_preflight_pass": True, "m0_acceptance_pass": False,
+                "checks": [],
                 "result_digest": "d" * 64,
             }))
         if argv[:2] == (str(control.PYTHON), str(control.JOURNEY_PROGRAM)):
@@ -315,10 +383,11 @@ class Fixture:
             self.ledger, self.evidence, 0.15,
         )
 
-    def activate(self, runner: FakeRunner) -> dict[str, object]:
+    def activate(self, runner: FakeRunner, **kwargs: object) -> dict[str, object]:
         return control.activate(
             runner, self.provision, self.provision_sha, self.manifest,
             self.manifest_sha, self.git_sha, self.preflight(), self.activation, 0.15,
+            **kwargs,
         )
 
     def restart(self, runner: FakeRunner) -> dict[str, object]:
@@ -459,7 +528,7 @@ class ControlTests(unittest.TestCase):
 
     def test_nightrun_failure_after_parallel_target_start_rolls_back(self) -> None:
         self.runner.nightrun_fails_after_start = True
-        with self.assertRaisesRegex(control.ControlError, "readiness_failed"):
+        with self.assertRaisesRegex(control.ControlError, "activation_oneshot_failed"):
             self.fixture.activate(self.runner)
         verbs = [call[1] for call in self.runner.calls]
         self.assertNotIn("reset-failed", verbs)
@@ -468,6 +537,110 @@ class ControlTests(unittest.TestCase):
             self.runner.states[unit]["ActiveState"] == "inactive"
             for unit in control.ALL_UNITS
         ))
+
+    def test_activation_waits_for_gradual_units_without_busy_loop(self) -> None:
+        clock = FakeClock()
+        for index, unit in enumerate(control.ALL_UNITS):
+            self.runner.ready_after_rounds[unit] = 1 + index % 3
+        result = self.fixture.activate(
+            self.runner, activation_deadline=10.0,
+            monotonic=clock.monotonic, sleeper=clock.sleep,
+        )
+        self.assertEqual(result["status"], "ACTIVE")
+        self.assertEqual(clock.sleeps, [1.0, 1.0])
+        self.assertTrue(all(
+            self.runner.states[unit]["ActiveState"] == "active"
+            for unit in control.ALL_UNITS
+        ))
+
+    def test_activation_allows_long_temporal_preflight_recovery(self) -> None:
+        clock = FakeClock()
+        self.runner.preflight_failures_remaining = 149
+        result = self.fixture.activate(
+            self.runner, activation_deadline=300.0,
+            monotonic=clock.monotonic, sleeper=clock.sleep,
+        )
+        self.assertEqual(result["status"], "ACTIVE")
+        self.assertEqual(clock.now, 149.0)
+        self.assertGreater(clock.now, control.MAX_TIMEOUT_SECONDS)
+
+    def test_activation_never_ready_timer_stops_at_monotonic_deadline(self) -> None:
+        clock = FakeClock()
+        timer = "sentinel-nightrun.timer"
+        self.runner.ready_after_rounds[timer] = 10_000
+        with self.assertRaisesRegex(control.ControlError, "activation_timeout"):
+            self.fixture.activate(
+                self.runner, activation_deadline=5.0,
+                monotonic=clock.monotonic, sleeper=clock.sleep,
+            )
+        self.assertEqual(clock.now, 5.0)
+        self.assertEqual(
+            [call[2] for call in self.runner.calls if call[1] == "stop"],
+            list(control.ROLLBACK_ORDER),
+        )
+
+    def test_activation_terminal_unit_failure_is_immediate(self) -> None:
+        clock = FakeClock()
+        self.runner.terminal_failure_unit = "nats-server.service"
+        with self.assertRaisesRegex(control.ControlError, "activation_unit_failed"):
+            self.fixture.activate(
+                self.runner, activation_deadline=300.0,
+                monotonic=clock.monotonic, sleeper=clock.sleep,
+            )
+        self.assertEqual(clock.sleeps, [])
+
+    def test_post_start_failure_rolls_back_running_oneshots(self) -> None:
+        self.runner.active_oneshot = "sentinel-nightrun.service"
+        self.runner.terminal_failure_unit = "nats-server.service"
+        with self.assertRaisesRegex(control.ControlError, "activation_unit_failed"):
+            self.fixture.activate(self.runner)
+        stops = [call[2] for call in self.runner.calls if call[1] == "stop"]
+        self.assertEqual(stops, list(control.ROLLBACK_ORDER))
+        self.assertEqual(stops[:3], [control.TARGET, *control.ONESHOTS])
+        self.assertEqual(
+            self.runner.states["sentinel-nightrun.service"]["ActiveState"],
+            "inactive",
+        )
+
+    def test_running_oneshot_that_later_fails_never_reaches_preflight(self) -> None:
+        clock = FakeClock()
+        unit = "sentinel-nightrun.service"
+        self.runner.active_oneshot = unit
+        self.runner.oneshot_finish_after_rounds[unit] = 2
+        self.runner.oneshot_failure = True
+        with self.assertRaisesRegex(control.ControlError, "activation_oneshot_failed"):
+            self.fixture.activate(
+                self.runner, activation_deadline=10.0,
+                monotonic=clock.monotonic, sleeper=clock.sleep,
+            )
+        self.assertEqual(clock.sleeps, [1.0])
+        self.assertFalse(any(
+            call[:2] == (str(control.PYTHON), str(control.PREFLIGHT_PROGRAM))
+            for call in self.runner.calls
+        ))
+        self.assertEqual(json.loads(self.fixture.activation.read_text())["status"], "ROLLED_BACK")
+
+    def test_active_receipt_waits_for_running_oneshot_success(self) -> None:
+        clock = FakeClock()
+        unit = "sentinel-health-monitor.service"
+        self.runner.active_oneshot = unit
+        self.runner.oneshot_finish_after_rounds[unit] = 2
+        result = self.fixture.activate(
+            self.runner, activation_deadline=10.0,
+            monotonic=clock.monotonic, sleeper=clock.sleep,
+        )
+        self.assertEqual(result["status"], "ACTIVE")
+        self.assertEqual(clock.sleeps, [1.0])
+        self.assertEqual(self.runner.states[unit]["ActiveState"], "inactive")
+        preflight_index = next(
+            index for index, call in enumerate(self.runner.calls)
+            if call[:2] == (str(control.PYTHON), str(control.PREFLIGHT_PROGRAM))
+        )
+        completion_index = max(
+            index for index, call in enumerate(self.runner.calls[:preflight_index])
+            if call[:3] == (str(control.SYSTEMCTL), "show", unit)
+        )
+        self.assertLess(completion_index, preflight_index)
 
     def test_controller_lock_is_fail_closed_before_commands(self) -> None:
         lock_path = self.root / ".m0-activation-control.lock"
@@ -555,8 +728,12 @@ class ControlTests(unittest.TestCase):
                 runner = FakeRunner(self.fixture)
                 runner.partial_start_at = partial
                 runner.readiness_failure = readiness
+                clock = FakeClock()
                 with self.assertRaises(control.ControlError):
-                    self.fixture.activate(runner)
+                    self.fixture.activate(
+                        runner, activation_deadline=0.2,
+                        monotonic=clock.monotonic, sleeper=clock.sleep,
+                    )
                 stopped = [call[2] for call in runner.calls if call[1] == "stop"]
                 self.assertEqual(stopped, list(control.ROLLBACK_ORDER))
                 self.assertNotIn("foreign.service", stopped)
@@ -625,6 +802,66 @@ class ControlTests(unittest.TestCase):
                     with self.assertRaisesRegex(control.ControlError, reason):
                         control.production_runner(argv, timeout, environment)
                     self.assertLess(__import__("time").monotonic() - started, 3.0)
+
+    def test_successful_process_does_not_signal_its_reaped_process_group(self) -> None:
+        helper = self.root / "success.py"
+        helper.write_text("print('{}')\n", encoding="ascii")
+        helper.chmod(0o600)
+        with (
+            mock.patch.object(control, "PREFLIGHT_PROGRAM", helper),
+            mock.patch.object(control.os, "killpg") as killpg,
+        ):
+            argv = (str(control.PYTHON), str(helper))
+            result = control.production_runner(argv, 1.0, control.child_environment(argv))
+        self.assertEqual(result, control.Result(0, b"{}\n"))
+        killpg.assert_not_called()
+
+    def test_abnormal_process_kills_its_grandchild_before_return(self) -> None:
+        for mode, reason in (
+            ("timeout", "command_timeout"),
+            ("overflow", "command_output_oversized"),
+        ):
+            with self.subTest(mode=mode):
+                pid_path = self.root / f"{mode}-grandchild.pid"
+                marker = self.root / f"{mode}-grandchild-survived"
+                helper = self.root / f"{mode}-process-tree.py"
+                child = (
+                    "import os,time,pathlib;"
+                    f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()));"
+                    "time.sleep(1.0);"
+                    f"pathlib.Path({str(marker)!r}).write_text('survived')"
+                )
+                trigger = (
+                    "time.sleep(10)"
+                    if mode == "timeout"
+                    else "os.write(1, b'x' * (4 * 1024 * 1024 + 1))"
+                )
+                helper.write_text(
+                    "import os,pathlib,subprocess,sys,time\n"
+                    f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+                    f"pid_path = pathlib.Path({str(pid_path)!r})\n"
+                    "deadline = time.monotonic() + 2.0\n"
+                    "while not pid_path.exists() and time.monotonic() < deadline:\n"
+                    "    time.sleep(0.01)\n"
+                    "if not pid_path.exists():\n"
+                    "    raise RuntimeError('child did not start')\n"
+                    f"{trigger}\n",
+                    encoding="ascii",
+                )
+                helper.chmod(0o600)
+                with mock.patch.object(control, "PREFLIGHT_PROGRAM", helper):
+                    argv = (str(control.PYTHON), str(helper))
+                    with self.assertRaisesRegex(control.ControlError, reason):
+                        control.production_runner(
+                            argv, 0.5 if mode == "timeout" else 2.0,
+                            control.child_environment(argv),
+                        )
+                self.assertTrue(pid_path.exists())
+                grandchild_pid = int(pid_path.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(grandchild_pid, 0)
+                __import__("time").sleep(1.05)
+                self.assertFalse(marker.exists())
 
     def test_restart_control_rejects_unsafe_unit_digest_and_executable(self) -> None:
         bad = copy.deepcopy(self.fixture.control_value)
