@@ -1,8 +1,9 @@
 [Unit]
 Description=Sentinel Dashboard-Backend — axum HTTPS + WebTransport/QUIC, topic+msgpack+zstd (#431)
 Documentation=https://github.com/silentspike/project-sentinel/issues/431
-After=network-online.target
+After=network-online.target sentinel-auth-init.service
 Wants=network-online.target
+Requires=sentinel-auth-init.service
 StartLimitBurst=5
 StartLimitIntervalSec=300
 

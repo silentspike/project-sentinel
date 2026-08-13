@@ -861,6 +861,7 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
     use std::thread;
 
@@ -887,26 +888,37 @@ mod tests {
         }
     }
 
-    fn short_socket_case(name: &str) -> (TestDir, PathBuf) {
-        let root = PathBuf::from("/work/tmp/project-sentinel/c3-650-s")
-            .join(format!("{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+    fn isolated_test_root(kind: &str) -> TestDir {
+        static NEXT_CASE: AtomicU64 = AtomicU64::new(1);
+        let parent = std::env::var_os("RUNNER_TEMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/work/tmp/project-sentinel"));
+        if std::env::var_os("RUNNER_TEMP").is_none() {
+            std::fs::create_dir_all(&parent).unwrap();
+        }
+        assert!(parent.is_dir(), "test temp parent must already exist");
+        let root = parent.join(format!(
+            "c3-{}-{}-{kind}",
+            std::process::id(),
+            NEXT_CASE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        TestDir(root)
+    }
+
+    fn short_socket_case(name: &str) -> (TestDir, PathBuf) {
+        let root = isolated_test_root(name);
         let socket = root.join("broker.sock");
-        (TestDir(root), socket)
+        (root, socket)
     }
 
     fn credential_case(name: &str) -> (TestDir, PathBuf) {
-        let root = PathBuf::from("/work/tmp/project-sentinel/c3-650-s")
-            .join(format!("{}-credential-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = isolated_test_root(name);
         let path = root.join(OPERATOR_CREDENTIAL_NAME);
         std::fs::write(&path, b"0123456789abcdef0123456789abcdef").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        (TestDir(root), path)
+        (root, path)
     }
 
     fn set_credential_environment(root: &Path, path: &Path) {

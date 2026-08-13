@@ -13,6 +13,8 @@ import uuid
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "deploy/scripts/init-dashboard-auth.sh"
+AUTH_INIT_UNIT = REPO_ROOT / "deploy/systemd/sentinel-auth-init.service"
+TARGET_UNIT = REPO_ROOT / "deploy/systemd/sentinel.target"
 DASHBOARD_UNIT = REPO_ROOT / "deploy/systemd/sentinel-dashboard-backend.service"
 DAEMON_UNIT = REPO_ROOT / "deploy/systemd/sentinel-daemon.service"
 GATEWAY_UNIT = REPO_ROOT / "deploy/systemd/sentinel-gateway.service"
@@ -31,6 +33,9 @@ GAIA_CONFIG = REPO_ROOT / "services/sentinel-gaia-loop/src/config.rs"
 GAIA_SESSION = REPO_ROOT / "services/sentinel-gaia-loop/src/session.rs"
 GAIA_SYSTEM_PROMPT = REPO_ROOT / "services/sentinel-gaia-loop/prompts/gaia-system.md"
 M0_PREFLIGHT = REPO_ROOT / "scripts/product-acceptance/run_m0_preflight.py"
+MANIFEST_GENERATOR = REPO_ROOT / "deploy/generate-manifest.sh"
+PROVISIONER = REPO_ROOT / "deploy/provision-m0-single-node.sh"
+ACTIVATION = REPO_ROOT / "scripts/product-acceptance/m0-activation/control.py"
 
 DASHBOARD_SECRET = "dashboard-" + "a" * 40
 OPERATOR_SECRET = "operator-" + "b" * 40
@@ -120,6 +125,55 @@ class OperatorCredentialWiringTests(unittest.TestCase):
         self.assertNotIn("SENTINEL_OPERATOR_CREDENTIAL_FILE=", gateway_source)
         self.assertIn("independent dashboard login key", dashboard_source)
         self.assertIn("ExecStartPre=/usr/bin/test -x /usr/bin/bwrap", dashboard_source)
+
+    def test_single_auth_init_unit_gates_every_credential_consumer(self) -> None:
+        auth_init = AUTH_INIT_UNIT.read_text(encoding="utf-8")
+        target = TARGET_UNIT.read_text(encoding="utf-8")
+        consumers = {
+            "sentinel-daemon.service": DAEMON_UNIT.read_text(encoding="utf-8"),
+            "sentinel-gateway.service": GATEWAY_UNIT.read_text(encoding="utf-8"),
+            "sentinel-dashboard-backend.service": DASHBOARD_UNIT.read_text(
+                encoding="utf-8"
+            ),
+            "sentinel-nightrun.service": NIGHTRUN_UNIT.read_text(encoding="utf-8"),
+        }
+        discovered_consumers = {
+            path.name
+            for path in (REPO_ROOT / "deploy/systemd").glob("*.service")
+            if "LoadCredential=operator-api:" in path.read_text(encoding="utf-8")
+        }
+        self.assertEqual(discovered_consumers, set(consumers))
+        self.assertIn("Type=oneshot\n", auth_init)
+        self.assertIn("User=root\n", auth_init)
+        self.assertIn("ExecStart=/opt/sentinel/scripts/init-dashboard-auth.sh\n", auth_init)
+        self.assertIn("RemainAfterExit=yes\n", auth_init)
+        self.assertIn("Requires=sentinel-auth-init.service\n", target)
+        before = next(line for line in auth_init.splitlines() if line.startswith("Before="))
+        before_units = set(before.removeprefix("Before=").split())
+        self.assertEqual(before_units, set(consumers))
+        for name, source in consumers.items():
+            self.assertIn("sentinel-auth-init.service", next(
+                line for line in source.splitlines() if line.startswith("Requires=")
+            ))
+            self.assertIn("sentinel-auth-init.service", next(
+                line for line in source.splitlines() if line.startswith("After=")
+            ))
+            self.assertNotIn("ExecStartPre=/opt/sentinel/scripts/init-dashboard-auth.sh", source)
+            self.assertIn(name, before_units)
+
+    def test_auth_init_is_in_every_release_and_activation_authority(self) -> None:
+        expected_source = "deploy/systemd/sentinel-auth-init.service"
+        expected_target = "/etc/systemd/system/sentinel-auth-init.service"
+        for path in (MANIFEST_GENERATOR, PROVISIONER, M0_PREFLIGHT):
+            source = path.read_text(encoding="utf-8")
+            self.assertIn(expected_source, source, path)
+            self.assertIn(expected_target, source, path)
+        provisioner = PROVISIONER.read_text(encoding="utf-8")
+        activation = ACTIVATION.read_text(encoding="utf-8")
+        self.assertIn('"sentinel-auth-init.service",', provisioner)
+        self.assertIn('AUTH_INIT = "sentinel-auth-init.service"', activation)
+        self.assertIn("ALL_UNITS = (AUTH_INIT, *TOPOLOGY, TARGET)", activation)
+        self.assertIn("*tuple(reversed(TOPOLOGY)), AUTH_INIT", activation)
 
     def test_productive_operator_consumers_use_file_references_only(self) -> None:
         gateway_main = GATEWAY_MAIN.read_text(encoding="utf-8")
