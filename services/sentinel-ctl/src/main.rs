@@ -251,7 +251,7 @@ fn read_operator_credential_with_hook(
     } = open_operator_credential(path, expected_owner, expected_group)?;
     after_open()?;
     let mut bytes = Vec::with_capacity(before.size as usize);
-    file.by_ref()
+    std::io::Read::by_ref(&mut file)
         .take(CREDENTIAL_MAX_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("read operator credential: {error}"))?;
@@ -452,7 +452,7 @@ struct Call {
     risk: Risk,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Method {
     Get,
     Post,
@@ -859,7 +859,6 @@ fn fail(cli: &Cli, msg: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Mutex, OnceLock};
