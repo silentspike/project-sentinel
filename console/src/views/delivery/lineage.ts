@@ -1,6 +1,21 @@
 export type DeliveryStage =
+  | "customer_request"
+  | "agreement"
+  | "project"
+  | "work_item"
+  | "participant"
+  | "decision"
+  | "handoff"
+  | "blocker"
   | "candidate"
   | "qa"
+  | "workbench"
+  | "artifact"
+  | "review"
+  | "test"
+  | "finding"
+  | "approval"
+  | "manifest"
   | "release"
   | "delivery"
   | "acceptance"
@@ -15,7 +30,8 @@ export interface DeliveryLineageNode {
   digest: string;
   generation: number;
   actorRole: string;
-  costUsd?: number;
+  costMinor?: string;
+  currency?: string;
 }
 
 export interface DeliveryLineageEdge {
@@ -24,7 +40,7 @@ export interface DeliveryLineageEdge {
 }
 
 /**
- * Public DTO for the isolated #696 scaffold.
+ * Public DTO for the authenticated #696 lineage surface.
  *
  * The future authenticated server adapter must construct this DTO after
  * tenant authorization and redaction. Raw aggregate snapshots, tenant IDs,
@@ -40,7 +56,8 @@ export interface PublicDeliveryLineageDto {
   edges: DeliveryLineageEdge[];
   blockers: string[];
   adapterReady: boolean;
-  readAt: string;
+  authorityGeneration: number;
+  readAtMs: number;
 }
 
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -56,6 +73,14 @@ export function validateLineage(snapshot: PublicDeliveryLineageDto): string[] {
   if (!Number.isSafeInteger(snapshot.revision) || snapshot.revision < 0) {
     failures.push("invalid revision");
   }
+  if (
+    !Number.isSafeInteger(snapshot.authorityGeneration) ||
+    snapshot.authorityGeneration < 1 ||
+    !Number.isSafeInteger(snapshot.readAtMs) ||
+    snapshot.readAtMs < 0
+  ) {
+    failures.push("invalid authority or read generation");
+  }
 
   const ids = new Set<string>();
   for (const node of snapshot.nodes) {
@@ -66,7 +91,11 @@ export function validateLineage(snapshot: PublicDeliveryLineageDto): string[] {
       failures.push(`invalid generation: ${node.id}`);
     }
     if (!node.actorRole) failures.push(`missing authority role: ${node.id}`);
-    if (node.costUsd !== undefined && (!Number.isFinite(node.costUsd) || node.costUsd < 0)) {
+    if (node.costMinor !== undefined) {
+      if (!/^(?:0|[1-9][0-9]*)$/.test(node.costMinor) || node.currency !== "USD") {
+        failures.push(`invalid cost: ${node.id}`);
+      }
+    } else if (node.currency !== undefined) {
       failures.push(`invalid cost: ${node.id}`);
     }
   }
@@ -86,6 +115,125 @@ export function validateLineage(snapshot: PublicDeliveryLineageDto): string[] {
   return failures;
 }
 
+export function parsePublicDeliveryLineageDto(value: unknown): PublicDeliveryLineageDto {
+  const root = exactObject(value, [
+    "schemaVersion",
+    "serverRedacted",
+    "projectLabel",
+    "revision",
+    "nodes",
+    "edges",
+    "blockers",
+    "adapterReady",
+    "authorityGeneration",
+    "readAtMs",
+  ]);
+  if (root.serverRedacted !== true) {
+    throw new Error("delivery lineage is not server-redacted");
+  }
+  if (typeof root.adapterReady !== "boolean") {
+    throw new Error("adapterReady is not a boolean");
+  }
+  const nodes = arrayValue(root.nodes, "nodes").map((entry) => {
+    const node = exactObject(
+      entry,
+      ["id", "stage", "label", "state", "digest", "generation", "actorRole"],
+      ["costMinor", "currency"],
+    );
+    return {
+      id: stringValue(node.id, "node.id"),
+      stage: stageValue(node.stage),
+      label: stringValue(node.label, "node.label"),
+      state: stringValue(node.state, "node.state"),
+      digest: stringValue(node.digest, "node.digest"),
+      generation: numberValue(node.generation, "node.generation"),
+      actorRole: stringValue(node.actorRole, "node.actorRole"),
+      ...(node.costMinor === undefined
+        ? {}
+        : { costMinor: stringValue(node.costMinor, "node.costMinor") }),
+      ...(node.currency === undefined
+        ? {}
+        : { currency: stringValue(node.currency, "node.currency") }),
+    };
+  });
+  const edges = arrayValue(root.edges, "edges").map((entry) => {
+    const edge = exactObject(entry, ["from", "to"]);
+    return {
+      from: stringValue(edge.from, "edge.from"),
+      to: stringValue(edge.to, "edge.to"),
+    };
+  });
+  const snapshot: PublicDeliveryLineageDto = {
+    schemaVersion: numberValue(root.schemaVersion, "schemaVersion") as 1,
+    serverRedacted: true,
+    projectLabel: stringValue(root.projectLabel, "projectLabel"),
+    revision: numberValue(root.revision, "revision"),
+    nodes,
+    edges,
+    blockers: arrayValue(root.blockers, "blockers").map((entry) =>
+      stringValue(entry, "blocker"),
+    ),
+    adapterReady: root.adapterReady,
+    authorityGeneration: numberValue(root.authorityGeneration, "authorityGeneration"),
+    readAtMs: numberValue(root.readAtMs, "readAtMs"),
+  };
+  const failures = validateLineage(snapshot);
+  if (failures.length > 0) throw new Error(`invalid delivery lineage: ${failures.join("; ")}`);
+  return snapshot;
+}
+
 export function shortDigest(value: string): string {
   return SHA256.test(value) ? `${value.slice(0, 10)}...${value.slice(-6)}` : "invalid";
+}
+
+export function formatMinorUnits(value: string, currency: string): string {
+  if (!/^(?:0|[1-9][0-9]*)$/.test(value) || currency !== "USD") return "Cost invalid";
+  const minor = BigInt(value);
+  const major = minor / 100n;
+  const cents = (minor % 100n).toString().padStart(2, "0");
+  return `${currency} ${major}.${cents}`;
+}
+
+function exactObject(
+  value: unknown,
+  required: string[],
+  optional: string[] = [],
+): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("delivery lineage record is not an object");
+  }
+  const object = value as Record<string, unknown>;
+  const allowed = new Set([...required, ...optional]);
+  if (required.some((key) => !(key in object)) || Object.keys(object).some((key) => !allowed.has(key))) {
+    throw new Error("delivery lineage record has missing or unknown fields");
+  }
+  return object;
+}
+
+function arrayValue(value: unknown, field: string): unknown[] {
+  if (!Array.isArray(value)) throw new Error(`${field} is not an array`);
+  return value;
+}
+
+function stringValue(value: unknown, field: string): string {
+  if (typeof value !== "string") throw new Error(`${field} is not a string`);
+  return value;
+}
+
+function numberValue(value: unknown, field: string): number {
+  if (typeof value !== "number") throw new Error(`${field} is not a number`);
+  return value;
+}
+
+function stageValue(value: unknown): DeliveryStage {
+  const supported: DeliveryStage[] = [
+    "customer_request", "agreement", "project", "work_item", "participant",
+    "decision", "handoff", "blocker", "candidate", "qa", "workbench",
+    "artifact", "review", "test", "finding", "approval", "manifest",
+    "release", "delivery", "acceptance", "closeout", "rollback",
+  ];
+  if (typeof value !== "string" || !supported.includes(value as DeliveryStage)) {
+    throw new Error("node.stage is unsupported");
+  }
+  return value as DeliveryStage;
 }

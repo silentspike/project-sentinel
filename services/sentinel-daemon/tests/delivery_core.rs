@@ -23,11 +23,7 @@ fn reference(id: &str, generation: u64) -> VersionedRefV1 {
 }
 
 fn versioned_release(release: &ReleaseV1) -> VersionedRefV1 {
-    VersionedRefV1 {
-        id: release.release_id.clone(),
-        generation: release.generation,
-        digest: ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, release).unwrap(),
-    }
+    canonical_release_reference(release).unwrap()
 }
 
 fn principal(id: &str, role: AuthorityRole) -> PrincipalV1 {
@@ -2856,7 +2852,7 @@ fn exact_gate_manifest_delivery_and_explicit_customer_acceptance_form_one_lineag
     let release_ref = VersionedRefV1 {
         id: active.release_id.clone(),
         generation: active.generation,
-        digest: ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, &active).unwrap(),
+        digest: canonical_release_reference_digest(&active).unwrap(),
     };
     let delivery = DeliveryReceiptV1 {
         schema_version: DELIVERY_SCHEMA_V1,
@@ -3152,12 +3148,12 @@ fn rollback_local_adoption_is_idempotent_after_successful_commit() {
         from_release: VersionedRefV1 {
             id: failed.release_id.clone(),
             generation: failed.generation,
-            digest: ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, &failed).unwrap(),
+            digest: canonical_release_reference_digest(&failed).unwrap(),
         },
         to_release: VersionedRefV1 {
             id: previous.release_id.clone(),
             generation: previous.generation,
-            digest: ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, &previous).unwrap(),
+            digest: canonical_release_reference_digest(&previous).unwrap(),
         },
         actor: command.principal.clone(),
         reason_digest: digest("rollback-reason"),

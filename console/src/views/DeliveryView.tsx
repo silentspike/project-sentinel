@@ -1,5 +1,7 @@
-import { For, Show, type JSX } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
+import { fetchPublicDeliveryLineage } from "./delivery/api";
 import {
+  formatMinorUnits,
   shortDigest,
   validateLineage,
   type PublicDeliveryLineageDto,
@@ -7,11 +9,27 @@ import {
 
 export interface DeliveryViewProps {
   snapshot?: PublicDeliveryLineageDto;
+  load?: (signal: AbortSignal) => Promise<PublicDeliveryLineageDto>;
 }
 
 const STAGE_LABELS: Record<string, string> = {
+  customer_request: "Customer request",
+  agreement: "Agreement",
+  project: "Project",
+  work_item: "Work item",
+  participant: "Participant",
+  decision: "Decision",
+  handoff: "Handoff",
+  blocker: "Blocker",
   candidate: "Candidate",
   qa: "Independent QA",
+  workbench: "Workbench",
+  artifact: "Artifact",
+  review: "Review",
+  test: "Test",
+  finding: "Finding",
+  approval: "Approval",
+  manifest: "Manifest",
   release: "Release",
   delivery: "Customer delivery",
   acceptance: "Acceptance",
@@ -20,8 +38,23 @@ const STAGE_LABELS: Record<string, string> = {
 };
 
 export function DeliveryView(props: DeliveryViewProps): JSX.Element {
-  const snapshot = () => (props.snapshot?.adapterReady ? props.snapshot : undefined);
+  const [loaded, setLoaded] = createSignal<PublicDeliveryLineageDto | undefined>(props.snapshot);
+  const [loading, setLoading] = createSignal(props.snapshot === undefined);
+  const snapshot = () => {
+    const value = props.snapshot ?? loaded();
+    return value?.adapterReady ? value : undefined;
+  };
   const failures = () => (snapshot() ? validateLineage(snapshot()!) : []);
+  const controller = new AbortController();
+
+  onMount(() => {
+    if (props.snapshot) return;
+    void (props.load ?? fetchPublicDeliveryLineage)(controller.signal)
+      .then((value) => setLoaded(value))
+      .catch(() => setLoaded(undefined))
+      .finally(() => setLoading(false));
+  });
+  onCleanup(() => controller.abort());
 
   return (
     <div
@@ -38,7 +71,11 @@ export function DeliveryView(props: DeliveryViewProps): JSX.Element {
             </p>
           </div>
           <span data-testid="delivery-adapter-state" class="muted">
-            {snapshot()?.adapterReady ? "Adapter ready" : "Integration gated"}
+            {snapshot()?.adapterReady
+              ? "Adapter ready"
+              : loading()
+                ? "Loading"
+                : "Integration gated"}
           </span>
         </div>
       </header>
@@ -98,7 +135,9 @@ export function DeliveryView(props: DeliveryViewProps): JSX.Element {
                         g{node.generation} {shortDigest(node.digest)}
                       </code>
                       <span data-testid="delivery-cost">
-                        {node.costUsd === undefined ? "Cost n/a" : `$${node.costUsd.toFixed(2)}`}
+                        {node.costMinor === undefined || node.currency === undefined
+                          ? "Cost n/a"
+                          : formatMinorUnits(node.costMinor, node.currency)}
                       </span>
                     </article>
                   )}

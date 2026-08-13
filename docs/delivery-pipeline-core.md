@@ -2,10 +2,11 @@
 
 Issue: #696
 
-Status: dependency-independent core. Productive adapters, authenticated APIs,
-single-node deployment, browser acceptance, memory publication, and live
-benchmarks remain gated on the explicitly named dependencies and later ORC
-authorization.
+Status: dependency-independent core with a configured local store and reachable
+authenticated Console surface. The server HTTP handler, productive authority,
+effect, workbench, and publication adapters, single-node deployment, browser
+acceptance, memory publication, and live benchmarks remain gated on the
+explicitly named dependencies and later ORC authorization.
 
 ## 1. Purpose and authority boundary
 
@@ -41,10 +42,21 @@ API ownership surfaces.
   and rollback plan exist.
 
 The daemon library remains startable when productive integration is absent.
-There is no productive `DeliveryCore` constructor or runtime wiring in this
-phase. `UnavailableDeliveryIntegration` and `UnavailableDeliveryEffects` report
-typed unavailability and reject authority- or effect-dependent commands before
-local state adoption. The test-only store can still start and report health.
+`DeliveryStoreConfigV1` opens the local redb authority only beneath an approved,
+canonical, owner-only data root; `ConfiguredDeliveryCore` receives integration,
+workbench, effect, and publication ports explicitly. Its full readiness and
+public lineage read remain typed unavailable unless every narrow current M0
+port has the exact version, generation, and contract digest. Construction alone
+does not claim productive readiness. The productive composition exposes no raw
+core accessor or public port-bypass constructor: command-specific configured
+methods check exactly the authorities their operation needs. A local commit may
+queue its durable outbox while the broker is unavailable, but cannot bypass its
+workflow, workbench, or effect authority. The three unavailable adapters preserve
+normal daemon startup while failing dependent calls closed.
+
+The #696 changelog entry remains deferred until the overlapping #694
+`CHANGELOG.md` delta is merged; this correction deliberately does not edit that
+shared file.
 
 ## 3. Canonical data contract
 
@@ -55,6 +67,10 @@ Persisted and wire structs reject unknown fields; lifecycle outcomes,
 case/model/flake classifications, findings, and authority roles are closed
 enums. Golden vectors prove that record or schema substitution changes the
 digest. Digest fields are cleared before a record computes its own digest.
+Direct M0 writes accept only canonical USD minor-unit ledger references. An
+unsupported currency, malformed ledger ID, zero generation/digest, or
+candidate/manifest cost mismatch is rejected before revision, journal,
+idempotency, or outbox mutation.
 
 The core defines the following record families:
 
@@ -73,7 +89,7 @@ The core defines the following record families:
 | `QaFlakeRecordV1` | append-only attempt refs, deterministic/model split, disposition authority and expiry |
 | `QaReleaseGateReceiptV1` | exact plan/candidate/evidence set, evaluator authority, policy, validity and future manifest input digest |
 | `ReleaseManifestV1` | agreement, project, work items, exact candidate, artifacts, QA gate, source/toolchain/runtime, release actor, cost and rollback reference |
-| `ReleaseV1` | immutable manifest reference and release lifecycle |
+| `ReleaseV1` | immutable manifest plus first rollout receipt, stable release-reference digest, and mutable lifecycle state |
 | `DeliveryReceiptV1` | exact release/customer plus server-issued `DELIVERY_PREVIEW_TTL_POLICY_V1`, strictly positive TTL capped at 15 minutes, expiry and receipt digest |
 | `CustomerFeedbackV1` | authenticated customer action, exact delivery and linked rework items |
 | `AcceptanceV1` | explicit customer, delivery and release binding |
@@ -135,7 +151,11 @@ Superseded -> Active
 Only one release ID is active in an aggregate. The test fixture adopts promotion
 or rollback state in one local CAS commit after a separately durable effect-saga
 receipt exists. The external effect and local adoption are never described as
-one atomic transaction.
+one atomic transaction. Delivery, acceptance, rollback, and closeout bind one
+canonical release-reference digest over the immutable release identity,
+manifest, and first rollout receipt. Mutable state and timestamps are excluded,
+so `Active -> RolledBack -> Active` preserves historical references while a
+hypothetical full-record state digest or manifest/receipt substitution fails.
 
 ### 4.4 Delivery and customer action
 
@@ -173,12 +193,20 @@ cross-tenant replay. The test record repeats all four namespace components;
 lookup, duplicate adoption, and `health()` require the table key to equal those
 fields exactly, so key-only authority tampering fails closed.
 
-## 6. Test persistence and productive append/publication boundary
+## 6. Local persistence and productive publication boundary
 
-`DeliveryStore::open_test_only` is a deterministic redb fixture, not a
-productive trajectory, event, or publication authority. It proves the core's
-restart, CAS, idempotency, envelope, and receipt contracts without competing
-with #732 or #733. It uses five tables:
+`DeliveryStore::open` is the configured local #696 aggregate, idempotency,
+journal, and outbox authority. It requires an approved canonical data root,
+rejects symlink components and root escape, and descriptor-pins both root and
+database using `openat`, `NOFOLLOW`, and `CLOEXEC`. The root must belong to the
+effective daemon UID with exactly mode `0700`; the database must be the same regular
+file before and after redb open, belong to that UID, have exactly mode `0600`, and have
+exactly one hard link. Device/inode readback detects root or path replacement,
+and redb receives a clone of the already pinned file descriptor through its
+file-backed builder rather than performing a second untrusted path lookup.
+`open_test_only` retains the
+same deterministic redb semantics for existing core fixtures. Both use five
+tables:
 
 | Table | Key and purpose |
 | --- | --- |
@@ -188,17 +216,20 @@ with #732 or #733. It uses five tables:
 | `delivery_idempotency` | `tenant:principal:command:key` request/receipt binding |
 | `delivery_outbox` | event-digest keyed canonical publication request and receipt |
 
-One fixture write transaction checks the expected aggregate revision and writes
-the aggregate, journal entry, idempotency record, and outbox row. A duplicate
+One local write transaction recomputes sealed-record digests, checks exact
+generation/digest cross-record references and cost consistency, and checks the
+expected aggregate revision, then writes the aggregate, journal entry,
+idempotency record, and outbox row. A duplicate
 request with the same command digest receives the original operation receipt
 with `duplicate=true`; different content under the same
 tenant/principal/command/key namespace is a typed conflict.
 
-Productive construction stays unavailable until #732 supplies the canonical
-aggregate/expected-revision append adapter and #733 supplies the canonical
-publication-state adapter. The two narrow traits are separate even though the
-test fixture implements both. This PR makes no productive CQRS, journal, outbox,
-or event-store claim.
+This narrow local ownership is sufficient for the original #696 M0 journey and
+does not claim the broad #732/#733 CQRS program. Publication into the application
+event chain remains a separately injected adapter. Its stable idempotency key is
+the exact `(operation_id, request_digest)`; replay after publisher success and a
+caller crash must return the identical receipt/effective event. The contract
+does not claim exactly-once transport.
 
 The outbox uses a stable namespaced operation ID:
 
@@ -229,12 +260,30 @@ to #732/#733.
 - readiness with exact contract version, authority generation, and immutable
   contract digest;
 - opaque principal/role current-authority validation;
-- a read-only workflow authority/currentness snapshot; and
+- a read-only candidate authority/currentness snapshot;
+- a server-redacted, digest-bound workflow-lineage snapshot; and
 - execution of one stable QA workbench evidence request.
 
 The authority snapshot binds agreement, project, work-item digest, current
 candidate generation/digest, participant principals, and snapshot digest.
 Promotion resolves it again so a stale candidate cannot pass on old evidence.
+
+The separate lineage query binds tenant, exact project and candidate
+generation/digest, authority generation, authority identity, and its own sealed
+query digest. The #695 response repeats every binding and adds an immutable
+snapshot generation/digest plus a closed inventory for customer request,
+agreement, project/work items, participants/roles, decisions, handoffs, and
+blocker status. Exactly one request, agreement, and project form the mandatory
+request-to-agreement-to-project chain. Unique edges, the closed per-kind state
+matrix, an acyclic graph, full request reachability, and project ancestry for
+every dynamic node are required. Omitted edges/classes, duplicate roots/edges,
+cycles, disconnected nodes, illegal states, digest substitution,
+arbitrary/private labels, and stale authority fail closed. Authority receipt,
+candidate-authority, query, and workflow generations converge before the
+adapter call; principal and candidate authority are read again afterward and
+must be identity-, generation-, digest-, and aggregate-revision-equal before a
+DTO byte is accepted. The adapter remains deferred, but the versioned input now
+exists and cannot be fabricated from the local delivery aggregate.
 
 The QA request is called outside any writer transaction. It binds tenant,
 project, exact candidate, plan, run ID and generation, assigned QA principal and
@@ -376,18 +425,38 @@ This core stores and validates the imported graph and legal pass/fail/harness
 gate matrices, but intentionally does not implement a productive runner,
 provider, sandbox, retention job, or #709/#710 effect engine.
 
-## 10. Console lineage scaffold
+## 10. Console lineage surface
 
-`DeliveryView` is an isolated, unreachable scaffold. It is not a product Console
-surface, is not wired into `App`, and has no API/projection adapter. Therefore
-this phase makes no AC-9 product, authentication, authorization, or browser
-security claim.
+`DeliveryView` is reachable from the authenticated `App` product navigation. It
+fetches only the strict, server-redacted `PublicDeliveryLineageDtoV1` contract
+from the declared same-origin endpoint with session credentials. The client
+accepts exactly `application/json` with optional parameters, applies one short
+internal deadline combined with caller cancellation across fetch and streamed
+body reads, enforces a hard streamed 256 KiB limit, and cancels overflow or
+timeout. It also enforces exact fields and types, digest/generation/reference
+shape, USD minor-unit semantics, and public-text redaction before rendering;
+`application/jsonp` is rejected. It shows a generic typed unavailable state and
+never renders raw server errors.
 
-It accepts only a narrow `PublicDeliveryLineageDto` whose type deliberately has
-no tenant ID, prompts, credentials, private artifacts, or infrastructure fields.
-The future authenticated server adapter must enforce tenant authorization and
-redact before sending this DTO; browser code is not a redaction boundary.
-Defense-in-depth validation rejects:
+The server DTO combines that exact external workflow snapshot with local
+candidate/artifact, QA plan/run/workbench/result/gate, review/test/finding/
+approval, manifest, release, delivery, acceptance, rollback, and closeout
+evidence. Every source key is replaced by a response-local sequence ID; only
+generic class labels, closed state/role values, generation, digest, and the
+explicit USD amount survive. Missing required local endpoints or self/cross-
+digest mismatches return `CorruptStore` rather than a partial graph.
+The validated workflow Project node links to every retained candidate, not only
+the current query candidate, so earlier/rework candidate subgraphs remain
+reachable without exposing their private identifiers.
+
+Response-local node IDs are canonical sequence numbers and the project label is
+generic; neither is a truncated hash of tenant, project, record, principal,
+artifact, or infrastructure authority. Required public evidence digests remain
+visible. The server DTO builder requires fresh authority and full configured
+composition readiness. The actual HTTP handler and productive #694/#695
+adapters are not in this owned scope and therefore remain absent: the reachable
+surface correctly renders unavailable until that later seam is wired.
+Defense-in-depth client validation rejects:
 
 - schema version;
 - a missing server-redacted marker and invalid revision shape;
@@ -395,17 +464,18 @@ Defense-in-depth validation rejects:
 - valid SHA-256 digests;
 - positive generations;
 - non-empty actor roles; and
-- finite non-negative costs when present; and
+- non-USD or malformed minor-unit costs;
 - non-dangling lineage edges;
 - credential-shaped text, internal addresses, and local paths.
 
 ## 11. Recovery, backup, and retention
 
-The #722 whole-product contract applies to the future productive #732/#733
-authority, not to the test-only redb fixture. Its canonical aggregate, journal,
+The #722 whole-product contract applies to the configured local delivery store
+and its injected publication frontier. Its canonical aggregate, journal,
 idempotency records, outbox frontier, published receipts, QA evidence
 generations, manifests, releases, deliveries, acceptances, rollback history, and
-closeouts form one recovery participant.
+closeouts form one recovery participant. Broad recovery implementation remains
+owned by #722 and is not pulled into this M0 slice.
 
 Before productive activation, recovery integration must:
 
@@ -436,10 +506,10 @@ rollback, closeout, unpublished outbox row, or recovery frontier.
 | AC-6 customer flow | Core records/transitions implemented; authenticated API/browser and productive delivery effect deferred |
 | AC-7 rework history | Governed-rework request/receipt saga implemented with fake; productive #695 effect deferred |
 | AC-8 rollback | Exact source+target receipt, stable operation, revision-conflict reconciliation and restart-safe local adoption tested with a durable fake; productive #710 rollout/rollback effect deferred |
-| AC-9 Console lineage | Isolated public-DTO scaffold only; product/API/live criterion OPEN |
+| AC-9 Console lineage | Authenticated App navigation, strict fetch/parser and unavailable-safe public DTO surface implemented; server handler, productive adapters and live criterion OPEN |
 | AC-10 memory closeout | Receipt-gated saga and restart readback tested with fake; productive memory path deferred |
 | AC-11 Gaia oversight | No bypass surface added; productive observation deferred |
-| AC-12 restart/idempotency | Test-only store, QA outcome reconciliation, outbox, effect revision-conflict retry, rollback and closeout boundaries covered; productive adapter crash matrix deferred |
+| AC-12 restart/idempotency | Configured local store, QA outcome reconciliation, replay-idempotent publisher receipt, outbox, effect revision-conflict retry, rollback and closeout boundaries covered; productive adapter crash matrix deferred |
 | AC-13 `.240` journey | Not authorized in this phase |
 | AC-14 canonical QA schemas | Plan, dataset, run, case, deterministic, flake and gate core are versioned and strictly validated; PARTIAL because model/calibration authority and the productive import lane remain #749/dependency deferred |
 | AC-15 deterministic/probabilistic split | Deterministic bindings are implemented; populated model/grader evidence is typed unavailable and model/calibration activation remains #749-deferred |
@@ -462,10 +532,11 @@ effect, retention, and recovery integrations.
 1. Merge the productive #694 workbench dispatcher and its opaque,
    request-deduplicated evidence receipt.
 2. Merge the #695 workflow authority and linked-work-item/currentness adapter.
-3. Add an authenticated API and existing CQRS publication adapter in their
-   owners' scopes.
+3. Wire the declared authenticated lineage HTTP handler and application-event
+   publication adapter in their owners' scopes.
 4. Add the delivery store to the approved #722 recovery participant set.
-5. Wire the Console component to the public-safe projection.
+5. Validate the already reachable Console component against the productive
+   public-safe projection.
 6. Re-run canonical Rust and Console gates on final main.
 7. Obtain ORC code approval and an explicit `.240` runtime authorization.
 8. Create and verify the issue-specific snapshot before deployment.

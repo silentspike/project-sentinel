@@ -8,10 +8,11 @@ use super::{
     error::DeliveryError,
     ports::{
         expected_effect_saga_contract_digest, expected_integration_contract_digest,
-        expected_workbench_execution_saga_contract_digest, AdapterReadiness, AuthorityReceiptV1,
-        AuthorityValidationRequestV1, CandidateAuthorityQueryV1, DeliveryEffectKind,
-        DeliveryEffectPort, DeliveryEffectRequestV1, DeliveryIntegrationPort,
-        DeliveryPublicationPort, WorkbenchEvidenceReceiptV1, WorkbenchEvidenceRequestV1,
+        expected_publication_contract_digest, expected_workbench_execution_saga_contract_digest,
+        AdapterReadiness, AuthorityReceiptV1, AuthorityValidationRequestV1,
+        CandidateAuthorityQueryV1, DeliveryEffectKind, DeliveryEffectPort, DeliveryEffectRequestV1,
+        DeliveryIntegrationPort, DeliveryPublicationPort, WorkbenchEvidenceReceiptV1,
+        WorkbenchEvidenceRequestV1, WorkflowLineageQueryV1,
     },
     schema::{
         AcceptanceV1, ApprovalV1, AuthorityRole, CandidateState, CustomerAction,
@@ -29,8 +30,9 @@ use super::{
     },
     store::{
         DeliveryAggregateStorePort, DeliveryCommitReceiptV1, DeliveryCommitRequestV1,
-        DeliveryPublicationStatePort, DeliveryStore,
+        DeliveryPublicationStatePort, DeliveryStore, DeliveryStoreConfigV1,
     },
+    canonical_release_reference, canonical_release_reference_digest, PublicDeliveryLineageDtoV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,23 +67,34 @@ pub struct DeliveryCore<I, S = DeliveryStore, E = super::ports::UnavailableDeliv
     effects: E,
 }
 
+/// Product-shaped composition with every external authority injected.
+///
+/// Construction opens and verifies the local durable store but deliberately
+/// succeeds with unavailable external ports so the daemon can start before
+/// #694/#695 integration. `readiness` and every dependent command remain
+/// fail-closed until the exact versioned contracts are ready.
+pub struct ConfiguredDeliveryCore<I, E, P> {
+    core: DeliveryCore<I, DeliveryStore, E>,
+    publication: P,
+}
+
 impl<I, S, E> DeliveryCore<I, S, E>
 where
     I: DeliveryIntegrationPort,
     S: DeliveryAggregateStorePort + DeliveryPublicationStatePort,
     E: DeliveryEffectPort,
 {
-    /// Deterministic constructor for the dependency-independent core.
-    ///
-    /// Productive construction remains unavailable until #732 and #733 provide
-    /// the canonical trajectory and publication adapters.
-    #[doc(hidden)]
-    pub fn new_test_only(store: S, integration: I, effects: E) -> Self {
+    fn with_ports(store: S, integration: I, effects: E) -> Self {
         Self {
             store,
             integration,
             effects,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn new_test_only(store: S, integration: I, effects: E) -> Self {
+        Self::with_ports(store, integration, effects)
     }
 
     pub fn command_readiness(&self, command: DeliveryCommandV1) -> Result<(), DeliveryError> {
@@ -112,6 +125,107 @@ where
         self.store.load(tenant_id, project_id)
     }
 
+    fn read_public_lineage_authorized(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Result<PublicDeliveryLineageDtoV1, DeliveryError> {
+        let role = lineage_role(&context.principal).ok_or_else(|| {
+            DeliveryError::AuthorityDenied(
+                "principal has no public delivery-lineage reader role".to_string(),
+            )
+        })?;
+        let authority = self.require_current_authority(
+            context,
+            tenant_id,
+            role.clone(),
+            "read_public_delivery_lineage",
+        )?;
+        let aggregate = self.required_aggregate(tenant_id, project_id)?;
+        if role == AuthorityRole::Customer
+            && !aggregate.deliveries.values().any(|delivery| {
+                delivery.customer_principal_id == context.principal.principal_id
+            })
+        {
+            return Err(DeliveryError::AuthorityDenied(
+                "customer has no delivery in the requested project".to_string(),
+            ));
+        }
+        let candidate = aggregate
+            .candidates
+            .values()
+            .max_by(|left, right| {
+                left.generation
+                    .cmp(&right.generation)
+                    .then_with(|| left.candidate_id.cmp(&right.candidate_id))
+            })
+            .ok_or_else(|| DeliveryError::MissingEvidence("release candidate".to_string()))?;
+        let candidate_query = CandidateAuthorityQueryV1 {
+            tenant_id: tenant_id.to_string(),
+            agreement: candidate.agreement.clone(),
+            project: candidate.project.clone(),
+            work_items_digest: candidate.work_items_digest.clone(),
+            candidate_digest: candidate.candidate_digest.clone(),
+        };
+        let candidate_authority = self.integration.candidate_authority(&candidate_query)?;
+        if candidate_authority.schema_version != DELIVERY_SCHEMA_V1
+            || candidate_authority.authority_generation == 0
+            || candidate_authority.authority_generation
+                != authority.contract_authority_generation
+            || candidate_authority.agreement != candidate.agreement
+            || candidate_authority.project != candidate.project
+            || candidate_authority.work_items_digest != candidate.work_items_digest
+            || candidate_authority.current_candidate_generation != candidate.generation
+            || candidate_authority.current_candidate_digest != candidate.candidate_digest
+            || candidate_authority.snapshot_digest != candidate_authority.computed_digest()?
+        {
+            return Err(DeliveryError::StaleEvidence(
+                "workflow authority does not match the lineage candidate".to_string(),
+            ));
+        }
+        let query = WorkflowLineageQueryV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            tenant_id: tenant_id.to_string(),
+            project: candidate.project.clone(),
+            candidate: VersionedRefV1 {
+                id: candidate.candidate_id.clone(),
+                generation: candidate.generation,
+                digest: candidate.candidate_digest.clone(),
+            },
+            authority_generation: candidate_authority.authority_generation,
+            authority_identity_digest: candidate_authority.snapshot_digest,
+            query_digest: ContentDigest::zero(),
+        }
+        .seal()?;
+        let workflow = self.integration.workflow_lineage(&query)?;
+        let authority_after = self.require_current_authority(
+            context,
+            tenant_id,
+            role,
+            "read_public_delivery_lineage",
+        )?;
+        let candidate_authority_after = self.integration.candidate_authority(&candidate_query)?;
+        let aggregate_after = self.required_aggregate(tenant_id, project_id)?;
+        if !same_authority_identity(&authority_after, &authority)
+            || authority_after.contract_authority_generation
+                != candidate_authority.authority_generation
+            || candidate_authority_after != candidate_authority
+            || aggregate_after.revision != aggregate.revision
+        {
+            return Err(DeliveryError::StaleEvidence(
+                "lineage authority changed during workflow snapshot read".to_string(),
+            ));
+        }
+        PublicDeliveryLineageDtoV1::from_authorized_aggregate(
+            &aggregate,
+            &query,
+            &workflow,
+            authority.contract_authority_generation,
+            context.now_ms,
+        )
+    }
+
     pub fn register_candidate(
         &self,
         context: &CommandContextV1,
@@ -125,6 +239,7 @@ where
         )?;
         validate_ref("candidate agreement", &candidate.agreement)?;
         validate_ref("candidate project", &candidate.project)?;
+        validate_cost_ref("candidate cost", &candidate.cost)?;
         self.require_current_authority(
             context,
             &candidate.tenant_id,
@@ -1126,6 +1241,7 @@ where
             release.generation,
         )?;
         validate_ref("release manifest", &release.manifest)?;
+        validate_cost_ref("release manifest cost", &manifest.cost)?;
         if manifest.tenant_id != tenant_id
             || manifest.project.id != project_id
             || manifest.created_at_ms > context.now_ms
@@ -1165,6 +1281,7 @@ where
             || manifest.candidate.id != candidate.candidate_id
             || manifest.candidate.generation != candidate.generation
             || manifest.candidate.digest != candidate.candidate_digest
+            || manifest.cost != candidate.cost
             || manifest.release_actor != release_authority.principal
         {
             return Err(DeliveryError::StaleEvidence(
@@ -1367,8 +1484,7 @@ where
             .ok_or_else(|| DeliveryError::NotFound(format!("release {}", receipt.release.id)))?;
         if release.state != ReleaseState::Active
             || release.generation != receipt.release.generation
-            || receipt.release.digest
-                != ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, release)?
+            || receipt.release.digest != canonical_release_reference_digest(release)?
         {
             return Err(DeliveryError::StaleEvidence(
                 "delivery is not bound to the active release".to_string(),
@@ -1651,10 +1767,8 @@ where
             .releases
             .get(&rollback.to_release.id)
             .ok_or_else(|| DeliveryError::NotFound("rollback target release".to_string()))?;
-        if ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, from_snapshot)?
-            != rollback.from_release.digest
-            || ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, to_snapshot)?
-                != rollback.to_release.digest
+        if canonical_release_reference_digest(from_snapshot)? != rollback.from_release.digest
+            || canonical_release_reference_digest(to_snapshot)? != rollback.to_release.digest
         {
             return Err(DeliveryError::StaleEvidence(
                 "rollback release digest mismatch".to_string(),
@@ -1706,8 +1820,7 @@ where
                 .releases
                 .get_mut(&rollback.from_release.id)
                 .ok_or_else(|| DeliveryError::NotFound("rollback source release".to_string()))?;
-            if ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, &*from)?
-                != rollback.from_release.digest
+            if canonical_release_reference_digest(&*from)? != rollback.from_release.digest
             {
                 return Err(DeliveryError::StaleEvidence(
                     "rollback source digest mismatch".to_string(),
@@ -1721,8 +1834,7 @@ where
                 .releases
                 .get_mut(&rollback.to_release.id)
                 .ok_or_else(|| DeliveryError::NotFound("rollback target release".to_string()))?;
-            if ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, &*to)?
-                != rollback.to_release.digest
+            if canonical_release_reference_digest(&*to)? != rollback.to_release.digest
             {
                 return Err(DeliveryError::StaleEvidence(
                     "rollback target digest mismatch".to_string(),
@@ -1730,7 +1842,11 @@ where
             }
             transition_release(to.state, ReleaseState::Active)?;
             to.state = ReleaseState::Active;
-            to.activated_at_ms = Some(context.now_ms);
+            if to.activated_at_ms.is_none() {
+                return Err(DeliveryError::CorruptStore(
+                    "reactivated release has no original activation timestamp".to_string(),
+                ));
+            }
         }
         aggregate.active_release_id = Some(rollback.to_release.id.clone());
         if aggregate
@@ -1819,7 +1935,7 @@ where
             .releases
             .get(&closeout.accepted_release.id)
             .ok_or_else(|| DeliveryError::MissingEvidence("accepted release".to_string()))?;
-        if closeout.accepted_release != versioned_release_ref(accepted_release)? {
+        if closeout.accepted_release != canonical_release_reference(accepted_release)? {
             return Err(DeliveryError::StaleEvidence(
                 "closeout release reference is stale or differently digested".to_string(),
             ));
@@ -2069,6 +2185,237 @@ where
     }
 }
 
+impl<I, E, P> ConfiguredDeliveryCore<I, E, P>
+where
+    I: DeliveryIntegrationPort,
+    E: DeliveryEffectPort,
+    P: DeliveryPublicationPort,
+{
+    pub fn open(
+        config: &DeliveryStoreConfigV1,
+        integration: I,
+        effects: E,
+        publication: P,
+    ) -> Result<Self, DeliveryError> {
+        let store = DeliveryStore::open(config)?;
+        Ok(Self {
+            core: DeliveryCore::with_ports(store, integration, effects),
+            publication,
+        })
+    }
+
+    pub fn readiness(&self) -> Result<(), DeliveryError> {
+        self.core.store.health()?;
+        self.core.require_integration()?;
+        self.core.require_execution_saga()?;
+        self.core.require_effect_saga()?;
+        require_saga_readiness(
+            self.publication.readiness(),
+            "delivery_publication",
+            &expected_publication_contract_digest(),
+        )
+    }
+
+    pub fn command_readiness(&self, command: DeliveryCommandV1) -> Result<(), DeliveryError> {
+        self.core.command_readiness(command)
+    }
+
+    /// Productive local commit. Publication readiness is deliberately not
+    /// required: the durable local outbox remains the safe hand-off boundary.
+    pub fn register_candidate(
+        &self,
+        context: &CommandContextV1,
+        candidate: ReleaseCandidateV1,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        self.core.command_readiness(DeliveryCommandV1::RegisterCandidate)?;
+        self.core.register_candidate(context, candidate)
+    }
+
+    pub fn assign_qa(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        candidate_id: &str,
+        plan: QaEvaluationPlanV1,
+        run: QaEvaluationRunReceiptV1,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        self.core.command_readiness(DeliveryCommandV1::AssignQa)?;
+        self.core
+            .assign_qa(context, tenant_id, project_id, candidate_id, plan, run)
+    }
+
+    pub fn transition_qa(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        run_id: &str,
+        next: QaRunState,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        self.core.command_readiness(DeliveryCommandV1::TransitionQa)?;
+        self.core
+            .transition_qa(context, tenant_id, project_id, run_id, next)
+    }
+
+    pub fn execute_qa(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        run_id: &str,
+    ) -> Result<(DeliveryCommitReceiptV1, WorkbenchEvidenceReceiptV1), DeliveryError> {
+        self.core.command_readiness(DeliveryCommandV1::ExecuteQa)?;
+        self.core.execute_qa(context, tenant_id, project_id, run_id)
+    }
+
+    pub fn import_evidence_graph(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        run_id: &str,
+        graph: QaEvidenceGraphV1,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        self.core
+            .command_readiness(DeliveryCommandV1::ImportEvidenceGraph)?;
+        self.core
+            .import_evidence_graph(context, tenant_id, project_id, run_id, graph)
+    }
+
+    pub fn record_gate(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        run_id: &str,
+        gate: QaReleaseGateReceiptV1,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        self.core.command_readiness(DeliveryCommandV1::RecordGate)?;
+        self.core
+            .record_gate(context, tenant_id, project_id, run_id, gate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_review_bundle(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        run_id: &str,
+        review: ReviewV1,
+        test_run: TestRunV1,
+        findings: Vec<FindingV1>,
+        approval: Option<ApprovalV1>,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        self.core
+            .command_readiness(DeliveryCommandV1::RecordReviewBundle)?;
+        self.core.record_review_bundle(
+            context, tenant_id, project_id, run_id, review, test_run, findings, approval,
+        )
+    }
+
+    pub fn promote(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        candidate_id: &str,
+        manifest: ReleaseManifestV1,
+        release: ReleaseV1,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        self.core.command_readiness(DeliveryCommandV1::Promote)?;
+        self.core
+            .promote(context, tenant_id, project_id, candidate_id, manifest, release)
+    }
+
+    pub fn issue_delivery(
+        &self,
+        context: &CommandContextV1,
+        project_id: &str,
+        receipt: DeliveryReceiptV1,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        self.core
+            .command_readiness(DeliveryCommandV1::IssueDelivery)?;
+        self.core.issue_delivery(context, project_id, receipt)
+    }
+
+    pub fn customer_action(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        feedback: CustomerFeedbackV1,
+        acceptance: Option<AcceptanceV1>,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        let command = match feedback.action {
+            CustomerAction::Accept => DeliveryCommandV1::CustomerAccept,
+            CustomerAction::Reject => DeliveryCommandV1::CustomerReject,
+            CustomerAction::RequestChanges => DeliveryCommandV1::CustomerRequestChanges,
+        };
+        self.core.command_readiness(command)?;
+        self.core
+            .customer_action(context, tenant_id, project_id, feedback, acceptance)
+    }
+
+    pub fn rollback(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        rollback: RollbackV1,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        self.core.command_readiness(DeliveryCommandV1::Rollback)?;
+        self.core.rollback(context, tenant_id, project_id, rollback)
+    }
+
+    pub fn closeout(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        closeout: ProjectCloseoutV1,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        self.core.command_readiness(DeliveryCommandV1::Closeout)?;
+        self.core.closeout(context, tenant_id, project_id, closeout)
+    }
+
+    pub fn health(&self) -> Result<(), DeliveryError> {
+        self.core.store.health()
+    }
+
+    pub fn pending_publication_count(&self) -> Result<usize, DeliveryError> {
+        Ok(self.core.store.pending_publications()?.len())
+    }
+
+    #[doc(hidden)]
+    pub fn pending_publications_test_only(
+        &self,
+    ) -> Result<Vec<super::store::DeliveryOutboxEntryV1>, DeliveryError> {
+        self.core.store.pending_publications()
+    }
+
+    pub fn read_public_lineage(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Result<PublicDeliveryLineageDtoV1, DeliveryError> {
+        self.readiness()?;
+        self.core
+            .read_public_lineage_authorized(context, tenant_id, project_id)
+    }
+
+    pub fn publish_pending(&self) -> Result<usize, DeliveryError> {
+        require_saga_readiness(
+            self.publication.readiness(),
+            "delivery_publication",
+            &expected_publication_contract_digest(),
+        )?;
+        self.core.publish_pending(&self.publication)
+    }
+}
+
 fn command_digest<T: Serialize>(
     context: &CommandContextV1,
     payload: &T,
@@ -2083,6 +2430,17 @@ fn command_digest<T: Serialize>(
             payload,
         ),
     )
+}
+
+fn lineage_role(principal: &PrincipalV1) -> Option<AuthorityRole> {
+    [
+        AuthorityRole::Auditor,
+        AuthorityRole::ReleaseManager,
+        AuthorityRole::Customer,
+        AuthorityRole::GaiaObserver,
+    ]
+    .into_iter()
+    .find(|role| principal.has_role(role.clone()))
 }
 
 fn require_tenant(context: &CommandContextV1, tenant_id: &str) -> Result<(), DeliveryError> {
@@ -2239,6 +2597,19 @@ fn validate_ref(name: &str, value: &VersionedRefV1) -> Result<(), DeliveryError>
     if !canonical_id(&value.id) || value.generation == 0 || value.digest == ContentDigest::zero() {
         return Err(DeliveryError::Validation(format!(
             "{name} is not a canonical versioned reference"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cost_ref(name: &str, value: &super::schema::CostRefV1) -> Result<(), DeliveryError> {
+    if !canonical_id(&value.ledger_id)
+        || value.generation == 0
+        || value.digest == ContentDigest::zero()
+        || value.currency != "USD"
+    {
+        return Err(DeliveryError::Validation(format!(
+            "{name} is not a canonical USD minor-unit ledger reference"
         )));
     }
     Ok(())
@@ -2647,14 +3018,6 @@ fn legal_flake_disposition(
                 | QaFlakeClassification::ProductDefect
         )
     )
-}
-
-fn versioned_release_ref(release: &ReleaseV1) -> Result<VersionedRefV1, DeliveryError> {
-    Ok(VersionedRefV1 {
-        id: release.release_id.clone(),
-        generation: release.generation,
-        digest: ContentDigest::of_domain("release", DELIVERY_SCHEMA_V1, release)?,
-    })
 }
 
 pub fn qa_source_evidence_digest(

@@ -43,6 +43,108 @@ pub struct CandidateAuthoritySnapshotV1 {
     pub snapshot_digest: ContentDigest,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowLineageKindV1 {
+    CustomerRequest,
+    Agreement,
+    Project,
+    WorkItem,
+    Participant,
+    Decision,
+    Handoff,
+    Blocker,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowLineageStateV1 {
+    Requested,
+    Active,
+    Completed,
+    Approved,
+    HandedOff,
+    Blocked,
+    Clear,
+}
+
+/// Internal, server-redacted workflow node supplied by the future #695 adapter.
+/// `node_ordinal` is used only to reconstruct topology and is remapped before
+/// the public DTO is returned. Arbitrary labels and source authority identifiers
+/// are not representable in this contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLineageNodeV1 {
+    pub node_ordinal: u32,
+    pub kind: WorkflowLineageKindV1,
+    pub state: WorkflowLineageStateV1,
+    pub generation: u64,
+    pub digest: ContentDigest,
+    pub participant_role: Option<AuthorityRole>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLineageEdgeV1 {
+    pub from_ordinal: u32,
+    pub to_ordinal: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLineageQueryV1 {
+    pub schema_version: u16,
+    pub tenant_id: String,
+    pub project: VersionedRefV1,
+    pub candidate: VersionedRefV1,
+    pub authority_generation: u64,
+    pub authority_identity_digest: ContentDigest,
+    pub query_digest: ContentDigest,
+}
+
+impl WorkflowLineageQueryV1 {
+    pub fn computed_digest(&self) -> Result<ContentDigest, DeliveryError> {
+        let mut unsigned = self.clone();
+        unsigned.query_digest = ContentDigest::zero();
+        ContentDigest::of_domain("workflow-lineage-query", DELIVERY_SCHEMA_V1, &unsigned)
+    }
+
+    pub fn seal(mut self) -> Result<Self, DeliveryError> {
+        self.query_digest = self.computed_digest()?;
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLineageSnapshotV1 {
+    pub schema_version: u16,
+    pub server_redacted: bool,
+    pub tenant_id: String,
+    pub project: VersionedRefV1,
+    pub candidate: VersionedRefV1,
+    pub authority_generation: u64,
+    pub authority_identity_digest: ContentDigest,
+    pub query_digest: ContentDigest,
+    pub snapshot_generation: u64,
+    pub nodes: Vec<WorkflowLineageNodeV1>,
+    pub edges: Vec<WorkflowLineageEdgeV1>,
+    pub snapshot_digest: ContentDigest,
+}
+
+impl WorkflowLineageSnapshotV1 {
+    pub fn computed_digest(&self) -> Result<ContentDigest, DeliveryError> {
+        let mut unsigned = self.clone();
+        unsigned.snapshot_digest = ContentDigest::zero();
+        ContentDigest::of_domain("workflow-lineage-snapshot", DELIVERY_SCHEMA_V1, &unsigned)
+    }
+
+    pub fn seal(mut self) -> Result<Self, DeliveryError> {
+        self.snapshot_digest = self.computed_digest()?;
+        Ok(self)
+    }
+}
+
 impl CandidateAuthoritySnapshotV1 {
     pub fn computed_digest(&self) -> Result<ContentDigest, DeliveryError> {
         let mut unsigned = self.clone();
@@ -237,6 +339,16 @@ pub trait DeliveryIntegrationPort: Send + Sync {
         query: &CandidateAuthorityQueryV1,
     ) -> Result<CandidateAuthoritySnapshotV1, DeliveryError>;
 
+    fn workflow_lineage(
+        &self,
+        _query: &WorkflowLineageQueryV1,
+    ) -> Result<WorkflowLineageSnapshotV1, DeliveryError> {
+        Err(DeliveryError::AdapterUnavailable {
+            dependency: "workflow_lineage",
+            reason: "productive #695 workflow lineage adapter is not provisioned".to_string(),
+        })
+    }
+
     fn authorize(
         &self,
         request: &AuthorityValidationRequestV1,
@@ -286,14 +398,39 @@ pub struct PublicationReceiptV1 {
     pub request_digest: ContentDigest,
 }
 
-/// Adapter into the canonical #733 publication chain. Productive durability and
-/// receipt authority belong to the injected store/publication adapters; the
-/// local redb implementation in this module's test harness is not an event SSOT.
+/// Adapter from the local durable #696 outbox into the application event chain.
+/// Receipt authority belongs to the injected publisher and is adopted only
+/// after exact request, aggregate, row, and payload-digest readback.
+/// `operation_id` plus `request_digest` is the stable idempotency key: after a
+/// successful publish every replay must return the identical receipt for the
+/// same effective event. This closes caller-crash reconciliation; it does not
+/// claim exactly-once transport.
 pub trait DeliveryPublicationPort: Send + Sync {
+    fn readiness(&self) -> AdapterReadiness {
+        AdapterReadiness::Unavailable {
+            reason: "productive delivery event publisher is not provisioned".to_string(),
+        }
+    }
+
     fn publish(
         &self,
         request: &PublicationRequestV1,
     ) -> Result<PublicationReceiptV1, DeliveryError>;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct UnavailableDeliveryPublication;
+
+impl DeliveryPublicationPort for UnavailableDeliveryPublication {
+    fn publish(
+        &self,
+        _request: &PublicationRequestV1,
+    ) -> Result<PublicationReceiptV1, DeliveryError> {
+        Err(DeliveryError::AdapterUnavailable {
+            dependency: "delivery_publication",
+            reason: "productive delivery event publisher is not provisioned".to_string(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -490,6 +627,15 @@ pub fn expected_workbench_execution_saga_contract_digest() -> ContentDigest {
         &"workbench-execution-saga-v1",
     )
     .expect("constant workbench execution saga contract must be canonical")
+}
+
+pub fn expected_publication_contract_digest() -> ContentDigest {
+    ContentDigest::of_domain(
+        "publication-contract",
+        DELIVERY_SCHEMA_V1,
+        &"delivery-publication-v1",
+    )
+    .expect("constant publication contract must be canonical")
 }
 
 fn valid_wire_id(value: &str) -> bool {
