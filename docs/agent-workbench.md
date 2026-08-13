@@ -11,7 +11,7 @@ Tool-bearing agent work has one supported path:
 3. The daemon reserves the digest-bound invocation in its durable workbench store.
 4. `NanoRuntimeRegistry` selects the configured secure runtime. M0 requires `bwrap-landlock`; an unavailable or mismatched runtime fails closed.
 5. The daemon launches `agent-runtime` inside the #75 full-cage sandbox and exchanges versioned JSONL messages.
-6. The daemon re-resolves current authority, validates the result against the reserved request and declared artifact kinds, then commits terminal state and publishes an idempotent safe event. Revoked or stale authority is rejected before runtime I/O and again before output acceptance.
+6. The daemon retains one World owner capability across resource attestation and runtime I/O, revalidates that same capability before decoding, artifact acceptance, and durable terminal adoption, and separately re-resolves the assignment authority. Revoked or stale authority leaves the invocation recoverable without publishing a terminal event.
 
 There is no host-shell, ECS-only, or less-isolated fallback for an M0 tool request.
 
@@ -45,7 +45,7 @@ Workspace roots are assigned per project and work item. Tool paths are relative,
 
 The runtime derives the only accepted workspace ID as `<project_id>:<work_item_id>` and maps it to `/workspace/<project_id>/<work_item_id>`. The matching artifact boundary is `/artifacts/<project_id>/<work_item_id>`. Declared input files live under the separately read-only `/workspace/.inputs/<project_id>/<work_item_id>` bind and must match both their SHA-256 and `sha256:<digest>` artifact binding before any effect begins. Input inspection and exact declared command arguments resolve through that boundary; undeclared `.inputs` arguments, parent replacement, and writes remain unavailable. Command arguments otherwise reject absolute, parent-relative, and home-relative paths.
 
-For `agent-runtime`, bubblewrap binds `/workspace` and `/artifacts` from symlink-rejected subdirectories of that agent's private backing filesystem and overlays `/workspace/.inputs` from a mandatory read-only sibling. The broad agent-home, `/company`, and resolver-file binds used by non-workbench agent sandboxes are absent. The parent daemon environment is cleared before bwrap starts and replaced with the four immutable profile variables. Landlock permits only the fixed runtime and profile toolchain executables; its `/proc` read grant sees only bwrap's private PID namespace and supports bounded process-group accounting. The cgroup sets the M0 memory and process ceilings and those ceilings are restored before every invocation. The executor additionally measures the command process group and enforces request CPU-time, memory, process-count, wall-time, output, and file-size limits.
+For `agent-runtime`, bubblewrap binds `/workspace` and `/artifacts` from symlink-rejected subdirectories of that agent's private backing filesystem and overlays `/workspace/.inputs` from a mandatory read-only sibling. The broad agent-home, `/company`, and resolver-file binds used by non-workbench agent sandboxes are absent. The parent daemon environment is cleared before bwrap starts and replaced with the four immutable profile variables. Workbench startup accepts only the wrapper's actual irreversible `FullyEnforced` Landlock result for the requested ABI; partial, absent, or mismatched enforcement rolls the spawn back. Landlock permits only the fixed runtime and profile toolchain executables; its `/proc` read grant sees only bwrap's private PID namespace and supports bounded process-group accounting. The cgroup sets the M0 memory and process ceilings and those ceilings are restored before every invocation. The executor additionally measures the command process group and enforces request CPU-time, memory, process-count, wall-time, output, and file-size limits.
 
 The M0 tools are:
 
@@ -55,7 +55,7 @@ The M0 tools are:
 - allowlisted command and test execution with a cleared environment;
 - immutable artifact-manifest packaging for request-declared artifact kinds.
 
-Packaging installs every file as an immutable SHA-256 blob and writes a digest-named immutable manifest that binds the invocation, authority digests, workspace, file paths, blob IDs, and sizes. The manifest never embeds private file content.
+Packaging installs every file as an immutable SHA-256 blob and writes a digest-named immutable manifest that binds the invocation, authority digests, workspace, file paths, blob IDs, and sizes. Sandbox and daemon acceptance pin the scoped directories and read each manifest and blob only through a no-follow descriptor after checking its device, inode, owner, mode, link count, and size. The manifest never embeds private file content.
 
 The immutable start configuration is `config/workbench-profiles/web-authoring-v1.toml`. Its file SHA-256 is carried as `tool_profile_digest`. The daemon rejects requests whose runtime, capability set, artifact kinds, command rules, test suite, environment contract, or resource limits exceed that exact profile. Profile replacement therefore requires a new digest-bound request; there is no silent live mutation.
 

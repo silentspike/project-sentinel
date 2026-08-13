@@ -27,6 +27,8 @@ const STORE_SCHEMA_VERSION: u16 = 2;
 const PROFILE_SCHEMA_VERSION: u16 = 1;
 const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
 const MAX_ARTIFACT_MANIFEST_BYTES: u64 = 1024 * 1024;
+const LINUX_O_NOFOLLOW: i32 = 0o400000;
+const LINUX_O_CLOEXEC: i32 = 0o2000000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -282,14 +284,26 @@ fn open_secure_store_file(
 ) -> anyhow::Result<(File, FileIdentity, PathBuf)> {
     let base = canonical_secure_authority_base(base)?;
     let path = base.join(secure_authority_name(relative)?);
-    let file = match fs::symlink_metadata(&path) {
+    open_secure_store_file_at(&base, &path, |path| {
+        OpenOptions::new().read(true).write(true).open(path)
+    })
+}
+
+fn open_secure_store_file_at<Open>(
+    base: &Path,
+    path: &Path,
+    open_existing: Open,
+) -> anyhow::Result<(File, FileIdentity, PathBuf)>
+where
+    Open: FnOnce(&Path) -> std::io::Result<File>,
+{
+    let (file, inspected_identity) = match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            validate_authority_file_metadata(&metadata, u64::MAX, Some(0o600))?;
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .context("open existing workbench store")?
+            let identity = validate_authority_file_metadata(&metadata, u64::MAX, Some(0o600))?;
+            (
+                open_existing(path).context("open existing workbench store")?,
+                Some(identity),
+            )
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let file = OpenOptions::new()
@@ -305,12 +319,15 @@ fn open_secure_store_file(
             File::open(&base)
                 .and_then(|directory| directory.sync_all())
                 .context("sync workbench store directory")?;
-            file
+            (file, None)
         }
         Err(error) => return Err(error).context("inspect workbench store"),
     };
     let metadata = file.metadata().context("inspect opened workbench store")?;
     let identity = FileIdentity::from_metadata(&metadata);
+    if inspected_identity.is_some_and(|expected| expected != identity) {
+        bail!("workbench store identity changed before open");
+    }
     if !metadata.is_file()
         || metadata.nlink() != 1
         || metadata.uid() != current_daemon_uid()?
@@ -318,8 +335,8 @@ fn open_secure_store_file(
     {
         bail!("opened workbench store identity or mode is unsafe");
     }
-    ensure_path_identity(&path, identity)?;
-    Ok((file, identity, path))
+    ensure_path_identity(path, identity)?;
+    Ok((file, identity, path.to_path_buf()))
 }
 
 fn ensure_path_identity(path: &Path, expected: FileIdentity) -> anyhow::Result<()> {
@@ -745,6 +762,15 @@ impl WorkbenchInvocationStore {
         message: &WorkbenchMessage,
         now_ms: u64,
     ) -> anyhow::Result<WorkbenchInvocationRecord> {
+        self.accept_result_guarded(message, now_ms, &|| Ok(()))
+    }
+
+    fn accept_result_guarded(
+        &self,
+        message: &WorkbenchMessage,
+        now_ms: u64,
+        revalidate: &dyn Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<WorkbenchInvocationRecord> {
         let WorkbenchMessage::Result {
             schema_version,
             invocation_id,
@@ -763,7 +789,7 @@ impl WorkbenchInvocationStore {
         }
         let next = state_for_outcome(*outcome)?;
         let safe_error = error.as_ref().map(sanitize_runtime_error).transpose()?;
-        self.transition(invocation_id, input_digest, now_ms, |record| {
+        self.transition_guarded(invocation_id, input_digest, revalidate, |record| {
             if record.state == next && record.state.is_terminal() {
                 if record.resources.as_ref() != Some(resources)
                     || record.artifacts != *artifacts
@@ -803,8 +829,19 @@ impl WorkbenchInvocationStore {
         now_ms: u64,
         error: WorkbenchErrorInfo,
     ) -> anyhow::Result<WorkbenchInvocationRecord> {
+        self.mark_failed_guarded(invocation_id, request_digest, now_ms, error, &|| Ok(()))
+    }
+
+    fn mark_failed_guarded(
+        &self,
+        invocation_id: &str,
+        request_digest: &str,
+        now_ms: u64,
+        error: WorkbenchErrorInfo,
+        revalidate: &dyn Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<WorkbenchInvocationRecord> {
         let safe_error = sanitize_runtime_error(&error)?;
-        self.transition(invocation_id, request_digest, now_ms, |record| {
+        self.transition_guarded(invocation_id, request_digest, revalidate, |record| {
             if record.state == WorkbenchInvocationState::Failed {
                 if record.resources.as_ref() == Some(&WorkbenchResourceUsage::default())
                     && record.artifacts.is_empty()
@@ -849,15 +886,16 @@ impl WorkbenchInvocationStore {
         )
     }
 
-    fn mark_unknown_outcome(
+    fn mark_unknown_outcome_guarded(
         &self,
         invocation_id: &str,
         request_digest: &str,
         now_ms: u64,
         error: WorkbenchErrorInfo,
+        revalidate: &dyn Fn() -> anyhow::Result<()>,
     ) -> anyhow::Result<WorkbenchInvocationRecord> {
         let safe_error = sanitize_runtime_error(&error)?;
-        self.transition(invocation_id, request_digest, now_ms, |record| {
+        self.transition_guarded(invocation_id, request_digest, revalidate, |record| {
             if record.state == WorkbenchInvocationState::UnknownOutcome {
                 if record.resources.as_ref() == Some(&WorkbenchResourceUsage::default())
                     && record.artifacts.is_empty()
@@ -886,13 +924,14 @@ impl WorkbenchInvocationStore {
         })
     }
 
-    fn mark_runtime_cancelled(
+    fn mark_runtime_cancelled_guarded(
         &self,
         invocation_id: &str,
         request_digest: &str,
         now_ms: u64,
+        revalidate: &dyn Fn() -> anyhow::Result<()>,
     ) -> anyhow::Result<WorkbenchInvocationRecord> {
-        self.mark_cancelled_with_error(
+        self.mark_cancelled_with_error_guarded(
             invocation_id,
             request_digest,
             now_ms,
@@ -902,6 +941,7 @@ impl WorkbenchInvocationStore {
                 safe_message: "the isolated workbench acknowledged cancellation".to_string(),
                 retryable: false,
             },
+            revalidate,
         )
     }
 
@@ -912,8 +952,25 @@ impl WorkbenchInvocationStore {
         now_ms: u64,
         error: WorkbenchErrorInfo,
     ) -> anyhow::Result<WorkbenchInvocationRecord> {
+        self.mark_cancelled_with_error_guarded(
+            invocation_id,
+            request_digest,
+            now_ms,
+            error,
+            &|| Ok(()),
+        )
+    }
+
+    fn mark_cancelled_with_error_guarded(
+        &self,
+        invocation_id: &str,
+        request_digest: &str,
+        now_ms: u64,
+        error: WorkbenchErrorInfo,
+        revalidate: &dyn Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<WorkbenchInvocationRecord> {
         let safe_error = sanitize_runtime_error(&error)?;
-        self.transition(invocation_id, request_digest, now_ms, |record| {
+        self.transition_guarded(invocation_id, request_digest, revalidate, |record| {
             if record.state == WorkbenchInvocationState::Cancelled {
                 if record.resources.as_ref() == Some(&WorkbenchResourceUsage::default())
                     && record.artifacts.is_empty()
@@ -943,6 +1000,15 @@ impl WorkbenchInvocationStore {
         &self,
         envelope: &WorkbenchRuntimeEnvelope,
         now_ms: u64,
+    ) -> anyhow::Result<Option<WorkbenchInvocationRecord>> {
+        self.accept_runtime_envelope_guarded(envelope, now_ms, &|| Ok(()))
+    }
+
+    fn accept_runtime_envelope_guarded(
+        &self,
+        envelope: &WorkbenchRuntimeEnvelope,
+        now_ms: u64,
+        revalidate: &dyn Fn() -> anyhow::Result<()>,
     ) -> anyhow::Result<Option<WorkbenchInvocationRecord>> {
         let mut current = self
             .load(&envelope.invocation_id)?
@@ -1011,30 +1077,33 @@ impl WorkbenchInvocationStore {
         for message in &envelope.messages {
             match message {
                 WorkbenchMessage::Result { .. } => {
-                    current = self.accept_result(message, now_ms)?;
+                    current = self.accept_result_guarded(message, now_ms, revalidate)?;
                 }
                 WorkbenchMessage::Error { error, .. } => {
                     current = if error.class == sentinel_common::WorkbenchErrorClass::Recovery {
-                        self.mark_unknown_outcome(
+                        self.mark_unknown_outcome_guarded(
                             &envelope.invocation_id,
                             &current.request_digest,
                             now_ms,
                             error.clone(),
+                            revalidate,
                         )?
                     } else {
-                        self.mark_failed(
+                        self.mark_failed_guarded(
                             &envelope.invocation_id,
                             &current.request_digest,
                             now_ms,
                             error.clone(),
+                            revalidate,
                         )?
                     };
                 }
                 WorkbenchMessage::Cancelled { .. } => {
-                    current = self.mark_runtime_cancelled(
+                    current = self.mark_runtime_cancelled_guarded(
                         &envelope.invocation_id,
                         &current.request_digest,
                         now_ms,
+                        revalidate,
                     )?;
                 }
                 _ => {}
@@ -1092,6 +1161,16 @@ impl WorkbenchInvocationStore {
         _now_ms: u64,
         update: impl FnOnce(&mut WorkbenchInvocationRecord) -> anyhow::Result<()>,
     ) -> anyhow::Result<WorkbenchInvocationRecord> {
+        self.transition_guarded(invocation_id, request_digest, &|| Ok(()), update)
+    }
+
+    fn transition_guarded(
+        &self,
+        invocation_id: &str,
+        request_digest: &str,
+        revalidate: &dyn Fn() -> anyhow::Result<()>,
+        update: impl FnOnce(&mut WorkbenchInvocationRecord) -> anyhow::Result<()>,
+    ) -> anyhow::Result<WorkbenchInvocationRecord> {
         let write = self.db.begin_write()?;
         let record;
         {
@@ -1105,6 +1184,9 @@ impl WorkbenchInvocationStore {
                 return Err(WorkbenchStoreError::DigestConflict.into());
             }
             update(&mut current)?;
+            // Recheck the effect's original World capability after any artifact
+            // validation and immediately before staging the durable transition.
+            revalidate()?;
             let bytes = encode_record(&current)?;
             table.insert(invocation_id, bytes.as_slice())?;
             record = current;
@@ -1253,7 +1335,24 @@ fn validate_concrete_artifact_manifest(
     if !manifest_path.starts_with(&scoped_root) {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
-    let bytes = fs::read(&manifest_path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let manifest_name = manifest_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(WorkbenchStoreError::OutputRejected)?;
+    let scope = open_pinned_daemon_artifact_directory(&scoped_root)?;
+    let mut manifest_file = open_scoped_daemon_artifact_file(
+        &scope,
+        manifest_name,
+        MAX_ARTIFACT_MANIFEST_BYTES,
+        None,
+    )?;
+    let mut bytes = Vec::new();
+    manifest_file
+        .by_ref()
+        .take(MAX_ARTIFACT_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    revalidate_scoped_daemon_artifact_file(&scope, manifest_name, &manifest_file)?;
     if hex_sha256(&bytes) != artifact.sha256 {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
@@ -1277,6 +1376,7 @@ fn validate_concrete_artifact_manifest(
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
     let blobs_root = canonical_daemon_child_directory(&scoped_root, "blobs")?;
+    let blobs = open_pinned_daemon_artifact_directory(&blobs_root)?;
     let mut total_size = 0_u64;
     for entry in manifest.entries {
         let path = Path::new(&entry.path);
@@ -1298,19 +1398,137 @@ fn validate_concrete_artifact_manifest(
         total_size = total_size
             .checked_add(entry.size_bytes)
             .ok_or(WorkbenchStoreError::OutputRejected)?;
-        let blob = blobs_root.join(&entry.sha256);
-        let metadata =
-            fs::symlink_metadata(&blob).map_err(|_| WorkbenchStoreError::OutputRejected)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.len() != entry.size_bytes
-            || hex_sha256(&fs::read(&blob).map_err(|_| WorkbenchStoreError::OutputRejected)?)
-                != entry.sha256
+        let mut blob = open_scoped_daemon_artifact_file(
+            &blobs,
+            &entry.sha256,
+            entry.size_bytes,
+            Some(entry.size_bytes),
+        )?;
+        let mut blob_bytes = Vec::new();
+        blob.by_ref()
+            .take(entry.size_bytes.saturating_add(1))
+            .read_to_end(&mut blob_bytes)
+            .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        revalidate_scoped_daemon_artifact_file(&blobs, &entry.sha256, &blob)?;
+        if blob_bytes.len() as u64 != entry.size_bytes
+            || hex_sha256(&blob_bytes) != entry.sha256
         {
             return Err(WorkbenchStoreError::OutputRejected.into());
         }
     }
     if total_size != artifact.size_bytes {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactFileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+}
+
+impl ArtifactFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+        }
+    }
+}
+
+fn open_pinned_daemon_artifact_directory(path: &Path) -> anyhow::Result<File> {
+    let before = fs::symlink_metadata(path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    if before.file_type().is_symlink() || !before.is_dir() {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let directory = File::open(path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let opened = directory
+        .metadata()
+        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    if before.dev() != opened.dev() || before.ino() != opened.ino() {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    Ok(directory)
+}
+
+fn open_scoped_daemon_artifact_file(
+    directory: &File,
+    name: &str,
+    max_bytes: u64,
+    exact_size: Option<u64>,
+) -> anyhow::Result<File> {
+    open_scoped_daemon_artifact_file_with(directory, name, max_bytes, exact_size, |path| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC)
+            .open(path)
+    })
+}
+
+fn open_scoped_daemon_artifact_file_with<Open>(
+    directory: &File,
+    name: &str,
+    max_bytes: u64,
+    exact_size: Option<u64>,
+    open: Open,
+) -> anyhow::Result<File>
+where
+    Open: FnOnce(&Path) -> std::io::Result<File>,
+{
+    daemon_scope_component(name)?;
+    let path = PathBuf::from(format!("/proc/self/fd/{}/{}", directory.as_raw_fd(), name));
+    let before = fs::symlink_metadata(&path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    validate_daemon_artifact_file_metadata(&before, max_bytes, exact_size)?;
+    let expected = ArtifactFileIdentity::from_metadata(&before);
+    let file = open(&path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    validate_daemon_artifact_file_metadata(&opened, max_bytes, exact_size)?;
+    if ArtifactFileIdentity::from_metadata(&opened) != expected {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    Ok(file)
+}
+
+fn validate_daemon_artifact_file_metadata(
+    metadata: &fs::Metadata,
+    max_bytes: u64,
+    exact_size: Option<u64>,
+) -> anyhow::Result<()> {
+    let mode = metadata.mode() & 0o777;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.nlink() != 1
+        || metadata.uid() != current_daemon_uid()?
+        || mode & 0o022 != 0
+        || metadata.len() > max_bytes
+        || exact_size.is_some_and(|size| metadata.len() != size)
+    {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    Ok(())
+}
+
+fn revalidate_scoped_daemon_artifact_file(
+    directory: &File,
+    name: &str,
+    file: &File,
+) -> anyhow::Result<()> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}/{}", directory.as_raw_fd(), name));
+    let opened = file
+        .metadata()
+        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let path_metadata =
+        fs::symlink_metadata(&path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    validate_daemon_artifact_file_metadata(&opened, opened.len(), Some(opened.len()))?;
+    validate_daemon_artifact_file_metadata(&path_metadata, opened.len(), Some(opened.len()))?;
+    if ArtifactFileIdentity::from_metadata(&path_metadata)
+            != ArtifactFileIdentity::from_metadata(&opened)
+    {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
     Ok(())
@@ -1550,12 +1768,37 @@ pub fn authorize_workbench_record(
     Ok(effective)
 }
 
+pub struct WorkbenchRuntimeExchange<'a> {
+    result: NanoExecResult,
+    revalidate_world_authority: Box<dyn Fn() -> anyhow::Result<()> + 'a>,
+}
+
+impl<'a> WorkbenchRuntimeExchange<'a> {
+    pub fn new(
+        result: NanoExecResult,
+        revalidate_world_authority: impl Fn() -> anyhow::Result<()> + 'a,
+    ) -> Self {
+        Self {
+            result,
+            revalidate_world_authority: Box::new(revalidate_world_authority),
+        }
+    }
+
+    fn result(&self) -> &NanoExecResult {
+        &self.result
+    }
+
+    fn revalidate(&self) -> anyhow::Result<()> {
+        (self.revalidate_world_authority)()
+    }
+}
+
 pub trait WorkbenchRuntimeClient {
     fn exchange(
         &mut self,
         agent_id: AgentId,
         request: NanoExecRequest,
-    ) -> anyhow::Result<NanoExecResult>;
+    ) -> anyhow::Result<WorkbenchRuntimeExchange<'_>>;
 }
 
 pub enum WorkbenchDispatchCommand {
@@ -1857,7 +2100,8 @@ impl<'a> WorkbenchCoordinator<'a> {
         // not complete. Keep the durable invocation executing so recovery can
         // probe the runtime receipt without dispatching the external effect a
         // second time.
-        let result = runtime.exchange(agent_id, request)?;
+        let exchange = runtime.exchange(agent_id, request)?;
+        exchange.revalidate()?;
         let current = self
             .store
             .load(invocation_id)?
@@ -1866,14 +2110,20 @@ impl<'a> WorkbenchCoordinator<'a> {
         authorize_workbench_record(&current, &current_authority)?;
         let expected_workload_id = format!("AGENT-{:02}", agent_id.0);
         let envelope =
-            match WorkbenchRuntimeEnvelope::decode(invocation_id, &expected_workload_id, &result) {
+            match WorkbenchRuntimeEnvelope::decode(
+                invocation_id,
+                &expected_workload_id,
+                exchange.result(),
+            ) {
                 Ok(envelope) => envelope,
                 Err(_) => {
-                    let unresolved = self.store.mark_unknown_outcome(
+                    exchange.revalidate()?;
+                    let unresolved = self.store.mark_unknown_outcome_guarded(
                         invocation_id,
                         request_digest,
                         now_ms,
                         safe_recovery_failure("runtime_response_rejected"),
+                        &|| exchange.revalidate(),
                     )?;
                     records.push(unresolved);
                     return Ok(WorkbenchCoordinatorUpdate {
@@ -1882,9 +2132,14 @@ impl<'a> WorkbenchCoordinator<'a> {
                         replayed,
                     });
                 }
-            };
+        };
         let runtime_state = Some(envelope.state.clone());
-        if let Some(terminal) = self.store.accept_runtime_envelope(&envelope, now_ms)? {
+        exchange.revalidate()?;
+        if let Some(terminal) = self.store.accept_runtime_envelope_guarded(
+            &envelope,
+            now_ms,
+            &|| exchange.revalidate(),
+        )? {
             records.push(terminal);
         }
         Ok(WorkbenchCoordinatorUpdate {
@@ -1903,15 +2158,16 @@ impl<'a> WorkbenchCoordinator<'a> {
     ) -> anyhow::Result<WorkbenchCoordinatorUpdate> {
         let current_authority = authority.current_for_record(record)?;
         authorize_workbench_record(record, &current_authority)?;
-        let result = runtime.exchange(
+        let exchange = runtime.exchange(
             record.agent_id,
             WorkbenchRuntimeEnvelope::cancel(&record.invocation_id)?,
         )?;
+        exchange.revalidate()?;
         let expected_workload_id = format!("AGENT-{:02}", record.agent_id.0);
         let envelope = WorkbenchRuntimeEnvelope::decode(
             &record.invocation_id,
             &expected_workload_id,
-            &result,
+            exchange.result(),
         )?;
         let current = self
             .store
@@ -1920,7 +2176,12 @@ impl<'a> WorkbenchCoordinator<'a> {
         let current_authority = authority.current_for_record(&current)?;
         authorize_workbench_record(&current, &current_authority)?;
         let mut records = Vec::new();
-        if let Some(terminal) = self.store.accept_runtime_envelope(&envelope, now_ms)? {
+        exchange.revalidate()?;
+        if let Some(terminal) = self.store.accept_runtime_envelope_guarded(
+            &envelope,
+            now_ms,
+            &|| exchange.revalidate(),
+        )? {
             records.push(terminal);
         }
         Ok(WorkbenchCoordinatorUpdate {
@@ -2057,16 +2318,49 @@ mod tests {
             &mut self,
             _agent_id: AgentId,
             _request: NanoExecRequest,
-        ) -> anyhow::Result<NanoExecResult> {
+        ) -> anyhow::Result<WorkbenchRuntimeExchange<'_>> {
             self.calls += 1;
-            self.responses
+            let result = self
+                .responses
                 .pop_front()
-                .unwrap_or_else(|| Err(anyhow::anyhow!("unexpected runtime exchange")))
+                .unwrap_or_else(|| Err(anyhow::anyhow!("unexpected runtime exchange")))?;
+            Ok(WorkbenchRuntimeExchange::new(result, || Ok(())))
         }
     }
 
     struct SequencedAuthority {
         snapshots: Mutex<VecDeque<WorkbenchAuthoritySnapshot>>,
+    }
+
+    struct GuardedRuntime {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        validations: Arc<std::sync::atomic::AtomicUsize>,
+        operations: Arc<Mutex<Vec<String>>>,
+        fail_validation: usize,
+        response: NanoExecResult,
+    }
+
+    impl WorkbenchRuntimeClient for GuardedRuntime {
+        fn exchange(
+            &mut self,
+            _agent_id: AgentId,
+            request: NanoExecRequest,
+        ) -> anyhow::Result<WorkbenchRuntimeExchange<'_>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.operations.lock().unwrap().push(request.operation);
+            let validations = Arc::clone(&self.validations);
+            let fail_validation = self.fail_validation;
+            Ok(WorkbenchRuntimeExchange::new(
+                self.response.clone(),
+                move || {
+                    let current = validations.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if current == fail_validation {
+                        bail!("workbench World authority became stale");
+                    }
+                    Ok(())
+                },
+            ))
+        }
     }
 
     impl WorkbenchAuthoritySource for SequencedAuthority {
@@ -2312,6 +2606,26 @@ mod tests {
         fs::rename(&path, &target).unwrap();
         symlink(&target, &path).unwrap();
         assert!(WorkbenchInvocationStore::open(&path).is_err());
+    }
+
+    #[test]
+    fn invocation_store_rejects_identity_replacement_between_inspect_and_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workbench.redb");
+        let replacement = directory.path().join("replacement.redb");
+        fs::write(&path, b"original").unwrap();
+        fs::write(&replacement, b"replacement").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(open_secure_store_file_at(directory.path(), &path, |opened_path| {
+            fs::rename(&replacement, &path)?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(opened_path)
+        })
+        .is_err());
     }
 
     #[test]
@@ -2636,6 +2950,35 @@ mod tests {
             request.agent_id,
             &request.project_id,
             &request.work_item_id,
+        )
+        .is_err());
+
+        let safe_scope = directory.path().join("safe-files");
+        fs::create_dir(&safe_scope).unwrap();
+        let manifest = safe_scope.join("manifest.json");
+        fs::write(&manifest, b"{}").unwrap();
+        let pinned = open_pinned_daemon_artifact_directory(&safe_scope).unwrap();
+        open_scoped_daemon_artifact_file(&pinned, "manifest.json", 16, None).unwrap();
+
+        let hardlink = safe_scope.join("manifest-hardlink.json");
+        fs::hard_link(&manifest, &hardlink).unwrap();
+        assert!(open_scoped_daemon_artifact_file(&pinned, "manifest.json", 16, None).is_err());
+        fs::remove_file(hardlink).unwrap();
+
+        let replacement = safe_scope.join("replacement.json");
+        fs::write(&replacement, b"[]").unwrap();
+        assert!(open_scoped_daemon_artifact_file_with(
+            &pinned,
+            "manifest.json",
+            16,
+            None,
+            |path| {
+                fs::rename(&replacement, &manifest)?;
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC)
+                    .open(path)
+            },
         )
         .is_err());
     }
@@ -3054,6 +3397,91 @@ mod tests {
             WorkbenchInvocationState::Executing
         );
         assert!(store.has_inflight().unwrap());
+    }
+
+    #[test]
+    fn stale_world_guard_during_store_adoption_retains_recoverable_state_without_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let profile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/workbench-profiles/web-authoring-v1.toml");
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_path).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2817");
+        request.tool_profile_digest = profile_digest.clone();
+        request.input_digest = request.canonical_digest().unwrap();
+        let authority = authority(&request, &profile);
+        let result = WorkbenchMessage::Result {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            outcome: WorkbenchOutcome::Succeeded,
+            resources: WorkbenchResourceUsage::default(),
+            artifacts: Vec::new(),
+            output: BTreeMap::new(),
+            error: None,
+        };
+        let response = NanoExecResult {
+            runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
+            workload_id: "AGENT-07".to_string(),
+            success: true,
+            output: serde_json::to_string(&serde_json::json!({
+                "schema_version": WORKBENCH_SCHEMA_VERSION,
+                "invocation_id": request.invocation_id,
+                "state": "completed",
+                "messages": [result],
+            }))
+            .unwrap(),
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let validations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = GuardedRuntime {
+            calls: Arc::clone(&calls),
+            validations: Arc::clone(&validations),
+            operations: Arc::clone(&operations),
+            fail_validation: 3,
+            response: response.clone(),
+        };
+        let coordinator = WorkbenchCoordinator::new(&store, &profile, &profile_digest);
+
+        let error = coordinator
+            .submit(&mut runtime, &request, &authority, 1_900_000_000_000)
+            .unwrap_err();
+        assert!(error.to_string().contains("World authority became stale"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load(&request.invocation_id).unwrap().unwrap().state,
+            WorkbenchInvocationState::Executing
+        );
+        assert!(store.has_inflight().unwrap());
+        let event_store = sentinel_limbo::EventStore::open(
+            directory.path().join("events.db").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(event_store.event_count().unwrap(), 0);
+
+        let recovery_operations = Arc::new(Mutex::new(Vec::new()));
+        let mut recovery_runtime = GuardedRuntime {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            validations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            operations: Arc::clone(&recovery_operations),
+            fail_validation: usize::MAX,
+            response,
+        };
+        let recovered = coordinator
+            .recover_executing(
+                &mut recovery_runtime,
+                &request.invocation_id,
+                &authority,
+                1_900_000_000_001,
+            )
+            .unwrap();
+        assert_eq!(recovered.records.last().unwrap().state, WorkbenchInvocationState::Succeeded);
+        assert_eq!(operations.lock().unwrap().as_slice(), ["workbench_start"]);
+        assert_eq!(
+            recovery_operations.lock().unwrap().as_slice(),
+            ["workbench_recover"]
+        );
     }
 
     #[test]

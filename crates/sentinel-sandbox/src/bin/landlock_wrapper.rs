@@ -63,22 +63,41 @@ fn main() {
     // Apply Landlock (irreversible)
     let rules =
         sentinel_sandbox::LandlockRuleset::for_agent(agent_name).with_entrypoint_exec(&command[0]);
-    match rules.apply() {
-        Ok(true) => eprintln!("[landlock-wrapper] Landlock enforced for {agent_name}"),
-        Ok(false) => {
-            eprintln!("[landlock-wrapper] Landlock not enforced");
-            process::exit(126);
-        }
+    let enforcement = match rules.apply_status() {
+        Ok(enforcement) => enforcement,
         Err(e) => {
             eprintln!("[landlock-wrapper] Landlock apply failed: {e}");
             process::exit(126);
         }
-    }
+    };
+    let attested_abi = match attestation {
+        Some((_, expected_abi)) => {
+            let Some(abi) = sentinel_sandbox::landlock::workbench_fully_enforced_abi(
+                enforcement,
+                expected_abi,
+            ) else {
+                eprintln!(
+                    "[landlock-wrapper] Workbench Landlock contract was not fully enforced"
+                );
+                process::exit(126);
+            };
+            Some(abi)
+        }
+        None => match enforcement {
+            sentinel_sandbox::landlock::LandlockEnforcement::FullyEnforced { .. }
+            | sentinel_sandbox::landlock::LandlockEnforcement::PartiallyEnforced => None,
+            sentinel_sandbox::landlock::LandlockEnforcement::NotEnforced => {
+                eprintln!("[landlock-wrapper] Landlock not enforced");
+                process::exit(126);
+            }
+        }
+    };
+    eprintln!("[landlock-wrapper] Landlock enforced for {agent_name}");
 
     // Exec the actual command (replaces this process)
     let mut child = Command::new(&command[0]);
     child.args(&command[1..]);
-    if let Some((nonce, abi)) = attestation {
+    if let (Some((nonce, _)), Some(abi)) = (attestation, attested_abi) {
         child
             .env(ATTESTATION_NONCE_ENV, nonce)
             .env(ATTESTATION_WRAPPER_VERSION_ENV, env!("CARGO_PKG_VERSION"))

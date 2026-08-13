@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::OpenOptionsExt as UnixOpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
