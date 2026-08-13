@@ -204,6 +204,9 @@ class Fixture:
         self.command_overrides: dict[tuple[str, ...], bytes | Exception] = {}
         self.event_store_reads: list[dict[str, int]] = []
         self.hash_calls: list[tuple[Path, int]] = []
+        self.running_hash_calls: list[tuple[int, Path, int]] = []
+        self.running_hash_overrides: dict[Path, tuple[str, int] | Exception] = {}
+        self.unit_fact_reads: dict[str, list[dict[str, str]]] = {}
         self.manifest_path = Path("/fixture/release-manifest.json")
         self.contract_path = preflight.M0_CONTRACT_PATH
         self.profile_path = preflight.M0_PROFILE_PATH
@@ -308,18 +311,52 @@ id = "web-authoring-v1"
                 "SubState": "active",
                 "FragmentPath": "/etc/systemd/system/sentinel.target",
                 "Wants": " ".join(sorted(preflight.REQUIRED_UNITS)),
+                "NeedDaemonReload": "no",
             }
         }
-        for unit in preflight.REQUIRED_UNITS:
-            is_service = unit in preflight.REQUIRED_SERVICES
+        self.main_pids = {
+            unit: 2000 + index
+            for index, unit in enumerate(sorted(preflight.REQUIRED_SERVICES), start=1)
+        }
+        for unit in preflight.REQUIRED_SERVICES:
             facts[unit] = {
                 "Id": unit,
                 "LoadState": "loaded",
                 "ActiveState": "active",
-                "SubState": "running" if is_service else "waiting",
+                "SubState": "running",
                 "Result": "success",
                 "FragmentPath": f"/etc/systemd/system/{unit}",
-                **({"NRestarts": "0"} if is_service else {}),
+                "NRestarts": "0",
+                "NeedDaemonReload": "no",
+                "MainPID": str(self.main_pids[unit]),
+            }
+        for index, (timer, service) in enumerate(
+            sorted(preflight.TIMER_SERVICES.items()), start=1
+        ):
+            trigger = 1_000_000 * index
+            facts[timer] = {
+                "Id": timer,
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "waiting",
+                "Result": "success",
+                "FragmentPath": f"/etc/systemd/system/{timer}",
+                "NeedDaemonReload": "no",
+                "Unit": service,
+                "LastTriggerUSecMonotonic": str(trigger),
+            }
+            facts[service] = {
+                "Id": service,
+                "LoadState": "loaded",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "FragmentPath": f"/etc/systemd/system/{service}",
+                "NeedDaemonReload": "no",
+                "ExecMainCode": "1",
+                "ExecMainStatus": "0",
+                "ExecMainStartTimestampMonotonic": str(trigger + 10),
+                "ExecMainExitTimestampMonotonic": str(trigger + 20),
             }
         return facts
 
@@ -331,7 +368,14 @@ id = "web-authoring-v1"
             state = "LISTEN" if protocol == "tcp" else "UNCONN"
             remote = "0.0.0.0:*" if family == "ipv4" else "[::]:*"
             local = f"{host}:{port}" if family == "ipv4" else f"[{host}]:{port}"
-            lines.append(f"{protocol} {state} 0 128 {local} {remote}")
+            service = preflight.LISTENER_SERVICES[
+                (protocol, expected_family, host, port)
+            ]
+            pid = self.main_pids[service]
+            lines.append(
+                f'{protocol} {state} 0 128 {local} {remote} '
+                f'users:(("service",pid={pid},fd=7))'
+            )
         return (("\n".join(lines) + "\n") if lines else "").encode("ascii")
 
     @staticmethod
@@ -468,6 +512,23 @@ id = "web-authoring-v1"
             raise preflight.PreflightError("artifact_oversized")
         return hashlib.sha256(data).hexdigest(), len(data)
 
+    def hash_running_executable(
+        self, pid: int, path: Path, limit: int
+    ) -> tuple[str, int]:
+        self.running_hash_calls.append((pid, path, limit))
+        override = self.running_hash_overrides.get(path)
+        if isinstance(override, Exception):
+            raise override
+        if isinstance(override, tuple):
+            return override
+        expected_pid = self.main_pids[
+            next(unit for unit, executable in preflight.SERVICE_EXECUTABLES.items() if executable == path)
+        ]
+        if pid != expected_pid:
+            raise preflight.PreflightError("running_executable_identity_race")
+        data = self.files[path]
+        return hashlib.sha256(data).hexdigest(), len(data)
+
     def projection_snapshot(self) -> list[dict[str, object]]:
         return [
             {
@@ -501,11 +562,17 @@ id = "web-authoring-v1"
         if isinstance(override, bytes):
             return override
         if argv[:2] == ["/usr/bin/systemctl", "show"]:
-            facts = self.unit_facts[argv[2]]
-            return ("\n".join(f"{key}={value}" for key, value in facts.items()) + "\n").encode("ascii")
-        if argv == ["/usr/bin/ss", "-H", "-lntu", "-4"]:
+            unit = argv[2]
+            reads = self.unit_fact_reads.get(unit)
+            facts = reads.pop(0) if reads else self.unit_facts[unit]
+            properties = argv[-1].removeprefix("--property=").split(",")
+            selected = {key: facts[key] for key in properties if key in facts}
+            return (
+                "\n".join(f"{key}={value}" for key, value in selected.items()) + "\n"
+            ).encode("ascii")
+        if argv == ["/usr/bin/ss", "-H", "-lntup", "-4"]:
             return self.listeners_v4
-        if argv == ["/usr/bin/ss", "-H", "-lntu", "-6"]:
+        if argv == ["/usr/bin/ss", "-H", "-lntup", "-6"]:
             return self.listeners_v6
         if argv[:3] == ["/usr/bin/sqlite3", "-readonly", "-json"]:
             if Path(argv[3]) == EVENT_DB:
@@ -575,6 +642,7 @@ id = "web-authoring-v1"
             self.https,
             self.read_file,
             self.hash_file,
+            self.hash_running_executable,
             self.list_agents,
             self.read_file,
         )
@@ -623,18 +691,18 @@ class PreflightTests(unittest.TestCase):
         fixture.unit_facts["sentinel-nightrun.timer"]["SubState"] = "elapsed"
         result = preflight.evaluate(fixture.inputs(), fixture.deps())
         self.assertEqual(
-            self.check(result, "systemd_units")["reason"], "systemd_unit_not_ready"
+            self.check(result, "systemd_units")["reason"], "systemd_timer_not_ready"
         )
 
         fixture = Fixture()
         fixture.unit_facts["sentinel-nightrun.timer"]["Result"] = "failed"
         result = preflight.evaluate(fixture.inputs(), fixture.deps())
         self.assertEqual(
-            self.check(result, "systemd_units")["reason"], "systemd_unit_not_ready"
+            self.check(result, "systemd_units")["reason"], "systemd_timer_not_ready"
         )
 
         fixture = Fixture()
-        fixture.unit_facts[preflight.TARGET_UNIT]["Result"] = "success"
+        fixture.unit_facts[preflight.TARGET_UNIT].pop("NeedDaemonReload")
         result = preflight.evaluate(fixture.inputs(), fixture.deps())
         self.assertEqual(
             self.check(result, "systemd_units")["reason"], "systemd_target_shape"
@@ -644,6 +712,160 @@ class PreflightTests(unittest.TestCase):
         self.fixture.unit_facts["sentinel-gateway.service"]["NRestarts"] = "1"
         result = self.run_fixture()
         self.assertEqual(self.check(result, "systemd_units")["status"], "FAIL")
+
+    def test_running_executables_match_manifest_and_main_pids(self) -> None:
+        result = self.run_fixture()
+        self.assertTrue(result["runtime_preflight_pass"])
+        self.assertEqual(
+            {path for _, path, _ in self.fixture.running_hash_calls},
+            set(preflight.SERVICE_EXECUTABLES.values()),
+        )
+        self.assertIn(
+            "/usr/local/bin/nats-server", preflight.CANONICAL_RELEASE_ARTIFACTS
+        )
+        self.assertEqual(
+            preflight.CANONICAL_RELEASE_ARTIFACTS["/usr/local/bin/nats-server"],
+            ("external/nats-server", "binary"),
+        )
+
+    def test_running_executable_old_deleted_replaced_and_pid_race_fail(self) -> None:
+        unit = "sentinel-daemon.service"
+        path = preflight.SERVICE_EXECUTABLES[unit]
+        old = self.fixture.files[path]
+        replacement = b"replacement-daemon"
+        self.fixture.files[path] = replacement
+        artifact = next(
+            item
+            for item in self.fixture.manifest["artifacts"]  # type: ignore[union-attr]
+            if item["path"] == str(path)
+        )
+        artifact["sha256"] = hashlib.sha256(replacement).hexdigest()
+        self.fixture.authorize_manifest()
+        self.fixture.running_hash_overrides[path] = (
+            hashlib.sha256(old).hexdigest(),
+            len(old),
+        )
+        result = self.run_fixture()
+        self.assertEqual(
+            self.check(result, "systemd_units")["reason"],
+            "running_executable_hash_mismatch",
+        )
+
+        for reason in (
+            "running_executable_identity_mismatch",
+            "running_executable_unavailable",
+        ):
+            with self.subTest(reason=reason):
+                fixture = Fixture()
+                fixture.running_hash_overrides[path] = preflight.PreflightError(reason)
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertEqual(self.check(result, "systemd_units")["reason"], reason)
+
+        fixture = Fixture()
+        first = copy.deepcopy(fixture.unit_facts[unit])
+        changed = copy.deepcopy(first)
+        changed["MainPID"] = str(int(first["MainPID"]) + 100)
+        fixture.unit_fact_reads[unit] = [first, changed]
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(
+            self.check(result, "systemd_units")["reason"],
+            "systemd_service_identity_changed",
+        )
+
+    def test_main_pid_reload_and_nats_manifest_omission_fail(self) -> None:
+        for pid in ("", "0"):
+            with self.subTest(pid=pid):
+                fixture = Fixture()
+                fixture.unit_facts["sentinel-daemon.service"]["MainPID"] = pid
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertEqual(
+                    self.check(result, "systemd_units")["reason"],
+                    "systemd_main_pid_invalid",
+                )
+
+        fixture = Fixture()
+        fixture.unit_facts["sentinel-daemon.service"]["NeedDaemonReload"] = "yes"
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(
+            self.check(result, "systemd_units")["reason"],
+            "systemd_unit_not_ready",
+        )
+
+        fixture = Fixture()
+        fixture.manifest["artifacts"] = [  # type: ignore[index]
+            item
+            for item in fixture.manifest["artifacts"]  # type: ignore[union-attr]
+            if item["path"] != "/usr/local/bin/nats-server"
+        ]
+        fixture.authorize_manifest()
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(
+            self.check(result, "release_manifest_identity")["reason"],
+            "manifest_required_artifact_missing",
+        )
+
+    def test_timer_triggered_service_outcome_fails_closed(self) -> None:
+        timer = "sentinel-health-monitor.timer"
+        service = preflight.TIMER_SERVICES[timer]
+        mutations = (
+            (
+                "never_run",
+                lambda fixture: fixture.unit_facts[timer].__setitem__(
+                    "LastTriggerUSecMonotonic", "0"
+                ),
+                "systemd_timer_never_ran",
+            ),
+            (
+                "running",
+                lambda fixture: fixture.unit_facts[service].update(
+                    {"ActiveState": "active", "SubState": "running"}
+                ),
+                "systemd_timer_outcome_failed",
+            ),
+            (
+                "failed",
+                lambda fixture: fixture.unit_facts[service].update(
+                    {"Result": "failed", "ExecMainStatus": "1"}
+                ),
+                "systemd_timer_outcome_failed",
+            ),
+            (
+                "stale",
+                lambda fixture: fixture.unit_facts[service].update(
+                    {
+                        "ExecMainStartTimestampMonotonic": str(
+                            int(
+                                fixture.unit_facts[timer][
+                                    "LastTriggerUSecMonotonic"
+                                ]
+                            )
+                            - 1
+                        )
+                    }
+                ),
+                "systemd_timer_outcome_stale",
+            ),
+            (
+                "mismatched_unit",
+                lambda fixture: fixture.unit_facts[timer].__setitem__(
+                    "Unit", "sentinel-nightrun.service"
+                ),
+                "systemd_timer_not_ready",
+            ),
+            (
+                "missing_completion",
+                lambda fixture: fixture.unit_facts[service].__setitem__(
+                    "ExecMainExitTimestampMonotonic", "0"
+                ),
+                "systemd_timer_outcome_missing",
+            ),
+        )
+        for name, mutate, reason in mutations:
+            with self.subTest(name=name):
+                fixture = Fixture()
+                mutate(fixture)
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertEqual(self.check(result, "systemd_units")["reason"], reason)
 
     def test_missing_or_duplicate_required_unit_fails(self) -> None:
         wants = self.fixture.unit_facts[preflight.TARGET_UNIT]["Wants"].split()
@@ -801,10 +1023,11 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(self.check(result, "required_listeners")["reason"], "listener_contract_mismatch")
 
     def test_protected_listener_multiset_rejects_extra_family_and_duplicate(self) -> None:
+        daemon_pid = self.fixture.main_pids["sentinel-daemon.service"]
         cases = (
-            ("wildcard", "ipv4", b"tcp LISTEN 0 128 0.0.0.0:8084 0.0.0.0:*\n"),
-            ("ipv6", "ipv6", b"tcp LISTEN 0 128 [::]:8084 [::]:*\n"),
-            ("duplicate", "ipv4", b"tcp LISTEN 0 128 127.0.0.1:8084 0.0.0.0:*\n"),
+            ("wildcard", "ipv4", f'tcp LISTEN 0 128 0.0.0.0:8084 0.0.0.0:* users:(("service",pid={daemon_pid},fd=7))\n'.encode()),
+            ("ipv6", "ipv6", f'tcp LISTEN 0 128 [::]:8084 [::]:* users:(("service",pid={daemon_pid},fd=7))\n'.encode()),
+            ("duplicate", "ipv4", f'tcp LISTEN 0 128 127.0.0.1:8084 0.0.0.0:* users:(("service",pid={daemon_pid},fd=8))\n'.encode()),
         )
         for name, family, line in cases:
             with self.subTest(name=name):
@@ -833,6 +1056,53 @@ class PreflightTests(unittest.TestCase):
     def test_unrelated_listener_is_allowed(self) -> None:
         self.fixture.listeners_v4 += b"tcp LISTEN 0 128 0.0.0.0:9999 0.0.0.0:*\n"
         self.assertTrue(self.run_fixture()["runtime_preflight_pass"])
+
+    def test_listener_process_owner_is_required_and_exact(self) -> None:
+        unit = "sentinel-daemon.service"
+        correct_pid = self.fixture.main_pids[unit]
+        marker = f'users:(("service",pid={correct_pid},fd=7))'.encode()
+        cases = (
+            ("omitted", b"", "listener_process_ambiguous"),
+            (
+                "foreign",
+                f'users:(("foreign",pid={correct_pid + 999},fd=7))'.encode(),
+                "listener_process_mismatch",
+            ),
+            (
+                "ambiguous",
+                (
+                    f'users:(("service",pid={correct_pid},fd=7),'
+                    f'("foreign",pid={correct_pid + 1},fd=8))'
+                ).encode(),
+                "listener_process_ambiguous",
+            ),
+        )
+        for name, replacement, reason in cases:
+            with self.subTest(name=name):
+                fixture = Fixture()
+                fixture.listeners_v4 = fixture.listeners_v4.replace(
+                    marker, replacement, 1
+                )
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertEqual(
+                    self.check(result, "required_listeners")["reason"], reason
+                )
+
+    def test_default_running_executable_hash_binds_proc_object(self) -> None:
+        executable = Path(sys.executable).resolve()
+        expected = hashlib.sha256(executable.read_bytes()).hexdigest()
+        self.assertEqual(
+            preflight.default_hash_running_executable(
+                os.getpid(), executable, preflight.MAX_ARTIFACT_BYTES
+            ),
+            (expected, executable.stat().st_size),
+        )
+        with self.assertRaisesRegex(
+            preflight.PreflightError, "running_executable_identity_mismatch"
+        ):
+            preflight.default_hash_running_executable(
+                os.getpid(), Path("/usr/bin/true"), preflight.MAX_ARTIFACT_BYTES
+            )
 
     def test_http_malformed_and_duplicate_json_fail(self) -> None:
         url = "http://127.0.0.1:8080/health"
@@ -868,7 +1138,7 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(self.check(result, "loopback_health")["reason"], "http_content_type")
 
         fixture = Fixture()
-        ss_argv = ("/usr/bin/ss", "-H", "-lntu", "-4")
+        ss_argv = ("/usr/bin/ss", "-H", "-lntup", "-4")
         fixture.command_overrides[ss_argv] = preflight.PreflightError("command_failed")
         result = preflight.evaluate(fixture.inputs(), fixture.deps())
         self.assertEqual(self.check(result, "required_listeners")["reason"], "command_failed")
@@ -1089,6 +1359,7 @@ shift_set = 0
             deps.https,
             deps.read_file,
             deps.hash_file,
+            deps.hash_running_executable,
             deps.list_agents,
             lambda path, limit: (_ for _ in ()).throw(
                 preflight.PreflightError("credential_permissions_invalid")

@@ -50,6 +50,22 @@ REQUIRED_SERVICES = {
 }
 REQUIRED_TIMERS = {"sentinel-health-monitor.timer", "sentinel-nightrun.timer"}
 REQUIRED_UNITS = REQUIRED_SERVICES | REQUIRED_TIMERS
+SERVICE_EXECUTABLES = {
+    "nats-server.service": Path("/usr/local/bin/nats-server"),
+    "sentinel-daemon.service": Path("/opt/sentinel/bin/sentinel-daemon"),
+    "sentinel-dashboard-backend.service": Path(
+        "/opt/sentinel/bin/sentinel-dashboard-backend"
+    ),
+    "sentinel-gaia-loop.service": Path("/opt/sentinel/bin/sentinel-gaia-loop"),
+    "sentinel-gateway.service": Path("/opt/sentinel/bin/cortex-gateway"),
+    "sentinel-judge.service": Path("/opt/sentinel/bin/sentinel-judge"),
+    "sentinel-nats-bridge.service": Path("/opt/sentinel/bin/sentinel-nats-bridge"),
+    "sentinel-projection.service": Path("/opt/sentinel/bin/sentinel-projection"),
+}
+TIMER_SERVICES = {
+    "sentinel-health-monitor.timer": "sentinel-health-monitor.service",
+    "sentinel-nightrun.timer": "sentinel-nightrun.service",
+}
 M0_CONTRACT_PATH = Path("/opt/sentinel/config/product-acceptance/m0-contract.toml")
 M0_PROFILE_PATH = Path("/opt/sentinel/config/work-profiles/web-project-v1.toml")
 M0_WORKBENCH_PROFILE_PATH = Path(
@@ -68,6 +84,18 @@ EXPECTED_LISTENERS = {
     ("tcp", "ipv4", "127.0.0.1", 9090),
 }
 PROTECTED_LISTENER_PORTS = {item[3] for item in EXPECTED_LISTENERS}
+LISTENER_SERVICES = {
+    ("tcp", "ipv4", "127.0.0.1", 4222): "nats-server.service",
+    ("tcp", "ipv4", "127.0.0.1", 8001): "sentinel-dashboard-backend.service",
+    ("udp", "ipv4", "127.0.0.1", 8001): "sentinel-dashboard-backend.service",
+    ("tcp", "ipv4", "0.0.0.0", 8080): "sentinel-gateway.service",
+    ("tcp", "ipv4", "127.0.0.1", 8081): "sentinel-gateway.service",
+    ("tcp", "ipv4", "0.0.0.0", 8082): "sentinel-judge.service",
+    ("tcp", "ipv4", "127.0.0.1", 8083): "sentinel-nats-bridge.service",
+    ("tcp", "ipv4", "127.0.0.1", 8084): "sentinel-daemon.service",
+    ("tcp", "ipv4", "127.0.0.1", 8222): "nats-server.service",
+    ("tcp", "ipv4", "127.0.0.1", 9090): "sentinel-daemon.service",
+}
 HTTP_CONTRACTS = (
     ("gateway_health", "http://127.0.0.1:8080/health", None, "status", "ok"),
     ("gateway_ready", "http://127.0.0.1:8080/ready", None, "ready", True),
@@ -166,6 +194,7 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
         "services/sentinel-nats-bridge/sentinel-nats-bridge",
         "binary",
     ),
+    "/usr/local/bin/nats-server": ("external/nats-server", "binary"),
     "/opt/sentinel/config/daemon.toml": ("config/daemon.toml", "config"),
     "/opt/sentinel/config/cortex-gateway.toml": ("config/cortex-gateway.toml", "config"),
     "/opt/sentinel/config/nightrun.toml": ("config/nightrun.toml", "config"),
@@ -333,6 +362,7 @@ HttpReader = Callable[[str, str | None, float, int], bytes]
 HttpsReader = Callable[[str, float, int, bytes, str], bytes]
 FileReader = Callable[[Path, int], bytes]
 ArtifactHasher = Callable[[Path, int], tuple[str, int]]
+RunningExecutableHasher = Callable[[int, Path, int], tuple[str, int]]
 
 
 @dataclass(frozen=True)
@@ -357,6 +387,7 @@ class Dependencies:
     https: HttpsReader
     read_file: FileReader
     hash_file: ArtifactHasher
+    hash_running_executable: RunningExecutableHasher
     list_agents: Callable[[Path], list[Path]]
     read_secret: FileReader
 
@@ -547,6 +578,82 @@ def default_hash_file(path: Path, limit: int) -> tuple[str, int]:
         if total != expected_size:
             raise PreflightError("unsafe_file")
         return digest.hexdigest(), total
+
+
+def _hash_descriptor(fd: int, expected_size: int, limit: int) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        block = os.read(fd, 1024 * 1024)
+        if not block:
+            break
+        total += len(block)
+        if total > limit:
+            raise PreflightError("artifact_oversized")
+        digest.update(block)
+    if total != expected_size:
+        raise PreflightError("running_executable_identity_mismatch")
+    return digest.hexdigest(), total
+
+
+def default_hash_running_executable(
+    pid: int, installed_path: Path, limit: int
+) -> tuple[str, int]:
+    if pid <= 0:
+        raise PreflightError("systemd_main_pid_invalid")
+    try:
+        with _pinned_regular_file(
+            installed_path,
+            limit,
+            owner_only=False,
+            oversized_code="artifact_oversized",
+        ) as (installed_fd, installed_size):
+            installed = os.fstat(installed_fd)
+            installed_digest, _ = _hash_descriptor(installed_fd, installed_size, limit)
+            with _pinned_directory(Path("/proc") / str(pid)) as process_fd:
+                executable_fd = os.open(
+                    "exe", os.O_RDONLY | os.O_CLOEXEC, dir_fd=process_fd
+                )
+                try:
+                    running = os.fstat(executable_fd)
+                    _validate_regular_metadata(running, owner_only=False)
+                    if (running.st_dev, running.st_ino) != (
+                        installed.st_dev,
+                        installed.st_ino,
+                    ):
+                        raise PreflightError("running_executable_identity_mismatch")
+                    running_digest, running_size = _hash_descriptor(
+                        executable_fd, running.st_size, limit
+                    )
+                    verify_fd = os.open(
+                        "exe", os.O_RDONLY | os.O_CLOEXEC, dir_fd=process_fd
+                    )
+                    try:
+                        verified = os.fstat(verify_fd)
+                        if (verified.st_dev, verified.st_ino) != (
+                            running.st_dev,
+                            running.st_ino,
+                        ):
+                            raise PreflightError("running_executable_identity_race")
+                    finally:
+                        os.close(verify_fd)
+                finally:
+                    os.close(executable_fd)
+            if not hmac.compare_digest(running_digest, installed_digest):
+                raise PreflightError("running_executable_hash_mismatch")
+            return running_digest, running_size
+    except PreflightError as exc:
+        if exc.code in {
+            "unsafe_file",
+            "unsafe_file_mode",
+            "unsafe_path_component",
+            "file_unavailable",
+        }:
+            raise PreflightError("running_executable_identity_mismatch") from exc
+        raise
+    except OSError as exc:
+        raise PreflightError("running_executable_unavailable") from exc
 
 
 def default_read_file(path: Path, limit: int) -> bytes:
@@ -761,6 +868,7 @@ DEFAULT_DEPENDENCIES = Dependencies(
     default_https,
     default_read_file,
     default_hash_file,
+    default_hash_running_executable,
     default_list_agents,
     default_read_secret,
 )
@@ -893,7 +1001,9 @@ def validate_contract_profile_roster(
     return evidence, roster
 
 
-def validate_manifest(inputs: Inputs, deps: Dependencies) -> dict[str, Any]:
+def validate_manifest(
+    inputs: Inputs, deps: Dependencies
+) -> tuple[dict[str, Any], dict[str, dict[str, str | int]]]:
     manifest_bytes = deps.read_file(inputs.manifest, MAX_FILE_BYTES)
     if not DIGEST_RE.fullmatch(inputs.expected_manifest_sha256):
         raise PreflightError("manifest_authority_digest_invalid")
@@ -916,6 +1026,7 @@ def validate_manifest(inputs: Inputs, deps: Dependencies) -> dict[str, Any]:
     seen_paths: set[str] = set()
     seen_sources: set[str] = set()
     verified: list[dict[str, str | int]] = []
+    artifact_authority: dict[str, dict[str, str | int]] = {}
     for item in artifacts:
         item = require_dict(item, "manifest_artifact_shape")
         if set(item) != {"path", "source", "sha256", "type"}:
@@ -955,14 +1066,25 @@ def validate_manifest(inputs: Inputs, deps: Dependencies) -> dict[str, Any]:
                 "size": size,
             }
         )
+        artifact_authority[path_text] = {
+            "sha256": actual,
+            "size": size,
+            "source": source,
+            "type": kind,
+        }
     if seen_paths != set(CANONICAL_RELEASE_ARTIFACTS):
         raise PreflightError("manifest_required_artifact_missing")
-    return {
-        "artifact_count": len(verified),
-        "artifact_set_digest": evidence_digest(sorted(verified, key=lambda row: row["path_digest"])),
-        "git_sha": manifest["git_sha"],
-        "manifest_sha256": manifest_sha256,
-    }
+    return (
+        {
+            "artifact_count": len(verified),
+            "artifact_set_digest": evidence_digest(
+                sorted(verified, key=lambda row: row["path_digest"])
+            ),
+            "git_sha": manifest["git_sha"],
+            "manifest_sha256": manifest_sha256,
+        },
+        artifact_authority,
+    )
 
 
 def parse_key_values(data: bytes) -> dict[str, str]:
@@ -999,7 +1121,22 @@ def systemctl_show(
     )
 
 
-def validate_systemd(deps: Dependencies, timeout: float) -> dict[str, Any]:
+def systemd_uint(value: Any, code: str, *, positive: bool = False) -> int:
+    if not isinstance(value, str) or not value.isdecimal():
+        raise PreflightError(code)
+    parsed = int(value)
+    if positive and parsed <= 0:
+        raise PreflightError(code)
+    return parsed
+
+
+def validate_systemd(
+    deps: Dependencies,
+    timeout: float,
+    artifact_authority: dict[str, dict[str, str | int]],
+) -> tuple[dict[str, Any], dict[str, int]]:
+    if set(SERVICE_EXECUTABLES) != REQUIRED_SERVICES or set(TIMER_SERVICES) != REQUIRED_TIMERS:
+        raise PreflightError("systemd_authority_map_invalid")
     target_properties = (
         "Id",
         "LoadState",
@@ -1007,6 +1144,7 @@ def validate_systemd(deps: Dependencies, timeout: float) -> dict[str, Any]:
         "SubState",
         "FragmentPath",
         "Wants",
+        "NeedDaemonReload",
     )
     target = systemctl_show(TARGET_UNIT, target_properties, deps, timeout)
     if set(target) != set(target_properties):
@@ -1020,20 +1158,25 @@ def validate_systemd(deps: Dependencies, timeout: float) -> dict[str, Any]:
         "ActiveState": "active",
         "SubState": "active",
         "FragmentPath": "/etc/systemd/system/sentinel.target",
+        "NeedDaemonReload": "no",
     }
     for key, value in expected_target.items():
         if target.get(key) != value:
             raise PreflightError("systemd_target_not_ready")
     unit_facts: list[dict[str, str]] = []
-    for unit in sorted(REQUIRED_UNITS):
-        is_service = unit in REQUIRED_SERVICES
+    main_pids: dict[str, int] = {}
+    for unit in sorted(REQUIRED_SERVICES):
         properties = (
             "Id",
             "LoadState",
             "ActiveState",
             "SubState",
             "Result",
-        ) + (("NRestarts",) if is_service else ()) + ("FragmentPath",)
+            "NRestarts",
+            "FragmentPath",
+            "NeedDaemonReload",
+            "MainPID",
+        )
         facts = systemctl_show(unit, properties, deps, timeout)
         if set(facts) != set(properties):
             raise PreflightError("systemd_unit_shape")
@@ -1041,17 +1184,154 @@ def validate_systemd(deps: Dependencies, timeout: float) -> dict[str, Any]:
             "Id": unit,
             "LoadState": "loaded",
             "ActiveState": "active",
-            "SubState": "running" if is_service else "waiting",
+            "SubState": "running",
             "Result": "success",
-            **({"NRestarts": "0"} if is_service else {}),
+            "NRestarts": "0",
             "FragmentPath": f"/etc/systemd/system/{unit}",
+            "NeedDaemonReload": "no",
         }
         for key, value in expected.items():
             if facts.get(key) != value:
                 raise PreflightError("systemd_unit_not_ready")
-        fragment = facts["FragmentPath"]
-        unit_facts.append({"unit": unit, "fragment_digest": hashlib.sha256(fragment.encode("ascii")).hexdigest()})
-    return {"required_unit_count": len(REQUIRED_UNITS), "unit_set_digest": evidence_digest(unit_facts)}
+        main_pid = systemd_uint(facts.get("MainPID"), "systemd_main_pid_invalid", positive=True)
+        executable = SERVICE_EXECUTABLES[unit]
+        manifest_record = artifact_authority.get(str(executable))
+        if manifest_record is None:
+            raise PreflightError("service_executable_manifest_missing")
+        expected_digest = manifest_record.get("sha256")
+        expected_size = manifest_record.get("size")
+        if not isinstance(expected_digest, str) or not isinstance(expected_size, int):
+            raise PreflightError("service_executable_manifest_invalid")
+        running_digest, running_size = deps.hash_running_executable(
+            main_pid, executable, MAX_ARTIFACT_BYTES
+        )
+        if (
+            not hmac.compare_digest(running_digest, expected_digest)
+            or running_size != expected_size
+        ):
+            raise PreflightError("running_executable_hash_mismatch")
+        identity_properties = (
+            "Id",
+            "MainPID",
+            "ActiveState",
+            "SubState",
+            "NeedDaemonReload",
+        )
+        identity = systemctl_show(unit, identity_properties, deps, timeout)
+        if set(identity) != set(identity_properties):
+            raise PreflightError("systemd_service_identity_shape")
+        if identity != {key: facts[key] for key in identity_properties}:
+            raise PreflightError("systemd_service_identity_changed")
+        main_pids[unit] = main_pid
+        unit_facts.append(
+            {
+                "unit": unit,
+                "fragment_digest": hashlib.sha256(
+                    facts["FragmentPath"].encode("ascii")
+                ).hexdigest(),
+                "executable_digest": running_digest,
+            }
+        )
+
+    timer_outcomes: list[dict[str, str]] = []
+    for timer in sorted(REQUIRED_TIMERS):
+        service = TIMER_SERVICES[timer]
+        timer_properties = (
+            "Id",
+            "LoadState",
+            "ActiveState",
+            "SubState",
+            "Result",
+            "FragmentPath",
+            "NeedDaemonReload",
+            "Unit",
+            "LastTriggerUSecMonotonic",
+        )
+        timer_facts = systemctl_show(timer, timer_properties, deps, timeout)
+        if set(timer_facts) != set(timer_properties):
+            raise PreflightError("systemd_timer_shape")
+        expected_timer = {
+            "Id": timer,
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "waiting",
+            "Result": "success",
+            "FragmentPath": f"/etc/systemd/system/{timer}",
+            "NeedDaemonReload": "no",
+            "Unit": service,
+        }
+        if any(timer_facts.get(key) != value for key, value in expected_timer.items()):
+            raise PreflightError("systemd_timer_not_ready")
+        trigger = systemd_uint(
+            timer_facts.get("LastTriggerUSecMonotonic"),
+            "systemd_timer_never_ran",
+            positive=True,
+        )
+        outcome_properties = (
+            "Id",
+            "LoadState",
+            "ActiveState",
+            "SubState",
+            "Result",
+            "FragmentPath",
+            "NeedDaemonReload",
+            "ExecMainCode",
+            "ExecMainStatus",
+            "ExecMainStartTimestampMonotonic",
+            "ExecMainExitTimestampMonotonic",
+        )
+        outcome = systemctl_show(service, outcome_properties, deps, timeout)
+        if set(outcome) != set(outcome_properties):
+            raise PreflightError("systemd_timer_outcome_shape")
+        expected_outcome = {
+            "Id": service,
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+            "FragmentPath": f"/etc/systemd/system/{service}",
+            "NeedDaemonReload": "no",
+            "ExecMainCode": "1",
+            "ExecMainStatus": "0",
+        }
+        if any(outcome.get(key) != value for key, value in expected_outcome.items()):
+            raise PreflightError("systemd_timer_outcome_failed")
+        started = systemd_uint(
+            outcome.get("ExecMainStartTimestampMonotonic"),
+            "systemd_timer_outcome_missing",
+            positive=True,
+        )
+        exited = systemd_uint(
+            outcome.get("ExecMainExitTimestampMonotonic"),
+            "systemd_timer_outcome_missing",
+            positive=True,
+        )
+        if not trigger <= started <= exited:
+            raise PreflightError("systemd_timer_outcome_stale")
+        timer_outcomes.append(
+            {
+                "timer": timer,
+                "service": service,
+                "outcome_digest": evidence_digest(
+                    {
+                        "trigger": trigger,
+                        "started": started,
+                        "exited": exited,
+                        "result": outcome["Result"],
+                    }
+                ),
+            }
+        )
+    return (
+        {
+            "required_unit_count": len(REQUIRED_UNITS),
+            "service_executable_count": len(main_pids),
+            "timer_outcome_count": len(timer_outcomes),
+            "unit_set_digest": evidence_digest(unit_facts),
+            "timer_outcome_digest": evidence_digest(timer_outcomes),
+        },
+        main_pids,
+    )
 
 
 def split_listener(value: str, family: str) -> tuple[str, int]:
@@ -1078,11 +1358,16 @@ def split_listener(value: str, family: str) -> tuple[str, int]:
     return address.compressed, parsed_port
 
 
-def validate_listeners(deps: Dependencies, timeout: float) -> dict[str, Any]:
+def validate_listeners(
+    deps: Dependencies, timeout: float, main_pids: dict[str, int]
+) -> dict[str, Any]:
+    if set(LISTENER_SERVICES) != EXPECTED_LISTENERS:
+        raise PreflightError("listener_authority_map_invalid")
     observed: Counter[tuple[str, str, str, int]] = Counter()
+    ownership: list[dict[str, str | int]] = []
     for family, option in (("ipv4", "-4"), ("ipv6", "-6")):
         raw = deps.command(
-            ["/usr/bin/ss", "-H", "-lntu", option], timeout, MAX_COMMAND_BYTES
+            ["/usr/bin/ss", "-H", "-lntup", option], timeout, MAX_COMMAND_BYTES
         )
         try:
             lines = raw.decode("utf-8").splitlines()
@@ -1094,12 +1379,40 @@ def validate_listeners(deps: Dependencies, timeout: float) -> dict[str, Any]:
                 raise PreflightError("listener_invalid")
             host, port = split_listener(fields[4], family)
             if port in PROTECTED_LISTENER_PORTS:
-                observed[(fields[0], family, host, port)] += 1
+                listener = (fields[0], family, host, port)
+                service = LISTENER_SERVICES.get(listener)
+                if service is None:
+                    raise PreflightError("listener_contract_mismatch")
+                process_ids = {
+                    int(value) for value in re.findall(r"\bpid=(\d+)\b", line)
+                }
+                if len(process_ids) != 1:
+                    raise PreflightError("listener_process_ambiguous")
+                expected_pid = main_pids.get(service)
+                if expected_pid is None or process_ids != {expected_pid}:
+                    raise PreflightError("listener_process_mismatch")
+                observed[listener] += 1
+                ownership.append(
+                    {
+                        "protocol": fields[0],
+                        "family": family,
+                        "port": port,
+                        "service": service,
+                    }
+                )
     if observed != Counter(EXPECTED_LISTENERS):
         raise PreflightError("listener_contract_mismatch")
     return {
         "required_listener_count": len(EXPECTED_LISTENERS),
         "listener_set_digest": evidence_digest(sorted(EXPECTED_LISTENERS)),
+        "listener_owner_digest": evidence_digest(
+            sorted(
+                ownership,
+                key=lambda item: (
+                    item["protocol"], item["family"], item["port"], item["service"]
+                ),
+            )
+        ),
     }
 
 
@@ -1573,11 +1886,52 @@ def evaluate(inputs: Inputs, deps: Dependencies = DEFAULT_DEPENDENCIES) -> dict[
     checks.append(contract_result)
     roster = roster_cache.get("value") if contract_data is not None else None
 
-    manifest_result, _ = check_result("release_manifest_identity", lambda: validate_manifest(inputs, deps))
+    manifest_cache: dict[str, Any] = {}
+
+    def manifest_check() -> dict[str, Any]:
+        evidence, authority = validate_manifest(inputs, deps)
+        manifest_cache["authority"] = authority
+        return evidence
+
+    manifest_result, manifest_evidence = check_result(
+        "release_manifest_identity", manifest_check
+    )
     checks.append(manifest_result)
-    systemd_result, _ = check_result("systemd_units", lambda: validate_systemd(deps, inputs.timeout_seconds))
+    systemd_cache: dict[str, Any] = {}
+
+    def systemd_check() -> dict[str, Any]:
+        evidence, main_pids = validate_systemd(
+            deps, inputs.timeout_seconds, manifest_cache["authority"]
+        )
+        systemd_cache["main_pids"] = main_pids
+        return evidence
+
+    if manifest_evidence is None:
+        systemd_result, systemd_evidence = check_result(
+            "systemd_units",
+            lambda: (_ for _ in ()).throw(
+                PreflightError("manifest_dependency_failed")
+            ),
+        )
+    else:
+        systemd_result, systemd_evidence = check_result(
+            "systemd_units", systemd_check
+        )
     checks.append(systemd_result)
-    listener_result, _ = check_result("required_listeners", lambda: validate_listeners(deps, inputs.timeout_seconds))
+    if systemd_evidence is None:
+        listener_result, _ = check_result(
+            "required_listeners",
+            lambda: (_ for _ in ()).throw(
+                PreflightError("systemd_dependency_failed")
+            ),
+        )
+    else:
+        listener_result, _ = check_result(
+            "required_listeners",
+            lambda: validate_listeners(
+                deps, inputs.timeout_seconds, systemd_cache["main_pids"]
+            ),
+        )
     checks.append(listener_result)
 
     secret_cache: dict[str, str] = {}
