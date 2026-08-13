@@ -395,7 +395,7 @@ id = "web-authoring-v1"
             "adapter_handle_present": True,
             "adapter_instance_matches": True,
             "runtime_resources_healthy": True,
-            "adapter_health_state": "Healthy",
+            "adapter_health_state": "healthy",
             "adapter_observation_error": None,
             "logical_status": "Active",
             "last_repair_status": "healthy",
@@ -649,6 +649,13 @@ id = "web-authoring-v1"
 
 
 class PreflightTests(unittest.TestCase):
+    def test_nats_contract_requires_jetstream_readiness(self) -> None:
+        contracts = {name: url for name, url, *_rest in preflight.HTTP_CONTRACTS}
+        self.assertEqual(
+            contracts["nats_health"],
+            "http://127.0.0.1:8222/healthz?js-enabled-only=true",
+        )
+
     def setUp(self) -> None:
         self.fixture = Fixture()
 
@@ -879,6 +886,20 @@ class PreflightTests(unittest.TestCase):
         runtime["stale_runtime_entries"] = 1
         result = self.run_fixture()
         self.assertEqual(self.check(result, "identity_readiness")["reason"], "runtime_drift")
+
+    def test_full_preflight_rejects_projection_absent_during_daemon_local_boot(self) -> None:
+        runtime = self.fixture.http_payloads["runtime_health"]
+        runtime["projection_agents"] = 0
+        runtime["projection_drift_detected"] = True
+        runtime["projection_drift_agents"] = runtime["expected_active_agents"]
+        runtime["stale_runtime_entries"] = runtime["expected_active_agents"]
+        runtime["repair_last_status"] = "drift_detected"
+        for agent in runtime["agents"]:
+            agent["projection_present"] = False
+        result = self.run_fixture()
+        self.assertEqual(
+            self.check(result, "identity_readiness")["reason"], "runtime_drift"
+        )
 
     def test_runtime_roster_mismatch_fails(self) -> None:
         runtime = self.fixture.http_payloads["runtime_health"]
