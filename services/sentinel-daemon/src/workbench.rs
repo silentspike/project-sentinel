@@ -3675,11 +3675,11 @@ mod tests {
 
         authority.assignment_active = false;
         let error = match coordinator.poll(
-                &mut runtime,
-                &request.invocation_id,
-                &authority,
-                1_900_000_000_001,
-            ) {
+            &mut runtime,
+            &request.invocation_id,
+            &authority,
+            1_900_000_000_001,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("poll unexpectedly succeeded after authority revocation"),
         };
@@ -3731,12 +3731,8 @@ mod tests {
         };
         let coordinator = WorkbenchCoordinator::new(&store, &profile, &profile_digest);
 
-        let error = match coordinator.submit(
-            &mut runtime,
-            &request,
-            &authority,
-            1_900_000_000_000,
-        ) {
+        let error = match coordinator.submit(&mut runtime, &request, &authority, 1_900_000_000_000)
+        {
             Err(error) => error,
             Ok(_) => panic!("submit unexpectedly succeeded after authority revocation"),
         };
@@ -3793,12 +3789,8 @@ mod tests {
         };
         let coordinator = WorkbenchCoordinator::new(&store, &profile, &profile_digest);
 
-        let error = match coordinator.submit(
-            &mut runtime,
-            &request,
-            &authority,
-            1_900_000_000_000,
-        ) {
+        let error = match coordinator.submit(&mut runtime, &request, &authority, 1_900_000_000_000)
+        {
             Err(error) => error,
             Ok(_) => panic!("submit unexpectedly succeeded with a stale World guard"),
         };
@@ -3923,12 +3915,12 @@ mod tests {
         let coordinator = WorkbenchCoordinator::new(&store, &profile, &profile_digest);
 
         let error = match coordinator.cancel(
-                &mut runtime,
-                &request.invocation_id,
-                "operator_cancelled",
-                &authority,
-                1_900_000_000_001,
-            ) {
+            &mut runtime,
+            &request.invocation_id,
+            "operator_cancelled",
+            &authority,
+            1_900_000_000_001,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("cancel unexpectedly succeeded after authority revocation"),
         };
