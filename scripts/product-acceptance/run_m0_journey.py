@@ -447,12 +447,12 @@ def validate_assertions(
             raise JourneyError(f"step {step_id} has an invalid {field} assertion")
         if set(assertion) not in ({"pointer", "present"}, {"pointer", "equals"}):
             raise JourneyError(f"step {step_id} {field} assertion shape is invalid")
-        pointer = validate_pointer(assertion["pointer"], f"step {step_id} {field}")
-        pointer_parts = [
-            part.replace("~1", "/").replace("~0", "~")
-            for part in pointer.removeprefix("/").split("/")
-            if part
-        ]
+        pointer = validate_pointer(
+            assertion["pointer"],
+            f"step {step_id} {field}",
+            require_non_root=reject_sensitive_pointer,
+        )
+        pointer_parts = decode_pointer_parts(pointer)
         if reject_sensitive_pointer and any(
             SENSITIVE_KEY_RE.search(part) for part in pointer_parts
         ):
@@ -465,6 +465,13 @@ def validate_assertions(
                 available_references,
                 f"step {step_id} {field}",
             )
+            validate_public_structure(
+                assertion["equals"], f"step {step_id} {field} equals"
+            )
+            if not public_safe(assertion["equals"]):
+                raise JourneyError(
+                    f"step {step_id} {field} equals is not public-safe"
+                )
 
 
 def validate_observe_contract(value: object, step_id: str) -> None:
@@ -698,13 +705,11 @@ def validate_plan(plan: dict[str, Any]) -> None:
             if set(specification) != {"pointer", "type"}:
                 raise JourneyError(f"step {step_id} capture must declare pointer and type")
             pointer = validate_pointer(
-                specification["pointer"], f"step {step_id} capture"
+                specification["pointer"],
+                f"step {step_id} capture",
+                require_non_root=schema_version == SCHEMA_VERSION_V2,
             )
-            pointer_parts = [
-                part.replace("~1", "/").replace("~0", "~")
-                for part in pointer.removeprefix("/").split("/")
-                if part
-            ]
+            pointer_parts = decode_pointer_parts(pointer)
             if SENSITIVE_KEY_RE.search(name) or any(
                 SENSITIVE_KEY_RE.search(part) for part in pointer_parts
             ):
@@ -773,9 +778,34 @@ def validate_plan(plan: dict[str, Any]) -> None:
         raise JourneyError("plan must contain at least one explicit negative probe")
 
 
-def validate_pointer(pointer: object, label: str) -> str:
+def decode_pointer_parts(pointer: str) -> list[str]:
+    if pointer == "":
+        return []
+    parts: list[str] = []
+    for encoded_part in pointer[1:].split("/"):
+        index = 0
+        while index < len(encoded_part):
+            if encoded_part[index] != "~":
+                index += 1
+                continue
+            if index + 1 >= len(encoded_part) or encoded_part[index + 1] not in "01":
+                raise JourneyError("JSON pointer contains an invalid escape")
+            index += 2
+        parts.append(encoded_part.replace("~1", "/").replace("~0", "~"))
+    return parts
+
+
+def validate_pointer(
+    pointer: object, label: str, *, require_non_root: bool = False
+) -> str:
     if not isinstance(pointer, str) or (pointer != "" and not pointer.startswith("/")):
         raise JourneyError(f"{label} has an invalid JSON pointer")
+    try:
+        parts = decode_pointer_parts(pointer)
+    except JourneyError as exc:
+        raise JourneyError(f"{label} has an invalid JSON pointer escape") from exc
+    if require_non_root and (not pointer or not any(parts)):
+        raise JourneyError(f"{label} must target a non-root JSON pointer")
     return pointer
 
 
@@ -783,8 +813,7 @@ def pointer_get(value: Any, pointer: str) -> Any:
     if pointer == "":
         return value
     current = value
-    for encoded_part in pointer[1:].split("/"):
-        part = encoded_part.replace("~1", "/").replace("~0", "~")
+    for part in decode_pointer_parts(pointer):
         if isinstance(current, dict) and part in current:
             current = current[part]
         elif isinstance(current, list) and part.isdigit() and int(part) < len(current):
@@ -1132,11 +1161,9 @@ def validate_evidence_binding(
     path: Path,
     ledger: dict[str, Any],
     plan: dict[str, Any],
-) -> None:
+) -> bool:
     if not path.exists():
-        if ledger["completed"]:
-            raise JourneyError("resume evidence is missing for a non-empty ledger")
-        return
+        return bool(ledger["completed"])
     evidence = load_json(path, "journey evidence")
     required = {
         "schema_version",
@@ -1159,6 +1186,7 @@ def validate_evidence_binding(
         and isinstance(replay_steps, list)
         and all(isinstance(item, str) for item in replay_steps)
     )
+    record_count = evidence.get("record_count")
     if (
         set(evidence) != required
         or not structurally_valid
@@ -1167,9 +1195,9 @@ def validate_evidence_binding(
         or evidence.get("plan_digest") != ledger["plan_digest"]
         or evidence.get("provider_mode") != "token_free"
         or evidence.get("target_origin") != ledger["target_origin"]
-        or evidence.get("record_chain_tip") != ledger["chain_tip"]
-        or evidence.get("record_count") != len(ledger["completed"])
-        or isinstance(evidence.get("record_count"), bool)
+        or not isinstance(record_count, int)
+        or isinstance(record_count, bool)
+        or not 0 <= record_count <= len(ledger["completed"])
         or evidence.get("result") not in {"in_progress", "checkpoint_reached", "complete"}
         or (
             evidence.get("result") == "checkpoint_reached"
@@ -1189,23 +1217,45 @@ def validate_evidence_binding(
                 if step["id"] in ledger["completed"]
             }
         )
-        or not isinstance(evidence.get("steps"), list)
         or [item.get("id") for item in evidence["steps"]]
-        != [step["id"] for step in plan["steps"] if step["id"] in ledger["completed"]]
+        != [step["id"] for step in plan["steps"][:record_count]]
         or any(
             item != {"id": step_id, **ledger["completed"][step_id]}
             for item, step_id in zip(
                 evidence["steps"],
-                (
-                    step["id"]
-                    for step in plan["steps"]
-                    if step["id"] in ledger["completed"]
-                ),
+                (step["id"] for step in plan["steps"][:record_count]),
             )
         )
         or not public_safe(evidence)
     ):
         raise JourneyError("journey evidence does not match the resume ledger")
+    prefix_tip = (
+        ZERO_DIGEST
+        if record_count == 0
+        else ledger["completed"][plan["steps"][record_count - 1]["id"]][
+            "record_digest"
+        ]
+    )
+    last_checkpoint = (
+        None if record_count == 0 else plan["steps"][record_count - 1].get("checkpoint")
+    )
+    if (
+        evidence["record_chain_tip"] != prefix_tip
+        or len(evidence["steps"]) != record_count
+        or not set(evidence["replay_verified_steps"]).issubset(
+            {step["id"] for step in plan["steps"][:record_count]}
+        )
+        or (
+            evidence["result"] == "checkpoint_reached"
+            and (last_checkpoint is None or evidence["stopped_at"] != last_checkpoint)
+        )
+        or (
+            evidence["result"] == "complete"
+            and record_count != len(plan["steps"])
+        )
+    ):
+        raise JourneyError("journey evidence is not a canonical ledger prefix")
+    return record_count < len(ledger["completed"])
 
 
 def completed_references(completed: dict[str, Any]) -> dict[str, Any]:
@@ -1549,7 +1599,12 @@ def _run_journey_locked(
     )
     completed = ledger["completed"]
     validate_completed_prefix(plan, completed, ledger["chain_tip"])
-    validate_evidence_binding(evidence_path, ledger, plan)
+    evidence_needs_repair = validate_evidence_binding(evidence_path, ledger, plan)
+    if evidence_needs_repair:
+        atomic_json_write(
+            evidence_path,
+            build_evidence(plan, ledger, "in_progress", None, set()),
+        )
     references = completed_references(completed)
     stopped_at: str | None = None
     replay_verified_steps: set[str] = set()
