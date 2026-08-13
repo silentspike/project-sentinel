@@ -5,7 +5,10 @@
 //! accounting, safe error classification, and content-addressed artifacts.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, RwLock};
 
@@ -51,11 +54,26 @@ pub struct WorkbenchTestSuite {
 
 impl WorkbenchProfile {
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<(Self, String)> {
-        let metadata = fs::metadata(path.as_ref()).context("stat workbench profile")?;
-        if metadata.len() == 0 || metadata.len() > MAX_PROFILE_BYTES {
+        let path = path.as_ref();
+        let base = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("workbench profile base is unavailable"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("workbench profile name is unavailable"))?;
+        let (mut file, identity, canonical_path) =
+            open_secure_authority_file(base, Path::new(name), MAX_PROFILE_BYTES, None)
+                .context("open workbench profile authority")?;
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(MAX_PROFILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .context("read workbench profile")?;
+        ensure_path_identity(&canonical_path, identity)
+            .context("workbench profile identity changed during read")?;
+        if bytes.is_empty() || bytes.len() as u64 > MAX_PROFILE_BYTES {
             bail!("workbench profile size is outside the accepted boundary");
         }
-        let bytes = fs::read(path.as_ref()).context("read workbench profile")?;
         let profile: Self =
             toml::from_str(std::str::from_utf8(&bytes).context("workbench profile is not UTF-8")?)
                 .context("parse workbench profile")?;
@@ -144,6 +162,176 @@ fn hex_sha256(bytes: &[u8]) -> String {
         let _ = write!(output, "{byte:02x}");
     }
     output
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+fn current_daemon_uid() -> anyhow::Result<u32> {
+    fs::metadata("/proc/self")
+        .map(|metadata| metadata.uid())
+        .context("read daemon uid")
+}
+
+fn canonical_secure_authority_base(base: &Path) -> anyhow::Result<PathBuf> {
+    if !base.is_absolute() {
+        bail!("authority base must be absolute");
+    }
+    let mut current = PathBuf::new();
+    for component in base.components() {
+        match component {
+            std::path::Component::RootDir => current.push(std::path::MAIN_SEPARATOR_STR),
+            std::path::Component::Normal(component) => current.push(component),
+            _ => bail!("authority base is not canonical"),
+        }
+        let metadata = fs::symlink_metadata(&current).context("inspect authority base")?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("authority base contains an invalid component");
+        }
+    }
+    let canonical = fs::canonicalize(&current).context("resolve authority base")?;
+    if canonical != current {
+        bail!("authority base changed identity");
+    }
+    let metadata = fs::metadata(&canonical).context("inspect canonical authority base")?;
+    if metadata.uid() != current_daemon_uid()? || metadata.mode() & 0o022 != 0 {
+        bail!("authority base ownership or mode is unsafe");
+    }
+    Ok(canonical)
+}
+
+fn secure_authority_name(relative: &Path) -> anyhow::Result<&Path> {
+    let mut components = relative.components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        bail!("authority file name is invalid");
+    }
+    Ok(relative)
+}
+
+fn validate_authority_file_metadata(
+    metadata: &fs::Metadata,
+    max_bytes: u64,
+    exact_mode: Option<u32>,
+) -> anyhow::Result<FileIdentity> {
+    if !authority_file_metadata_is_safe(
+        metadata,
+        current_daemon_uid()?,
+        max_bytes,
+        exact_mode,
+    ) {
+        bail!("authority file identity or size is unsafe");
+    }
+    Ok(FileIdentity::from_metadata(metadata))
+}
+
+fn authority_file_metadata_is_safe(
+    metadata: &fs::Metadata,
+    expected_uid: u32,
+    max_bytes: u64,
+    exact_mode: Option<u32>,
+) -> bool {
+    let mode = metadata.mode() & 0o777;
+    metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.nlink() == 1
+        && metadata.uid() == expected_uid
+        && metadata.len() > 0
+        && metadata.len() <= max_bytes
+        && !exact_mode.map_or(mode & 0o022 != 0, |expected| mode != expected)
+}
+
+fn open_secure_authority_file(
+    base: &Path,
+    relative: &Path,
+    max_bytes: u64,
+    exact_mode: Option<u32>,
+) -> anyhow::Result<(File, FileIdentity, PathBuf)> {
+    let base = canonical_secure_authority_base(base)?;
+    let path = base.join(secure_authority_name(relative)?);
+    let before = fs::symlink_metadata(&path).context("inspect authority file")?;
+    let expected = validate_authority_file_metadata(&before, max_bytes, exact_mode)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .context("open authority file")?;
+    let opened = file.metadata().context("inspect opened authority file")?;
+    if FileIdentity::from_metadata(&opened) != expected {
+        bail!("authority file identity changed before open");
+    }
+    ensure_path_identity(&path, expected)?;
+    Ok((file, expected, path))
+}
+
+fn open_secure_store_file(
+    base: &Path,
+    relative: &Path,
+) -> anyhow::Result<(File, FileIdentity, PathBuf)> {
+    let base = canonical_secure_authority_base(base)?;
+    let path = base.join(secure_authority_name(relative)?);
+    let file = match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            validate_authority_file_metadata(&metadata, u64::MAX, Some(0o600))?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .context("open existing workbench store")?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .context("create workbench store")?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .context("set workbench store mode")?;
+            file.sync_all().context("sync new workbench store")?;
+            File::open(&base)
+                .and_then(|directory| directory.sync_all())
+                .context("sync workbench store directory")?;
+            file
+        }
+        Err(error) => return Err(error).context("inspect workbench store"),
+    };
+    let metadata = file.metadata().context("inspect opened workbench store")?;
+    let identity = FileIdentity::from_metadata(&metadata);
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != current_daemon_uid()?
+        || metadata.mode() & 0o777 != 0o600
+    {
+        bail!("opened workbench store identity or mode is unsafe");
+    }
+    ensure_path_identity(&path, identity)?;
+    Ok((file, identity, path))
+}
+
+fn ensure_path_identity(path: &Path, expected: FileIdentity) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path).context("reinspect authority file")?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.nlink() != 1
+        || FileIdentity::from_metadata(&metadata) != expected
+    {
+        bail!("authority file identity changed");
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -459,12 +647,18 @@ pub struct WorkbenchInvocationStore {
 impl WorkbenchInvocationStore {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
-        let db = Database::create(path).with_context(|| {
-            format!(
-                "failed to create/open workbench invocation store at {}",
-                path.display()
-            )
-        })?;
+        let base = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("workbench store base is unavailable"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("workbench store name is unavailable"))?;
+        let (file, identity, canonical_path) =
+            open_secure_store_file(base, Path::new(name)).context("open workbench store")?;
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let db = Database::create(&fd_path).context("create/open workbench invocation store")?;
+        ensure_path_identity(&canonical_path, identity)
+            .context("workbench store identity changed during open")?;
         let write = db.begin_write()?;
         {
             write.open_table(INVOCATIONS)?;
@@ -1039,9 +1233,12 @@ fn validate_concrete_artifact_manifest(
     let root = artifact_roots
         .get(&record.agent_id)
         .ok_or(WorkbenchStoreError::OutputRejected)?;
-    let scoped_root = root.join(&record.project_id).join(&record.work_item_id);
-    let scoped_root =
-        fs::canonicalize(&scoped_root).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let scoped_root = bind_daemon_artifact_scope(
+        root,
+        record.agent_id,
+        &record.project_id,
+        &record.work_item_id,
+    )?;
     let manifest_path = scoped_root.join(&artifact.manifest_path);
     let metadata =
         fs::symlink_metadata(&manifest_path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
@@ -1079,6 +1276,7 @@ fn validate_concrete_artifact_manifest(
     {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
+    let blobs_root = canonical_daemon_child_directory(&scoped_root, "blobs")?;
     let mut total_size = 0_u64;
     for entry in manifest.entries {
         let path = Path::new(&entry.path);
@@ -1100,7 +1298,7 @@ fn validate_concrete_artifact_manifest(
         total_size = total_size
             .checked_add(entry.size_bytes)
             .ok_or(WorkbenchStoreError::OutputRejected)?;
-        let blob = scoped_root.join("blobs").join(&entry.sha256);
+        let blob = blobs_root.join(&entry.sha256);
         let metadata =
             fs::symlink_metadata(&blob).map_err(|_| WorkbenchStoreError::OutputRejected)?;
         if metadata.file_type().is_symlink()
@@ -1116,6 +1314,83 @@ fn validate_concrete_artifact_manifest(
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
     Ok(())
+}
+
+fn bind_daemon_artifact_scope(
+    artifact_base: &Path,
+    agent_id: AgentId,
+    project_id: &str,
+    work_item_id: &str,
+) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let artifact_base = canonical_daemon_real_directory(artifact_base)?;
+    let agent_root = artifact_base
+        .parent()
+        .ok_or(WorkbenchStoreError::OutputRejected)?;
+    let marker = agent_root.join(".nano-runtime");
+    let metadata = fs::symlink_metadata(&marker).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let expected_workload = format!("AGENT-{:02}", agent_id.0);
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.nlink() != 1
+        || fs::read_to_string(&marker).ok().as_deref() != Some(expected_workload.as_str())
+    {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let project = canonical_daemon_child_directory(
+        &artifact_base,
+        daemon_scope_component(project_id)?,
+    )?;
+    canonical_daemon_child_directory(&project, daemon_scope_component(work_item_id)?)
+}
+
+fn daemon_scope_component(value: &str) -> anyhow::Result<&str> {
+    let mut components = Path::new(value).components();
+    if value.is_empty()
+        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    Ok(value)
+}
+
+fn canonical_daemon_child_directory(parent: &Path, child: &str) -> anyhow::Result<PathBuf> {
+    let path = parent.join(child);
+    let metadata = fs::symlink_metadata(&path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let canonical = fs::canonicalize(&path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    if canonical.parent() != Some(parent) {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    Ok(canonical)
+}
+
+fn canonical_daemon_real_directory(path: &Path) -> anyhow::Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => current.push(std::path::MAIN_SEPARATOR_STR),
+            std::path::Component::Normal(component) => current.push(component),
+            _ => return Err(WorkbenchStoreError::OutputRejected.into()),
+        }
+        let metadata =
+            fs::symlink_metadata(&current).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        }
+    }
+    let canonical = fs::canonicalize(&current).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    if canonical != current {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    Ok(canonical)
 }
 
 fn valid_lower_sha256(value: &str) -> bool {
@@ -1974,6 +2249,72 @@ mod tests {
     }
 
     #[test]
+    fn profile_authority_rejects_symlink_hardlink_mode_and_identity_replacement() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/workbench-profiles/web-authoring-v1.toml");
+        let safe = directory.path().join("profile.toml");
+        fs::copy(&source, &safe).unwrap();
+        fs::set_permissions(&safe, fs::Permissions::from_mode(0o600)).unwrap();
+        WorkbenchProfile::load(&safe).unwrap();
+
+        let symlink_path = directory.path().join("profile-link.toml");
+        symlink(&safe, &symlink_path).unwrap();
+        assert!(WorkbenchProfile::load(&symlink_path).is_err());
+
+        let hardlink_path = directory.path().join("profile-hardlink.toml");
+        fs::hard_link(&safe, &hardlink_path).unwrap();
+        assert!(WorkbenchProfile::load(&safe).is_err());
+        fs::remove_file(&hardlink_path).unwrap();
+
+        fs::set_permissions(&safe, fs::Permissions::from_mode(0o622)).unwrap();
+        assert!(WorkbenchProfile::load(&safe).is_err());
+        fs::set_permissions(&safe, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let metadata = fs::symlink_metadata(&safe).unwrap();
+        assert!(!authority_file_metadata_is_safe(
+            &metadata,
+            current_daemon_uid().unwrap().wrapping_add(1),
+            MAX_PROFILE_BYTES,
+            None,
+        ));
+
+        let identity = FileIdentity::from_metadata(&metadata);
+        let replacement = directory.path().join("replacement.toml");
+        fs::copy(&source, &replacement).unwrap();
+        fs::rename(&replacement, &safe).unwrap();
+        assert!(ensure_path_identity(&safe, identity).is_err());
+    }
+
+    #[test]
+    fn invocation_store_is_mode_bound_and_reopens_the_same_safe_file() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workbench.redb");
+        drop(WorkbenchInvocationStore::open(&path).unwrap());
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        drop(WorkbenchInvocationStore::open(&path).unwrap());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(WorkbenchInvocationStore::open(&path).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let linked = directory.path().join("workbench-hardlink.redb");
+        fs::hard_link(&path, &linked).unwrap();
+        assert!(WorkbenchInvocationStore::open(&path).is_err());
+        fs::remove_file(linked).unwrap();
+
+        let target = directory.path().join("target.redb");
+        fs::rename(&path, &target).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(WorkbenchInvocationStore::open(&path).is_err());
+    }
+
+    #[test]
     fn poll_frame_matches_the_exact_v1_registry_contract() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b280a";
         let poll = WorkbenchRuntimeEnvelope::poll(invocation_id).unwrap();
@@ -2040,6 +2381,7 @@ mod tests {
         request.capabilities = BTreeSet::from(["artifact.commit".to_string()]);
         request.output_artifact_kinds = BTreeSet::from(["source_tree".to_string()]);
         request.input_digest = request.canonical_digest().unwrap();
+        fs::write(directory.path().join(".nano-runtime"), "AGENT-07").unwrap();
         let store = WorkbenchInvocationStore::open_with_artifact_roots(
             directory.path().join("workbench.redb"),
             HashMap::from([(request.agent_id, artifact_root.clone())]),
@@ -2183,6 +2525,7 @@ mod tests {
         request.output_artifact_kinds = BTreeSet::from(["source_tree".to_string()]);
         request.input_digest = request.canonical_digest().unwrap();
         let record = WorkbenchInvocationRecord::reserved(&request, 1_900_000_000_000);
+        fs::write(directory.path().join(".nano-runtime"), "AGENT-07").unwrap();
         let roots = HashMap::from([(request.agent_id, artifact_root.clone())]);
         let scoped = artifact_root
             .join(&request.project_id)
@@ -2239,6 +2582,62 @@ mod tests {
         artifact.manifest_path = format!("{foreign_digest}.manifest.json");
         fs::write(scoped.join(&artifact.manifest_path), foreign).unwrap();
         assert!(validate_concrete_artifact_manifest(&record, &artifact, &roots).is_err());
+    }
+
+    #[test]
+    fn daemon_artifact_scope_rejects_symlink_components_and_foreign_agent_base() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2898");
+        let agent_root = directory.path().join("agent-a");
+        let artifact_root = agent_root.join("artifacts");
+        fs::create_dir_all(&artifact_root).unwrap();
+        fs::write(agent_root.join(".nano-runtime"), "AGENT-07").unwrap();
+
+        let foreign_scope = directory.path().join("foreign-scope");
+        fs::create_dir_all(foreign_scope.join(&request.work_item_id)).unwrap();
+        symlink(&foreign_scope, artifact_root.join(&request.project_id)).unwrap();
+        assert!(bind_daemon_artifact_scope(
+            &artifact_root,
+            request.agent_id,
+            &request.project_id,
+            &request.work_item_id,
+        )
+        .is_err());
+        fs::remove_file(artifact_root.join(&request.project_id)).unwrap();
+
+        let project = artifact_root.join(&request.project_id);
+        fs::create_dir(&project).unwrap();
+        symlink(
+            foreign_scope.join(&request.work_item_id),
+            project.join(&request.work_item_id),
+        )
+        .unwrap();
+        assert!(bind_daemon_artifact_scope(
+            &artifact_root,
+            request.agent_id,
+            &request.project_id,
+            &request.work_item_id,
+        )
+        .is_err());
+
+        let foreign_agent_root = directory.path().join("agent-b");
+        let foreign_artifacts = foreign_agent_root.join("artifacts");
+        fs::create_dir_all(
+            foreign_artifacts
+                .join(&request.project_id)
+                .join(&request.work_item_id),
+        )
+        .unwrap();
+        fs::write(foreign_agent_root.join(".nano-runtime"), "AGENT-08").unwrap();
+        assert!(bind_daemon_artifact_scope(
+            &foreign_artifacts,
+            request.agent_id,
+            &request.project_id,
+            &request.work_item_id,
+        )
+        .is_err());
     }
 
     #[test]

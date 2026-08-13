@@ -10,18 +10,49 @@ use std::env;
 use std::os::unix::process::CommandExt;
 use std::process::{self, Command};
 
+const ATTESTATION_NONCE_ENV: &str = "SENTINEL_WORKBENCH_ATTESTATION_NONCE";
+const ATTESTATION_WRAPPER_VERSION_ENV: &str = "SENTINEL_WORKBENCH_WRAPPER_VERSION";
+const ATTESTATION_LANDLOCK_ABI_ENV: &str = "SENTINEL_WORKBENCH_LANDLOCK_ABI";
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Parse: landlock-wrapper <agent-name> -- <command> [args...]
+    // Parse either the general-agent form or the workbench attestation form:
+    // landlock-wrapper <agent-name> -- <command> [args...]
+    // landlock-wrapper --attest-v1 <nonce> <abi> <agent-name> -- <command> [args...]
     let separator = args.iter().position(|a| a == "--");
     if args.len() < 4 || separator.is_none() {
         eprintln!("Usage: landlock-wrapper <agent-name> -- <command> [args...]");
         process::exit(2);
     }
 
-    let agent_name = &args[1];
     let sep_idx = separator.unwrap();
+    let (attestation, agent_name) = if args.get(1).is_some_and(|arg| arg == "--attest-v1") {
+        if sep_idx != 5 {
+            eprintln!("Invalid workbench attestation arguments");
+            process::exit(2);
+        }
+        let nonce = args.get(2).expect("validated attestation nonce");
+        if uuid::Uuid::parse_str(nonce).is_err() {
+            eprintln!("Invalid workbench attestation nonce");
+            process::exit(2);
+        }
+        let abi = args
+            .get(3)
+            .and_then(|value| value.parse::<u8>().ok())
+            .filter(|abi| *abi > 0);
+        let Some(abi) = abi else {
+            eprintln!("Invalid workbench Landlock ABI");
+            process::exit(2);
+        };
+        (Some((nonce.as_str(), abi)), &args[4])
+    } else {
+        if sep_idx != 2 {
+            eprintln!("Invalid Landlock wrapper arguments");
+            process::exit(2);
+        }
+        (None, &args[1])
+    };
     let command = &args[sep_idx + 1..];
 
     if command.is_empty() {
@@ -45,7 +76,15 @@ fn main() {
     }
 
     // Exec the actual command (replaces this process)
-    let err = Command::new(&command[0]).args(&command[1..]).exec();
+    let mut child = Command::new(&command[0]);
+    child.args(&command[1..]);
+    if let Some((nonce, abi)) = attestation {
+        child
+            .env(ATTESTATION_NONCE_ENV, nonce)
+            .env(ATTESTATION_WRAPPER_VERSION_ENV, env!("CARGO_PKG_VERSION"))
+            .env(ATTESTATION_LANDLOCK_ABI_ENV, abi.to_string());
+    }
+    let err = child.exec();
 
     // exec() only returns on error
     eprintln!("[landlock-wrapper] exec failed: {err}");

@@ -91,6 +91,7 @@ struct WorkbenchExchange {
 
 #[derive(Debug, Clone)]
 struct WorkbenchArtifactAuthority {
+    workload_id: String,
     invocation_id: String,
     input_digest: String,
     project_id: String,
@@ -189,7 +190,7 @@ fn valid_sha256(value: &str) -> bool {
 }
 
 impl WorkbenchArtifactAuthority {
-    fn from_request(request: &WorkbenchRequest) -> Self {
+    fn from_request(workload_id: &str, request: &WorkbenchRequest) -> Self {
         let expected_package = match &request.tool {
             WorkbenchTool::PackageArtifact {
                 artifact_kind,
@@ -202,6 +203,7 @@ impl WorkbenchArtifactAuthority {
             _ => None,
         };
         Self {
+            workload_id: workload_id.to_string(),
             invocation_id: request.invocation_id.clone(),
             input_digest: request.input_digest.clone(),
             project_id: request.project_id.clone(),
@@ -333,17 +335,12 @@ fn validate_artifact_manifest(
             "workbench artifact manifest path is not canonical",
         ));
     }
-    let artifact_root = host_agent_root
-        .join("artifacts")
-        .join(&authority.project_id)
-        .join(&authority.work_item_id);
-    let artifact_root = std::fs::canonicalize(&artifact_root).map_err(|_| {
-        exec_error(
-            NanoExecErrorCode::ProtocolViolation,
-            false,
-            "workbench artifact scope is unavailable",
-        )
-    })?;
+    let artifact_root = bind_workbench_artifact_scope(
+        host_agent_root,
+        &authority.workload_id,
+        &authority.project_id,
+        &authority.work_item_id,
+    )?;
     let manifest_path = artifact_root.join(relative);
     let metadata = std::fs::symlink_metadata(&manifest_path).map_err(|_| {
         exec_error(
@@ -418,6 +415,7 @@ fn validate_artifact_manifest(
             "workbench artifact manifest authority binding is invalid",
         ));
     }
+    let blobs_root = canonical_child_directory(&artifact_root, "blobs")?;
     let mut total_size = 0_u64;
     for entry in manifest.entries {
         let _ = safe_relative_path(&entry.path)?;
@@ -435,7 +433,7 @@ fn validate_artifact_manifest(
                 "workbench artifact size overflowed its boundary",
             )
         })?;
-        let blob = artifact_root.join("blobs").join(&entry.sha256);
+        let blob = blobs_root.join(&entry.sha256);
         let blob_metadata = std::fs::symlink_metadata(&blob).map_err(|_| {
             exec_error(
                 NanoExecErrorCode::ProtocolViolation,
@@ -477,6 +475,140 @@ fn validate_artifact_manifest(
         ));
     }
     Ok(())
+}
+
+fn bind_workbench_artifact_scope(
+    host_agent_root: &std::path::Path,
+    expected_workload_id: &str,
+    project_id: &str,
+    work_item_id: &str,
+) -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let agent_root = canonical_real_directory(host_agent_root)?;
+    let marker = agent_root.join(".nano-runtime");
+    let marker_metadata = std::fs::symlink_metadata(&marker).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench agent artifact authority marker is unavailable",
+        )
+    })?;
+    if marker_metadata.file_type().is_symlink()
+        || !marker_metadata.is_file()
+        || marker_metadata.nlink() != 1
+        || std::fs::read_to_string(&marker).ok().as_deref() != Some(expected_workload_id)
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench agent artifact authority marker is invalid",
+        ));
+    }
+    let artifacts = canonical_child_directory(&agent_root, "artifacts")?;
+    let project = canonical_child_directory(&artifacts, safe_scope_component(project_id)?)?;
+    canonical_child_directory(&project, safe_scope_component(work_item_id)?)
+}
+
+fn safe_scope_component(value: &str) -> Result<&str> {
+    let mut components = std::path::Path::new(value).components();
+    if value.is_empty()
+        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact scope component is invalid",
+        ));
+    }
+    Ok(value)
+}
+
+fn canonical_child_directory(parent: &std::path::Path, child: &str) -> Result<std::path::PathBuf> {
+    let path = parent.join(child);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact scope directory is unavailable",
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact scope directory is invalid",
+        ));
+    }
+    let canonical = std::fs::canonicalize(&path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact scope directory cannot be resolved",
+        )
+    })?;
+    if canonical.parent() != Some(parent) {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact scope escaped its authority base",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn canonical_real_directory(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let mut current = std::path::PathBuf::new();
+    if !path.is_absolute() {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact authority base is not absolute",
+        ));
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => current.push(std::path::MAIN_SEPARATOR_STR),
+            std::path::Component::Normal(component) => current.push(component),
+            _ => {
+                return Err(exec_error(
+                    NanoExecErrorCode::ProtocolViolation,
+                    false,
+                    "workbench artifact authority base is not canonical",
+                ))
+            }
+        }
+        let metadata = std::fs::symlink_metadata(&current).map_err(|_| {
+            exec_error(
+                NanoExecErrorCode::ProtocolViolation,
+                false,
+                "workbench artifact authority base is unavailable",
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(exec_error(
+                NanoExecErrorCode::ProtocolViolation,
+                false,
+                "workbench artifact authority base contains an invalid component",
+            ));
+        }
+    }
+    let canonical = std::fs::canonicalize(&current).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact authority base cannot be resolved",
+        )
+    })?;
+    if canonical != current {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact authority base changed identity",
+        ));
+    }
+    Ok(canonical)
 }
 
 fn safe_relative_path(path: &str) -> Result<&std::path::Path> {
@@ -983,6 +1115,7 @@ impl BwrapNanoRuntime {
                 .expect("pending spawn inserted")
                 .state
                 .command;
+            let workbench_process = is_workbench_agent_runtime(command);
             let process = start_process(&self.enforcer, &agent_name, &workload_id, command)
                 .with_context(|| format!("bwrap start_agent_process failed for {agent_name}"))?;
             let pid = process.pid;
@@ -990,11 +1123,26 @@ impl BwrapNanoRuntime {
                 .pending_spawns
                 .get_mut(&workload_id)
                 .expect("pending spawn inserted");
-            transaction
+            let handle = transaction
                 .handle
                 .as_mut()
-                .expect("setup completed before process start")
-                .bwrap_pid = Some(pid);
+                .expect("setup completed before process start");
+            if workbench_process {
+                let attestation = process
+                    .workbench_isolation_attestation()
+                    .context("workbench process returned without isolation attestation")?;
+                anyhow::ensure!(
+                    handle.cgroup_created
+                        && process.child_pid == Some(attestation.child_pid)
+                        && attestation.landlock_abi > 0,
+                    "workbench process isolation evidence is incomplete"
+                );
+                // These flags are published only after the exact child, cgroup,
+                // netns and post-Landlock exec evidence have all succeeded.
+                handle.landlock_applied = true;
+                handle.network_isolated = true;
+            }
+            handle.bwrap_pid = Some(pid);
             transaction.process = Some(process);
             checkpoint(BwrapSpawnStage::ProcessStarted)?;
             Ok(pid)
@@ -1143,6 +1291,17 @@ impl BwrapNanoRuntime {
                     .start_workbench_process(agent_name, Some(workload_id), command)
                     .with_context(|| format!("restart agent-runtime for {agent_name}"))?;
                 handle.bwrap_pid = Some(process.pid);
+                let attestation = process
+                    .workbench_isolation_attestation()
+                    .context("restarted workbench process lacks isolation attestation")?;
+                anyhow::ensure!(
+                    handle.cgroup_created
+                        && process.child_pid == Some(attestation.child_pid)
+                        && attestation.landlock_abi > 0,
+                    "restarted workbench process isolation evidence is incomplete"
+                );
+                handle.landlock_applied = true;
+                handle.network_isolated = true;
                 Ok((handle, process))
             },
         )
@@ -1293,7 +1452,7 @@ impl BwrapNanoRuntime {
             .unwrap_or_else(|| request_digest.clone());
         let artifact_authority = serde_json::from_value::<WorkbenchRequest>(request_value)
             .ok()
-            .map(|request| WorkbenchArtifactAuthority::from_request(&request));
+            .map(|request| WorkbenchArtifactAuthority::from_request(&handle.workload_id, &request));
         if self.exchanges.contains_key(&handle.workload_id) {
             self.validate_exchange_handle(handle)?;
             self.retry_pending_exchange_cleanup(&handle.workload_id)?;
@@ -2728,6 +2887,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workbench_spawn_without_exact_isolation_attestation_rolls_back_all_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = BwrapNanoRuntime::with_test_dirs(
+            temp.path().join("cas"),
+            temp.path().join("homes"),
+        );
+        let workload_id = "AGENT-42";
+        let mut state = transactional_fixture_state(workload_id, "workbench-agent");
+        state.command = vec!["/usr/bin/agent-runtime".to_string()];
+        let error = runtime
+            .spawn_state_with(
+                state,
+                |_, _, _, _| AgentProcess::launch_fixture(),
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("isolation attestation"));
+        assert!(!runtime.pending_spawns.contains_key(workload_id));
+        assert!(!runtime.workloads.contains_key(workload_id));
+        assert!(!runtime.handles.contains_key(workload_id));
+        assert!(!runtime.processes.contains_key(workload_id));
+        assert!(!temp
+            .path()
+            .join("homes/workbench-agent/.nano-runtime")
+            .exists());
+    }
+
+    #[test]
+    fn sandbox_artifact_scope_rejects_symlink_components_and_foreign_agent_base() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let agent_root = directory.path().join("AGENT-07");
+        let artifacts = agent_root.join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(agent_root.join(".nano-runtime"), "AGENT-07").unwrap();
+        let foreign_scope = directory.path().join("foreign-scope");
+        std::fs::create_dir_all(foreign_scope.join("work-04")).unwrap();
+
+        symlink(&foreign_scope, artifacts.join("project-01")).unwrap();
+        assert!(bind_workbench_artifact_scope(
+            &agent_root,
+            "AGENT-07",
+            "project-01",
+            "work-04",
+        )
+        .is_err());
+        std::fs::remove_file(artifacts.join("project-01")).unwrap();
+
+        let project = artifacts.join("project-01");
+        std::fs::create_dir(&project).unwrap();
+        symlink(foreign_scope.join("work-04"), project.join("work-04")).unwrap();
+        assert!(bind_workbench_artifact_scope(
+            &agent_root,
+            "AGENT-07",
+            "project-01",
+            "work-04",
+        )
+        .is_err());
+
+        let foreign_agent = directory.path().join("AGENT-08");
+        std::fs::create_dir_all(
+            foreign_agent
+                .join("artifacts/project-01")
+                .join("work-04"),
+        )
+        .unwrap();
+        std::fs::write(foreign_agent.join(".nano-runtime"), "AGENT-08").unwrap();
+        assert!(bind_workbench_artifact_scope(
+            &foreign_agent,
+            "AGENT-07",
+            "project-01",
+            "work-04",
+        )
+        .is_err());
+    }
+
     fn insert_protocol_fixture(
         runtime: &mut BwrapNanoRuntime,
         workload_id: &str,
@@ -2778,6 +3015,36 @@ mod tests {
             agent_id: None,
             pid: Some(pid),
         }
+    }
+
+    #[test]
+    fn attested_workbench_protocol_reports_exact_instance_and_all_isolation_barriers() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2998";
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let mut process = AgentProcess::launch_protocol_fixture(&[]).unwrap();
+        let child_pid = process.pid;
+        process.install_workbench_isolation_attestation(child_pid, 4);
+        let workload_id = "AGENT-42";
+        let handle = insert_protocol_process(&mut runtime, workload_id, process);
+        let sandbox = runtime.handles.get_mut(workload_id).unwrap();
+        sandbox.cgroup_created = true;
+        sandbox.landlock_applied = true;
+        sandbox.network_isolated = true;
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap();
+        let resources = runtime.resources(&handle).unwrap();
+        assert_eq!(resources.instance_id, Some(handle.instance_id));
+        assert_eq!(resources.child_pid, Some(child_pid));
+        assert!(resources.cgroup_created);
+        assert!(resources.landlock_applied);
+        assert!(resources.network_isolated);
     }
 
     fn start_frame(invocation_id: &str, deadline_unix_ms: u64) -> String {

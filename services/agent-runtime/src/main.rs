@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -14,14 +15,29 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_runtime::WorkbenchExecutor;
+use serde::Serialize;
 use sentinel_common::{
     WorkbenchCommand, WorkbenchErrorClass, WorkbenchErrorInfo, WorkbenchMessage,
-    WorkbenchProgressStage, WORKBENCH_SCHEMA_VERSION,
+    WorkbenchProgressStage, WORKBENCH_AGENT_RUNTIME_VERSION, WORKBENCH_SCHEMA_VERSION,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const STARTUP_ATTESTATION_SCHEMA_VERSION: u16 = 1;
+const ATTESTATION_NONCE_ENV: &str = "SENTINEL_WORKBENCH_ATTESTATION_NONCE";
+const ATTESTATION_WRAPPER_VERSION_ENV: &str = "SENTINEL_WORKBENCH_WRAPPER_VERSION";
+const ATTESTATION_LANDLOCK_ABI_ENV: &str = "SENTINEL_WORKBENCH_LANDLOCK_ABI";
+
+#[derive(Serialize)]
+struct StartupAttestation<'a> {
+    schema_version: u16,
+    nonce: &'a str,
+    wrapper_version: &'a str,
+    runtime_version: &'static str,
+    landlock_abi: u8,
+    host_pid: u32,
+}
 
 #[derive(Clone)]
 struct ActiveInvocation {
@@ -38,6 +54,10 @@ enum ReaderEvent {
 }
 
 fn main() {
+    if write_startup_attestation().is_err() {
+        eprintln!("agent-runtime: startup isolation attestation failed");
+        std::process::exit(126);
+    }
     eprintln!(
         "agent-runtime: workbench started (pid={})",
         std::process::id()
@@ -98,6 +118,94 @@ fn main() {
 
     cancel_all_and_wait(&active);
     eprintln!("agent-runtime: workbench stopped");
+}
+
+fn write_startup_attestation() -> io::Result<()> {
+    if env!("CARGO_PKG_VERSION") != WORKBENCH_AGENT_RUNTIME_VERSION {
+        return Err(io::Error::other(
+            "agent runtime version is outside the attestation contract",
+        ));
+    }
+    let nonce = std::env::var(ATTESTATION_NONCE_ENV)
+        .map_err(|_| io::Error::other("startup attestation nonce is unavailable"))?;
+    if !valid_attestation_nonce(&nonce) {
+        return Err(io::Error::other("startup attestation nonce is invalid"));
+    }
+    let wrapper_version = std::env::var(ATTESTATION_WRAPPER_VERSION_ENV)
+        .map_err(|_| io::Error::other("startup wrapper version is unavailable"))?;
+    let landlock_abi = std::env::var(ATTESTATION_LANDLOCK_ABI_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|abi| *abi > 0)
+        .ok_or_else(|| io::Error::other("startup Landlock ABI is invalid"))?;
+    let host_pid = host_pid_from_nspid()?;
+    let attestation = StartupAttestation {
+        schema_version: STARTUP_ATTESTATION_SCHEMA_VERSION,
+        nonce: &nonce,
+        wrapper_version: &wrapper_version,
+        runtime_version: env!("CARGO_PKG_VERSION"),
+        landlock_abi,
+        host_pid,
+    };
+    let bytes = serde_json::to_vec(&attestation)
+        .map_err(|_| io::Error::other("encode startup attestation"))?;
+    let path = PathBuf::from(format!(
+        "/tmp/.sentinel-workbench-attestation-{nonce}.json"
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()
+}
+
+fn valid_attestation_nonce(nonce: &str) -> bool {
+    nonce.len() == 36
+        && nonce.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+            }
+        })
+}
+
+fn host_pid_from_nspid() -> io::Result<u32> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    parse_host_pid_from_nspid(&status)
+        .ok_or_else(|| io::Error::other("host PID identity is unavailable"))
+}
+
+fn parse_host_pid_from_nspid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .filter(|pid| *pid > 0)
+}
+
+#[cfg(test)]
+mod startup_attestation_tests {
+    use super::*;
+
+    #[test]
+    fn startup_attestation_nonce_and_host_pid_are_strict() {
+        assert!(valid_attestation_nonce(
+            "018f3f32-4f01-4f2c-a6c1-f6f4a81b2903"
+        ));
+        assert!(!valid_attestation_nonce(
+            "018F3F32-4F01-4F2C-A6C1-F6F4A81B2903"
+        ));
+        assert!(!valid_attestation_nonce("../attestation"));
+        assert_eq!(
+            parse_host_pid_from_nspid("Name:\tagent-runtime\nNSpid:\t4242\t1\n"),
+            Some(4242)
+        );
+        assert_eq!(parse_host_pid_from_nspid("NSpid:\t0\n"), None);
+    }
 }
 
 fn read_commands(sender: mpsc::Sender<ReaderEvent>) {
