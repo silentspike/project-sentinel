@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 from urllib import parse
 import uuid
 
@@ -849,6 +850,56 @@ class JourneyRunnerTests(unittest.TestCase):
             self.run_plan_v2(plan)
         self.assertEqual(sum(self.state.calls.values()), 0)
 
+    def test_v2_pointers_and_equals_literals_reject_root_escapes_and_secrets(self) -> None:
+        mutations = (
+            (
+                lambda step: step.update(
+                    initial_assertions=[{"pointer": "", "present": True}]
+                ),
+                "non-root JSON pointer",
+            ),
+            (
+                lambda step: step["capture"]["request_id"].update(pointer=""),
+                "non-root JSON pointer",
+            ),
+            (
+                lambda step: step.update(
+                    initial_assertions=[{"pointer": "/invalid~2field", "present": True}]
+                ),
+                "invalid JSON pointer escape",
+            ),
+            (
+                lambda step: step.update(
+                    initial_assertions=[
+                        {
+                            "pointer": "/result",
+                            "equals": {"private_token": "public-looking-value"},
+                        }
+                    ]
+                ),
+                "contains a sensitive or invalid key",
+            ),
+        )
+        for mutate, expected in mutations:
+            with self.subTest(expected=expected):
+                plan = canonical_plan_v2()
+                mutate(plan["steps"][1])
+                with self.assertRaisesRegex(runner.JourneyError, expected):
+                    runner.validate_plan(plan)
+
+        plan = canonical_plan_v2()
+        plan["steps"][1]["initial_assertions"] = [
+            {
+                "pointer": "",
+                "equals": {
+                    "request_id": "request-1",
+                    "private_token": "response-secret-value",
+                },
+            }
+        ]
+        with self.assertRaisesRegex(runner.JourneyError, "non-root JSON pointer"):
+            runner.validate_plan(plan)
+
     def test_role_credentials_are_separated_and_never_persisted(self) -> None:
         self.run_plan()
         observed = dict(self.state.auth_headers)
@@ -1115,8 +1166,103 @@ class JourneyRunnerTests(unittest.TestCase):
         evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
         evidence["record_chain_tip"] = "f" * 64
         runner.atomic_json_write(self.evidence, evidence)
-        with self.assertRaisesRegex(runner.JourneyError, "evidence does not match"):
+        with self.assertRaisesRegex(runner.JourneyError, "journey evidence"):
             self.run_plan()
+        self.assertEqual(sum(self.state.calls.values()), prior_calls)
+
+    def test_restart_repairs_ledger_before_evidence_crash_without_duplicate_effect(self) -> None:
+        original_write = runner.atomic_json_write
+        failure_injected = False
+
+        def fail_after_submit_ledger(path: Path, value: object) -> None:
+            nonlocal failure_injected
+            if path == self.evidence and self.ledger.exists() and not failure_injected:
+                ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+                if "submit" in ledger["completed"]:
+                    failure_injected = True
+                    raise runner.JourneyError("injected evidence write failure")
+            original_write(path, value)
+
+        with mock.patch.object(runner, "atomic_json_write", fail_after_submit_ledger):
+            with self.assertRaisesRegex(runner.JourneyError, "injected evidence"):
+                self.run_plan_v2(checkpoint="after_customer_request")
+        self.assertTrue(failure_injected)
+        self.assertEqual(
+            self.state.effective_mutations["/customer/workflow/commands"], 1
+        )
+        stale = json.loads(self.evidence.read_text(encoding="utf-8"))
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        self.assertLess(stale["record_count"], len(ledger["completed"]))
+
+        original_observe = runner.observe_step
+        reconciliation_checked = False
+
+        def verify_repaired_before_http(*args: object, **kwargs: object) -> object:
+            nonlocal reconciliation_checked
+            if not reconciliation_checked:
+                repaired = json.loads(self.evidence.read_text(encoding="utf-8"))
+                current_ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+                self.assertEqual(repaired["record_count"], len(current_ledger["completed"]))
+                self.assertEqual(repaired["record_chain_tip"], current_ledger["chain_tip"])
+                reconciliation_checked = True
+            return original_observe(*args, **kwargs)
+
+        with mock.patch.object(runner, "observe_step", verify_repaired_before_http):
+            resumed = self.run_plan_v2(checkpoint="after_customer_request")
+        self.assertTrue(reconciliation_checked)
+        self.assertEqual(resumed["result"], "checkpoint_reached")
+        self.assertEqual(
+            self.state.effective_mutations["/customer/workflow/commands"], 1
+        )
+
+    def test_restart_repairs_missing_and_exact_stale_evidence_only(self) -> None:
+        self.run_plan_v2(checkpoint="after_customer_request")
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        self.evidence.unlink()
+        self.run_plan_v2(checkpoint="after_customer_request")
+        self.assertEqual(
+            self.state.effective_mutations["/customer/workflow/commands"], 1
+        )
+        repaired = json.loads(self.evidence.read_text(encoding="utf-8"))
+        self.assertEqual(repaired["record_chain_tip"], ledger["chain_tip"])
+
+        readiness = ledger["completed"]["readiness"]
+        stale = {
+            **repaired,
+            "record_chain_tip": readiness["record_digest"],
+            "record_count": 1,
+            "result": "in_progress",
+            "stopped_at": None,
+            "replay_verified_steps": [],
+            "steps": [{"id": "readiness", **readiness}],
+        }
+        runner.atomic_json_write(self.evidence, stale)
+        self.run_plan_v2(checkpoint="after_customer_request")
+        repaired = json.loads(self.evidence.read_text(encoding="utf-8"))
+        self.assertEqual(repaired["record_count"], len(ledger["completed"]))
+        self.assertEqual(
+            self.state.effective_mutations["/customer/workflow/commands"], 1
+        )
+
+    def test_restart_rejects_non_prefix_and_semantically_manipulated_evidence(self) -> None:
+        self.run_plan_v2(checkpoint="after_customer_request")
+        evidence = json.loads(self.evidence.read_text(encoding="utf-8"))
+        prior_calls = sum(self.state.calls.values())
+
+        non_prefix = json.loads(json.dumps(evidence))
+        non_prefix["record_count"] = 1
+        non_prefix["record_chain_tip"] = non_prefix["steps"][1]["record_digest"]
+        non_prefix["steps"] = [non_prefix["steps"][1]]
+        runner.atomic_json_write(self.evidence, non_prefix)
+        with self.assertRaisesRegex(runner.JourneyError, "does not match"):
+            self.run_plan_v2()
+        self.assertEqual(sum(self.state.calls.values()), prior_calls)
+
+        manipulated = json.loads(json.dumps(evidence))
+        manipulated["steps"][1]["captures"]["request_id"] = "forged-request"
+        runner.atomic_json_write(self.evidence, manipulated)
+        with self.assertRaisesRegex(runner.JourneyError, "does not match"):
+            self.run_plan_v2()
         self.assertEqual(sum(self.state.calls.values()), prior_calls)
 
     def test_record_chain_truncation_fails_before_http(self) -> None:
