@@ -40,7 +40,7 @@ STOPPED_UNITS = (
     PREFLIGHT.REQUIRED_SERVICES
     | PREFLIGHT.REQUIRED_TIMERS
     | set(PREFLIGHT.TIMER_SERVICES.values())
-    | {PREFLIGHT.TARGET_UNIT}
+    | {PREFLIGHT.AUTH_INIT_UNIT, PREFLIGHT.TARGET_UNIT}
 )
 SOURCE_MODES = {"binary": 0o700, "script": 0o700, "config": 0o600, "systemd": 0o600}
 GIT_ENV = {
@@ -209,6 +209,10 @@ class ReleasePackageTests(unittest.TestCase):
         readiness_destination = "/opt/sentinel/scripts/m0-readiness.py"
         readiness_source = "scripts/product-acceptance/m0-readiness/readiness.py"
         self.assertEqual(AUTHORITY[readiness_destination], (readiness_source, "script"))
+        self.assertEqual(
+            AUTHORITY["/etc/systemd/system/sentinel-auth-init.service"],
+            ("deploy/systemd/sentinel-auth-init.service", "systemd"),
+        )
         self.assertIn(
             {
                 "path": readiness_destination,

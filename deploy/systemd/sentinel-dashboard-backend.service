@@ -1,8 +1,9 @@
 [Unit]
 Description=Sentinel Dashboard-Backend — axum HTTPS + WebTransport/QUIC, topic+msgpack+zstd (#431)
 Documentation=https://github.com/silentspike/project-sentinel/issues/431
-After=network-online.target
+After=network-online.target sentinel-auth-init.service
 Wants=network-online.target
+Requires=sentinel-auth-init.service
 StartLimitBurst=5
 StartLimitIntervalSec=300
 
@@ -11,10 +12,13 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/sentinel
+ExecStartPre=/usr/bin/test -x /usr/bin/bwrap
 ExecStart=/opt/sentinel/bin/sentinel-dashboard-backend
-# Operator secret (SENTINEL_DASHBOARD_API_KEY) + login rate-limit knobs; see
-# docs/security/dashboard-key-management.md (#474). Strong deploy-specific secret, never a smoke/test key.
+# The env file retains only the independent dashboard login key and rate-limit knobs;
+# the daemon operator proxy credential is file-only. See docs/security/dashboard-key-management.md (#474).
 EnvironmentFile=/opt/sentinel/config/dashboard-backend.env
+LoadCredential=operator-api:/etc/sentinel/credentials/operator-api
+Environment=SENTINEL_OPERATOR_API_KEY_FILE=%d/operator-api
 # #474: loopback-only secure default. On-VM access is full (incl. WebTransport); an `ssh -L`
 # tunnel is HTTP-only (WT/QUIC = UDP does not traverse a TCP tunnel; full remote console: #522).
 # Deliberate LAN/third-party exposure: override SENTINEL_DASHBOARD_*_BIND via the env-file above;

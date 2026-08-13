@@ -1,7 +1,8 @@
 [Unit]
 Description=Sentinel Nightrun — Schichtwechsel-Konsolidierung
 Documentation=https://github.com/silentspike/project-sentinel/issues/17
-After=sentinel-daemon.service
+After=sentinel-auth-init.service sentinel-daemon.service
+Requires=sentinel-auth-init.service
 
 [Service]
 Type=oneshot
