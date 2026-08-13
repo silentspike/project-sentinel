@@ -4,7 +4,7 @@
 # Runs via systemd timer every 60s. Checks:
 #   - systemd service status (is-active)
 #   - HTTP /health endpoints (where available)
-#   - NATS monitoring endpoint (:8222/healthz)
+#   - NATS JetStream readiness endpoint (:8222/healthz?js-enabled-only=true)
 #   - Projection lag (events.db vs projection_offsets)
 #
 # Alerts via ntfy on state transitions only (no spam).
@@ -83,10 +83,10 @@ send_ntfy() {
 }
 
 alert_down() {
-    local name="$1" detail="$2" priority="$3"
+    local name="$1" detail="$2" priority="$3" action="$4"
     send_ntfy \
         "[SENTINEL] $name DOWN" \
-        "$detail. Auto-restart attempted." \
+        "$detail. $action" \
         "$priority" \
         "rotating_light,sentinel"
     log_info "ALERT DOWN: $name — $detail"
@@ -148,7 +148,7 @@ check_https_health() {
 
 check_nats_health() {
     curl -sf --connect-timeout 3 --max-time "$CURL_TIMEOUT" \
-        "http://localhost:8222/healthz" >/dev/null 2>&1
+        "http://127.0.0.1:8222/healthz?js-enabled-only=true" >/dev/null 2>&1
 }
 
 check_projection_lag() {
@@ -193,7 +193,7 @@ try_restart() {
 # --- Service Check Logic ---
 
 check_service() {
-    local name="$1" unit="$2" check_type="$3" port="$4" path="$5" priority="$6"
+    local name="$1" unit="$2" check_type="$3" port="$4" path="$5" priority="$6" restart_policy="$7"
     local now
     now=$(now_epoch)
     local is_ok=false
@@ -238,14 +238,20 @@ check_service() {
         CURR_RESTARTS[$name]="$prev_restarts"
 
         if [ "$prev" = "ok" ]; then
-            # New failure — alert + restart
+            # NATS recovery is owned by nats-server.service. Restarting it from
+            # this timer can destroy a valid long-running JetStream recovery.
             CURR_SINCE[$name]="$now"
-            alert_down "$name" "$unit is inactive/unhealthy" "$priority"
-            try_restart "$unit" "$name"
+            if [ "$restart_policy" = "restart" ]; then
+                alert_down "$name" "$unit is inactive/unhealthy" "$priority" "Auto-restart attempted."
+                try_restart "$unit" "$name"
+            else
+                alert_down "$name" "$unit is inactive/unhealthy" "$priority" "Recovery remains service-owned."
+            fi
         else
-            # Ongoing failure — keep since timestamp, try restart if under limit
             CURR_SINCE[$name]="$prev_since"
-            try_restart "$unit" "$name" 2>/dev/null || true
+            if [ "$restart_policy" = "restart" ]; then
+                try_restart "$unit" "$name" 2>/dev/null || true
+            fi
         fi
     fi
 }
@@ -257,20 +263,20 @@ main() {
     local now
     now=$(now_epoch)
 
-    # Service definitions: name:unit:check_type:port:path:priority
+    # Service definitions: name:unit:check_type:port:path:priority:restart-policy
     local services=(
-        "daemon:sentinel-daemon.service:systemd:::5"
-        "projection:sentinel-projection.service:systemd:::5"
-        "nats:nats-server.service:nats:::5"
-        "cortex:sentinel-gateway.service:http:8080:/health:5"
-        "dashboard-backend:sentinel-dashboard-backend.service:https:8001:/api/health:3"
-        "judge:sentinel-judge.service:http:8082:/health:3"
-        "nats-bridge:sentinel-nats-bridge.service:http:8083:/health:3"
+        "daemon:sentinel-daemon.service:systemd:::5:restart"
+        "projection:sentinel-projection.service:systemd:::5:restart"
+        "nats:nats-server.service:nats:::5:observe"
+        "cortex:sentinel-gateway.service:http:8080:/health:5:restart"
+        "dashboard-backend:sentinel-dashboard-backend.service:https:8001:/api/health:3:restart"
+        "judge:sentinel-judge.service:http:8082:/health:3:restart"
+        "nats-bridge:sentinel-nats-bridge.service:http:8083:/health:3:restart"
     )
 
     for entry in "${services[@]}"; do
-        IFS=: read -r name unit check_type port path priority <<< "$entry"
-        check_service "$name" "$unit" "$check_type" "$port" "$path" "$priority"
+        IFS=: read -r name unit check_type port path priority restart_policy <<< "$entry"
+        check_service "$name" "$unit" "$check_type" "$port" "$path" "$priority" "$restart_policy"
     done
 
     # --- Projection Lag Check (independent of service status) ---
@@ -316,4 +322,6 @@ main() {
     log_info "Check complete: ${summary}lag=$lag"
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

@@ -159,8 +159,8 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         output = json.loads(result.stdout)
         self.assertEqual(output["status"], "COMPLETE")
-        self.assertEqual(output["artifact_count"], 111)
-        self.assertEqual(output["changed_count"], 111)
+        self.assertEqual(output["artifact_count"], len(AUTHORITY))
+        self.assertEqual(output["changed_count"], len(AUTHORITY))
         self.assertFalse(output["services_started"])
         self.assertTrue(self.fixture.target_for(next(
             row for row in self.fixture.artifacts if row["source"] == "external/nats-server"
