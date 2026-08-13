@@ -351,6 +351,8 @@ fn verify_broker_peer(
         .map_err(|_| "Gaia operator broker peer credentials unavailable".to_string())?
         .pid()
         .ok_or_else(|| "Gaia operator broker peer pid unavailable".to_string())?;
+    let pid =
+        u32::try_from(pid).map_err(|_| "Gaia operator broker peer pid is invalid".to_string())?;
     let metadata = fs::metadata(format!("/proc/{pid}/exe"))
         .map_err(|_| "Gaia operator broker peer executable unavailable".to_string())?;
     let executable = ExecutableIdentity::from_metadata(&metadata);
@@ -713,8 +715,6 @@ fn internal_error(action: &str, error: impl std::fmt::Display) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt as _;
-    use tokio::io::AsyncWriteExt as _;
 
     #[test]
     fn rejects_unsafe_session_ids() {
@@ -891,7 +891,11 @@ mod tests {
             .await
             .is_err());
         }
-        assert!(http_listener.try_accept().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), http_listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
