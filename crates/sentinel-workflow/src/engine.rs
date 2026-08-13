@@ -43,6 +43,17 @@ where
         &self.store
     }
 
+    pub fn apply_company_command(
+        &self,
+        principal: &crate::AuthenticatedCompanyPrincipalV1,
+        operation_id: uuid::Uuid,
+        command: &crate::CompanyWorkflowCommandV1,
+        now_ms: u64,
+    ) -> Result<crate::CompanyCommandOutcomeV1, WorkflowError> {
+        self.store
+            .apply_company_command(principal, operation_id, command, now_ms)
+    }
+
     pub fn admit_plan(
         &self,
         plan: &crate::ExecutionPlanV1,

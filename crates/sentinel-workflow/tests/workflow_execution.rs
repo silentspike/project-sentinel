@@ -651,9 +651,7 @@ fn plan_rejects_digest_mutation_workspace_split_and_free_form_shell() {
 
     let mut duplicate_rule = exact_command.clone();
     let duplicated_rule = duplicate_rule.steps[0].command_policy[0].clone();
-    duplicate_rule.steps[0]
-        .command_policy
-        .push(duplicated_rule);
+    duplicate_rule.steps[0].command_policy.push(duplicated_rule);
     duplicate_rule = duplicate_rule.bind_digest().unwrap();
     assert_eq!(
         duplicate_rule.validate_at(NOW).unwrap_err().code,
