@@ -262,6 +262,16 @@ jobs:
           test "$(stat -c '%u' /usr/bin/bwrap)" = "0"
           dpkg-query -W -f='bubblewrap package: ${Package} ${Version}\n' bubblewrap
           /usr/bin/bwrap --version
+          credential_dir="$RUNNER_TEMP/bwrap-credential-smoke"
+          install -d -m 0700 "$credential_dir"
+          trap 'rmdir "$credential_dir"' EXIT
+          /usr/bin/bwrap \
+            --die-with-parent \
+            --unshare-pid \
+            --bind / / \
+            --proc /proc \
+            --tmpfs "$credential_dir" \
+            -- /bin/true
 
       - name: Tests
         run: cargo test --workspace

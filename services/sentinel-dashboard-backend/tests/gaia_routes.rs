@@ -173,7 +173,7 @@ async fn gaia_read_routes_return_console_jsonl() {
         true,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "safe response body: {body}");
     assert_eq!(alerts["count"], 1);
     assert_eq!(alerts["alerts"][0]["summary"], "projection lag");
 
@@ -319,7 +319,7 @@ echo '{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cost_usd":0
     drop(active_lock);
     assert_eq!(busy, StatusCode::TOO_MANY_REQUESTS);
 
-    let (first, _) = request_with_idempotency(
+    let (first, first_body) = request_with_idempotency(
         state.clone(),
         Method::POST,
         "/api/gaia/deep",
@@ -328,7 +328,7 @@ echo '{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cost_usd":0
         Some("test-idempotency-first"),
     )
     .await;
-    assert_eq!(first, StatusCode::OK);
+    assert_eq!(first, StatusCode::OK, "safe response body: {first_body}");
 
     let (conflict, _) = request_with_idempotency(
         state.clone(),
@@ -371,7 +371,7 @@ echo '{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cost_usd":0
     make_executable(&fake_claude);
 
     for _ in 0..2 {
-        let (status, _) = request_with_idempotency(
+        let (status, body) = request_with_idempotency(
             state.clone(),
             Method::POST,
             "/api/gaia/deep",
@@ -380,7 +380,7 @@ echo '{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cost_usd":0
             Some("rate-operation-one"),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::OK, "safe response body: {body}");
     }
 
     let (limited, _) = request_with_idempotency(
