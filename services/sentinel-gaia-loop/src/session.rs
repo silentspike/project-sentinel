@@ -998,7 +998,11 @@ echo 'fake stderr' >&2
         assert_eq!(run.entry.usage.total_cost_usd, Some(0.001));
 
         let prompt = fs::read_to_string(&run.prompt_path).unwrap();
-        assert!(prompt.contains("Mutating `sentinel-ctl` commands require `--confirm`"));
+        assert!(prompt.contains("Gaia Console sessions, `sentinel-ctl` is observation-only"));
+        assert!(prompt.contains(
+            "Authoritative mutations must enter the governed customer/operator workflow or a trusted non-Gaia operator path"
+        ));
+        assert!(prompt.contains("do not retry it as a mutation"));
         assert!(prompt.contains("Continue task evidence"));
         let stream = fs::read_to_string(&run.entry.stream_path).unwrap();
         assert!(stream.contains("\"type\":\"message\""));
