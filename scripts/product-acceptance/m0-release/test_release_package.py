@@ -270,6 +270,17 @@ class ReleasePackageTests(unittest.TestCase):
         self.assert_error("source_changed", self.fixture.build, failure_hook=replace_after_first)
         self.assertFalse(self.fixture.package.exists())
 
+    def test_source_root_swap_after_git_readback_is_rejected(self) -> None:
+        original = self.fixture.root / "source-pinned"
+
+        def swap_source_root() -> None:
+            os.rename(self.fixture.source, original)
+            self.fixture.source.mkdir(mode=0o700)
+
+        self.assert_error("source_root_changed", self.fixture.build, after_git_hook=swap_source_root)
+        self.assertFalse(self.fixture.package.exists())
+        self.assertTrue((original / "config/daemon.toml").is_file())
+
     def test_wrong_git_sha_and_dirty_tracked_source_fail(self) -> None:
         self.assert_error(
             "git_sha_mismatch",
@@ -385,6 +396,89 @@ class ReleasePackageTests(unittest.TestCase):
         self.assert_error("stale_output_conflict", self.fixture.build)
         self.assertEqual(manifest.read_bytes(), b"{}\n")
         self.assertEqual(first["status"], "COMPLETE")
+
+    def test_verify_enumerates_the_pinned_root_after_lexical_swap(self) -> None:
+        attacks = {
+            "extra": "package_file_set_mismatch",
+            "missing": "package_artifact_missing_or_unsafe",
+            "special": "package_special_file",
+            "symlink": "package_symlink",
+        }
+        for attack, expected in attacks.items():
+            with self.subTest(attack=attack):
+                fixture = Fixture(self.case / f"verify-root-{attack}")
+                fixture.build()
+                fixture.thaw_package()
+                manifest = json.loads((fixture.package / PACKAGE.MANIFEST_NAME).read_bytes())
+                if attack == "extra":
+                    (fixture.package / "hidden-extra").write_bytes(b"extra\n")
+                    (fixture.package / "hidden-extra").chmod(0o400)
+                elif attack == "missing":
+                    (fixture.package / manifest["artifacts"][0]["source"]).unlink()
+                elif attack == "special":
+                    os.mkfifo(fixture.package / "hidden-special", 0o400)
+                else:
+                    (fixture.package / "hidden-symlink").symlink_to(PACKAGE.MANIFEST_NAME)
+                for directory in (path for path in fixture.package.rglob("*") if path.is_dir()):
+                    directory.chmod(0o500)
+                fixture.package.chmod(0o500)
+
+                pinned_name = fixture.output / f"pinned-{attack}"
+
+                def swap_root() -> None:
+                    os.rename(fixture.package, pinned_name)
+                    fixture.package.mkdir(mode=0o500)
+
+                self.assert_error(
+                    expected,
+                    PACKAGE.verify_package,
+                    fixture.package,
+                    fixture.git_sha,
+                    after_root_pin=swap_root,
+                )
+
+    def test_post_rename_swaps_never_accept_or_delete_the_replacement(self) -> None:
+        for phase in ("after-rename", "before-verify"):
+            with self.subTest(phase=phase):
+                fixture = Fixture(self.case / phase)
+                pinned_name = fixture.output / f"pinned-{phase}"
+                marker = b"foreign replacement\n"
+
+                def swap_final() -> None:
+                    os.rename(fixture.package, pinned_name)
+                    fixture.package.mkdir(mode=0o700)
+                    replacement = fixture.package / "replacement-marker"
+                    replacement.write_bytes(marker)
+                    replacement.chmod(0o400)
+                    fixture.package.chmod(0o500)
+
+                kwargs = (
+                    {"after_rename_hook": swap_final}
+                    if phase == "after-rename"
+                    else {"before_final_verify_hook": swap_final}
+                )
+                self.assert_error("final_identity_changed", fixture.build, **kwargs)
+                self.assertEqual((fixture.package / "replacement-marker").read_bytes(), marker)
+                self.assertTrue((pinned_name / PACKAGE.MANIFEST_NAME).is_file())
+
+    def test_interrupted_stage_swap_never_deletes_the_replacement(self) -> None:
+        operation = self.fixture.stage / f".build-{self.fixture.git_sha}"
+        pinned = self.fixture.stage / "pinned-operation"
+        marker = b"foreign stage replacement\n"
+
+        def swap_stage(index: int) -> None:
+            if index != 1:
+                return
+            os.rename(operation, pinned)
+            operation.mkdir(mode=0o700)
+            replacement = operation / "replacement-marker"
+            replacement.write_bytes(marker)
+            replacement.chmod(0o600)
+            raise RuntimeError("private injected detail")
+
+        self.assert_error("final_identity_changed", self.fixture.build, failure_hook=swap_stage)
+        self.assertEqual((operation / "replacement-marker").read_bytes(), marker)
+        self.assertTrue(pinned.is_dir())
 
     def test_missing_package_artifact_and_non_owner_only_roots_fail_closed(self) -> None:
         self.fixture.build()

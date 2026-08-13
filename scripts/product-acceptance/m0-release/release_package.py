@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -14,7 +15,6 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -261,7 +261,23 @@ def current_absolute_identity(path: Path) -> tuple[int, int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, stat.S_IMODE(info.st_mode))
 
 
-def git_metadata(source_root: Path, expected_git_sha: str) -> str:
+def directory_identity(info: os.stat_result) -> tuple[int, int]:
+    return (info.st_dev, info.st_ino)
+
+
+def assert_absolute_directory_identity(path: Path, expected: tuple[int, int]) -> None:
+    try:
+        fd = open_absolute_dir(path)
+    except (OSError, PackageError) as exc:
+        raise PackageError("source_root_changed") from exc
+    try:
+        if directory_identity(os.fstat(fd)) != expected:
+            fail("source_root_changed")
+    finally:
+        os.close(fd)
+
+
+def git_metadata(source_root_fd: int, expected_git_sha: str) -> str:
     if not SHA1_RE.fullmatch(expected_git_sha):
         fail("git_sha_invalid")
     environment = {
@@ -271,33 +287,28 @@ def git_metadata(source_root: Path, expected_git_sha: str) -> str:
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "LC_ALL": "C",
     }
+    descriptor_path = f"/proc/self/fd/{source_root_fd}"
+    common = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "timeout": 10,
+        "check": False,
+        "env": environment,
+        "pass_fds": (source_root_fd,),
+    }
     try:
         head = subprocess.run(
-            ["git", "-C", str(source_root), "rev-parse", "--verify", "HEAD^{commit}"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-            env=environment,
+            ["git", "-C", descriptor_path, "rev-parse", "--verify", "HEAD^{commit}"],
+            **common,
         )
         dirty = subprocess.run(
-            ["git", "-C", str(source_root), "status", "--porcelain", "--untracked-files=no"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-            env=environment,
+            ["git", "-C", descriptor_path, "status", "--porcelain", "--untracked-files=no"],
+            **common,
         )
         timestamp = subprocess.run(
-            ["git", "-C", str(source_root), "show", "-s", "--format=%ct", expected_git_sha],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-            env=environment,
+            ["git", "-C", descriptor_path, "show", "-s", "--format=%ct", expected_git_sha],
+            **common,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PackageError("git_authority_unavailable") from exc
@@ -315,9 +326,37 @@ def git_metadata(source_root: Path, expected_git_sha: str) -> str:
     return datetime.fromtimestamp(int(timestamp_text), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def write_pinned(item: PinnedSource, destination: Path) -> None:
-    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+def ensure_parent_at(root_fd: int, relative: str) -> tuple[int, str]:
+    parts = safe_parts(relative, absolute=False)
+    current = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, 0o700, dir_fd=current)
+            except FileExistsError:
+                pass
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=current,
+            )
+            os.close(current)
+            current = next_fd
+            validate_dir(os.fstat(current), exact_mode=0o700, exact_owner=True)
+        return current, parts[-1]
+    except Exception:
+        os.close(current)
+        raise
+
+
+def write_pinned_at(root_fd: int, item: PinnedSource) -> None:
+    parent_fd, leaf = ensure_parent_at(root_fd, item.source)
+    fd = os.open(
+        leaf,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=parent_fd,
+    )
     digest = hashlib.sha256()
     size = 0
     try:
@@ -338,40 +377,157 @@ def write_pinned(item: PinnedSource, destination: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+        os.close(parent_fd)
 
 
-def fsync_tree_and_freeze(root: Path) -> None:
-    directories = sorted((path for path in root.rglob("*") if path.is_dir()), key=lambda path: len(path.parts), reverse=True)
-    for directory in directories:
-        directory.chmod(0o500)
-        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+def write_bytes_at(root_fd: int, relative: str, raw: bytes, mode: int) -> None:
+    parent_fd, leaf = ensure_parent_at(root_fd, relative)
+    fd = os.open(
+        leaf,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=parent_fd,
+    )
     try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fchmod(fd, mode)
         os.fsync(fd)
+    finally:
+        os.close(fd)
+        os.close(parent_fd)
+
+
+def open_entry_at(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
+    if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+        fail("package_entry_invalid")
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise PackageError("package_symlink") from exc
+        raise
+    return fd, os.fstat(fd)
+
+
+def directory_names(directory_fd: int) -> list[str]:
+    scan_fd = os.open(
+        ".",
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=directory_fd,
+    )
+    try:
+        return sorted(os.listdir(scan_fd))
+    finally:
+        os.close(scan_fd)
+
+
+def fsync_tree_and_freeze_fd(root_fd: int, *, freeze_root: bool) -> None:
+    for name in directory_names(root_fd):
+        child_fd, info = open_entry_at(root_fd, name)
+        try:
+            if stat.S_ISDIR(info.st_mode):
+                fsync_tree_and_freeze_fd(child_fd, freeze_root=True)
+            elif not stat.S_ISREG(info.st_mode):
+                fail("package_special_file")
+        finally:
+            os.close(child_fd)
+    if freeze_root:
+        os.fchmod(root_fd, 0o500)
+    os.fsync(root_fd)
+
+
+def inode_identity(info: os.stat_result) -> tuple[int, int, int]:
+    return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
+
+
+def open_path_entry_at(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
+    try:
+        fd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+    except FileNotFoundError:
+        raise
+    return fd, os.fstat(fd)
+
+
+def name_matches_identity(parent_fd: int, name: str, expected: tuple[int, int, int]) -> bool:
+    try:
+        fd, info = open_path_entry_at(parent_fd, name)
+    except FileNotFoundError:
+        return False
+    try:
+        return inode_identity(info) == expected
     finally:
         os.close(fd)
 
 
-def remove_owned_tree(path: Path) -> None:
+def remove_tree_at(
+    parent_fd: int,
+    name: str,
+    *,
+    expected_identity: tuple[int, int, int] | None = None,
+    missing_ok: bool = True,
+) -> None:
     try:
-        info = os.lstat(path)
+        path_fd, path_info = open_path_entry_at(parent_fd, name)
     except FileNotFoundError:
-        return
-    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid():
-        fail("stale_stage_unsafe")
-    path.chmod(0o700)
-    for child in path.rglob("*"):
-        if child.is_dir() and not child.is_symlink():
-            child.chmod(0o700)
-        elif child.is_symlink():
-            child.unlink()
-        else:
-            child.chmod(0o600)
-    shutil.rmtree(path)
+        if missing_ok:
+            return
+        fail("cleanup_missing")
+    try:
+        actual_identity = inode_identity(path_info)
+        if expected_identity is not None and actual_identity != expected_identity:
+            fail("cleanup_identity_mismatch")
+        if not stat.S_ISDIR(path_info.st_mode) or path_info.st_uid != os.geteuid():
+            fail("cleanup_authority_invalid")
+        directory_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+        try:
+            if inode_identity(os.fstat(directory_fd)) != actual_identity:
+                fail("cleanup_identity_mismatch")
+            os.fchmod(directory_fd, 0o700)
+            for child_name in directory_names(directory_fd):
+                child_path_fd, child_info = open_path_entry_at(directory_fd, child_name)
+                child_identity = inode_identity(child_info)
+                os.close(child_path_fd)
+                if stat.S_ISDIR(child_info.st_mode):
+                    remove_tree_at(
+                        directory_fd,
+                        child_name,
+                        expected_identity=child_identity,
+                        missing_ok=False,
+                    )
+                else:
+                    if not name_matches_identity(directory_fd, child_name, child_identity):
+                        fail("cleanup_identity_mismatch")
+                    os.unlink(child_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        if not name_matches_identity(parent_fd, name, actual_identity):
+            fail("cleanup_identity_mismatch")
+        os.rmdir(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(path_fd)
+
+
+def remove_owned_tree(path: Path) -> None:
+    if not path.is_absolute():
+        fail("path_invalid")
+    parent_fd = open_absolute_dir(path.parent)
+    try:
+        remove_tree_at(parent_fd, path.name)
+    finally:
+        os.close(parent_fd)
 
 
 def package_name(expected_git_sha: str) -> str:
@@ -392,30 +548,101 @@ def manifest_for(created_at: str, git_sha: str, pinned: list[PinnedSource]) -> d
     }
 
 
-def verify_package(package: Path, expected_git_sha: str) -> dict[str, Any]:
+@dataclass
+class TreeFile:
+    fd: int
+    info: os.stat_result
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+
+def stable_stat(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        stat.S_IFMT(info.st_mode),
+        stat.S_IMODE(info.st_mode),
+        info.st_uid,
+        info.st_gid,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def enumerate_tree(root_fd: int) -> tuple[dict[str, TreeFile], dict[str, tuple[int, ...]]]:
+    files: dict[str, TreeFile] = {}
+    directories: dict[str, tuple[int, ...]] = {}
+
+    def visit(directory_fd: int, prefix: str) -> None:
+        before = stable_stat(os.fstat(directory_fd))
+        for name in directory_names(directory_fd):
+            try:
+                entry_fd, info = open_entry_at(directory_fd, name)
+            except OSError as exc:
+                raise PackageError("package_entry_unsafe") from exc
+            relative = f"{prefix}/{name}" if prefix else name
+            if stat.S_ISDIR(info.st_mode):
+                try:
+                    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o500:
+                        fail("package_directory_authority_invalid")
+                    visit(entry_fd, relative)
+                finally:
+                    os.close(entry_fd)
+            elif stat.S_ISREG(info.st_mode):
+                files[relative] = TreeFile(entry_fd, info)
+            else:
+                os.close(entry_fd)
+                fail("package_special_file")
+        after = stable_stat(os.fstat(directory_fd))
+        if before != after:
+            fail("package_tree_changed")
+        directories[prefix] = after
+
+    try:
+        visit(root_fd, "")
+        return files, directories
+    except Exception:
+        for item in files.values():
+            item.close()
+        raise
+
+
+def read_fd(fd: int, size: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            fail("file_truncated")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        fail("file_grew")
+    os.lseek(fd, 0, os.SEEK_SET)
+    return b"".join(chunks)
+
+
+def verify_package_fd(root_fd: int, expected_git_sha: str) -> dict[str, Any]:
     inventory = load_inventory()
+    validate_dir(os.fstat(root_fd), exact_mode=0o500, exact_owner=True)
+    files, directory_snapshot = enumerate_tree(root_fd)
     try:
-        root_fd = open_absolute_dir(package, exact_mode=0o500)
-    except OSError as exc:
-        raise PackageError("package_root_unsafe") from exc
-    try:
-        try:
-            manifest_fd, manifest_info = open_relative_file(root_fd, MANIFEST_NAME)
-        except OSError as exc:
-            raise PackageError("manifest_missing_or_unsafe") from exc
-        try:
-            if (
-                not stat.S_ISREG(manifest_info.st_mode)
-                or manifest_info.st_nlink != 1
-                or manifest_info.st_uid != os.geteuid()
-                or stat.S_IMODE(manifest_info.st_mode) != 0o400
-            ):
-                fail("manifest_authority_invalid")
-            manifest_sha, size = digest_fd(manifest_fd, MAX_MANIFEST_BYTES)
-            os.lseek(manifest_fd, 0, os.SEEK_SET)
-            raw = os.read(manifest_fd, size + 1)
-        finally:
-            os.close(manifest_fd)
+        manifest_file = files.get(MANIFEST_NAME)
+        if manifest_file is None:
+            fail("manifest_missing_or_unsafe")
+        manifest_info = manifest_file.info
+        if (
+            manifest_info.st_nlink != 1
+            or manifest_info.st_uid != os.geteuid()
+            or stat.S_IMODE(manifest_info.st_mode) != 0o400
+        ):
+            fail("manifest_authority_invalid")
+        manifest_sha, size = digest_fd(manifest_file.fd, MAX_MANIFEST_BYTES)
+        raw = read_fd(manifest_file.fd, size)
         manifest = strict_json(raw)
         if canonical_json(manifest) != raw:
             fail("manifest_not_canonical")
@@ -448,21 +675,19 @@ def verify_package(package: Path, expected_git_sha: str) -> dict[str, Any]:
                 fail("manifest_artifact_authority_mismatch")
             if destination in seen_destinations or source in seen_sources:
                 fail("manifest_artifact_duplicate")
-            try:
-                artifact_fd, artifact_info = open_relative_file(root_fd, source)
-            except OSError as exc:
-                raise PackageError("package_artifact_missing_or_unsafe") from exc
-            try:
-                if (
-                    not stat.S_ISREG(artifact_info.st_mode)
-                    or artifact_info.st_nlink != 1
-                    or artifact_info.st_uid != os.geteuid()
-                    or stat.S_IMODE(artifact_info.st_mode) != FILE_MODES[kind]
-                ):
-                    fail("package_artifact_authority_invalid")
-                actual, _ = digest_fd(artifact_fd)
-            finally:
-                os.close(artifact_fd)
+            artifact_file = files.get(source)
+            if artifact_file is None:
+                fail("package_artifact_missing_or_unsafe")
+            artifact_info = artifact_file.info
+            if (
+                artifact_info.st_nlink != 1
+                or artifact_info.st_uid != os.geteuid()
+                or stat.S_IMODE(artifact_info.st_mode) != FILE_MODES[kind]
+            ):
+                fail("package_artifact_authority_invalid")
+            actual, _ = digest_fd(artifact_file.fd)
+            if stable_stat(os.fstat(artifact_file.fd)) != stable_stat(artifact_info):
+                fail("package_tree_changed")
             if not hmac.compare_digest(actual, digest):
                 fail("package_artifact_digest_mismatch")
             expected_files.add(source)
@@ -470,32 +695,46 @@ def verify_package(package: Path, expected_git_sha: str) -> dict[str, Any]:
             seen_sources.add(source)
         if seen_destinations != set(inventory) or seen_sources != {value[0] for value in inventory.values()}:
             fail("manifest_required_artifact_missing")
+        if set(files) != expected_files:
+            fail("package_file_set_mismatch")
+        final_files, final_directories = enumerate_tree(root_fd)
+        try:
+            if final_directories != directory_snapshot or {
+                path: stable_stat(item.info) for path, item in final_files.items()
+            } != {path: stable_stat(item.info) for path, item in files.items()}:
+                fail("package_tree_changed")
+        finally:
+            for item in final_files.values():
+                item.close()
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "status": "VERIFIED",
+            "git_sha": expected_git_sha,
+            "manifest_sha256": manifest_sha,
+            "artifact_count": len(inventory),
+            "package_name": package_name(expected_git_sha),
+        }
+    finally:
+        for item in files.values():
+            item.close()
+
+
+def verify_package(
+    package: Path,
+    expected_git_sha: str,
+    *,
+    after_root_pin: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    try:
+        root_fd = open_absolute_dir(package, exact_mode=0o500)
+    except (OSError, PackageError) as exc:
+        raise PackageError("package_root_unsafe") from exc
+    try:
+        if after_root_pin is not None:
+            after_root_pin()
+        return verify_package_fd(root_fd, expected_git_sha)
     finally:
         os.close(root_fd)
-
-    actual_files: set[str] = set()
-    for path in package.rglob("*"):
-        relative = path.relative_to(package).as_posix()
-        info = os.lstat(path)
-        if stat.S_ISLNK(info.st_mode):
-            fail("package_symlink")
-        if stat.S_ISREG(info.st_mode):
-            actual_files.add(relative)
-        elif stat.S_ISDIR(info.st_mode):
-            if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o500:
-                fail("package_directory_authority_invalid")
-        else:
-            fail("package_special_file")
-    if actual_files != expected_files:
-        fail("package_file_set_mismatch")
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "status": "VERIFIED",
-        "git_sha": expected_git_sha,
-        "manifest_sha256": manifest_sha,
-        "artifact_count": len(inventory),
-        "package_name": package.name,
-    }
 
 
 def build_package(
@@ -506,21 +745,31 @@ def build_package(
     expected_git_sha: str,
     *,
     failure_hook: Callable[[int], None] | None = None,
+    after_git_hook: Callable[[], None] | None = None,
+    after_rename_hook: Callable[[], None] | None = None,
+    before_final_verify_hook: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     if not all(path.is_absolute() for path in (source_root, nats_server, output_root, stage_root)):
         fail("path_invalid")
-    inventory = load_inventory()
-    created_at = git_metadata(source_root, expected_git_sha)
     source_root_fd: int | None = None
     output_root_fd: int | None = None
     stage_root_fd: int | None = None
+    operation_fd: int | None = None
+    final_fd: int | None = None
     lock_fd: int | None = None
     pinned: list[PinnedSource] = []
-    operation = stage_root / f".build-{expected_git_sha}"
-    final = output_root / package_name(expected_git_sha)
+    operation_name = f".build-{expected_git_sha}"
+    final_name = package_name(expected_git_sha)
+    operation_identity: tuple[int, int, int] | None = None
     renamed = False
     try:
         source_root_fd = open_absolute_dir(source_root)
+        source_root_identity = directory_identity(os.fstat(source_root_fd))
+        created_at = git_metadata(source_root_fd, expected_git_sha)
+        if after_git_hook is not None:
+            after_git_hook()
+        assert_absolute_directory_identity(source_root, source_root_identity)
+
         output_root_fd = open_absolute_dir(output_root, exact_mode=0o700)
         stage_root_fd = open_absolute_dir(stage_root, exact_mode=0o700)
         if os.fstat(output_root_fd).st_dev != os.fstat(stage_root_fd).st_dev:
@@ -541,16 +790,6 @@ def build_package(
         except BlockingIOError as exc:
             raise PackageError("package_build_active") from exc
 
-        remove_owned_tree(operation)
-        if final.exists() or final.is_symlink():
-            try:
-                result = verify_package(final, expected_git_sha)
-            except (OSError, PackageError) as exc:
-                raise PackageError("stale_output_conflict") from exc
-            result["status"] = "REUSED"
-            return result
-        operation.mkdir(mode=0o700)
-
         nats_lexical = Path(os.path.abspath(nats_server))
         try:
             nats_lexical.relative_to(source_root)
@@ -559,6 +798,7 @@ def build_package(
         else:
             fail("nats_not_separate")
 
+        inventory = load_inventory()
         for destination, (source, kind) in sorted(inventory.items()):
             try:
                 if source == "external/nats-server":
@@ -571,20 +811,41 @@ def build_package(
 
         manifest = manifest_for(created_at, expected_git_sha, pinned)
         manifest_raw = canonical_json(manifest)
+        expected_manifest_sha = hashlib.sha256(manifest_raw).hexdigest()
+
+        remove_tree_at(stage_root_fd, operation_name)
+        try:
+            existing_fd, existing_info = open_entry_at(output_root_fd, final_name)
+        except FileNotFoundError:
+            existing_fd = None
+        except (OSError, PackageError) as exc:
+            raise PackageError("stale_output_conflict") from exc
+        if existing_fd is not None:
+            try:
+                if not stat.S_ISDIR(existing_info.st_mode):
+                    fail("stale_output_conflict")
+                try:
+                    result = verify_package_fd(existing_fd, expected_git_sha)
+                except PackageError as exc:
+                    raise PackageError("stale_output_conflict") from exc
+                if not hmac.compare_digest(result["manifest_sha256"], expected_manifest_sha):
+                    fail("stale_output_conflict")
+                result["status"] = "REUSED"
+                return result
+            finally:
+                os.close(existing_fd)
+
+        os.mkdir(operation_name, 0o700, dir_fd=stage_root_fd)
+        operation_fd, operation_info = open_entry_at(stage_root_fd, operation_name)
+        validate_dir(operation_info, exact_mode=0o700, exact_owner=True)
+        operation_identity = inode_identity(operation_info)
+
         for index, item in enumerate(pinned, start=1):
-            write_pinned(item, operation / item.source)
+            write_pinned_at(operation_fd, item)
             if failure_hook is not None:
                 failure_hook(index)
 
-        manifest_path = operation / MANIFEST_NAME
-        manifest_fd = os.open(
-            manifest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o400
-        )
-        try:
-            os.write(manifest_fd, manifest_raw)
-            os.fsync(manifest_fd)
-        finally:
-            os.close(manifest_fd)
+        write_bytes_at(operation_fd, MANIFEST_NAME, manifest_raw, 0o400)
 
         for item in pinned:
             descriptor_info = os.fstat(item.fd)
@@ -608,34 +869,58 @@ def build_package(
             if current != item.identity:
                 fail("source_changed")
 
-        fsync_tree_and_freeze(operation)
-        os.rename(operation.name, final.name, src_dir_fd=stage_root_fd, dst_dir_fd=output_root_fd)
+        assert_absolute_directory_identity(source_root, source_root_identity)
+        fsync_tree_and_freeze_fd(operation_fd, freeze_root=False)
+        os.rename(operation_name, final_name, src_dir_fd=stage_root_fd, dst_dir_fd=output_root_fd)
         renamed = True
-        final.chmod(0o500)
-        final_fd = os.open(final, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        if after_rename_hook is not None:
+            after_rename_hook()
         try:
-            os.fsync(final_fd)
-        finally:
-            os.close(final_fd)
+            final_fd, final_info = open_entry_at(output_root_fd, final_name)
+        except (OSError, PackageError) as exc:
+            raise PackageError("final_identity_changed") from exc
+        if not stat.S_ISDIR(final_info.st_mode) or inode_identity(final_info) != operation_identity:
+            fail("final_identity_changed")
+        os.fchmod(final_fd, 0o500)
+        os.fsync(final_fd)
+        if before_final_verify_hook is not None:
+            before_final_verify_hook()
+        result = verify_package_fd(final_fd, expected_git_sha)
+        if not name_matches_identity(output_root_fd, final_name, operation_identity):
+            fail("final_identity_changed")
         os.fsync(stage_root_fd)
         os.fsync(output_root_fd)
-        result = verify_package(final, expected_git_sha)
         result["status"] = "COMPLETE"
         return result
-    except PackageError:
-        if renamed:
-            remove_owned_tree(final)
-            if output_root_fd is not None:
-                os.fsync(output_root_fd)
-        elif stage_root_fd is not None:
-            remove_owned_tree(operation)
+    except PackageError as exc:
+        cleanup_parent = output_root_fd if renamed else stage_root_fd
+        cleanup_name = final_name if renamed else operation_name
+        if cleanup_parent is not None and operation_identity is not None:
+            try:
+                remove_tree_at(
+                    cleanup_parent,
+                    cleanup_name,
+                    expected_identity=operation_identity,
+                )
+            except PackageError as cleanup_exc:
+                if str(cleanup_exc) == "cleanup_identity_mismatch":
+                    raise PackageError("final_identity_changed") from exc
+                raise
         raise
     except Exception as exc:
-        if not renamed and stage_root_fd is not None:
+        cleanup_parent = output_root_fd if renamed else stage_root_fd
+        cleanup_name = final_name if renamed else operation_name
+        if cleanup_parent is not None and operation_identity is not None:
             try:
-                remove_owned_tree(operation)
-            except Exception:
-                pass
+                remove_tree_at(
+                    cleanup_parent,
+                    cleanup_name,
+                    expected_identity=operation_identity,
+                )
+            except PackageError as cleanup_exc:
+                if str(cleanup_exc) == "cleanup_identity_mismatch":
+                    raise PackageError("final_identity_changed") from exc
+                raise
         raise PackageError("internal_failure") from exc
     finally:
         for item in pinned:
@@ -646,7 +931,7 @@ def build_package(
             except OSError:
                 pass
             os.close(lock_fd)
-        for fd in (source_root_fd, output_root_fd, stage_root_fd):
+        for fd in (final_fd, operation_fd, source_root_fd, output_root_fd, stage_root_fd):
             if fd is not None:
                 os.close(fd)
 
