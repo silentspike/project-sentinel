@@ -879,6 +879,14 @@ mod tests {
         }
     }
 
+    impl std::ops::Deref for TestDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
     fn short_socket_case(name: &str) -> (TestDir, PathBuf) {
         let root = PathBuf::from("/work/tmp/project-sentinel/c3-650-s")
             .join(format!("{}-{name}", std::process::id()));
@@ -889,19 +897,16 @@ mod tests {
         (TestDir(root), socket)
     }
 
-    fn credential_case(name: &str) -> (PathBuf, PathBuf) {
-        let root = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join("sentinel-ctl-credential-tests")
-            .join(format!("{name}-{}", std::process::id()));
+    fn credential_case(name: &str) -> (TestDir, PathBuf) {
+        let root = PathBuf::from("/work/tmp/project-sentinel/c3-650-s")
+            .join(format!("{}-credential-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = root.join(OPERATOR_CREDENTIAL_NAME);
         std::fs::write(&path, b"0123456789abcdef0123456789abcdef").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        (root, path)
+        (TestDir(root), path)
     }
 
     fn set_credential_environment(root: &Path, path: &Path) {
@@ -1031,7 +1036,6 @@ mod tests {
         std::env::remove_var("SENTINEL_OPERATOR_API_KEY");
         std::env::remove_var(OPERATOR_KEY_FILE_ENV);
         std::env::remove_var(CREDENTIALS_DIRECTORY_ENV);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1054,7 +1058,6 @@ mod tests {
         std::env::remove_var("SENTINEL_OPERATOR_API_URL");
         std::env::remove_var(OPERATOR_KEY_FILE_ENV);
         std::env::remove_var(CREDENTIALS_DIRECTORY_ENV);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1075,7 +1078,6 @@ mod tests {
         std::env::remove_var("SENTINEL_OPERATOR_API_KEY");
         std::env::remove_var(OPERATOR_KEY_FILE_ENV);
         std::env::remove_var(CREDENTIALS_DIRECTORY_ENV);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1187,6 +1189,5 @@ mod tests {
             })
             .is_err()
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 }
