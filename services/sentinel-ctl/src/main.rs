@@ -866,7 +866,27 @@ mod tests {
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct TestDir(PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn short_socket_case(name: &str) -> (TestDir, PathBuf) {
+        let root = PathBuf::from("/work/tmp/project-sentinel/c3-650-s")
+            .join(format!("{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = root.join("broker.sock");
+        (TestDir(root), socket)
     }
 
     fn credential_case(name: &str) -> (PathBuf, PathBuf) {
@@ -1061,8 +1081,7 @@ mod tests {
     #[test]
     fn broker_mode_sends_only_structured_scoped_request() {
         let _guard = env_lock();
-        let (root, socket_path) = credential_case("broker");
-        std::fs::remove_file(&socket_path).unwrap();
+        let (_socket_root, socket_path) = short_socket_case("broker");
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let session = "gaia-broker-session-1";
         let capability = "opaque-capability-0123456789abcdef";
@@ -1095,14 +1114,12 @@ mod tests {
         std::env::remove_var(OPERATOR_BROKER_SOCKET_ENV);
         std::env::remove_var(OPERATOR_BROKER_SESSION_ENV);
         std::env::remove_var(OPERATOR_BROKER_CAPABILITY_ENV);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn broker_mode_rejects_mutation_before_socket_io() {
         let _guard = env_lock();
-        let (root, socket_path) = credential_case("broker-mutation");
-        std::fs::remove_file(&socket_path).unwrap();
+        let (_socket_root, socket_path) = short_socket_case("broker-mutation");
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         listener.set_nonblocking(true).unwrap();
         std::env::set_var(OPERATOR_BROKER_SOCKET_ENV, &socket_path);
@@ -1128,7 +1145,6 @@ mod tests {
         std::env::remove_var(OPERATOR_BROKER_SOCKET_ENV);
         std::env::remove_var(OPERATOR_BROKER_SESSION_ENV);
         std::env::remove_var(OPERATOR_BROKER_CAPABILITY_ENV);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
