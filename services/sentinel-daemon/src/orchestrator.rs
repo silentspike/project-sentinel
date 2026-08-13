@@ -669,7 +669,11 @@ impl DaemonWorkbenchRuntimeClient<'_> {
 }
 
 impl crate::workbench::WorkbenchRuntimeClient for DaemonWorkbenchRuntimeClient<'_> {
-    fn exchange(&mut self, agent_id: AgentId, request: NanoExecRequest) -> Result<NanoExecResult> {
+    fn exchange(
+        &mut self,
+        agent_id: AgentId,
+        request: NanoExecRequest,
+    ) -> Result<crate::workbench::WorkbenchRuntimeExchange<'_>> {
         // One capability represents the authority line for the entire
         // exchange. Re-issuing here would let a successor term legitimize an
         // effect that began under the predecessor.
@@ -713,7 +717,15 @@ impl crate::workbench::WorkbenchRuntimeClient for DaemonWorkbenchRuntimeClient<'
         self.revalidate_world_authority(&world_guard)?;
         let result = self.runtimes.adapter_owner.exec(&handle, request)?;
         self.revalidate_world_authority(&world_guard)?;
-        Ok(result)
+        let owner_registry = self.owner_registry;
+        Ok(crate::workbench::WorkbenchRuntimeExchange::new(
+            result,
+            move || {
+                owner_registry
+                    .validate(&world_guard)
+                    .context("workbench World authority became stale")
+            },
+        ))
     }
 }
 

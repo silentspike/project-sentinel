@@ -13,6 +13,29 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
+/// ABI whose filesystem rights are requested by the current Sentinel ruleset.
+pub const LANDLOCK_RULESET_ABI: u8 = 4;
+
+/// Kernel result returned after the irreversible `restrict_self` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandlockEnforcement {
+    FullyEnforced { abi: u8 },
+    PartiallyEnforced,
+    NotEnforced,
+}
+
+/// Returns the measured ABI only when the irreversible ruleset result exactly
+/// satisfies the workbench contract.
+pub fn workbench_fully_enforced_abi(
+    enforcement: LandlockEnforcement,
+    expected_abi: u8,
+) -> Option<u8> {
+    match enforcement {
+        LandlockEnforcement::FullyEnforced { abi } if abi == expected_abi => Some(abi),
+        _ => None,
+    }
+}
+
 /// Landlock filesystem ruleset for agent isolation.
 #[derive(Debug, Clone)]
 pub struct LandlockRuleset {
@@ -85,6 +108,17 @@ impl LandlockRuleset {
     /// Must be called in the bwrap child process BEFORE exec'ing the agent.
     /// Returns true if fully or partially enforced, false if not enforced.
     pub fn apply(&self) -> Result<bool> {
+        Ok(matches!(
+            self.apply_status()?,
+            LandlockEnforcement::FullyEnforced { .. }
+                | LandlockEnforcement::PartiallyEnforced
+        ))
+    }
+
+    /// Applies the ruleset and returns the actual irreversible enforcement
+    /// result. Workbench callers must require `FullyEnforced`; the general
+    /// agent path may retain its existing best-effort policy.
+    pub fn apply_status(&self) -> Result<LandlockEnforcement> {
         use landlock::*;
 
         let abi = ABI::V4;
@@ -136,15 +170,17 @@ impl LandlockRuleset {
         match restriction.ruleset {
             RulesetStatus::FullyEnforced => {
                 info!("Landlock fully enforced");
-                Ok(true)
+                Ok(LandlockEnforcement::FullyEnforced {
+                    abi: LANDLOCK_RULESET_ABI,
+                })
             }
             RulesetStatus::PartiallyEnforced => {
                 warn!("Landlock partially enforced (kernel ABI may be older)");
-                Ok(true)
+                Ok(LandlockEnforcement::PartiallyEnforced)
             }
             RulesetStatus::NotEnforced => {
                 warn!("Landlock not enforced");
-                Ok(false)
+                Ok(LandlockEnforcement::NotEnforced)
             }
         }
     }
@@ -230,5 +266,41 @@ mod tests {
         assert!(rs1.write_paths.contains(&PathBuf::from("/home/thomas")));
         assert!(rs2.write_paths.contains(&PathBuf::from("/home/lisa")));
         assert!(!rs1.write_paths.contains(&PathBuf::from("/home/lisa")));
+    }
+
+    #[test]
+    fn workbench_rejects_partial_missing_and_mismatched_enforcement() {
+        assert_eq!(
+            workbench_fully_enforced_abi(
+                LandlockEnforcement::FullyEnforced {
+                    abi: LANDLOCK_RULESET_ABI,
+                },
+                LANDLOCK_RULESET_ABI,
+            ),
+            Some(LANDLOCK_RULESET_ABI)
+        );
+        assert_eq!(
+            workbench_fully_enforced_abi(
+                LandlockEnforcement::FullyEnforced {
+                    abi: LANDLOCK_RULESET_ABI,
+                },
+                LANDLOCK_RULESET_ABI - 1,
+            ),
+            None
+        );
+        assert_eq!(
+            workbench_fully_enforced_abi(
+                LandlockEnforcement::PartiallyEnforced,
+                LANDLOCK_RULESET_ABI,
+            ),
+            None
+        );
+        assert_eq!(
+            workbench_fully_enforced_abi(
+                LandlockEnforcement::NotEnforced,
+                LANDLOCK_RULESET_ABI,
+            ),
+            None
+        );
     }
 }

@@ -1,5 +1,8 @@
 use std::collections::HashMap;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -373,13 +376,36 @@ fn validate_artifact_manifest(
             "workbench artifact manifest escaped its authority scope",
         ));
     }
-    let bytes = std::fs::read(&manifest_path).map_err(|_| {
-        exec_error(
-            NanoExecErrorCode::ProtocolViolation,
-            false,
-            "workbench artifact manifest cannot be read",
-        )
-    })?;
+    let manifest_name = manifest_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            exec_error(
+                NanoExecErrorCode::ProtocolViolation,
+                false,
+                "workbench artifact manifest name is invalid",
+            )
+        })?;
+    let scope = open_pinned_artifact_directory(&artifact_root)?;
+    let mut manifest_file = open_scoped_artifact_file(
+        &scope,
+        manifest_name,
+        MAX_WORKBENCH_ARTIFACT_MANIFEST_BYTES,
+        None,
+    )?;
+    let mut bytes = Vec::new();
+    manifest_file
+        .by_ref()
+        .take(MAX_WORKBENCH_ARTIFACT_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            exec_error(
+                NanoExecErrorCode::ProtocolViolation,
+                false,
+                "workbench artifact manifest cannot be read",
+            )
+        })?;
+    revalidate_scoped_artifact_file(&scope, manifest_name, &manifest_file)?;
     if hex_sha256_bytes(&bytes) != artifact.sha256 {
         return Err(exec_error(
             NanoExecErrorCode::DigestConflict,
@@ -416,6 +442,7 @@ fn validate_artifact_manifest(
         ));
     }
     let blobs_root = canonical_child_directory(&artifact_root, "blobs")?;
+    let blobs = open_pinned_artifact_directory(&blobs_root)?;
     let mut total_size = 0_u64;
     for entry in manifest.entries {
         let _ = safe_relative_path(&entry.path)?;
@@ -433,31 +460,24 @@ fn validate_artifact_manifest(
                 "workbench artifact size overflowed its boundary",
             )
         })?;
-        let blob = blobs_root.join(&entry.sha256);
-        let blob_metadata = std::fs::symlink_metadata(&blob).map_err(|_| {
-            exec_error(
-                NanoExecErrorCode::ProtocolViolation,
-                false,
-                "workbench artifact blob is missing",
-            )
-        })?;
-        if blob_metadata.file_type().is_symlink()
-            || !blob_metadata.is_file()
-            || blob_metadata.len() != entry.size_bytes
-        {
-            return Err(exec_error(
-                NanoExecErrorCode::ProtocolViolation,
-                false,
-                "workbench artifact blob size binding is invalid",
-            ));
-        }
-        let blob_bytes = std::fs::read(&blob).map_err(|_| {
-            exec_error(
-                NanoExecErrorCode::ProtocolViolation,
-                false,
-                "workbench artifact blob cannot be read",
-            )
-        })?;
+        let mut blob = open_scoped_artifact_file(
+            &blobs,
+            &entry.sha256,
+            entry.size_bytes,
+            Some(entry.size_bytes),
+        )?;
+        let mut blob_bytes = Vec::new();
+        blob.by_ref()
+            .take(entry.size_bytes.saturating_add(1))
+            .read_to_end(&mut blob_bytes)
+            .map_err(|_| {
+                exec_error(
+                    NanoExecErrorCode::ProtocolViolation,
+                    false,
+                    "workbench artifact blob cannot be read",
+                )
+            })?;
+        revalidate_scoped_artifact_file(&blobs, &entry.sha256, &blob)?;
         let digest = hex_sha256_bytes(&blob_bytes);
         if digest != entry.sha256 {
             return Err(exec_error(
@@ -472,6 +492,187 @@ fn validate_artifact_manifest(
             NanoExecErrorCode::ProtocolViolation,
             false,
             "workbench artifact size conflicts with its manifest",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactFileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+}
+
+impl ArtifactFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+        }
+    }
+}
+
+fn current_process_uid() -> Result<u32> {
+    std::fs::metadata("/proc/self")
+        .map(|metadata| metadata.uid())
+        .map_err(|_| {
+            exec_error(
+                NanoExecErrorCode::ProtocolViolation,
+                false,
+                "workbench artifact owner cannot be verified",
+            )
+        })
+}
+
+fn open_pinned_artifact_directory(path: &std::path::Path) -> Result<File> {
+    let before = std::fs::symlink_metadata(path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact directory cannot be inspected",
+        )
+    })?;
+    if before.file_type().is_symlink() || !before.is_dir() {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact directory identity is invalid",
+        ));
+    }
+    let directory = File::open(path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact directory cannot be opened",
+        )
+    })?;
+    let opened = directory.metadata().map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact directory cannot be verified",
+        )
+    })?;
+    if before.dev() != opened.dev() || before.ino() != opened.ino() {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact directory identity changed",
+        ));
+    }
+    Ok(directory)
+}
+
+fn open_scoped_artifact_file(
+    directory: &File,
+    name: &str,
+    max_bytes: u64,
+    exact_size: Option<u64>,
+) -> Result<File> {
+    open_scoped_artifact_file_with(directory, name, max_bytes, exact_size, |path| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    })
+}
+
+fn open_scoped_artifact_file_with<Open>(
+    directory: &File,
+    name: &str,
+    max_bytes: u64,
+    exact_size: Option<u64>,
+    open: Open,
+) -> Result<File>
+where
+    Open: FnOnce(&std::path::Path) -> std::io::Result<File>,
+{
+    safe_scope_component(name)?;
+    let path = PathBuf::from(format!("/proc/self/fd/{}/{}", directory.as_raw_fd(), name));
+    let before = std::fs::symlink_metadata(&path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file cannot be inspected",
+        )
+    })?;
+    validate_artifact_file_metadata(&before, max_bytes, exact_size)?;
+    let expected = ArtifactFileIdentity::from_metadata(&before);
+    let file = open(&path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file cannot be opened",
+        )
+    })?;
+    let opened = file.metadata().map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file cannot be verified",
+        )
+    })?;
+    validate_artifact_file_metadata(&opened, max_bytes, exact_size)?;
+    if ArtifactFileIdentity::from_metadata(&opened) != expected {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file identity changed before open",
+        ));
+    }
+    Ok(file)
+}
+
+fn validate_artifact_file_metadata(
+    metadata: &std::fs::Metadata,
+    max_bytes: u64,
+    exact_size: Option<u64>,
+) -> Result<()> {
+    let mode = metadata.mode() & 0o777;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.nlink() != 1
+        || metadata.uid() != current_process_uid()?
+        || mode & 0o022 != 0
+        || metadata.len() > max_bytes
+        || exact_size.is_some_and(|size| metadata.len() != size)
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file ownership or mode is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn revalidate_scoped_artifact_file(directory: &File, name: &str, file: &File) -> Result<()> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}/{}", directory.as_raw_fd(), name));
+    let opened = file.metadata().map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file cannot be revalidated",
+        )
+    })?;
+    let path_metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file disappeared during read",
+        )
+    })?;
+    validate_artifact_file_metadata(&opened, opened.len(), Some(opened.len()))?;
+    validate_artifact_file_metadata(&path_metadata, opened.len(), Some(opened.len()))?;
+    if ArtifactFileIdentity::from_metadata(&path_metadata)
+            != ArtifactFileIdentity::from_metadata(&opened)
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file identity changed during read",
         ));
     }
     Ok(())
@@ -2961,6 +3162,35 @@ mod tests {
             "AGENT-07",
             "project-01",
             "work-04",
+        )
+        .is_err());
+
+        let safe_scope = directory.path().join("safe-files");
+        std::fs::create_dir(&safe_scope).unwrap();
+        let manifest = safe_scope.join("manifest.json");
+        std::fs::write(&manifest, b"{}").unwrap();
+        let pinned = open_pinned_artifact_directory(&safe_scope).unwrap();
+        open_scoped_artifact_file(&pinned, "manifest.json", 16, None).unwrap();
+
+        let hardlink = safe_scope.join("manifest-hardlink.json");
+        std::fs::hard_link(&manifest, &hardlink).unwrap();
+        assert!(open_scoped_artifact_file(&pinned, "manifest.json", 16, None).is_err());
+        std::fs::remove_file(hardlink).unwrap();
+
+        let replacement = safe_scope.join("replacement.json");
+        std::fs::write(&replacement, b"[]").unwrap();
+        assert!(open_scoped_artifact_file_with(
+            &pinned,
+            "manifest.json",
+            16,
+            None,
+            |path| {
+                std::fs::rename(&replacement, &manifest)?;
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(path)
+            },
         )
         .is_err());
     }
