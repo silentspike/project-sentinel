@@ -244,15 +244,11 @@ pub fn validate_delivery_aggregate_references(
         if let Some(gate) = aggregate.gates.get(&approval.gate.id) {
             let gate_digest =
                 ContentDigest::of_domain("qa-release-gate", DELIVERY_SCHEMA_V1, gate)?;
-            if approval.gate.generation != gate.generation
-                || approval.gate.digest != gate_digest
-            {
+            if approval.gate.generation != gate.generation || approval.gate.digest != gate_digest {
                 return Err(corrupt("approval gate reference is stale"));
             }
         } else if candidate.state != CandidateState::QaRunning {
-            return Err(corrupt(
-                "approval gate is missing outside staged QA review",
-            ));
+            return Err(corrupt("approval gate is missing outside staged QA review"));
         }
     }
     for manifest in aggregate.manifests.values() {

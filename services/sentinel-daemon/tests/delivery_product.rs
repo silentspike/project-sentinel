@@ -244,13 +244,12 @@ impl DeliveryIntegrationPort for DeterministicIntegration {
         query: &CandidateAuthorityQueryV1,
     ) -> Result<CandidateAuthoritySnapshotV1, DeliveryError> {
         let phase = self.lineage_phase.fetch_add(1, Ordering::SeqCst);
-        let generation = if matches!(self.workflow_fault, WorkflowFault::GenerationMismatch)
-            && phase >= 1
-        {
-            12
-        } else {
-            11
-        };
+        let generation =
+            if matches!(self.workflow_fault, WorkflowFault::GenerationMismatch) && phase >= 1 {
+                12
+            } else {
+                11
+            };
         let candidate_digest =
             if matches!(self.workflow_fault, WorkflowFault::CandidateSwap) && phase >= 1 {
                 digest("candidate-swap")
@@ -1336,10 +1335,7 @@ fn publication_fails_before_external_io_when_local_authority_is_corrupt() {
         DeterministicEffects,
         publisher.clone(),
     );
-    assert!(matches!(
-        restarted,
-        Err(DeliveryError::CorruptStore(_))
-    ));
+    assert!(matches!(restarted, Err(DeliveryError::CorruptStore(_))));
     assert_eq!(
         publisher.counts(),
         (0, 0),
@@ -1643,10 +1639,7 @@ fn health_and_lineage_reject_tampered_content_and_wrong_or_substituted_reference
         DeterministicEffects,
         DeterministicPublisher::default(),
     );
-    assert!(matches!(
-        reopened,
-        Err(DeliveryError::CorruptStore(_))
-    ));
+    assert!(matches!(reopened, Err(DeliveryError::CorruptStore(_))));
 }
 
 #[test]
