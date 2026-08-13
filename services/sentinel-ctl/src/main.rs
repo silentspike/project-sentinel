@@ -5,15 +5,286 @@
 //! Mutierende/hochriskante Subcommands laufen durch ein Policy-Gate (Risiko-Tag + Bestaetigung);
 //! `--json` liefert maschinenlesbare Ausgabe fuer Gaia.
 
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const DEFAULT_OPERATOR_URL: &str = "http://127.0.0.1:8084";
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:8081";
 const OPERATOR_KEY_HEADER: &str = "x-sentinel-operator-key";
+const OPERATOR_KEY_FILE_ENV: &str = "SENTINEL_OPERATOR_API_KEY_FILE";
+const CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
+const OPERATOR_BROKER_SOCKET_ENV: &str = "SENTINEL_GAIA_OPERATOR_BROKER_SOCKET";
+const OPERATOR_BROKER_SESSION_ENV: &str = "SENTINEL_GAIA_OPERATOR_BROKER_SESSION";
+const OPERATOR_BROKER_CAPABILITY_ENV: &str = "SENTINEL_GAIA_OPERATOR_BROKER_CAPABILITY";
+const OPERATOR_CREDENTIAL_NAME: &str = "operator-api";
+const CREDENTIAL_MIN_BYTES: u64 = 32;
+const CREDENTIAL_MAX_BYTES: u64 = 4096;
+const O_DIRECTORY: i32 = 0o200000;
+const O_NOFOLLOW: i32 = 0o400000;
+const O_NONBLOCK: i32 = 0o4000;
+const BROKER_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CredentialIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    group: u32,
+    mode: u32,
+    links: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl CredentialIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner: metadata.uid(),
+            group: metadata.gid(),
+            mode: metadata.mode() & 0o7777,
+            links: metadata.nlink(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CredentialDirectoryIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    group: u32,
+    mode: u32,
+    is_directory: bool,
+}
+
+impl CredentialDirectoryIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner: metadata.uid(),
+            group: metadata.gid(),
+            mode: metadata.mode() & 0o7777,
+            is_directory: metadata.is_dir(),
+        }
+    }
+}
+
+struct OpenCredential {
+    file: std::fs::File,
+    identity: CredentialIdentity,
+    directories: Vec<CredentialDirectoryIdentity>,
+}
+
+fn operator_credential_path() -> Result<PathBuf, String> {
+    if std::env::var_os("SENTINEL_OPERATOR_API_KEY").is_some() {
+        return Err("direct operator credentials are not allowed".into());
+    }
+    let path = std::env::var_os(OPERATOR_KEY_FILE_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{OPERATOR_KEY_FILE_ENV} is required"))?;
+    let directory = std::env::var_os(CREDENTIALS_DIRECTORY_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{CREDENTIALS_DIRECTORY_ENV} is required"))?;
+    if !path.is_absolute()
+        || !directory.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || directory
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || path != directory.join(OPERATOR_CREDENTIAL_NAME)
+    {
+        return Err("operator credential path must be the canonical systemd credential leaf".into());
+    }
+    Ok(path)
+}
+
+fn effective_identity() -> Result<(u32, u32), String> {
+    let metadata = std::fs::metadata("/proc/self")
+        .map_err(|error| format!("operator credential owner authority unavailable: {error}"))?;
+    Ok((metadata.uid(), metadata.gid()))
+}
+
+fn validate_credential_metadata(
+    metadata: &std::fs::Metadata,
+    expected_owner: u32,
+    expected_group: u32,
+) -> Result<CredentialIdentity, String> {
+    let identity = CredentialIdentity::from_metadata(metadata);
+    let regular = metadata.file_type().is_file();
+    let root_systemd = identity.owner == 0
+        && identity.group == 0
+        && matches!(identity.mode, 0o400 | 0o440);
+    let service_owned = identity.owner == expected_owner
+        && identity.group == expected_group
+        && matches!(identity.mode, 0o400 | 0o600);
+    if !regular
+        || identity.links != 1
+        || identity.size < CREDENTIAL_MIN_BYTES
+        || identity.size > CREDENTIAL_MAX_BYTES
+        || (!root_systemd && !service_owned)
+    {
+        return Err("operator credential metadata is invalid".into());
+    }
+    Ok(identity)
+}
+
+fn validate_credential_directory(
+    metadata: &std::fs::Metadata,
+    expected_owner: u32,
+) -> Result<CredentialDirectoryIdentity, String> {
+    let identity = CredentialDirectoryIdentity::from_metadata(metadata);
+    if !identity.is_directory
+        || (identity.owner != 0 && identity.owner != expected_owner)
+        || identity.mode & 0o7022 != 0
+    {
+        return Err("operator credential directory metadata is invalid".into());
+    }
+    Ok(identity)
+}
+
+fn open_operator_credential(
+    path: &Path,
+    expected_owner: u32,
+    expected_group: u32,
+) -> Result<OpenCredential, String> {
+    if !path.is_absolute() {
+        return Err("operator credential path must be absolute".into());
+    }
+    let components = path
+        .components()
+        .map(|component| match component {
+            Component::RootDir => Ok(None),
+            Component::Normal(value) => Ok(Some(value.to_os_string())),
+            _ => Err("operator credential path is invalid".to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let names = components.into_iter().flatten().collect::<Vec<_>>();
+    let (file_name, parents) = names
+        .split_last()
+        .ok_or_else(|| "operator credential path is invalid".to_string())?;
+
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+        .open("/")
+        .map_err(|error| format!("open operator credential root: {error}"))?;
+    let mut directories = vec![validate_credential_directory(
+        &directory
+            .metadata()
+            .map_err(|error| format!("stat operator credential root: {error}"))?,
+        expected_owner,
+    )?];
+    for component in parents {
+        let candidate =
+            PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(component);
+        let next = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+            .open(candidate)
+            .map_err(|error| format!("open operator credential directory: {error}"))?;
+        directories.push(validate_credential_directory(
+            &next
+                .metadata()
+                .map_err(|error| format!("stat operator credential directory: {error}"))?,
+            expected_owner,
+        )?);
+        directory = next;
+    }
+
+    let candidate =
+        PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(file_name);
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(candidate)
+        .map_err(|error| format!("open operator credential: {error}"))?;
+    let identity = validate_credential_metadata(
+        &file
+            .metadata()
+            .map_err(|error| format!("stat operator credential: {error}"))?,
+        expected_owner,
+        expected_group,
+    )?;
+    Ok(OpenCredential {
+        file,
+        identity,
+        directories,
+    })
+}
+
+fn read_operator_credential_with_hook(
+    path: &Path,
+    expected_owner: u32,
+    expected_group: u32,
+    after_open: impl FnOnce() -> Result<(), String>,
+) -> Result<String, String> {
+    let OpenCredential {
+        mut file,
+        identity: before,
+        directories,
+    } = open_operator_credential(path, expected_owner, expected_group)?;
+    after_open()?;
+    let mut bytes = Vec::with_capacity(before.size as usize);
+    file.by_ref()
+        .take(CREDENTIAL_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read operator credential: {error}"))?;
+    if bytes.len() < CREDENTIAL_MIN_BYTES as usize || bytes.len() > CREDENTIAL_MAX_BYTES as usize {
+        return Err("operator credential length is invalid".into());
+    }
+    let after = validate_credential_metadata(
+        &file
+            .metadata()
+            .map_err(|error| format!("recheck operator credential metadata: {error}"))?,
+        expected_owner,
+        expected_group,
+    )?;
+    let reopened = open_operator_credential(path, expected_owner, expected_group)?;
+    if before != after
+        || before != reopened.identity
+        || directories != reopened.directories
+        || bytes.len() as u64 != before.size
+    {
+        return Err("operator credential identity changed while reading".into());
+    }
+    let value = String::from_utf8(bytes)
+        .map_err(|_| "operator credential encoding is invalid".to_string())?;
+    if value.trim() != value || value.chars().any(char::is_control) {
+        return Err("operator credential content is invalid".into());
+    }
+    Ok(value)
+}
+
+fn read_operator_credential() -> Result<String, String> {
+    let path = operator_credential_path()?;
+    let (owner, group) = effective_identity()?;
+    read_operator_credential_with_hook(&path, owner, group, || Ok(()))
+}
 
 /// Risiko-Klassifikation eines Subcommands (Policy-as-Code, operator-seitig).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +457,28 @@ enum Method {
     Post,
 }
 
+#[derive(Serialize)]
+struct GaiaBrokerRequest<'a> {
+    schema_version: u8,
+    session_id: &'a str,
+    capability: &'a str,
+    operation_id: String,
+    method: &'static str,
+    gateway: bool,
+    path: &'a str,
+    body: &'a Option<Value>,
+    risk: &'static str,
+    confirmed: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GaiaBrokerResponse {
+    ok: bool,
+    value: Option<Value>,
+    error: Option<String>,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let assume_yes = std::env::var("SENTINEL_CTL_ASSUME_YES")
@@ -202,7 +495,8 @@ fn main() -> ExitCode {
         return fail(&cli, &e);
     }
 
-    match execute(&call) {
+    let confirmed = cli.confirm || assume_yes;
+    match execute(&call, confirmed) {
         Ok(value) => {
             if cli.json {
                 println!("{}", serde_json::to_string(&value).unwrap_or_default());
@@ -424,7 +718,100 @@ fn resolve_call(cmd: &Commands) -> Result<Call, String> {
     })
 }
 
-fn execute(call: &Call) -> Result<Value, String> {
+fn execute(call: &Call, confirmed: bool) -> Result<Value, String> {
+    let broker_values = [
+        std::env::var(OPERATOR_BROKER_SOCKET_ENV).ok(),
+        std::env::var(OPERATOR_BROKER_SESSION_ENV).ok(),
+        std::env::var(OPERATOR_BROKER_CAPABILITY_ENV).ok(),
+    ];
+    if broker_values.iter().any(Option::is_some) {
+        if std::env::var_os(OPERATOR_KEY_FILE_ENV).is_some()
+            || std::env::var_os("SENTINEL_OPERATOR_API_KEY").is_some()
+        {
+            return Err("brokered Gaia execution rejects direct credential authority".into());
+        }
+        let [Some(socket), Some(session_id), Some(capability)] = broker_values else {
+            return Err("Gaia operator broker capability is incomplete".into());
+        };
+        if call.method != Method::Get
+            || call.gateway
+            || call.body.is_some()
+            || call.risk != Risk::Read
+        {
+            return Err("Gaia operator broker permits only read observations".into());
+        }
+        return execute_via_broker(call, confirmed, &socket, &session_id, &capability);
+    }
+    execute_direct(call)
+}
+
+fn execute_via_broker(
+    call: &Call,
+    confirmed: bool,
+    socket: &str,
+    session_id: &str,
+    capability: &str,
+) -> Result<Value, String> {
+    if !Path::new(socket).is_absolute()
+        || session_id.len() < 16
+        || capability.len() < 32
+        || !session_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || !capability
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("Gaia operator broker capability is invalid".into());
+    }
+    let operation_id = format!(
+        "ctl-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "operator broker clock is invalid")?
+            .as_nanos()
+    );
+    let request = GaiaBrokerRequest {
+        schema_version: 1,
+        session_id,
+        capability,
+        operation_id,
+        method: method_str(call.method),
+        gateway: call.gateway,
+        path: &call.path,
+        body: &call.body,
+        risk: call.risk.label(),
+        confirmed,
+    };
+    let mut wire = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    wire.push(b'\n');
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|error| format!("connect Gaia operator broker: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(|error| error.to_string())?;
+    stream.write_all(&wire).map_err(|error| error.to_string())?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|error| error.to_string())?;
+    let mut response = Vec::new();
+    stream
+        .take(BROKER_MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut response)
+        .map_err(|error| error.to_string())?;
+    if response.len() > BROKER_MAX_RESPONSE_BYTES as usize {
+        return Err("Gaia operator broker response is too large".into());
+    }
+    let response: GaiaBrokerResponse =
+        serde_json::from_slice(&response).map_err(|_| "Gaia operator broker response is invalid")?;
+    match (response.ok, response.value, response.error) {
+        (true, Some(value), None) => Ok(value),
+        (false, None, Some(error)) if !error.is_empty() => Err(error),
+        _ => Err("Gaia operator broker response is inconsistent".into()),
+    }
+}
+
+fn execute_direct(call: &Call) -> Result<Value, String> {
+    let operator_credential = read_operator_credential()?;
     let base = if call.gateway {
         std::env::var("CORTEX_GATEWAY_URL").unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_string())
     } else {
@@ -441,11 +828,7 @@ fn execute(call: &Call) -> Result<Value, String> {
         Method::Get => client.get(&url),
         Method::Post => client.post(&url),
     };
-    if let Ok(key) = std::env::var("SENTINEL_OPERATOR_API_KEY") {
-        if !key.is_empty() {
-            req = req.header(OPERATOR_KEY_HEADER, key);
-        }
-    }
+    req = req.header(OPERATOR_KEY_HEADER, operator_credential);
     if let Some(body) = &call.body {
         req = req.json(body);
     }
@@ -473,6 +856,51 @@ fn fail(cli: &Cli, msg: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, OnceLock};
+    use std::thread;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn credential_case(name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("sentinel-ctl-credential-tests")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join(OPERATOR_CREDENTIAL_NAME);
+        std::fs::write(&path, b"0123456789abcdef0123456789abcdef").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (root, path)
+    }
+
+    fn set_credential_environment(root: &Path, path: &Path) {
+        assert_eq!(path.parent(), Some(root));
+        std::env::set_var(CREDENTIALS_DIRECTORY_ENV, root);
+        std::env::set_var(OPERATOR_KEY_FILE_ENV, path);
+        std::env::remove_var("SENTINEL_OPERATOR_API_KEY");
+        std::env::remove_var(OPERATOR_BROKER_SOCKET_ENV);
+        std::env::remove_var(OPERATOR_BROKER_SESSION_ENV);
+        std::env::remove_var(OPERATOR_BROKER_CAPABILITY_ENV);
+    }
+
+    fn read_test_call() -> Call {
+        Call {
+            method: Method::Get,
+            gateway: false,
+            path: "/operator/runtime-health".into(),
+            body: None,
+            risk: Risk::Read,
+        }
+    }
 
     #[test]
     fn read_commands_need_no_confirmation() {
@@ -553,5 +981,196 @@ mod tests {
             .path,
             "/operator/task"
         );
+    }
+
+    #[test]
+    fn execute_sends_operator_header_loaded_from_file() {
+        let _guard = env_lock();
+        let (root, path) = credential_case("header");
+        set_credential_environment(&root, &path);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::env::set_var("SENTINEL_OPERATOR_API_URL", format!("http://{address}"));
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.contains(
+                "x-sentinel-operator-key: 0123456789abcdef0123456789abcdef"
+            ));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{}")
+                .unwrap();
+        });
+
+        assert!(execute(&read_test_call(), false).is_ok());
+        server.join().unwrap();
+        std::env::remove_var("SENTINEL_OPERATOR_API_URL");
+        std::env::remove_var("SENTINEL_OPERATOR_API_KEY");
+        std::env::remove_var(OPERATOR_KEY_FILE_ENV);
+        std::env::remove_var(CREDENTIALS_DIRECTORY_ENV);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_or_tampered_credential_makes_zero_http_calls() {
+        let _guard = env_lock();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        std::env::set_var("SENTINEL_OPERATOR_API_URL", format!("http://{address}"));
+
+        std::env::remove_var(OPERATOR_KEY_FILE_ENV);
+        assert!(execute(&read_test_call(), false).is_err());
+        assert!(listener.accept().is_err());
+
+        let (root, path) = credential_case("tampered");
+        set_credential_environment(&root, &path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(execute(&read_test_call(), false).is_err());
+        assert!(listener.accept().is_err());
+        std::env::remove_var("SENTINEL_OPERATOR_API_URL");
+        std::env::remove_var(OPERATOR_KEY_FILE_ENV);
+        std::env::remove_var(CREDENTIALS_DIRECTORY_ENV);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_plaintext_authority_makes_zero_http_calls() {
+        let _guard = env_lock();
+        let (root, path) = credential_case("plaintext");
+        set_credential_environment(&root, &path);
+        std::env::set_var("SENTINEL_OPERATOR_API_KEY", "must-not-be-used");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::env::set_var(
+            "SENTINEL_OPERATOR_API_URL",
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        assert!(execute(&read_test_call(), false).is_err());
+        assert!(listener.accept().is_err());
+        std::env::remove_var("SENTINEL_OPERATOR_API_URL");
+        std::env::remove_var("SENTINEL_OPERATOR_API_KEY");
+        std::env::remove_var(OPERATOR_KEY_FILE_ENV);
+        std::env::remove_var(CREDENTIALS_DIRECTORY_ENV);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn broker_mode_sends_only_structured_scoped_request() {
+        let _guard = env_lock();
+        let (root, socket_path) = credential_case("broker");
+        std::fs::remove_file(&socket_path).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let session = "gaia-broker-session-1";
+        let capability = "opaque-capability-0123456789abcdef";
+        std::env::set_var(OPERATOR_BROKER_SOCKET_ENV, &socket_path);
+        std::env::set_var(OPERATOR_BROKER_SESSION_ENV, session);
+        std::env::set_var(OPERATOR_BROKER_CAPABILITY_ENV, capability);
+        std::env::remove_var(OPERATOR_KEY_FILE_ENV);
+        std::env::remove_var(CREDENTIALS_DIRECTORY_ENV);
+        std::env::remove_var("SENTINEL_OPERATOR_API_KEY");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["schema_version"], 1);
+            assert_eq!(request["session_id"], session);
+            assert_eq!(request["capability"], capability);
+            assert_eq!(request["method"], "GET");
+            assert_eq!(request["path"], "/operator/runtime-health");
+            assert_eq!(request["risk"], "read");
+            assert_eq!(request["confirmed"], false);
+            assert!(request.get("operator_key").is_none());
+            stream
+                .write_all(b"{\"ok\":true,\"value\":{\"status\":200,\"body\":{}},\"error\":null}")
+                .unwrap();
+        });
+        assert!(execute(&read_test_call(), false).is_ok());
+        server.join().unwrap();
+        std::env::remove_var(OPERATOR_BROKER_SOCKET_ENV);
+        std::env::remove_var(OPERATOR_BROKER_SESSION_ENV);
+        std::env::remove_var(OPERATOR_BROKER_CAPABILITY_ENV);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn broker_mode_rejects_mutation_before_socket_io() {
+        let _guard = env_lock();
+        let (root, socket_path) = credential_case("broker-mutation");
+        std::fs::remove_file(&socket_path).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::env::set_var(OPERATOR_BROKER_SOCKET_ENV, &socket_path);
+        std::env::set_var(OPERATOR_BROKER_SESSION_ENV, "gaia-broker-session-1");
+        std::env::set_var(
+            OPERATOR_BROKER_CAPABILITY_ENV,
+            "opaque-capability-0123456789abcdef",
+        );
+        std::env::remove_var(OPERATOR_KEY_FILE_ENV);
+        std::env::remove_var(CREDENTIALS_DIRECTORY_ENV);
+        std::env::remove_var("SENTINEL_OPERATOR_API_KEY");
+
+        let mutation = Call {
+            method: Method::Post,
+            gateway: false,
+            path: "/operator/snapshot".to_string(),
+            body: Some(json!({"tier": "manual"})),
+            risk: Risk::Mutate,
+        };
+        assert!(execute(&mutation, true).is_err());
+        assert!(listener.accept().is_err());
+
+        std::env::remove_var(OPERATOR_BROKER_SOCKET_ENV);
+        std::env::remove_var(OPERATOR_BROKER_SESSION_ENV);
+        std::env::remove_var(OPERATOR_BROKER_CAPABILITY_ENV);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn credential_reader_rejects_parent_symlink_hardlink_and_replacement() {
+        let _guard = env_lock();
+        let (root, path) = credential_case("identity");
+        let metadata = std::fs::metadata(&path).unwrap();
+        let owner = metadata.uid();
+        let group = metadata.gid();
+
+        let hardlink = root.join("operator-api.hardlink");
+        std::fs::hard_link(&path, &hardlink).unwrap();
+        assert!(
+            read_operator_credential_with_hook(&path, owner, group, || Ok(())).is_err()
+        );
+        std::fs::remove_file(&hardlink).unwrap();
+
+        let parent = root.join("credentials");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent_path = parent.join(OPERATOR_CREDENTIAL_NAME);
+        std::fs::rename(&path, &parent_path).unwrap();
+        let linked_parent = root.join("credentials.link");
+        std::os::unix::fs::symlink(&parent, &linked_parent).unwrap();
+        assert!(read_operator_credential_with_hook(
+            &linked_parent.join(OPERATOR_CREDENTIAL_NAME),
+            owner,
+            group,
+            || Ok(())
+        )
+        .is_err());
+
+        let original = parent.join("operator-api.original");
+        assert!(read_operator_credential_with_hook(&parent_path, owner, group, || {
+            std::fs::rename(&parent_path, &original).map_err(|error| error.to_string())?;
+            std::fs::write(&parent_path, b"fedcba9876543210fedcba9876543210")
+                .map_err(|error| error.to_string())?;
+            std::fs::set_permissions(&parent_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

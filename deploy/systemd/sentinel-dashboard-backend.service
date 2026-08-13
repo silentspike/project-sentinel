@@ -11,6 +11,7 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/sentinel
+ExecStartPre=/usr/bin/test -x /usr/bin/bwrap
 ExecStart=/opt/sentinel/bin/sentinel-dashboard-backend
 # The env file retains only the independent dashboard login key and rate-limit knobs;
 # the daemon operator proxy credential is file-only. See docs/security/dashboard-key-management.md (#474).

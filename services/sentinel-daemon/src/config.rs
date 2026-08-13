@@ -823,9 +823,8 @@ fn credential_file_identity_is_allowed(
     is_regular: bool,
     expected_owner: u32,
 ) -> bool {
-    let systemd_owned = identity.owner == 0
-        && identity.group == 0
-        && matches!(identity.mode, 0o400 | 0o440);
+    let systemd_owned =
+        identity.owner == 0 && identity.group == 0 && matches!(identity.mode, 0o400 | 0o440);
     let service_owned = identity.owner == expected_owner && matches!(identity.mode, 0o400 | 0o600);
     is_regular && identity.links == 1 && (systemd_owned || service_owned)
 }
@@ -835,11 +834,8 @@ fn validate_credential_directory(
     expected_owner: u32,
 ) -> Result<CredentialDirectoryIdentity> {
     let file_identity = CredentialFileIdentity::from_metadata(metadata);
-    if !credential_directory_identity_is_allowed(
-        &file_identity,
-        metadata.is_dir(),
-        expected_owner,
-    ) {
+    if !credential_directory_identity_is_allowed(&file_identity, metadata.is_dir(), expected_owner)
+    {
         return Err(anyhow!("operator credential directory metadata is invalid"));
     }
     Ok(CredentialDirectoryIdentity::from_metadata(metadata))
@@ -933,12 +929,18 @@ fn read_operator_credential_with_hook(
             .read(&mut bytes[offset..])
             .context("operator credential read failed")?;
         if count == 0 {
-            return Err(anyhow!("operator credential read was shorter than declared"));
+            return Err(anyhow!(
+                "operator credential read was shorter than declared"
+            ));
         }
         offset += count;
     }
     let mut trailing = [0_u8; 1];
-    if file.read(&mut trailing).context("operator credential read failed")? != 0 {
+    if file
+        .read(&mut trailing)
+        .context("operator credential read failed")?
+        != 0
+    {
         return Err(anyhow!("operator credential has trailing data"));
     }
     let after_read = validate_credential_metadata(&file.metadata()?, effective_uid()?)?;
@@ -1216,7 +1218,11 @@ enabled = {enabled}
         ));
 
         let fifo = directory.path().join("fifo");
-        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
         assert!(read_operator_credential(&fifo).is_err());
 
         let unsafe_parent = directory.path().join("unsafe-parent");
@@ -1320,7 +1326,10 @@ enabled = {enabled}
 
         write_credential(&path, TEST_CREDENTIAL.as_bytes(), 0o400);
         assert!(read_operator_credential_with_hook(&path, || {
-            fs::OpenOptions::new().write(true).open(&path)?.set_len(16)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_len(16)?;
             Ok(())
         })
         .is_err());
@@ -1342,7 +1351,11 @@ enabled = {enabled}
         assert!(read_operator_credential_with_hook(&parent_path, || {
             fs::rename(&parent, &old_parent)?;
             fs::create_dir(&parent)?;
-            write_credential(&parent.join("operator-api"), TEST_CREDENTIAL.as_bytes(), 0o400);
+            write_credential(
+                &parent.join("operator-api"),
+                TEST_CREDENTIAL.as_bytes(),
+                0o400,
+            );
             Ok(())
         })
         .is_err());
