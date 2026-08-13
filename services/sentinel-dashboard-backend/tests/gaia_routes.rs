@@ -173,7 +173,7 @@ async fn gaia_read_routes_return_console_jsonl() {
         true,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "safe response body: {body}");
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(alerts["count"], 1);
     assert_eq!(alerts["alerts"][0]["summary"], "projection lag");
 
@@ -233,7 +233,7 @@ echo '{"type":"message","usage":{"input_tokens":2,"output_tokens":3,"cost_usd":0
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "safe response body: {body}");
     assert_eq!(body["entry"]["status"], "succeeded");
     assert!(body["entry"]["claude_session_id"].as_str().is_some());
     assert_eq!(body["entry"]["usage"]["input_tokens"], 2);

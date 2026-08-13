@@ -253,6 +253,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq bubblewrap
+          sudo sysctl --load deploy/vm-config/99-sentinel-bwrap.conf
 
       - name: Verify bubblewrap runtime dependency
         run: |
@@ -262,6 +263,9 @@ jobs:
           test "$(stat -c '%u' /usr/bin/bwrap)" = "0"
           dpkg-query -W -f='bubblewrap package: ${Package} ${Version}\n' bubblewrap
           /usr/bin/bwrap --version
+          test "$(cat /sys/module/apparmor/parameters/enabled)" = "Y"
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "0"
+          test "$(sysctl -n kernel.unprivileged_userns_clone)" = "1"
           credential_dir="$RUNNER_TEMP/bwrap-credential-smoke"
           install -d -m 0700 "$credential_dir"
           trap 'rmdir "$credential_dir"' EXIT
