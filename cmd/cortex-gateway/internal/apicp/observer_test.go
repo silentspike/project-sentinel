@@ -289,6 +289,42 @@ func TestSnapshotRoundTripViaHTTP(t *testing.T) {
 	}
 }
 
+func TestDisabledOrUnauthenticatedObserverMakesNoSyncCalls(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	disabled := NewObserver(Config{HTTPClient: server.Client()}, nil)
+	disabled.syncToRemote()
+	disabled.Stop()
+
+	unauthenticated := NewObserver(Config{
+		SyncURL:      server.URL,
+		SyncInterval: time.Millisecond,
+		HTTPClient:   server.Client(),
+	}, nil)
+	unauthenticated.syncToRemote()
+	unauthenticated.Stop()
+
+	enabled := false
+	runtimeDisabled := NewObserver(Config{
+		SyncURL:      server.URL,
+		SyncInterval: time.Millisecond,
+		SharedSecret: "topsecret",
+		HTTPClient:   server.Client(),
+		Enabled:      func() bool { return enabled },
+	}, nil)
+	runtimeDisabled.syncToRemote()
+	runtimeDisabled.Stop()
+	time.Sleep(10 * time.Millisecond)
+	if calls != 0 {
+		t.Fatalf("disabled/unauthenticated observer made %d remote calls, want 0", calls)
+	}
+}
+
 func TestSnapshotRestorePreservesEvolutionVersions(t *testing.T) {
 	o := newTestObserver(t)
 
@@ -354,6 +390,7 @@ func TestSnapshotLoadRetriesOnStartup(t *testing.T) {
 	o := NewObserver(Config{
 		SyncURL:      server.URL,
 		SyncInterval: time.Hour,
+		SharedSecret: "topsecret",
 	}, nil)
 	t.Cleanup(o.Stop)
 
@@ -395,6 +432,7 @@ func TestStopFlushesFinalSnapshot(t *testing.T) {
 	o := NewObserver(Config{
 		SyncURL:      server.URL,
 		SyncInterval: time.Hour,
+		SharedSecret: "topsecret",
 	}, nil)
 
 	for i := 0; i < 3; i++ {

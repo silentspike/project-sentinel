@@ -16,6 +16,19 @@ use tower::ServiceExt;
 fn test_state(dir: &TempDir) -> AppState {
     let mut config = Config::from_env();
     config.dashboard_api_key = Some("test-key".into());
+    config.operator_key = Some("public-test-operator-authority".into());
+    let credential_directory = dir.path().join("credentials");
+    fs::create_dir_all(&credential_directory).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&credential_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    config.operator_credential_directory = Some(credential_directory.display().to_string());
+    let sentinel_ctl = dir.path().join("sentinel-ctl");
+    fs::write(&sentinel_ctl, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+    make_executable(&sentinel_ctl);
+    config.gaia_sentinel_ctl_bin = sentinel_ctl.display().to_string();
     config.projection_db = "/nonexistent/dashboard-gaia-test-projection.db".into();
     config.events_db = "/nonexistent/dashboard-gaia-test-events.db".into();
     config.gateway_proxy_url = "http://127.0.0.1:1".into();
@@ -220,7 +233,7 @@ echo '{"type":"message","usage":{"input_tokens":2,"output_tokens":3,"cost_usd":0
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "safe response body: {body}");
     assert_eq!(body["entry"]["status"], "succeeded");
     assert!(body["entry"]["claude_session_id"].as_str().is_some());
     assert_eq!(body["entry"]["usage"]["input_tokens"], 2);
@@ -306,7 +319,7 @@ echo '{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cost_usd":0
     drop(active_lock);
     assert_eq!(busy, StatusCode::TOO_MANY_REQUESTS);
 
-    let (first, _) = request_with_idempotency(
+    let (first, first_body) = request_with_idempotency(
         state.clone(),
         Method::POST,
         "/api/gaia/deep",
@@ -315,7 +328,7 @@ echo '{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cost_usd":0
         Some("test-idempotency-first"),
     )
     .await;
-    assert_eq!(first, StatusCode::OK);
+    assert_eq!(first, StatusCode::OK, "safe response body: {first_body}");
 
     let (conflict, _) = request_with_idempotency(
         state.clone(),
@@ -358,7 +371,7 @@ echo '{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cost_usd":0
     make_executable(&fake_claude);
 
     for _ in 0..2 {
-        let (status, _) = request_with_idempotency(
+        let (status, body) = request_with_idempotency(
             state.clone(),
             Method::POST,
             "/api/gaia/deep",
@@ -367,7 +380,7 @@ echo '{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cost_usd":0
             Some("rate-operation-one"),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::OK, "safe response body: {body}");
     }
 
     let (limited, _) = request_with_idempotency(
