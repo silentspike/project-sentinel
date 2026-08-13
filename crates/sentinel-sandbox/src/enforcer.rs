@@ -11,7 +11,7 @@
 //! 3. `start_agent_process()` — startet bwrap (spaeter: mit Landlock im Child)
 //! 4. `teardown_agent()` — beendet bwrap-Reste + entfernt cgroup
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(test)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::bwrap::{BwrapConfig, SpawnedSandbox};
@@ -34,6 +35,26 @@ const PROTOCOL_CANCEL_GRACE_MS: u64 = 1_000;
 const PROTOCOL_WRITE_TIMEOUT_MS: u64 = 250;
 
 const PROTOCOL_TERMINAL_SETTLE_MS: u64 = 25;
+const WORKBENCH_ATTESTATION_SCHEMA_VERSION: u16 = 1;
+const WORKBENCH_ATTESTATION_TIMEOUT_MS: u64 = 2_000;
+const WORKBENCH_ATTESTATION_MAX_BYTES: u64 = 4 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkbenchIsolationAttestation {
+    pub(crate) child_pid: u32,
+    pub(crate) landlock_abi: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkbenchStartupAttestation {
+    schema_version: u16,
+    nonce: String,
+    wrapper_version: String,
+    runtime_version: String,
+    landlock_abi: u8,
+    host_pid: u32,
+}
 
 enum ProtocolFrame {
     Line(String),
@@ -348,6 +369,7 @@ pub struct AgentProcess {
     supervision: Arc<ProtocolSupervision>,
     termination: Arc<ProcessTermination>,
     supervised_cgroup: Option<String>,
+    workbench_isolation: Option<WorkbenchIsolationAttestation>,
 }
 
 impl AgentProcess {
@@ -385,6 +407,7 @@ impl AgentProcess {
             supervision,
             termination: Arc::new(ProcessTermination::default()),
             supervised_cgroup: None,
+            workbench_isolation: None,
         }
     }
 
@@ -704,6 +727,25 @@ impl AgentProcess {
 
     pub(crate) fn owned_process_reaped(&self) -> bool {
         self.termination.reaped.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn workbench_isolation_attestation(
+        &self,
+    ) -> Option<WorkbenchIsolationAttestation> {
+        self.workbench_isolation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_workbench_isolation_attestation(
+        &mut self,
+        child_pid: u32,
+        landlock_abi: u8,
+    ) {
+        self.child_pid = Some(child_pid);
+        self.workbench_isolation = Some(WorkbenchIsolationAttestation {
+            child_pid,
+            landlock_abi,
+        });
     }
 
     #[cfg(test)]
@@ -1359,7 +1401,7 @@ impl SandboxEnforcer {
             config = config.with_fs_mount(fs_mount, fs_host_agent_dir.unwrap_or(name), name);
         }
 
-        self.start_process_with_config(name, config, command)
+        self.start_process_with_config(name, config, command, false)
     }
 
     /// Starts the persistent agent-runtime used by the M0 workbench protocol.
@@ -1380,7 +1422,7 @@ impl SandboxEnforcer {
         let config = BwrapConfig::for_agent(name)
             .for_workbench()
             .with_workbench_roots(&host_agent_root);
-        self.start_process_with_config(name, config, command)
+        self.start_process_with_config(name, config, command, true)
     }
 
     fn start_process_with_config(
@@ -1388,28 +1430,57 @@ impl SandboxEnforcer {
         name: &str,
         mut config: BwrapConfig,
         command: &[String],
+        require_workbench_attestation: bool,
     ) -> Result<AgentProcess> {
         // #75: full cage is unconditional — BwrapConfig::for_agent already sets
         // share_net=false (no --share-net). The daemon verifies isolation
         // post-spawn on the sandboxed child PID.
 
-        // Wrap command with Landlock enforcement if available
-        let wrapped_command = if self.landlock_abi.is_some() {
+        let attestation_nonce = require_workbench_attestation
+            .then(|| uuid::Uuid::new_v4().to_string());
+        let landlock_abi = if require_workbench_attestation {
+            Some(
+                self.landlock_abi
+                    .context("workbench requires Landlock enforcement")?,
+            )
+        } else {
+            self.landlock_abi
+        };
+        let wrapper_path = landlock_wrapper_path();
+        let wrapper_is_regular = std::fs::symlink_metadata(&wrapper_path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
+        if require_workbench_attestation {
+            validate_workbench_static_prerequisites(
+                landlock_abi,
+                wrapper_is_regular,
+                self.cgroup_available,
+            )?;
+        }
+
+        // Wrap command with Landlock enforcement if available. Workbench mode
+        // requires the wrapper and a post-exec attestation; the general agent
+        // path retains its existing best-effort defense-in-depth behavior.
+        let wrapped_command = if let Some(abi) = landlock_abi {
             // Bind the wrapper binary into the namespace
-            let wrapper_path = landlock_wrapper_path();
-            if wrapper_path.exists() {
+            if wrapper_is_regular {
                 config.readonly_binds.push((
                     wrapper_path.to_string_lossy().into_owned(),
                     "/landlock-wrapper".to_string(),
                 ));
-                let mut cmd = vec![
-                    "/landlock-wrapper".to_string(),
-                    name.to_string(),
-                    "--".to_string(),
-                ];
+                let mut cmd = vec!["/landlock-wrapper".to_string()];
+                if let Some(nonce) = attestation_nonce.as_deref() {
+                    cmd.extend([
+                        "--attest-v1".to_string(),
+                        nonce.to_string(),
+                        abi.to_string(),
+                    ]);
+                }
+                cmd.extend([name.to_string(), "--".to_string()]);
                 cmd.extend_from_slice(command);
                 info!("Landlock wrapper injected for agent {name}");
                 cmd
+            } else if require_workbench_attestation {
+                bail!("workbench Landlock wrapper is unavailable");
             } else {
                 warn!(
                     "landlock-wrapper binary not found at {}, skipping Landlock",
@@ -1430,9 +1501,36 @@ impl SandboxEnforcer {
         // sandboxed child PID).
         if self.cgroup_available {
             process.set_supervised_cgroup(name);
-            if let Err(e) = cgroups::add_pid_to_cgroup(name, pid) {
-                warn!("Failed to add bwrap PID {pid} to cgroup {name}: {e}");
+            if let Err(error) = cgroups::add_pid_to_cgroup(name, pid) {
+                if require_workbench_attestation {
+                    return Err(error).context("attach workbench supervisor to cgroup");
+                }
+                warn!("Failed to add bwrap PID {pid} to cgroup {name}: {error}");
             }
+        } else if require_workbench_attestation {
+            bail!("workbench requires an active cgroup boundary");
+        }
+
+        if require_workbench_attestation {
+            let child_pid = child_pid.context("workbench sandbox did not report its child PID")?;
+            cgroups::add_pid_to_cgroup(name, child_pid)
+                .context("attach exact workbench child to cgroup")?;
+            let cgroup_members = cgroups::list_pids_in_cgroup(name)
+                .context("verify exact workbench child cgroup membership")?;
+            validate_workbench_child_boundary(
+                Some(child_pid),
+                cgroup_members.contains(&child_pid),
+                self.verify_agent_netns_isolation(child_pid),
+            )?;
+            let nonce = attestation_nonce
+                .as_deref()
+                .context("workbench attestation nonce is unavailable")?;
+            let abi = landlock_abi.context("workbench Landlock ABI is unavailable")?;
+            await_workbench_startup_attestation(child_pid, nonce, abi)?;
+            process.workbench_isolation = Some(WorkbenchIsolationAttestation {
+                child_pid,
+                landlock_abi: abi,
+            });
         }
 
         debug!(
@@ -1528,6 +1626,43 @@ impl SandboxEnforcer {
     pub fn oom_score_set(&self) -> bool {
         self.oom_set.load(Ordering::Relaxed)
     }
+}
+
+fn validate_workbench_static_prerequisites(
+    landlock_abi: Option<u8>,
+    wrapper_is_regular: bool,
+    cgroup_available: bool,
+) -> Result<()> {
+    ensure!(
+        landlock_abi.is_some_and(|abi| abi > 0),
+        "workbench requires Landlock enforcement"
+    );
+    ensure!(
+        wrapper_is_regular,
+        "workbench Landlock wrapper is unavailable"
+    );
+    ensure!(
+        cgroup_available,
+        "workbench requires an active cgroup boundary"
+    );
+    Ok(())
+}
+
+fn validate_workbench_child_boundary(
+    child_pid: Option<u32>,
+    exact_child_in_cgroup: bool,
+    network_isolation: IsolationStatus,
+) -> Result<u32> {
+    let child_pid = child_pid.context("workbench sandbox did not report its child PID")?;
+    ensure!(
+        exact_child_in_cgroup,
+        "workbench child cgroup membership was not observed"
+    );
+    ensure!(
+        network_isolation == IsolationStatus::Isolated,
+        "workbench network namespace isolation was not attested"
+    );
+    Ok(child_pid)
 }
 
 fn protocol_reader_parts(
@@ -1830,6 +1965,87 @@ fn prepare_workbench_roots(host_agent_root: &Path) -> Result<()> {
             "workbench {child} root escaped its agent boundary"
         );
     }
+    Ok(())
+}
+
+fn await_workbench_startup_attestation(
+    child_pid: u32,
+    expected_nonce: &str,
+    expected_landlock_abi: u8,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(WORKBENCH_ATTESTATION_TIMEOUT_MS);
+    let path = PathBuf::from(format!(
+        "/proc/{child_pid}/root/tmp/.sentinel-workbench-attestation-{expected_nonce}.json"
+    ));
+    loop {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.nlink() == 1
+                        && metadata.len() > 0
+                        && metadata.len() <= WORKBENCH_ATTESTATION_MAX_BYTES,
+                    "workbench startup attestation failed its file boundary"
+                );
+                let file = std::fs::File::open(&path)
+                    .context("open workbench startup attestation")?;
+                let opened = file
+                    .metadata()
+                    .context("inspect opened workbench startup attestation")?;
+                ensure!(
+                    opened.dev() == metadata.dev() && opened.ino() == metadata.ino(),
+                    "workbench startup attestation identity changed before read"
+                );
+                let mut bytes = Vec::with_capacity(opened.len() as usize);
+                file.take(WORKBENCH_ATTESTATION_MAX_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .context("read workbench startup attestation")?;
+                ensure!(
+                    !bytes.is_empty() && bytes.len() as u64 <= WORKBENCH_ATTESTATION_MAX_BYTES,
+                    "workbench startup attestation exceeded its bound"
+                );
+                validate_workbench_startup_attestation(
+                    &bytes,
+                    expected_nonce,
+                    expected_landlock_abi,
+                    child_pid,
+                )?;
+                std::fs::remove_file(&path)
+                    .context("remove consumed workbench startup attestation")?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::time::Instant::now() >= deadline {
+                    bail!("workbench startup attestation timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error).context("inspect workbench startup attestation"),
+        }
+    }
+}
+
+fn validate_workbench_startup_attestation(
+    bytes: &[u8],
+    expected_nonce: &str,
+    expected_landlock_abi: u8,
+    expected_child_pid: u32,
+) -> Result<()> {
+    let attestation: WorkbenchStartupAttestation = serde_json::from_slice(bytes)
+        .context("decode workbench startup attestation")?;
+    ensure!(
+        attestation.schema_version == WORKBENCH_ATTESTATION_SCHEMA_VERSION
+            && attestation.nonce == expected_nonce
+            && attestation.wrapper_version == env!("CARGO_PKG_VERSION")
+            && attestation.runtime_version == sentinel_common::WORKBENCH_AGENT_RUNTIME_VERSION
+            && attestation.landlock_abi == expected_landlock_abi
+            && attestation.host_pid == expected_child_pid,
+        "workbench startup attestation did not match its exact child"
+    );
     Ok(())
 }
 
@@ -2177,6 +2393,80 @@ mod tests {
         std::fs::remove_dir(root.join("inputs")).unwrap();
         std::os::unix::fs::symlink(directory.path(), root.join("inputs")).unwrap();
         assert!(prepare_workbench_roots(&root).is_err());
+    }
+
+    #[test]
+    fn workbench_startup_attestation_is_exact_child_and_version_bound() {
+        let nonce = "018f3f32-4f01-4f2c-a6c1-f6f4a81b2903";
+        let bytes = |child_pid: u32, abi: u8, wrapper_version: &str, runtime_version: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": WORKBENCH_ATTESTATION_SCHEMA_VERSION,
+                "nonce": nonce,
+                "wrapper_version": wrapper_version,
+                "runtime_version": runtime_version,
+                "landlock_abi": abi,
+                "host_pid": child_pid,
+            }))
+            .unwrap()
+        };
+        let valid = bytes(
+            4242,
+            4,
+            env!("CARGO_PKG_VERSION"),
+            sentinel_common::WORKBENCH_AGENT_RUNTIME_VERSION,
+        );
+        validate_workbench_startup_attestation(&valid, nonce, 4, 4242).unwrap();
+        assert!(validate_workbench_startup_attestation(&valid, nonce, 4, 4243).is_err());
+        assert!(validate_workbench_startup_attestation(&valid, nonce, 3, 4242).is_err());
+        assert!(validate_workbench_startup_attestation(
+            &bytes(
+                4242,
+                4,
+                "foreign",
+                sentinel_common::WORKBENCH_AGENT_RUNTIME_VERSION,
+            ),
+            nonce,
+            4,
+            4242,
+        )
+        .is_err());
+        assert!(validate_workbench_startup_attestation(
+            &bytes(4242, 4, env!("CARGO_PKG_VERSION"), "foreign"),
+            nonce,
+            4,
+            4242,
+        )
+        .is_err());
+        assert!(validate_workbench_startup_attestation(b"{}", nonce, 4, 4242).is_err());
+    }
+
+    #[test]
+    fn workbench_spawn_prerequisites_reject_missing_or_shared_boundaries() {
+        assert!(validate_workbench_static_prerequisites(None, true, true).is_err());
+        assert!(validate_workbench_static_prerequisites(Some(4), false, true).is_err());
+        assert!(validate_workbench_static_prerequisites(Some(4), true, false).is_err());
+        validate_workbench_static_prerequisites(Some(4), true, true).unwrap();
+
+        assert!(validate_workbench_child_boundary(None, true, IsolationStatus::Isolated).is_err());
+        assert!(
+            validate_workbench_child_boundary(Some(42), false, IsolationStatus::Isolated).is_err()
+        );
+        assert!(validate_workbench_child_boundary(
+            Some(42),
+            true,
+            IsolationStatus::NotIsolated,
+        )
+        .is_err());
+        assert!(validate_workbench_child_boundary(
+            Some(42),
+            true,
+            IsolationStatus::ProbeError,
+        )
+        .is_err());
+        assert_eq!(
+            validate_workbench_child_boundary(Some(42), true, IsolationStatus::Isolated).unwrap(),
+            42
+        );
     }
 
     #[test]

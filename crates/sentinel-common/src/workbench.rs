@@ -15,6 +15,8 @@ use crate::AgentId;
 
 pub const WORKBENCH_SCHEMA_VERSION: u16 = 1;
 pub const WORKBENCH_RUNTIME_BWRAP: &str = "bwrap-landlock";
+/// Exact isolated runtime version accepted by the v1 startup attestation.
+pub const WORKBENCH_AGENT_RUNTIME_VERSION: &str = "0.1.0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

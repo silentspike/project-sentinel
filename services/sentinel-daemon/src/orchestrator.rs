@@ -652,19 +652,29 @@ struct DaemonWorkbenchRuntimeClient<'a> {
 }
 
 impl DaemonWorkbenchRuntimeClient<'_> {
-    fn revalidate_world_authority(&self) -> Result<()> {
-        let guard = self
-            .owner_registry
-            .issue(sentinel_common::StateTransferScope::World)
-            .context("workbench World authority is unavailable")?;
+    fn issue_world_authority(&self) -> Result<sentinel_common::OwnerWriteGuard> {
         self.owner_registry
-            .validate(&guard)
+            .issue(sentinel_common::StateTransferScope::World)
+            .context("workbench World authority is unavailable")
+    }
+
+    fn revalidate_world_authority(
+        &self,
+        guard: &sentinel_common::OwnerWriteGuard,
+    ) -> Result<()> {
+        self.owner_registry
+            .validate(guard)
             .context("workbench World authority became stale")
     }
 }
 
 impl crate::workbench::WorkbenchRuntimeClient for DaemonWorkbenchRuntimeClient<'_> {
     fn exchange(&mut self, agent_id: AgentId, request: NanoExecRequest) -> Result<NanoExecResult> {
+        // One capability represents the authority line for the entire
+        // exchange. Re-issuing here would let a successor term legitimize an
+        // effect that began under the predecessor.
+        let world_guard = self.issue_world_authority()?;
+        self.revalidate_world_authority(&world_guard)?;
         let handle = self
             .runtimes
             .handles
@@ -677,11 +687,11 @@ impl crate::workbench::WorkbenchRuntimeClient for DaemonWorkbenchRuntimeClient<'
             handle.runtime_key
         );
 
-        self.revalidate_world_authority()?;
         if matches!(
             request.operation.as_str(),
             "workbench_start" | "workbench_recover"
         ) {
+            self.revalidate_world_authority(&world_guard)?;
             let resources = self.runtimes.adapter_owner.resources(&handle)?;
             anyhow::ensure!(
                 resources.instance_id == Some(handle.instance_id)
@@ -697,11 +707,12 @@ impl crate::workbench::WorkbenchRuntimeClient for DaemonWorkbenchRuntimeClient<'
                 resources.network_isolated,
                 resources.child_pid.is_some()
             );
-            self.revalidate_world_authority()?;
+            self.revalidate_world_authority(&world_guard)?;
         }
 
+        self.revalidate_world_authority(&world_guard)?;
         let result = self.runtimes.adapter_owner.exec(&handle, request)?;
-        self.revalidate_world_authority()?;
+        self.revalidate_world_authority(&world_guard)?;
         Ok(result)
     }
 }
@@ -12841,6 +12852,17 @@ mod tests {
         resource_calls: Arc<AtomicUsize>,
         exec_calls: Arc<AtomicUsize>,
         isolated_resources: bool,
+        authority_transition: Option<(
+            Arc<sentinel_common::OwnerRegistry>,
+            sentinel_common::OwnerTerm,
+            AuthorityTransitionStage,
+        )>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AuthorityTransitionStage {
+        Resources,
+        Exec,
     }
 
     impl NanoRuntime for RecreateFixtureRuntime {
@@ -12876,6 +12898,11 @@ mod tests {
         ) -> Result<sentinel_common::nano_runtime::NanoExecResult> {
             anyhow::ensure!(self.active.as_ref() == Some(handle), "stale fixture handle");
             self.exec_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((registry, term, AuthorityTransitionStage::Exec)) =
+                self.authority_transition.as_ref()
+            {
+                registry.commit_owner(term.clone());
+            }
             Ok(NanoExecResult {
                 runtime_key: RUNTIME_BWRAP_LANDLOCK.to_string(),
                 workload_id: handle.workload_id.clone(),
@@ -12939,6 +12966,11 @@ mod tests {
         fn resources(&self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
             anyhow::ensure!(self.active.as_ref() == Some(handle), "stale fixture handle");
             self.resource_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((registry, term, AuthorityTransitionStage::Resources)) =
+                self.authority_transition.as_ref()
+            {
+                registry.commit_owner(term.clone());
+            }
             Ok(NanoRuntimeResources {
                 instance_id: Some(handle.instance_id),
                 child_pid: self.isolated_resources.then_some(1234),
@@ -12960,6 +12992,7 @@ mod tests {
                 resource_calls: Arc::new(AtomicUsize::new(0)),
                 exec_calls: Arc::new(AtomicUsize::new(0)),
                 isolated_resources: false,
+                authority_transition: None,
             })
             .unwrap();
         let handle = NanoHandle::new(
@@ -13003,6 +13036,7 @@ mod tests {
             resource_calls: Arc::clone(&resource_calls),
             exec_calls: Arc::clone(&exec_calls),
             isolated_resources: true,
+            authority_transition: None,
         };
         let mut registry = NanoRuntimeRegistry::new(None);
         registry.register(adapter).unwrap();
@@ -13055,6 +13089,124 @@ mod tests {
         )
         .is_err());
         assert_eq!(exec_calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn cluster_owner_registry_for_workbench_test(
+    ) -> (Arc<sentinel_common::OwnerRegistry>, sentinel_common::OwnerTerm) {
+        let seed = sentinel_common::NodeId::new();
+        let successor = sentinel_common::NodeId::new();
+        let registry = Arc::new(sentinel_common::OwnerRegistry::new_cluster_for_test(seed));
+        let initial = sentinel_common::OwnerTerm {
+            scope: sentinel_common::StateTransferScope::World,
+            owner_node: seed,
+            epoch: 1,
+            coordinator_generation: sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+        };
+        let global = sentinel_common::OwnerTermSnapshot::new(
+            sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+            1,
+            vec![initial.clone()],
+        )
+        .unwrap();
+        let local = sentinel_common::LocalOwnerStateSnapshot::new(
+            seed,
+            sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+            1,
+            vec![sentinel_common::LocalOwnerBaseState {
+                scope: sentinel_common::StateTransferScope::World,
+                recipient_node: seed,
+                owner_term: initial,
+                base_role: sentinel_common::LocalOwnerBaseRole::Owner,
+                activation_state: sentinel_common::ActivationState::Routable,
+            }],
+        )
+        .unwrap();
+        registry
+            .rebuild_from_owner_snapshot(&global, &local, vec![])
+            .unwrap();
+        let successor_term = sentinel_common::OwnerTerm {
+            scope: sentinel_common::StateTransferScope::World,
+            owner_node: successor,
+            epoch: 2,
+            coordinator_generation: sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+        };
+        (registry, successor_term)
+    }
+
+    fn workbench_authority_transition_fixture(
+        stage: AuthorityTransitionStage,
+    ) -> (
+        DaemonNanoRuntimeRegistry,
+        Arc<sentinel_common::OwnerRegistry>,
+        Arc<AtomicUsize>,
+    ) {
+        let agent_id = AgentId(42);
+        let handle = NanoHandle::new(
+            RUNTIME_BWRAP_LANDLOCK,
+            "AGENT-42".to_string(),
+            Some(agent_id),
+            Some(1234),
+        );
+        let (owner, successor_term) = cluster_owner_registry_for_workbench_test();
+        let exec_calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = NanoRuntimeRegistry::new(None);
+        registry
+            .register(RecreateFixtureRuntime {
+                active: Some(handle.clone()),
+                resource_calls: Arc::new(AtomicUsize::new(0)),
+                exec_calls: Arc::clone(&exec_calls),
+                isolated_resources: true,
+                authority_transition: Some((Arc::clone(&owner), successor_term, stage)),
+            })
+            .unwrap();
+        (
+            DaemonNanoRuntimeRegistry {
+                adapter_owner: RuntimeAdapterOwner::from_registry(registry),
+                handles: HashMap::from([(agent_id, handle)]),
+                recovery_blocked_agents: HashSet::new(),
+            },
+            owner,
+            exec_calls,
+        )
+    }
+
+    #[test]
+    fn workbench_exchange_reuses_one_guard_before_exec_and_output_acceptance() {
+        let request = NanoExecRequest {
+            operation: "workbench_start".to_string(),
+            input: "start".to_string(),
+        };
+        let (mut runtimes, owner, exec_calls) =
+            workbench_authority_transition_fixture(AuthorityTransitionStage::Resources);
+        let mut client = DaemonWorkbenchRuntimeClient {
+            runtimes: &mut runtimes,
+            owner_registry: owner.as_ref(),
+        };
+        assert!(crate::workbench::WorkbenchRuntimeClient::exchange(
+            &mut client,
+            AgentId(42),
+            request.clone(),
+        )
+        .is_err());
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 0);
+
+        let (mut runtimes, owner, exec_calls) =
+            workbench_authority_transition_fixture(AuthorityTransitionStage::Exec);
+        let mut client = DaemonWorkbenchRuntimeClient {
+            runtimes: &mut runtimes,
+            owner_registry: owner.as_ref(),
+        };
+        assert!(crate::workbench::WorkbenchRuntimeClient::exchange(
+            &mut client,
+            AgentId(42),
+            request,
+        )
+        .is_err());
+        assert_eq!(
+            exec_calls.load(Ordering::SeqCst),
+            1,
+            "the stale result must be rejected after exact guarded I/O"
+        );
     }
 
     #[test]
