@@ -22,9 +22,11 @@ OOMScoreAdjust=-1000
 LoadCredential=caller-agent-runtime:/etc/sentinel/credentials/caller-agent-runtime
 LoadCredential=caller-platform:/etc/sentinel/credentials/caller-platform
 LoadCredential=caller-evolution:/etc/sentinel/credentials/caller-evolution
+LoadCredential=operator-api:/etc/sentinel/credentials/operator-api
 Environment=SENTINEL_AGENT_RUNTIME_CREDENTIAL_FILE=%d/caller-agent-runtime
 Environment=SENTINEL_PLATFORM_CREDENTIAL_FILE=%d/caller-platform
 Environment=SENTINEL_EVOLUTION_CREDENTIAL_FILE=%d/caller-evolution
+Environment=SENTINEL_OPERATOR_CREDENTIAL_FILE=%d/operator-api
 # Cutover invariant: remain false until the independent hierarchy projection
 # has backfilled to the recorded boundary.
 Environment=SENTINEL_LLM_USAGE_V2_ENABLED=false

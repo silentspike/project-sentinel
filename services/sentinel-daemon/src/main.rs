@@ -11,7 +11,9 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tracing::{error, info};
 
-use sentinel_daemon::config::DaemonConfig;
+use sentinel_daemon::config::{
+    CREDENTIALS_DIRECTORY_ENV, DaemonConfig, OPERATOR_CREDENTIAL_FILE_ENV,
+};
 
 /// Sentinel Daemon — ECS Orchestrator fuer die Agent-Simulation.
 #[derive(Parser, Debug)]
@@ -75,8 +77,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let config = DaemonConfig::load(Path::new(&cli.config))
-        .with_context(|| format!("Config laden: {}", cli.config))?;
+    let credential_path = std::env::var_os(OPERATOR_CREDENTIAL_FILE_ENV).map(PathBuf::from);
+    let credentials_directory = std::env::var_os(CREDENTIALS_DIRECTORY_ENV).map(PathBuf::from);
+    let config = load_runtime_config(
+        Path::new(&cli.config),
+        credentials_directory.as_deref(),
+        credential_path.as_deref(),
+    )
+    .with_context(|| format!("Config laden: {}", cli.config))?;
 
     info!(
         config_dir = %config.config_dir.display(),
@@ -113,6 +121,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     runtime.block_on(sentinel_daemon::orchestrator::run(config))
 }
 
+fn load_runtime_config(
+    config_path: &Path,
+    credentials_directory: Option<&Path>,
+    credential_path: Option<&Path>,
+) -> anyhow::Result<DaemonConfig> {
+    let mut config = DaemonConfig::load(config_path)?;
+    config
+        .bind_operator_credential(credentials_directory, credential_path)
+        .context("Operator-API Credential validieren")?;
+    Ok(config)
+}
+
 /// Dry-Run: Config validieren, Agents laden, Schicht erkennen, beenden.
 fn dry_run(config: &DaemonConfig) -> anyhow::Result<()> {
     use sentinel_common::agent_config::load_all_agents_with_validation;
@@ -144,4 +164,47 @@ fn dry_run(config: &DaemonConfig) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn safe_tempdir() -> tempfile::TempDir {
+        let root = std::env::var_os("RUNNER_TEMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/work/tmp/project-sentinel"));
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("operator-credential-main-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    #[test]
+    fn runtime_config_fails_before_dry_run_or_start_without_operator_credential() {
+        let directory = safe_tempdir();
+        let config_path = directory.path().join("daemon.toml");
+        fs::write(
+            &config_path,
+            "[daemon]\nconfig_dir = \"/opt/sentinel/config\"\ndata_dir = \"/opt/sentinel/data\"\n",
+        )
+        .unwrap();
+
+        let error = load_runtime_config(&config_path, None, None).unwrap_err();
+        assert!(error.to_string().contains("Credential validieren"));
+
+        let credential_path = directory.path().join("operator-api");
+        fs::write(&credential_path, b"0123456789abcdef0123456789abcdef").unwrap();
+        fs::set_permissions(&credential_path, fs::Permissions::from_mode(0o400)).unwrap();
+        let config = load_runtime_config(
+            &config_path,
+            Some(directory.path()),
+            Some(&credential_path),
+        )
+        .unwrap();
+        assert!(config.operator_api.shared_secret.is_some());
+    }
 }

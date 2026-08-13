@@ -12,6 +12,12 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub mod auth;
@@ -28,8 +34,18 @@ pub mod projection;
 pub mod tls;
 pub mod wt;
 
+pub const OPERATOR_API_KEY_FILE_ENV: &str = "SENTINEL_OPERATOR_API_KEY_FILE";
+pub const CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
+const OPERATOR_API_KEY_ENV: &str = "SENTINEL_OPERATOR_API_KEY";
+const CREDENTIAL_MIN_BYTES: usize = 32;
+const CREDENTIAL_MAX_BYTES: usize = 4096;
+const O_DIRECTORY: i32 = 0o200000;
+const O_NONBLOCK: i32 = 0o4000;
+const O_NOFOLLOW: i32 = 0o400000;
+const OPERATOR_CREDENTIAL_NAME: &str = "operator-api";
+
 /// Runtime configuration (env-driven, plus the self-signed cert hash computed at startup).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     /// Operator-Key fuer die Dashboard-Auth; None => Auth deaktiviert (fail-closed beim Login).
     pub dashboard_api_key: Option<String>,
@@ -107,10 +123,263 @@ pub struct Config {
     pub gaia_model: Option<String>,
 }
 
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field(
+                "dashboard_api_key_configured",
+                &self.dashboard_api_key.is_some(),
+            )
+            .field("http_bind", &self.http_bind)
+            .field("wt_bind", &self.wt_bind)
+            .field("operator_url", &self.operator_url)
+            .field("operator_key_configured", &self.operator_key.is_some())
+            .field("gateway_url", &self.gateway_url)
+            .field("gateway_proxy_url", &self.gateway_proxy_url)
+            .field("prometheus_url", &self.prometheus_url)
+            .field("projection_db", &self.projection_db)
+            .field("events_db", &self.events_db)
+            .field("bundle_dir", &self.bundle_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CredentialFileIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    group: u32,
+    mode: u32,
+    links: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl CredentialFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner: metadata.uid(),
+            group: metadata.gid(),
+            mode: metadata.mode() & 0o7777,
+            links: metadata.nlink(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OpenCredential {
+    file: File,
+    file_identity: CredentialFileIdentity,
+    parent_identities: Vec<CredentialFileIdentity>,
+}
+
+fn effective_uid() -> anyhow::Result<u32> {
+    Ok(std::fs::metadata("/proc/self")?.uid())
+}
+
+fn validate_credential_metadata(
+    metadata: &std::fs::Metadata,
+    expected_owner: u32,
+) -> anyhow::Result<CredentialFileIdentity> {
+    let identity = CredentialFileIdentity::from_metadata(metadata);
+    anyhow::ensure!(
+        credential_file_identity_is_allowed(&identity, metadata.is_file(), expected_owner),
+        "operator API credential file metadata is invalid"
+    );
+    anyhow::ensure!(
+        identity.size >= CREDENTIAL_MIN_BYTES as u64
+            && identity.size <= CREDENTIAL_MAX_BYTES as u64,
+        "operator API credential length is invalid"
+    );
+    Ok(identity)
+}
+
+fn credential_file_identity_is_allowed(
+    identity: &CredentialFileIdentity,
+    is_regular: bool,
+    expected_owner: u32,
+) -> bool {
+    let systemd_owned = identity.owner == 0
+        && identity.group == 0
+        && matches!(identity.mode, 0o400 | 0o440);
+    let service_owned = identity.owner == expected_owner && matches!(identity.mode, 0o400 | 0o600);
+    is_regular && identity.links == 1 && (systemd_owned || service_owned)
+}
+
+fn validate_credential_directory(
+    metadata: &std::fs::Metadata,
+    expected_owner: u32,
+) -> anyhow::Result<CredentialFileIdentity> {
+    let identity = CredentialFileIdentity::from_metadata(metadata);
+    anyhow::ensure!(
+        credential_directory_identity_is_allowed(&identity, metadata.is_dir(), expected_owner),
+        "operator API credential directory metadata is invalid"
+    );
+    Ok(identity)
+}
+
+fn credential_directory_identity_is_allowed(
+    identity: &CredentialFileIdentity,
+    is_directory: bool,
+    expected_owner: u32,
+) -> bool {
+    is_directory
+        && (identity.owner == 0 || identity.owner == expected_owner)
+        && identity.mode & 0o7022 == 0
+}
+
+fn open_credential_file(path: &Path) -> anyhow::Result<OpenCredential> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "operator API credential path must be absolute"
+    );
+    let components = path
+        .components()
+        .map(|component| match component {
+            Component::RootDir => Ok(None),
+            Component::Normal(value) => Ok(Some(value.to_os_string())),
+            _ => Err(anyhow::anyhow!("operator API credential path is invalid")),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let names = components.into_iter().flatten().collect::<Vec<_>>();
+    let (file_name, parents) = names
+        .split_last()
+        .ok_or_else(|| anyhow::anyhow!("operator API credential path is invalid"))?;
+
+    let expected_owner = effective_uid()?;
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+        .open("/")?;
+    let mut parent_identities = vec![validate_credential_directory(
+        &directory.metadata()?,
+        expected_owner,
+    )?];
+    for component in parents {
+        let candidate =
+            PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(component);
+        let next = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+            .open(candidate)?;
+        parent_identities.push(validate_credential_directory(
+            &next.metadata()?,
+            expected_owner,
+        )?);
+        directory = next;
+    }
+
+    let candidate =
+        PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(file_name);
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(candidate)?;
+    let file_identity = validate_credential_metadata(&file.metadata()?, expected_owner)?;
+    Ok(OpenCredential {
+        file,
+        file_identity,
+        parent_identities,
+    })
+}
+
+fn read_operator_api_credential_with_hook(
+    path: &Path,
+    after_open: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
+    let OpenCredential {
+        mut file,
+        file_identity: initial_identity,
+        parent_identities: initial_parents,
+    } = open_credential_file(path)?;
+    after_open()?;
+
+    let mut bytes = vec![0_u8; initial_identity.size as usize];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let count = file.read(&mut bytes[offset..])?;
+        anyhow::ensure!(count != 0, "operator API credential read was shorter than declared");
+        offset += count;
+    }
+    let mut trailing = [0_u8; 1];
+    anyhow::ensure!(
+        file.read(&mut trailing)? == 0,
+        "operator API credential has trailing data"
+    );
+    let after_read = validate_credential_metadata(&file.metadata()?, effective_uid()?)?;
+    let reopened = open_credential_file(path)?;
+    anyhow::ensure!(
+        initial_identity == after_read
+            && initial_identity == reopened.file_identity
+            && initial_parents == reopened.parent_identities
+            && bytes.len() as u64 == initial_identity.size,
+        "operator API credential identity changed"
+    );
+
+    let value = String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("operator API credential encoding is invalid"))?;
+    anyhow::ensure!(
+        value.trim() == value && !value.chars().any(char::is_control),
+        "operator API credential content is invalid"
+    );
+    Ok(value)
+}
+
+fn read_operator_api_credential(path: &Path) -> anyhow::Result<String> {
+    read_operator_api_credential_with_hook(path, || Ok(()))
+}
+
 impl Config {
     /// Liest die Konfiguration aus der Umgebung (Defaults = lokale Single-VM-Deploy).
     pub fn from_env() -> Self {
         Self::from_env_values(|k| std::env::var(k).ok())
+    }
+
+    /// Build the production configuration with the operator proxy credential
+    /// sourced exclusively from its systemd-style credential file.
+    pub fn from_production_env() -> anyhow::Result<Self> {
+        Self::from_production_env_values(|key| std::env::var(key).ok())
+    }
+
+    fn from_production_env_values(
+        mut read_env: impl FnMut(&str) -> Option<String>,
+    ) -> anyhow::Result<Self> {
+        let credential_file = read_env(OPERATOR_API_KEY_FILE_ENV).filter(|value| !value.is_empty());
+        let credentials_directory =
+            read_env(CREDENTIALS_DIRECTORY_ENV).filter(|value| !value.is_empty());
+        let mut config = Self::from_env_values(|key| read_env(key));
+        let direct_key = config.operator_key.take();
+        anyhow::ensure!(
+            !(credential_file.is_some() && direct_key.is_some()),
+            "operator API credential authorities are ambiguous"
+        );
+        anyhow::ensure!(
+            direct_key.is_none(),
+            "direct operator API credentials are not allowed in production"
+        );
+        let path = credential_file
+            .ok_or_else(|| anyhow::anyhow!("operator API credential file is required"))?;
+        let directory = credentials_directory
+            .ok_or_else(|| anyhow::anyhow!("systemd credentials directory is required"))?;
+        anyhow::ensure!(
+            Path::new(&directory).is_absolute()
+                && Path::new(&path) == Path::new(&directory).join(OPERATOR_CREDENTIAL_NAME),
+            "operator API credential path must be the systemd credential leaf"
+        );
+        config.operator_key = Some(read_operator_api_credential(Path::new(&path))?);
+        Ok(config)
     }
 
     fn from_env_values(mut read_env: impl FnMut(&str) -> Option<String>) -> Self {
@@ -129,7 +398,7 @@ impl Config {
             wt_bind: env("SENTINEL_DASHBOARD_WT_BIND").unwrap_or_else(|| "0.0.0.0:8001".into()),
             operator_url: env("SENTINEL_OPERATOR_API_URL")
                 .unwrap_or_else(|| "http://127.0.0.1:8084".into()),
-            operator_key: env("SENTINEL_OPERATOR_API_KEY"),
+            operator_key: env(OPERATOR_API_KEY_ENV),
             gateway_url: env("CORTEX_GATEWAY_CONTROL_URL")
                 .unwrap_or_else(|| "http://127.0.0.1:8081".into()),
             gateway_proxy_url: env("CORTEX_GATEWAY_PROXY_URL")
@@ -411,6 +680,28 @@ async fn health() -> axum::Json<serde_json::Value> {
 mod tests {
     use super::Config;
     use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const TEST_CREDENTIAL: &str = "0123456789abcdef0123456789abcdef";
+
+    fn safe_tempdir() -> tempfile::TempDir {
+        let root = std::env::var_os("RUNNER_TEMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/work/tmp/project-sentinel"));
+        fs::create_dir_all(&root).unwrap();
+        assert!(root.is_absolute());
+        for ancestor in root.ancestors() {
+            let metadata = fs::metadata(ancestor).unwrap();
+            assert_ne!(metadata.mode() & 0o1777, 0o1777);
+        }
+        tempfile::Builder::new()
+            .prefix("operator-credential-dashboard-")
+            .tempdir_in(root)
+            .unwrap()
+    }
 
     fn config_from(values: &[(&str, &str)]) -> Config {
         let vars = values
@@ -418,6 +709,265 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect::<HashMap<_, _>>();
         Config::from_env_values(|k| vars.get(k).cloned())
+    }
+
+    fn production_config_from(values: &[(&str, &str)]) -> anyhow::Result<Config> {
+        let vars = values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<HashMap<_, _>>();
+        Config::from_production_env_values(|key| vars.get(key).cloned())
+    }
+
+    fn write_credential(path: &Path, value: &[u8], mode: u32) {
+        fs::write(path, value).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn production_config_requires_secure_operator_credential_file() {
+        let directory = safe_tempdir();
+        let path = directory.path().join("operator-api");
+        write_credential(&path, TEST_CREDENTIAL.as_bytes(), 0o400);
+
+        assert!(production_config_from(&[]).is_err());
+        let config = production_config_from(&[
+            (
+                super::CREDENTIALS_DIRECTORY_ENV,
+                directory.path().to_str().unwrap(),
+            ),
+            (super::OPERATOR_API_KEY_FILE_ENV, path.to_str().unwrap()),
+        ])
+        .unwrap();
+        assert_eq!(config.operator_key.as_deref(), Some(TEST_CREDENTIAL));
+        assert!(!format!("{config:?}").contains(TEST_CREDENTIAL));
+
+        let alternate = directory.path().join("alternate");
+        write_credential(&alternate, TEST_CREDENTIAL.as_bytes(), 0o400);
+        assert!(production_config_from(&[
+            (
+                super::CREDENTIALS_DIRECTORY_ENV,
+                directory.path().to_str().unwrap(),
+            ),
+            (
+                super::OPERATOR_API_KEY_FILE_ENV,
+                alternate.to_str().unwrap(),
+            ),
+        ])
+        .is_err());
+
+        if super::effective_uid().unwrap() == 0 {
+            write_credential(&path, TEST_CREDENTIAL.as_bytes(), 0o440);
+            assert!(super::read_operator_api_credential(&path).is_ok());
+        }
+    }
+
+    #[test]
+    fn production_config_rejects_direct_and_ambiguous_operator_credentials() {
+        let directory = safe_tempdir();
+        let path = directory.path().join("operator-api");
+        write_credential(&path, TEST_CREDENTIAL.as_bytes(), 0o600);
+        let direct = "direct-secret-that-must-never-appear";
+
+        let error = production_config_from(&[(super::OPERATOR_API_KEY_ENV, direct)]).unwrap_err();
+        assert!(!format!("{error:?}").contains(direct));
+        let error = production_config_from(&[
+            (super::OPERATOR_API_KEY_ENV, direct),
+            (super::OPERATOR_API_KEY_FILE_ENV, path.to_str().unwrap()),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("ambiguous"));
+        assert!(!format!("{error:?}").contains(direct));
+
+        let fixture = config_from(&[(super::OPERATOR_API_KEY_ENV, direct)]);
+        assert_eq!(fixture.operator_key.as_deref(), Some(direct));
+        assert!(!format!("{fixture:?}").contains(direct));
+    }
+
+    #[test]
+    fn dashboard_operator_credential_rejects_invalid_content_and_metadata() {
+        let directory = safe_tempdir();
+        let cases: &[(&str, &[u8], u32)] = &[
+            ("empty", b"", 0o400),
+            ("short", b"0123456789abcdef", 0o400),
+            (
+                "trailing-space",
+                b"0123456789abcdef0123456789abcdef ",
+                0o400,
+            ),
+            ("control", b"0123456789abcdef0123456789abcde\n", 0o400),
+            ("unsafe-mode", TEST_CREDENTIAL.as_bytes(), 0o604),
+        ];
+        for (name, value, mode) in cases {
+            let path = directory.path().join(name);
+            write_credential(&path, value, *mode);
+            assert!(
+                super::read_operator_api_credential(&path).is_err(),
+                "case {name} must fail closed"
+            );
+        }
+
+        let oversized = directory.path().join("oversized");
+        write_credential(
+            &oversized,
+            &vec![b'x'; super::CREDENTIAL_MAX_BYTES + 1],
+            0o400,
+        );
+        assert!(super::read_operator_api_credential(&oversized).is_err());
+
+        let target = directory.path().join("target");
+        let symlink_path = directory.path().join("symlink");
+        write_credential(&target, TEST_CREDENTIAL.as_bytes(), 0o400);
+        symlink(&target, &symlink_path).unwrap();
+        assert!(super::read_operator_api_credential(&symlink_path).is_err());
+
+        let hardlink = directory.path().join("hardlink");
+        fs::hard_link(&target, &hardlink).unwrap();
+        assert!(super::read_operator_api_credential(&target).is_err());
+        let owner_only = directory.path().join("owner-only");
+        write_credential(&owner_only, TEST_CREDENTIAL.as_bytes(), 0o400);
+        let metadata = fs::metadata(&owner_only).unwrap();
+        let mut foreign_file = super::CredentialFileIdentity::from_metadata(&metadata);
+        foreign_file.owner = metadata.uid().saturating_add(1).max(1);
+        foreign_file.group = metadata.gid().saturating_add(1).max(1);
+        assert!(!super::credential_file_identity_is_allowed(
+            &foreign_file,
+            true,
+            metadata.uid()
+        ));
+        let mut group_readable_service_file =
+            super::CredentialFileIdentity::from_metadata(&metadata);
+        group_readable_service_file.owner = 1_000;
+        group_readable_service_file.group = 1_000;
+        group_readable_service_file.mode = 0o440;
+        assert!(!super::credential_file_identity_is_allowed(
+            &group_readable_service_file,
+            true,
+            1_000
+        ));
+        group_readable_service_file.owner = 0;
+        group_readable_service_file.group = 0;
+        assert!(super::credential_file_identity_is_allowed(
+            &group_readable_service_file,
+            true,
+            1_000
+        ));
+
+        let fifo = directory.path().join("fifo");
+        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        assert!(super::read_operator_api_credential(&fifo).is_err());
+
+        let unsafe_parent = directory.path().join("unsafe-parent");
+        fs::create_dir(&unsafe_parent).unwrap();
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o770)).unwrap();
+        let unsafe_leaf = unsafe_parent.join("operator-api");
+        write_credential(&unsafe_leaf, TEST_CREDENTIAL.as_bytes(), 0o400);
+        assert!(super::read_operator_api_credential(&unsafe_leaf).is_err());
+
+        let real_parent = directory.path().join("real-parent");
+        let linked_parent = directory.path().join("linked-parent");
+        fs::create_dir(&real_parent).unwrap();
+        write_credential(
+            &real_parent.join("operator-api"),
+            TEST_CREDENTIAL.as_bytes(),
+            0o400,
+        );
+        symlink(&real_parent, &linked_parent).unwrap();
+        assert!(super::read_operator_api_credential(&linked_parent.join("operator-api")).is_err());
+
+        let parent_metadata = fs::metadata(directory.path()).unwrap();
+        let mut foreign_parent = super::CredentialFileIdentity::from_metadata(&parent_metadata);
+        foreign_parent.owner = parent_metadata.uid().saturating_add(1).max(1);
+        assert!(!super::credential_directory_identity_is_allowed(
+            &foreign_parent,
+            true,
+            parent_metadata.uid()
+        ));
+        for unsafe_mode in [0o1700, 0o2700, 0o4700, 0o770] {
+            let mut unsafe_identity =
+                super::CredentialFileIdentity::from_metadata(&parent_metadata);
+            unsafe_identity.owner = 1_000;
+            unsafe_identity.mode = unsafe_mode;
+            assert!(!super::credential_directory_identity_is_allowed(
+                &unsafe_identity,
+                true,
+                1_000
+            ));
+        }
+    }
+
+    #[test]
+    fn dashboard_operator_credential_rejects_path_replacement_after_open() {
+        let directory = safe_tempdir();
+        let path = directory.path().join("operator-api");
+        let original = directory.path().join("operator-api.original");
+        write_credential(&path, TEST_CREDENTIAL.as_bytes(), 0o400);
+
+        let result = super::read_operator_api_credential_with_hook(&path, || {
+            fs::rename(&path, &original)?;
+            write_credential(&path, b"fedcba9876543210fedcba9876543210", 0o400);
+            Ok(())
+        });
+        assert!(result.unwrap_err().to_string().contains("identity changed"));
+    }
+
+    #[test]
+    fn dashboard_operator_credential_rejects_in_place_and_parent_identity_changes() {
+        let directory = safe_tempdir();
+        let path = directory.path().join("operator-api");
+
+        write_credential(&path, TEST_CREDENTIAL.as_bytes(), 0o400);
+        assert!(super::read_operator_api_credential_with_hook(&path, || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            fs::write(&path, b"fedcba9876543210fedcba9876543210")?;
+            Ok(())
+        })
+        .is_err());
+
+        write_credential(&path, TEST_CREDENTIAL.as_bytes(), 0o400);
+        assert!(super::read_operator_api_credential_with_hook(&path, || {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            Ok(())
+        })
+        .is_err());
+
+        write_credential(&path, TEST_CREDENTIAL.as_bytes(), 0o400);
+        let link = directory.path().join("linked");
+        assert!(super::read_operator_api_credential_with_hook(&path, || {
+            fs::hard_link(&path, &link)?;
+            Ok(())
+        })
+        .is_err());
+        fs::remove_file(&link).unwrap();
+
+        write_credential(&path, TEST_CREDENTIAL.as_bytes(), 0o400);
+        assert!(super::read_operator_api_credential_with_hook(&path, || {
+            fs::OpenOptions::new().write(true).open(&path)?.set_len(16)?;
+            Ok(())
+        })
+        .is_err());
+
+        write_credential(&path, TEST_CREDENTIAL.as_bytes(), 0o400);
+        assert!(super::read_operator_api_credential_with_hook(&path, || {
+            use std::io::Write;
+            let mut append = fs::OpenOptions::new().append(true).open(&path)?;
+            append.write_all(b"x")?;
+            Ok(())
+        })
+        .is_err());
+
+        let parent = directory.path().join("credentials");
+        fs::create_dir(&parent).unwrap();
+        let parent_path = parent.join("operator-api");
+        write_credential(&parent_path, TEST_CREDENTIAL.as_bytes(), 0o400);
+        let old_parent = directory.path().join("credentials.old");
+        assert!(super::read_operator_api_credential_with_hook(&parent_path, || {
+            fs::rename(&parent, &old_parent)?;
+            fs::create_dir(&parent)?;
+            write_credential(&parent.join("operator-api"), TEST_CREDENTIAL.as_bytes(), 0o400);
+            Ok(())
+        })
+        .is_err());
     }
 
     #[test]
