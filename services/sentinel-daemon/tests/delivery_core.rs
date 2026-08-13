@@ -312,9 +312,7 @@ fn insert_complete_release_fixture(
     aggregate
         .candidates
         .insert(candidate.candidate_id.clone(), candidate.clone());
-    aggregate
-        .qa_plans
-        .insert(qa_plan.plan_id.clone(), qa_plan);
+    aggregate.qa_plans.insert(qa_plan.plan_id.clone(), qa_plan);
     aggregate.qa_runs.insert(qa_run.run_id.clone(), qa_run);
     aggregate.gates.insert(gate.gate_id.clone(), gate);
     aggregate
@@ -3573,12 +3571,8 @@ fn closeout_requires_bound_memory_receipt_and_survives_restart() {
         "rollout-1",
     );
     let release_ref = versioned_release(&release);
-    let acceptance = insert_accepted_delivery_fixture(
-        &mut aggregate,
-        &release,
-        "delivery-1",
-        "acceptance-1",
-    );
+    let acceptance =
+        insert_accepted_delivery_fixture(&mut aggregate, &release, "delivery-1", "acceptance-1");
     let core = core_with_seeded_aggregate(&temp, aggregate);
     let command = context(
         "release-manager",
