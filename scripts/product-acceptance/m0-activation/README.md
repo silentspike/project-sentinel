@@ -4,13 +4,16 @@
 M0 runtime phase. It has two commands:
 
 - `activate` validates the raw provision-receipt digest, manifest digest, Git
-  SHA, stopped unit set, and repository-defined topology before it reloads
+  SHA, dynamic artifact count and artifact-set digest, stopped unit set, and
+  repository-defined topology before it reloads
   systemd and queues only `sentinel.target` with `--no-block`. A separate bounded activation
-  deadline allows asynchronous service startup and recovery while each command
-  retains its short timeout. The controller polls without busy-waiting until
-  long-lived units are ready, fails immediately on terminal unit or oneshot
-  failure, and retries the existing runtime preflight only for its explicit
-  time-dependent readiness outcomes. After the target-start mutation, the
+  deadline allows asynchronous service startup and recovery while every
+  readback and preflight call is bounded by freshly computed remaining time.
+  The controller polls without busy-waiting until long-lived units are ready,
+  treats any systemd `Result` other than `success` as terminal, and retries the
+  existing runtime preflight only for its explicit time-dependent readiness
+  outcomes. Preflight status, checks, evidence and canonical result digest must
+  agree exactly. After the target-start mutation, the
   complete prevalidated topology is invocation-owned for rollback: the target
   is stopped first, then both timer-triggered oneshots and every canonical unit
   in reverse order, with bounded readback.
