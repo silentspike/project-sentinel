@@ -402,8 +402,11 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         help_text = " ".join(result.stdout.split())
         self.assertIn("owner- and mode-sensitive", help_text)
-        self.assertIn("transport must preserve ownership, modes", help_text)
-        self.assertIn("run verify as the executing owner before provisioning", help_text)
+        self.assertIn("Transport must preserve modes, regular-file identities, and hardlink counts", help_text)
+        self.assertIn("remain identical to the later executor", help_text)
+        self.assertIn("remapped in one closed root-controlled staging step to that executor", help_text)
+        self.assertIn("Mixed ownership and partial remaps are invalid", help_text)
+        self.assertIn("run verify as exactly that executor before provisioning", help_text)
         self.assertNotIn("scp", help_text.lower())
 
     def test_tamper_extra_type_swap_and_hardlink_package_fail(self) -> None:
