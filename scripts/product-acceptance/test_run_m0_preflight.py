@@ -203,9 +203,10 @@ class Fixture:
         self.https_overrides: dict[str, bytes | Exception] = {}
         self.command_overrides: dict[tuple[str, ...], bytes | Exception] = {}
         self.event_store_reads: list[dict[str, int]] = []
+        self.hash_calls: list[tuple[Path, int]] = []
         self.manifest_path = Path("/fixture/release-manifest.json")
-        self.contract_path = Path("/fixture/m0-contract.toml")
-        self.profile_path = Path("/opt/sentinel/config/work-profiles/web-project-v1.toml")
+        self.contract_path = preflight.M0_CONTRACT_PATH
+        self.profile_path = preflight.M0_PROFILE_PATH
         self.agents_dir = Path("/opt/sentinel/config/agents")
         self.credential_path = Path("/fixture/operator.secret")
         self.agent_paths = [
@@ -224,6 +225,9 @@ tool_runtime = "bwrap"
 runtime_registry_required = true
 allow_secure_runtime_fallback = false
 '''
+        self.files[preflight.M0_WORKBENCH_PROFILE_PATH] = b'''schema_version = 1
+id = "web-authoring-v1"
+'''
         repository_agents = Path(__file__).resolve().parents[2] / "config" / "agents"
         self.agent_identities: dict[int, dict[str, object]] = {}
         for path in self.agent_paths:
@@ -234,13 +238,14 @@ allow_secure_runtime_fallback = false
         self.files[self.credential_path] = (SECRET + "\n").encode("ascii")
         self.files[preflight.DASHBOARD_CERT_PATH] = TEST_CERTIFICATE
         self.manifest = self._manifest()
-        self.files[self.manifest_path] = encoded(self.manifest)
+        self.authorize_manifest()
         self.unit_facts = self._unit_facts()
-        self.listeners = self._listeners()
+        self.listeners_v4 = self._listeners("ipv4")
+        self.listeners_v6 = self._listeners("ipv6")
         self.http_payloads = self._http_payloads()
         self.event_store = {
             "latest_event_id": 41,
-            "pending_outbox": 0,
+            "unpublished_outbox": 0,
             "orphan_outbox": 0,
             "unresolved_llm": 0,
             "runtime_recovery": 0,
@@ -269,21 +274,17 @@ allow_secure_runtime_fallback = false
 
     def _manifest(self) -> dict[str, object]:
         artifacts = []
-        for index, path in enumerate(sorted(preflight.REQUIRED_MANIFEST_PATHS)):
+        for index, (path, (source, kind)) in enumerate(
+            sorted(preflight.CANONICAL_RELEASE_ARTIFACTS.items())
+        ):
             content = self.files.get(Path(path), f"artifact-{index}".encode("ascii"))
             self.files[Path(path)] = content
             artifacts.append(
                 {
                     "path": path,
-                    "source": f"source/artifact-{index}",
+                    "source": source,
                     "sha256": hashlib.sha256(content).hexdigest(),
-                    "type": (
-                        "binary"
-                        if "/bin/" in path
-                        else "systemd"
-                        if path.endswith((".service", ".timer", ".target"))
-                        else "config"
-                    ),
+                    "type": kind,
                 }
             )
         return {
@@ -292,6 +293,11 @@ allow_secure_runtime_fallback = false
             "git_sha": "a" * 40,
             "artifacts": artifacts,
         }
+
+    def authorize_manifest(self) -> None:
+        raw = encoded(self.manifest)
+        self.files[self.manifest_path] = raw
+        self.expected_manifest_sha256 = hashlib.sha256(raw).hexdigest()
 
     def _unit_facts(self) -> dict[str, dict[str, str]]:
         facts = {
@@ -317,12 +323,16 @@ allow_secure_runtime_fallback = false
             }
         return facts
 
-    def _listeners(self) -> bytes:
+    def _listeners(self, family: str) -> bytes:
         lines = []
-        for protocol, host, port in sorted(preflight.EXPECTED_LISTENERS):
+        for protocol, expected_family, host, port in sorted(preflight.EXPECTED_LISTENERS):
+            if expected_family != family:
+                continue
             state = "LISTEN" if protocol == "tcp" else "UNCONN"
-            lines.append(f"{protocol} {state} 0 128 {host}:{port} 0.0.0.0:*")
-        return ("\n".join(lines) + "\n").encode("ascii")
+            remote = "0.0.0.0:*" if family == "ipv4" else "[::]:*"
+            local = f"{host}:{port}" if family == "ipv4" else f"[{host}]:{port}"
+            lines.append(f"{protocol} {state} 0 128 {local} {remote}")
+        return (("\n".join(lines) + "\n") if lines else "").encode("ascii")
 
     @staticmethod
     def _runtime_agent(agent_id: int, name: str) -> dict[str, object]:
@@ -431,6 +441,7 @@ allow_secure_runtime_fallback = false
             agents_dir=self.agents_dir,
             operator_credential=self.credential_path,
             expected_git_sha="a" * 40,
+            expected_manifest_sha256=self.expected_manifest_sha256,
             event_store=EVENT_DB,
             projection_store=PROJECTION_DB,
         )
@@ -448,6 +459,38 @@ allow_secure_runtime_fallback = false
             raise preflight.PreflightError("agents_unavailable")
         return list(self.agent_paths)
 
+    def hash_file(self, path: Path, limit: int) -> tuple[str, int]:
+        self.hash_calls.append((path, limit))
+        if path not in self.files:
+            raise preflight.PreflightError("file_unavailable")
+        data = self.files[path]
+        if len(data) > limit:
+            raise preflight.PreflightError("artifact_oversized")
+        return hashlib.sha256(data).hexdigest(), len(data)
+
+    def projection_snapshot(self) -> list[dict[str, object]]:
+        return [
+            {
+                "row_kind": "watermark",
+                "projection_name": row["projection_name"],
+                "last_event_id": row["last_event_id"],
+                "agent_id": None,
+                "name": None,
+                "role": None,
+                "shift_set": None,
+                "status": None,
+            }
+            for row in self.projection_store
+        ] + [
+            {
+                "row_kind": "agent",
+                "projection_name": None,
+                "last_event_id": None,
+                **row,
+            }
+            for row in self.projection_agents
+        ]
+
     def command(self, argv: list[str], timeout: float, limit: int) -> bytes:
         del timeout, limit
         self.commands.append(list(argv))
@@ -460,17 +503,18 @@ allow_secure_runtime_fallback = false
         if argv[:2] == ["/usr/bin/systemctl", "show"]:
             facts = self.unit_facts[argv[2]]
             return ("\n".join(f"{key}={value}" for key, value in facts.items()) + "\n").encode("ascii")
-        if argv == ["/usr/bin/ss", "-H", "-lntu"]:
-            return self.listeners
+        if argv == ["/usr/bin/ss", "-H", "-lntu", "-4"]:
+            return self.listeners_v4
+        if argv == ["/usr/bin/ss", "-H", "-lntu", "-6"]:
+            return self.listeners_v6
         if argv[:3] == ["/usr/bin/sqlite3", "-readonly", "-json"]:
             if Path(argv[3]) == EVENT_DB:
                 if self.event_store_reads:
                     return encoded([self.event_store_reads.pop(0)])
                 return encoded([self.event_store])
             if Path(argv[3]) == PROJECTION_DB:
-                if argv[4] == preflight.PROJECTION_AGENTS_SQL:
-                    return encoded(self.projection_agents)
-                return encoded(self.projection_store)
+                if argv[4] == preflight.PROJECTION_SNAPSHOT_SQL:
+                    return encoded(self.projection_snapshot())
         raise AssertionError(f"unexpected command: {argv!r}")
 
     def http(self, url: str, credential: str | None, timeout: float, limit: int) -> bytes:
@@ -530,6 +574,7 @@ allow_secure_runtime_fallback = false
             self.http,
             self.https,
             self.read_file,
+            self.hash_file,
             self.list_agents,
             self.read_file,
         )
@@ -632,6 +677,100 @@ class PreflightTests(unittest.TestCase):
         result = self.run_fixture()
         self.assertEqual(self.check(result, "release_manifest_identity")["reason"], "artifact_hash_mismatch")
 
+    def test_manifest_raw_digest_and_exact_authority_fail_closed(self) -> None:
+        self.fixture.files[self.fixture.manifest_path] += b" "
+        result = self.run_fixture()
+        self.assertEqual(
+            self.check(result, "release_manifest_identity")["reason"],
+            "manifest_authority_digest_mismatch",
+        )
+
+        for field, value in (("source", "fork/replaced"), ("type", "script")):
+            with self.subTest(field=field):
+                fixture = Fixture()
+                artifact = fixture.manifest["artifacts"][0]  # type: ignore[index]
+                if artifact[field] == value:  # type: ignore[index]
+                    value = "binary"
+                artifact[field] = value  # type: ignore[index]
+                fixture.authorize_manifest()
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertEqual(
+                    self.check(result, "release_manifest_identity")["reason"],
+                    "manifest_artifact_authority_mismatch",
+                )
+
+        fixture = Fixture()
+        fixture.manifest["artifacts"].append(  # type: ignore[union-attr]
+            {
+                "path": "/opt/sentinel/bin/unapproved",
+                "source": "target/release/unapproved",
+                "sha256": "0" * 64,
+                "type": "binary",
+            }
+        )
+        fixture.authorize_manifest()
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(
+            self.check(result, "release_manifest_identity")["reason"],
+            "manifest_unexpected_artifact",
+        )
+
+    def test_streaming_artifact_hash_accepts_more_than_metadata_limit(self) -> None:
+        artifact = self.fixture.manifest["artifacts"][0]  # type: ignore[index]
+        path = Path(artifact["path"])
+        content = b"x" * (preflight.MAX_FILE_BYTES + 1)
+        self.fixture.files[path] = content
+        artifact["sha256"] = hashlib.sha256(content).hexdigest()
+        self.fixture.authorize_manifest()
+        result = self.run_fixture()
+        self.assertEqual(self.check(result, "release_manifest_identity")["status"], "PASS")
+        self.assertIn((path, preflight.MAX_ARTIFACT_BYTES), self.fixture.hash_calls)
+
+        runner_temp = Path(os.environ["RUNNER_TEMP"])
+        runner_temp.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="cdx1-650-large-", dir=runner_temp) as raw:
+            large = Path(raw) / "large-artifact"
+            large.write_bytes(content)
+            large.chmod(0o644)
+            self.assertEqual(
+                preflight.default_hash_file(large, preflight.MAX_ARTIFACT_BYTES),
+                (hashlib.sha256(content).hexdigest(), len(content)),
+            )
+
+    def test_streaming_artifact_hash_rejects_oversize_and_replacement(self) -> None:
+        runner_temp = Path(os.environ["RUNNER_TEMP"])
+        runner_temp.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="cdx1-650-hash-", dir=runner_temp) as raw:
+            root = Path(raw)
+            oversized = root / "oversized"
+            with oversized.open("wb") as stream:
+                stream.truncate(preflight.MAX_ARTIFACT_BYTES + 1)
+            oversized.chmod(0o644)
+            with self.assertRaisesRegex(preflight.PreflightError, "artifact_oversized"):
+                preflight.default_hash_file(oversized, preflight.MAX_ARTIFACT_BYTES)
+
+            artifact = root / "artifact"
+            artifact.write_bytes(b"a" * (2 * 1024 * 1024))
+            artifact.chmod(0o644)
+            moved = root / "artifact-old"
+            real_read = os.read
+            replaced = False
+
+            def replace_during_hash(fd: int, size: int) -> bytes:
+                nonlocal replaced
+                block = real_read(fd, size)
+                if block and not replaced:
+                    replaced = True
+                    artifact.rename(moved)
+                    artifact.write_bytes(b"b" * (2 * 1024 * 1024))
+                    artifact.chmod(0o644)
+                return block
+
+            with mock.patch.object(preflight.os, "read", side_effect=replace_during_hash):
+                with self.assertRaisesRegex(preflight.PreflightError, "unsafe_file"):
+                    preflight.default_hash_file(artifact, preflight.MAX_ARTIFACT_BYTES)
+            self.assertTrue(replaced)
+
     def test_expected_release_identity_mismatch_fails(self) -> None:
         inputs = self.fixture.inputs()
         inputs = preflight.Inputs(**{**inputs.__dict__, "expected_git_sha": "b" * 40})
@@ -641,13 +780,13 @@ class PreflightTests(unittest.TestCase):
     def test_manifest_duplicate_and_missing_required_artifact_fail(self) -> None:
         duplicate = copy.deepcopy(self.fixture.manifest["artifacts"][0])  # type: ignore[index]
         self.fixture.manifest["artifacts"].append(duplicate)  # type: ignore[union-attr]
-        self.fixture.files[self.fixture.manifest_path] = encoded(self.fixture.manifest)
+        self.fixture.authorize_manifest()
         result = self.run_fixture()
         self.assertEqual(self.check(result, "release_manifest_identity")["reason"], "manifest_artifact_duplicate")
 
         fixture = Fixture()
         fixture.manifest["artifacts"].pop()  # type: ignore[union-attr]
-        fixture.files[fixture.manifest_path] = encoded(fixture.manifest)
+        fixture.authorize_manifest()
         result = preflight.evaluate(fixture.inputs(), fixture.deps())
         self.assertEqual(
             self.check(result, "release_manifest_identity")["reason"],
@@ -655,9 +794,45 @@ class PreflightTests(unittest.TestCase):
         )
 
     def test_missing_listener_fails(self) -> None:
-        self.fixture.listeners = b"\n".join(self.fixture.listeners.splitlines()[:-1]) + b"\n"
+        self.fixture.listeners_v4 = (
+            b"\n".join(self.fixture.listeners_v4.splitlines()[:-1]) + b"\n"
+        )
         result = self.run_fixture()
         self.assertEqual(self.check(result, "required_listeners")["reason"], "listener_contract_mismatch")
+
+    def test_protected_listener_multiset_rejects_extra_family_and_duplicate(self) -> None:
+        cases = (
+            ("wildcard", "ipv4", b"tcp LISTEN 0 128 0.0.0.0:8084 0.0.0.0:*\n"),
+            ("ipv6", "ipv6", b"tcp LISTEN 0 128 [::]:8084 [::]:*\n"),
+            ("duplicate", "ipv4", b"tcp LISTEN 0 128 127.0.0.1:8084 0.0.0.0:*\n"),
+        )
+        for name, family, line in cases:
+            with self.subTest(name=name):
+                fixture = Fixture()
+                attribute = f"listeners_{'v4' if family == 'ipv4' else 'v6'}"
+                setattr(fixture, attribute, getattr(fixture, attribute) + line)
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertEqual(
+                    self.check(result, "required_listeners")["reason"],
+                    "listener_contract_mismatch",
+                )
+
+        fixture = Fixture()
+        fixture.listeners_v4 = b"\n".join(
+            line
+            for line in fixture.listeners_v4.splitlines()
+            if b"127.0.0.1:8084" not in line
+        ) + b"\n"
+        fixture.listeners_v6 += b"tcp LISTEN 0 128 [::1]:8084 [::]:*\n"
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(
+            self.check(result, "required_listeners")["reason"],
+            "listener_contract_mismatch",
+        )
+
+    def test_unrelated_listener_is_allowed(self) -> None:
+        self.fixture.listeners_v4 += b"tcp LISTEN 0 128 0.0.0.0:9999 0.0.0.0:*\n"
+        self.assertTrue(self.run_fixture()["runtime_preflight_pass"])
 
     def test_http_malformed_and_duplicate_json_fail(self) -> None:
         url = "http://127.0.0.1:8080/health"
@@ -693,7 +868,7 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(self.check(result, "loopback_health")["reason"], "http_content_type")
 
         fixture = Fixture()
-        ss_argv = ("/usr/bin/ss", "-H", "-lntu")
+        ss_argv = ("/usr/bin/ss", "-H", "-lntu", "-4")
         fixture.command_overrides[ss_argv] = preflight.PreflightError("command_failed")
         result = preflight.evaluate(fixture.inputs(), fixture.deps())
         self.assertEqual(self.check(result, "required_listeners")["reason"], "command_failed")
@@ -721,6 +896,7 @@ class PreflightTests(unittest.TestCase):
             agents_dir=inputs.agents_dir,
             operator_credential=inputs.operator_credential,
             expected_git_sha=inputs.expected_git_sha,
+            expected_manifest_sha256=inputs.expected_manifest_sha256,
             event_store=Path("/opt/sentinel/data/events.db;touch-owned"),
             projection_store=inputs.projection_store,
         )
@@ -729,7 +905,7 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(self.fixture.commands, [])
 
     def test_store_backlog_and_projection_lag_fail(self) -> None:
-        self.fixture.event_store["pending_outbox"] = 1
+        self.fixture.event_store["unpublished_outbox"] = 1
         result = self.run_fixture()
         self.assertEqual(self.check(result, "store_projection_backlog")["reason"], "publication_or_recovery_backlog")
         fixture = Fixture()
@@ -744,6 +920,56 @@ class PreflightTests(unittest.TestCase):
             self.check(result, "store_projection_backlog")["reason"],
             "read_model_projection_lag",
         )
+
+    def test_failed_outbox_row_is_publication_backlog(self) -> None:
+        self.assertIn("status != 'published'", preflight.EVENT_STORE_SQL)
+        self.fixture.event_store["unpublished_outbox"] = 1
+        result = self.run_fixture()
+        self.assertEqual(
+            self.check(result, "store_projection_backlog")["reason"],
+            "publication_or_recovery_backlog",
+        )
+
+    def test_projection_watermarks_and_identities_use_one_snapshot(self) -> None:
+        result = self.run_fixture()
+        self.assertTrue(result["runtime_preflight_pass"])
+        projection_commands = [
+            argv
+            for argv in self.fixture.commands
+            if len(argv) > 4 and Path(argv[3]) == PROJECTION_DB
+        ]
+        self.assertEqual(len(projection_commands), 1)
+        self.assertEqual(projection_commands[0][4], preflight.PROJECTION_SNAPSHOT_SQL)
+
+        fixture = Fixture()
+        mixed = fixture.projection_snapshot()
+        mixed[0]["last_event_id"] = 40
+        projection_argv = (
+            "/usr/bin/sqlite3",
+            "-readonly",
+            "-json",
+            str(PROJECTION_DB),
+            preflight.PROJECTION_SNAPSHOT_SQL,
+        )
+        fixture.command_overrides[projection_argv] = encoded(mixed)
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(
+            self.check(result, "store_projection_backlog")["reason"],
+            "read_model_projection_lag",
+        )
+
+    def test_episode_frontier_must_equal_global_cut(self) -> None:
+        for frontier, reason in (
+            (None, "episode_projection_frontier_missing"),
+            (40, "episode_projection_frontier_mismatch"),
+        ):
+            with self.subTest(frontier=frontier):
+                fixture = Fixture()
+                fixture.http_payloads["episode_projection"]["agents"][0][  # type: ignore[index]
+                    "frontier_source_row_id"
+                ] = frontier
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertEqual(self.check(result, "identity_readiness")["reason"], reason)
 
     def test_event_cut_progress_between_projection_reads_fails(self) -> None:
         before = copy.deepcopy(self.fixture.event_store)
@@ -862,6 +1088,7 @@ shift_set = 0
             deps.http,
             deps.https,
             deps.read_file,
+            deps.hash_file,
             deps.list_agents,
             lambda path, limit: (_ for _ in ()).throw(
                 preflight.PreflightError("credential_permissions_invalid")
@@ -1041,18 +1268,108 @@ shift_set = 0
             real_open = os.open
             replaced = False
 
-            def replace_before_open(path: object, flags: int, *args: object) -> int:
+            def replace_before_open(
+                path: object, flags: int, *args: object, **kwargs: object
+            ) -> int:
                 nonlocal replaced
-                if Path(path) == replacement and not replaced:
+                if path == replacement.name and kwargs.get("dir_fd") is not None and not replaced:
                     replaced = True
                     replacement.unlink()
                     replacement.write_bytes(b"after")
                     replacement.chmod(0o600)
-                return real_open(path, flags, *args)
+                return real_open(path, flags, *args, **kwargs)
 
             with mock.patch.object(preflight.os, "open", side_effect=replace_before_open):
                 with self.assertRaisesRegex(preflight.PreflightError, "unsafe_file"):
                     preflight.default_read_file(replacement, 64)
+            self.assertTrue(replaced)
+
+    def test_descriptor_pinning_rejects_parent_symlink_replacement_and_modes(self) -> None:
+        runner_temp = Path(os.environ["RUNNER_TEMP"])
+        runner_temp.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="cdx1-650-path-", dir=runner_temp) as raw:
+            root = Path(raw)
+            real_parent = root / "real"
+            real_parent.mkdir(mode=0o755)
+            leaf = real_parent / "artifact"
+            leaf.write_bytes(b"content")
+            leaf.chmod(0o644)
+            linked_parent = root / "linked"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(preflight.PreflightError, "unsafe_path_component"):
+                preflight.default_read_file(linked_parent / "artifact", 64)
+
+            for mode in (0o664, 0o4755):
+                with self.subTest(mode=oct(mode)):
+                    leaf.chmod(mode)
+                    with self.assertRaisesRegex(preflight.PreflightError, "unsafe_file_mode"):
+                        preflight.default_read_file(leaf, 64)
+            leaf.chmod(0o644)
+
+            parent = root / "replace-parent"
+            parent.mkdir(mode=0o755)
+            target = parent / "artifact"
+            target.write_bytes(b"before")
+            target.chmod(0o644)
+            old_parent = root / "old-parent"
+            real_read = os.read
+            replaced = False
+
+            def replace_parent(fd: int, size: int) -> bytes:
+                nonlocal replaced
+                block = real_read(fd, size)
+                if block and not replaced:
+                    replaced = True
+                    parent.rename(old_parent)
+                    parent.mkdir(mode=0o755)
+                    replacement = parent / "artifact"
+                    replacement.write_bytes(b"after")
+                    replacement.chmod(0o644)
+                return block
+
+            with mock.patch.object(preflight.os, "read", side_effect=replace_parent):
+                with self.assertRaisesRegex(
+                    preflight.PreflightError, "unsafe_path_component"
+                ):
+                    preflight.default_read_file(target, 64)
+            self.assertTrue(replaced)
+
+    def test_agent_directory_is_component_pinned(self) -> None:
+        runner_temp = Path(os.environ["RUNNER_TEMP"])
+        runner_temp.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="cdx1-650-agents-", dir=runner_temp) as raw:
+            root = Path(raw)
+            agents = root / "agents"
+            agents.mkdir(mode=0o755)
+            for name in sorted(preflight.CANONICAL_AGENT_FILES):
+                item = agents / name
+                item.write_bytes(b"")
+                item.chmod(0o644)
+            self.assertEqual(len(preflight.default_list_agents(agents)), preflight.MAX_AGENTS)
+
+            link = root / "agent-link"
+            link.symlink_to(agents, target_is_directory=True)
+            with self.assertRaisesRegex(preflight.PreflightError, "unsafe_path_component"):
+                preflight.default_list_agents(link)
+
+            moved = root / "agents-old"
+            real_listdir = os.listdir
+            replaced = False
+
+            def replace_directory(path: object) -> list[str]:
+                nonlocal replaced
+                names = real_listdir(path)
+                if not replaced:
+                    replaced = True
+                    agents.rename(moved)
+                    agents.mkdir(mode=0o755)
+                return names
+
+            with mock.patch.object(preflight.os, "listdir", side_effect=replace_directory):
+                with self.assertRaisesRegex(
+                    preflight.PreflightError, "unsafe_path_component"
+                ):
+                    preflight.default_list_agents(agents)
             self.assertTrue(replaced)
 
     def test_secret_reader_uses_same_owner_only_pinned_descriptor(self) -> None:
@@ -1078,14 +1395,16 @@ shift_set = 0
             real_open = os.open
             replaced = False
 
-            def replace_secret(path: object, flags: int, *args: object) -> int:
+            def replace_secret(
+                path: object, flags: int, *args: object, **kwargs: object
+            ) -> int:
                 nonlocal replaced
-                if Path(path) == replacement and not replaced:
+                if path == replacement.name and kwargs.get("dir_fd") is not None and not replaced:
                     replaced = True
                     replacement.unlink()
                     replacement.write_bytes((SECRET + "-changed").encode("ascii"))
                     replacement.chmod(0o600)
-                return real_open(path, flags, *args)
+                return real_open(path, flags, *args, **kwargs)
 
             with mock.patch.object(preflight.os, "open", side_effect=replace_secret):
                 with self.assertRaisesRegex(
