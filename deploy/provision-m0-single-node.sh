@@ -543,38 +543,80 @@ def ensure_stage_root(path: Path) -> None:
 
 def prepare_stage(args: argparse.Namespace) -> tuple[int, Path]:
     safe_abs(args.stage_root)
-    ensure_stage_root(args.stage_root)
-    info = os.lstat(args.stage_root)
+    try:
+        ensure_stage_root(args.stage_root)
+    except ProvisionError:
+        raise
+    except OSError as exc:
+        raise ProvisionError("stage_root_unsafe") from exc
+    try:
+        info = os.lstat(args.stage_root)
+    except OSError as exc:
+        raise ProvisionError("stage_root_unsafe") from exc
     if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
         fail("stage_root_authority_invalid")
     lock_path = args.stage_root / ".provision.lock"
-    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-    if stat.S_IMODE(os.fstat(lock_fd).st_mode) != 0o600 or os.fstat(lock_fd).st_uid != os.geteuid():
-        os.close(lock_fd)
-        fail("stage_lock_authority_invalid")
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
+        lock_fd = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+    except OSError as exc:
+        raise ProvisionError("stage_lock_unsafe") from exc
+    locked = False
+    try:
+        lock_info = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_nlink != 1
+            or stat.S_IMODE(lock_info.st_mode) != 0o600
+            or lock_info.st_uid != os.geteuid()
+        ):
+            fail("stage_lock_authority_invalid")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except BlockingIOError as exc:
+            raise ProvisionError("provision_already_running") from exc
+        except OSError as exc:
+            raise ProvisionError("stage_lock_failed") from exc
+        operation = args.stage_root / "operation"
+        try:
+            if operation.is_symlink():
+                fail("stage_operation_unsafe")
+            if operation.exists():
+                fail("stage_operation_stale")
+        except ProvisionError:
+            raise
+        except OSError as exc:
+            raise ProvisionError("stage_operation_unsafe") from exc
+        try:
+            operation.mkdir(mode=0o700)
+        except OSError as exc:
+            raise ProvisionError("stage_operation_unsafe") from exc
+        return lock_fd, operation
+    except Exception:
+        if locked:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
         os.close(lock_fd)
-        raise ProvisionError("provision_already_running") from exc
-    operation = args.stage_root / "operation"
-    if operation.is_symlink():
-        fail("stage_operation_unsafe")
-    if operation.exists():
-        info = os.lstat(operation)
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
-            fail("stage_operation_unsafe")
-        shutil.rmtree(operation)
-    operation.mkdir(mode=0o700)
-    return lock_fd, operation
+        raise
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    uid, gid = validate_fake_contract(args)
-    lock_fd, operation = prepare_stage(args)
+    lock_fd: int | None = None
+    operation: Path | None = None
     changed: list[tuple[Path, Path | None, int, int, int]] = []
     created_dirs: list[Path] = []
+    target_mutation_started = False
     try:
+        uid, gid = validate_fake_contract(args)
+        lock_fd, operation = prepare_stage(args)
+        if args.inject_pre_mutation_error:
+            raise RuntimeError(f"injected private detail at {args.stage_root}")
         rows, manifest_sha = validate_manifest(args)
         validate_services(args)
         validate_targets(args, rows, uid, gid)
@@ -602,6 +644,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         validate_services(args)
         validate_targets(args, rows, uid, gid)
         applied = 0
+        target_mutation_started = True
         for index, row in enumerate(rows):
             target = target_path(args.target_root, row["path"])
             ensure_dir(target.parent, uid, gid, created_dirs)
@@ -654,6 +697,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         shutil.rmtree(operation)
         return receipt
     except Exception as exc:
+        reason = exc.args[0] if isinstance(exc, ProvisionError) and exc.args else "internal_failure"
+        if not target_mutation_started:
+            if operation is not None:
+                try:
+                    shutil.rmtree(operation)
+                except OSError:
+                    pass
+            raise ProvisionError(reason) from exc
         rollback_ok = True
         for target, backup, mode, old_uid, old_gid in reversed(changed):
             try:
@@ -676,16 +727,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 directory.rmdir()
             except OSError:
                 pass
-        reason = exc.args[0] if isinstance(exc, ProvisionError) and exc.args else "internal_failure"
         receipt = {"schema_version": SCHEMA_VERSION,
                    "status": "ROLLED_BACK" if rollback_ok else "ROLLBACK_FAILED",
                    "reason": reason, "git_sha": args.expected_git_sha,
                    "artifact_count": len(AUTHORITY), "services_started": False}
-        receipt["receipt_sha256"] = write_receipt(args.stage_root, receipt)
+        try:
+            receipt["receipt_sha256"] = write_receipt(args.stage_root, receipt)
+        except Exception:
+            rollback_ok = False
         raise ProvisionError(reason if rollback_ok else "rollback_failed") from exc
     finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
 
 
 def parse_args() -> argparse.Namespace:
@@ -700,6 +757,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--install-gid", type=int, default=0)
     parser.add_argument("--service-state-file", type=Path)
     parser.add_argument("--fail-after", type=int)
+    parser.add_argument("--inject-pre-mutation-error", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     for name in ("manifest", "source_root", "target_root", "stage_root"):
         safe_abs(getattr(args, name))
@@ -707,13 +765,16 @@ def parse_args() -> argparse.Namespace:
         safe_abs(args.service_state_file)
     if args.fail_after is not None and args.fail_after < 1:
         fail("fail_after_invalid")
+    if args.target_root == Path("/") and args.inject_pre_mutation_error:
+        fail("production_authority_invalid")
     return args
 
 
 try:
     result = run(parse_args())
-except ProvisionError as exc:
-    print(canonical({"schema_version": SCHEMA_VERSION, "status": "FAIL", "reason": str(exc)}).decode("ascii"), end="", file=sys.stderr)
+except Exception as exc:
+    reason = exc.args[0] if isinstance(exc, ProvisionError) and exc.args else "internal_failure"
+    print(canonical({"schema_version": SCHEMA_VERSION, "status": "FAIL", "reason": reason}).decode("ascii"), end="", file=sys.stderr)
     raise SystemExit(1)
 print(canonical(result).decode("ascii"), end="")
 PY
