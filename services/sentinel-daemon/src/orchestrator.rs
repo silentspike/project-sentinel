@@ -26,9 +26,9 @@ use sentinel_common::agent_config::{load_all_agents_with_validation, AgentConfig
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::events::{DomainEvent, DomainEventPayload};
 use sentinel_common::nano_runtime::{
-    NanoExecRequest, NanoExecResult, NanoHandle, NanoRuntimeControlAction,
-    NanoRuntimeControlError, NanoRuntimeControlResult, NanoRuntimeResources, NanoStopResult,
-    NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
+    NanoExecRequest, NanoExecResult, NanoHandle, NanoRuntimeControlAction, NanoRuntimeControlError,
+    NanoRuntimeControlResult, NanoRuntimeResources, NanoStopResult, NanoWorkloadSpec,
+    RUNTIME_BWRAP_LANDLOCK,
 };
 #[cfg(test)]
 use sentinel_common::nano_runtime::{RUNTIME_ECS_NATIVE, RUNTIME_MICROVM, RUNTIME_WASM_WASMTIME};
@@ -657,8 +657,8 @@ impl DaemonWorkbenchRuntimeClient<'_> {
             .owner_registry
             .issue(sentinel_common::StateTransferScope::World)
             .context("workbench World authority is unavailable")?;
-        guard
-            .validate()
+        self.owner_registry
+            .validate(&guard)
             .context("workbench World authority became stale")
     }
 }
@@ -678,7 +678,10 @@ impl crate::workbench::WorkbenchRuntimeClient for DaemonWorkbenchRuntimeClient<'
         );
 
         self.revalidate_world_authority()?;
-        if matches!(request.operation.as_str(), "workbench_start" | "workbench_recover") {
+        if matches!(
+            request.operation.as_str(),
+            "workbench_start" | "workbench_recover"
+        ) {
             let resources = self.runtimes.adapter_owner.resources(&handle)?;
             anyhow::ensure!(
                 resources.instance_id == Some(handle.instance_id)
@@ -738,12 +741,7 @@ fn process_workbench_dispatch(
                 authority,
                 response,
             } => (
-                coordinator.poll(
-                    &mut runtime,
-                    &invocation_id,
-                    authority.as_ref(),
-                    now_ms,
-                ),
+                coordinator.poll(&mut runtime, &invocation_id, authority.as_ref(), now_ms),
                 response,
             ),
             crate::workbench::WorkbenchDispatchCommand::Recover {
@@ -2321,8 +2319,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             let raw_agent_id = agent.identity.id;
             let agent_id = AgentId(raw_agent_id);
             let host_root = match active_fs_mount.as_deref() {
-                Some(mount) => std::path::PathBuf::from(mount)
-                    .join(format!("AGENT-{raw_agent_id:02}")),
+                Some(mount) => {
+                    std::path::PathBuf::from(mount).join(format!("AGENT-{raw_agent_id:02}"))
+                }
                 None => std::path::PathBuf::from("/ram/agents").join(&agent.identity.name),
             };
             (agent_id, host_root.join("artifacts"))
@@ -11263,9 +11262,8 @@ fn ecs_tick_loop(
         Some(service) => service.store.has_inflight().unwrap_or(true),
         None => false,
     };
-    let shift_snapshot_fenced = pending_shift_target.is_some()
-        || shift_snapshot_blocked_this_tick
-        || workbench_inflight;
+    let shift_snapshot_fenced =
+        pending_shift_target.is_some() || shift_snapshot_blocked_this_tick || workbench_inflight;
     if shift_snapshot_fenced {
         warn!(
             target_shift = ?pending_shift_target,

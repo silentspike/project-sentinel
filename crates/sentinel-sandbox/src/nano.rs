@@ -215,7 +215,6 @@ impl WorkbenchArtifactAuthority {
             expected_package,
         }
     }
-
 }
 
 fn is_workbench_agent_runtime(command: &[String]) -> bool {
@@ -293,12 +292,9 @@ fn validate_terminal_artifacts(
             false,
             "non-package workbench result cannot publish artifacts",
         )),
-        Some(expected) if artifacts.len() == 1 => validate_artifact_manifest(
-            host_agent_root,
-            authority,
-            expected,
-            &artifacts[0],
-        ),
+        Some(expected) if artifacts.len() == 1 => {
+            validate_artifact_manifest(host_agent_root, authority, expected, &artifacts[0])
+        }
         Some(_) => Err(exec_error(
             NanoExecErrorCode::ProtocolViolation,
             false,
@@ -326,7 +322,10 @@ fn validate_artifact_manifest(
     }
     let relative = safe_relative_path(&artifact.manifest_path)?;
     if relative.components().count() != 1
-        || !matches!(relative.components().next(), Some(std::path::Component::Normal(_)))
+        || !matches!(
+            relative.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
     {
         return Err(exec_error(
             NanoExecErrorCode::ProtocolViolation,
@@ -422,9 +421,7 @@ fn validate_artifact_manifest(
     let mut total_size = 0_u64;
     for entry in manifest.entries {
         let _ = safe_relative_path(&entry.path)?;
-        if !valid_sha256(&entry.sha256)
-            || entry.blob_id != format!("sha256:{}", entry.sha256)
-        {
+        if !valid_sha256(&entry.sha256) || entry.blob_id != format!("sha256:{}", entry.sha256) {
             return Err(exec_error(
                 NanoExecErrorCode::ProtocolViolation,
                 false,
@@ -1198,13 +1195,8 @@ impl BwrapNanoRuntime {
                 )
             })
             .ok_or_else(|| anyhow!("workbench sandbox handle is unavailable during recycle"))?;
-        let (handle, process) = replace(
-            &self.enforcer,
-            previous,
-            &agent_name,
-            workload_id,
-            &command,
-        )?;
+        let (handle, process) =
+            replace(&self.enforcer, previous, &agent_name, workload_id, &command)?;
         self.handles.insert(workload_id.to_string(), handle);
         self.processes.insert(workload_id.to_string(), process);
         Ok(())
@@ -1866,8 +1858,7 @@ impl BwrapNanoRuntime {
                     violation = Some(NanoExecErrorCode::InvalidFrame);
                     break;
                 };
-                let Ok(bound_message) =
-                    serde_json::from_value::<WorkbenchMessage>(message.clone())
+                let Ok(bound_message) = serde_json::from_value::<WorkbenchMessage>(message.clone())
                 else {
                     violation = Some(NanoExecErrorCode::InvalidFrame);
                     break;
@@ -1894,14 +1885,9 @@ impl BwrapNanoRuntime {
                             break;
                         }
                         if artifact_authority.as_ref().is_some_and(|authority| {
-                            validate_terminal_artifacts(
-                                &host_agent_root,
-                                authority,
-                                &bound_message,
-                            )
-                            .is_err()
-                        })
-                        {
+                            validate_terminal_artifacts(&host_agent_root, authority, &bound_message)
+                                .is_err()
+                        }) {
                             violation = Some(NanoExecErrorCode::ProtocolViolation);
                             break;
                         }
@@ -3079,9 +3065,11 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(runtime.processes[&handle.workload_id]
-            .protocol_supervision_snapshot()
-            .terminal_finalized);
+        assert!(
+            runtime.processes[&handle.workload_id]
+                .protocol_supervision_snapshot()
+                .terminal_finalized
+        );
         {
             let exchange = runtime.exchanges.get_mut(&handle.workload_id).unwrap();
             exchange.messages = vec![
@@ -3104,18 +3092,15 @@ mod tests {
             r#"{{"kind":"progress","schema_version":1,"invocation_id":"{second_id}","stage":"completed","elapsed_ms":1}}"#
         );
         runtime
-            .recycle_workbench_runtime_with(
-                &handle.workload_id,
-                |_, mut previous, _, _, _| {
-                    let process = AgentProcess::launch_recording_protocol_fixture(
-                        &[&second_result, &second_completed],
-                        &second_record,
-                        &second_descendant,
-                    )?;
-                    previous.bwrap_pid = Some(process.pid);
-                    Ok((previous, process))
-                },
-            )
+            .recycle_workbench_runtime_with(&handle.workload_id, |_, mut previous, _, _, _| {
+                let process = AgentProcess::launch_recording_protocol_fixture(
+                    &[&second_result, &second_completed],
+                    &second_record,
+                    &second_descendant,
+                )?;
+                previous.bwrap_pid = Some(process.pid);
+                Ok((previous, process))
+            })
             .unwrap();
         runtime
             .exchanges
@@ -3133,7 +3118,10 @@ mod tests {
             )
             .unwrap();
         assert!(replay.output.contains("completed"));
-        assert!(!second_record.exists(), "terminal replay reached the replacement runtime");
+        assert!(
+            !second_record.exists(),
+            "terminal replay reached the replacement runtime"
+        );
 
         let second_start = start_frame(second_id, unix_time_ms() + 10_000);
         let accepted = runtime
@@ -3161,7 +3149,10 @@ mod tests {
             )
             .unwrap();
         assert!(duplicate.output.contains("pending") || duplicate.output.contains("completed"));
-        assert_eq!(wait_for_recorded_lines(&second_record, 1).lines().count(), 1);
+        assert_eq!(
+            wait_for_recorded_lines(&second_record, 1).lines().count(),
+            1
+        );
         runtime
             .workloads
             .get_mut(&handle.workload_id)
@@ -3178,14 +3169,13 @@ mod tests {
                     },
                 )
                 .unwrap();
-            (serde_json::from_str::<serde_json::Value>(&result.output).unwrap()["state"]
-                .as_str()
+            (serde_json::from_str::<serde_json::Value>(&result.output).unwrap()["state"].as_str()
                 == Some("completed"))
-                .then_some(result)
-                .or_else(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    None
-                })
+            .then_some(result)
+            .or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                None
+            })
         });
         assert!(terminal.is_some());
     }
@@ -3291,7 +3281,8 @@ mod tests {
 
         let recorded = wait_for_recorded_lines(&record_path, 1);
         assert_eq!(recorded.lines().count(), 1);
-        let frame: serde_json::Value = serde_json::from_str(recorded.lines().next().unwrap()).unwrap();
+        let frame: serde_json::Value =
+            serde_json::from_str(recorded.lines().next().unwrap()).unwrap();
         assert_eq!(frame["kind"], "recover");
         assert_eq!(frame["input_digest"], input_digest);
     }

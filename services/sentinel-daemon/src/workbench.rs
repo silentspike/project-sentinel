@@ -568,10 +568,7 @@ impl WorkbenchInvocationStore {
             return Err(WorkbenchStoreError::UnsupportedResultVersion.into());
         }
         let next = state_for_outcome(*outcome)?;
-        let safe_error = error
-            .as_ref()
-            .map(sanitize_runtime_error)
-            .transpose()?;
+        let safe_error = error.as_ref().map(sanitize_runtime_error).transpose()?;
         self.transition(invocation_id, input_digest, now_ms, |record| {
             if record.state == next && record.state.is_terminal() {
                 if record.resources.as_ref() != Some(resources)
@@ -676,7 +673,10 @@ impl WorkbenchInvocationStore {
                 }
                 return Err(WorkbenchStoreError::ResultDigestConflict.into());
             }
-            if !record.state.permits(WorkbenchInvocationState::UnknownOutcome) {
+            if !record
+                .state
+                .permits(WorkbenchInvocationState::UnknownOutcome)
+            {
                 return Err(WorkbenchStoreError::InvalidTransition {
                     from: record.state,
                     to: WorkbenchInvocationState::UnknownOutcome,
@@ -951,7 +951,9 @@ fn validate_bound_outputs(
         (None, None) if !artifacts.is_empty() => {
             return Err(WorkbenchStoreError::OutputRejected.into());
         }
-        (Some(_), Some(_)) if matches!(outcome, WorkbenchOutcome::Succeeded) && artifacts.len() != 1 => {
+        (Some(_), Some(_))
+            if matches!(outcome, WorkbenchOutcome::Succeeded) && artifacts.len() != 1 =>
+        {
             return Err(WorkbenchStoreError::OutputRejected.into());
         }
         (None, None) | (Some(_), Some(_)) => {}
@@ -1038,19 +1040,19 @@ fn validate_concrete_artifact_manifest(
         .get(&record.agent_id)
         .ok_or(WorkbenchStoreError::OutputRejected)?;
     let scoped_root = root.join(&record.project_id).join(&record.work_item_id);
-    let scoped_root = fs::canonicalize(&scoped_root)
-        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let scoped_root =
+        fs::canonicalize(&scoped_root).map_err(|_| WorkbenchStoreError::OutputRejected)?;
     let manifest_path = scoped_root.join(&artifact.manifest_path);
-    let metadata = fs::symlink_metadata(&manifest_path)
-        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let metadata =
+        fs::symlink_metadata(&manifest_path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() > MAX_ARTIFACT_MANIFEST_BYTES
     {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
-    let manifest_path = fs::canonicalize(&manifest_path)
-        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let manifest_path =
+        fs::canonicalize(&manifest_path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
     if !manifest_path.starts_with(&scoped_root) {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
@@ -1099,8 +1101,8 @@ fn validate_concrete_artifact_manifest(
             .checked_add(entry.size_bytes)
             .ok_or(WorkbenchStoreError::OutputRejected)?;
         let blob = scoped_root.join("blobs").join(&entry.sha256);
-        let metadata = fs::symlink_metadata(&blob)
-            .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        let metadata =
+            fs::symlink_metadata(&blob).map_err(|_| WorkbenchStoreError::OutputRejected)?;
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
             || metadata.len() != entry.size_bytes
@@ -1328,9 +1330,8 @@ pub(crate) fn install_workbench_service(
     if service.is_some() {
         bail!("workbench service is already installed");
     }
-    let (profile, profile_digest) = WorkbenchProfile::load(
-        config_dir.join("workbench-profiles/web-authoring-v1.toml"),
-    )?;
+    let (profile, profile_digest) =
+        WorkbenchProfile::load(config_dir.join("workbench-profiles/web-authoring-v1.toml"))?;
     let store = WorkbenchInvocationStore::open_with_artifact_roots(
         data_dir.join("workbench.redb"),
         artifact_roots,
@@ -1589,27 +1590,24 @@ impl<'a> WorkbenchCoordinator<'a> {
         let current_authority = authority.current_for_record(&current)?;
         authorize_workbench_record(&current, &current_authority)?;
         let expected_workload_id = format!("AGENT-{:02}", agent_id.0);
-        let envelope = match WorkbenchRuntimeEnvelope::decode(
-            invocation_id,
-            &expected_workload_id,
-            &result,
-        ) {
-            Ok(envelope) => envelope,
-            Err(_) => {
-                let unresolved = self.store.mark_unknown_outcome(
-                    invocation_id,
-                    request_digest,
-                    now_ms,
-                    safe_recovery_failure("runtime_response_rejected"),
-                )?;
-                records.push(unresolved);
-                return Ok(WorkbenchCoordinatorUpdate {
-                    records,
-                    runtime_state: Some("completed".to_string()),
-                    replayed,
-                });
-            }
-        };
+        let envelope =
+            match WorkbenchRuntimeEnvelope::decode(invocation_id, &expected_workload_id, &result) {
+                Ok(envelope) => envelope,
+                Err(_) => {
+                    let unresolved = self.store.mark_unknown_outcome(
+                        invocation_id,
+                        request_digest,
+                        now_ms,
+                        safe_recovery_failure("runtime_response_rejected"),
+                    )?;
+                    records.push(unresolved);
+                    return Ok(WorkbenchCoordinatorUpdate {
+                        records,
+                        runtime_state: Some("completed".to_string()),
+                        replayed,
+                    });
+                }
+            };
         let runtime_state = Some(envelope.state.clone());
         if let Some(terminal) = self.store.accept_runtime_envelope(&envelope, now_ms)? {
             records.push(terminal);
@@ -2289,12 +2287,8 @@ mod tests {
             &wrong_workload,
         )
         .is_err());
-        let envelope = WorkbenchRuntimeEnvelope::decode(
-            &request.invocation_id,
-            "AGENT-07",
-            &wire,
-        )
-        .unwrap();
+        let envelope =
+            WorkbenchRuntimeEnvelope::decode(&request.invocation_id, "AGENT-07", &wire).unwrap();
         assert!(store
             .accept_runtime_envelope(&envelope, 1_900_000_000_012)
             .unwrap()

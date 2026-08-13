@@ -701,7 +701,10 @@ mod tests {
                     && args[2] == "/workspace/.inputs"
             })
             .unwrap();
-        assert!(workspace < inputs, "read-only input overlay must be mounted last");
+        assert!(
+            workspace < inputs,
+            "read-only input overlay must be mounted last"
+        );
     }
 
     #[test]
