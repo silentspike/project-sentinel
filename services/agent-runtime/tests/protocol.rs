@@ -212,7 +212,10 @@ fn jsonl_process_handles_health_rejection_and_execution() {
 fn cancel_waits_for_the_receipted_result_instead_of_acknowledging_early() {
     let directory = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-runtime"))
-        .env("SENTINEL_WORKSPACE_ROOT", directory.path().join("workspace"))
+        .env(
+            "SENTINEL_WORKSPACE_ROOT",
+            directory.path().join("workspace"),
+        )
         .env("SENTINEL_ARTIFACT_ROOT", directory.path().join("artifacts"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -281,7 +284,10 @@ fn cancel_waits_for_the_receipted_result_instead_of_acknowledging_early() {
 fn adapter_deadline_cancel_is_receipted_as_timed_out() {
     let directory = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-runtime"))
-        .env("SENTINEL_WORKSPACE_ROOT", directory.path().join("workspace"))
+        .env(
+            "SENTINEL_WORKSPACE_ROOT",
+            directory.path().join("workspace"),
+        )
         .env("SENTINEL_ARTIFACT_ROOT", directory.path().join("artifacts"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -356,7 +362,10 @@ fn receipt_failure_is_one_terminal_error_without_completed_after_it() {
     let artifact_file = directory.path().join("artifact-root-is-a-file");
     std::fs::write(&artifact_file, "not a directory").unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-runtime"))
-        .env("SENTINEL_WORKSPACE_ROOT", directory.path().join("workspace"))
+        .env(
+            "SENTINEL_WORKSPACE_ROOT",
+            directory.path().join("workspace"),
+        )
         .env("SENTINEL_ARTIFACT_ROOT", &artifact_file)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -1057,12 +1057,14 @@ fn resolve_existing_beneath(
 
 fn reject_input_mutation(request: &WorkbenchRequest, relative: &str) -> Result<(), ExecutionError> {
     let path = checked_relative(relative)?;
-    if path.components().next().is_some_and(|component| {
-        component.as_os_str() == std::ffi::OsStr::new(".inputs")
-    }) || request
-        .inputs
-        .iter()
-        .any(|input| input.mount_path == relative)
+    if path
+        .components()
+        .next()
+        .is_some_and(|component| component.as_os_str() == std::ffi::OsStr::new(".inputs"))
+        || request
+            .inputs
+            .iter()
+            .any(|input| input.mount_path == relative)
     {
         return Err(ExecutionError::workspace(
             "input_mount_read_only",
@@ -1171,10 +1173,7 @@ impl ProcessGroupUsage {
 
 fn sample_process_group(process_group: u32) -> ProcessGroupUsage {
     let clock_ticks = sysconf(SysconfVar::CLK_TCK).ok().flatten().unwrap_or(0);
-    let page_size = sysconf(SysconfVar::PAGE_SIZE)
-        .ok()
-        .flatten()
-        .unwrap_or(0);
+    let page_size = sysconf(SysconfVar::PAGE_SIZE).ok().flatten().unwrap_or(0);
     if clock_ticks <= 0 || page_size <= 0 {
         return ProcessGroupUsage::default();
     }
@@ -2121,10 +2120,7 @@ mod tests {
         }];
         excessive_output.resource_limits.stdout_bytes = 2;
         excessive_output.input_digest = excessive_output.canonical_digest().unwrap();
-        let excessive_output = executor.execute(
-            excessive_output,
-            Arc::new(AtomicBool::new(false)),
-        );
+        let excessive_output = executor.execute(excessive_output, Arc::new(AtomicBool::new(false)));
         let WorkbenchMessage::Result { outcome, error, .. } = excessive_output else {
             panic!("command execution must return a result")
         };
@@ -2221,11 +2217,7 @@ mod tests {
         fs::create_dir_all(&foreign).unwrap();
         fs::write(assigned.join("brief.md"), "assigned").unwrap();
         fs::write(foreign.join("brief.md"), "foreign").unwrap();
-        fs::set_permissions(
-            assigned.join("brief.md"),
-            fs::Permissions::from_mode(0o444),
-        )
-        .unwrap();
+        fs::set_permissions(assigned.join("brief.md"), fs::Permissions::from_mode(0o444)).unwrap();
         let executor = WorkbenchExecutor::with_input_root(&workspace, &artifacts, &inputs);
         let digest = hex_sha256(b"assigned");
         let mut replace_parent = request(
@@ -2247,7 +2239,10 @@ mod tests {
             outcome(&executor.execute(replace_parent, Arc::new(AtomicBool::new(false)))),
             WorkbenchOutcome::Failed
         );
-        assert_eq!(fs::read_to_string(assigned.join("brief.md")).unwrap(), "assigned");
+        assert_eq!(
+            fs::read_to_string(assigned.join("brief.md")).unwrap(),
+            "assigned"
+        );
 
         let mut foreign_command = request(
             WorkbenchTool::RunCommand {

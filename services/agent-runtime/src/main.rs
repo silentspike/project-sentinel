@@ -361,10 +361,7 @@ fn cancel_all_and_wait(active: &ActiveInvocations) {
     eprintln!("agent-runtime: shutdown grace expired with active work");
 }
 
-fn apply_outer_deadline_outcome(
-    message: &mut WorkbenchMessage,
-    deadline_cancelled: &AtomicBool,
-) {
+fn apply_outer_deadline_outcome(message: &mut WorkbenchMessage, deadline_cancelled: &AtomicBool) {
     if !deadline_cancelled.load(Ordering::Acquire) {
         return;
     }

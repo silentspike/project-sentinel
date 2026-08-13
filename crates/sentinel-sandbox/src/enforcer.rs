@@ -1374,11 +1374,8 @@ impl SandboxEnforcer {
         if !self.bwrap_available {
             anyhow::bail!("bwrap not available — cannot start workbench process");
         }
-        let host_agent_root = workbench_host_agent_root(
-            self.fs_mount.as_deref(),
-            name,
-            fs_host_agent_dir,
-        );
+        let host_agent_root =
+            workbench_host_agent_root(self.fs_mount.as_deref(), name, fs_host_agent_dir);
         prepare_workbench_roots(&host_agent_root)?;
         let config = BwrapConfig::for_agent(name)
             .for_workbench()
@@ -1392,7 +1389,6 @@ impl SandboxEnforcer {
         mut config: BwrapConfig,
         command: &[String],
     ) -> Result<AgentProcess> {
-
         // #75: full cage is unconditional — BwrapConfig::for_agent already sets
         // share_net=false (no --share-net). The daemon verifies isolation
         // post-spawn on the sandboxed child PID.
@@ -1804,8 +1800,12 @@ fn prepare_workbench_roots(host_agent_root: &Path) -> Result<()> {
         }
         Err(error) => return Err(error).context("inspect workbench agent root"),
     }
-    let canonical_root = std::fs::canonicalize(host_agent_root)
-        .with_context(|| format!("canonicalize workbench agent root {}", host_agent_root.display()))?;
+    let canonical_root = std::fs::canonicalize(host_agent_root).with_context(|| {
+        format!(
+            "canonicalize workbench agent root {}",
+            host_agent_root.display()
+        )
+    })?;
     anyhow::ensure!(
         canonical_root.starts_with(&parent),
         "workbench agent root escaped its configured host boundary"
