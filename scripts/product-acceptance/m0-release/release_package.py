@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify the deterministic single-node M0 release package."""
+"""Build and verify the owner- and mode-sensitive single-node M0 release package."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import errno
 import fcntl
 import hashlib
 import hmac
-import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -18,6 +17,7 @@ import re
 import stat
 import subprocess
 import sys
+import types
 from typing import Any, Callable, Mapping
 
 
@@ -35,6 +35,14 @@ FORBIDDEN_SOURCE_PARTS = frozenset(
     {"credential", "credentials", "data", "database", "databases", "secret", "secrets", "state"}
 )
 FORBIDDEN_SOURCE_SUFFIXES = (".db", ".env", ".key", ".pem", ".redb", ".sqlite", ".sqlite3")
+GIT_BINARY = Path("/usr/bin/git")
+INVENTORY_RELATIVE = "scripts/product-acceptance/run_m0_preflight.py"
+TOOL_INVENTORY_PATH = Path(__file__).resolve().parent.parent / "run_m0_preflight.py"
+TRANSPORT_NOTICE = (
+    "The package is an owner- and mode-sensitive directory tree, not a generic copy-ready archive. "
+    "Any transport must preserve ownership, modes, regular-file identities, and hardlink counts. "
+    "After transport, run verify as the executing owner before provisioning."
+)
 
 
 class PackageError(Exception):
@@ -76,21 +84,82 @@ def safe_parts(value: str, *, absolute: bool) -> tuple[str, ...]:
     return tuple(parts)
 
 
-def load_inventory() -> dict[str, tuple[str, str]]:
-    authority_path = Path(__file__).resolve().parent.parent / "run_m0_preflight.py"
-    spec = importlib.util.spec_from_file_location("m0_release_inventory_authority", authority_path)
-    if spec is None or spec.loader is None:
-        fail("inventory_unavailable")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
+def read_bounded_fd(fd: int, maximum: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = os.read(fd, min(1024 * 1024, maximum + 1 - size))
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > maximum:
+            fail("inventory_authority_oversized")
+        chunks.append(chunk)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return b"".join(chunks)
+
+
+def inventory_from_bytes(raw: bytes) -> dict[str, tuple[str, str]]:
+    digest = hashlib.sha256(raw).hexdigest()
+    module_name = f"m0_release_inventory_{digest}"
+    module = types.ModuleType(module_name)
+    module.__file__ = f"<pinned-source:{INVENTORY_RELATIVE}>"
+    sys.modules[module_name] = module
     try:
-        spec.loader.exec_module(module)
+        code = compile(raw, module.__file__, "exec", dont_inherit=True)
+        exec(code, module.__dict__)
     except Exception as exc:
         raise PackageError("inventory_unavailable") from exc
-    value = getattr(module, "CANONICAL_RELEASE_ARTIFACTS", None)
+    finally:
+        sys.modules.pop(module_name, None)
+    value = module.__dict__.get("CANONICAL_RELEASE_ARTIFACTS")
     if not isinstance(value, dict):
         fail("inventory_invalid")
     return validate_inventory(value)
+
+
+def read_inventory_authority(fd: int, info: os.stat_result) -> bytes:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o022
+        or info.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+    ):
+        fail("inventory_authority_invalid")
+    raw = read_bounded_fd(fd, MAX_MANIFEST_BYTES)
+    if len(raw) != info.st_size or stable_stat(os.fstat(fd)) != stable_stat(info):
+        fail("inventory_authority_changed")
+    return raw
+
+
+def load_tool_inventory() -> dict[str, tuple[str, str]]:
+    try:
+        fd, info = open_absolute_file(TOOL_INVENTORY_PATH)
+    except OSError as exc:
+        raise PackageError("inventory_unavailable") from exc
+    try:
+        return inventory_from_bytes(read_inventory_authority(fd, info))
+    finally:
+        os.close(fd)
+
+
+def load_source_inventory(source_root_fd: int) -> dict[str, tuple[str, str]]:
+    try:
+        source_fd, source_info = open_relative_file(source_root_fd, INVENTORY_RELATIVE)
+        tool_fd, tool_info = open_absolute_file(TOOL_INVENTORY_PATH)
+    except OSError as exc:
+        raise PackageError("inventory_unavailable") from exc
+    try:
+        source_raw = read_inventory_authority(source_fd, source_info)
+        tool_raw = read_inventory_authority(tool_fd, tool_info)
+        if not hmac.compare_digest(hashlib.sha256(source_raw).digest(), hashlib.sha256(tool_raw).digest()):
+            fail("inventory_authority_mismatch")
+        return inventory_from_bytes(source_raw)
+    finally:
+        os.close(source_fd)
+        os.close(tool_fd)
 
 
 def validate_inventory(value: Mapping[Any, Any]) -> dict[str, tuple[str, str]]:
@@ -282,11 +351,31 @@ def assert_absolute_directory_identity(
 def git_metadata(source_root_fd: int, expected_git_sha: str) -> str:
     if not SHA1_RE.fullmatch(expected_git_sha):
         fail("git_sha_invalid")
+    try:
+        binary_link = os.lstat(GIT_BINARY)
+        binary = os.stat(GIT_BINARY)
+    except OSError as exc:
+        raise PackageError("git_authority_unavailable") from exc
+    if (
+        not (stat.S_ISLNK(binary_link.st_mode) or stat.S_ISREG(binary_link.st_mode))
+        or binary_link.st_uid != 0
+        or not stat.S_ISREG(binary.st_mode)
+        or binary.st_uid != 0
+        or binary.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX | 0o022)
+    ):
+        fail("git_binary_authority_invalid")
     environment = {
-        "PATH": os.environ.get("PATH", ""),
+        "PATH": "/usr/bin:/bin",
         "HOME": "/nonexistent",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": "false",
+        "GIT_CONFIG_KEY_1": "core.hooksPath",
+        "GIT_CONFIG_VALUE_1": "/dev/null",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
         "LC_ALL": "C",
     }
     descriptor_path = f"/proc/self/fd/{source_root_fd}"
@@ -299,17 +388,27 @@ def git_metadata(source_root_fd: int, expected_git_sha: str) -> str:
         "env": environment,
         "pass_fds": (source_root_fd,),
     }
+    command_prefix = [
+        str(GIT_BINARY),
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-C",
+        descriptor_path,
+    ]
     try:
         head = subprocess.run(
-            ["git", "-C", descriptor_path, "rev-parse", "--verify", "HEAD^{commit}"],
+            [*command_prefix, "rev-parse", "--verify", "HEAD^{commit}"],
             **common,
         )
         dirty = subprocess.run(
-            ["git", "-C", descriptor_path, "status", "--porcelain", "--untracked-files=no"],
+            [*command_prefix, "status", "--porcelain", "--untracked-files=no"],
             **common,
         )
         timestamp = subprocess.run(
-            ["git", "-C", descriptor_path, "show", "-s", "--format=%ct", expected_git_sha],
+            [*command_prefix, "show", "-s", "--format=%ct", expected_git_sha],
             **common,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -629,7 +728,7 @@ def read_fd(fd: int, size: int) -> bytes:
 
 
 def verify_package_fd(root_fd: int, expected_git_sha: str) -> dict[str, Any]:
-    inventory = load_inventory()
+    inventory = load_tool_inventory()
     validate_dir(os.fstat(root_fd), exact_mode=0o500, exact_owner=True)
     files, directory_snapshot = enumerate_tree(root_fd)
     try:
@@ -771,6 +870,7 @@ def build_package(
         if after_git_hook is not None:
             after_git_hook()
         assert_absolute_directory_identity(source_root, source_root_identity, "source_root_changed")
+        inventory = load_source_inventory(source_root_fd)
 
         output_root_fd = open_absolute_dir(output_root, exact_mode=0o700)
         stage_root_fd = open_absolute_dir(stage_root, exact_mode=0o700)
@@ -802,7 +902,6 @@ def build_package(
         else:
             fail("nats_not_separate")
 
-        inventory = load_inventory()
         for destination, (source, kind) in sorted(inventory.items()):
             try:
                 if source == "external/nats-server":
@@ -943,15 +1042,27 @@ def build_package(
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=TRANSPORT_NOTICE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    build = subparsers.add_parser("build")
+    build = subparsers.add_parser(
+        "build",
+        description="Build a local owner- and mode-sensitive package tree.",
+        epilog=TRANSPORT_NOTICE,
+    )
     build.add_argument("--source-root", type=Path, required=True)
     build.add_argument("--nats-server", type=Path, required=True)
     build.add_argument("--output-root", type=Path, required=True)
     build.add_argument("--stage-root", type=Path, required=True)
     build.add_argument("--expected-git-sha", required=True)
-    verify = subparsers.add_parser("verify")
+    verify = subparsers.add_parser(
+        "verify",
+        description="Reverify ownership, modes, identities, inventory, and bytes after transport.",
+        epilog=TRANSPORT_NOTICE,
+    )
     verify.add_argument("--package", type=Path, required=True)
     verify.add_argument("--expected-git-sha", required=True)
     return parser.parse_args(argv)
