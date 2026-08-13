@@ -1041,6 +1041,17 @@ enabled = {enabled}
     }
 
     fn write_credential(path: &Path, value: &[u8], mode: u32) {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                assert!(
+                    metadata.file_type().is_file(),
+                    "test credential reset requires an existing regular file"
+                );
+                fs::remove_file(path).expect("remove existing test credential");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("inspect existing test credential: {error}"),
+        }
         fs::write(path, value).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
