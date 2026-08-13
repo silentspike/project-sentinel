@@ -45,9 +45,9 @@ The daemon library remains startable when productive integration is absent.
 `DeliveryStoreConfigV1` opens the local redb authority only beneath an approved,
 canonical, owner-only data root; `ConfiguredDeliveryCore` receives integration,
 workbench, effect, and publication ports explicitly. Its full readiness and
-public lineage read remain typed unavailable unless every narrow current M0
-port has the exact version, generation, and contract digest. Construction alone
-does not claim productive readiness. The productive composition exposes no raw
+activation probe remain typed unavailable unless every narrow current M0 port
+has the exact version, generation, and contract digest. Construction alone does
+not claim productive readiness. The productive composition exposes no raw
 core accessor or public port-bypass constructor: command-specific configured
 methods check exactly the authorities their operation needs. A local commit may
 queue its durable outbox while the broker is unavailable, but cannot bypass its
@@ -246,6 +246,11 @@ crash-after-publication-before-local-ACK, duplicate ACK, wrong-schema,
 empty-event-ID, wrong-row/wrong-digest receipt, and idempotency collision remain
 recoverable or fail closed.
 
+Because publication is an external effect, each worker pass runs the complete
+store health check before reading or sending a pending row. A decodable outbox
+entry beside a corrupt aggregate, journal, idempotency binding, or cross-record
+reference therefore produces zero publisher calls.
+
 The test fixture's `health()` decodes every table and validates schema, aggregate
 key/revision, contiguous journal history, domain-separated envelope digest,
 journal/outbox linkage, canonical payload bytes, publication receipt, and
@@ -266,7 +271,14 @@ to #732/#733.
 
 The authority snapshot binds agreement, project, work-item digest, current
 candidate generation/digest, participant principals, and snapshot digest.
-Promotion resolves it again so a stale candidate cannot pass on old evidence.
+The core requires the exact schema and current integration authority generation,
+a canonical nonempty and unique participant inventory, and exact participant
+role/generation bindings for candidate registration, QA assignment, promotion,
+delivery issuer, and delivery recipient. It resolves the snapshot again at the
+effect/adoption boundaries so a stale candidate or revoked participant cannot
+pass on old evidence. An arbitrary caller-supplied customer ID is not a delivery
+authority: the selected customer must be a current workflow participant and
+pass a fresh authority read before the receipt is committed.
 
 The separate lineage query binds tenant, exact project and candidate
 generation/digest, authority generation, authority identity, and its own sealed
@@ -357,12 +369,20 @@ readiness and the #710 effect port cannot satisfy #694 workbench readiness;
 swapped, stale, zero-generation, or wrong-version contracts fail before either
 port is invoked.
 
-The public readiness probe is command-specific. Authority-only commands require
+The command readiness probe is command-specific. Authority-only commands require
 the integration contract; `ExecuteQa` additionally requires the exact #694
 workbench saga; and promotion/rollout, rollback, governed rework, and closeout
 memory publication additionally require the exact #710 effect saga. There is no
 general `Ready` response that omits a dependency required by the requested
 command.
+
+`lineage_readiness` is deliberately narrower than full activation readiness. A
+public lineage read requires a healthy local store and the exact current
+integration contract; it then performs fresh caller, candidate, workflow, and
+post-read authority checks before returning the server-redacted DTO. Unavailable
+workbench execution, delivery effects, or event publication cannot hide already
+committed history. Unavailable/stale integration, corrupt local state, revoked
+authority, or malformed workflow lineage still fails closed.
 
 ## 8. External-effect sagas
 
@@ -372,6 +392,10 @@ stable operation ID, tenant, project, candidate, subject, optional target,
 actor, operation kind, and request digest. Rollback binds both exact source and
 target release references and their digests. The short-lived authority receipt
 is carried for authorization/audit but excluded from the stable request digest.
+Sealing rejects noncanonical tenant, principal, candidate, subject, or target
+references and enforces the closed operation shape: release-manager rollout and
+memory publication have no target, release-manager rollback has one distinct
+target, and governed rework has a customer actor and no target.
 The same stable authority-identity digest used by the workbench contract is
 included in the request digest and repeated exactly by the receipt. The trusted
 receipt returns an opaque effect reference and exact operation, source, target,
@@ -499,17 +523,17 @@ rollback, closeout, unpublished outbox row, or recovery frontier.
 | Criterion | Dependency-independent status |
 | --- | --- |
 | AC-1 schemas and legal transitions | Implemented and testable |
-| AC-2 independent authority | Implemented; live probes deferred |
+| AC-2 independent authority | Exact authenticated workflow participants are rechecked for candidate, QA, release, and customer delivery boundaries; live probes deferred |
 | AC-3 productive #694 suite | Port and fake only; productive execution deferred |
 | AC-4 missing/stale/different gate | Core negative tests cover missing approval, unresolved findings, expiry, plan-digest substitution and incomplete evidence; broader runner matrix deferred |
 | AC-5 immutable manifest | Core rejects ID reuse and binds exact gate/candidate/authority; canonical #732 append deferred |
-| AC-6 customer flow | Core records/transitions implemented; authenticated API/browser and productive delivery effect deferred |
+| AC-6 customer flow | Core records/transitions and current workflow-recipient authority checks implemented; authenticated API/browser and productive delivery effect deferred |
 | AC-7 rework history | Governed-rework request/receipt saga implemented with fake; productive #695 effect deferred |
 | AC-8 rollback | Exact source+target receipt, stable operation, revision-conflict reconciliation and restart-safe local adoption tested with a durable fake; productive #710 rollout/rollback effect deferred |
-| AC-9 Console lineage | Authenticated App navigation, strict fetch/parser and unavailable-safe public DTO surface implemented; server handler, productive adapters and live criterion OPEN |
+| AC-9 Console lineage | Authenticated App navigation, strict fetch/parser, graph-integrity validation and unavailable-safe public DTO surface implemented; server handler, productive adapters and live criterion OPEN |
 | AC-10 memory closeout | Receipt-gated saga and restart readback tested with fake; productive memory path deferred |
 | AC-11 Gaia oversight | No bypass surface added; productive observation deferred |
-| AC-12 restart/idempotency | Configured local store, QA outcome reconciliation, replay-idempotent publisher receipt, outbox, effect revision-conflict retry, rollback and closeout boundaries covered; productive adapter crash matrix deferred |
+| AC-12 restart/idempotency | Configured local store, QA outcome reconciliation, pre-I/O store validation, replay-idempotent publisher receipt, outbox, effect revision-conflict retry, rollback and closeout boundaries covered; productive adapter crash matrix deferred |
 | AC-13 `.240` journey | Not authorized in this phase |
 | AC-14 canonical QA schemas | Plan, dataset, run, case, deterministic, flake and gate core are versioned and strictly validated; PARTIAL because model/calibration authority and the productive import lane remain #749/dependency deferred |
 | AC-15 deterministic/probabilistic split | Deterministic bindings are implemented; populated model/grader evidence is typed unavailable and model/calibration activation remains #749-deferred |

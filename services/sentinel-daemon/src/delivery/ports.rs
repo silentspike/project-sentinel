@@ -267,9 +267,21 @@ impl WorkbenchEvidenceRequestV1 {
     }
 
     pub fn seal(mut self) -> Result<Self, DeliveryError> {
-        if self.authority_identity_digest == ContentDigest::zero() {
+        if self.schema_version != DELIVERY_SCHEMA_V1
+            || !valid_wire_id(&self.tenant_id)
+            || !valid_versioned_ref(&self.project)
+            || !valid_versioned_ref(&self.candidate)
+            || !valid_versioned_ref(&self.qa_plan)
+            || !valid_versioned_ref(&self.qa_run)
+            || !valid_principal(&self.assigned_qa)
+            || self.assigned_qa.tenant_id != self.tenant_id
+            || !self.assigned_qa.has_role(AuthorityRole::Qa)
+            || self.authority_receipt_digest == ContentDigest::zero()
+            || self.authority_identity_digest == ContentDigest::zero()
+            || !valid_versioned_ref(&self.invocation)
+        {
             return Err(DeliveryError::Validation(
-                "workbench authority identity is missing".to_string(),
+                "workbench request identity or authority binding is invalid".to_string(),
             ));
         }
         self.request_digest = self.computed_digest()?;
@@ -470,17 +482,44 @@ impl DeliveryEffectRequestV1 {
     }
 
     pub fn seal(mut self) -> Result<Self, DeliveryError> {
+        let legal_effect_shape = match self.kind {
+            DeliveryEffectKind::Rollout | DeliveryEffectKind::MemoryPublication => {
+                self.candidate.is_some()
+                    && self.target.is_none()
+                    && self.actor.has_role(AuthorityRole::ReleaseManager)
+            }
+            DeliveryEffectKind::Rollback => {
+                self.candidate.is_some()
+                    && self
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target != &self.subject)
+                    && self.actor.has_role(AuthorityRole::ReleaseManager)
+            }
+            DeliveryEffectKind::GovernedRework => {
+                self.candidate.is_some()
+                    && self.target.is_none()
+                    && self.actor.has_role(AuthorityRole::Customer)
+            }
+        };
         if self.schema_version != DELIVERY_SCHEMA_V1
             || !valid_wire_id(&self.operation_id)
-            || self.project.generation == 0
-            || self.project.digest == ContentDigest::zero()
-            || self.subject.generation == 0
-            || self.subject.digest == ContentDigest::zero()
+            || !valid_wire_id(&self.tenant_id)
+            || !valid_versioned_ref(&self.project)
+            || self
+                .candidate
+                .as_ref()
+                .is_some_and(|value| !valid_versioned_ref(value))
+            || !valid_versioned_ref(&self.subject)
+            || !valid_principal(&self.actor)
+            || self.actor.tenant_id != self.tenant_id
+            || self.actor_authority_receipt_digest == ContentDigest::zero()
             || self.actor_authority_identity_digest == ContentDigest::zero()
             || self
                 .target
                 .as_ref()
-                .is_some_and(|value| value.generation == 0 || value.digest == ContentDigest::zero())
+                .is_some_and(|value| !valid_versioned_ref(value))
+            || !legal_effect_shape
         {
             return Err(DeliveryError::Validation(
                 "delivery effect request identity or binding is invalid".to_string(),
@@ -644,4 +683,17 @@ fn valid_wire_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn valid_versioned_ref(value: &VersionedRefV1) -> bool {
+    valid_wire_id(&value.id)
+        && value.generation > 0
+        && value.digest != ContentDigest::zero()
+}
+
+fn valid_principal(value: &PrincipalV1) -> bool {
+    valid_wire_id(&value.tenant_id)
+        && valid_wire_id(&value.principal_id)
+        && value.authority_generation > 0
+        && !value.roles.is_empty()
 }

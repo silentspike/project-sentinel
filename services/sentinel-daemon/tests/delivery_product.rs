@@ -209,6 +209,7 @@ enum WorkflowFault {
     Cycle,
     DuplicateRoot,
     IllegalState,
+    StaleIntegration,
 }
 
 impl DeliveryIntegrationPort for DeterministicIntegration {
@@ -216,7 +217,11 @@ impl DeliveryIntegrationPort for DeterministicIntegration {
         AdapterReadiness::Ready {
             contract_version: DELIVERY_SCHEMA_V1,
             authority_generation: 11,
-            contract_digest: expected_integration_contract_digest(),
+            contract_digest: if matches!(self.workflow_fault, WorkflowFault::StaleIntegration) {
+                digest("stale-integration-contract")
+            } else {
+                expected_integration_contract_digest()
+            },
         }
     }
 
@@ -315,6 +320,7 @@ impl DeliveryIntegrationPort for DeterministicIntegration {
         };
         match self.workflow_fault {
             WorkflowFault::None
+            | WorkflowFault::StaleIntegration
             | WorkflowFault::GenerationMismatch
             | WorkflowFault::AuthorityRevoked
             | WorkflowFault::CandidateSwap => {}
@@ -506,6 +512,21 @@ fn configured_core_starts_with_typed_unavailable_ports_and_no_fake_readiness() {
             ..
         })
     ));
+    assert!(matches!(
+        product.read_public_lineage(
+            &CommandContextV1 {
+                principal: principal("auditor-private", AuthorityRole::Auditor),
+                idempotency_key: "read-with-integration-down".to_string(),
+                now_ms: 10,
+            },
+            "tenant-a",
+            "project-private-1",
+        ),
+        Err(DeliveryError::AdapterUnavailable {
+            dependency: "delivery_integration",
+            ..
+        })
+    ));
     let rejected = product.register_candidate(
         &CommandContextV1 {
             principal: principal("developer-private", AuthorityRole::Developer),
@@ -527,11 +548,99 @@ fn configured_core_starts_with_typed_unavailable_ports_and_no_fake_readiness() {
     assert!(!service_source.contains("pub fn with_ports("));
     drop(product);
 
+    let stale_integration_temp = TempDir::new().expect("stale integration tempdir");
+    let stale_integration = ConfiguredDeliveryCore::open(
+        &config(&stale_integration_temp),
+        DeterministicIntegration {
+            principals: vec![],
+            execution_ready: true,
+            workflow_fault: WorkflowFault::StaleIntegration,
+            lineage_phase: Arc::default(),
+        },
+        DeterministicEffects,
+        DeterministicPublisher::default(),
+    )
+    .expect("stale integration store opens");
+    assert!(matches!(
+        stale_integration.read_public_lineage(
+            &CommandContextV1 {
+                principal: principal("auditor-private", AuthorityRole::Auditor),
+                idempotency_key: "read-with-stale-integration".to_string(),
+                now_ms: 10,
+            },
+            "tenant-a",
+            "project-private-1",
+        ),
+        Err(DeliveryError::StaleEvidence(_))
+    ));
+    drop(stale_integration);
+
+    fn seed_committed_lineage(temp: &TempDir) -> (PrincipalV1, PrincipalV1) {
+        let developer = principal("developer-private", AuthorityRole::Developer);
+        let auditor = principal("auditor-private", AuthorityRole::Auditor);
+        let seeded = ConfiguredDeliveryCore::open(
+            &config(temp),
+            DeterministicIntegration {
+                principals: vec![developer.clone(), auditor.clone()],
+                execution_ready: true,
+                workflow_fault: WorkflowFault::None,
+                lineage_phase: Arc::default(),
+            },
+            DeterministicEffects,
+            DeterministicPublisher::default(),
+        )
+        .expect("seeded store opens");
+        seeded
+            .register_candidate(
+                &CommandContextV1 {
+                    principal: developer.clone(),
+                    idempotency_key: "seed-lineage".to_string(),
+                    now_ms: 100,
+                },
+                candidate(),
+            )
+            .expect("committed lineage seed");
+        drop(seeded);
+        (developer, auditor)
+    }
+
+    fn assert_lineage_readable<I, E, P>(
+        product: &ConfiguredDeliveryCore<I, E, P>,
+        auditor: PrincipalV1,
+        key: &str,
+    ) where
+        I: DeliveryIntegrationPort,
+        E: DeliveryEffectPort,
+        P: DeliveryPublicationPort,
+    {
+        product
+            .lineage_readiness()
+            .expect("lineage-specific readiness");
+        let lineage = product
+            .read_public_lineage(
+                &CommandContextV1 {
+                    principal: auditor,
+                    idempotency_key: key.to_string(),
+                    now_ms: 101,
+                },
+                "tenant-a",
+                "project-private-1",
+            )
+            .expect("unrelated adapter outage must not hide committed lineage");
+        assert!(lineage.adapter_ready);
+        assert!(lineage
+            .nodes
+            .iter()
+            .any(|node| node.stage == DeliveryLineageStageV1::Candidate));
+    }
+
     let publication_temp = TempDir::new().expect("publication tempdir");
+    let (publication_developer, publication_auditor) =
+        seed_committed_lineage(&publication_temp);
     let publication_gated = ConfiguredDeliveryCore::open(
         &config(&publication_temp),
         DeterministicIntegration {
-            principals: vec![],
+            principals: vec![publication_developer, publication_auditor.clone()],
             execution_ready: true,
             workflow_fault: WorkflowFault::None,
             lineage_phase: Arc::default(),
@@ -547,12 +656,19 @@ fn configured_core_starts_with_typed_unavailable_ports_and_no_fake_readiness() {
             ..
         })
     ));
+    assert_lineage_readable(
+        &publication_gated,
+        publication_auditor,
+        "read-with-publication-down",
+    );
+    drop(publication_gated);
 
     let execution_temp = TempDir::new().expect("execution tempdir");
+    let (execution_developer, execution_auditor) = seed_committed_lineage(&execution_temp);
     let execution_gated = ConfiguredDeliveryCore::open(
         &config(&execution_temp),
         DeterministicIntegration {
-            principals: vec![],
+            principals: vec![execution_developer, execution_auditor.clone()],
             execution_ready: false,
             workflow_fault: WorkflowFault::None,
             lineage_phase: Arc::default(),
@@ -562,26 +678,25 @@ fn configured_core_starts_with_typed_unavailable_ports_and_no_fake_readiness() {
     )
     .expect("integration store opens");
     assert!(matches!(
-        execution_gated.read_public_lineage(
-            &CommandContextV1 {
-                principal: principal("auditor", AuthorityRole::Auditor),
-                idempotency_key: "read".to_string(),
-                now_ms: 10,
-            },
-            "tenant-a",
-            "project-1",
-        ),
+        execution_gated.readiness(),
         Err(DeliveryError::AdapterUnavailable {
             dependency: "workbench_execution_saga",
             ..
         })
     ));
+    assert_lineage_readable(
+        &execution_gated,
+        execution_auditor,
+        "read-with-execution-down",
+    );
+    drop(execution_gated);
 
     let effects_temp = TempDir::new().expect("effects tempdir");
+    let (effects_developer, effects_auditor) = seed_committed_lineage(&effects_temp);
     let effects_gated = ConfiguredDeliveryCore::open(
         &config(&effects_temp),
         DeterministicIntegration {
-            principals: vec![],
+            principals: vec![effects_developer, effects_auditor.clone()],
             execution_ready: true,
             workflow_fault: WorkflowFault::None,
             lineage_phase: Arc::default(),
@@ -591,36 +706,17 @@ fn configured_core_starts_with_typed_unavailable_ports_and_no_fake_readiness() {
     )
     .expect("integration store opens");
     assert!(matches!(
-        effects_gated.read_public_lineage(
-            &CommandContextV1 {
-                principal: principal("auditor", AuthorityRole::Auditor),
-                idempotency_key: "read".to_string(),
-                now_ms: 10,
-            },
-            "tenant-a",
-            "project-1",
-        ),
+        effects_gated.readiness(),
         Err(DeliveryError::AdapterUnavailable {
             dependency: "delivery_effect_saga",
             ..
         })
     ));
-
-    assert!(matches!(
-        publication_gated.read_public_lineage(
-            &CommandContextV1 {
-                principal: principal("auditor", AuthorityRole::Auditor),
-                idempotency_key: "read".to_string(),
-                now_ms: 10,
-            },
-            "tenant-a",
-            "project-1",
-        ),
-        Err(DeliveryError::AdapterUnavailable {
-            dependency: "delivery_publication",
-            ..
-        })
-    ));
+    assert_lineage_readable(
+        &effects_gated,
+        effects_auditor,
+        "read-with-effects-down",
+    );
 }
 
 #[cfg(unix)]
@@ -1149,6 +1245,69 @@ fn publisher_replay_after_crash_before_local_receipt_has_one_effective_event() {
         Some(&first_receipt),
     );
     assert_eq!(restarted.pending_publication_count().expect("published outbox"), 0);
+}
+
+#[test]
+fn publication_fails_before_external_io_when_local_authority_is_corrupt() {
+    let temp = TempDir::new().expect("tempdir");
+    let developer = principal("developer-private", AuthorityRole::Developer);
+    let integration = DeterministicIntegration {
+        principals: vec![developer.clone()],
+        execution_ready: true,
+        workflow_fault: WorkflowFault::None,
+        lineage_phase: Arc::default(),
+    };
+    let publisher = DeterministicPublisher::default();
+    let product = ConfiguredDeliveryCore::open(
+        &config(&temp),
+        integration.clone(),
+        DeterministicEffects,
+        publisher.clone(),
+    )
+    .expect("configured product");
+    product
+        .register_candidate(
+            &CommandContextV1 {
+                principal: developer,
+                idempotency_key: "register-before-publication-tamper".to_string(),
+                now_ms: 100,
+            },
+            candidate(),
+        )
+        .expect("candidate commit");
+    drop(product);
+
+    let store = DeliveryStore::open(&config(&temp)).expect("open store for fault injection");
+    let mut aggregate = store
+        .load("tenant-a", "project-private-1")
+        .expect("load aggregate")
+        .expect("aggregate");
+    aggregate
+        .candidates
+        .get_mut("candidate-private-1")
+        .expect("candidate")
+        .source_digest = digest("tampered-before-publication");
+    store
+        .replace_aggregate_test_only(&aggregate)
+        .expect("inject corrupt aggregate");
+    drop(store);
+
+    let restarted = ConfiguredDeliveryCore::open(
+        &config(&temp),
+        integration,
+        DeterministicEffects,
+        publisher.clone(),
+    )
+    .expect("reopen without adopting corrupt authority");
+    assert!(matches!(
+        restarted.publish_pending(),
+        Err(DeliveryError::CorruptStore(_))
+    ));
+    assert_eq!(
+        publisher.counts(),
+        (0, 0),
+        "corrupt local authority must fail before publisher I/O"
+    );
 }
 
 #[test]

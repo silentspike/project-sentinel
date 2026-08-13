@@ -76,6 +76,20 @@ describe("delivery lineage model", () => {
     expect(validateLineage(value)).toContain("dangling edge: release-1->missing");
   });
 
+  it("rejects duplicate, cyclic and disconnected public lineage graphs", () => {
+    const duplicate = snapshot();
+    duplicate.edges.push({ ...duplicate.edges[0] });
+    expect(validateLineage(duplicate)).toContain("duplicate edge: candidate-1->qa-1");
+
+    const cyclic = snapshot();
+    cyclic.edges.push({ from: "release-1", to: "candidate-1" });
+    expect(validateLineage(cyclic)).toContain("cyclic lineage graph");
+
+    const disconnected = snapshot();
+    disconnected.edges.pop();
+    expect(validateLineage(disconnected)).toContain("disconnected lineage graph");
+  });
+
   it("rejects unknown fields before raw authority data reaches the view", () => {
     const value = { ...snapshot(), tenantId: "tenant-private" };
     expect(() => parsePublicDeliveryLineageDto(value)).toThrow("missing or unknown fields");
