@@ -100,11 +100,10 @@ impl GaiaOperatorBroker {
             .as_ref()
             .map(PathBuf::from)
             .ok_or_else(|| anyhow::anyhow!("Gaia credential isolation is unavailable"))?;
-        let expected_executable = ExecutableIdentity::from_metadata(
-            &fs::metadata(&config.sentinel_ctl_bin).map_err(|error| {
-                anyhow::anyhow!("trusted sentinel-ctl executable is unavailable: {error}")
-            })?,
-        );
+        let expected_executable =
+            ExecutableIdentity::from_metadata(&fs::metadata(&config.sentinel_ctl_bin).map_err(
+                |error| anyhow::anyhow!("trusted sentinel-ctl executable is unavailable: {error}"),
+            )?);
         let broker_dir = config.console_dir.join("operator-brokers");
         ensure_private_dir(&broker_dir)?;
         let session_id = format!("gaia-broker-{}", uuid::Uuid::new_v4().simple());
@@ -318,8 +317,9 @@ async fn process_broker_request(
         }
         response_body.extend_from_slice(&chunk);
     }
-    let body = serde_json::from_slice(&response_body)
-        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&response_body).into_owned()));
+    let body = serde_json::from_slice(&response_body).unwrap_or_else(|_| {
+        serde_json::Value::String(String::from_utf8_lossy(&response_body).into_owned())
+    });
     if (200..300).contains(&status) {
         Ok(json!({"status": status, "body": body}))
     } else {
@@ -757,9 +757,11 @@ mod tests {
             ExecutableIdentity::from_metadata(&fs::metadata("/proc/self/exe").unwrap());
         let current_group = process_group_for_pid(std::process::id()).unwrap();
         assert!(current_group > 0);
-        assert!(verify_broker_peer_authority(executable, current_group, executable, 0)
-            .unwrap_err()
-            .contains("unbound"));
+        assert!(
+            verify_broker_peer_authority(executable, current_group, executable, 0)
+                .unwrap_err()
+                .contains("unbound")
+        );
         assert!(verify_broker_peer_authority(
             executable,
             current_group,
@@ -768,13 +770,10 @@ mod tests {
         )
         .unwrap_err()
         .contains("outside"));
-        assert!(verify_broker_peer_authority(
-            executable,
-            current_group,
-            executable,
-            current_group,
-        )
-        .is_ok());
+        assert!(
+            verify_broker_peer_authority(executable, current_group, executable, current_group,)
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -816,7 +815,9 @@ mod tests {
 
         let replay = tokio::sync::Mutex::new(HashSet::new());
         assert!(claim_broker_operation(&replay, "operation-1").await.is_ok());
-        assert!(claim_broker_operation(&replay, "operation-1").await.is_err());
+        assert!(claim_broker_operation(&replay, "operation-1")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -908,9 +909,7 @@ mod tests {
                 assert!(request.len() <= 4096);
             }
             let request = String::from_utf8_lossy(&request);
-            assert!(request.contains(
-                "x-sentinel-operator-key: 0123456789abcdef0123456789abcdef"
-            ));
+            assert!(request.contains("x-sentinel-operator-key: 0123456789abcdef0123456789abcdef"));
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",

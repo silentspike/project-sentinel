@@ -118,7 +118,9 @@ fn operator_credential_path() -> Result<PathBuf, String> {
             .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
         || path != directory.join(OPERATOR_CREDENTIAL_NAME)
     {
-        return Err("operator credential path must be the canonical systemd credential leaf".into());
+        return Err(
+            "operator credential path must be the canonical systemd credential leaf".into(),
+        );
     }
     Ok(path)
 }
@@ -136,9 +138,8 @@ fn validate_credential_metadata(
 ) -> Result<CredentialIdentity, String> {
     let identity = CredentialIdentity::from_metadata(metadata);
     let regular = metadata.file_type().is_file();
-    let root_systemd = identity.owner == 0
-        && identity.group == 0
-        && matches!(identity.mode, 0o400 | 0o440);
+    let root_systemd =
+        identity.owner == 0 && identity.group == 0 && matches!(identity.mode, 0o400 | 0o440);
     let service_owned = identity.owner == expected_owner
         && identity.group == expected_group
         && matches!(identity.mode, 0o400 | 0o600);
@@ -755,7 +756,9 @@ fn execute_via_broker(
     if !Path::new(socket).is_absolute()
         || session_id.len() < 16
         || capability.len() < 32
-        || !session_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         || !capability
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
@@ -801,8 +804,8 @@ fn execute_via_broker(
     if response.len() > BROKER_MAX_RESPONSE_BYTES as usize {
         return Err("Gaia operator broker response is too large".into());
     }
-    let response: GaiaBrokerResponse =
-        serde_json::from_slice(&response).map_err(|_| "Gaia operator broker response is invalid")?;
+    let response: GaiaBrokerResponse = serde_json::from_slice(&response)
+        .map_err(|_| "Gaia operator broker response is invalid")?;
     match (response.ok, response.value, response.error) {
         (true, Some(value), None) => Ok(value),
         (false, None, Some(error)) if !error.is_empty() => Err(error),
@@ -997,9 +1000,7 @@ mod tests {
             let mut request = [0_u8; 4096];
             let count = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..count]);
-            assert!(request.contains(
-                "x-sentinel-operator-key: 0123456789abcdef0123456789abcdef"
-            ));
+            assert!(request.contains("x-sentinel-operator-key: 0123456789abcdef0123456789abcdef"));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{}")
                 .unwrap();
@@ -1141,9 +1142,7 @@ mod tests {
 
         let hardlink = root.join("operator-api.hardlink");
         std::fs::hard_link(&path, &hardlink).unwrap();
-        assert!(
-            read_operator_credential_with_hook(&path, owner, group, || Ok(())).is_err()
-        );
+        assert!(read_operator_credential_with_hook(&path, owner, group, || Ok(())).is_err());
         std::fs::remove_file(&hardlink).unwrap();
 
         let parent = root.join("credentials");
@@ -1162,15 +1161,17 @@ mod tests {
         .is_err());
 
         let original = parent.join("operator-api.original");
-        assert!(read_operator_credential_with_hook(&parent_path, owner, group, || {
-            std::fs::rename(&parent_path, &original).map_err(|error| error.to_string())?;
-            std::fs::write(&parent_path, b"fedcba9876543210fedcba9876543210")
-                .map_err(|error| error.to_string())?;
-            std::fs::set_permissions(&parent_path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|error| error.to_string())?;
-            Ok(())
-        })
-        .is_err());
+        assert!(
+            read_operator_credential_with_hook(&parent_path, owner, group, || {
+                std::fs::rename(&parent_path, &original).map_err(|error| error.to_string())?;
+                std::fs::write(&parent_path, b"fedcba9876543210fedcba9876543210")
+                    .map_err(|error| error.to_string())?;
+                std::fs::set_permissions(&parent_path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .is_err()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }
