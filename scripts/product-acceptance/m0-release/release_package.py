@@ -40,8 +40,10 @@ INVENTORY_RELATIVE = "scripts/product-acceptance/run_m0_preflight.py"
 TOOL_INVENTORY_PATH = Path(__file__).resolve().parent.parent / "run_m0_preflight.py"
 TRANSPORT_NOTICE = (
     "The package is an owner- and mode-sensitive directory tree, not a generic copy-ready archive. "
-    "Any transport must preserve ownership, modes, regular-file identities, and hardlink counts. "
-    "After transport, run verify as the executing owner before provisioning."
+    "Transport must preserve modes, regular-file identities, and hardlink counts. Ownership must either "
+    "remain identical to the later executor, or an already verified whole tree must be remapped in one "
+    "closed root-controlled staging step to that executor. Mixed ownership and partial remaps are invalid. "
+    "After transport or remap, run verify as exactly that executor before provisioning."
 )
 
 
