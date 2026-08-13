@@ -4,12 +4,15 @@
 //! independent gate implementations remain behind narrow authority ports.
 
 mod digest;
+mod domain;
+mod domain_store;
 mod engine;
 mod error;
 mod model;
 mod port;
 mod store;
 
+pub use domain::*;
 pub use engine::WorkflowCore;
 pub use error::{WorkflowError, WorkflowErrorCode};
 pub use model::*;

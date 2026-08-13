@@ -118,7 +118,7 @@ UPDATE workflow_schema_meta SET schema_version = 2 WHERE singleton = 1;
 
 #[derive(Debug)]
 pub struct WorkflowStore {
-    connection: Mutex<Connection>,
+    pub(crate) connection: Mutex<Connection>,
 }
 
 struct ExecutionRow {
@@ -222,6 +222,7 @@ impl WorkflowStore {
                 }
             }
         }
+        crate::domain_store::ensure_company_schema(&transaction)?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -1647,7 +1648,7 @@ fn read_schema_version(connection: &Connection) -> Result<u32, WorkflowError> {
 fn workflow_object_count(connection: &Connection) -> Result<i64, WorkflowError> {
     connection
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','index','view','trigger') AND (name LIKE 'workflow_%' OR tbl_name LIKE 'workflow_%')",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','index','view','trigger') AND (name LIKE 'workflow_%' OR tbl_name LIKE 'workflow_%' OR name LIKE 'company_%' OR tbl_name LIKE 'company_%')",
             [],
             |row| row.get(0),
         )
