@@ -1,9 +1,11 @@
 //! Capability-scoped tool executor used inside the bwrap agent sandbox.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -25,12 +27,252 @@ use sha2::{Digest, Sha256};
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_COMPLETION_RECEIPT_BYTES: u64 = 1024 * 1024;
 const MAX_ARTIFACT_MANIFEST_BYTES: u64 = 1024 * 1024;
+const COMPLETION_RECEIPT_DIRECTORY: &str = ".workbench-receipts";
+const COMPLETION_RECEIPT_DIRECTORY_MODE: u32 = 0o700;
+const COMPLETION_RECEIPT_FILE_MODE: u32 = 0o600;
 const SAFE_ENVIRONMENT: [(&str, &str); 4] = [
     ("HOME", "/workspace"),
     ("LANG", "C.UTF-8"),
     ("LC_ALL", "C.UTF-8"),
     ("PATH", "/usr/bin:/bin"),
 ];
+
+#[derive(Debug)]
+struct PinnedDirectory {
+    file: File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReceiptFileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+}
+
+impl PinnedDirectory {
+    fn open_chain(path: &Path, create: bool) -> std::io::Result<Self> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let mut current = open_directory(Path::new("/"))?;
+        for component in absolute.components() {
+            let name = match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(name) => name,
+                Component::ParentDir | Component::Prefix(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "receipt directory contains an unsupported component",
+                    ));
+                }
+            };
+            let parent = Self { file: current };
+            let child = parent.child_path(name);
+            current = match open_directory(&child) {
+                Ok(directory) => directory,
+                Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                    let mut builder = DirBuilder::new();
+                    builder.mode(COMPLETION_RECEIPT_DIRECTORY_MODE);
+                    match builder.create(&child) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error),
+                    }
+                    open_directory(&child)?
+                }
+                Err(error) => return Err(error),
+            };
+        }
+        Ok(Self { file: current })
+    }
+
+    fn child_path(&self, name: impl AsRef<OsStr>) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+            .join(Path::new(name.as_ref()))
+    }
+
+    fn open_child_directory(&self, name: &str, create: bool) -> std::io::Result<Option<Self>> {
+        let path = self.child_path(name);
+        let file = match open_directory(&path) {
+            Ok(file) => file,
+            Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = DirBuilder::new();
+                builder.mode(COMPLETION_RECEIPT_DIRECTORY_MODE);
+                match builder.create(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+                open_directory(&path)?
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Some(Self { file }))
+    }
+
+    fn validate_owned_safe_directory(&self, exact_mode: bool) -> std::io::Result<()> {
+        let metadata = self.file.metadata()?;
+        if !metadata.is_dir() || metadata.uid() != current_euid()? {
+            return Err(invalid_receipt_data());
+        }
+        let mode = metadata.mode() & 0o7777;
+        if exact_mode {
+            if mode != COMPLETION_RECEIPT_DIRECTORY_MODE {
+                self.file.set_permissions(fs::Permissions::from_mode(
+                    COMPLETION_RECEIPT_DIRECTORY_MODE,
+                ))?;
+                let updated = self.file.metadata()?;
+                if updated.uid() != current_euid()?
+                    || updated.mode() & 0o7777 != COMPLETION_RECEIPT_DIRECTORY_MODE
+                {
+                    return Err(invalid_receipt_data());
+                }
+            }
+        } else if mode & (0o7000 | 0o022) != 0 {
+            return Err(invalid_receipt_data());
+        }
+        Ok(())
+    }
+
+    fn create_private_file(&self, name: &OsStr) -> std::io::Result<File> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(COMPLETION_RECEIPT_FILE_MODE)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(self.child_path(name))?;
+        file.set_permissions(fs::Permissions::from_mode(COMPLETION_RECEIPT_FILE_MODE))?;
+        Ok(file)
+    }
+
+    fn open_private_file(&self, name: &OsStr) -> std::io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(self.child_path(name))
+    }
+
+    fn remove_entry_if_identity(
+        &self,
+        name: &OsStr,
+        expected: ReceiptFileIdentity,
+        expected_links: u64,
+    ) -> std::io::Result<()> {
+        let file = self.open_private_file(name)?;
+        let metadata = file.metadata()?;
+        validate_receipt_metadata(&metadata, expected_links, true)?;
+        if receipt_file_identity(&metadata) != expected {
+            return Err(invalid_receipt_data());
+        }
+        fs::remove_file(self.child_path(name))
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
+fn open_directory(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+}
+
+fn current_euid() -> std::io::Result<u32> {
+    fs::read_to_string("/proc/self/status")?
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|value| value.split_whitespace().nth(1))
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(invalid_receipt_data)
+}
+
+fn invalid_receipt_data() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "completion receipt failed its integrity boundary",
+    )
+}
+
+fn receipt_file_identity(metadata: &fs::Metadata) -> ReceiptFileIdentity {
+    ReceiptFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+    }
+}
+
+fn validate_receipt_metadata(
+    metadata: &fs::Metadata,
+    expected_links: u64,
+    allow_empty: bool,
+) -> std::io::Result<()> {
+    if !metadata.is_file()
+        || metadata.nlink() != expected_links
+        || metadata.uid() != current_euid()?
+        || metadata.mode() & 0o7777 != COMPLETION_RECEIPT_FILE_MODE
+        || metadata.len() > MAX_COMPLETION_RECEIPT_BYTES
+        || (!allow_empty && metadata.len() == 0)
+    {
+        return Err(invalid_receipt_data());
+    }
+    Ok(())
+}
+
+fn validate_receipt_file(
+    metadata: &fs::Metadata,
+    allow_empty: bool,
+) -> std::io::Result<ReceiptFileIdentity> {
+    validate_receipt_metadata(metadata, 1, allow_empty)?;
+    Ok(receipt_file_identity(metadata))
+}
+
+fn read_validated_receipt(
+    directory: &PinnedDirectory,
+    name: &OsStr,
+    after_open: impl FnOnce(),
+) -> std::io::Result<Vec<u8>> {
+    let mut file = directory.open_private_file(name)?;
+    let before = file.metadata()?;
+    let identity = validate_receipt_file(&before, false)?;
+    after_open();
+    let mut bytes = Vec::with_capacity(identity.size.try_into().unwrap_or(0));
+    (&mut file)
+        .take(MAX_COMPLETION_RECEIPT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != identity.size {
+        return Err(invalid_receipt_data());
+    }
+    let after = file.metadata()?;
+    validate_receipt_file(&after, false)?;
+    if receipt_file_identity(&after) != identity {
+        return Err(invalid_receipt_data());
+    }
+    let installed = directory.open_private_file(name)?;
+    let installed_metadata = installed.metadata()?;
+    validate_receipt_file(&installed_metadata, false)?;
+    if receipt_file_identity(&installed_metadata) != identity {
+        return Err(invalid_receipt_data());
+    }
+    Ok(bytes)
+}
+
+fn random_receipt_suffix() -> std::io::Result<String> {
+    let mut random = [0_u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let mut encoded = String::with_capacity(random.len() * 2);
+    for byte in random {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    Ok(encoded)
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkbenchExecutor {
@@ -147,7 +389,11 @@ impl WorkbenchExecutor {
     /// The immutable receipt closes the daemon-crash window between a completed
     /// tool effect and its durable orchestration transition. Transient tool
     /// output is intentionally removed; recovery returns only the auditable
-    /// outcome, resources, artifacts, and safe error classification.
+    /// outcome, resources, artifacts, and safe error classification. The M0
+    /// command child does not attest this receipt: receipt authority belongs to
+    /// this runtime process after its own result validation. The M0 profile is
+    /// limited to direct allowlisted argv; this local receipt is not evidence
+    /// that an external side effect has an idempotency or provider receipt.
     pub fn persist_completion_receipt(
         &self,
         message: &WorkbenchMessage,
@@ -161,26 +407,6 @@ impl WorkbenchExecutor {
         else {
             unreachable!("safe_terminal_receipt accepts only results");
         };
-        let directory = self.artifact_root.join(".workbench-receipts");
-        fs::create_dir_all(&directory).map_err(receipt_error)?;
-        reject_symlink(&directory).map_err(|_| {
-            recovery_error(
-                "completion_receipt_path_rejected",
-                "the completion receipt path failed containment validation",
-            )
-        })?;
-        let destination = directory.join(format!("{invocation_id}.json"));
-        if destination.exists() {
-            let existing = self.recover_completion(invocation_id, input_digest)?;
-            if existing == safe {
-                return Ok(());
-            }
-            return Err(recovery_error(
-                "completion_receipt_conflict",
-                "the immutable completion receipt conflicts with this result",
-            ));
-        }
-
         let bytes = serde_json::to_vec(&safe).map_err(|_| {
             recovery_error(
                 "completion_receipt_encode_failed",
@@ -193,33 +419,72 @@ impl WorkbenchExecutor {
                 "the completion receipt exceeded its size boundary",
             ));
         }
-        let temporary = directory.join(format!(".{invocation_id}.{}.tmp", std::process::id()));
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
+        let directory = self
+            .open_completion_receipt_directory(true)?
+            .ok_or_else(|| {
+                recovery_error(
+                    "completion_receipt_path_rejected",
+                    "the completion receipt directory is unavailable",
+                )
+            })?;
+        let destination = OsString::from(format!("{invocation_id}.json"));
+        let temporary = OsString::from(format!(
+            ".{invocation_id}.{}.tmp",
+            random_receipt_suffix().map_err(receipt_error)?
+        ));
+        let mut file = directory
+            .create_private_file(&temporary)
             .map_err(receipt_error)?;
         file.write_all(&bytes).map_err(receipt_error)?;
         file.sync_all().map_err(receipt_error)?;
-        match fs::hard_link(&temporary, &destination) {
+        let temporary_identity =
+            validate_receipt_file(&file.metadata().map_err(receipt_error)?, true)
+                .map_err(receipt_error)?;
+        match fs::hard_link(
+            directory.child_path(&temporary),
+            directory.child_path(&destination),
+        ) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                directory
+                    .remove_entry_if_identity(&temporary, temporary_identity, 1)
+                    .map_err(receipt_error)?;
                 let existing = self.recover_completion(invocation_id, input_digest)?;
                 if existing != safe {
-                    let _ = fs::remove_file(&temporary);
                     return Err(recovery_error(
                         "completion_receipt_conflict",
                         "the immutable completion receipt conflicts with this result",
                     ));
                 }
+                directory.sync().map_err(receipt_error)?;
+                return Ok(());
             }
             Err(error) => {
-                let _ = fs::remove_file(&temporary);
+                let _ = directory.remove_entry_if_identity(&temporary, temporary_identity, 1);
                 return Err(receipt_error(error));
             }
         }
-        fs::remove_file(&temporary).map_err(receipt_error)?;
-        sync_directory(&directory).map_err(receipt_error)?;
+        let installed = directory
+            .open_private_file(&destination)
+            .map_err(receipt_error)?;
+        let installed_metadata = installed.metadata().map_err(receipt_error)?;
+        let installed_identity = receipt_file_identity(&installed_metadata);
+        if installed_identity != temporary_identity || installed_metadata.nlink() != 2 {
+            return Err(recovery_error(
+                "completion_receipt_invalid",
+                "the completion receipt changed during atomic installation",
+            ));
+        }
+        directory.sync().map_err(receipt_error)?;
+        directory
+            .remove_entry_if_identity(&temporary, temporary_identity, 2)
+            .map_err(receipt_error)?;
+        let installed = directory
+            .open_private_file(&destination)
+            .map_err(receipt_error)?;
+        validate_receipt_file(&installed.metadata().map_err(receipt_error)?, false)
+            .map_err(receipt_error)?;
+        directory.sync().map_err(receipt_error)?;
         Ok(())
     }
 
@@ -229,27 +494,16 @@ impl WorkbenchExecutor {
         input_digest: &str,
     ) -> Result<WorkbenchMessage, WorkbenchErrorInfo> {
         validate_receipt_key(invocation_id, input_digest)?;
-        let path = self
-            .artifact_root
-            .join(".workbench-receipts")
-            .join(format!("{invocation_id}.json"));
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(recovery_error(
-                    "completion_receipt_path_rejected",
-                    "the completion receipt path failed containment validation",
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(recovery_error(
+        let directory = self
+            .open_completion_receipt_directory(false)?
+            .ok_or_else(|| {
+                recovery_error(
                     "completion_receipt_not_found",
                     "no durable completion receipt exists for this invocation",
-                ));
-            }
-            Err(error) => return Err(receipt_error(error)),
-        }
-        let metadata = fs::metadata(&path).map_err(|error| {
+                )
+            })?;
+        let name = OsString::from(format!("{invocation_id}.json"));
+        let bytes = read_validated_receipt(&directory, &name, || {}).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 recovery_error(
                     "completion_receipt_not_found",
@@ -259,13 +513,6 @@ impl WorkbenchExecutor {
                 receipt_error(error)
             }
         })?;
-        if !metadata.is_file() || metadata.len() > MAX_COMPLETION_RECEIPT_BYTES {
-            return Err(recovery_error(
-                "completion_receipt_invalid",
-                "the completion receipt is outside its integrity boundary",
-            ));
-        }
-        let bytes = fs::read(&path).map_err(receipt_error)?;
         let message: WorkbenchMessage = serde_json::from_slice(&bytes).map_err(|_| {
             recovery_error(
                 "completion_receipt_invalid",
@@ -288,6 +535,32 @@ impl WorkbenchExecutor {
             ));
         }
         Ok(safe)
+    }
+
+    fn open_completion_receipt_directory(
+        &self,
+        create: bool,
+    ) -> Result<Option<PinnedDirectory>, WorkbenchErrorInfo> {
+        let artifact_root = match PinnedDirectory::open_chain(&self.artifact_root, create) {
+            Ok(directory) => directory,
+            Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(receipt_error(error)),
+        };
+        artifact_root
+            .validate_owned_safe_directory(false)
+            .map_err(receipt_error)?;
+        match artifact_root.open_child_directory(COMPLETION_RECEIPT_DIRECTORY, create) {
+            Ok(Some(directory)) => {
+                directory
+                    .validate_owned_safe_directory(true)
+                    .map_err(receipt_error)?;
+                Ok(Some(directory))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(receipt_error(error)),
+        }
     }
 
     fn execute_validated(
@@ -833,20 +1106,7 @@ impl WorkbenchExecutor {
             }
         }
 
-        let receipt_directory = self.artifact_root.join(".workbench-receipts");
-        if receipt_directory.exists() {
-            reject_symlink(&receipt_directory)?;
-            for entry in fs::read_dir(&receipt_directory).map_err(workspace_io_error)? {
-                let entry = entry.map_err(workspace_io_error)?;
-                let path = entry.path();
-                reject_symlink(&path)?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') && name.ends_with(".tmp") {
-                    fs::remove_file(path).map_err(workspace_io_error)?;
-                }
-            }
-            sync_directory(&receipt_directory).map_err(workspace_io_error)?;
-        }
+        self.reconcile_completion_receipts()?;
 
         let blob_directory = self.artifact_root.join("blobs");
         fs::create_dir_all(&blob_directory).map_err(workspace_io_error)?;
@@ -892,6 +1152,104 @@ impl WorkbenchExecutor {
         }
         sync_directory(&blob_directory).map_err(workspace_io_error)?;
         sync_directory(&self.artifact_root).map_err(workspace_io_error)?;
+        Ok(())
+    }
+
+    fn reconcile_completion_receipts(&self) -> Result<(), ExecutionError> {
+        let Some(directory) = self
+            .open_completion_receipt_directory(false)
+            .map_err(|_| completion_receipt_reconcile_error())?
+        else {
+            return Ok(());
+        };
+        let mut names = fs::read_dir(directory.child_path(OsStr::new(".")))
+            .map_err(|_| completion_receipt_reconcile_error())?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.file_name())
+                    .map_err(|_| completion_receipt_reconcile_error())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        names.sort();
+        for name in names
+            .iter()
+            .filter(|name| name.to_str().is_some_and(is_completion_receipt_temporary))
+        {
+            let Some(name_text) = name.to_str() else {
+                return Err(completion_receipt_reconcile_error());
+            };
+            let invocation_id = completion_receipt_temp_invocation(name_text)
+                .ok_or_else(completion_receipt_reconcile_error)?;
+            let file = directory
+                .open_private_file(name)
+                .map_err(|_| completion_receipt_reconcile_error())?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| completion_receipt_reconcile_error())?;
+            let identity = receipt_file_identity(&metadata);
+            match metadata.nlink() {
+                1 => {
+                    validate_receipt_metadata(&metadata, 1, true)
+                        .map_err(|_| completion_receipt_reconcile_error())?;
+                }
+                2 => {
+                    validate_receipt_metadata(&metadata, 2, true)
+                        .map_err(|_| completion_receipt_reconcile_error())?;
+                    let destination = OsString::from(format!("{invocation_id}.json"));
+                    let installed = directory
+                        .open_private_file(&destination)
+                        .map_err(|_| completion_receipt_reconcile_error())?;
+                    let installed_metadata = installed
+                        .metadata()
+                        .map_err(|_| completion_receipt_reconcile_error())?;
+                    validate_receipt_metadata(&installed_metadata, 2, false)
+                        .map_err(|_| completion_receipt_reconcile_error())?;
+                    if receipt_file_identity(&installed_metadata) != identity {
+                        return Err(completion_receipt_reconcile_error());
+                    }
+                }
+                _ => return Err(completion_receipt_reconcile_error()),
+            }
+            directory
+                .remove_entry_if_identity(name, identity, metadata.nlink())
+                .map_err(|_| completion_receipt_reconcile_error())?;
+            directory
+                .sync()
+                .map_err(|_| completion_receipt_reconcile_error())?;
+        }
+        for name in names
+            .iter()
+            .filter(|name| !name.to_str().is_some_and(is_completion_receipt_temporary))
+        {
+            let Some(name_text) = name.to_str() else {
+                return Err(completion_receipt_reconcile_error());
+            };
+            let Some(invocation_id) = name_text.strip_suffix(".json") else {
+                return Err(completion_receipt_reconcile_error());
+            };
+            if !valid_receipt_invocation_id(invocation_id) {
+                return Err(completion_receipt_reconcile_error());
+            }
+            let bytes = read_validated_receipt(&directory, name, || {})
+                .map_err(|_| completion_receipt_reconcile_error())?;
+            let message: WorkbenchMessage =
+                serde_json::from_slice(&bytes).map_err(|_| completion_receipt_reconcile_error())?;
+            let safe = safe_terminal_receipt(&message)
+                .map_err(|_| completion_receipt_reconcile_error())?;
+            let WorkbenchMessage::Result {
+                invocation_id: stored_invocation,
+                ..
+            } = safe
+            else {
+                unreachable!("safe_terminal_receipt accepts only results");
+            };
+            if stored_invocation != invocation_id {
+                return Err(completion_receipt_reconcile_error());
+            }
+        }
+        directory
+            .sync()
+            .map_err(|_| completion_receipt_reconcile_error())?;
         Ok(())
     }
 
@@ -1107,21 +1465,49 @@ fn safe_terminal_receipt(
 }
 
 fn validate_receipt_key(invocation_id: &str, input_digest: &str) -> Result<(), WorkbenchErrorInfo> {
-    let invocation_valid = invocation_id.len() == 36
-        && invocation_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-');
     let digest_valid = input_digest.len() == 64
         && input_digest
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
-    if !invocation_valid || !digest_valid {
+    if !valid_receipt_invocation_id(invocation_id) || !digest_valid {
         return Err(recovery_error(
             "completion_receipt_key_invalid",
             "the completion receipt key is invalid",
         ));
     }
     Ok(())
+}
+
+fn valid_receipt_invocation_id(invocation_id: &str) -> bool {
+    invocation_id.len() == 36
+        && invocation_id.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+            }
+        })
+}
+
+fn is_completion_receipt_temporary(name: &str) -> bool {
+    completion_receipt_temp_invocation(name).is_some()
+}
+
+fn completion_receipt_temp_invocation(name: &str) -> Option<&str> {
+    let Some(value) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return None;
+    };
+    let Some((invocation_id, token)) = value.split_once('.') else {
+        return None;
+    };
+    (valid_receipt_invocation_id(invocation_id)
+        && !token.is_empty()
+        && token.len() <= 64
+        && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(invocation_id)
 }
 
 fn sync_directory(path: &Path) -> std::io::Result<()> {
@@ -1132,6 +1518,15 @@ fn receipt_error(_error: std::io::Error) -> WorkbenchErrorInfo {
     recovery_error(
         "completion_receipt_io_failed",
         "the completion receipt could not be persisted or read",
+    )
+}
+
+fn completion_receipt_reconcile_error() -> ExecutionError {
+    ExecutionError::new(
+        WorkbenchErrorClass::Recovery,
+        "completion_receipt_invalid",
+        "the completion receipt store failed its integrity boundary",
+        false,
     )
 }
 
@@ -1824,6 +2219,27 @@ mod tests {
         base.join("project-01").join("work-04")
     }
 
+    fn completion_result() -> (WorkbenchMessage, String, String) {
+        let request = request(
+            WorkbenchTool::InspectFile {
+                path: "index.html".to_string(),
+                max_bytes: 1024,
+            },
+            "file.inspect",
+        );
+        let result = WorkbenchMessage::Result {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            outcome: WorkbenchOutcome::Succeeded,
+            resources: WorkbenchResourceUsage::default(),
+            artifacts: Vec::new(),
+            output: BTreeMap::from([("content".to_string(), "PRIVATE".to_string())]),
+            error: None,
+        };
+        (result, request.invocation_id, request.input_digest)
+    }
+
     #[test]
     fn writes_patches_inspects_and_packages_digest_bound_files() {
         let directory = tempfile::tempdir().unwrap();
@@ -2318,6 +2734,100 @@ mod tests {
                 .unwrap_err()
                 .code,
             "completion_receipt_conflict"
+        );
+    }
+
+    #[test]
+    fn completion_receipt_rejects_symlinked_directory_component_and_hardlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_root = directory.path().join("artifacts");
+        let foreign = directory.path().join("foreign");
+        fs::create_dir(&artifact_root).unwrap();
+        fs::create_dir(&foreign).unwrap();
+        symlink(&foreign, artifact_root.join(COMPLETION_RECEIPT_DIRECTORY)).unwrap();
+        let executor = WorkbenchExecutor::new(directory.path().join("workspace"), &artifact_root);
+        let (result, invocation_id, input_digest) = completion_result();
+        assert!(executor.persist_completion_receipt(&result).is_err());
+        assert!(executor
+            .recover_completion(&invocation_id, &input_digest)
+            .is_err());
+
+        fs::remove_file(artifact_root.join(COMPLETION_RECEIPT_DIRECTORY)).unwrap();
+        executor.persist_completion_receipt(&result).unwrap();
+        let receipt = artifact_root
+            .join(COMPLETION_RECEIPT_DIRECTORY)
+            .join(format!("{invocation_id}.json"));
+        fs::hard_link(&receipt, artifact_root.join("receipt-hardlink")).unwrap();
+        assert!(executor
+            .recover_completion(&invocation_id, &input_digest)
+            .is_err());
+    }
+
+    #[test]
+    fn completion_receipt_rejects_name_replacement_after_descriptor_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_root = directory.path().join("artifacts");
+        let executor = WorkbenchExecutor::new(directory.path().join("workspace"), &artifact_root);
+        let (result, invocation_id, _) = completion_result();
+        executor.persist_completion_receipt(&result).unwrap();
+        let receipt_directory = executor
+            .open_completion_receipt_directory(false)
+            .unwrap()
+            .unwrap();
+        let name = OsString::from(format!("{invocation_id}.json"));
+        let installed = receipt_directory.child_path(&name);
+        let displaced = receipt_directory.child_path(OsStr::new("displaced.json"));
+        let replacement = installed.clone();
+
+        let error = read_validated_receipt(&receipt_directory, &name, || {
+            fs::rename(&installed, &displaced).unwrap();
+            fs::write(&replacement, b"{}").unwrap();
+            fs::set_permissions(
+                &replacement,
+                fs::Permissions::from_mode(COMPLETION_RECEIPT_FILE_MODE),
+            )
+            .unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn receipt_reconcile_rejects_manipulated_temporary_cleanup_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_root = directory.path().join("artifacts");
+        let executor = WorkbenchExecutor::new(directory.path().join("workspace"), &artifact_root);
+        let (result, invocation_id, _) = completion_result();
+        executor.persist_completion_receipt(&result).unwrap();
+        let temporary = artifact_root
+            .join(COMPLETION_RECEIPT_DIRECTORY)
+            .join(format!(".{invocation_id}.deadbeef.tmp"));
+        fs::write(&temporary, b"manipulated").unwrap();
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(executor.reconcile_completion_receipts().is_err());
+        assert!(temporary.exists());
+    }
+
+    #[test]
+    fn receipt_reconcile_finishes_crash_after_no_overwrite_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_root = directory.path().join("artifacts");
+        let executor = WorkbenchExecutor::new(directory.path().join("workspace"), &artifact_root);
+        let (result, invocation_id, input_digest) = completion_result();
+        executor.persist_completion_receipt(&result).unwrap();
+        let receipt_directory = artifact_root.join(COMPLETION_RECEIPT_DIRECTORY);
+        let receipt = receipt_directory.join(format!("{invocation_id}.json"));
+        let temporary = receipt_directory.join(format!(".{invocation_id}.deadbeef.tmp"));
+        fs::hard_link(&receipt, &temporary).unwrap();
+
+        executor.reconcile_completion_receipts().unwrap();
+        assert!(!temporary.exists());
+        assert_eq!(
+            executor
+                .recover_completion(&invocation_id, &input_digest)
+                .unwrap(),
+            safe_terminal_receipt(&result).unwrap()
         );
     }
 }

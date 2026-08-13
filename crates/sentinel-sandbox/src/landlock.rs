@@ -110,8 +110,7 @@ impl LandlockRuleset {
     pub fn apply(&self) -> Result<bool> {
         Ok(matches!(
             self.apply_status()?,
-            LandlockEnforcement::FullyEnforced { .. }
-                | LandlockEnforcement::PartiallyEnforced
+            LandlockEnforcement::FullyEnforced { .. } | LandlockEnforcement::PartiallyEnforced
         ))
     }
 
@@ -296,10 +295,7 @@ mod tests {
             None
         );
         assert_eq!(
-            workbench_fully_enforced_abi(
-                LandlockEnforcement::NotEnforced,
-                LANDLOCK_RULESET_ABI,
-            ),
+            workbench_fully_enforced_abi(LandlockEnforcement::NotEnforced, LANDLOCK_RULESET_ABI,),
             None
         );
     }

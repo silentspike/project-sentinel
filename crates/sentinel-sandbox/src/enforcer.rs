@@ -729,9 +729,7 @@ impl AgentProcess {
         self.termination.reaped.load(Ordering::Acquire)
     }
 
-    pub(crate) fn workbench_isolation_attestation(
-        &self,
-    ) -> Option<WorkbenchIsolationAttestation> {
+    pub(crate) fn workbench_isolation_attestation(&self) -> Option<WorkbenchIsolationAttestation> {
         self.workbench_isolation
     }
 
@@ -1436,8 +1434,8 @@ impl SandboxEnforcer {
         // share_net=false (no --share-net). The daemon verifies isolation
         // post-spawn on the sandboxed child PID.
 
-        let attestation_nonce = require_workbench_attestation
-            .then(|| uuid::Uuid::new_v4().to_string());
+        let attestation_nonce =
+            require_workbench_attestation.then(|| uuid::Uuid::new_v4().to_string());
         let landlock_abi = if require_workbench_attestation {
             Some(
                 self.landlock_abi
@@ -1975,8 +1973,8 @@ fn await_workbench_startup_attestation(
 ) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(WORKBENCH_ATTESTATION_TIMEOUT_MS);
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(WORKBENCH_ATTESTATION_TIMEOUT_MS);
     let path = PathBuf::from(format!(
         "/proc/{child_pid}/root/tmp/.sentinel-workbench-attestation-{expected_nonce}.json"
     ));
@@ -1991,8 +1989,8 @@ fn await_workbench_startup_attestation(
                         && metadata.len() <= WORKBENCH_ATTESTATION_MAX_BYTES,
                     "workbench startup attestation failed its file boundary"
                 );
-                let file = std::fs::File::open(&path)
-                    .context("open workbench startup attestation")?;
+                let file =
+                    std::fs::File::open(&path).context("open workbench startup attestation")?;
                 let opened = file
                     .metadata()
                     .context("inspect opened workbench startup attestation")?;
@@ -2035,8 +2033,8 @@ fn validate_workbench_startup_attestation(
     expected_landlock_abi: u8,
     expected_child_pid: u32,
 ) -> Result<()> {
-    let attestation: WorkbenchStartupAttestation = serde_json::from_slice(bytes)
-        .context("decode workbench startup attestation")?;
+    let attestation: WorkbenchStartupAttestation =
+        serde_json::from_slice(bytes).context("decode workbench startup attestation")?;
     ensure!(
         attestation.schema_version == WORKBENCH_ATTESTATION_SCHEMA_VERSION
             && attestation.nonce == expected_nonce
@@ -2451,18 +2449,14 @@ mod tests {
         assert!(
             validate_workbench_child_boundary(Some(42), false, IsolationStatus::Isolated).is_err()
         );
-        assert!(validate_workbench_child_boundary(
-            Some(42),
-            true,
-            IsolationStatus::NotIsolated,
-        )
-        .is_err());
-        assert!(validate_workbench_child_boundary(
-            Some(42),
-            true,
-            IsolationStatus::ProbeError,
-        )
-        .is_err());
+        assert!(
+            validate_workbench_child_boundary(Some(42), true, IsolationStatus::NotIsolated,)
+                .is_err()
+        );
+        assert!(
+            validate_workbench_child_boundary(Some(42), true, IsolationStatus::ProbeError,)
+                .is_err()
+        );
         assert_eq!(
             validate_workbench_child_boundary(Some(42), true, IsolationStatus::Isolated).unwrap(),
             42

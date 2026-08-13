@@ -26,7 +26,7 @@ use sentinel_common::agent_config::{load_all_agents_with_validation, AgentConfig
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::events::{DomainEvent, DomainEventPayload};
 use sentinel_common::nano_runtime::{
-    NanoExecRequest, NanoExecResult, NanoHandle, NanoRuntimeControlAction, NanoRuntimeControlError,
+    NanoExecRequest, NanoHandle, NanoRuntimeControlAction, NanoRuntimeControlError,
     NanoRuntimeControlResult, NanoRuntimeResources, NanoStopResult, NanoWorkloadSpec,
     RUNTIME_BWRAP_LANDLOCK,
 };
@@ -658,10 +658,7 @@ impl DaemonWorkbenchRuntimeClient<'_> {
             .context("workbench World authority is unavailable")
     }
 
-    fn revalidate_world_authority(
-        &self,
-        guard: &sentinel_common::OwnerWriteGuard,
-    ) -> Result<()> {
+    fn revalidate_world_authority(&self, guard: &sentinel_common::OwnerWriteGuard) -> Result<()> {
         self.owner_registry
             .validate(guard)
             .context("workbench World authority became stale")
@@ -12915,7 +12912,7 @@ mod tests {
             {
                 registry.commit_owner(term.clone());
             }
-            Ok(NanoExecResult {
+            Ok(sentinel_common::NanoExecResult {
                 runtime_key: RUNTIME_BWRAP_LANDLOCK.to_string(),
                 workload_id: handle.workload_id.clone(),
                 success: true,
@@ -13103,8 +13100,10 @@ mod tests {
         assert_eq!(exec_calls.load(Ordering::SeqCst), 2);
     }
 
-    fn cluster_owner_registry_for_workbench_test(
-    ) -> (Arc<sentinel_common::OwnerRegistry>, sentinel_common::OwnerTerm) {
+    fn cluster_owner_registry_for_workbench_test() -> (
+        Arc<sentinel_common::OwnerRegistry>,
+        sentinel_common::OwnerTerm,
+    ) {
         let seed = sentinel_common::NodeId::new();
         let successor = sentinel_common::NodeId::new();
         let registry = Arc::new(sentinel_common::OwnerRegistry::new_cluster_for_test(seed));

@@ -229,12 +229,7 @@ fn validate_authority_file_metadata(
     max_bytes: u64,
     exact_mode: Option<u32>,
 ) -> anyhow::Result<FileIdentity> {
-    if !authority_file_metadata_is_safe(
-        metadata,
-        current_daemon_uid()?,
-        max_bytes,
-        exact_mode,
-    ) {
+    if !authority_file_metadata_is_safe(metadata, current_daemon_uid()?, max_bytes, exact_mode) {
         bail!("authority file identity or size is unsafe");
     }
     Ok(FileIdentity::from_metadata(metadata))
@@ -246,14 +241,14 @@ fn authority_file_metadata_is_safe(
     max_bytes: u64,
     exact_mode: Option<u32>,
 ) -> bool {
-    let mode = metadata.mode() & 0o777;
+    let mode = metadata.mode() & 0o7777;
     metadata.is_file()
         && !metadata.file_type().is_symlink()
         && metadata.nlink() == 1
         && metadata.uid() == expected_uid
         && metadata.len() > 0
         && metadata.len() <= max_bytes
-        && !exact_mode.map_or(mode & 0o022 != 0, |expected| mode != expected)
+        && !exact_mode.map_or(mode & 0o7022 != 0, |expected| mode != expected)
 }
 
 fn open_secure_authority_file(
@@ -331,7 +326,7 @@ where
     if !metadata.is_file()
         || metadata.nlink() != 1
         || metadata.uid() != current_daemon_uid()?
-        || metadata.mode() & 0o777 != 0o600
+        || metadata.mode() & 0o7777 != 0o600
     {
         bail!("opened workbench store identity or mode is unsafe");
     }
@@ -1340,12 +1335,8 @@ fn validate_concrete_artifact_manifest(
         .and_then(|name| name.to_str())
         .ok_or(WorkbenchStoreError::OutputRejected)?;
     let scope = open_pinned_daemon_artifact_directory(&scoped_root)?;
-    let mut manifest_file = open_scoped_daemon_artifact_file(
-        &scope,
-        manifest_name,
-        MAX_ARTIFACT_MANIFEST_BYTES,
-        None,
-    )?;
+    let mut manifest_file =
+        open_scoped_daemon_artifact_file(&scope, manifest_name, MAX_ARTIFACT_MANIFEST_BYTES, None)?;
     let mut bytes = Vec::new();
     manifest_file
         .by_ref()
@@ -1410,9 +1401,7 @@ fn validate_concrete_artifact_manifest(
             .read_to_end(&mut blob_bytes)
             .map_err(|_| WorkbenchStoreError::OutputRejected)?;
         revalidate_scoped_daemon_artifact_file(&blobs, &entry.sha256, &blob)?;
-        if blob_bytes.len() as u64 != entry.size_bytes
-            || hex_sha256(&blob_bytes) != entry.sha256
-        {
+        if blob_bytes.len() as u64 != entry.size_bytes || hex_sha256(&blob_bytes) != entry.sha256 {
             return Err(WorkbenchStoreError::OutputRejected.into());
         }
     }
@@ -1499,12 +1488,12 @@ fn validate_daemon_artifact_file_metadata(
     max_bytes: u64,
     exact_size: Option<u64>,
 ) -> anyhow::Result<()> {
-    let mode = metadata.mode() & 0o777;
+    let mode = metadata.mode() & 0o7777;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
         || metadata.nlink() != 1
         || metadata.uid() != current_daemon_uid()?
-        || mode & 0o022 != 0
+        || mode & 0o7022 != 0
         || metadata.len() > max_bytes
         || exact_size.is_some_and(|size| metadata.len() != size)
     {
@@ -1527,7 +1516,7 @@ fn revalidate_scoped_daemon_artifact_file(
     validate_daemon_artifact_file_metadata(&opened, opened.len(), Some(opened.len()))?;
     validate_daemon_artifact_file_metadata(&path_metadata, opened.len(), Some(opened.len()))?;
     if ArtifactFileIdentity::from_metadata(&path_metadata)
-            != ArtifactFileIdentity::from_metadata(&opened)
+        != ArtifactFileIdentity::from_metadata(&opened)
     {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
@@ -1547,7 +1536,8 @@ fn bind_daemon_artifact_scope(
         .parent()
         .ok_or(WorkbenchStoreError::OutputRejected)?;
     let marker = agent_root.join(".nano-runtime");
-    let metadata = fs::symlink_metadata(&marker).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let metadata =
+        fs::symlink_metadata(&marker).map_err(|_| WorkbenchStoreError::OutputRejected)?;
     let expected_workload = format!("AGENT-{:02}", agent_id.0);
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -1556,10 +1546,8 @@ fn bind_daemon_artifact_scope(
     {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
-    let project = canonical_daemon_child_directory(
-        &artifact_base,
-        daemon_scope_component(project_id)?,
-    )?;
+    let project =
+        canonical_daemon_child_directory(&artifact_base, daemon_scope_component(project_id)?)?;
     canonical_daemon_child_directory(&project, daemon_scope_component(work_item_id)?)
 }
 
@@ -2109,37 +2097,35 @@ impl<'a> WorkbenchCoordinator<'a> {
         let current_authority = authority.current_for_record(&current)?;
         authorize_workbench_record(&current, &current_authority)?;
         let expected_workload_id = format!("AGENT-{:02}", agent_id.0);
-        let envelope =
-            match WorkbenchRuntimeEnvelope::decode(
-                invocation_id,
-                &expected_workload_id,
-                exchange.result(),
-            ) {
-                Ok(envelope) => envelope,
-                Err(_) => {
-                    exchange.revalidate()?;
-                    let unresolved = self.store.mark_unknown_outcome_guarded(
-                        invocation_id,
-                        request_digest,
-                        now_ms,
-                        safe_recovery_failure("runtime_response_rejected"),
-                        &|| exchange.revalidate(),
-                    )?;
-                    records.push(unresolved);
-                    return Ok(WorkbenchCoordinatorUpdate {
-                        records,
-                        runtime_state: Some("completed".to_string()),
-                        replayed,
-                    });
-                }
+        let envelope = match WorkbenchRuntimeEnvelope::decode(
+            invocation_id,
+            &expected_workload_id,
+            exchange.result(),
+        ) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                exchange.revalidate()?;
+                let unresolved = self.store.mark_unknown_outcome_guarded(
+                    invocation_id,
+                    request_digest,
+                    now_ms,
+                    safe_recovery_failure("runtime_response_rejected"),
+                    &|| exchange.revalidate(),
+                )?;
+                records.push(unresolved);
+                return Ok(WorkbenchCoordinatorUpdate {
+                    records,
+                    runtime_state: Some("completed".to_string()),
+                    replayed,
+                });
+            }
         };
         let runtime_state = Some(envelope.state.clone());
         exchange.revalidate()?;
-        if let Some(terminal) = self.store.accept_runtime_envelope_guarded(
-            &envelope,
-            now_ms,
-            &|| exchange.revalidate(),
-        )? {
+        if let Some(terminal) =
+            self.store
+                .accept_runtime_envelope_guarded(&envelope, now_ms, &|| exchange.revalidate())?
+        {
             records.push(terminal);
         }
         Ok(WorkbenchCoordinatorUpdate {
@@ -2177,11 +2163,10 @@ impl<'a> WorkbenchCoordinator<'a> {
         authorize_workbench_record(&current, &current_authority)?;
         let mut records = Vec::new();
         exchange.revalidate()?;
-        if let Some(terminal) = self.store.accept_runtime_envelope_guarded(
-            &envelope,
-            now_ms,
-            &|| exchange.revalidate(),
-        )? {
+        if let Some(terminal) =
+            self.store
+                .accept_runtime_envelope_guarded(&envelope, now_ms, &|| exchange.revalidate())?
+        {
             records.push(terminal);
         }
         Ok(WorkbenchCoordinatorUpdate {
@@ -2280,6 +2265,86 @@ mod tests {
 
     fn store(directory: &tempfile::TempDir) -> WorkbenchInvocationStore {
         WorkbenchInvocationStore::open(directory.path().join("workbench.redb")).unwrap()
+    }
+
+    struct TestWorkbenchProfileAuthority {
+        _directory: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl TestWorkbenchProfileAuthority {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    fn secure_test_workbench_authority_base() -> PathBuf {
+        let configured = std::env::var_os("RUNNER_TEMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/work/tmp/project-sentinel"));
+        let base = canonical_secure_authority_base(&configured)
+            .expect("test workbench authority base must satisfy the production contract");
+        for ancestor in base.ancestors() {
+            let metadata =
+                fs::symlink_metadata(ancestor).expect("inspect test workbench authority ancestor");
+            assert!(metadata.is_dir());
+            assert!(!metadata.file_type().is_symlink());
+            assert_eq!(
+                metadata.mode() & 0o022,
+                0,
+                "test workbench authority must not have a writable parent: {}",
+                ancestor.display()
+            );
+            assert_ne!(
+                metadata.mode() & 0o7777,
+                0o1777,
+                "test workbench authority must not be below an unsafe 01777 parent"
+            );
+        }
+        base
+    }
+
+    fn secure_test_workbench_profile_authority() -> TestWorkbenchProfileAuthority {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/workbench-profiles/web-authoring-v1.toml");
+        let profile_bytes = fs::read(source).expect("read repository workbench profile fixture");
+        let authority_base = secure_test_workbench_authority_base();
+        let directory = tempfile::Builder::new()
+            .prefix("sentinel-workbench-profile-")
+            .tempdir_in(authority_base)
+            .expect("create secure workbench profile authority");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure workbench profile authority mode");
+        let path = directory.path().join("web-authoring-v1.toml");
+        let mut profile = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("create secure workbench profile fixture");
+        profile
+            .write_all(&profile_bytes)
+            .expect("write exact workbench profile fixture bytes");
+        profile
+            .sync_all()
+            .expect("sync secure workbench profile fixture");
+        drop(profile);
+
+        let metadata = fs::symlink_metadata(&path).expect("inspect workbench profile fixture");
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.uid(), current_daemon_uid().unwrap());
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(fs::read(&path).unwrap(), profile_bytes);
+
+        TestWorkbenchProfileAuthority {
+            _directory: directory,
+            path,
+        }
     }
 
     fn authority(
@@ -2525,9 +2590,8 @@ mod tests {
 
     #[test]
     fn immutable_profile_binds_runtime_capabilities_and_resource_ceilings() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/workbench-profiles/web-authoring-v1.toml");
-        let (profile, digest) = WorkbenchProfile::load(path).unwrap();
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
         let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2809");
         request.tool_profile_digest = digest.clone();
         request.input_digest = request.canonical_digest().unwrap();
@@ -2565,6 +2629,10 @@ mod tests {
 
         fs::set_permissions(&safe, fs::Permissions::from_mode(0o622)).unwrap();
         assert!(WorkbenchProfile::load(&safe).is_err());
+        for mode in [0o4600, 0o2600] {
+            fs::set_permissions(&safe, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(WorkbenchProfile::load(&safe).is_err());
+        }
         fs::set_permissions(&safe, fs::Permissions::from_mode(0o600)).unwrap();
 
         let metadata = fs::symlink_metadata(&safe).unwrap();
@@ -2596,6 +2664,10 @@ mod tests {
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         assert!(WorkbenchInvocationStore::open(&path).is_err());
+        for mode in [0o4600, 0o2600] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(WorkbenchInvocationStore::open(&path).is_err());
+        }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let linked = directory.path().join("workbench-hardlink.redb");
         fs::hard_link(&path, &linked).unwrap();
@@ -2618,14 +2690,13 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
 
-        assert!(open_secure_store_file_at(directory.path(), &path, |opened_path| {
-            fs::rename(&replacement, &path)?;
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(opened_path)
-        })
-        .is_err());
+        assert!(
+            open_secure_store_file_at(directory.path(), &path, |opened_path| {
+                fs::rename(&replacement, &path)?;
+                OpenOptions::new().read(true).write(true).open(opened_path)
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -2965,6 +3036,12 @@ mod tests {
         assert!(open_scoped_daemon_artifact_file(&pinned, "manifest.json", 16, None).is_err());
         fs::remove_file(hardlink).unwrap();
 
+        for mode in [0o4644, 0o2644, 0o1644] {
+            fs::set_permissions(&manifest, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(open_scoped_daemon_artifact_file(&pinned, "manifest.json", 16, None).is_err());
+        }
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o644)).unwrap();
+
         let replacement = safe_scope.join("replacement.json");
         fs::write(&replacement, b"[]").unwrap();
         assert!(open_scoped_daemon_artifact_file_with(
@@ -3207,9 +3284,8 @@ mod tests {
     fn coordinator_replays_without_duplicate_dispatch_and_recovers_a_receipt() {
         let directory = tempfile::tempdir().unwrap();
         let store = store(&directory);
-        let profile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/workbench-profiles/web-authoring-v1.toml");
-        let (profile, profile_digest) = WorkbenchProfile::load(profile_path).unwrap();
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
         let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2812");
         request.tool_profile_digest = profile_digest.clone();
         request.input_digest = request.canonical_digest().unwrap();
@@ -3300,9 +3376,8 @@ mod tests {
     fn output_acceptance_rechecks_current_authority_and_events_are_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let store = store(&directory);
-        let profile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/workbench-profiles/web-authoring-v1.toml");
-        let (profile, profile_digest) = WorkbenchProfile::load(profile_path).unwrap();
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
         let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2813");
         request.tool_profile_digest = profile_digest.clone();
         request.input_digest = request.canonical_digest().unwrap();
@@ -3357,9 +3432,8 @@ mod tests {
     fn authority_revoked_during_adapter_io_rejects_output_and_retains_fence() {
         let directory = tempfile::tempdir().unwrap();
         let store = store(&directory);
-        let profile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/workbench-profiles/web-authoring-v1.toml");
-        let (profile, profile_digest) = WorkbenchProfile::load(profile_path).unwrap();
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
         let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2816");
         request.tool_profile_digest = profile_digest.clone();
         request.input_digest = request.canonical_digest().unwrap();
@@ -3403,9 +3477,8 @@ mod tests {
     fn stale_world_guard_during_store_adoption_retains_recoverable_state_without_event() {
         let directory = tempfile::tempdir().unwrap();
         let store = store(&directory);
-        let profile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/workbench-profiles/web-authoring-v1.toml");
-        let (profile, profile_digest) = WorkbenchProfile::load(profile_path).unwrap();
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
         let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2817");
         request.tool_profile_digest = profile_digest.clone();
         request.input_digest = request.canonical_digest().unwrap();
@@ -3454,10 +3527,9 @@ mod tests {
             WorkbenchInvocationState::Executing
         );
         assert!(store.has_inflight().unwrap());
-        let event_store = sentinel_limbo::EventStore::open(
-            directory.path().join("events.db").to_str().unwrap(),
-        )
-        .unwrap();
+        let event_store =
+            sentinel_limbo::EventStore::open(directory.path().join("events.db").to_str().unwrap())
+                .unwrap();
         assert_eq!(event_store.event_count().unwrap(), 0);
 
         let recovery_operations = Arc::new(Mutex::new(Vec::new()));
@@ -3476,7 +3548,10 @@ mod tests {
                 1_900_000_000_001,
             )
             .unwrap();
-        assert_eq!(recovered.records.last().unwrap().state, WorkbenchInvocationState::Succeeded);
+        assert_eq!(
+            recovered.records.last().unwrap().state,
+            WorkbenchInvocationState::Succeeded
+        );
         assert_eq!(operations.lock().unwrap().as_slice(), ["workbench_start"]);
         assert_eq!(
             recovery_operations.lock().unwrap().as_slice(),
@@ -3488,9 +3563,8 @@ mod tests {
     fn terminal_poll_and_recovery_replay_still_require_current_authority() {
         let directory = tempfile::tempdir().unwrap();
         let store = store(&directory);
-        let profile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/workbench-profiles/web-authoring-v1.toml");
-        let (profile, profile_digest) = WorkbenchProfile::load(profile_path).unwrap();
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
         let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2818");
         request.tool_profile_digest = profile_digest.clone();
         request.input_digest = request.canonical_digest().unwrap();
@@ -3551,9 +3625,8 @@ mod tests {
     fn cancellation_requires_current_authority_before_runtime_io() {
         let directory = tempfile::tempdir().unwrap();
         let store = store(&directory);
-        let profile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/workbench-profiles/web-authoring-v1.toml");
-        let (profile, profile_digest) = WorkbenchProfile::load(profile_path).unwrap();
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
         let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2814");
         request.tool_profile_digest = profile_digest.clone();
         request.input_digest = request.canonical_digest().unwrap();
@@ -3604,9 +3677,8 @@ mod tests {
     fn transport_failure_keeps_execution_recoverable_without_redispatch() {
         let directory = tempfile::tempdir().unwrap();
         let store = store(&directory);
-        let profile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/workbench-profiles/web-authoring-v1.toml");
-        let (profile, profile_digest) = WorkbenchProfile::load(profile_path).unwrap();
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
         let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2815");
         request.tool_profile_digest = profile_digest.clone();
         request.input_digest = request.canonical_digest().unwrap();
