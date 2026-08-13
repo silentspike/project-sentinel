@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -27,6 +28,9 @@ CONTROL_LOCK = SAFE_ROOT / ".m0-activation-control.lock"
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_TIMEOUT_SECONDS = 30.0
+MAX_ACTIVATION_DEADLINE_SECONDS = 900.0
+DEFAULT_ACTIVATION_DEADLINE_SECONDS = 300.0
+ACTIVATION_POLL_SECONDS = 1.0
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SAFE_UNIT_RE = re.compile(r"^[a-z0-9][a-z0-9@_.-]{0,127}\.(?:service|timer|target)$")
@@ -64,7 +68,7 @@ TOPOLOGY = (
 )
 ALL_UNITS = (*TOPOLOGY, TARGET)
 INSPECT_UNITS = (*ALL_UNITS, *ONESHOTS)
-ROLLBACK_ORDER = (TARGET, *tuple(reversed(TOPOLOGY)))
+ROLLBACK_ORDER = (TARGET, *ONESHOTS, *tuple(reversed(TOPOLOGY)))
 BASE_CHILD_ENV = {
     "LC_ALL": "C",
     "PATH": "/usr/bin:/bin",
@@ -72,6 +76,31 @@ BASE_CHILD_ENV = {
     "PYTHONNOUSERSITE": "1",
 }
 MAX_CREDENTIAL_BYTES = 4096
+TEMPORAL_PREFLIGHT_REASONS = frozenset({
+    "episode_projection_blocked",
+    "episode_projection_not_ready",
+    "event_cut_changed",
+    "event_projection_lag",
+    "http_readiness_failed",
+    "http_timeout",
+    "identity_dependency_failed",
+    "listener_contract_mismatch",
+    "platform_unresolved",
+    "publication_or_recovery_backlog",
+    "read_model_projection_lag",
+    "runtime_agent_not_ready",
+    "runtime_count_mismatch",
+    "runtime_drift",
+    "runtime_queue_backlog",
+    "runtime_repair_unresolved",
+    "runtime_roster_mismatch",
+    "runtime_worker_not_ready",
+    "store_snapshot_dependency_failed",
+    "systemd_dependency_failed",
+    "systemd_target_not_ready",
+    "systemd_timer_not_ready",
+    "systemd_unit_not_ready",
+})
 
 
 class ControlError(RuntimeError):
@@ -365,7 +394,7 @@ def validate_command(argv: tuple[str, ...]) -> None:
         return
     if verb == "show" and len(argv) == 5 and argv[2] in INSPECT_UNITS:
         return
-    if verb == "stop" and len(argv) == 3 and argv[2] in ALL_UNITS:
+    if verb == "stop" and len(argv) == 3 and argv[2] in INSPECT_UNITS:
         return
     if verb == "restart" and len(argv) == 3 and argv[2] in SERVICES:
         return
@@ -425,6 +454,7 @@ def production_runner(
         process = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, shell=False, env=environment,
+            start_new_session=True,
         )
     except OSError as exc:
         raise ControlError("command_failed") from exc
@@ -457,17 +487,36 @@ def production_runner(
         if remaining <= 0:
             fail("command_timeout")
         return Result(process.wait(timeout=remaining), b"".join(chunks))
+    except ControlError:
+        terminate_process_group(process)
+        raise
     except subprocess.TimeoutExpired as exc:
+        terminate_process_group(process)
         raise ControlError("command_timeout") from exc
     except OSError as exc:
+        terminate_process_group(process)
         raise ControlError("command_failed") from exc
     finally:
         selector.close()
-        if process.poll() is None:
-            process.kill()
-            process.wait()
         process.stdout.close()
         process.stderr.close()
+
+
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    group = process.pid
+    try:
+        os.killpg(group, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    time.sleep(0.05)
+    try:
+        os.killpg(group, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired as exc:
+        raise ControlError("command_tree_kill_failed") from exc
 
 
 def validate_executables(systemctl: Path, python: Path, preflight: Path, journey: Path) -> None:
@@ -588,30 +637,129 @@ def preflight_command(value: PreflightArgs) -> tuple[str, ...]:
     )
 
 
-def run_preflight(runner: Runner, value: PreflightArgs) -> str:
+def run_preflight_attempt(runner: Runner, value: PreflightArgs) -> tuple[str | None, bool]:
     result = invoke(runner, preflight_command(value), value.timeout)
-    if result.returncode != 0:
-        fail("readiness_failed")
     output = strict_json(result.stdout, "preflight")
+    expected_keys = {
+        "schema_version", "claim", "runtime_preflight_pass",
+        "m0_acceptance_pass", "checks", "result_digest",
+    }
     if (
         not isinstance(output, dict)
-        or output.get("runtime_preflight_pass") is not True
-        or output.get("claim") != "runtime_preflight_pass"
+        or frozenset(output) not in {
+            frozenset(expected_keys), frozenset({*expected_keys, "fatal_reason"})
+        }
+        or output.get("schema_version") != 1
         or output.get("m0_acceptance_pass") is not False
+        or not isinstance(output.get("checks"), list)
         or not isinstance(output.get("result_digest"), str)
         or not DIGEST_RE.fullmatch(output["result_digest"])
     ):
         fail("readiness_failed")
-    return output["result_digest"]
+    passed = output.get("runtime_preflight_pass") is True
+    if passed:
+        if result.returncode != 0 or output.get("claim") != "runtime_preflight_pass":
+            fail("readiness_failed")
+        return output["result_digest"], False
+    if result.returncode == 0 or output.get("claim") != "runtime_preflight_fail":
+        fail("readiness_failed")
+    if "fatal_reason" in output:
+        fail("readiness_failed")
+    failed_reasons: list[str] = []
+    for check in output["checks"]:
+        if (
+            not isinstance(check, dict)
+            or set(check) != {"id", "status", "reason", "evidence_digest", "evidence"}
+            or check.get("status") not in {"PASS", "FAIL"}
+            or not isinstance(check.get("id"), str)
+            or not isinstance(check.get("reason"), str)
+            or not isinstance(check.get("evidence_digest"), str)
+            or not DIGEST_RE.fullmatch(check["evidence_digest"])
+            or not isinstance(check.get("evidence"), dict)
+        ):
+            fail("readiness_failed")
+        if check["status"] == "FAIL":
+            failed_reasons.append(check["reason"])
+    if (
+        not failed_reasons
+        or any(reason not in TEMPORAL_PREFLIGHT_REASONS for reason in failed_reasons)
+    ):
+        fail("readiness_failed")
+    return None, True
+
+
+def run_preflight(runner: Runner, value: PreflightArgs) -> str:
+    result, _ = run_preflight_attempt(runner, value)
+    if result is None:
+        fail("readiness_failed")
+    return result
+
+
+def unit_terminal_failure(unit: str, values: dict[str, str]) -> bool:
+    return (
+        values["LoadState"] != "loaded"
+        or values["ActiveState"] == "failed"
+        or (unit != TARGET and values.get("Result") == "failed")
+    )
+
+
+def oneshot_terminal_success(values: dict[str, str]) -> bool:
+    return (
+        values["LoadState"] == "loaded"
+        and values["ActiveState"] == "inactive"
+        and values["SubState"] == "dead"
+        and values["Result"] == "success"
+    )
+
+
+def wait_for_activation(
+    runner: Runner, preflight: PreflightArgs, command_timeout: float,
+    deadline: float, monotonic: Callable[[], float],
+    sleeper: Callable[[float], None],
+) -> str:
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            fail("activation_timeout")
+        per_command_timeout = min(command_timeout, remaining)
+        all_ready = True
+        for unit in ALL_UNITS:
+            values = systemctl_show(runner, unit, per_command_timeout)
+            if unit_terminal_failure(unit, values):
+                fail("activation_unit_failed")
+            if not unit_ready(unit, values):
+                all_ready = False
+        for unit in ONESHOTS:
+            values = systemctl_show(runner, unit, per_command_timeout)
+            if unit_terminal_failure(unit, values):
+                fail("activation_oneshot_failed")
+            if not oneshot_terminal_success(values):
+                all_ready = False
+        if all_ready:
+            readiness_digest, retryable = run_preflight_attempt(runner, preflight)
+            if readiness_digest is not None:
+                return readiness_digest
+            if not retryable:
+                fail("readiness_failed")
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            fail("activation_timeout")
+        sleeper(min(ACTIVATION_POLL_SECONDS, remaining))
 
 
 def _activate(
     runner: Runner, receipt_path: Path, expected_receipt_sha: str,
     manifest_path: Path, expected_manifest_sha: str, expected_git_sha: str,
     preflight: PreflightArgs, output_path: Path, timeout: float,
+    activation_deadline: float, monotonic: Callable[[], float],
+    sleeper: Callable[[float], None],
 ) -> dict[str, Any]:
     if not 0 < timeout <= MAX_TIMEOUT_SECONDS:
         fail("timeout_invalid")
+    if (
+        not timeout <= activation_deadline <= MAX_ACTIVATION_DEADLINE_SECONDS
+    ):
+        fail("activation_deadline_invalid")
     validate_executables(SYSTEMCTL, PYTHON, PREFLIGHT_PROGRAM, JOURNEY_PROGRAM)
     if (
         preflight.manifest != manifest_path
@@ -630,26 +778,19 @@ def _activate(
     reload_result = invoke(runner, (str(SYSTEMCTL), "daemon-reload"), timeout)
     if reload_result.returncode != 0:
         fail("daemon_reload_failed")
-    invocation_units = list(ALL_UNITS)
+    invocation_units = list(ROLLBACK_ORDER)
     failure: str | None = None
     readiness_digest: str | None = None
     rollback_failed = False
     try:
         result = invoke(runner, (str(SYSTEMCTL), "start", TARGET), timeout)
         start_failed = result.returncode != 0
-        readback_failed = False
-        for unit in ALL_UNITS:
-            try:
-                values = systemctl_show(runner, unit, timeout)
-                if not unit_ready(unit, values):
-                    readback_failed = True
-            except ControlError:
-                readback_failed = True
         if start_failed:
             fail("target_start_failed")
-        if readback_failed:
-            fail("activation_readback_failed")
-        readiness_digest = run_preflight(runner, preflight)
+        readiness_digest = wait_for_activation(
+            runner, preflight, timeout, monotonic() + activation_deadline,
+            monotonic, sleeper,
+        )
     except ControlError as exc:
         failure = exc.code
     if failure is not None:
@@ -686,7 +827,7 @@ def _activate(
         "git_sha": expected_git_sha, "manifest_sha256": expected_manifest_sha,
         "provision_receipt_sha256": expected_receipt_sha,
         "provision_artifact_set_digest": provision["artifact_set_digest"],
-        "started_unit_count": len(invocation_units),
+        "started_unit_count": len(ALL_UNITS),
         "readiness_digest": readiness_digest,
         "m0_acceptance_pass": False,
     }
@@ -698,6 +839,9 @@ def activate(
     runner: Runner, receipt_path: Path, expected_receipt_sha: str,
     manifest_path: Path, expected_manifest_sha: str, expected_git_sha: str,
     preflight: PreflightArgs, output_path: Path, timeout: float,
+    activation_deadline: float = DEFAULT_ACTIVATION_DEADLINE_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     safe_output_path(output_path, "activation_receipt")
     if output_path.exists() or output_path.is_symlink():
@@ -707,7 +851,7 @@ def activate(
             return _activate(
                 runner, receipt_path, expected_receipt_sha, manifest_path,
                 expected_manifest_sha, expected_git_sha, preflight, output_path,
-                timeout,
+                timeout, activation_deadline, monotonic, sleeper,
             )
     except Exception as exc:
         code = exc.code if isinstance(exc, ControlError) else "internal_failure"
@@ -995,6 +1139,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     activation.add_argument("--provision-receipt", type=Path, required=True)
     activation.add_argument("--expected-provision-receipt-sha256", required=True)
     activation.add_argument("--output", type=Path, required=True)
+    activation.add_argument(
+        "--activation-deadline-seconds", type=float,
+        default=DEFAULT_ACTIVATION_DEADLINE_SECONDS,
+    )
     restart = commands.add_parser("restart-journey")
     add_preflight(restart)
     restart.add_argument("--plan", type=Path, required=True)
@@ -1018,6 +1166,7 @@ def main(argv: list[str] | None = None, runner: Runner = production_runner) -> i
                 args.expected_provision_receipt_sha256, args.manifest,
                 args.expected_manifest_sha256, args.expected_git_sha,
                 preflight, args.output, args.timeout,
+                args.activation_deadline_seconds,
             )
         else:
             journey = JourneyArgs(
