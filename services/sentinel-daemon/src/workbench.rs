@@ -3674,16 +3674,16 @@ mod tests {
             .unwrap();
 
         authority.assignment_active = false;
-        assert!(coordinator
-            .poll(
+        let error = match coordinator.poll(
                 &mut runtime,
                 &request.invocation_id,
                 &authority,
                 1_900_000_000_001,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("assignment is not active"));
+            ) {
+            Err(error) => error,
+            Ok(_) => panic!("poll unexpectedly succeeded after authority revocation"),
+        };
+        assert!(error.to_string().contains("assignment is not active"));
         assert_eq!(
             runtime.calls, 1,
             "revocation must reject before runtime I/O"
@@ -3731,9 +3731,15 @@ mod tests {
         };
         let coordinator = WorkbenchCoordinator::new(&store, &profile, &profile_digest);
 
-        let error = coordinator
-            .submit(&mut runtime, &request, &authority, 1_900_000_000_000)
-            .unwrap_err();
+        let error = match coordinator.submit(
+            &mut runtime,
+            &request,
+            &authority,
+            1_900_000_000_000,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("submit unexpectedly succeeded after authority revocation"),
+        };
         assert!(error.to_string().contains("assignment is not active"));
         assert_eq!(runtime.calls, 1);
         assert_eq!(
@@ -3787,9 +3793,15 @@ mod tests {
         };
         let coordinator = WorkbenchCoordinator::new(&store, &profile, &profile_digest);
 
-        let error = coordinator
-            .submit(&mut runtime, &request, &authority, 1_900_000_000_000)
-            .unwrap_err();
+        let error = match coordinator.submit(
+            &mut runtime,
+            &request,
+            &authority,
+            1_900_000_000_000,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("submit unexpectedly succeeded with a stale World guard"),
+        };
         assert!(error.to_string().contains("World authority became stale"));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
@@ -3883,10 +3895,11 @@ mod tests {
                 1_900_000_000_004,
             ),
         ] {
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("assignment is not active"));
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("terminal replay unexpectedly bypassed current authority"),
+            };
+            assert!(error.to_string().contains("assignment is not active"));
         }
         assert_eq!(runtime.calls, 0);
     }
@@ -3909,17 +3922,17 @@ mod tests {
         };
         let coordinator = WorkbenchCoordinator::new(&store, &profile, &profile_digest);
 
-        assert!(coordinator
-            .cancel(
+        let error = match coordinator.cancel(
                 &mut runtime,
                 &request.invocation_id,
                 "operator_cancelled",
                 &authority,
                 1_900_000_000_001,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("assignment is not active"));
+            ) {
+            Err(error) => error,
+            Ok(_) => panic!("cancel unexpectedly succeeded after authority revocation"),
+        };
+        assert!(error.to_string().contains("assignment is not active"));
         assert_eq!(runtime.calls, 0);
         assert_eq!(
             store.load(&request.invocation_id).unwrap().unwrap().state,
