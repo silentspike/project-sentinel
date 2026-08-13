@@ -181,7 +181,10 @@ class ReleasePackageTests(unittest.TestCase):
         self.fixture = Fixture(self.case)
 
     def tearDown(self) -> None:
-        shutil.rmtree(self.case, ignore_errors=True)
+        try:
+            PACKAGE.remove_owned_tree(self.case)
+        except (OSError, PACKAGE.PackageError):
+            shutil.rmtree(self.case, ignore_errors=True)
 
     def assert_error(self, code: str, callable_, *args, **kwargs) -> None:
         with self.assertRaises(PACKAGE.PackageError) as context:
