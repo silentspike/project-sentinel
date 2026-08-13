@@ -23,6 +23,15 @@ PREFLIGHT = REPO_ROOT / "scripts/product-acceptance/run_m0_preflight.py"
 GIT_SHA = "a" * 40
 
 
+def load_provision_core() -> dict[str, object]:
+    shell = PROVISIONER.read_text(encoding="utf-8")
+    python_source = shell.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    definitions = python_source.split("\ntry:\n    result = run", 1)[0]
+    namespace: dict[str, object] = {"__name__": "provision_core_for_tests"}
+    exec(compile(definitions, str(PROVISIONER), "exec"), namespace)
+    return namespace
+
+
 def load_preflight():
     spec = importlib.util.spec_from_file_location("m0_preflight_for_provision_test", PREFLIGHT)
     assert spec is not None and spec.loader is not None
@@ -33,12 +42,13 @@ def load_preflight():
 
 
 PREFLIGHT_MODULE = load_preflight()
+PROVISION_CORE = load_provision_core()
 AUTHORITY = PREFLIGHT_MODULE.CANONICAL_RELEASE_ARTIFACTS
 STOPPED_UNITS = (
     PREFLIGHT_MODULE.REQUIRED_SERVICES
     | PREFLIGHT_MODULE.REQUIRED_TIMERS
     | set(PREFLIGHT_MODULE.TIMER_SERVICES.values())
-    | {PREFLIGHT_MODULE.TARGET_UNIT}
+    | {PREFLIGHT_MODULE.AUTH_INIT_UNIT, PREFLIGHT_MODULE.TARGET_UNIT}
 )
 MODES = {"binary": 0o755, "script": 0o755, "config": 0o644, "systemd": 0o644}
 
@@ -116,6 +126,25 @@ class Fixture:
     def target_for(self, artifact: dict[str, str]) -> Path:
         return self.target / artifact["path"].lstrip("/")
 
+    def artifact_for(self, destination: str) -> dict[str, str]:
+        return next(row for row in self.artifacts if row["path"] == destination)
+
+    def write_legacy_target(
+        self, destination: str, content: bytes = b"legacy-release\n", mode: int = 0o660
+    ) -> Path:
+        target = self.target_for(self.artifact_for(destination))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(mode)
+        current = target.parent
+        sentinel = self.target / "opt/sentinel"
+        while current == sentinel or sentinel in current.parents:
+            current.chmod(0o775)
+            if current == sentinel:
+                break
+            current = current.parent
+        return target
+
 
 class ProvisionM0SingleNodeTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -165,6 +194,16 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
         self.assertTrue(self.fixture.target_for(next(
             row for row in self.fixture.artifacts if row["source"] == "external/nats-server"
         )).is_file())
+        auth_init = next(
+            row
+            for row in self.fixture.artifacts
+            if row["source"] == "deploy/systemd/sentinel-auth-init.service"
+        )
+        self.assertEqual(
+            auth_init["path"], "/etc/systemd/system/sentinel-auth-init.service"
+        )
+        self.assertTrue(self.fixture.target_for(auth_init).is_file())
+        self.assertIn("sentinel-auth-init.service", STOPPED_UNITS)
         self.assertEqual(len(list((self.fixture.target / "opt/sentinel/config/agents").glob("*.toml"))), 60)
         for artifact in self.fixture.artifacts:
             target = self.fixture.target_for(artifact)
@@ -174,6 +213,8 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
         self.assertEqual(receipt["manifest_sha256"], self.fixture.manifest_sha)
         self.assertNotIn("source", receipt)
         self.assertNotIn("target", receipt)
+        self.assertNotIn("uid", json.dumps(receipt))
+        self.assertNotIn("gid", json.dumps(receipt))
 
     def test_idempotent_retry_has_no_mutation(self) -> None:
         first = self.fixture.run()
@@ -186,6 +227,10 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
         second = self.fixture.run()
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(json.loads(second.stdout)["changed_count"], 0)
+        self.assertEqual(
+            json.loads(second.stdout)["legacy_migration"],
+            {"status": "COMPLETE", "directory_count": 0, "file_count": 0},
+        )
         after = {
             row["path"]: (self.fixture.target_for(row).stat().st_ino,
                           self.fixture.target_for(row).stat().st_mtime_ns)
@@ -310,6 +355,15 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
         target.chmod(0o666)
         self.assert_failed(mode_fixture.run(), "target_file_owner_or_mode_invalid")
 
+        hardlink_fixture = Fixture(self.case / "cases" / "target-hardlink")
+        hardlink_row = hardlink_fixture.artifacts[0]
+        hardlink_target = hardlink_fixture.target_for(hardlink_row)
+        hardlink_target.parent.mkdir(parents=True)
+        hardlink_target.write_bytes(b"old")
+        hardlink_target.chmod(MODES[hardlink_row["type"]])
+        os.link(hardlink_target, hardlink_fixture.base / "second-link")
+        self.assert_failed(hardlink_fixture.run(), "target_file_authority_invalid")
+
         owner_result = Fixture(self.case / "cases" / "owner").run("--install-uid", str(os.geteuid() + 1))
         self.assert_failed(owner_result, "install_owner_invalid")
 
@@ -343,6 +397,132 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
         receipt = json.loads((self.fixture.stage / "provision-receipt.json").read_text())
         self.assertEqual(receipt["status"], "ROLLED_BACK")
         self.assertFalse(receipt["services_started"])
+
+    def test_legacy_modes_are_taken_over_only_for_manifest_files_and_canonical_dirs(self) -> None:
+        daemon = self.fixture.write_legacy_target("/opt/sentinel/config/daemon.toml")
+        nats = self.fixture.write_legacy_target("/etc/nats/nats.conf", mode=0o640)
+        original_daemon = daemon.read_bytes()
+        original_nats = nats.read_bytes()
+
+        result = self.fixture.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(result.stdout)
+        self.assertGreaterEqual(receipt["legacy_migration"]["directory_count"], 2)
+        self.assertEqual(receipt["legacy_migration"]["file_count"], 2)
+        self.assertNotEqual(daemon.read_bytes(), original_daemon)
+        self.assertNotEqual(nats.read_bytes(), original_nats)
+        self.assertEqual(daemon.stat().st_mode & 0o7777, 0o644)
+        self.assertEqual(nats.stat().st_mode & 0o7777, 0o644)
+        self.assertEqual((self.fixture.target / "opt/sentinel").stat().st_mode & 0o7777, 0o755)
+
+    def test_identity_drift_is_rejected_before_takeover(self) -> None:
+        target = self.fixture.write_legacy_target("/opt/sentinel/config/daemon.toml")
+        before = (target.read_bytes(), target.stat().st_mode, target.stat().st_ino)
+        result = self.fixture.run("--test-identity-mismatch")
+        self.assert_failed(result, "target_identity_changed")
+        self.assertEqual(
+            (target.read_bytes(), target.stat().st_mode, target.stat().st_ino), before
+        )
+        self.assertFalse((self.fixture.stage / "provision-receipt.json").exists())
+
+    def test_partial_takeover_failure_restores_exact_metadata(self) -> None:
+        daemon = self.fixture.write_legacy_target("/opt/sentinel/config/daemon.toml")
+        script = self.fixture.write_legacy_target(
+            "/opt/sentinel/scripts/init-dashboard-auth.sh", mode=0o750
+        )
+        paths = [self.fixture.target / "opt/sentinel", daemon.parent, daemon, script]
+        before = {
+            path: (path.read_bytes() if path.is_file() else None, path.stat().st_uid,
+                   path.stat().st_gid, path.stat().st_mode & 0o7777, path.stat().st_ino)
+            for path in paths
+        }
+        result = self.fixture.run("--test-fail-takeover-after", "2")
+        self.assert_failed(result, "injected_takeover_failure")
+        after = {
+            path: (path.read_bytes() if path.is_file() else None, path.stat().st_uid,
+                   path.stat().st_gid, path.stat().st_mode & 0o7777, path.stat().st_ino)
+            for path in paths
+        }
+        self.assertEqual(after, before)
+        receipt = json.loads((self.fixture.stage / "provision-receipt.json").read_text())
+        self.assertEqual(receipt["status"], "ROLLED_BACK")
+        self.assertEqual(receipt["legacy_migration"]["status"], "ROLLED_BACK")
+        state = self.fixture.stage / "operation/legacy-owner-state.json"
+        self.assertEqual(state.stat().st_mode & 0o7777, 0o600)
+        records = json.loads(state.read_text())["records"]
+        self.assertGreaterEqual(len(records), 4)
+
+    def test_install_failure_after_takeover_restores_content_owner_and_mode(self) -> None:
+        daemon = self.fixture.write_legacy_target("/opt/sentinel/config/daemon.toml")
+        before = (
+            daemon.read_bytes(), daemon.stat().st_uid, daemon.stat().st_gid,
+            daemon.stat().st_mode & 0o7777,
+        )
+        result = self.fixture.run("--fail-after", str(len(AUTHORITY)))
+        self.assert_failed(result, "injected_install_failure")
+        self.assertEqual(
+            (daemon.read_bytes(), daemon.stat().st_uid, daemon.stat().st_gid,
+             daemon.stat().st_mode & 0o7777),
+            before,
+        )
+        self.assertEqual(
+            (self.fixture.target / "opt/sentinel").stat().st_mode & 0o7777, 0o775
+        )
+
+    def test_world_writable_or_setid_legacy_metadata_is_rejected(self) -> None:
+        for mode in (0o777, 0o2755):
+            with self.subTest(mode=oct(mode)):
+                fixture = Fixture(self.case / "cases" / f"unsafe-{mode:o}")
+                target = fixture.write_legacy_target(
+                    "/opt/sentinel/config/daemon.toml", mode=mode
+                )
+                before = target.read_bytes()
+                self.assert_failed(fixture.run(), "target_file_owner_or_mode_invalid")
+                self.assertEqual(target.read_bytes(), before)
+
+        directory_fixture = Fixture(self.case / "cases" / "unsafe-directory")
+        directory_fixture.write_legacy_target("/opt/sentinel/config/daemon.toml")
+        (directory_fixture.target / "opt/sentinel").chmod(0o777)
+        self.assert_failed(
+            directory_fixture.run(), "target_parent_authority_invalid"
+        )
+
+        noncanonical_fixture = Fixture(self.case / "cases" / "broad-parent")
+        noncanonical_fixture.write_legacy_target("/etc/nats/nats.conf", mode=0o640)
+        (noncanonical_fixture.target / "etc/nats").chmod(0o775)
+        self.assert_failed(
+            noncanonical_fixture.run(), "target_parent_authority_invalid"
+        )
+
+    def test_owner_pair_allowlist_is_exact_and_never_cartesian(self) -> None:
+        parse = PROVISION_CORE["parse_owner_pairs"]
+        allowed_fn = PROVISION_CORE["owner_pair_allowed"]
+        self.assertTrue(callable(parse))
+        self.assertTrue(callable(allowed_fn))
+        allowed = {(0, 0)} | parse(["1000:1000", "0:1000"], "invalid")
+        self.assertTrue(allowed_fn(0, 0, allowed))
+        self.assertTrue(allowed_fn(1000, 1000, allowed))
+        self.assertTrue(allowed_fn(0, 1000, allowed))
+        for pair in ((1000, 0), (1001, 1000), (0, 1001), (65534, 65534)):
+            with self.subTest(pair=pair):
+                self.assertFalse(allowed_fn(pair[0], pair[1], allowed))
+
+    @unittest.skipUnless(os.geteuid() == 0, "mixed-owner representation requires root")
+    def test_approved_legacy_owner_migrates_and_foreign_owner_fails(self) -> None:
+        approved = Fixture(self.case / "cases" / "approved-owner")
+        target = approved.write_legacy_target("/opt/sentinel/config/daemon.toml")
+        os.chown(target, 65534, 65534)
+        result = approved.run("--test-legacy-owner", "65534:65534")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((target.stat().st_uid, target.stat().st_gid), (0, 0))
+
+        foreign = Fixture(self.case / "cases" / "foreign-owner")
+        foreign_target = foreign.write_legacy_target("/opt/sentinel/config/daemon.toml")
+        os.chown(foreign_target, 65533, 65533)
+        self.assert_failed(
+            foreign.run("--test-legacy-owner", "65534:65534"),
+            "target_file_foreign_owner",
+        )
 
     def test_manifest_and_source_path_ambiguity_fail(self) -> None:
         for field, value in (("source", "../secret"), ("path", "/opt/sentinel/../data")):

@@ -12,6 +12,13 @@ the product-acceptance contract, and the separately packaged `nats-server`
 binary. Missing, extra, duplicate, source-swapped, type-swapped, or hash-mismatched
 entries fail before target files are changed.
 
+The stopped release also installs `sentinel-auth-init.service`. On activation,
+`sentinel.target` requires this single root-owned oneshot before the daemon,
+Gateway, dashboard, or Nightrun may consume `operator-api`. The idempotent
+initializer migrates a legacy dashboard environment value into the canonical
+systemd credential leaf; any conflict or initialization failure prevents every
+credential consumer from starting.
+
 The operator supplies both the approved Git SHA and the SHA-256 of the raw
 manifest. Sources must be regular, single-link, owner-controlled files below
 the source root. All required Sentinel units must be stopped. Production
@@ -23,16 +30,30 @@ sudo bash deploy/provision-m0-single-node.sh \
   --expected-manifest-sha256 "${APPROVED_MANIFEST_SHA256}" \
   --expected-git-sha "${APPROVED_GIT_SHA}" \
   --source-root /work/tmp/project-sentinel/release \
-  --stage-root /work/tmp/project-sentinel/m0-provision
+  --stage-root /work/tmp/project-sentinel/m0-provision \
+  --approved-legacy-owner 1000:1000 \
+  --approved-legacy-owner 0:1000
 ```
+
+The two numeric legacy owner pairs are an explicit, host-specific approval and must be
+reconfirmed read-only with `stat -c '%u:%g'` on the canonical legacy Sentinel
+paths immediately before this later `.240` command. The values above are the
+approved M0 legacy identities (`1000:1000` files/directories and the
+root-owned, legacy-group `0:1000` config); the provisioner never infers owners,
+combines UID/GID components, or broadens this exact pair list.
 
 Installed ownership is `root:root`; binaries and scripts use mode `0755`, while
 configs and systemd units use `0644`. Existing files are captured in the
 owner-only staging area before replacement. A partial installation rolls back
-the changed files and emits `provision-receipt.json` with a bounded, public-safe
-status. The provisioner never copies secrets, identity, databases, or runtime
-state, and it never starts, enables, reloads, or restarts a service. Service
-activation and runtime acceptance are separate, explicitly authorized steps.
+the changed files and the exact pre-takeover owner/mode metadata, then emits
+`provision-receipt.json` with a bounded, public-safe status. Only manifest-owned
+files and the minimal canonical `/opt/sentinel` parent set may move from the
+approved numeric legacy identity to `root:root`; foreign owners, symlinks,
+hardlinks, set-id/sticky bits, and world-writable paths fail closed. There is no
+recursive `chown`. The provisioner never copies secrets, identity, databases,
+or runtime state, and it never starts, enables, reloads, or restarts a service.
+Service activation and runtime acceptance are separate, explicitly authorized
+steps.
 
 ## Ziel-VM
 

@@ -36,6 +36,7 @@ ARTIFACT_DEFS=(
   "config/controlplane.toml|/opt/sentinel/config/controlplane.toml|config"
   "config/nats.conf|/etc/nats/nats.conf|config"
   # systemd units
+  "deploy/systemd/sentinel-auth-init.service|/etc/systemd/system/sentinel-auth-init.service|systemd"
   "deploy/systemd/sentinel-daemon.service|/etc/systemd/system/sentinel-daemon.service|systemd"
   "deploy/systemd/sentinel-gateway.service|/etc/systemd/system/sentinel-gateway.service|systemd"
   "deploy/systemd/sentinel-judge.service|/etc/systemd/system/sentinel-judge.service|systemd"

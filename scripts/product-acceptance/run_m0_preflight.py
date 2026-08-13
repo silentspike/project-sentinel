@@ -38,6 +38,7 @@ DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 TARGET_UNIT = "sentinel.target"
+AUTH_INIT_UNIT = "sentinel-auth-init.service"
 REQUIRED_SERVICES = {
     "nats-server.service",
     "sentinel-daemon.service",
@@ -49,7 +50,8 @@ REQUIRED_SERVICES = {
     "sentinel-projection.service",
 }
 REQUIRED_TIMERS = {"sentinel-health-monitor.timer", "sentinel-nightrun.timer"}
-REQUIRED_UNITS = REQUIRED_SERVICES | REQUIRED_TIMERS
+TARGET_WANTS = REQUIRED_SERVICES | REQUIRED_TIMERS
+REQUIRED_UNITS = TARGET_WANTS | {AUTH_INIT_UNIT}
 SERVICE_EXECUTABLES = {
     "nats-server.service": Path("/usr/local/bin/nats-server"),
     "sentinel-daemon.service": Path("/opt/sentinel/bin/sentinel-daemon"),
@@ -211,6 +213,10 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
     "/opt/sentinel/config/company.toml": ("config/company.toml", "config"),
     "/opt/sentinel/config/controlplane.toml": ("config/controlplane.toml", "config"),
     "/etc/nats/nats.conf": ("config/nats.conf", "config"),
+    "/etc/systemd/system/sentinel-auth-init.service": (
+        "deploy/systemd/sentinel-auth-init.service",
+        "systemd",
+    ),
     "/etc/systemd/system/sentinel-daemon.service": (
         "deploy/systemd/sentinel-daemon.service",
         "systemd",
@@ -1154,13 +1160,17 @@ def validate_systemd(
         "SubState",
         "FragmentPath",
         "Wants",
+        "Requires",
         "NeedDaemonReload",
     )
     target = systemctl_show(TARGET_UNIT, target_properties, deps, timeout)
     if set(target) != set(target_properties):
         raise PreflightError("systemd_target_shape")
     wants = target.get("Wants", "").split()
-    if len(wants) != len(set(wants)) or set(wants) != set(REQUIRED_UNITS):
+    requires = target.get("Requires", "").split()
+    if len(wants) != len(set(wants)) or set(wants) != set(TARGET_WANTS):
+        raise PreflightError("systemd_required_set_mismatch")
+    if len(requires) != len(set(requires)) or set(requires) != {AUTH_INIT_UNIT}:
         raise PreflightError("systemd_required_set_mismatch")
     expected_target = {
         "Id": TARGET_UNIT,
@@ -1175,6 +1185,44 @@ def validate_systemd(
             raise PreflightError("systemd_target_not_ready")
     unit_facts: list[dict[str, str]] = []
     main_pids: dict[str, int] = {}
+    auth_properties = (
+        "Id",
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "Result",
+        "FragmentPath",
+        "NeedDaemonReload",
+        "ExecMainCode",
+        "ExecMainStatus",
+    )
+    auth_facts = systemctl_show(AUTH_INIT_UNIT, auth_properties, deps, timeout)
+    if set(auth_facts) != set(auth_properties):
+        raise PreflightError("systemd_auth_init_shape")
+    expected_auth = {
+        "Id": AUTH_INIT_UNIT,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "SubState": "exited",
+        "Result": "success",
+        "FragmentPath": f"/etc/systemd/system/{AUTH_INIT_UNIT}",
+        "NeedDaemonReload": "no",
+        "ExecMainCode": "1",
+        "ExecMainStatus": "0",
+    }
+    if any(auth_facts.get(key) != value for key, value in expected_auth.items()):
+        raise PreflightError("systemd_auth_init_not_ready")
+    unit_facts.append(
+        {
+            "unit": AUTH_INIT_UNIT,
+            "fragment_digest": hashlib.sha256(
+                auth_facts["FragmentPath"].encode("ascii")
+            ).hexdigest(),
+            "executable_digest": artifact_authority[
+                "/opt/sentinel/scripts/init-dashboard-auth.sh"
+            ]["sha256"],
+        }
+    )
     for unit in sorted(REQUIRED_SERVICES):
         properties = (
             "Id",

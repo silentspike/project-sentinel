@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unicode"
+	"unicode/utf8"
 )
 
 type CallerRole string
@@ -26,6 +29,327 @@ type CallerCredentials struct {
 	PlatformControlplane string
 	Evolution            string
 	Judge                string
+}
+
+const (
+	directOperatorCredentialEnv = "SENTINEL_OPERATOR_API_KEY"
+	operatorCredentialFileEnv   = "SENTINEL_OPERATOR_API_KEY_FILE"
+	operatorCredentialName      = "operator-api"
+	operatorCredentialMinSize   = 32
+	operatorCredentialMaxSize   = 4096
+)
+
+type operatorCredentialIdentity struct {
+	device uint64
+	inode  uint64
+	uid    uint32
+	gid    uint32
+	mode   uint32
+	links  uint64
+	size   int64
+	mtime  syscall.Timespec
+	ctime  syscall.Timespec
+}
+
+type operatorCredentialDirectoryIdentity struct {
+	device uint64
+	inode  uint64
+	uid    uint32
+	gid    uint32
+	mode   uint32
+}
+
+type openOperatorCredential struct {
+	file        *os.File
+	identity    operatorCredentialIdentity
+	directories []operatorCredentialDirectoryIdentity
+}
+
+type operatorCredentialProcessIdentityError struct {
+	field string
+}
+
+func (err operatorCredentialProcessIdentityError) Error() string {
+	return fmt.Sprintf("operator credential process %s is invalid", err.field)
+}
+
+func operatorIdentity(stat *syscall.Stat_t) operatorCredentialIdentity {
+	return operatorCredentialIdentity{
+		device: uint64(stat.Dev),
+		inode:  stat.Ino,
+		uid:    stat.Uid,
+		gid:    stat.Gid,
+		mode:   stat.Mode,
+		links:  uint64(stat.Nlink),
+		size:   stat.Size,
+		mtime:  stat.Mtim,
+		ctime:  stat.Ctim,
+	}
+}
+
+func operatorDirectoryIdentity(stat *syscall.Stat_t) operatorCredentialDirectoryIdentity {
+	return operatorCredentialDirectoryIdentity{
+		device: uint64(stat.Dev),
+		inode:  stat.Ino,
+		uid:    stat.Uid,
+		gid:    stat.Gid,
+		mode:   stat.Mode,
+	}
+}
+
+// LoadOperatorCredentialFromFile loads the gateway's operator authority from
+// the canonical systemd credential leaf. The value is returned only to the
+// in-memory API-CP client and is never logged or copied into configuration.
+func LoadOperatorCredentialFromFile() (string, error) {
+	if err := RejectDirectOperatorCredentialEnv(); err != nil {
+		return "", err
+	}
+	return loadOperatorCredentialFromFile()
+}
+
+// LoadAPICPOperatorCredential validates the process-wide authority contract
+// before considering whether API-CP is enabled. Disabled API-CP does not open
+// the credential file, but a present plaintext variable is always rejected.
+func LoadAPICPOperatorCredential(enabled bool) (string, error) {
+	if err := RejectDirectOperatorCredentialEnv(); err != nil {
+		return "", err
+	}
+	if !enabled {
+		return "", nil
+	}
+	return loadOperatorCredentialFromFile()
+}
+
+// RejectDirectOperatorCredentialEnv rejects presence, including an explicitly
+// empty value, so no caller can retain a second plaintext authority source.
+func RejectDirectOperatorCredentialEnv() error {
+	if _, present := os.LookupEnv(directOperatorCredentialEnv); present {
+		return fmt.Errorf("direct operator credentials are not allowed")
+	}
+	return nil
+}
+
+func loadOperatorCredentialFromFile() (string, error) {
+	path := os.Getenv(operatorCredentialFileEnv)
+	if path == "" {
+		return "", fmt.Errorf("%s is required", operatorCredentialFileEnv)
+	}
+	if strings.TrimSpace(path) != path {
+		return "", fmt.Errorf("operator credential path is invalid")
+	}
+	return readOperatorCredentialFile(path, func() error { return nil })
+}
+
+func validateOperatorCredentialPath(path string) (string, []string, error) {
+	cleanPath := filepath.Clean(path)
+	if !filepath.IsAbs(path) || path != cleanPath || filepath.Base(path) != operatorCredentialName {
+		return "", nil, fmt.Errorf("operator credential path must be the canonical systemd credential leaf")
+	}
+	credentialsDirectory := os.Getenv("CREDENTIALS_DIRECTORY")
+	if credentialsDirectory == "" || !filepath.IsAbs(credentialsDirectory) ||
+		strings.TrimSpace(credentialsDirectory) != credentialsDirectory ||
+		credentialsDirectory != filepath.Clean(credentialsDirectory) ||
+		filepath.Dir(path) != credentialsDirectory {
+		return "", nil, fmt.Errorf("operator credential path is outside CREDENTIALS_DIRECTORY")
+	}
+
+	components := strings.Split(strings.TrimPrefix(credentialsDirectory, string(filepath.Separator)), string(filepath.Separator))
+	for _, component := range components {
+		if component == "" || component == "." || component == ".." {
+			return "", nil, fmt.Errorf("operator credential path is invalid")
+		}
+	}
+	return credentialsDirectory, components, nil
+}
+
+func checkedOperatorCredentialProcessID(field string, value int) (uint32, error) {
+	if value < 0 || uint64(value) > uint64(^uint32(0)) {
+		return 0, operatorCredentialProcessIdentityError{field: field}
+	}
+	return uint32(value), nil
+}
+
+func checkedOperatorCredentialFileDescriptor(value int) (uintptr, error) {
+	if value < 0 {
+		return 0, operatorCredentialProcessIdentityError{field: "file descriptor"}
+	}
+	return uintptr(value), nil
+}
+
+func operatorCredentialProcessIdentity() (uint32, uint32, error) {
+	euid, err := checkedOperatorCredentialProcessID("user ID", os.Geteuid())
+	if err != nil {
+		return 0, 0, err
+	}
+	egID, err := checkedOperatorCredentialProcessID("group ID", os.Getegid())
+	if err != nil {
+		return 0, 0, err
+	}
+	return euid, egID, nil
+}
+
+func validateOperatorCredentialDirectory(fd int, processUID uint32) (operatorCredentialDirectoryIdentity, error) {
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil {
+		return operatorCredentialDirectoryIdentity{}, err
+	}
+	mode := stat.Mode & 0o7777
+	if stat.Mode&syscall.S_IFMT != syscall.S_IFDIR ||
+		(stat.Uid != 0 && stat.Uid != processUID) || mode&0o7022 != 0 {
+		return operatorCredentialDirectoryIdentity{}, fmt.Errorf("operator credential directory metadata is invalid")
+	}
+	return operatorDirectoryIdentity(&stat), nil
+}
+
+func openOperatorCredentialDirectory(
+	components []string,
+	processUID uint32,
+) (int, []operatorCredentialDirectoryIdentity, error) {
+	directoryFD, err := syscall.Open(string(filepath.Separator), syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, nil, fmt.Errorf("open operator credential root: %w", err)
+	}
+	directories := make([]operatorCredentialDirectoryIdentity, 0, len(components)+1)
+	returnDirectory := false
+	defer func() {
+		if !returnDirectory {
+			_ = syscall.Close(directoryFD)
+		}
+	}()
+
+	identity, err := validateOperatorCredentialDirectory(directoryFD, processUID)
+	if err != nil {
+		return -1, nil, err
+	}
+	directories = append(directories, identity)
+	for _, component := range components {
+		nextFD, err := syscall.Openat(directoryFD, component, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return -1, nil, fmt.Errorf("open operator credential directory: %w", err)
+		}
+		identity, err := validateOperatorCredentialDirectory(nextFD, processUID)
+		if err != nil {
+			_ = syscall.Close(nextFD)
+			return -1, nil, err
+		}
+		_ = syscall.Close(directoryFD)
+		directoryFD = nextFD
+		directories = append(directories, identity)
+	}
+	returnDirectory = true
+	return directoryFD, directories, nil
+}
+
+func openOperatorCredentialLeaf(directoryFD int, processUID, processGID uint32) (*os.File, operatorCredentialIdentity, error) {
+	fileFD, err := syscall.Openat(directoryFD, operatorCredentialName, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, operatorCredentialIdentity{}, fmt.Errorf("open operator credential: %w", err)
+	}
+	fileDescriptor, err := checkedOperatorCredentialFileDescriptor(fileFD)
+	if err != nil {
+		_ = syscall.Close(fileFD)
+		return nil, operatorCredentialIdentity{}, err
+	}
+	file := os.NewFile(fileDescriptor, operatorCredentialName)
+	if file == nil {
+		_ = syscall.Close(fileFD)
+		return nil, operatorCredentialIdentity{}, fmt.Errorf("open operator credential: invalid descriptor")
+	}
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fileFD, &stat); err != nil {
+		_ = file.Close()
+		return nil, operatorCredentialIdentity{}, fmt.Errorf("stat opened operator credential: %w", err)
+	}
+	identity := operatorIdentity(&stat)
+	permission := stat.Mode & 0o7777
+	rootSystemdCredential := stat.Uid == 0 && stat.Gid == 0 && (permission == 0o400 || permission == 0o440)
+	serviceCredential := stat.Uid == processUID && stat.Gid == processGID &&
+		(permission == 0o400 || permission == 0o600)
+	if stat.Mode&syscall.S_IFMT != syscall.S_IFREG || stat.Nlink != 1 ||
+		stat.Size < operatorCredentialMinSize || stat.Size > operatorCredentialMaxSize ||
+		(!rootSystemdCredential && !serviceCredential) {
+		_ = file.Close()
+		return nil, operatorCredentialIdentity{}, fmt.Errorf("operator credential metadata is invalid")
+	}
+	return file, identity, nil
+}
+
+func openOperatorCredentialFile(path string) (openOperatorCredential, error) {
+	_, components, err := validateOperatorCredentialPath(path)
+	if err != nil {
+		return openOperatorCredential{}, err
+	}
+	processUID, processGID, err := operatorCredentialProcessIdentity()
+	if err != nil {
+		return openOperatorCredential{}, err
+	}
+	directoryFD, directories, err := openOperatorCredentialDirectory(components, processUID)
+	if err != nil {
+		return openOperatorCredential{}, err
+	}
+	defer func() { _ = syscall.Close(directoryFD) }()
+	file, identity, err := openOperatorCredentialLeaf(directoryFD, processUID, processGID)
+	if err != nil {
+		return openOperatorCredential{}, err
+	}
+	return openOperatorCredential{file: file, identity: identity, directories: directories}, nil
+}
+
+func readOperatorCredentialFile(path string, afterOpen func() error) (string, error) {
+	opened, err := openOperatorCredentialFile(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = opened.file.Close() }()
+	if err := afterOpen(); err != nil {
+		return "", fmt.Errorf("operator credential validation hook: %w", err)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(opened.file, operatorCredentialMaxSize+1))
+	if err != nil {
+		return "", fmt.Errorf("read operator credential: %w", err)
+	}
+	if len(data) < operatorCredentialMinSize || len(data) > operatorCredentialMaxSize {
+		return "", fmt.Errorf("operator credential length is invalid")
+	}
+	afterInfo, err := opened.file.Stat()
+	if err != nil {
+		return "", fmt.Errorf("recheck opened operator credential metadata: %w", err)
+	}
+	after, ok := afterInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", fmt.Errorf("recheck opened operator credential metadata: invalid stat type")
+	}
+	reopened, err := openOperatorCredentialFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reopen operator credential: %w", err)
+	}
+	defer func() { _ = reopened.file.Close() }()
+	if operatorIdentity(after) != opened.identity || reopened.identity != opened.identity ||
+		len(data) != int(opened.identity.size) ||
+		!equalOperatorCredentialDirectories(reopened.directories, opened.directories) {
+		return "", fmt.Errorf("operator credential identity changed while reading")
+	}
+	if !utf8.Valid(data) {
+		return "", fmt.Errorf("operator credential encoding is invalid")
+	}
+	value := string(data)
+	if strings.TrimSpace(value) != value || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return "", fmt.Errorf("operator credential content is invalid")
+	}
+	return value, nil
+}
+
+func equalOperatorCredentialDirectories(left, right []operatorCredentialDirectoryIdentity) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func LoadCallerCredentialsFromFiles() (CallerCredentials, error) {
