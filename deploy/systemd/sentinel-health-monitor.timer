@@ -1,6 +1,7 @@
 [Unit]
 Description=Sentinel Health Monitor Timer — Check every 60s
 Documentation=https://github.com/silentspike/project-sentinel
+After=nats-server.service sentinel-daemon.service sentinel-projection.service sentinel-gateway.service sentinel-dashboard-backend.service sentinel-nats-bridge.service sentinel-judge.service
 
 [Timer]
 OnBootSec=30

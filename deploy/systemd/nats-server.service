@@ -8,8 +8,10 @@ StartLimitIntervalSec=300
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/nats-server -c /etc/nats/nats.conf
+ExecStartPost=/usr/bin/python3 /opt/sentinel/scripts/m0-readiness.py nats --timeout-seconds 285
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=300
 MemoryMax=768M
 
 # Logging
