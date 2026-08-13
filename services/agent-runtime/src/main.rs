@@ -23,7 +23,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-type ActiveInvocations = Arc<Mutex<BTreeMap<String, Arc<AtomicBool>>>>;
+#[derive(Clone)]
+struct ActiveInvocation {
+    cancelled: Arc<AtomicBool>,
+    deadline_cancelled: Arc<AtomicBool>,
+}
+
+type ActiveInvocations = Arc<Mutex<BTreeMap<String, ActiveInvocation>>>;
 
 enum ReaderEvent {
     Command(WorkbenchCommand),
@@ -43,7 +49,14 @@ fn main() {
     let artifact_root = std::env::var_os("SENTINEL_ARTIFACT_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/artifacts"));
-    let executor = Arc::new(WorkbenchExecutor::new(workspace_root, artifact_root));
+    let input_root = std::env::var_os("SENTINEL_INPUT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/workspace/.inputs"));
+    let executor = Arc::new(WorkbenchExecutor::with_input_root(
+        workspace_root,
+        artifact_root,
+        input_root,
+    ));
     let active: ActiveInvocations = Arc::new(Mutex::new(BTreeMap::new()));
     let output_lock = Arc::new(Mutex::new(()));
     let running = Arc::new(AtomicBool::new(true));
@@ -133,6 +146,7 @@ fn handle_command(
                 return;
             }
             let cancellation = Arc::new(AtomicBool::new(false));
+            let deadline_cancellation = Arc::new(AtomicBool::new(false));
             let active_conflict = {
                 let mut active_guard = active.lock().unwrap_or_else(|error| error.into_inner());
                 if active_guard.contains_key(&invocation_id) {
@@ -146,7 +160,13 @@ fn handle_command(
                         "the isolated agent runtime already has an active invocation",
                     ))
                 } else {
-                    active_guard.insert(invocation_id.clone(), cancellation.clone());
+                    active_guard.insert(
+                        invocation_id.clone(),
+                        ActiveInvocation {
+                            cancelled: cancellation.clone(),
+                            deadline_cancelled: deadline_cancellation.clone(),
+                        },
+                    );
                     None
                 }
             };
@@ -175,33 +195,43 @@ fn handle_command(
                     WorkbenchProgressStage::Executing,
                     0,
                 );
-                let result = executor.execute(*request, cancellation);
-                match executor.persist_completion_receipt(&result) {
-                    Ok(()) => emit(&output_lock, &result),
-                    Err(error) => emit(
-                        &output_lock,
-                        &WorkbenchMessage::Error {
-                            schema_version: WORKBENCH_SCHEMA_VERSION,
-                            invocation_id: Some(invocation_id.clone()),
-                            error,
-                        },
-                    ),
+                let mut result = executor.execute(*request, cancellation);
+                apply_outer_deadline_outcome(&mut result, &deadline_cancellation);
+                let receipt_persisted = match executor.persist_completion_receipt(&result) {
+                    Ok(()) => {
+                        emit(&output_lock, &result);
+                        true
+                    }
+                    Err(error) => {
+                        emit(
+                            &output_lock,
+                            &WorkbenchMessage::Error {
+                                schema_version: WORKBENCH_SCHEMA_VERSION,
+                                invocation_id: Some(invocation_id.clone()),
+                                error,
+                            },
+                        );
+                        false
+                    }
                 };
-                let mut active_guard = active.lock().unwrap_or_else(|error| error.into_inner());
-                active_guard.remove(&invocation_id);
-                drop(active_guard);
-                emit_progress(
-                    &output_lock,
-                    &invocation_id,
-                    WorkbenchProgressStage::Completed,
-                    elapsed_ms(started),
-                );
+                if receipt_persisted {
+                    emit_progress(
+                        &output_lock,
+                        &invocation_id,
+                        WorkbenchProgressStage::Completed,
+                        elapsed_ms(started),
+                    );
+                }
+                active
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&invocation_id);
             });
         }
         WorkbenchCommand::Cancel {
             schema_version,
             invocation_id,
-            reason: _,
+            reason,
         } => {
             if schema_version != WORKBENCH_SCHEMA_VERSION {
                 emit(
@@ -222,28 +252,16 @@ fn handle_command(
                 .unwrap_or_else(|error| error.into_inner())
                 .get(&invocation_id)
                 .cloned();
-            match cancellation {
-                Some(cancellation) => {
-                    cancellation.store(true, Ordering::Release);
-                    emit(
-                        &output_lock,
-                        &WorkbenchMessage::Cancelled {
-                            schema_version: WORKBENCH_SCHEMA_VERSION,
-                            invocation_id,
-                        },
-                    );
+            if let Some(cancellation) = cancellation {
+                // The result/receipt path owns the terminal acknowledgement.
+                // Emitting `cancelled` here would let the adapter tear down the
+                // process before the effect outcome and receipt are known.
+                if reason == "deadline_expired" {
+                    cancellation
+                        .deadline_cancelled
+                        .store(true, Ordering::Release);
                 }
-                None => emit(
-                    &output_lock,
-                    &WorkbenchMessage::Error {
-                        schema_version: WORKBENCH_SCHEMA_VERSION,
-                        invocation_id: Some(invocation_id),
-                        error: protocol_error(
-                            "invocation_not_active",
-                            "the invocation is not active in this runtime",
-                        ),
-                    },
-                ),
+                cancellation.cancelled.store(true, Ordering::Release);
             }
         }
         WorkbenchCommand::Recover {
@@ -326,7 +344,7 @@ fn cancel_all_and_wait(active: &ActiveInvocations) {
     {
         let active_guard = active.lock().unwrap_or_else(|error| error.into_inner());
         for cancellation in active_guard.values() {
-            cancellation.store(true, Ordering::Release);
+            cancellation.cancelled.store(true, Ordering::Release);
         }
     }
     let deadline = Instant::now() + SHUTDOWN_GRACE;
@@ -341,6 +359,30 @@ fn cancel_all_and_wait(active: &ActiveInvocations) {
         thread::sleep(Duration::from_millis(10));
     }
     eprintln!("agent-runtime: shutdown grace expired with active work");
+}
+
+fn apply_outer_deadline_outcome(
+    message: &mut WorkbenchMessage,
+    deadline_cancelled: &AtomicBool,
+) {
+    if !deadline_cancelled.load(Ordering::Acquire) {
+        return;
+    }
+    let WorkbenchMessage::Result {
+        outcome,
+        error: Some(error),
+        ..
+    } = message
+    else {
+        return;
+    };
+    if *outcome == sentinel_common::WorkbenchOutcome::Cancelled {
+        *outcome = sentinel_common::WorkbenchOutcome::TimedOut;
+        error.class = WorkbenchErrorClass::Resource;
+        error.code = "deadline_expired".to_string();
+        error.safe_message = "invocation deadline expired".to_string();
+        error.retryable = false;
+    }
 }
 
 fn emit_progress(

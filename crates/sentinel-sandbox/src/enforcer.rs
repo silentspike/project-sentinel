@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::bwrap::{BwrapConfig, SpawnedSandbox};
@@ -1359,6 +1359,40 @@ impl SandboxEnforcer {
             config = config.with_fs_mount(fs_mount, fs_host_agent_dir.unwrap_or(name), name);
         }
 
+        self.start_process_with_config(name, config, command)
+    }
+
+    /// Starts the persistent agent-runtime used by the M0 workbench protocol.
+    /// Its only writable roots are the exact agent-owned workspace and artifact
+    /// directories. Unlike the general agent sandbox, missing binds are fatal.
+    pub fn start_workbench_process(
+        &self,
+        name: &str,
+        fs_host_agent_dir: Option<&str>,
+        command: &[String],
+    ) -> Result<AgentProcess> {
+        if !self.bwrap_available {
+            anyhow::bail!("bwrap not available — cannot start workbench process");
+        }
+        let host_agent_root = workbench_host_agent_root(
+            self.fs_mount.as_deref(),
+            name,
+            fs_host_agent_dir,
+        );
+        prepare_workbench_roots(&host_agent_root)?;
+        let config = BwrapConfig::for_agent(name)
+            .for_workbench()
+            .with_workbench_roots(&host_agent_root);
+        self.start_process_with_config(name, config, command)
+    }
+
+    fn start_process_with_config(
+        &self,
+        name: &str,
+        mut config: BwrapConfig,
+        command: &[String],
+    ) -> Result<AgentProcess> {
+
         // #75: full cage is unconditional — BwrapConfig::for_agent already sets
         // share_net=false (no --share-net). The daemon verifies isolation
         // post-spawn on the sandboxed child PID.
@@ -1752,6 +1786,64 @@ fn expire_protocol_cancel_if_due(
 /// Returns the expected path for the landlock-wrapper binary.
 ///
 /// Checks (in order): next to current executable, /opt/sentinel/bin/, /usr/local/bin/.
+fn prepare_workbench_roots(host_agent_root: &Path) -> Result<()> {
+    let parent = host_agent_root
+        .parent()
+        .ok_or_else(|| anyhow!("workbench agent root has no parent"))?;
+    let parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("canonicalize workbench root parent {}", parent.display()))?;
+    match std::fs::symlink_metadata(host_agent_root) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "workbench agent root must be a real directory"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(host_agent_root).with_context(|| {
+                format!("create workbench agent root {}", host_agent_root.display())
+            })?;
+        }
+        Err(error) => return Err(error).context("inspect workbench agent root"),
+    }
+    let canonical_root = std::fs::canonicalize(host_agent_root)
+        .with_context(|| format!("canonicalize workbench agent root {}", host_agent_root.display()))?;
+    anyhow::ensure!(
+        canonical_root.starts_with(&parent),
+        "workbench agent root escaped its configured host boundary"
+    );
+    for child in ["inputs", "workspaces", "artifacts"] {
+        let path = canonical_root.join(child);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "workbench {child} root must be a real directory"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&path)
+                    .with_context(|| format!("create workbench {child} root {}", path.display()))?;
+            }
+            Err(error) => return Err(error).context("inspect workbench persistent root"),
+        }
+        let canonical = std::fs::canonicalize(&path)
+            .with_context(|| format!("canonicalize workbench {child} root {}", path.display()))?;
+        anyhow::ensure!(
+            canonical.parent() == Some(canonical_root.as_path()),
+            "workbench {child} root escaped its agent boundary"
+        );
+    }
+    Ok(())
+}
+
+fn workbench_host_agent_root(
+    fs_mount: Option<&str>,
+    agent_name: &str,
+    fs_host_agent_dir: Option<&str>,
+) -> PathBuf {
+    match fs_mount {
+        Some(fs_mount) => PathBuf::from(fs_mount).join(fs_host_agent_dir.unwrap_or(agent_name)),
+        None => PathBuf::from("/ram/agents").join(agent_name),
+    }
+}
+
 fn landlock_wrapper_path() -> PathBuf {
     // 1. Same directory as current executable
     if let Ok(exe) = std::env::current_exe() {
@@ -2063,6 +2155,28 @@ mod tests {
                 "cgroup-only retry must not signal a reused numeric process target"
             );
         }
+    }
+
+    #[test]
+    fn workbench_roots_cover_default_and_active_fs_backing_fail_closed() {
+        assert_eq!(
+            workbench_host_agent_root(None, "alice", Some("AGENT-01")),
+            PathBuf::from("/ram/agents/alice")
+        );
+        assert_eq!(
+            workbench_host_agent_root(Some("/mnt/sentinel-fs"), "alice", Some("AGENT-01")),
+            PathBuf::from("/mnt/sentinel-fs/AGENT-01")
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("AGENT-01");
+        prepare_workbench_roots(&root).unwrap();
+        for child in ["inputs", "workspaces", "artifacts"] {
+            assert!(root.join(child).is_dir());
+        }
+        std::fs::remove_dir(root.join("inputs")).unwrap();
+        std::os::unix::fs::symlink(directory.path(), root.join("inputs")).unwrap();
+        assert!(prepare_workbench_roots(&root).is_err());
     }
 
     #[test]
