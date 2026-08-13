@@ -461,6 +461,28 @@ class ReleasePackageTests(unittest.TestCase):
                 self.assertEqual((fixture.package / "replacement-marker").read_bytes(), marker)
                 self.assertTrue((pinned_name / PACKAGE.MANIFEST_NAME).is_file())
 
+    def test_output_and_stage_root_swaps_fail_without_deleting_replacements(self) -> None:
+        for root_name, expected in (
+            ("output", "output_root_changed"),
+            ("stage", "stage_root_changed"),
+        ):
+            with self.subTest(root=root_name):
+                fixture = Fixture(self.case / f"{root_name}-root-swap")
+                root = getattr(fixture, root_name)
+                pinned = fixture.root / f"pinned-{root_name}-root"
+                marker = b"foreign root replacement\n"
+
+                def swap_root() -> None:
+                    os.rename(root, pinned)
+                    root.mkdir(mode=0o700)
+                    replacement = root / "replacement-marker"
+                    replacement.write_bytes(marker)
+                    replacement.chmod(0o600)
+
+                self.assert_error(expected, fixture.build, after_rename_hook=swap_root)
+                self.assertEqual((root / "replacement-marker").read_bytes(), marker)
+                self.assertTrue(pinned.is_dir())
+
     def test_interrupted_stage_swap_never_deletes_the_replacement(self) -> None:
         operation = self.fixture.stage / f".build-{self.fixture.git_sha}"
         pinned = self.fixture.stage / "pinned-operation"

@@ -265,14 +265,16 @@ def directory_identity(info: os.stat_result) -> tuple[int, int]:
     return (info.st_dev, info.st_ino)
 
 
-def assert_absolute_directory_identity(path: Path, expected: tuple[int, int]) -> None:
+def assert_absolute_directory_identity(
+    path: Path, expected: tuple[int, int], error_code: str
+) -> None:
     try:
         fd = open_absolute_dir(path)
     except (OSError, PackageError) as exc:
-        raise PackageError("source_root_changed") from exc
+        raise PackageError(error_code) from exc
     try:
         if directory_identity(os.fstat(fd)) != expected:
-            fail("source_root_changed")
+            fail(error_code)
     finally:
         os.close(fd)
 
@@ -768,10 +770,12 @@ def build_package(
         created_at = git_metadata(source_root_fd, expected_git_sha)
         if after_git_hook is not None:
             after_git_hook()
-        assert_absolute_directory_identity(source_root, source_root_identity)
+        assert_absolute_directory_identity(source_root, source_root_identity, "source_root_changed")
 
         output_root_fd = open_absolute_dir(output_root, exact_mode=0o700)
         stage_root_fd = open_absolute_dir(stage_root, exact_mode=0o700)
+        output_root_identity = directory_identity(os.fstat(output_root_fd))
+        stage_root_identity = directory_identity(os.fstat(stage_root_fd))
         if os.fstat(output_root_fd).st_dev != os.fstat(stage_root_fd).st_dev:
             fail("roots_cross_device")
         lock_fd = os.open(
@@ -869,7 +873,7 @@ def build_package(
             if current != item.identity:
                 fail("source_changed")
 
-        assert_absolute_directory_identity(source_root, source_root_identity)
+        assert_absolute_directory_identity(source_root, source_root_identity, "source_root_changed")
         fsync_tree_and_freeze_fd(operation_fd, freeze_root=False)
         os.rename(operation_name, final_name, src_dir_fd=stage_root_fd, dst_dir_fd=output_root_fd)
         renamed = True
@@ -888,6 +892,8 @@ def build_package(
         result = verify_package_fd(final_fd, expected_git_sha)
         if not name_matches_identity(output_root_fd, final_name, operation_identity):
             fail("final_identity_changed")
+        assert_absolute_directory_identity(output_root, output_root_identity, "output_root_changed")
+        assert_absolute_directory_identity(stage_root, stage_root_identity, "stage_root_changed")
         os.fsync(stage_root_fd)
         os.fsync(output_root_fd)
         result["status"] = "COMPLETE"
