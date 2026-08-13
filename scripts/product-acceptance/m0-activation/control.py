@@ -42,6 +42,7 @@ JOURNEY_PROGRAM = PRODUCT_ACCEPTANCE / "run_m0_journey.py"
 SYSTEMCTL = Path("/usr/bin/systemctl")
 PYTHON = Path("/usr/bin/python3")
 TARGET = "sentinel.target"
+AUTH_INIT = "sentinel-auth-init.service"
 SERVICES = (
     "nats-server.service",
     "sentinel-daemon.service",
@@ -66,9 +67,9 @@ TOPOLOGY = (
     "sentinel-judge.service",
     "sentinel-health-monitor.timer",
 )
-ALL_UNITS = (*TOPOLOGY, TARGET)
+ALL_UNITS = (AUTH_INIT, *TOPOLOGY, TARGET)
 INSPECT_UNITS = (*ALL_UNITS, *ONESHOTS)
-ROLLBACK_ORDER = (TARGET, *ONESHOTS, *tuple(reversed(TOPOLOGY)))
+ROLLBACK_ORDER = (TARGET, *ONESHOTS, *tuple(reversed(TOPOLOGY)), AUTH_INIT)
 BASE_CHILD_ENV = {
     "LC_ALL": "C",
     "PATH": "/usr/bin:/bin",
@@ -564,6 +565,8 @@ def unit_ready(unit: str, values: dict[str, str]) -> bool:
         return False
     if unit == TARGET:
         return values["ActiveState"] == "active" and values["SubState"] == "active"
+    if unit == AUTH_INIT:
+        return values["ActiveState"] == "active" and values["SubState"] == "exited"
     if values["Result"] != "success":
         return False
     if unit in TIMERS:

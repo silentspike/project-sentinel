@@ -14,9 +14,6 @@ func operatorCredentialDirectory(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	absolute, err := filepath.Abs(directory)
 	if err != nil {
@@ -163,11 +160,21 @@ func TestLoadOperatorCredentialRejectsSymlinkAndReplacement(t *testing.T) {
 		if err := os.Rename(path, old); err != nil {
 			return err
 		}
-		replacement, writeErr := os.Create(path)
-		if replacement != nil {
-			_ = replacement.Close()
+		directoryFD, openErr := syscall.Open(directory, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+		if openErr != nil {
+			return openErr
 		}
-		return writeErr
+		defer func() { _ = syscall.Close(directoryFD) }()
+		replacementFD, openErr := syscall.Openat(
+			directoryFD,
+			operatorCredentialName,
+			syscall.O_WRONLY|syscall.O_CLOEXEC|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW,
+			0o600,
+		)
+		if openErr != nil {
+			return openErr
+		}
+		return syscall.Close(replacementFD)
 	})
 	if err == nil {
 		t.Fatal("replaced operator credential was accepted")

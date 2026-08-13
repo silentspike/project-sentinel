@@ -1,8 +1,9 @@
 [Unit]
 Description=Sentinel Cortex Gateway — LLM Pipeline + Synthesis Engine
 Documentation=https://github.com/silentspike/project-sentinel/issues/288
-After=network-online.target sentinel-daemon.service
+After=network-online.target sentinel-auth-init.service sentinel-daemon.service
 Wants=network-online.target
+Requires=sentinel-auth-init.service
 StartLimitBurst=5
 StartLimitIntervalSec=300
 

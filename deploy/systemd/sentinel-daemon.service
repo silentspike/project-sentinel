@@ -1,9 +1,9 @@
 [Unit]
 Description=Sentinel Daemon — ECS Orchestrator
 Documentation=https://github.com/silentspike/project-sentinel/issues/94
-After=network-online.target nats-server.service
+After=network-online.target nats-server.service sentinel-auth-init.service
 Wants=network-online.target
-Requires=nats-server.service
+Requires=nats-server.service sentinel-auth-init.service
 StartLimitBurst=5
 StartLimitIntervalSec=300
 
