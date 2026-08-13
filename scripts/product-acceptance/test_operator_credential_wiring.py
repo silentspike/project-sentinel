@@ -196,8 +196,6 @@ class OperatorCredentialWiringTests(unittest.TestCase):
         self,
     ) -> None:
         source = NIGHTRUN_UNIT.read_text(encoding="utf-8")
-        if "m0-readiness.py nightrun" not in source:
-            self.skipTest("PR #790 Nightrun contract awaits the required Main integration")
         self.assertEqual(
             source.count(
                 "LoadCredential=operator-api:/etc/sentinel/credentials/operator-api\n"
