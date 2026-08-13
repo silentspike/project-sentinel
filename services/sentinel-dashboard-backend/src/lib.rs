@@ -57,6 +57,8 @@ pub struct Config {
     pub operator_url: String,
     /// Operator-API-Key (x-sentinel-operator-key); optional.
     pub operator_key: Option<String>,
+    /// Trusted-parent-only credential directory hidden from Gaia model children.
+    pub operator_credential_directory: Option<String>,
     /// Gateway-Control-Basis-URL, Default `http://127.0.0.1:8081`.
     pub gateway_url: String,
     /// Gateway-Proxy-Basis-URL fuer Pipeline-Metrics, Default `http://127.0.0.1:8080`.
@@ -135,6 +137,10 @@ impl fmt::Debug for Config {
             .field("wt_bind", &self.wt_bind)
             .field("operator_url", &self.operator_url)
             .field("operator_key_configured", &self.operator_key.is_some())
+            .field(
+                "operator_credential_directory_configured",
+                &self.operator_credential_directory.is_some(),
+            )
             .field("gateway_url", &self.gateway_url)
             .field("gateway_proxy_url", &self.gateway_proxy_url)
             .field("prometheus_url", &self.prometheus_url)
@@ -234,9 +240,8 @@ fn credential_file_identity_is_allowed(
     is_regular: bool,
     expected_owner: u32,
 ) -> bool {
-    let systemd_owned = identity.owner == 0
-        && identity.group == 0
-        && matches!(identity.mode, 0o400 | 0o440);
+    let systemd_owned =
+        identity.owner == 0 && identity.group == 0 && matches!(identity.mode, 0o400 | 0o440);
     let service_owned = identity.owner == expected_owner && matches!(identity.mode, 0o400 | 0o600);
     is_regular && identity.links == 1 && (systemd_owned || service_owned)
 }
@@ -247,11 +252,7 @@ fn validate_credential_directory(
 ) -> anyhow::Result<CredentialDirectoryIdentity> {
     let file_identity = CredentialFileIdentity::from_metadata(metadata);
     anyhow::ensure!(
-        credential_directory_identity_is_allowed(
-            &file_identity,
-            metadata.is_dir(),
-            expected_owner
-        ),
+        credential_directory_identity_is_allowed(&file_identity, metadata.is_dir(), expected_owner),
         "operator API credential directory metadata is invalid"
     );
     Ok(CredentialDirectoryIdentity::from_metadata(metadata))
@@ -337,7 +338,10 @@ fn read_operator_api_credential_with_hook(
     let mut offset = 0;
     while offset < bytes.len() {
         let count = file.read(&mut bytes[offset..])?;
-        anyhow::ensure!(count != 0, "operator API credential read was shorter than declared");
+        anyhow::ensure!(
+            count != 0,
+            "operator API credential read was shorter than declared"
+        );
         offset += count;
     }
     let mut trailing = [0_u8; 1];
@@ -406,6 +410,7 @@ impl Config {
             "operator API credential path must be the systemd credential leaf"
         );
         config.operator_key = Some(read_operator_api_credential(Path::new(&path))?);
+        config.operator_credential_directory = Some(directory);
         Ok(config)
     }
 
@@ -426,6 +431,7 @@ impl Config {
             operator_url: env("SENTINEL_OPERATOR_API_URL")
                 .unwrap_or_else(|| "http://127.0.0.1:8084".into()),
             operator_key: env(OPERATOR_API_KEY_ENV),
+            operator_credential_directory: None,
             gateway_url: env("CORTEX_GATEWAY_CONTROL_URL")
                 .unwrap_or_else(|| "http://127.0.0.1:8081".into()),
             gateway_proxy_url: env("CORTEX_GATEWAY_PROXY_URL")
@@ -778,7 +784,12 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(config.operator_key.as_deref(), Some(TEST_CREDENTIAL));
+        assert_eq!(
+            config.operator_credential_directory.as_deref(),
+            directory.path().to_str()
+        );
         assert!(!format!("{config:?}").contains(TEST_CREDENTIAL));
+        assert!(!format!("{config:?}").contains(directory.path().to_str().unwrap()));
 
         let alternate = directory.path().join("alternate");
         write_credential(&alternate, TEST_CREDENTIAL.as_bytes(), 0o400);
@@ -892,7 +903,11 @@ mod tests {
         ));
 
         let fifo = directory.path().join("fifo");
-        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
         assert!(super::read_operator_api_credential(&fifo).is_err());
 
         let unsafe_parent = directory.path().join("unsafe-parent");
@@ -997,7 +1012,10 @@ mod tests {
 
         write_credential(&path, TEST_CREDENTIAL.as_bytes(), 0o400);
         assert!(super::read_operator_api_credential_with_hook(&path, || {
-            fs::OpenOptions::new().write(true).open(&path)?.set_len(16)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_len(16)?;
             Ok(())
         })
         .is_err());
@@ -1016,13 +1034,19 @@ mod tests {
         let parent_path = parent.join("operator-api");
         write_credential(&parent_path, TEST_CREDENTIAL.as_bytes(), 0o400);
         let old_parent = directory.path().join("credentials.old");
-        assert!(super::read_operator_api_credential_with_hook(&parent_path, || {
-            fs::rename(&parent, &old_parent)?;
-            fs::create_dir(&parent)?;
-            write_credential(&parent.join("operator-api"), TEST_CREDENTIAL.as_bytes(), 0o400);
-            Ok(())
-        })
-        .is_err());
+        assert!(
+            super::read_operator_api_credential_with_hook(&parent_path, || {
+                fs::rename(&parent, &old_parent)?;
+                fs::create_dir(&parent)?;
+                write_credential(
+                    &parent.join("operator-api"),
+                    TEST_CREDENTIAL.as_bytes(),
+                    0o400,
+                );
+                Ok(())
+            })
+            .is_err()
+        );
     }
 
     #[test]

@@ -15,7 +15,22 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "deploy/scripts/init-dashboard-auth.sh"
 DASHBOARD_UNIT = REPO_ROOT / "deploy/systemd/sentinel-dashboard-backend.service"
 DAEMON_UNIT = REPO_ROOT / "deploy/systemd/sentinel-daemon.service"
+GATEWAY_UNIT = REPO_ROOT / "deploy/systemd/sentinel-gateway.service"
+NIGHTRUN_UNIT = REPO_ROOT / "deploy/systemd/sentinel-nightrun.service"
 DAEMON_CONFIG = REPO_ROOT / "config/daemon.toml"
+GATEWAY_MAIN = REPO_ROOT / "cmd/cortex-gateway/main.go"
+GATEWAY_CREDENTIAL = REPO_ROOT / "cmd/cortex-gateway/internal/proxy/auth.go"
+DAEMON_MAIN = REPO_ROOT / "services/sentinel-daemon/src/main.rs"
+DAEMON_CREDENTIAL = REPO_ROOT / "services/sentinel-daemon/src/config.rs"
+DASHBOARD_CONFIG = REPO_ROOT / "services/sentinel-dashboard-backend/src/lib.rs"
+DASHBOARD_MAIN = REPO_ROOT / "services/sentinel-dashboard-backend/src/main.rs"
+DASHBOARD_PROXY = REPO_ROOT / "services/sentinel-dashboard-backend/src/control.rs"
+DASHBOARD_GAIA = REPO_ROOT / "services/sentinel-dashboard-backend/src/gaia.rs"
+SENTINEL_CTL = REPO_ROOT / "services/sentinel-ctl/src/main.rs"
+GAIA_CONFIG = REPO_ROOT / "services/sentinel-gaia-loop/src/config.rs"
+GAIA_SESSION = REPO_ROOT / "services/sentinel-gaia-loop/src/session.rs"
+GAIA_SYSTEM_PROMPT = REPO_ROOT / "services/sentinel-gaia-loop/prompts/gaia-system.md"
+M0_PREFLIGHT = REPO_ROOT / "scripts/product-acceptance/run_m0_preflight.py"
 
 DASHBOARD_SECRET = "dashboard-" + "a" * 40
 OPERATOR_SECRET = "operator-" + "b" * 40
@@ -78,11 +93,12 @@ class OperatorCredentialWiringTests(unittest.TestCase):
     def test_units_use_exact_file_only_systemd_credential_contract(self) -> None:
         dashboard_source = DASHBOARD_UNIT.read_text(encoding="utf-8")
         daemon_source = DAEMON_UNIT.read_text(encoding="utf-8")
+        gateway_source = GATEWAY_UNIT.read_text(encoding="utf-8")
         load_credential = (
             "LoadCredential=operator-api:/etc/sentinel/credentials/operator-api\n"
         )
 
-        for source in (dashboard_source, daemon_source):
+        for source in (dashboard_source, daemon_source, gateway_source):
             self.assertEqual(source.count(load_credential), 1)
             self.assertNotIn("SENTINEL_OPERATOR_API_KEY=", source)
             self.assertNotIn("SENTINEL_OPERATOR_SHARED_SECRET=", source)
@@ -97,7 +113,103 @@ class OperatorCredentialWiringTests(unittest.TestCase):
             daemon_source,
         )
         self.assertNotIn("SENTINEL_OPERATOR_API_KEY_FILE=", daemon_source)
+        self.assertIn(
+            "Environment=SENTINEL_OPERATOR_API_KEY_FILE=%d/operator-api\n",
+            gateway_source,
+        )
+        self.assertNotIn("SENTINEL_OPERATOR_CREDENTIAL_FILE=", gateway_source)
         self.assertIn("independent dashboard login key", dashboard_source)
+        self.assertIn("ExecStartPre=/usr/bin/test -x /usr/bin/bwrap", dashboard_source)
+
+    def test_productive_operator_consumers_use_file_references_only(self) -> None:
+        gateway_main = GATEWAY_MAIN.read_text(encoding="utf-8")
+        gateway_credential = GATEWAY_CREDENTIAL.read_text(encoding="utf-8")
+        daemon_main = DAEMON_MAIN.read_text(encoding="utf-8")
+        daemon_credential = DAEMON_CREDENTIAL.read_text(encoding="utf-8")
+        dashboard_config = DASHBOARD_CONFIG.read_text(encoding="utf-8")
+        dashboard_main = DASHBOARD_MAIN.read_text(encoding="utf-8")
+        dashboard_proxy = DASHBOARD_PROXY.read_text(encoding="utf-8")
+        dashboard_gaia = DASHBOARD_GAIA.read_text(encoding="utf-8")
+        sentinel_ctl = SENTINEL_CTL.read_text(encoding="utf-8")
+        gaia_config = GAIA_CONFIG.read_text(encoding="utf-8")
+        gaia_session = GAIA_SESSION.read_text(encoding="utf-8")
+        gaia_system_prompt = GAIA_SYSTEM_PROMPT.read_text(encoding="utf-8")
+        preflight = M0_PREFLIGHT.read_text(encoding="utf-8")
+
+        self.assertIn("proxy.LoadAPICPOperatorCredential", gateway_main)
+        self.assertIn("apicpSyncURL := \"\"", gateway_main)
+        self.assertIn("SetAPICPActivationValidator", gateway_main)
+        self.assertNotIn('os.Getenv("SENTINEL_OPERATOR_API_KEY")', gateway_main)
+        self.assertRegex(
+            gateway_credential,
+            r'operatorCredentialFileEnv\s*=\s*"SENTINEL_OPERATOR_API_KEY_FILE"',
+        )
+        self.assertIn("syscall.O_NOFOLLOW", gateway_credential)
+        self.assertIn("os.LookupEnv(directOperatorCredentialEnv)", gateway_credential)
+        self.assertIn("bind_operator_credential", daemon_main)
+        self.assertIn("OPERATOR_CREDENTIAL_FILE_ENV", daemon_main)
+        self.assertIn("operator credential file is required", daemon_credential)
+        self.assertIn("Config::from_production_env()", dashboard_main)
+        self.assertIn(
+            "direct operator API credentials are not allowed in production",
+            dashboard_config,
+        )
+        self.assertIn("OPERATOR_KEY_HEADER", dashboard_proxy)
+        self.assertIn("st.config.operator_key", dashboard_proxy)
+        self.assertIn("read_operator_credential()?", sentinel_ctl)
+        self.assertNotIn('std::env::var("SENTINEL_OPERATOR_API_KEY")', sentinel_ctl)
+        self.assertIn("execute_via_broker", sentinel_ctl)
+        self.assertIn("permits only read observations", sentinel_ctl)
+        self.assertNotIn("SENTINEL_OPERATOR_API_KEY", gaia_config)
+        self.assertIn("command.env_clear();", gaia_session)
+        self.assertIn("OPERATOR_BROKER_SOCKET_ENV", gaia_session)
+        self.assertIn("OPERATOR_BROKER_SESSION_ENV", gaia_session)
+        self.assertIn("OPERATOR_BROKER_CAPABILITY_ENV", gaia_session)
+        self.assertNotIn(
+            'command.env("SENTINEL_OPERATOR_API_KEY"',
+            gaia_session.split("#[cfg(test)]", 1)[0],
+        )
+        self.assertNotIn(
+            'command.env("SENTINEL_OPERATOR_API_KEY_FILE"',
+            gaia_session.split("#[cfg(test)]", 1)[0],
+        )
+        self.assertIn("verify_broker_peer", dashboard_gaia)
+        self.assertIn("process_group_for_pid", dashboard_gaia)
+        self.assertIn("expected_pgid", dashboard_gaia)
+        self.assertIn("validate_broker_request", dashboard_gaia)
+        self.assertIn("claim_broker_operation", dashboard_gaia)
+        self.assertIn("permits only bodyless read observations", dashboard_gaia)
+        self.assertNotIn('("POST", true, "/control/reload")', dashboard_gaia)
+        self.assertIn("broker_process_authority_binds_once_and_revokes", gaia_session)
+        self.assertIn('const BWRAP_BIN: &str = "/usr/bin/bwrap"', gaia_session)
+        self.assertIn('"--tmpfs"', gaia_session)
+        self.assertIn('"--unshare-pid"', gaia_session)
+        self.assertIn('"/proc"', gaia_session)
+        self.assertIn("`sentinel-ctl` is observation-only", gaia_system_prompt)
+        self.assertIn("governed customer/operator workflow", gaia_system_prompt)
+        self.assertIn("do not retry it as a mutation", gaia_system_prompt)
+        self.assertIn('parser.add_argument("--operator-credential-file"', preflight)
+        self.assertIn("load_operator_credential(inputs, deps)", preflight)
+        self.assertNotIn("SENTINEL_OPERATOR_API_KEY=", preflight)
+
+    def test_nightrun_current_main_authenticated_oneshot_after_integration(
+        self,
+    ) -> None:
+        source = NIGHTRUN_UNIT.read_text(encoding="utf-8")
+        if "m0-readiness.py nightrun" not in source:
+            self.skipTest("PR #790 Nightrun contract awaits the required Main integration")
+        self.assertEqual(
+            source.count(
+                "LoadCredential=operator-api:/etc/sentinel/credentials/operator-api\n"
+            ),
+            1,
+        )
+        self.assertIn(
+            "m0-readiness.py nightrun --credential-file %d/operator-api",
+            source,
+        )
+        self.assertNotIn("curl", source)
+        self.assertNotIn("SENTINEL_OPERATOR_API_KEY=", source)
 
     def test_generated_credentials_are_independent_secure_and_idempotent(self) -> None:
         first = self.run_script()

@@ -256,6 +256,11 @@ func main() {
 
 	// 5d. Traffic Control: Synthesis, Sequencing, Tick-Sync, API-CP
 	trafficSnap := controlConfig.Get()
+	operatorAPISecret, err := proxy.LoadAPICPOperatorCredential(trafficSnap.APICPEnabled)
+	if err != nil {
+		logger.Error("api-cp operator credential rejected", "error", err)
+		os.Exit(1)
+	}
 
 	synthEngine := synthesis.NewEngine(trafficSnap.SynthesisEnabled, logger)
 	if trafficSnap.SynthesisEnabled {
@@ -281,11 +286,21 @@ func main() {
 	responseLogs := proxy.NewResponseLogBuffer(200)
 
 	operatorAPIURL := envOrDefault("SENTINEL_OPERATOR_API_URL", "http://127.0.0.1:8084")
+	apicpSyncURL := ""
+	if trafficSnap.APICPEnabled {
+		apicpSyncURL = operatorAPIURL + "/operator/apicp/snapshot"
+	}
 	apicpObserver := apicp.NewObserver(apicp.Config{
-		SyncURL:      operatorAPIURL + "/operator/apicp/snapshot",
+		SyncURL:      apicpSyncURL,
 		SyncInterval: 5 * time.Minute,
-		SharedSecret: os.Getenv("SENTINEL_OPERATOR_API_KEY"),
+		SharedSecret: operatorAPISecret,
+		Enabled: func() bool {
+			return controlConfig.Get().APICPEnabled
+		},
 	}, logger)
+	controlConfig.SetAPICPActivationValidator(func() error {
+		return &control.APICPRestartRequiredError{}
+	})
 	if trafficSnap.APICPEnabled {
 		logger.Info("api-cp learning agent enabled", "sync_url", operatorAPIURL+"/operator/apicp/snapshot")
 	}

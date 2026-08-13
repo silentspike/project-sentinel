@@ -2,6 +2,10 @@ use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{
+    atomic::{AtomicI32, Ordering},
+    Arc,
+};
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -26,6 +30,10 @@ const STDERR_FILE_NAME: &str = "stderr.log";
 const PROMPT_FILE_NAME: &str = "prompt.txt";
 const MAX_COMPANY_CONTEXT_CHARS: usize = 16_000;
 const IDEMPOTENCY_KEY_MAX_LEN: usize = 128;
+const BWRAP_BIN: &str = "/usr/bin/bwrap";
+pub const OPERATOR_BROKER_SOCKET_ENV: &str = "SENTINEL_GAIA_OPERATOR_BROKER_SOCKET";
+pub const OPERATOR_BROKER_SESSION_ENV: &str = "SENTINEL_GAIA_OPERATOR_BROKER_SESSION";
+pub const OPERATOR_BROKER_CAPABILITY_ENV: &str = "SENTINEL_GAIA_OPERATOR_BROKER_CAPABILITY";
 const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "HOME",
     "USER",
@@ -128,18 +136,125 @@ pub struct GaiaSessionRun {
     pub stderr_path: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+pub struct GaiaOperatorBrokerCapability {
+    socket_path: PathBuf,
+    session_id: String,
+    capability: String,
+    hidden_credential_directory: PathBuf,
+    process_authority: GaiaOperatorBrokerProcessAuthority,
+}
+
+#[derive(Clone, Default)]
+pub struct GaiaOperatorBrokerProcessAuthority {
+    expected_pgid: Arc<AtomicI32>,
+}
+
+impl GaiaOperatorBrokerProcessAuthority {
+    pub fn expected_pgid(&self) -> i32 {
+        self.expected_pgid.load(Ordering::Acquire)
+    }
+
+    fn bind(&self, pid: u32) -> Result<()> {
+        let pgid = i32::try_from(pid).context("Gaia child process group is out of range")?;
+        if pgid <= 0 {
+            bail!("Gaia child process group must be positive");
+        }
+        self.expected_pgid
+            .compare_exchange(0, pgid, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| anyhow::anyhow!("Gaia broker process authority is already bound"))?;
+        Ok(())
+    }
+
+    pub fn revoke(&self) {
+        self.expected_pgid.store(0, Ordering::Release);
+    }
+}
+
+impl GaiaOperatorBrokerCapability {
+    pub fn new(
+        socket_path: PathBuf,
+        session_id: String,
+        capability: String,
+        hidden_credential_directory: PathBuf,
+    ) -> Self {
+        Self {
+            socket_path,
+            session_id,
+            capability,
+            hidden_credential_directory,
+            process_authority: GaiaOperatorBrokerProcessAuthority::default(),
+        }
+    }
+
+    pub fn process_authority(&self) -> GaiaOperatorBrokerProcessAuthority {
+        self.process_authority.clone()
+    }
+}
+
+#[derive(Clone)]
 pub struct ClaudeSessionRunner {
     config: GaiaLoopConfig,
+    operator_broker: Option<GaiaOperatorBrokerCapability>,
 }
 
 impl ClaudeSessionRunner {
     pub fn new(config: GaiaLoopConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            operator_broker: None,
+        }
+    }
+
+    pub fn with_operator_broker(mut self, capability: GaiaOperatorBrokerCapability) -> Self {
+        self.operator_broker = Some(capability);
+        self
     }
 
     pub fn config(&self) -> &GaiaLoopConfig {
         &self.config
+    }
+
+    fn configure_child_environment(&self, command: &mut Command) {
+        command.env_clear();
+        for name in CHILD_ENV_ALLOWLIST {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .env("SENTINEL_GAIA_CONSOLE_DIR", &self.config.console_dir)
+            .env("SENTINEL_CTL_BIN", &self.config.sentinel_ctl_bin)
+            .env("SENTINEL_GAIA_BIN", &self.config.sentinel_gaia_bin);
+        if let Some(broker) = self.operator_broker.as_ref() {
+            command
+                .env(OPERATOR_BROKER_SOCKET_ENV, &broker.socket_path)
+                .env(OPERATOR_BROKER_SESSION_ENV, &broker.session_id)
+                .env(OPERATOR_BROKER_CAPABILITY_ENV, &broker.capability);
+        }
+    }
+
+    fn child_command(&self) -> Result<Command> {
+        let Some(broker) = self.operator_broker.as_ref() else {
+            return Ok(Command::new(&self.config.claude_bin));
+        };
+        if !broker.hidden_credential_directory.is_absolute() {
+            bail!("Gaia credential isolation directory must be absolute");
+        }
+        let mut command = Command::new(BWRAP_BIN);
+        command.args([
+            "--die-with-parent",
+            "--unshare-pid",
+            "--bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+        ]);
+        command.arg(&broker.hidden_credential_directory);
+        command.arg("--").arg(&self.config.claude_bin);
+        Ok(command)
     }
 
     pub fn build_args(
@@ -244,19 +359,11 @@ impl ClaudeSessionRunner {
             &user_prompt,
         );
 
-        let mut command = Command::new(&self.config.claude_bin);
-        command.env_clear();
-        for name in CHILD_ENV_ALLOWLIST {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
-            }
-        }
+        let mut command = self.child_command()?;
+        self.configure_child_environment(&mut command);
         command
             .args(&args)
             .current_dir(&self.config.console_dir)
-            .env("SENTINEL_GAIA_CONSOLE_DIR", &self.config.console_dir)
-            .env("SENTINEL_CTL_BIN", &self.config.sentinel_ctl_bin)
-            .env("SENTINEL_GAIA_BIN", &self.config.sentinel_gaia_bin)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
@@ -272,6 +379,12 @@ impl ClaudeSessionRunner {
         })?;
         let child_pid = child.id().context("Claude Code child pid unavailable")?;
         let mut process_group_guard = ProcessGroupGuard::new(child_pid);
+        let mut broker_authority_guard = BrokerProcessAuthorityGuard::bind(
+            self.operator_broker
+                .as_ref()
+                .map(|broker| broker.process_authority.clone()),
+            child_pid,
+        )?;
 
         let (status, exit_code) = match timeout(self.config.session_timeout(), child.wait()).await {
             Ok(wait_result) => {
@@ -291,6 +404,7 @@ impl ClaudeSessionRunner {
         };
         process_group_guard.kill();
         process_group_guard.disarm();
+        broker_authority_guard.revoke();
 
         let finished_at_ms = Some(now_ms());
         let usage = ClaudeUsageSummary::from_stream_jsonl(&stream_path)?;
@@ -477,6 +591,31 @@ fn request_fingerprint(request: &GaiaSessionRequest) -> String {
 
 struct ProcessGroupGuard {
     pgid: Option<i32>,
+}
+
+struct BrokerProcessAuthorityGuard {
+    authority: Option<GaiaOperatorBrokerProcessAuthority>,
+}
+
+impl BrokerProcessAuthorityGuard {
+    fn bind(authority: Option<GaiaOperatorBrokerProcessAuthority>, pid: u32) -> Result<Self> {
+        if let Some(authority) = authority.as_ref() {
+            authority.bind(pid)?;
+        }
+        Ok(Self { authority })
+    }
+
+    fn revoke(&mut self) {
+        if let Some(authority) = self.authority.take() {
+            authority.revoke();
+        }
+    }
+}
+
+impl Drop for BrokerProcessAuthorityGuard {
+    fn drop(&mut self) {
+        self.revoke();
+    }
 }
 
 impl ProcessGroupGuard {
@@ -687,6 +826,120 @@ mod tests {
         assert!(system_prompt.contains("\"shift_model\": \"hybrid\""));
         assert!(system_prompt.contains("\"conflict_level\": 0.5"));
         assert!(system_prompt.contains("Keep `mission` and `values` inside `culture`"));
+    }
+
+    #[tokio::test]
+    async fn brokered_command_constructs_isolation_and_scrubs_child_environment() {
+        // This source test deliberately executes only the scrubbed inner command.
+        // Final SINGLE_NODE acceptance must execute the real bwrap command and
+        // verify credential masking, broker reachability, failure, and cleanup.
+        let secret = "secret-must-never-enter-child-environment";
+        let config_dir = tempfile::tempdir().unwrap();
+        let mut config = cfg(&config_dir);
+        config.claude_bin = PathBuf::from("/bin/sh");
+        let runner = ClaudeSessionRunner::new(config)
+            .with_operator_broker(GaiaOperatorBrokerCapability::new(
+                PathBuf::from("/run/sentinel/gaia-broker/session.sock"),
+                "gaia-broker-session-1".to_string(),
+                "opaque-capability-0123456789abcdef".to_string(),
+                PathBuf::from("/run/credentials/sentinel-dashboard-backend.service"),
+            ));
+        let wrapped = runner.child_command().unwrap();
+        assert_eq!(wrapped.as_std().get_program(), BWRAP_BIN);
+        let wrapped_args = wrapped
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(wrapped_args.windows(2).any(|pair| {
+            pair
+                == [
+                    "--tmpfs".to_string(),
+                    "/run/credentials/sentinel-dashboard-backend.service".to_string(),
+                ]
+        }));
+        assert_eq!(wrapped_args.last().map(String::as_str), Some("/bin/sh"));
+        assert!(!wrapped_args.iter().any(|arg| arg.contains("operator-api")));
+        let child_artifact = config_dir.path().join("child-observation.log");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(
+                "{ printf 'file=%s\\n' \"${SENTINEL_OPERATOR_API_KEY_FILE-unset}\"; \
+                 cat /run/credentials/service/operator-api 2>/dev/null || true; \
+                 /usr/bin/env; } > \"$1\"; cat \"$1\"",
+            )
+            .arg("gaia-child")
+            .arg(&child_artifact);
+        command.env("SENTINEL_OPERATOR_API_KEY", secret);
+        command.env(
+            "SENTINEL_OPERATOR_API_KEY_FILE",
+            "/run/credentials/service/operator-api",
+        );
+        runner.configure_child_environment(&mut command);
+
+        let environment = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|item| item.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(OPERATOR_BROKER_SOCKET_ENV),
+            Some(&Some("/run/sentinel/gaia-broker/session.sock".to_string()))
+        );
+        assert_eq!(
+            environment.get(OPERATOR_BROKER_SESSION_ENV),
+            Some(&Some("gaia-broker-session-1".to_string()))
+        );
+        assert!(environment.contains_key(OPERATOR_BROKER_CAPABILITY_ENV));
+        assert!(!environment.contains_key("SENTINEL_OPERATOR_API_KEY"));
+        assert!(!environment.contains_key("SENTINEL_OPERATOR_API_KEY_FILE"));
+        assert!(!format!("{environment:?}").contains(secret));
+        assert!(!command
+            .as_std()
+            .get_args()
+            .any(|arg| arg.to_string_lossy().contains(secret)));
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stdout.contains("file=unset"));
+        assert!(stdout.contains(OPERATOR_BROKER_SOCKET_ENV));
+        assert!(stdout.contains(OPERATOR_BROKER_SESSION_ENV));
+        assert!(stdout.contains(OPERATOR_BROKER_CAPABILITY_ENV));
+        assert!(!stdout.contains("SENTINEL_OPERATOR_API_KEY="));
+        assert!(!stdout.contains("SENTINEL_OPERATOR_API_KEY_FILE="));
+        assert!(!stdout.contains("/run/credentials/service/operator-api"));
+        assert!(!stdout.contains(secret));
+        assert!(!stderr.contains(secret));
+        let artifact = std::fs::read_to_string(child_artifact).unwrap();
+        assert!(!artifact.contains("SENTINEL_OPERATOR_API_KEY="));
+        assert!(!artifact.contains("SENTINEL_OPERATOR_API_KEY_FILE="));
+        assert!(!artifact.contains("/run/credentials/service/operator-api"));
+        assert!(!artifact.contains(secret));
+    }
+
+    #[test]
+    fn broker_process_authority_binds_once_and_revokes() {
+        let capability = GaiaOperatorBrokerCapability::new(
+            PathBuf::from("/run/sentinel/gaia-broker/session.sock"),
+            "gaia-broker-session-1".to_string(),
+            "opaque-capability-0123456789abcdef".to_string(),
+            PathBuf::from("/run/credentials/sentinel-dashboard-backend.service"),
+        );
+        let authority = capability.process_authority();
+        assert_eq!(authority.expected_pgid(), 0);
+
+        let mut guard = BrokerProcessAuthorityGuard::bind(Some(authority.clone()), 42).unwrap();
+        assert_eq!(authority.expected_pgid(), 42);
+        assert!(BrokerProcessAuthorityGuard::bind(Some(authority.clone()), 43).is_err());
+        guard.revoke();
+        assert_eq!(authority.expected_pgid(), 0);
     }
 
     #[tokio::test]

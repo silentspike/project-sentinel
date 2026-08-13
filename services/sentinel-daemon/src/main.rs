@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use tracing::{error, info};
 
 use sentinel_daemon::config::{
-    CREDENTIALS_DIRECTORY_ENV, DaemonConfig, OPERATOR_CREDENTIAL_FILE_ENV,
+    DaemonConfig, CREDENTIALS_DIRECTORY_ENV, OPERATOR_CREDENTIAL_FILE_ENV,
 };
 
 /// Sentinel Daemon — ECS Orchestrator fuer die Agent-Simulation.
@@ -199,12 +199,9 @@ mod tests {
         let credential_path = directory.path().join("operator-api");
         fs::write(&credential_path, b"0123456789abcdef0123456789abcdef").unwrap();
         fs::set_permissions(&credential_path, fs::Permissions::from_mode(0o400)).unwrap();
-        let config = load_runtime_config(
-            &config_path,
-            Some(directory.path()),
-            Some(&credential_path),
-        )
-        .unwrap();
+        let config =
+            load_runtime_config(&config_path, Some(directory.path()), Some(&credential_path))
+                .unwrap();
         assert!(config.operator_api.shared_secret.is_some());
     }
 }
