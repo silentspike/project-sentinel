@@ -1,8 +1,8 @@
 //! Durable, fail-closed coordination for capability-scoped workbench invocations.
 //!
-//! Runtime stdout and private tool output are deliberately absent from this
-//! store. The durable record contains only authority bindings, state, resource
-//! accounting, safe error classification, and content-addressed artifacts.
+//! Runtime stdout and private tool output are deliberately absent from durable
+//! records, events, projections, logs, and terminal replay. Only the immediate
+//! authorized response may carry validated transient tool output.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -27,6 +27,8 @@ const STORE_SCHEMA_VERSION: u16 = 2;
 const PROFILE_SCHEMA_VERSION: u16 = 1;
 const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
 const MAX_ARTIFACT_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_PROFILE_RULES: usize = 64;
+const MAX_PROFILE_TEST_SUITES: usize = 64;
 const LINUX_O_NOFOLLOW: i32 = 0o400000;
 const LINUX_O_CLOEXEC: i32 = 0o2000000;
 
@@ -103,6 +105,15 @@ impl WorkbenchProfile {
         {
             bail!("workbench request exceeds or mismatches its immutable profile");
         }
+        if let sentinel_common::WorkbenchTool::RunCommand { program, args } = &request.tool {
+            if !self
+                .command_rules
+                .iter()
+                .any(|rule| rule.allows(program, args))
+            {
+                bail!("workbench command does not match its immutable profile prefix");
+            }
+        }
         if let sentinel_common::WorkbenchTool::RunTests {
             suite_id,
             program,
@@ -136,11 +147,46 @@ impl WorkbenchProfile {
             || self.capabilities.is_empty()
             || self.output_artifact_kinds.is_empty()
             || self.environment != safe_environment
+            || self.command_rules.is_empty()
+            || self.command_rules.len() > MAX_PROFILE_RULES
+            || self.test_suites.is_empty()
+            || self.test_suites.len() > MAX_PROFILE_TEST_SUITES
         {
             bail!("invalid or unsafe workbench profile definition");
         }
+        for (index, rule) in self.command_rules.iter().enumerate() {
+            rule.validate()
+                .map_err(|_| anyhow::anyhow!("invalid workbench profile command rule"))?;
+            if self.command_rules[..index].contains(rule) {
+                bail!("duplicate workbench profile command rule");
+            }
+        }
+        for (index, suite) in self.test_suites.iter().enumerate() {
+            if !valid_profile_identifier(&suite.id)
+                || self.test_suites[..index]
+                    .iter()
+                    .any(|existing| existing.id == suite.id)
+            {
+                bail!("invalid or duplicate workbench profile test suite");
+            }
+            sentinel_common::CommandRule {
+                program: suite.program.clone(),
+                required_arg_prefix: suite.required_arg_prefix.clone(),
+                max_args: suite.max_args,
+            }
+            .validate()
+            .map_err(|_| anyhow::anyhow!("invalid workbench profile test suite command"))?;
+        }
         Ok(())
     }
+}
+
+fn valid_profile_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
 fn within_resource_ceilings(
@@ -306,12 +352,12 @@ where
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&path)
+                .open(path)
                 .context("create workbench store")?;
             file.set_permissions(fs::Permissions::from_mode(0o600))
                 .context("set workbench store mode")?;
             file.sync_all().context("sync new workbench store")?;
-            File::open(&base)
+            File::open(base)
                 .and_then(|directory| directory.sync_all())
                 .context("sync workbench store directory")?;
             (file, None)
@@ -697,8 +743,8 @@ impl WorkbenchInvocationStore {
         now_ms: u64,
     ) -> anyhow::Result<ReservationOutcome> {
         request
-            .validate_at(now_ms)
-            .context("workbench request failed validation before reservation")?;
+            .validate_for_replay()
+            .context("workbench replay request failed canonical validation")?;
         let write = self.db.begin_write()?;
         let outcome;
         {
@@ -713,6 +759,9 @@ impl WorkbenchInvocationStore {
                 }
                 outcome = ReservationOutcome::Replay(record);
             } else {
+                request
+                    .validate_at(now_ms)
+                    .context("workbench request failed admission before reservation")?;
                 let record = WorkbenchInvocationRecord::reserved(request, now_ms);
                 let bytes = encode_record(&record)?;
                 table.insert(record.invocation_id.as_str(), bytes.as_slice())?;
@@ -1245,6 +1294,8 @@ fn validate_bound_outputs(
                 manifest_path.components().next(),
                 Some(std::path::Component::Normal(_))
             )
+            && manifest_path.file_name().and_then(|name| name.to_str())
+                == Some(artifact.manifest_path.as_str())
             && !manifest_path.components().any(|component| {
                 matches!(
                     component,
@@ -1369,20 +1420,12 @@ fn validate_concrete_artifact_manifest(
     let blobs_root = canonical_daemon_child_directory(&scoped_root, "blobs")?;
     let blobs = open_pinned_daemon_artifact_directory(&blobs_root)?;
     let mut total_size = 0_u64;
+    let mut entry_paths = BTreeSet::new();
     for entry in manifest.entries {
-        let path = Path::new(&entry.path);
-        if path.as_os_str().is_empty()
-            || path.is_absolute()
-            || path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
-                )
-            })
+        if !is_canonical_relative_path(&entry.path)
             || !valid_lower_sha256(&entry.sha256)
             || entry.blob_id != format!("sha256:{}", entry.sha256)
+            || !entry_paths.insert(entry.path.clone())
         {
             return Err(WorkbenchStoreError::OutputRejected.into());
         }
@@ -1409,6 +1452,27 @@ fn validate_concrete_artifact_manifest(
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
     Ok(())
+}
+
+fn is_canonical_relative_path(value: &str) -> bool {
+    let path = Path::new(value);
+    if value.is_empty() || path.is_absolute() {
+        return false;
+    }
+    let mut canonical = String::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return false;
+        };
+        let Some(component) = component.to_str() else {
+            return false;
+        };
+        if !canonical.is_empty() {
+            canonical.push('/');
+        }
+        canonical.push_str(component);
+    }
+    !canonical.is_empty() && canonical == value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1891,11 +1955,15 @@ pub fn dispatch_workbench(command: WorkbenchDispatchCommand) -> anyhow::Result<(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WorkbenchCoordinatorUpdate {
     pub records: Vec<WorkbenchInvocationRecord>,
     pub runtime_state: Option<String>,
     pub replayed: bool,
+    /// The current authorized caller receives transient output only on the
+    /// immediate terminal exchange. Replay and restart return the durable-safe
+    /// projection with an empty output map.
+    pub caller_result: Option<WorkbenchMessage>,
 }
 
 pub struct WorkbenchCoordinator<'a> {
@@ -1934,10 +2002,15 @@ impl<'a> WorkbenchCoordinator<'a> {
             ReservationOutcome::Replay(record) => (record, true),
         };
         if record.state.is_terminal() || record.state == WorkbenchInvocationState::Executing {
+            let caller_result = record
+                .state
+                .is_terminal()
+                .then(|| durable_terminal_projection(&record));
             return Ok(WorkbenchCoordinatorUpdate {
                 records: vec![record],
                 runtime_state: None,
                 replayed: true,
+                caller_result,
             });
         }
 
@@ -1973,10 +2046,12 @@ impl<'a> WorkbenchCoordinator<'a> {
         let current_authority = authority.current_for_record(&record)?;
         authorize_workbench_record(&record, &current_authority)?;
         if record.state.is_terminal() {
+            let caller_result = Some(durable_terminal_projection(&record));
             return Ok(WorkbenchCoordinatorUpdate {
                 records: vec![record],
                 runtime_state: None,
                 replayed: true,
+                caller_result,
             });
         }
         if record.state != WorkbenchInvocationState::Executing {
@@ -2009,10 +2084,12 @@ impl<'a> WorkbenchCoordinator<'a> {
         let current_authority = authority.current_for_record(&record)?;
         authorize_workbench_record(&record, &current_authority)?;
         if record.state.is_terminal() {
+            let caller_result = Some(durable_terminal_projection(&record));
             return Ok(WorkbenchCoordinatorUpdate {
                 records: vec![record],
                 runtime_state: None,
                 replayed: true,
+                caller_result,
             });
         }
         if record.state != WorkbenchInvocationState::Executing {
@@ -2046,20 +2123,24 @@ impl<'a> WorkbenchCoordinator<'a> {
         let current_authority = authority.current_for_record(&record)?;
         authorize_workbench_record(&record, &current_authority)?;
         if record.state.is_terminal() {
+            let caller_result = Some(durable_terminal_projection(&record));
             return Ok(WorkbenchCoordinatorUpdate {
                 records: vec![record],
                 runtime_state: None,
                 replayed: true,
+                caller_result,
             });
         }
         if record.state == WorkbenchInvocationState::Reserved {
             let cancelled =
                 self.store
                     .mark_cancelled(&record.invocation_id, &record.request_digest, now_ms)?;
+            let caller_result = Some(durable_terminal_projection(&cancelled));
             return Ok(WorkbenchCoordinatorUpdate {
                 records: vec![cancelled],
                 runtime_state: Some("completed".to_string()),
                 replayed: false,
+                caller_result,
             });
         }
         self.apply_cancel_exchange(runtime, &record, authority, now_ms)
@@ -2117,21 +2198,30 @@ impl<'a> WorkbenchCoordinator<'a> {
                     records,
                     runtime_state: Some("completed".to_string()),
                     replayed,
+                    caller_result: None,
                 });
             }
         };
         let runtime_state = Some(envelope.state.clone());
         exchange.revalidate()?;
+        let mut caller_result = None;
         if let Some(terminal) =
             self.store
                 .accept_runtime_envelope_guarded(&envelope, now_ms, &|| exchange.revalidate())?
         {
+            caller_result = envelope
+                .messages
+                .iter()
+                .find(|message| matches!(message, WorkbenchMessage::Result { .. }))
+                .cloned()
+                .or_else(|| Some(durable_terminal_projection(&terminal)));
             records.push(terminal);
         }
         Ok(WorkbenchCoordinatorUpdate {
             records,
             runtime_state,
             replayed,
+            caller_result,
         })
     }
 
@@ -2162,17 +2252,25 @@ impl<'a> WorkbenchCoordinator<'a> {
         let current_authority = authority.current_for_record(&current)?;
         authorize_workbench_record(&current, &current_authority)?;
         let mut records = Vec::new();
+        let mut caller_result = None;
         exchange.revalidate()?;
         if let Some(terminal) =
             self.store
                 .accept_runtime_envelope_guarded(&envelope, now_ms, &|| exchange.revalidate())?
         {
+            caller_result = envelope
+                .messages
+                .iter()
+                .find(|message| matches!(message, WorkbenchMessage::Result { .. }))
+                .cloned()
+                .or_else(|| Some(durable_terminal_projection(&terminal)));
             records.push(terminal);
         }
         Ok(WorkbenchCoordinatorUpdate {
             records,
             runtime_state: Some(envelope.state),
             replayed: false,
+            caller_result,
         })
     }
 }
@@ -2209,6 +2307,40 @@ fn decode_record(bytes: &[u8]) -> anyhow::Result<WorkbenchInvocationRecord> {
     Ok(record)
 }
 
+fn durable_terminal_projection(record: &WorkbenchInvocationRecord) -> WorkbenchMessage {
+    if record.state == WorkbenchInvocationState::UnknownOutcome {
+        return WorkbenchMessage::Error {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: Some(record.invocation_id.clone()),
+            error: record
+                .error
+                .clone()
+                .unwrap_or_else(|| safe_recovery_failure("unknown_outcome")),
+        };
+    }
+    let outcome = match record.state {
+        WorkbenchInvocationState::Succeeded => WorkbenchOutcome::Succeeded,
+        WorkbenchInvocationState::Failed => WorkbenchOutcome::Failed,
+        WorkbenchInvocationState::Cancelled => WorkbenchOutcome::Cancelled,
+        WorkbenchInvocationState::TimedOut => WorkbenchOutcome::TimedOut,
+        WorkbenchInvocationState::Reserved
+        | WorkbenchInvocationState::Executing
+        | WorkbenchInvocationState::UnknownOutcome => {
+            unreachable!("durable replay requires a terminal invocation")
+        }
+    };
+    WorkbenchMessage::Result {
+        schema_version: WORKBENCH_SCHEMA_VERSION,
+        invocation_id: record.invocation_id.clone(),
+        input_digest: record.request_digest.clone(),
+        outcome,
+        resources: record.resources.clone().unwrap_or_default(),
+        artifacts: record.artifacts.clone(),
+        output: BTreeMap::new(),
+        error: record.error.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -2216,7 +2348,7 @@ mod tests {
 
     use sentinel_common::{
         WorkbenchErrorClass, WorkbenchProgressStage, WorkbenchResourceLimits, WorkbenchTool,
-        WORKBENCH_RUNTIME_BWRAP,
+        WorkbenchValidationError, WORKBENCH_RUNTIME_BWRAP,
     };
 
     use super::*;
@@ -2305,12 +2437,18 @@ mod tests {
     }
 
     fn secure_test_workbench_profile_authority() -> TestWorkbenchProfileAuthority {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../config/workbench-profiles/web-authoring-v1.toml");
         let profile_bytes = fs::read(source).expect("read repository workbench profile fixture");
+        secure_test_workbench_profile_authority_with_bytes(&profile_bytes)
+    }
+
+    fn secure_test_workbench_profile_authority_with_bytes(
+        profile_bytes: &[u8],
+    ) -> TestWorkbenchProfileAuthority {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
         let authority_base = secure_test_workbench_authority_base();
         let directory = tempfile::Builder::new()
             .prefix("sentinel-workbench-profile-")
@@ -2464,7 +2602,9 @@ mod tests {
             ReservationOutcome::Reserved(_)
         ));
         assert!(matches!(
-            store.reserve(&request, 1_900_000_000_001).unwrap(),
+            store
+                .reserve(&request, request.deadline_unix_ms + 1)
+                .unwrap(),
             ReservationOutcome::Replay(_)
         ));
 
@@ -2476,14 +2616,25 @@ mod tests {
         };
         conflicting.input_digest = conflicting.canonical_digest().unwrap();
         assert!(store
-            .reserve(&conflicting, 1_900_000_000_002)
+            .reserve(&conflicting, request.deadline_unix_ms + 2)
             .unwrap_err()
             .to_string()
             .contains("digest conflict"));
+
+        let mut expired = request.clone();
+        expired.invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2820".to_string();
+        expired.input_digest = expired.canonical_digest().unwrap();
+        let error = store
+            .reserve(&expired, expired.deadline_unix_ms + 1)
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<WorkbenchValidationError>(),
+            Some(WorkbenchValidationError::DeadlineExpired)
+        ));
     }
 
     #[test]
-    fn transitions_persist_safe_result_without_private_output() {
+    fn transitions_keep_transient_output_out_of_every_durable_surface() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("workbench.redb");
         let store = WorkbenchInvocationStore::open(&path).unwrap();
@@ -2522,6 +2673,10 @@ mod tests {
         assert!(safe_event.contains("succeeded"));
         assert!(!safe_event.contains("SECRET-VALUE"));
         drop(store);
+        assert!(!fs::read(&path)
+            .unwrap()
+            .windows("SECRET-VALUE".len())
+            .any(|bytes| bytes == b"SECRET-VALUE"));
 
         let reopened = WorkbenchInvocationStore::open(&path).unwrap();
         let recovered = reopened.load(&request.invocation_id).unwrap().unwrap();
@@ -2529,6 +2684,11 @@ mod tests {
         assert!(!serde_json::to_string(&recovered)
             .unwrap()
             .contains("SECRET-VALUE"));
+        let replay = durable_terminal_projection(&recovered);
+        let WorkbenchMessage::Result { output, .. } = replay else {
+            panic!("terminal replay did not use the durable-safe result projection");
+        };
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -2604,6 +2764,49 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exceeds"));
+    }
+
+    #[test]
+    fn immutable_profile_validates_rules_and_enforces_the_exact_node_prefix() {
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2819");
+        request.capabilities = BTreeSet::from(["command.run_allowlisted".to_string()]);
+        request.command_policy = profile.command_rules.clone();
+        request.tool = WorkbenchTool::RunCommand {
+            program: "node".to_string(),
+            args: vec!["--check".to_string(), "src/app.js".to_string()],
+        };
+        request.tool_profile_digest = digest.clone();
+        request.input_digest = request.canonical_digest().unwrap();
+        request.validate_at(1_900_000_000_000).unwrap();
+        profile.authorize_request(&digest, &request).unwrap();
+
+        let mut bypass = request;
+        bypass.tool = WorkbenchTool::RunCommand {
+            program: "node".to_string(),
+            args: vec!["src/app.js".to_string(), "--check".to_string()],
+        };
+        bypass.input_digest = bypass.canonical_digest().unwrap();
+        assert!(profile.authorize_request(&digest, &bypass).is_err());
+
+        let source = fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../config/workbench-profiles/web-authoring-v1.toml"),
+        )
+        .unwrap();
+        for malformed in [
+            source.replace("program = \"node\"", "program = \"../node\""),
+            source.replace(
+                "required_arg_prefix = [\"--check\"]",
+                "required_arg_prefix = [\"--check=/proc/self/environ\"]",
+            ),
+            source.replace("max_args = 2", "max_args = 65"),
+        ] {
+            let authority =
+                secure_test_workbench_profile_authority_with_bytes(malformed.as_bytes());
+            assert!(WorkbenchProfile::load(authority.path()).is_err());
+        }
     }
 
     #[test]
@@ -2738,7 +2941,7 @@ mod tests {
             outcome: WorkbenchOutcome::DigestConflict,
             resources: WorkbenchResourceUsage::default(),
             artifacts: Vec::new(),
-            output: BTreeMap::new(),
+            output: BTreeMap::from([("content".to_string(), "PRIVATE".to_string())]),
             error: Some(WorkbenchErrorInfo {
                 class: WorkbenchErrorClass::Recovery,
                 code: "digest_conflict".to_string(),
@@ -2919,7 +3122,18 @@ mod tests {
         let blob = b"verified";
         let blob_digest = hex_sha256(blob);
         fs::write(scoped.join("blobs").join(&blob_digest), blob).unwrap();
-        let manifest_bytes = |project_id: &str| {
+        let manifest_bytes = |project_id: &str, paths: &[&str]| {
+            let entries = paths
+                .iter()
+                .map(|path| {
+                    serde_json::json!({
+                        "path": path,
+                        "blob_id": format!("sha256:{blob_digest}"),
+                        "sha256": blob_digest.clone(),
+                        "size_bytes": blob.len(),
+                    })
+                })
+                .collect::<Vec<_>>();
             serde_json::to_vec(&serde_json::json!({
                 "schema_version": WORKBENCH_SCHEMA_VERSION,
                 "invocation_id": request.invocation_id.clone(),
@@ -2934,16 +3148,11 @@ mod tests {
                 "tool_profile": request.tool_profile.clone(),
                 "tool_profile_digest": request.tool_profile_digest.clone(),
                 "policy_digest": request.policy_digest.clone(),
-                "entries": [{
-                    "path": "src/index.html",
-                    "blob_id": format!("sha256:{blob_digest}"),
-                    "sha256": blob_digest.clone(),
-                    "size_bytes": blob.len(),
-                }],
+                "entries": entries,
             }))
             .unwrap()
         };
-        let valid = manifest_bytes(&request.project_id);
+        let valid = manifest_bytes(&request.project_id, &["src/index.html"]);
         let digest = hex_sha256(&valid);
         let mut artifact = WorkbenchArtifactRef {
             artifact_id: format!("sha256:{digest}"),
@@ -2957,10 +3166,32 @@ mod tests {
 
         fs::write(scoped.join(&artifact.manifest_path), &valid).unwrap();
         assert!(validate_concrete_artifact_manifest(&record, &artifact, &roots).is_ok());
+
+        for invalid_paths in [
+            vec!["src/index.html", "src/index.html"],
+            vec!["src/./index.html"],
+            vec!["src//index.html"],
+        ] {
+            let invalid = manifest_bytes(&request.project_id, &invalid_paths);
+            let invalid_digest = hex_sha256(&invalid);
+            let invalid_artifact = WorkbenchArtifactRef {
+                artifact_id: format!("sha256:{invalid_digest}"),
+                sha256: invalid_digest.clone(),
+                artifact_kind: "source_tree".to_string(),
+                media_type: "application/json".to_string(),
+                size_bytes: blob.len() as u64 * invalid_paths.len() as u64,
+                manifest_path: format!("{invalid_digest}.manifest.json"),
+            };
+            fs::write(scoped.join(&invalid_artifact.manifest_path), invalid).unwrap();
+            assert!(
+                validate_concrete_artifact_manifest(&record, &invalid_artifact, &roots).is_err()
+            );
+        }
+
         fs::write(scoped.join(&artifact.manifest_path), b"tampered").unwrap();
         assert!(validate_concrete_artifact_manifest(&record, &artifact, &roots).is_err());
 
-        let foreign = manifest_bytes("foreign-project");
+        let foreign = manifest_bytes("foreign-project", &["src/index.html"]);
         let foreign_digest = hex_sha256(&foreign);
         artifact.artifact_id = format!("sha256:{foreign_digest}");
         artifact.sha256 = foreign_digest.clone();
@@ -3061,7 +3292,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_envelope_is_bound_committed_and_recoverable_without_private_output() {
+    fn runtime_envelope_commits_only_the_durable_safe_terminal_projection() {
         let directory = tempfile::tempdir().unwrap();
         let store = store(&directory);
         let request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2810");
@@ -3094,7 +3325,7 @@ mod tests {
                 "schema_version": WORKBENCH_SCHEMA_VERSION,
                 "invocation_id": request.invocation_id,
                 "state": "pending",
-                "messages": [result],
+                "messages": [result.clone()],
             }))
             .unwrap(),
         };
@@ -3143,6 +3374,11 @@ mod tests {
         assert!(!serde_json::to_string(&completed)
             .unwrap()
             .contains("PRIVATE"));
+        let WorkbenchMessage::Result { output, .. } = durable_terminal_projection(&completed)
+        else {
+            panic!("completed record did not reconstruct a safe result");
+        };
+        assert!(output.is_empty());
         let recovery =
             WorkbenchRuntimeEnvelope::recover(&request.invocation_id, &request.input_digest)
                 .unwrap();
@@ -3312,7 +3548,7 @@ mod tests {
                 ..WorkbenchResourceUsage::default()
             },
             artifacts: Vec::new(),
-            output: BTreeMap::new(),
+            output: BTreeMap::from([("content".to_string(), "PRIVATE-RESULT".to_string())]),
             error: None,
         };
         let recovered = NanoExecResult {
@@ -3324,7 +3560,7 @@ mod tests {
                 "invocation_id": request.invocation_id,
                 "state": "completed",
                 "messages": [
-                    recovered_result,
+                    recovered_result.clone(),
                     WorkbenchMessage::Progress {
                         schema_version: WORKBENCH_SCHEMA_VERSION,
                         invocation_id: request.invocation_id.clone(),
@@ -3357,7 +3593,7 @@ mod tests {
         assert_eq!(runtime.calls, 1, "executing replay must not redispatch");
 
         let completed = coordinator
-            .recover_executing(
+            .poll(
                 &mut runtime,
                 &request.invocation_id,
                 &authority,
@@ -3370,6 +3606,40 @@ mod tests {
             completed.records.last().unwrap().state,
             WorkbenchInvocationState::Succeeded
         );
+        assert_eq!(completed.caller_result, Some(recovered_result.clone()));
+        let durable_result = durable_terminal_projection(completed.records.last().unwrap());
+        let terminal_replay = coordinator
+            .submit(
+                &mut runtime,
+                &request,
+                &authority,
+                request.deadline_unix_ms + 1,
+            )
+            .unwrap();
+        assert_eq!(runtime.calls, 2, "terminal replay must not redispatch");
+        assert_eq!(terminal_replay.caller_result, Some(durable_result.clone()));
+        assert!(!serde_json::to_string(&terminal_replay.records)
+            .unwrap()
+            .contains("PRIVATE-RESULT"));
+
+        drop(coordinator);
+        drop(store);
+        assert!(!fs::read(directory.path().join("workbench.redb"))
+            .unwrap()
+            .windows("PRIVATE-RESULT".len())
+            .any(|bytes| bytes == b"PRIVATE-RESULT"));
+        let restarted_store =
+            WorkbenchInvocationStore::open(directory.path().join("workbench.redb")).unwrap();
+        let restarted = WorkbenchCoordinator::new(&restarted_store, &profile, &profile_digest)
+            .submit(
+                &mut runtime,
+                &request,
+                &authority,
+                request.deadline_unix_ms + 2,
+            )
+            .unwrap();
+        assert_eq!(runtime.calls, 2, "restart replay must not redispatch");
+        assert_eq!(restarted.caller_result, Some(durable_result));
     }
 
     #[test]
