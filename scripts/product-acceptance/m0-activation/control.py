@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import stat
 import subprocess
 import sys
@@ -63,7 +64,14 @@ TOPOLOGY = (
 )
 ALL_UNITS = (*TOPOLOGY, TARGET)
 INSPECT_UNITS = (*ALL_UNITS, *ONESHOTS)
-ROLLBACK_ORDER = tuple(reversed(TOPOLOGY)) + (TARGET,)
+ROLLBACK_ORDER = (TARGET, *tuple(reversed(TOPOLOGY)))
+BASE_CHILD_ENV = {
+    "LC_ALL": "C",
+    "PATH": "/usr/bin:/bin",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONNOUSERSITE": "1",
+}
+MAX_CREDENTIAL_BYTES = 4096
 
 
 class ControlError(RuntimeError):
@@ -336,22 +344,130 @@ class Result:
     stdout: bytes = b""
 
 
-Runner = Callable[[tuple[str, ...], float], Result]
+Runner = Callable[[tuple[str, ...], float, dict[str, str]], Result]
 
 
-def production_runner(argv: tuple[str, ...], timeout: float) -> Result:
-    if not argv or argv[0] not in {str(SYSTEMCTL), str(PYTHON)}:
+def validate_command(argv: tuple[str, ...]) -> None:
+    if not argv:
         fail("executable_not_allowed")
+    if argv[0] == str(PYTHON):
+        if len(argv) < 2 or argv[1] not in {
+            str(PREFLIGHT_PROGRAM), str(JOURNEY_PROGRAM)
+        }:
+            fail("executable_not_allowed")
+        return
+    if argv[0] != str(SYSTEMCTL) or len(argv) < 2:
+        fail("executable_not_allowed")
+    verb = argv[1]
+    if verb == "daemon-reload" and len(argv) == 2:
+        return
+    if verb == "start" and argv[2:] == (TARGET,):
+        return
+    if verb == "show" and len(argv) == 5 and argv[2] in INSPECT_UNITS:
+        return
+    if verb == "stop" and len(argv) == 3 and argv[2] in ALL_UNITS:
+        return
+    if verb == "restart" and len(argv) == 3 and argv[2] in SERVICES:
+        return
+    fail("command_not_allowed")
+
+
+def credential_environment_names(argv: tuple[str, ...]) -> tuple[str, ...]:
+    if argv[:2] != (str(PYTHON), str(JOURNEY_PROGRAM)):
+        return ()
+    names: list[str] = []
+    roles: set[str] = set()
+    index = 2
+    while index < len(argv):
+        if argv[index] != "--credential":
+            index += 1
+            continue
+        if index + 1 >= len(argv):
+            fail("credential_reference_invalid")
+        reference = argv[index + 1]
+        if not CREDENTIAL_RE.fullmatch(reference):
+            fail("credential_reference_invalid")
+        role, name = reference.split("=", 1)
+        if role in roles or name in names:
+            fail("credential_reference_invalid")
+        roles.add(role)
+        names.append(name)
+        index += 2
+    return tuple(names)
+
+
+def child_environment(argv: tuple[str, ...]) -> dict[str, str]:
+    validate_command(argv)
+    result = dict(BASE_CHILD_ENV)
+    for name in credential_environment_names(argv):
+        value = os.environ.get(name)
+        if (
+            value is None
+            or not 1 <= len(value.encode("utf-8")) <= MAX_CREDENTIAL_BYTES
+            or any(ord(character) < 0x20 or ord(character) == 0x7f for character in value)
+        ):
+            fail("credential_value_invalid")
+        result[name] = value
+    return result
+
+
+def invoke(runner: Runner, argv: tuple[str, ...], timeout: float) -> Result:
+    return runner(argv, timeout, child_environment(argv))
+
+
+def production_runner(
+    argv: tuple[str, ...], timeout: float, environment: dict[str, str]
+) -> Result:
+    validate_command(argv)
+    if environment != child_environment(argv):
+        fail("child_environment_invalid")
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, timeout=timeout, check=False, env=os.environ,
+            stderr=subprocess.PIPE, shell=False, env=environment,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise ControlError("command_failed") from exc
-    if len(completed.stdout) > MAX_OUTPUT_BYTES:
-        fail("command_output_oversized")
-    return Result(completed.returncode, completed.stdout)
+    selector = selectors.DefaultSelector()
+    assert process.stdout is not None and process.stderr is not None
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    chunks: list[bytes] = []
+    total = 0
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("command_timeout")
+            events = selector.select(remaining)
+            if not events:
+                fail("command_timeout")
+            for key, _ in events:
+                block = os.read(key.fileobj.fileno(), 65536)
+                if not block:
+                    selector.unregister(key.fileobj)
+                    continue
+                total += len(block)
+                if total > MAX_OUTPUT_BYTES:
+                    fail("command_output_oversized")
+                if key.data == "stdout":
+                    chunks.append(block)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail("command_timeout")
+        return Result(process.wait(timeout=remaining), b"".join(chunks))
+    except subprocess.TimeoutExpired as exc:
+        raise ControlError("command_timeout") from exc
+    except OSError as exc:
+        raise ControlError("command_failed") from exc
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+        process.stderr.close()
 
 
 def validate_executables(systemctl: Path, python: Path, preflight: Path, journey: Path) -> None:
@@ -367,7 +483,7 @@ def systemctl_show(runner: Runner, unit: str, timeout: float) -> dict[str, str]:
     properties = ("LoadState", "ActiveState", "SubState")
     if unit != TARGET:
         properties += ("Result",)
-    result = runner((
+    result = invoke(runner, (
         str(SYSTEMCTL), "show", unit, f"--property={','.join(properties)}",
         "--no-pager",
     ), timeout)
@@ -473,7 +589,7 @@ def preflight_command(value: PreflightArgs) -> tuple[str, ...]:
 
 
 def run_preflight(runner: Runner, value: PreflightArgs) -> str:
-    result = runner(preflight_command(value), value.timeout)
+    result = invoke(runner, preflight_command(value), value.timeout)
     if result.returncode != 0:
         fail("readiness_failed")
     output = strict_json(result.stdout, "preflight")
@@ -511,23 +627,20 @@ def _activate(
         values = systemctl_show(runner, unit, timeout)
         if values["ActiveState"] != "inactive" or values.get("Result") == "failed":
             fail("unit_not_stopped_cleanly")
-    reload_result = runner((str(SYSTEMCTL), "daemon-reload"), timeout)
+    reload_result = invoke(runner, (str(SYSTEMCTL), "daemon-reload"), timeout)
     if reload_result.returncode != 0:
         fail("daemon_reload_failed")
-    started: list[str] = []
+    invocation_units = list(ALL_UNITS)
     failure: str | None = None
     readiness_digest: str | None = None
     rollback_failed = False
     try:
-        result = runner((str(SYSTEMCTL), "start", TARGET), timeout)
+        result = invoke(runner, (str(SYSTEMCTL), "start", TARGET), timeout)
         start_failed = result.returncode != 0
-        started.append(TARGET)
         readback_failed = False
         for unit in ALL_UNITS:
             try:
                 values = systemctl_show(runner, unit, timeout)
-                if unit != TARGET and values["ActiveState"] != "inactive":
-                    started.append(unit)
                 if not unit_ready(unit, values):
                     readback_failed = True
             except ControlError:
@@ -540,11 +653,12 @@ def _activate(
     except ControlError as exc:
         failure = exc.code
     if failure is not None:
-        started_set = set(started)
         for unit in ROLLBACK_ORDER:
-            if unit not in started_set:
+            try:
+                result = invoke(runner, (str(SYSTEMCTL), "stop", unit), timeout)
+            except ControlError:
+                rollback_failed = True
                 continue
-            result = runner((str(SYSTEMCTL), "stop", unit), timeout)
             if result.returncode != 0:
                 rollback_failed = True
             else:
@@ -561,7 +675,7 @@ def _activate(
             "git_sha": expected_git_sha,
             "manifest_sha256": expected_manifest_sha,
             "provision_receipt_sha256": expected_receipt_sha,
-            "started_unit_count": len(started),
+            "started_unit_count": len(invocation_units),
             "readiness_digest": None,
             "m0_acceptance_pass": False,
         }
@@ -572,7 +686,8 @@ def _activate(
         "git_sha": expected_git_sha, "manifest_sha256": expected_manifest_sha,
         "provision_receipt_sha256": expected_receipt_sha,
         "provision_artifact_set_digest": provision["artifact_set_digest"],
-        "started_unit_count": len(started), "readiness_digest": readiness_digest,
+        "started_unit_count": len(invocation_units),
+        "readiness_digest": readiness_digest,
         "m0_acceptance_pass": False,
     }
     write_receipt(output_path, receipt)
@@ -632,7 +747,16 @@ def load_control_plan(path: Path, expected_sha: str, journey_plan_sha: str,
     return {checkpoint: mapping[checkpoint] for checkpoint in checkpoints}
 
 
-def load_journey_contract(plan_path: Path) -> tuple[str, list[str]]:
+@dataclass(frozen=True)
+class JourneyContract:
+    raw_sha256: str
+    module: Any
+    plan: dict[str, Any]
+    checkpoints: tuple[str, ...]
+    step_ids: tuple[str, ...]
+
+
+def load_journey_contract(plan_path: Path) -> JourneyContract:
     raw, plan = load_json(plan_path, "journey_plan")
     if not isinstance(plan, dict) or not isinstance(plan.get("steps"), list):
         fail("journey_plan_shape")
@@ -663,7 +787,10 @@ def load_journey_contract(plan_path: Path) -> tuple[str, list[str]]:
             checkpoints.append(checkpoint)
     if not checkpoints:
         fail("journey_checkpoints_missing")
-    return digest_bytes(raw), checkpoints
+    return JourneyContract(
+        digest_bytes(raw), module, plan, tuple(checkpoints),
+        tuple(step["id"] for step in plan["steps"]),
+    )
 
 
 @dataclass(frozen=True)
@@ -691,18 +818,61 @@ def journey_command(value: JourneyArgs, checkpoint: str | None) -> tuple[str, ..
     return tuple(argv)
 
 
-def evidence_state(path: Path, expected_result: str, checkpoint: str | None) -> tuple[str, dict[str, Any]]:
-    raw, value = load_json(path, "journey_evidence")
+def validate_journey_state(
+    contract: JourneyContract, journey: JourneyArgs, expected_result: str,
+    checkpoint: str | None, expected_completed: tuple[str, ...],
+    expected_replayed: tuple[str, ...],
+) -> tuple[str, str, dict[str, Any]]:
+    plan_raw, plan_value = load_json(journey.plan, "journey_plan")
+    ledger_raw, ledger_value = load_json(journey.ledger, "journey_ledger")
+    evidence_raw, evidence_value = load_json(journey.evidence, "journey_evidence")
     if (
-        not isinstance(value, dict)
-        or value.get("result") != expected_result
-        or value.get("stopped_at") != checkpoint
-        or not isinstance(value.get("record_chain_tip"), str)
-        or not DIGEST_RE.fullmatch(value["record_chain_tip"])
-        or not isinstance(value.get("replay_verified_steps"), list)
+        digest_bytes(plan_raw) != contract.raw_sha256
+        or plan_value != contract.plan
+        or ledger_raw != canonical(ledger_value)
+        or evidence_raw != canonical(evidence_value)
     ):
-        fail("journey_evidence_invalid")
-    return digest_bytes(raw), value
+        fail("journey_state_noncanonical")
+    module = contract.module
+    original_load_json = module.load_json
+
+    def pinned_load_json(path: Path, _label: str) -> dict[str, Any]:
+        if path == journey.ledger and isinstance(ledger_value, dict):
+            return ledger_value
+        if path == journey.evidence and isinstance(evidence_value, dict):
+            return evidence_value
+        raise module.JourneyError("controller supplied an unknown state path")
+
+    try:
+        module.load_json = pinned_load_json
+        normalized_origin = module.validate_base_url(journey.base_url)
+        ledger = module.load_ledger(
+            journey.ledger, contract.plan["schema_version"],
+            module.digest(contract.plan), contract.plan["journey_id"],
+            normalized_origin,
+        )
+        module.validate_completed_prefix(
+            contract.plan, ledger["completed"], ledger["chain_tip"]
+        )
+        module.validate_evidence_binding(journey.evidence, ledger, contract.plan)
+        if (
+            len(ledger["completed"]) != len(expected_completed)
+            or set(ledger["completed"]) != set(expected_completed)
+        ):
+            fail("journey_completed_prefix_mismatch")
+        expected_evidence = module.build_evidence(
+            contract.plan, ledger, expected_result, checkpoint,
+            set(expected_replayed),
+        )
+        if evidence_value != expected_evidence:
+            fail("journey_evidence_mismatch")
+    except ControlError:
+        raise
+    except Exception as exc:
+        raise ControlError("journey_state_invalid") from exc
+    finally:
+        module.load_json = original_load_json
+    return digest_bytes(ledger_raw), digest_bytes(evidence_raw), evidence_value
 
 
 def wait_service(runner: Runner, unit: str, timeout: float) -> None:
@@ -728,17 +898,28 @@ def _restart_journey(
         fail("restart_receipt_exists")
     safe_output_path(journey.ledger, "ledger")
     safe_output_path(journey.evidence, "evidence")
-    plan_sha, checkpoints = load_journey_contract(journey.plan)
-    mapping = load_control_plan(control_path, expected_control_sha, plan_sha, checkpoints)
+    contract = load_journey_contract(journey.plan)
+    checkpoints = list(contract.checkpoints)
+    mapping = load_control_plan(
+        control_path, expected_control_sha, contract.raw_sha256, checkpoints
+    )
     records: list[dict[str, str]] = []
+    previously_completed: tuple[str, ...] = ()
     for checkpoint in checkpoints:
-        result = runner(journey_command(journey, checkpoint), journey.timeout)
+        result = invoke(runner, journey_command(journey, checkpoint), journey.timeout)
         if result.returncode != 0:
             fail("journey_checkpoint_failed")
-        evidence_before, _ = evidence_state(journey.evidence, "checkpoint_reached", checkpoint)
-        ledger_before = digest_bytes(read_regular(journey.ledger, "journey_ledger"))
+        checkpoint_index = next(
+            index for index, step in enumerate(contract.plan["steps"])
+            if step.get("checkpoint") == checkpoint
+        )
+        expected_completed = contract.step_ids[:checkpoint_index + 1]
+        ledger_before, evidence_before, _ = validate_journey_state(
+            contract, journey, "checkpoint_reached", checkpoint,
+            expected_completed, previously_completed,
+        )
         unit = mapping[checkpoint]
-        result = runner((str(SYSTEMCTL), "restart", unit), journey.timeout)
+        result = invoke(runner, (str(SYSTEMCTL), "restart", unit), journey.timeout)
         if result.returncode != 0:
             fail("restart_failed")
         wait_service(runner, unit, journey.timeout)
@@ -749,18 +930,24 @@ def _restart_journey(
             fail("evidence_changed_during_restart")
         records.append({"checkpoint": checkpoint, "unit": unit, "readiness_digest": readiness,
                         "ledger_digest": ledger_before, "evidence_digest": evidence_before})
-    result = runner(journey_command(journey, None), journey.timeout)
+        previously_completed = expected_completed
+    result = invoke(runner, journey_command(journey, None), journey.timeout)
     if result.returncode != 0:
         fail("journey_resume_failed")
-    _, final = evidence_state(journey.evidence, "complete", None)
-    completed_ids = {
-        item.get("id") for item in final.get("steps", []) if isinstance(item, dict)
-    }
-    if set(final["replay_verified_steps"]) != completed_ids:
-        fail("authoritative_replay_incomplete")
+    validate_journey_state(
+        contract, journey, "complete", None, contract.step_ids,
+        previously_completed,
+    )
+    result = invoke(runner, journey_command(journey, None), journey.timeout)
+    if result.returncode != 0:
+        fail("journey_replay_failed")
+    _, _, final = validate_journey_state(
+        contract, journey, "complete", None, contract.step_ids,
+        contract.step_ids,
+    )
     receipt = {
         "schema_version": SCHEMA_VERSION, "status": "COMPLETE",
-        "journey_plan_sha256": plan_sha,
+        "journey_plan_sha256": contract.raw_sha256,
         "restart_control_sha256": expected_control_sha,
         "checkpoint_count": len(records), "checkpoint_digest": digest(records),
         "final_record_chain_tip": final["record_chain_tip"],
