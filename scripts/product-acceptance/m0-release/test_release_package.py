@@ -196,15 +196,30 @@ class ReleasePackageTests(unittest.TestCase):
             callable_(*args, **kwargs)
         self.assertEqual(str(context.exception), code)
 
-    def test_complete_111_artifact_package_is_canonical_and_provisionable(self) -> None:
+    def test_complete_dynamic_artifact_package_is_canonical_and_provisionable(self) -> None:
+        expected_count = len(AUTHORITY)
         result = self.fixture.build()
         self.assertEqual(result["status"], "COMPLETE")
-        self.assertEqual(result["artifact_count"], 111)
+        self.assertEqual(result["artifact_count"], expected_count)
         manifest_raw = (self.fixture.package / PACKAGE.MANIFEST_NAME).read_bytes()
         manifest = json.loads(manifest_raw)
         self.assertEqual(manifest_raw, canonical(manifest))
-        self.assertEqual(len(manifest["artifacts"]), 111)
+        self.assertEqual(len(manifest["artifacts"]), expected_count)
         self.assertEqual(manifest["git_sha"], self.fixture.git_sha)
+        readiness_destination = "/opt/sentinel/scripts/m0-readiness.py"
+        readiness_source = "scripts/product-acceptance/m0-readiness/readiness.py"
+        self.assertEqual(AUTHORITY[readiness_destination], (readiness_source, "script"))
+        self.assertIn(
+            {
+                "path": readiness_destination,
+                "source": readiness_source,
+                "sha256": hashlib.sha256(
+                    (self.fixture.package / readiness_source).read_bytes()
+                ).hexdigest(),
+                "type": "script",
+            },
+            manifest["artifacts"],
+        )
         self.assertEqual(stat.S_IMODE(self.fixture.package.stat().st_mode), 0o500)
         verified = PACKAGE.verify_package(self.fixture.package, self.fixture.git_sha)
         self.assertEqual(verified["manifest_sha256"], result["manifest_sha256"])
@@ -213,8 +228,8 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertEqual(provisioned.returncode, 0, provisioned.stderr)
         receipt = json.loads(provisioned.stdout)
         self.assertEqual(receipt["status"], "COMPLETE")
-        self.assertEqual(receipt["artifact_count"], 111)
-        self.assertEqual(receipt["changed_count"], 111)
+        self.assertEqual(receipt["artifact_count"], expected_count)
+        self.assertEqual(receipt["changed_count"], expected_count)
 
     def test_retry_reuses_identical_immutable_package(self) -> None:
         first = self.fixture.build()
