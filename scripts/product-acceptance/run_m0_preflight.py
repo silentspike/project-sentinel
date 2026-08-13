@@ -1,0 +1,1138 @@
+#!/usr/bin/env python3
+"""Fail-closed, token-free runtime preflight for the single-node M0 journey."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import stat
+import subprocess
+import sys
+import time
+import tomllib
+from typing import Any, Callable
+from urllib import parse
+
+
+SCHEMA_VERSION = 1
+MAX_FILE_BYTES = 4 * 1024 * 1024
+MAX_COMMAND_BYTES = 512 * 1024
+MAX_HTTP_BYTES = 1024 * 1024
+MAX_TIMEOUT_SECONDS = 15.0
+MAX_AGENTS = 256
+DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+TARGET_UNIT = "sentinel.target"
+REQUIRED_UNITS = {
+    "nats-server.service": ("active", "running"),
+    "sentinel-daemon.service": ("active", "running"),
+    "sentinel-dashboard-backend.service": ("active", "running"),
+    "sentinel-gaia-loop.service": ("active", "running"),
+    "sentinel-gateway.service": ("active", "running"),
+    "sentinel-health-monitor.timer": ("active", "waiting"),
+    "sentinel-judge.service": ("active", "running"),
+    "sentinel-nats-bridge.service": ("active", "running"),
+    "sentinel-nightrun.timer": ("active", "waiting"),
+    "sentinel-projection.service": ("active", "running"),
+}
+REQUIRED_MANIFEST_PATHS = {
+    "/etc/nats/nats.conf",
+    "/etc/systemd/system/nats-server.service",
+    "/etc/systemd/system/sentinel-daemon.service",
+    "/etc/systemd/system/sentinel-dashboard-backend.service",
+    "/etc/systemd/system/sentinel-gaia-loop.service",
+    "/etc/systemd/system/sentinel-gateway.service",
+    "/etc/systemd/system/sentinel-health-monitor.service",
+    "/etc/systemd/system/sentinel-health-monitor.timer",
+    "/etc/systemd/system/sentinel-judge.service",
+    "/etc/systemd/system/sentinel-nats-bridge.service",
+    "/etc/systemd/system/sentinel-nightrun.timer",
+    "/etc/systemd/system/sentinel-projection.service",
+    "/etc/systemd/system/sentinel.target",
+    "/opt/sentinel/bin/cortex-gateway",
+    "/opt/sentinel/bin/landlock-wrapper",
+    "/opt/sentinel/bin/sentinel-daemon",
+    "/opt/sentinel/bin/sentinel-dashboard-backend",
+    "/opt/sentinel/bin/sentinel-gaia-loop",
+    "/opt/sentinel/bin/sentinel-judge",
+    "/opt/sentinel/bin/sentinel-nats-bridge",
+    "/opt/sentinel/bin/sentinel-projection",
+    "/opt/sentinel/config/cortex-gateway.toml",
+    "/opt/sentinel/config/company.toml",
+    "/opt/sentinel/config/controlplane.toml",
+    "/opt/sentinel/config/daemon.toml",
+    "/opt/sentinel/config/judge.toml",
+    "/opt/sentinel/config/nats-bridge.toml",
+    "/opt/sentinel/config/nightrun.toml",
+    "/opt/sentinel/config/rooms.toml",
+    "/opt/sentinel/config/simulation.toml",
+    "/opt/sentinel/config/work-profiles/web-project-v1.toml",
+    "/opt/sentinel/scripts/sentinel-health-monitor.sh",
+    "/usr/bin/agent-runtime",
+    "/usr/local/bin/nats-server",
+}
+EXPECTED_LISTENERS = {
+    ("tcp", "127.0.0.1", 4222),
+    ("tcp", "127.0.0.1", 8001),
+    ("udp", "127.0.0.1", 8001),
+    ("tcp", "0.0.0.0", 8080),
+    ("tcp", "127.0.0.1", 8081),
+    ("tcp", "0.0.0.0", 8082),
+    ("tcp", "127.0.0.1", 8083),
+    ("tcp", "127.0.0.1", 8084),
+    ("tcp", "127.0.0.1", 8222),
+    ("tcp", "127.0.0.1", 9090),
+}
+HTTP_CONTRACTS = (
+    ("gateway_health", "http://127.0.0.1:8080/health", None, "status", "ok"),
+    ("gateway_ready", "http://127.0.0.1:8080/ready", None, "ready", True),
+    ("gateway_control_health", "http://127.0.0.1:8081/health", None, "status", "ok"),
+    ("gateway_control_ready", "http://127.0.0.1:8081/ready", None, "status", "ok"),
+    ("judge_health", "http://127.0.0.1:8082/health", None, "status", "ok"),
+    ("judge_ready", "http://127.0.0.1:8082/ready", None, "ready", True),
+    ("bridge_health", "http://127.0.0.1:8083/health", None, "status", "ok"),
+    ("bridge_ready", "http://127.0.0.1:8083/ready", None, "status", "ok"),
+    ("dashboard_health", "http://127.0.0.1:8001/api/health", None, "status", "ok"),
+    ("nats_health", "http://127.0.0.1:8222/healthz", None, "status", "ok"),
+    ("runtime_health", "http://127.0.0.1:8084/operator/runtime-health", "operator", None, None),
+    ("platform_state", "http://127.0.0.1:8084/operator/platform-state", "operator", None, None),
+    ("episode_projection", "http://127.0.0.1:8084/operator/episode-projection", "operator", None, None),
+)
+EVENT_STORE_SQL = """
+SELECT
+  COALESCE((SELECT MAX(id) FROM events), 0) AS latest_event_id,
+  (SELECT COUNT(*) FROM outbox WHERE status = 'pending') AS pending_outbox,
+  (SELECT COUNT(*) FROM outbox o
+     LEFT JOIN events e ON e.event_id = o.event_id
+     WHERE e.event_id IS NULL) AS orphan_outbox,
+  (SELECT COUNT(*) FROM llm_completion_outbox) AS unresolved_llm,
+  (SELECT COUNT(*) FROM runtime_config_recovery) AS runtime_recovery,
+  (SELECT COUNT(*) FROM runtime_config_apply_recovery) AS config_apply_recovery,
+  COALESCE((SELECT last_event_id FROM projection_offsets
+            WHERE projection_name = 'sentinel-projection'), -1) AS projection_offset,
+  COALESCE((SELECT last_event_id FROM projection_offsets
+            WHERE projection_name = 'sentinel-projection-cost-hierarchy-v2'), -1)
+    AS hierarchy_offset;
+""".strip()
+PROJECTION_SQL = """
+SELECT COALESCE((SELECT last_event_id FROM projection_watermarks
+                 WHERE projection_name = 'sentinel-projection'), -1)
+  AS projection_watermark;
+""".strip()
+PROJECTION_AGENTS_SQL = """
+SELECT agent_id, name, role, shift_set, status
+FROM agent_live_view
+WHERE status = 'active'
+ORDER BY agent_id;
+""".strip()
+
+
+class PreflightError(RuntimeError):
+    """Public-safe validation error carrying a stable reason code."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+class DuplicateJsonKey(ValueError):
+    pass
+
+
+CommandRunner = Callable[[list[str], float, int], bytes]
+HttpReader = Callable[[str, str | None, float, int], bytes]
+FileReader = Callable[[Path, int], bytes]
+
+
+@dataclass(frozen=True)
+class Inputs:
+    manifest: Path
+    contract: Path
+    profile: Path
+    agents_dir: Path
+    operator_credential: Path
+    expected_git_sha: str
+    event_store: Path = Path("/opt/sentinel/data/events.db")
+    projection_store: Path = Path("/opt/sentinel/data/projection.db")
+    timeout_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
+class Dependencies:
+    command: CommandRunner
+    http: HttpReader
+    read_file: FileReader
+    list_agents: Callable[[Path], list[Path]]
+    validate_secret_file: Callable[[Path], None]
+
+
+def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKey(key)
+        result[key] = value
+    return result
+
+
+def strict_json(data: bytes) -> Any:
+    try:
+        return json.loads(data.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeError, json.JSONDecodeError, DuplicateJsonKey) as exc:
+        raise PreflightError("invalid_json") from exc
+
+
+def canonical_json(value: Any) -> bytes:
+    try:
+        return json.dumps(
+            value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+    except (TypeError, ValueError) as exc:
+        raise PreflightError("noncanonical_value") from exc
+
+
+def evidence_digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def default_read_file(path: Path, limit: int) -> bytes:
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise PreflightError("unsafe_file")
+        if metadata.st_size > limit:
+            raise PreflightError("oversized_file")
+        with path.open("rb") as handle:
+            data = handle.read(limit + 1)
+    except PreflightError:
+        raise
+    except OSError as exc:
+        raise PreflightError("file_unavailable") from exc
+    if len(data) > limit:
+        raise PreflightError("oversized_file")
+    return data
+
+
+def default_list_agents(path: Path) -> list[Path]:
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise PreflightError("unsafe_agents_directory")
+        entries = sorted(path.glob("AGENT-*.toml"))
+    except PreflightError:
+        raise
+    except OSError as exc:
+        raise PreflightError("agents_unavailable") from exc
+    if not entries or len(entries) > MAX_AGENTS:
+        raise PreflightError("invalid_agent_count")
+    return entries
+
+
+def default_validate_secret_file(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise PreflightError("credential_unavailable") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise PreflightError("credential_permissions_invalid")
+
+
+def default_command(argv: list[str], timeout: float, limit: int) -> bytes:
+    if not argv or argv[0] not in {"/usr/bin/systemctl", "/usr/bin/ss", "/usr/bin/sqlite3"}:
+        raise PreflightError("command_not_allowed")
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        )
+    except OSError as exc:
+        raise PreflightError("command_failed") from exc
+    selector = selectors.DefaultSelector()
+    assert process.stdout is not None and process.stderr is not None
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    sizes = {"stdout": 0, "stderr": 0}
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PreflightError("command_timeout")
+            events = selector.select(remaining)
+            if not events:
+                raise PreflightError("command_timeout")
+            for key, _ in events:
+                block = os.read(key.fileobj.fileno(), 65536)
+                if not block:
+                    selector.unregister(key.fileobj)
+                    continue
+                stream = key.data
+                sizes[stream] += len(block)
+                if sizes[stream] > limit:
+                    raise PreflightError("command_output_oversized")
+                chunks[stream].append(block)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PreflightError("command_timeout")
+        return_code = process.wait(timeout=remaining)
+        if return_code != 0:
+            raise PreflightError("command_failed")
+        return b"".join(chunks["stdout"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PreflightError("command_failed") from exc
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def default_http(url: str, credential: str | None, timeout: float, limit: int) -> bytes:
+    parsed = parse.urlsplit(url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise PreflightError("http_origin_not_loopback")
+    headers = {"Accept": "application/json"}
+    if credential is not None:
+        headers["Authorization"] = f"Bearer {credential}"
+    started = time.monotonic()
+    connection = http.client.HTTPConnection("127.0.0.1", parsed.port, timeout=timeout)
+    try:
+        target = parsed.path or "/"
+        if parsed.query:
+            target += f"?{parsed.query}"
+        connection.request("GET", target, headers=headers)
+        response = connection.getresponse()
+        if response.status != 200:
+            raise PreflightError("http_status")
+        if response.headers.get_content_type() != "application/json":
+            raise PreflightError("http_content_type")
+        declared = response.headers.get("Content-Length")
+        if declared is not None:
+            try:
+                if int(declared) > limit:
+                    raise PreflightError("http_body_oversized")
+            except ValueError as exc:
+                raise PreflightError("http_length_invalid") from exc
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise PreflightError("http_timeout")
+            if connection.sock is not None:
+                connection.sock.settimeout(remaining)
+            block = response.read(min(65536, limit + 1 - total))
+            if not block:
+                break
+            total += len(block)
+            if total > limit:
+                raise PreflightError("http_body_oversized")
+            chunks.append(block)
+        body = b"".join(chunks)
+    except PreflightError:
+        raise
+    except TimeoutError as exc:
+        raise PreflightError("http_timeout") from exc
+    except (OSError, http.client.HTTPException) as exc:
+        raise PreflightError("http_failed") from exc
+    finally:
+        connection.close()
+    return body
+
+
+DEFAULT_DEPENDENCIES = Dependencies(
+    default_command,
+    default_http,
+    default_read_file,
+    default_list_agents,
+    default_validate_secret_file,
+)
+
+
+def parse_toml(data: bytes) -> dict[str, Any]:
+    try:
+        value = tomllib.loads(data.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise PreflightError("invalid_toml") from exc
+    if not isinstance(value, dict):
+        raise PreflightError("invalid_toml")
+    return value
+
+
+def require_dict(value: Any, code: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise PreflightError(code)
+    return value
+
+
+def require_int(value: Any, code: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise PreflightError(code)
+    return value
+
+
+def require_bool(value: Any, code: str) -> bool:
+    if not isinstance(value, bool):
+        raise PreflightError(code)
+    return value
+
+
+def require_text(value: Any, code: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value.encode("utf-8")) <= 160
+        or not value.isascii()
+        or any(ord(char) < 0x20 or ord(char) > 0x7E for char in value)
+    ):
+        raise PreflightError(code)
+    return value
+
+
+def load_operator_credential(inputs: Inputs, deps: Dependencies) -> str:
+    deps.validate_secret_file(inputs.operator_credential)
+    data = deps.read_file(inputs.operator_credential, 4096)
+    try:
+        secret = data.decode("utf-8").strip()
+    except UnicodeError as exc:
+        raise PreflightError("credential_invalid") from exc
+    if not 32 <= len(secret.encode("utf-8")) <= 4096 or any(
+        ord(char) < 0x21 for char in secret
+    ):
+        raise PreflightError("credential_invalid")
+    return secret
+
+
+def validate_contract_profile_roster(
+    inputs: Inputs, deps: Dependencies
+) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
+    contract = parse_toml(deps.read_file(inputs.contract, MAX_FILE_BYTES))
+    profile = parse_toml(deps.read_file(inputs.profile, MAX_FILE_BYTES))
+    if contract.get("schema_version") != 1 or contract.get("profile") != "web-project-v1":
+        raise PreflightError("contract_identity_mismatch")
+    if contract.get("profile_path") != "config/work-profiles/web-project-v1.toml":
+        raise PreflightError("contract_profile_path_mismatch")
+    if profile.get("schema_version") != 1 or profile.get("id") != contract["profile"]:
+        raise PreflightError("profile_identity_mismatch")
+    if profile.get("runtime_mode") != "single_node" or profile.get("cluster_required") is not False:
+        raise PreflightError("profile_runtime_mismatch")
+    runtime = require_dict(profile.get("runtime"), "profile_runtime_missing")
+    if runtime.get("tool_runtime") != "bwrap" or runtime.get("runtime_registry_required") is not True:
+        raise PreflightError("profile_runtime_mismatch")
+    if runtime.get("allow_secure_runtime_fallback") is not False:
+        raise PreflightError("profile_fallback_enabled")
+
+    roster: dict[int, dict[str, Any]] = {}
+    names: set[str] = set()
+    for path in deps.list_agents(inputs.agents_dir):
+        agent = parse_toml(deps.read_file(path, MAX_FILE_BYTES))
+        identity = require_dict(agent.get("identity"), "agent_identity_missing")
+        agent_id = require_int(identity.get("id"), "agent_id_invalid", minimum=1)
+        name = require_text(identity.get("name"), "agent_name_invalid")
+        role = require_text(identity.get("role"), "agent_role_invalid")
+        shift = require_int(identity.get("shift_set"), "agent_shift_invalid")
+        if shift not in {0, 1, 2, 3} or agent_id in roster or name in names:
+            raise PreflightError("agent_roster_ambiguous")
+        runtime_config = agent.get("runtime", {})
+        if runtime_config is not None and not isinstance(runtime_config, dict):
+            raise PreflightError("agent_runtime_invalid")
+        runtime_key = (runtime_config or {}).get("nano_runtime", "bwrap-landlock")
+        if runtime_key != "bwrap-landlock":
+            raise PreflightError("agent_runtime_fallback")
+        roster[agent_id] = {
+            "name": name,
+            "role": role,
+            "shift": shift,
+            "runtime_key": runtime_key,
+        }
+        names.add(name)
+    evidence = {
+        "contract_digest": evidence_digest(contract),
+        "profile_digest": evidence_digest(profile),
+        "profile_id": profile["id"],
+        "roster_count": len(roster),
+        "roster_digest": evidence_digest(
+            [
+                {
+                    "id": key,
+                    "name": roster[key]["name"],
+                    "role": roster[key]["role"],
+                    "shift": roster[key]["shift"],
+                }
+                for key in sorted(roster)
+            ]
+        ),
+    }
+    return evidence, roster
+
+
+def validate_manifest(inputs: Inputs, deps: Dependencies) -> dict[str, Any]:
+    manifest = strict_json(deps.read_file(inputs.manifest, MAX_FILE_BYTES))
+    manifest = require_dict(manifest, "manifest_not_object")
+    if set(manifest) != {"version", "created_at", "git_sha", "artifacts"}:
+        raise PreflightError("manifest_shape")
+    if manifest["version"] != "1.0" or not isinstance(manifest["created_at"], str):
+        raise PreflightError("manifest_version")
+    if not isinstance(manifest["git_sha"], str) or not SHA_RE.fullmatch(manifest["git_sha"]):
+        raise PreflightError("manifest_git_sha")
+    if manifest["git_sha"] != inputs.expected_git_sha:
+        raise PreflightError("manifest_git_sha_mismatch")
+    artifacts = manifest["artifacts"]
+    if not isinstance(artifacts, list) or not artifacts or len(artifacts) > 512:
+        raise PreflightError("manifest_artifacts")
+    seen_paths: set[str] = set()
+    seen_sources: set[str] = set()
+    verified: list[dict[str, str]] = []
+    for item in artifacts:
+        item = require_dict(item, "manifest_artifact_shape")
+        if set(item) != {"path", "source", "sha256", "type"}:
+            raise PreflightError("manifest_artifact_shape")
+        path_text = item.get("path")
+        source = item.get("source")
+        expected = item.get("sha256")
+        kind = item.get("type")
+        if (
+            not isinstance(path_text, str)
+            or not path_text.startswith(("/opt/sentinel/", "/etc/nats/", "/etc/systemd/", "/usr/"))
+            or ".." in Path(path_text).parts
+            or not isinstance(source, str)
+            or source.startswith("/")
+            or ".." in Path(source).parts
+            or not isinstance(expected, str)
+            or not DIGEST_RE.fullmatch(expected)
+            or kind not in {"binary", "config", "systemd", "script"}
+        ):
+            raise PreflightError("manifest_artifact_invalid")
+        if path_text in seen_paths or source in seen_sources:
+            raise PreflightError("manifest_artifact_duplicate")
+        actual = hashlib.sha256(deps.read_file(Path(path_text), MAX_FILE_BYTES)).hexdigest()
+        if actual != expected:
+            raise PreflightError("artifact_hash_mismatch")
+        seen_paths.add(path_text)
+        seen_sources.add(source)
+        verified.append({"path_digest": hashlib.sha256(path_text.encode("ascii")).hexdigest(), "sha256": actual})
+    if not REQUIRED_MANIFEST_PATHS.issubset(seen_paths):
+        raise PreflightError("manifest_required_artifact_missing")
+    return {
+        "artifact_count": len(verified),
+        "artifact_set_digest": evidence_digest(sorted(verified, key=lambda row: row["path_digest"])),
+        "git_sha": manifest["git_sha"],
+        "manifest_digest": evidence_digest(manifest),
+    }
+
+
+def parse_key_values(data: bytes) -> dict[str, str]:
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeError as exc:
+        raise PreflightError("command_output_invalid") from exc
+    result: dict[str, str] = {}
+    for line in lines:
+        if not line or "=" not in line:
+            raise PreflightError("command_output_invalid")
+        key, value = line.split("=", 1)
+        if key in result:
+            raise PreflightError("command_output_duplicate")
+        result[key] = value
+    return result
+
+
+def systemctl_show(unit: str, deps: Dependencies, timeout: float) -> dict[str, str]:
+    return parse_key_values(
+        deps.command(
+            [
+                "/usr/bin/systemctl",
+                "show",
+                unit,
+                "--no-pager",
+                "--property=Id,LoadState,ActiveState,SubState,Result,NRestarts,FragmentPath,Wants",
+            ],
+            timeout,
+            MAX_COMMAND_BYTES,
+        )
+    )
+
+
+def validate_systemd(deps: Dependencies, timeout: float) -> dict[str, Any]:
+    target = systemctl_show(TARGET_UNIT, deps, timeout)
+    wants = target.get("Wants", "").split()
+    if len(wants) != len(set(wants)) or set(wants) != set(REQUIRED_UNITS):
+        raise PreflightError("systemd_required_set_mismatch")
+    expected_target = {
+        "Id": TARGET_UNIT,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "SubState": "active",
+        "Result": "success",
+        "NRestarts": "0",
+    }
+    for key, value in expected_target.items():
+        if target.get(key) != value:
+            raise PreflightError("systemd_target_not_ready")
+    unit_facts: list[dict[str, str]] = []
+    for unit, (active, sub) in sorted(REQUIRED_UNITS.items()):
+        facts = systemctl_show(unit, deps, timeout)
+        expected = {
+            "Id": unit,
+            "LoadState": "loaded",
+            "ActiveState": active,
+            "SubState": sub,
+            "Result": "success",
+            "NRestarts": "0",
+        }
+        for key, value in expected.items():
+            if facts.get(key) != value:
+                raise PreflightError("systemd_unit_not_ready")
+        fragment = facts.get("FragmentPath")
+        if fragment != f"/etc/systemd/system/{unit}":
+            raise PreflightError("systemd_fragment_invalid")
+        unit_facts.append({"unit": unit, "fragment_digest": hashlib.sha256(fragment.encode("ascii")).hexdigest()})
+    return {"required_unit_count": len(REQUIRED_UNITS), "unit_set_digest": evidence_digest(unit_facts)}
+
+
+def split_listener(value: str) -> tuple[str, int]:
+    if value.startswith("["):
+        end = value.rfind("]:")
+        if end < 0:
+            raise PreflightError("listener_invalid")
+        host, port = value[1:end], value[end + 2 :]
+    else:
+        if ":" not in value:
+            raise PreflightError("listener_invalid")
+        host, port = value.rsplit(":", 1)
+    host = {"*": "0.0.0.0", "0.0.0.0": "0.0.0.0", "127.0.0.1": "127.0.0.1"}.get(host, host)
+    try:
+        parsed_port = int(port)
+    except ValueError as exc:
+        raise PreflightError("listener_invalid") from exc
+    return host, parsed_port
+
+
+def validate_listeners(deps: Dependencies, timeout: float) -> dict[str, Any]:
+    raw = deps.command(["/usr/bin/ss", "-H", "-lntu"], timeout, MAX_COMMAND_BYTES)
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeError as exc:
+        raise PreflightError("listener_invalid") from exc
+    observed: list[tuple[str, str, int]] = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 5 or fields[0] not in {"tcp", "udp"}:
+            raise PreflightError("listener_invalid")
+        host, port = split_listener(fields[4])
+        observed.append((fields[0], host, port))
+    for expected in EXPECTED_LISTENERS:
+        if observed.count(expected) != 1:
+            raise PreflightError("listener_contract_mismatch")
+    return {
+        "required_listener_count": len(EXPECTED_LISTENERS),
+        "listener_set_digest": evidence_digest(sorted(EXPECTED_LISTENERS)),
+    }
+
+
+def validate_http(
+    deps: Dependencies, credential: str, timeout: float
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    payloads: dict[str, dict[str, Any]] = {}
+    evidence: list[dict[str, str]] = []
+    for name, url, role, field, expected in HTTP_CONTRACTS:
+        payload = strict_json(
+            deps.http(
+                url,
+                credential if role == "operator" else None,
+                timeout,
+                MAX_HTTP_BYTES,
+            )
+        )
+        payload = require_dict(payload, "http_payload_not_object")
+        if field is not None and payload.get(field) != expected:
+            raise PreflightError("http_readiness_failed")
+        payloads[name] = payload
+        evidence.append({"endpoint": name, "payload_digest": evidence_digest(payload)})
+    return {"endpoint_count": len(evidence), "endpoint_digest": evidence_digest(evidence)}, payloads
+
+
+def scheduled_roster(roster: dict[int, dict[str, Any]], shift: int) -> dict[int, dict[str, Any]]:
+    if shift not in {1, 2, 3}:
+        raise PreflightError("runtime_shift_invalid")
+    return {agent_id: item for agent_id, item in roster.items() if item["shift"] in {0, shift}}
+
+
+def unique_by_id(items: Any, code: str) -> dict[int, dict[str, Any]]:
+    if not isinstance(items, list) or len(items) > MAX_AGENTS:
+        raise PreflightError(code)
+    result: dict[int, dict[str, Any]] = {}
+    for raw in items:
+        item = require_dict(raw, code)
+        agent_id = require_int(item.get("agent_id"), code, minimum=1)
+        if agent_id in result:
+            raise PreflightError(code)
+        result[agent_id] = item
+    return result
+
+
+def validate_identity(roster: dict[int, dict[str, Any]], payloads: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    runtime = payloads["runtime_health"]
+    shift = require_int(runtime.get("current_shift"), "runtime_shape")
+    scheduled = scheduled_roster(roster, shift)
+    runtime_agents = unique_by_id(runtime.get("agents"), "runtime_agents_ambiguous")
+    if set(runtime_agents) != set(scheduled):
+        raise PreflightError("runtime_roster_mismatch")
+    required_zero = (
+        "projection_drift_agents",
+        "stale_runtime_entries",
+        "orphan_cgroups",
+        "zombie_tracked_pids",
+        "respawn_failures",
+    )
+    for field in required_zero:
+        if require_int(runtime.get(field), "runtime_shape") != 0:
+            raise PreflightError("runtime_drift")
+    if require_bool(runtime.get("projection_drift_detected"), "runtime_shape"):
+        raise PreflightError("runtime_drift")
+    if runtime.get("operator_auth_required") is not True:
+        raise PreflightError("operator_auth_disabled")
+    if runtime.get("last_repair_error") is not None or runtime.get("repair_last_status") != "healthy":
+        raise PreflightError("runtime_repair_unresolved")
+    if require_int(runtime.get("analysis_queue_depth"), "runtime_shape") != 0:
+        raise PreflightError("runtime_queue_backlog")
+    worker_states = require_dict(runtime.get("worker_states"), "runtime_shape")
+    if set(worker_states) != {"ecs_tick_loop", "service_health"}:
+        raise PreflightError("runtime_worker_mismatch")
+    for worker in worker_states.values():
+        worker = require_dict(worker, "runtime_shape")
+        if (
+            worker.get("running") is not True
+            or require_int(worker.get("restart_count"), "runtime_shape") != 0
+            or worker.get("last_error") is not None
+        ):
+            raise PreflightError("runtime_worker_not_ready")
+    expected_count = len(scheduled)
+    for field in (
+        "expected_active_agents",
+        "runtime_agents",
+        "projection_agents",
+        "security_runtime_entries",
+        "sandbox_handles",
+        "tracked_processes",
+        "live_cgroup_dirs",
+    ):
+        if require_int(runtime.get(field), "runtime_shape") != expected_count:
+            raise PreflightError("runtime_count_mismatch")
+    for agent_id, item in runtime_agents.items():
+        expected = scheduled[agent_id]
+        if item.get("aggregate_id") != f"AGENT-{agent_id:02}" or item.get("name") != expected["name"]:
+            raise PreflightError("runtime_identity_mismatch")
+        if item.get("runtime_key") != "bwrap-landlock":
+            raise PreflightError("runtime_fallback_detected")
+        for field in (
+            "runtime_present",
+            "projection_present",
+            "tracked_pid_alive",
+            "security_runtime_present",
+            "adapter_handle_present",
+            "adapter_instance_matches",
+            "runtime_resources_healthy",
+        ):
+            if item.get(field) is not True:
+                raise PreflightError("runtime_agent_not_ready")
+        if item.get("adapter_health_state") != "Healthy" or item.get("logical_status") not in {"Active", "Sleeping"}:
+            raise PreflightError("runtime_agent_not_ready")
+        if item.get("adapter_observation_error") is not None or item.get("last_repair_status") != "healthy":
+            raise PreflightError("runtime_agent_not_ready")
+        require_int(item.get("tracked_pid"), "runtime_agent_not_ready", minimum=1)
+        if require_int(item.get("cgroup_live_pid_count"), "runtime_agent_not_ready", minimum=1) < 1:
+            raise PreflightError("runtime_agent_not_ready")
+        if item.get("tracked_pid_state") in {None, "X", "Z"}:
+            raise PreflightError("runtime_agent_not_ready")
+
+    platform = payloads["platform_state"]
+    unresolved = require_dict(platform.get("unresolved_counts"), "platform_shape")
+    if any(require_int(value, "platform_shape") != 0 for value in unresolved.values()):
+        raise PreflightError("platform_unresolved")
+    platform_agents = unique_by_id(platform.get("agents"), "platform_agents_ambiguous")
+    if set(platform_agents) != set(scheduled):
+        raise PreflightError("platform_roster_mismatch")
+    resource_profiles = require_dict(platform.get("resource_profiles"), "platform_shape")
+    if set(resource_profiles) != {f"AGENT-{agent_id:02}" for agent_id in scheduled}:
+        raise PreflightError("platform_profile_mismatch")
+    for agent_id, item in platform_agents.items():
+        expected = scheduled[agent_id]
+        current_profile = item.get("current_profile")
+        if (
+            item.get("aggregate_id") != f"AGENT-{agent_id:02}"
+            or item.get("name") != expected["name"]
+            or current_profile not in {"idle", "normal", "heavy", "suspended"}
+            or resource_profiles.get(f"AGENT-{agent_id:02}") != current_profile
+        ):
+            raise PreflightError("platform_identity_mismatch")
+
+    projection = payloads["episode_projection"]
+    if projection.get("initialized") is not True or projection.get("integrity_error") is not False:
+        raise PreflightError("episode_projection_not_ready")
+    if projection.get("global_blockers") != []:
+        raise PreflightError("episode_projection_blocked")
+    projection_agents = unique_by_id(projection.get("agents"), "episode_agents_ambiguous")
+    if set(projection_agents) != set(roster):
+        raise PreflightError("episode_roster_mismatch")
+    for item in projection_agents.values():
+        if item.get("ready") is not True or item.get("lag_rows") != 0 or item.get("blockers") != []:
+            raise PreflightError("episode_projection_blocked")
+        require_int(item.get("frontier_source_row_id"), "episode_projection_frontier_missing")
+    return {
+        "configured_agents": len(roster),
+        "scheduled_agents": len(scheduled),
+        "current_shift": shift,
+        "configured_identity_digest": evidence_digest(
+            [
+                {
+                    "id": agent_id,
+                    "name": roster[agent_id]["name"],
+                    "role": roster[agent_id]["role"],
+                    "shift": roster[agent_id]["shift"],
+                }
+                for agent_id in sorted(roster)
+            ]
+        ),
+        "scheduled_identity_digest": evidence_digest(
+            [
+                {
+                    "id": agent_id,
+                    "name": scheduled[agent_id]["name"],
+                    "role": scheduled[agent_id]["role"],
+                    "shift": scheduled[agent_id]["shift"],
+                }
+                for agent_id in sorted(scheduled)
+            ]
+        ),
+    }
+
+
+def parse_sqlite_json(data: bytes, expected_keys: set[str]) -> dict[str, int]:
+    value = strict_json(data)
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+        raise PreflightError("store_readback_shape")
+    row = value[0]
+    if set(row) != expected_keys:
+        raise PreflightError("store_readback_shape")
+    return {key: require_int(row[key], "store_readback_value") for key in expected_keys}
+
+
+def validate_stores(inputs: Inputs, deps: Dependencies) -> dict[str, Any]:
+    event = parse_sqlite_json(
+        deps.command(
+            ["/usr/bin/sqlite3", "-readonly", "-json", str(inputs.event_store), EVENT_STORE_SQL],
+            inputs.timeout_seconds,
+            MAX_COMMAND_BYTES,
+        ),
+        {
+            "latest_event_id",
+            "pending_outbox",
+            "orphan_outbox",
+            "unresolved_llm",
+            "runtime_recovery",
+            "config_apply_recovery",
+            "projection_offset",
+            "hierarchy_offset",
+        },
+    )
+    projection = parse_sqlite_json(
+        deps.command(
+            ["/usr/bin/sqlite3", "-readonly", "-json", str(inputs.projection_store), PROJECTION_SQL],
+            inputs.timeout_seconds,
+            MAX_COMMAND_BYTES,
+        ),
+        {"projection_watermark"},
+    )
+    for key in ("pending_outbox", "orphan_outbox", "unresolved_llm", "runtime_recovery", "config_apply_recovery"):
+        if event[key] != 0:
+            raise PreflightError("publication_or_recovery_backlog")
+    latest = event["latest_event_id"]
+    if event["projection_offset"] != latest or event["hierarchy_offset"] != latest:
+        raise PreflightError("event_projection_lag")
+    if projection["projection_watermark"] != latest:
+        raise PreflightError("read_model_projection_lag")
+    return {
+        "latest_event_id": latest,
+        "projection_offset": event["projection_offset"],
+        "hierarchy_offset": event["hierarchy_offset"],
+        "projection_watermark": projection["projection_watermark"],
+        "backlog_count": 0,
+    }
+
+
+def validate_projection_identity_store(
+    inputs: Inputs,
+    deps: Dependencies,
+    roster: dict[int, dict[str, Any]],
+    shift: int,
+) -> dict[str, Any]:
+    raw = strict_json(
+        deps.command(
+            [
+                "/usr/bin/sqlite3",
+                "-readonly",
+                "-json",
+                str(inputs.projection_store),
+                PROJECTION_AGENTS_SQL,
+            ],
+            inputs.timeout_seconds,
+            MAX_COMMAND_BYTES,
+        )
+    )
+    if not isinstance(raw, list) or len(raw) > MAX_AGENTS:
+        raise PreflightError("projection_identity_shape")
+    observed: dict[int, dict[str, Any]] = {}
+    for item in raw:
+        item = require_dict(item, "projection_identity_shape")
+        if set(item) != {"agent_id", "name", "role", "shift_set", "status"}:
+            raise PreflightError("projection_identity_shape")
+        agent_id = require_int(item.get("agent_id"), "projection_identity_shape", minimum=1)
+        if agent_id in observed:
+            raise PreflightError("projection_identity_duplicate")
+        observed[agent_id] = item
+    expected = scheduled_roster(roster, shift)
+    if set(observed) != set(expected):
+        raise PreflightError("projection_store_roster_mismatch")
+    for agent_id, item in observed.items():
+        expected_item = expected[agent_id]
+        if (
+            item.get("name") != expected_item["name"]
+            or item.get("role") != expected_item["role"]
+            or item.get("shift_set") != expected_item["shift"]
+            or item.get("status") != "active"
+        ):
+            raise PreflightError("projection_store_identity_mismatch")
+    normalized = [
+        {
+            "agent_id": agent_id,
+            "name": observed[agent_id]["name"],
+            "role": observed[agent_id]["role"],
+            "shift_set": observed[agent_id]["shift_set"],
+        }
+        for agent_id in sorted(observed)
+    ]
+    return {
+        "active_agent_count": len(normalized),
+        "active_identity_digest": evidence_digest(normalized),
+    }
+
+
+def check_result(check_id: str, function: Callable[[], dict[str, Any]]) -> tuple[dict[str, Any], Any]:
+    try:
+        evidence = function()
+        return {
+            "id": check_id,
+            "status": "PASS",
+            "reason": "ok",
+            "evidence_digest": evidence_digest(evidence),
+            "evidence": evidence,
+        }, evidence
+    except PreflightError as exc:
+        marker = {"id": check_id, "reason": exc.code}
+        return {
+            "id": check_id,
+            "status": "FAIL",
+            "reason": exc.code,
+            "evidence_digest": evidence_digest(marker),
+            "evidence": {},
+        }, None
+    except Exception:
+        marker = {"id": check_id, "reason": "internal_validation_error"}
+        return {
+            "id": check_id,
+            "status": "FAIL",
+            "reason": "internal_validation_error",
+            "evidence_digest": evidence_digest(marker),
+            "evidence": {},
+        }, None
+
+
+def evaluate(inputs: Inputs, deps: Dependencies = DEFAULT_DEPENDENCIES) -> dict[str, Any]:
+    if not 0 < inputs.timeout_seconds <= MAX_TIMEOUT_SECONDS:
+        raise PreflightError("timeout_invalid")
+    if inputs.event_store != Path("/opt/sentinel/data/events.db") or inputs.projection_store != Path(
+        "/opt/sentinel/data/projection.db"
+    ):
+        raise PreflightError("store_path_invalid")
+    if inputs.profile != Path("/opt/sentinel/config/work-profiles/web-project-v1.toml"):
+        raise PreflightError("profile_path_invalid")
+    if inputs.agents_dir != Path("/opt/sentinel/config/agents"):
+        raise PreflightError("agents_path_invalid")
+    if not SHA_RE.fullmatch(inputs.expected_git_sha):
+        raise PreflightError("expected_git_sha_invalid")
+    checks: list[dict[str, Any]] = []
+
+    roster_cache: dict[str, dict[int, dict[str, Any]]] = {}
+
+    def contract_check() -> dict[str, Any]:
+        evidence, loaded_roster = validate_contract_profile_roster(inputs, deps)
+        roster_cache["value"] = loaded_roster
+        return evidence
+
+    contract_result, contract_data = check_result(
+        "contract_profile_roster", contract_check
+    )
+    checks.append(contract_result)
+    roster = roster_cache.get("value") if contract_data is not None else None
+
+    manifest_result, _ = check_result("release_manifest_identity", lambda: validate_manifest(inputs, deps))
+    checks.append(manifest_result)
+    systemd_result, _ = check_result("systemd_units", lambda: validate_systemd(deps, inputs.timeout_seconds))
+    checks.append(systemd_result)
+    listener_result, _ = check_result("required_listeners", lambda: validate_listeners(deps, inputs.timeout_seconds))
+    checks.append(listener_result)
+
+    secret_cache: dict[str, str] = {}
+
+    def credential_check() -> dict[str, Any]:
+        loaded_secret = load_operator_credential(inputs, deps)
+        secret_cache["value"] = loaded_secret
+        return {"credential_present": True}
+
+    credential_result, credential = check_result("operator_credential_reference", credential_check)
+    checks.append(credential_result)
+    secret = secret_cache.get("value") if credential is not None else None
+
+    http_result: dict[str, Any]
+    payload_cache: dict[str, dict[str, dict[str, Any]]] = {}
+
+    def http_check() -> dict[str, Any]:
+        evidence, loaded_payloads = validate_http(deps, secret or "", inputs.timeout_seconds)
+        payload_cache["value"] = loaded_payloads
+        return evidence
+
+    if secret is None:
+        http_result, _ = check_result(
+            "loopback_health",
+            lambda: (_ for _ in ()).throw(
+                PreflightError("credential_dependency_failed")
+            ),
+        )
+    else:
+        http_result, _ = check_result("loopback_health", http_check)
+    checks.append(http_result)
+    payloads = payload_cache.get("value")
+
+    if roster is None or payloads is None:
+        identity_result, _ = check_result(
+            "identity_readiness",
+            lambda: (_ for _ in ()).throw(PreflightError("identity_dependency_failed")),
+        )
+    else:
+        identity_result, _ = check_result(
+            "identity_readiness",
+            lambda: validate_identity(roster or {}, payloads or {}),
+        )
+    checks.append(identity_result)
+
+    stores_result, _ = check_result(
+        "store_projection_backlog", lambda: validate_stores(inputs, deps)
+    )
+    checks.append(stores_result)
+
+    if roster is None or payloads is None:
+        projection_identity_result, _ = check_result(
+            "projection_store_identity",
+            lambda: (_ for _ in ()).throw(PreflightError("identity_dependency_failed")),
+        )
+    else:
+        projection_identity_result, _ = check_result(
+            "projection_store_identity",
+            lambda: validate_projection_identity_store(
+                inputs,
+                deps,
+                roster or {},
+                require_int((payloads or {})["runtime_health"].get("current_shift"), "runtime_shape"),
+            ),
+        )
+    checks.append(projection_identity_result)
+
+    passed = all(item["status"] == "PASS" for item in checks)
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "claim": "runtime_preflight_pass" if passed else "runtime_preflight_fail",
+        "runtime_preflight_pass": passed,
+        "m0_acceptance_pass": False,
+        "checks": checks,
+    }
+    summary["result_digest"] = evidence_digest(summary)
+    return summary
+
+
+def parse_args(argv: list[str]) -> Inputs:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--contract", required=True, type=Path)
+    parser.add_argument("--profile", required=True, type=Path)
+    parser.add_argument("--agents-dir", required=True, type=Path)
+    parser.add_argument("--operator-credential-file", required=True, type=Path)
+    parser.add_argument("--expected-git-sha", required=True)
+    parser.add_argument(
+        "--event-store",
+        type=Path,
+        default=Inputs.__dataclass_fields__["event_store"].default,
+    )
+    parser.add_argument(
+        "--projection-store",
+        type=Path,
+        default=Inputs.__dataclass_fields__["projection_store"].default,
+    )
+    parser.add_argument("--timeout-seconds", type=float, default=5.0)
+    args = parser.parse_args(argv)
+    return Inputs(
+        manifest=args.manifest,
+        contract=args.contract,
+        profile=args.profile,
+        agents_dir=args.agents_dir,
+        operator_credential=args.operator_credential_file,
+        expected_git_sha=args.expected_git_sha,
+        event_store=args.event_store,
+        projection_store=args.projection_store,
+        timeout_seconds=args.timeout_seconds,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        result = evaluate(parse_args(sys.argv[1:] if argv is None else argv))
+    except PreflightError as exc:
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "claim": "runtime_preflight_fail",
+            "runtime_preflight_pass": False,
+            "m0_acceptance_pass": False,
+            "checks": [],
+            "fatal_reason": exc.code,
+        }
+        result["result_digest"] = evidence_digest(result)
+    sys.stdout.buffer.write(canonical_json(result) + b"\n")
+    return 0 if result["runtime_preflight_pass"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
