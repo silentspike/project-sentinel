@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import copy
 from contextlib import contextmanager
+import base64
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import shutil
+import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -20,6 +26,10 @@ import run_m0_preflight as preflight  # noqa: E402
 SECRET = "operator-secret-that-is-never-evidence"
 EVENT_DB = Path("/opt/sentinel/data/events.db")
 PROJECTION_DB = Path("/opt/sentinel/data/projection.db")
+TEST_CERTIFICATE = b"""-----BEGIN CERTIFICATE-----
+AA==
+-----END CERTIFICATE-----
+"""
 
 
 def encoded(value: object) -> bytes:
@@ -29,6 +39,8 @@ def encoded(value: object) -> bytes:
 class TransportState:
     def __init__(self) -> None:
         self.paths: list[str] = []
+        self.authorization: list[str | None] = []
+        self.certificate_hash: str | None = None
 
 
 class TransportHandler(BaseHTTPRequestHandler):
@@ -36,6 +48,7 @@ class TransportHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self.server.state.paths.append(self.path)
+        self.server.state.authorization.append(self.headers.get("Authorization"))
         if self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/credential-sink")
@@ -75,6 +88,17 @@ class TransportHandler(BaseHTTPRequestHandler):
             except BrokenPipeError:
                 pass
             return
+        if self.path == "/api/cert-hash":
+            self.write_response(
+                encoded(
+                    {
+                        "algorithm": "sha-256",
+                        "hash": self.server.state.certificate_hash,
+                    }
+                ),
+                "application/json",
+            )
+            return
         self.write_response(b'{"status":"ok"}', "application/json")
 
     def write_response(self, body: bytes, content_type: str) -> None:
@@ -89,9 +113,14 @@ class TransportHandler(BaseHTTPRequestHandler):
 
 
 class TransportServer(ThreadingHTTPServer):
-    def __init__(self) -> None:
-        super().__init__(("127.0.0.1", 0), TransportHandler)
+    allow_reuse_address = True
+
+    def __init__(self, port: int = 0) -> None:
+        super().__init__(("127.0.0.1", port), TransportHandler)
         self.state = TransportState()
+
+    def handle_error(self, request: object, client_address: object) -> None:
+        del request, client_address
 
 
 @contextmanager
@@ -107,21 +136,80 @@ def transport_server() -> object:
         thread.join()
 
 
+@contextmanager
+def tls_transport_server() -> object:
+    def generate_certificate(root: Path, stem: str) -> tuple[Path, Path]:
+        certificate = root / f"{stem}-cert.pem"
+        key = root / f"{stem}-key.pem"
+        subprocess.run(
+            [
+                shutil.which("openssl") or "/usr/bin/openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-sha256",
+                "-days",
+                "1",
+                "-nodes",
+                "-keyout",
+                str(key),
+                "-out",
+                str(certificate),
+                "-subj",
+                "/CN=127.0.0.1",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1",
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+            ],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return certificate, key
+
+    runner_temp = Path(os.environ["RUNNER_TEMP"])
+    runner_temp.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="cdx1-650-tls-", dir=runner_temp) as raw:
+        root = Path(raw)
+        certificate, key = generate_certificate(root, "server")
+        server = TransportServer(8001)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certificate, key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        pem = certificate.read_bytes()
+        der = ssl.PEM_cert_to_DER_cert(pem.decode("ascii"))
+        digest = hashlib.sha256(der)
+        server.state.certificate_hash = base64.b64encode(digest.digest()).decode("ascii")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield server, pem, digest.hexdigest(), root, generate_certificate
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+
 class Fixture:
     def __init__(self) -> None:
         self.files: dict[Path, bytes] = {}
         self.commands: list[list[str]] = []
         self.http_calls: list[tuple[str, str | None]] = []
+        self.https_calls: list[tuple[str, str]] = []
         self.http_overrides: dict[str, bytes | Exception] = {}
+        self.https_overrides: dict[str, bytes | Exception] = {}
         self.command_overrides: dict[tuple[str, ...], bytes | Exception] = {}
+        self.event_store_reads: list[dict[str, int]] = []
         self.manifest_path = Path("/fixture/release-manifest.json")
         self.contract_path = Path("/fixture/m0-contract.toml")
         self.profile_path = Path("/opt/sentinel/config/work-profiles/web-project-v1.toml")
         self.agents_dir = Path("/opt/sentinel/config/agents")
         self.credential_path = Path("/fixture/operator.secret")
         self.agent_paths = [
-            self.agents_dir / "AGENT-01-ONE.toml",
-            self.agents_dir / "AGENT-02-TWO.toml",
+            self.agents_dir / name for name in sorted(preflight.CANONICAL_AGENT_FILES)
         ]
         self.files[self.contract_path] = b'''schema_version = 1
 profile = "web-project-v1"
@@ -136,21 +224,15 @@ tool_runtime = "bwrap"
 runtime_registry_required = true
 allow_secure_runtime_fallback = false
 '''
-        self.files[self.agent_paths[0]] = b'''[identity]
-id = 1
-name = "Agent One"
-role = "Developer"
-shift_set = 1
-[runtime]
-nano_runtime = "bwrap-landlock"
-'''
-        self.files[self.agent_paths[1]] = b'''[identity]
-id = 2
-name = "Agent Two"
-role = "Operations"
-shift_set = 0
-'''
+        repository_agents = Path(__file__).resolve().parents[2] / "config" / "agents"
+        self.agent_identities: dict[int, dict[str, object]] = {}
+        for path in self.agent_paths:
+            data = (repository_agents / path.name).read_bytes()
+            self.files[path] = data
+            identity = preflight.parse_toml(data)["identity"]
+            self.agent_identities[identity["id"]] = identity
         self.files[self.credential_path] = (SECRET + "\n").encode("ascii")
+        self.files[preflight.DASHBOARD_CERT_PATH] = TEST_CERTIFICATE
         self.manifest = self._manifest()
         self.files[self.manifest_path] = encoded(self.manifest)
         self.unit_facts = self._unit_facts()
@@ -166,22 +248,23 @@ shift_set = 0
             "projection_offset": 41,
             "hierarchy_offset": 41,
         }
-        self.projection_store = {"projection_watermark": 41}
+        self.projection_store = [
+            {"projection_name": "sentinel-projection", "last_event_id": 41},
+            {
+                "projection_name": "sentinel-projection-cost-hierarchy-v2",
+                "last_event_id": 41,
+            },
+        ]
         self.projection_agents = [
             {
-                "agent_id": 1,
-                "name": "Agent One",
-                "role": "Developer",
-                "shift_set": 1,
+                "agent_id": agent_id,
+                "name": identity["name"],
+                "role": identity["role"],
+                "shift_set": identity["shift_set"],
                 "status": "active",
-            },
-            {
-                "agent_id": 2,
-                "name": "Agent Two",
-                "role": "Operations",
-                "shift_set": 0,
-                "status": "active",
-            },
+            }
+            for agent_id, identity in sorted(self.agent_identities.items())
+            if identity["shift_set"] in {0, 1}
         ]
 
     def _manifest(self) -> dict[str, object]:
@@ -217,22 +300,20 @@ shift_set = 0
                 "LoadState": "loaded",
                 "ActiveState": "active",
                 "SubState": "active",
-                "Result": "success",
-                "NRestarts": "0",
                 "FragmentPath": "/etc/systemd/system/sentinel.target",
                 "Wants": " ".join(sorted(preflight.REQUIRED_UNITS)),
             }
         }
-        for unit, (active, sub) in preflight.REQUIRED_UNITS.items():
+        for unit in preflight.REQUIRED_UNITS:
+            is_service = unit in preflight.REQUIRED_SERVICES
             facts[unit] = {
                 "Id": unit,
                 "LoadState": "loaded",
-                "ActiveState": active,
-                "SubState": sub,
+                "ActiveState": "active",
+                "SubState": "running" if is_service else "waiting",
                 "Result": "success",
-                "NRestarts": "0",
                 "FragmentPath": f"/etc/systemd/system/{unit}",
-                "Wants": "",
+                **({"NRestarts": "0"} if is_service else {}),
             }
         return facts
 
@@ -270,17 +351,23 @@ shift_set = 0
         payloads: dict[str, dict[str, object]] = {}
         for name, _, _, field, expected in preflight.HTTP_CONTRACTS:
             payloads[name] = {field: expected} if field is not None else {}
+        scheduled = {
+            agent_id: identity
+            for agent_id, identity in self.agent_identities.items()
+            if identity["shift_set"] in {0, 1}
+        }
+        scheduled_count = len(scheduled)
         payloads["runtime_health"] = {
             "current_shift": 1,
-            "expected_active_agents": 2,
-            "runtime_agents": 2,
-            "projection_agents": 2,
+            "expected_active_agents": scheduled_count,
+            "runtime_agents": scheduled_count,
+            "projection_agents": scheduled_count,
             "projection_drift_detected": False,
             "projection_drift_agents": 0,
-            "security_runtime_entries": 2,
-            "sandbox_handles": 2,
-            "tracked_processes": 2,
-            "live_cgroup_dirs": 2,
+            "security_runtime_entries": scheduled_count,
+            "sandbox_handles": scheduled_count,
+            "tracked_processes": scheduled_count,
+            "live_cgroup_dirs": scheduled_count,
             "stale_runtime_entries": 0,
             "orphan_cgroups": 0,
             "zombie_tracked_pids": 0,
@@ -297,14 +384,25 @@ shift_set = 0
             "last_repair_error": None,
             "repair_last_status": "healthy",
             "operator_auth_required": True,
-            "agents": [self._runtime_agent(1, "Agent One"), self._runtime_agent(2, "Agent Two")],
+            "agents": [
+                self._runtime_agent(agent_id, str(identity["name"]))
+                for agent_id, identity in sorted(scheduled.items())
+            ],
         }
         payloads["platform_state"] = {
             "unresolved_counts": {},
-            "resource_profiles": {"AGENT-01": "normal", "AGENT-02": "normal"},
+            "resource_profiles": {
+                f"AGENT-{agent_id:02}": "normal"
+                for agent_id in scheduled
+            },
             "agents": [
-                {"agent_id": 1, "aggregate_id": "AGENT-01", "name": "Agent One", "current_profile": "normal"},
-                {"agent_id": 2, "aggregate_id": "AGENT-02", "name": "Agent Two", "current_profile": "normal"},
+                {
+                    "agent_id": agent_id,
+                    "aggregate_id": f"AGENT-{agent_id:02}",
+                    "name": identity["name"],
+                    "current_profile": "normal",
+                }
+                for agent_id, identity in sorted(scheduled.items())
             ],
         }
         payloads["episode_projection"] = {
@@ -313,8 +411,14 @@ shift_set = 0
             "global_frontier_source_row_id": 41,
             "global_blockers": [],
             "agents": [
-                {"agent_id": 1, "ready": True, "frontier_source_row_id": 41, "lag_rows": 0, "blockers": []},
-                {"agent_id": 2, "ready": True, "frontier_source_row_id": 41, "lag_rows": 0, "blockers": []},
+                {
+                    "agent_id": agent_id,
+                    "ready": True,
+                    "frontier_source_row_id": 41,
+                    "lag_rows": 0,
+                    "blockers": [],
+                }
+                for agent_id in range(1, preflight.MAX_AGENTS + 1)
             ],
         }
         return payloads
@@ -360,11 +464,13 @@ shift_set = 0
             return self.listeners
         if argv[:3] == ["/usr/bin/sqlite3", "-readonly", "-json"]:
             if Path(argv[3]) == EVENT_DB:
+                if self.event_store_reads:
+                    return encoded([self.event_store_reads.pop(0)])
                 return encoded([self.event_store])
             if Path(argv[3]) == PROJECTION_DB:
                 if argv[4] == preflight.PROJECTION_AGENTS_SQL:
                     return encoded(self.projection_agents)
-                return encoded([self.projection_store])
+                return encoded(self.projection_store)
         raise AssertionError(f"unexpected command: {argv!r}")
 
     def http(self, url: str, credential: str | None, timeout: float, limit: int) -> bytes:
@@ -384,13 +490,48 @@ shift_set = 0
                 return encoded(self.http_payloads[name])
         raise AssertionError(f"unexpected URL: {url}")
 
+    def https(
+        self,
+        url: str,
+        timeout: float,
+        limit: int,
+        trusted_pem: bytes,
+        expected_peer_digest: str,
+    ) -> bytes:
+        del timeout, limit
+        actual_digest = hashlib.sha256(
+            ssl.PEM_cert_to_DER_cert(trusted_pem.decode("ascii"))
+        ).hexdigest()
+        if expected_peer_digest != actual_digest:
+            raise preflight.PreflightError("https_peer_pin_mismatch")
+        self.https_calls.append((url, expected_peer_digest))
+        override = self.https_overrides.get(url)
+        if isinstance(override, Exception):
+            raise override
+        if isinstance(override, bytes):
+            return override
+        if url == f"{preflight.DASHBOARD_ORIGIN}/api/health":
+            return encoded({"status": "ok"})
+        if url == f"{preflight.DASHBOARD_ORIGIN}/api/cert-hash":
+            digest = hashlib.sha256(
+                ssl.PEM_cert_to_DER_cert(trusted_pem.decode("ascii"))
+            ).digest()
+            return encoded(
+                {
+                    "algorithm": "sha-256",
+                    "hash": preflight.base64.b64encode(digest).decode("ascii"),
+                }
+            )
+        raise AssertionError(f"unexpected HTTPS URL: {url}")
+
     def deps(self) -> preflight.Dependencies:
         return preflight.Dependencies(
             self.command,
             self.http,
+            self.https,
             self.read_file,
             self.list_agents,
-            lambda path: None,
+            self.read_file,
         )
 
 
@@ -424,6 +565,35 @@ class PreflightTests(unittest.TestCase):
         self.fixture.unit_facts["sentinel-daemon.service"]["ActiveState"] = "inactive"
         result = self.run_fixture()
         self.assertEqual(self.check(result, "systemd_units")["reason"], "systemd_unit_not_ready")
+
+    def test_target_and_timer_omit_inapplicable_properties_but_bad_state_fails(self) -> None:
+        target = self.fixture.unit_facts[preflight.TARGET_UNIT]
+        timer = self.fixture.unit_facts["sentinel-nightrun.timer"]
+        self.assertNotIn("Result", target)
+        self.assertNotIn("NRestarts", target)
+        self.assertNotIn("NRestarts", timer)
+        self.assertTrue(self.run_fixture()["runtime_preflight_pass"])
+
+        fixture = Fixture()
+        fixture.unit_facts["sentinel-nightrun.timer"]["SubState"] = "elapsed"
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(
+            self.check(result, "systemd_units")["reason"], "systemd_unit_not_ready"
+        )
+
+        fixture = Fixture()
+        fixture.unit_facts["sentinel-nightrun.timer"]["Result"] = "failed"
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(
+            self.check(result, "systemd_units")["reason"], "systemd_unit_not_ready"
+        )
+
+        fixture = Fixture()
+        fixture.unit_facts[preflight.TARGET_UNIT]["Result"] = "success"
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(
+            self.check(result, "systemd_units")["reason"], "systemd_target_shape"
+        )
 
     def test_restart_count_fails(self) -> None:
         self.fixture.unit_facts["sentinel-gateway.service"]["NRestarts"] = "1"
@@ -563,9 +733,29 @@ class PreflightTests(unittest.TestCase):
         result = self.run_fixture()
         self.assertEqual(self.check(result, "store_projection_backlog")["reason"], "publication_or_recovery_backlog")
         fixture = Fixture()
-        fixture.projection_store["projection_watermark"] = 40
+        fixture.projection_store[0]["last_event_id"] = 40
         result = preflight.evaluate(fixture.inputs(), fixture.deps())
         self.assertEqual(self.check(result, "store_projection_backlog")["reason"], "read_model_projection_lag")
+
+        fixture = Fixture()
+        fixture.projection_store[1]["last_event_id"] = 40
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(
+            self.check(result, "store_projection_backlog")["reason"],
+            "read_model_projection_lag",
+        )
+
+    def test_event_cut_progress_between_projection_reads_fails(self) -> None:
+        before = copy.deepcopy(self.fixture.event_store)
+        after = copy.deepcopy(before)
+        for key in ("latest_event_id", "projection_offset", "hierarchy_offset"):
+            after[key] = 42
+        self.fixture.event_store_reads = [before, after]
+        result = self.run_fixture()
+        self.assertEqual(
+            self.check(result, "store_projection_backlog")["reason"],
+            "event_cut_changed",
+        )
 
     def test_projection_store_identity_mismatch_fails(self) -> None:
         self.fixture.projection_agents[0]["name"] = "Wrong Agent"
@@ -597,6 +787,53 @@ shift_set = 0
         result = self.run_fixture()
         self.assertEqual(self.check(result, "contract_profile_roster")["reason"], "agent_roster_ambiguous")
 
+    def test_canonical_roster_rejects_missing_gap_extra_and_renamed_files(self) -> None:
+        cases = [
+            ("missing", lambda fixture: fixture.agent_paths.pop()),
+            (
+                "id_gap",
+                lambda fixture: fixture.files.__setitem__(
+                    fixture.agent_paths[10],
+                    fixture.files[fixture.agent_paths[10]].replace(b"id = 11", b"id = 99"),
+                ),
+            ),
+            (
+                "extra",
+                lambda fixture: fixture.agent_paths.append(
+                    fixture.agents_dir / "AGENT-61-EXTRA.toml"
+                ),
+            ),
+            (
+                "renamed",
+                lambda fixture: fixture.agent_paths.__setitem__(
+                    0, fixture.agents_dir / "AGENT-01-RENAMED.toml"
+                ),
+            ),
+            (
+                "duplicate_filename",
+                lambda fixture: fixture.agent_paths.__setitem__(
+                    1, fixture.agent_paths[0]
+                ),
+            ),
+            (
+                "identity_rename",
+                lambda fixture: fixture.files.__setitem__(
+                    fixture.agent_paths[0],
+                    fixture.files[fixture.agent_paths[0]].replace(
+                        b'name = "Thomas Mueller"', b'name = "Thomas Renamed"'
+                    ),
+                ),
+            ),
+        ]
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                fixture = Fixture()
+                mutate(fixture)
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertEqual(
+                    self.check(result, "contract_profile_roster")["status"], "FAIL"
+                )
+
     def test_zero_mutation_uses_only_bounded_read_operations(self) -> None:
         result = self.run_fixture()
         self.assertTrue(result["runtime_preflight_pass"])
@@ -623,9 +860,10 @@ shift_set = 0
         denied = preflight.Dependencies(
             deps.command,
             deps.http,
+            deps.https,
             deps.read_file,
             deps.list_agents,
-            lambda path: (_ for _ in ()).throw(
+            lambda path, limit: (_ for _ in ()).throw(
                 preflight.PreflightError("credential_permissions_invalid")
             ),
         )
@@ -668,6 +906,193 @@ shift_set = 0
                 with self.subTest(path=path):
                     with self.assertRaisesRegex(preflight.PreflightError, reason):
                         preflight.default_http(f"{base}{path}", None, timeout, 64)
+
+    def test_default_https_pins_peer_and_rejects_redirect_proxy_and_wrong_origin(self) -> None:
+        previous = os.environ.get("HTTPS_PROXY")
+        os.environ["HTTPS_PROXY"] = "http://127.0.0.1:1"
+        try:
+            with tls_transport_server() as (
+                server,
+                pem,
+                peer_digest,
+                tls_root,
+                generate_certificate,
+            ):
+                health = preflight.default_https(
+                    f"{preflight.DASHBOARD_ORIGIN}/api/health",
+                    2.0,
+                    1024,
+                    pem,
+                    peer_digest,
+                )
+                self.assertEqual(preflight.strict_json(health), {"status": "ok"})
+                cert_hash = preflight.strict_json(
+                    preflight.default_https(
+                        f"{preflight.DASHBOARD_ORIGIN}/api/cert-hash",
+                        2.0,
+                        1024,
+                        pem,
+                        peer_digest,
+                    )
+                )
+                self.assertEqual(cert_hash["hash"], server.state.certificate_hash)
+                with self.assertRaisesRegex(
+                    preflight.PreflightError, "https_peer_pin_mismatch"
+                ):
+                    preflight.default_https(
+                        f"{preflight.DASHBOARD_ORIGIN}/api/health",
+                        2.0,
+                        1024,
+                        pem,
+                        "0" * 64,
+                    )
+                replacement_cert, _ = generate_certificate(tls_root, "replacement")
+                replacement_pem = replacement_cert.read_bytes()
+                replacement_der = ssl.PEM_cert_to_DER_cert(
+                    replacement_pem.decode("ascii")
+                )
+                with self.assertRaisesRegex(preflight.PreflightError, "https_failed"):
+                    preflight.default_https(
+                        f"{preflight.DASHBOARD_ORIGIN}/api/health",
+                        2.0,
+                        1024,
+                        replacement_pem,
+                        hashlib.sha256(replacement_der).hexdigest(),
+                    )
+                with self.assertRaisesRegex(preflight.PreflightError, "http_status"):
+                    preflight.default_https(
+                        f"{preflight.DASHBOARD_ORIGIN}/redirect",
+                        2.0,
+                        1024,
+                        pem,
+                        peer_digest,
+                    )
+                with self.assertRaisesRegex(preflight.PreflightError, "http_failed"):
+                    preflight.default_http(
+                        "http://127.0.0.1:8001/api/health", None, 1.0, 1024
+                    )
+                self.assertNotIn("/credential-sink", server.state.paths)
+                self.assertTrue(all(value is None for value in server.state.authorization))
+            with self.assertRaisesRegex(
+                preflight.PreflightError, "http_origin_not_loopback"
+            ):
+                preflight.default_https(
+                    "https://127.0.0.2:8001/api/health",
+                    1.0,
+                    1024,
+                    TEST_CERTIFICATE,
+                    "0" * 64,
+                )
+            with self.assertRaisesRegex(preflight.PreflightError, "https_origin_invalid"):
+                preflight.default_https(
+                    "https://127.0.0.1:1/api/health",
+                    1.0,
+                    1024,
+                    TEST_CERTIFICATE,
+                    "0" * 64,
+                )
+        finally:
+            if previous is None:
+                os.environ.pop("HTTPS_PROXY", None)
+            else:
+                os.environ["HTTPS_PROXY"] = previous
+
+    def test_dashboard_cert_hash_mismatch_and_replaced_pin_fail(self) -> None:
+        url = f"{preflight.DASHBOARD_ORIGIN}/api/cert-hash"
+        self.fixture.https_overrides[url] = encoded(
+            {"algorithm": "sha-256", "hash": base64.b64encode(b"x" * 32).decode("ascii")}
+        )
+        result = self.run_fixture()
+        self.assertEqual(
+            self.check(result, "loopback_health")["reason"],
+            "https_certificate_hash_mismatch",
+        )
+
+        fixture = Fixture()
+        fixture.https_overrides[f"{preflight.DASHBOARD_ORIGIN}/api/health"] = (
+            preflight.PreflightError("https_peer_pin_mismatch")
+        )
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(
+            self.check(result, "loopback_health")["reason"],
+            "https_peer_pin_mismatch",
+        )
+
+    def test_descriptor_pinned_reader_rejects_symlink_hardlink_and_replacement(self) -> None:
+        runner_temp = Path(os.environ["RUNNER_TEMP"])
+        runner_temp.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="cdx1-650-files-", dir=runner_temp) as raw:
+            root = Path(raw)
+            original = root / "original"
+            original.write_bytes(b"original")
+            original.chmod(0o600)
+            symlink = root / "symlink"
+            symlink.symlink_to(original)
+            hardlink = root / "hardlink"
+            os.link(original, hardlink)
+            for path in (symlink, hardlink):
+                with self.subTest(path=path.name):
+                    with self.assertRaisesRegex(preflight.PreflightError, "unsafe_file"):
+                        preflight.default_read_file(path, 64)
+
+            replacement = root / "replacement"
+            replacement.write_bytes(b"before")
+            replacement.chmod(0o600)
+            real_open = os.open
+            replaced = False
+
+            def replace_before_open(path: object, flags: int, *args: object) -> int:
+                nonlocal replaced
+                if Path(path) == replacement and not replaced:
+                    replaced = True
+                    replacement.unlink()
+                    replacement.write_bytes(b"after")
+                    replacement.chmod(0o600)
+                return real_open(path, flags, *args)
+
+            with mock.patch.object(preflight.os, "open", side_effect=replace_before_open):
+                with self.assertRaisesRegex(preflight.PreflightError, "unsafe_file"):
+                    preflight.default_read_file(replacement, 64)
+            self.assertTrue(replaced)
+
+    def test_secret_reader_uses_same_owner_only_pinned_descriptor(self) -> None:
+        runner_temp = Path(os.environ["RUNNER_TEMP"])
+        runner_temp.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="cdx1-650-secret-", dir=runner_temp) as raw:
+            root = Path(raw)
+            secret = root / "secret"
+            secret.write_bytes(SECRET.encode("ascii"))
+            secret.chmod(0o600)
+            self.assertEqual(
+                preflight.default_read_secret(secret, 4096), SECRET.encode("ascii")
+            )
+            secret.chmod(0o640)
+            with self.assertRaisesRegex(
+                preflight.PreflightError, "credential_permissions_invalid"
+            ):
+                preflight.default_read_secret(secret, 4096)
+
+            replacement = root / "replacement-secret"
+            replacement.write_bytes(SECRET.encode("ascii"))
+            replacement.chmod(0o600)
+            real_open = os.open
+            replaced = False
+
+            def replace_secret(path: object, flags: int, *args: object) -> int:
+                nonlocal replaced
+                if Path(path) == replacement and not replaced:
+                    replaced = True
+                    replacement.unlink()
+                    replacement.write_bytes((SECRET + "-changed").encode("ascii"))
+                    replacement.chmod(0o600)
+                return real_open(path, flags, *args)
+
+            with mock.patch.object(preflight.os, "open", side_effect=replace_secret):
+                with self.assertRaisesRegex(
+                    preflight.PreflightError, "credential_permissions_invalid"
+                ):
+                    preflight.default_read_secret(replacement, 4096)
+            self.assertTrue(replaced)
 
     def test_default_command_rejects_unapproved_executable(self) -> None:
         with self.assertRaisesRegex(preflight.PreflightError, "command_not_allowed"):
