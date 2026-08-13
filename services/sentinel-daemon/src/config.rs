@@ -768,11 +768,34 @@ impl CredentialFileIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CredentialDirectoryIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    group: u32,
+    mode: u32,
+    is_directory: bool,
+}
+
+impl CredentialDirectoryIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner: metadata.uid(),
+            group: metadata.gid(),
+            mode: metadata.mode() & 0o7777,
+            is_directory: metadata.is_dir(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct OpenCredential {
     file: File,
     file_identity: CredentialFileIdentity,
-    parent_identities: Vec<CredentialFileIdentity>,
+    parent_identities: Vec<CredentialDirectoryIdentity>,
 }
 
 fn effective_uid() -> Result<u32> {
@@ -810,12 +833,16 @@ fn credential_file_identity_is_allowed(
 fn validate_credential_directory(
     metadata: &std::fs::Metadata,
     expected_owner: u32,
-) -> Result<CredentialFileIdentity> {
-    let identity = CredentialFileIdentity::from_metadata(metadata);
-    if !credential_directory_identity_is_allowed(&identity, metadata.is_dir(), expected_owner) {
+) -> Result<CredentialDirectoryIdentity> {
+    let file_identity = CredentialFileIdentity::from_metadata(metadata);
+    if !credential_directory_identity_is_allowed(
+        &file_identity,
+        metadata.is_dir(),
+        expected_owner,
+    ) {
         return Err(anyhow!("operator credential directory metadata is invalid"));
     }
-    Ok(identity)
+    Ok(CredentialDirectoryIdentity::from_metadata(metadata))
 }
 
 fn credential_directory_identity_is_allowed(
@@ -1243,6 +1270,23 @@ enabled = {enabled}
             Ok(())
         });
         assert!(result.unwrap_err().to_string().contains("identity changed"));
+    }
+
+    #[test]
+    fn operator_credential_allows_unrelated_sibling_create_and_remove() {
+        let directory = safe_tempdir();
+        let path = directory.path().join("operator-api");
+        let sibling = directory.path().join("unrelated-sibling");
+        write_credential(&path, TEST_CREDENTIAL.as_bytes(), 0o400);
+
+        let credential = read_operator_credential_with_hook(&path, || {
+            fs::write(&sibling, b"unrelated")?;
+            fs::remove_file(&sibling)?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(credential, TEST_CREDENTIAL);
     }
 
     #[test]
