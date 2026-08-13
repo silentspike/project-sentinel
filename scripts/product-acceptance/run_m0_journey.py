@@ -23,6 +23,8 @@ from urllib import error, parse, request
 
 
 SCHEMA_VERSION = 1
+SCHEMA_VERSION_V2 = 2
+SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_VERSION, SCHEMA_VERSION_V2}
 SAFE_ROOT = Path("/work/tmp/project-sentinel")
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 1024 * 1024
@@ -30,6 +32,10 @@ MAX_TIMEOUT_SECONDS = 30.0
 MAX_QUERY_BYTES = 4096
 MIN_SECRET_BYTES = 16
 MAX_SECRET_BYTES = 4096
+MAX_OBSERVE_ATTEMPTS = 20
+MAX_OBSERVE_INTERVAL_MS = 2_000
+MAX_OBSERVE_ELAPSED_MS = 30_000
+OBSERVE_RETRY_STATUSES = {404, 409, 425, 429}
 ALLOWED_ROLES = {"agent", "customer", "none", "operator"}
 NO_AUTH_PATHS = {"/health", "/readiness"}
 PHASES = (
@@ -288,19 +294,42 @@ def validate_timeout(timeout: float) -> float:
     return timeout
 
 
-def validate_credentials(raw_values: list[str]) -> dict[str, str]:
-    credentials: dict[str, str] = {}
+def validate_credentials(
+    raw_values: list[str], schema_version: int = SCHEMA_VERSION
+) -> dict[str, Any]:
+    credentials: dict[str, Any] = {}
     for raw in raw_values:
-        role, separator, env_name = raw.partition("=")
+        identity, separator, env_name = raw.partition("=")
+        if schema_version == SCHEMA_VERSION:
+            role = identity
+            if (
+                not separator
+                or role not in ALLOWED_ROLES - {"none"}
+                or not ENV_NAME_RE.fullmatch(env_name)
+                or role in credentials
+                or env_name in credentials.values()
+            ):
+                raise JourneyError(
+                    "credential references must be unique ROLE=ENV_NAME pairs"
+                )
+            credentials[role] = env_name
+            continue
+        if schema_version != SCHEMA_VERSION_V2:
+            raise JourneyError("plan schema_version is unsupported")
+        alias, role_separator, role = identity.partition(":")
         if (
             not separator
+            or not role_separator
+            or not SAFE_ID_RE.fullmatch(alias)
             or role not in ALLOWED_ROLES - {"none"}
             or not ENV_NAME_RE.fullmatch(env_name)
-            or role in credentials
-            or env_name in credentials.values()
+            or alias in credentials
+            or any(binding["env"] == env_name for binding in credentials.values())
         ):
-            raise JourneyError("credential references must be unique ROLE=ENV_NAME pairs")
-        credentials[role] = env_name
+            raise JourneyError(
+                "credential references must be unique ALIAS:ROLE=ENV_NAME triples"
+            )
+        credentials[alias] = {"role": role, "env": env_name}
     return credentials
 
 
@@ -404,8 +433,86 @@ def validate_template(value: Any, available_references: set[str], label: str) ->
         validate_template(item, available_references, label)
 
 
+def validate_assertions(
+    assertions: object,
+    available_references: set[str],
+    step_id: str,
+    field: str,
+    reject_sensitive_pointer: bool,
+) -> None:
+    if not isinstance(assertions, list):
+        raise JourneyError(f"step {step_id} {field} must be an array")
+    for assertion in assertions:
+        if not isinstance(assertion, dict) or "pointer" not in assertion:
+            raise JourneyError(f"step {step_id} has an invalid {field} assertion")
+        if set(assertion) not in ({"pointer", "present"}, {"pointer", "equals"}):
+            raise JourneyError(f"step {step_id} {field} assertion shape is invalid")
+        pointer = validate_pointer(
+            assertion["pointer"],
+            f"step {step_id} {field}",
+            require_non_root=reject_sensitive_pointer,
+        )
+        pointer_parts = decode_pointer_parts(pointer)
+        if reject_sensitive_pointer and any(
+            SENSITIVE_KEY_RE.search(part) for part in pointer_parts
+        ):
+            raise JourneyError(f"step {step_id} {field} targets sensitive data")
+        if "present" in assertion and assertion["present"] is not True:
+            raise JourneyError("assertion present must be true")
+        if "equals" in assertion:
+            validate_template(
+                assertion["equals"],
+                available_references,
+                f"step {step_id} {field}",
+            )
+            validate_public_structure(
+                assertion["equals"], f"step {step_id} {field} equals"
+            )
+            if not public_safe(assertion["equals"]):
+                raise JourneyError(
+                    f"step {step_id} {field} equals is not public-safe"
+                )
+
+
+def validate_observe_contract(value: object, step_id: str) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "interval_ms",
+        "max_attempts",
+        "max_elapsed_ms",
+        "replay",
+        "retry_statuses",
+    }:
+        raise JourneyError(f"step {step_id} has an invalid observe contract")
+    attempts = value["max_attempts"]
+    interval = value["interval_ms"]
+    elapsed = value["max_elapsed_ms"]
+    retry_statuses = value["retry_statuses"]
+    if (
+        not isinstance(attempts, int)
+        or isinstance(attempts, bool)
+        or not 1 <= attempts <= MAX_OBSERVE_ATTEMPTS
+        or not isinstance(interval, int)
+        or isinstance(interval, bool)
+        or not 0 <= interval <= MAX_OBSERVE_INTERVAL_MS
+        or not isinstance(elapsed, int)
+        or isinstance(elapsed, bool)
+        or not 50 <= elapsed <= MAX_OBSERVE_ELAPSED_MS
+        or value["replay"] != "exact_status_and_captures"
+        or not isinstance(retry_statuses, list)
+        or len(retry_statuses) != len(set(retry_statuses))
+        or any(
+            not isinstance(status, int)
+            or isinstance(status, bool)
+            or status not in OBSERVE_RETRY_STATUSES
+            for status in retry_statuses
+        )
+    ):
+        raise JourneyError(f"step {step_id} has unsafe observe bounds")
+
+
 def validate_plan(plan: dict[str, Any]) -> None:
-    if plan.get("schema_version") != SCHEMA_VERSION:
+    schema_version = plan.get("schema_version")
+    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
         raise JourneyError("plan schema_version is unsupported")
     journey_id = plan.get("journey_id")
     if not isinstance(journey_id, str) or not SAFE_ID_RE.fullmatch(journey_id):
@@ -443,6 +550,13 @@ def validate_plan(plan: dict[str, Any]) -> None:
         "role",
         "route_role",
     }
+    if schema_version == SCHEMA_VERSION_V2:
+        allowed_fields = (allowed_fields - {"role"}) | {
+            "credential_alias",
+            "initial_assertions",
+            "observe",
+            "replay_assertions",
+        }
     for raw_step in steps:
         if not isinstance(raw_step, dict):
             raise JourneyError("every plan step must be an object")
@@ -468,12 +582,14 @@ def validate_plan(plan: dict[str, Any]) -> None:
             seen_phases.append(phase)
 
         kind = raw_step.get("kind", "positive")
-        if kind not in {"readiness", "positive", "negative"}:
+        if kind not in {"readiness", "positive", "negative", "observe"}:
             raise JourneyError(f"step {step_id} has an unknown kind")
         if phase == "readiness" and kind != "readiness":
             raise JourneyError("the readiness phase accepts readiness steps only")
         if phase != "readiness" and kind == "readiness":
             raise JourneyError("readiness steps must remain in the readiness phase")
+        if phase == "readiness" and kind == "observe":
+            raise JourneyError("readiness must retain its explicit readiness kind")
         if kind == "positive":
             positive_phases.add(phase)
         if kind == "negative":
@@ -484,20 +600,36 @@ def validate_plan(plan: dict[str, Any]) -> None:
             raise JourneyError(f"step {step_id} must use GET or POST")
         path = validate_path(raw_step.get("path"), step_id)
         route_authority = derived_route_role(path)
-        role = raw_step.get("role")
-        if role not in ALLOWED_ROLES:
-            raise JourneyError(f"step {step_id} has an invalid credential role")
         route_role = raw_step.get("route_role")
         if route_role not in ALLOWED_ROLES:
             raise JourneyError(f"step {step_id} has an invalid route authority role")
         if route_role != route_authority:
             raise JourneyError(f"step {step_id} spoofs its derived route authority")
-        mismatch = role != route_role
         allow_mismatch = raw_step.get("allow_route_mismatch") is True
-        if mismatch and not (kind == "negative" and allow_mismatch):
-            raise JourneyError(f"step {step_id} crosses its authenticated route")
-        if allow_mismatch and (kind != "negative" or not mismatch):
-            raise JourneyError("allow_route_mismatch is valid only for an explicit negative")
+        if schema_version == SCHEMA_VERSION:
+            role = raw_step.get("role")
+            if role not in ALLOWED_ROLES:
+                raise JourneyError(f"step {step_id} has an invalid credential role")
+            mismatch = role != route_role
+            if mismatch and not (kind == "negative" and allow_mismatch):
+                raise JourneyError(f"step {step_id} crosses its authenticated route")
+            if allow_mismatch and (kind != "negative" or not mismatch):
+                raise JourneyError(
+                    "allow_route_mismatch is valid only for an explicit negative"
+                )
+        else:
+            alias = raw_step.get("credential_alias")
+            if route_role == "none":
+                if alias is not None:
+                    raise JourneyError(
+                        f"step {step_id} must not select a credential for a no-auth route"
+                    )
+            elif not isinstance(alias, str) or not SAFE_ID_RE.fullmatch(alias):
+                raise JourneyError(f"step {step_id} has an invalid credential alias")
+            if allow_mismatch and kind != "negative":
+                raise JourneyError(
+                    "allow_route_mismatch is valid only for an explicit negative"
+                )
 
         expected = raw_step.get("expected_status", [200])
         if (
@@ -511,12 +643,12 @@ def validate_plan(plan: dict[str, Any]) -> None:
             )
         ):
             raise JourneyError(f"step {step_id} has invalid expected_status values")
-        if mismatch and any(status not in {401, 403, 405} for status in expected):
+        if allow_mismatch and any(status not in {401, 403, 405} for status in expected):
             raise JourneyError("route-separation probes must expect only 401, 403, or 405")
-        if kind in {"readiness", "positive"} and any(
+        if kind in {"readiness", "positive", "observe"} and any(
             not 200 <= status <= 299 for status in expected
         ):
-            raise JourneyError("readiness and positive steps must expect only 2xx")
+            raise JourneyError("readiness, positive, and observe steps must expect only 2xx")
         if kind == "negative" and any(
             not 400 <= status <= 499 for status in expected
         ):
@@ -549,6 +681,14 @@ def validate_plan(plan: dict[str, Any]) -> None:
                 raise JourneyError(
                     "positive M0 commands require the stable operation_id template"
                 )
+        if kind == "observe":
+            if schema_version != SCHEMA_VERSION_V2:
+                raise JourneyError("observe steps require plan schema_version 2")
+            if method != "GET":
+                raise JourneyError("observe steps must use GET")
+            validate_observe_contract(raw_step.get("observe"), step_id)
+        elif raw_step.get("observe") is not None:
+            raise JourneyError("observe bounds are valid only for observe steps")
 
         validate_query(raw_step.get("query"), available_references, step_id)
 
@@ -565,13 +705,11 @@ def validate_plan(plan: dict[str, Any]) -> None:
             if set(specification) != {"pointer", "type"}:
                 raise JourneyError(f"step {step_id} capture must declare pointer and type")
             pointer = validate_pointer(
-                specification["pointer"], f"step {step_id} capture"
+                specification["pointer"],
+                f"step {step_id} capture",
+                require_non_root=schema_version == SCHEMA_VERSION_V2,
             )
-            pointer_parts = [
-                part.replace("~1", "/").replace("~0", "~")
-                for part in pointer.removeprefix("/").split("/")
-                if part
-            ]
+            pointer_parts = decode_pointer_parts(pointer)
             if SENSITIVE_KEY_RE.search(name) or any(
                 SENSITIVE_KEY_RE.search(part) for part in pointer_parts
             ):
@@ -587,23 +725,33 @@ def validate_plan(plan: dict[str, Any]) -> None:
         if kind == "positive" and not capture:
             raise JourneyError("positive M0 commands require at least one typed capture")
 
-        assertions = raw_step.get("assertions", [])
-        if not isinstance(assertions, list):
-            raise JourneyError(f"step {step_id} assertions must be an array")
-        for assertion in assertions:
-            if not isinstance(assertion, dict) or "pointer" not in assertion:
-                raise JourneyError(f"step {step_id} has an invalid assertion")
-            if set(assertion) not in ({"pointer", "present"}, {"pointer", "equals"}):
-                raise JourneyError(f"step {step_id} assertion shape is invalid")
-            validate_pointer(assertion["pointer"], f"step {step_id} assertion")
-            if "present" in assertion and assertion["present"] is not True:
-                raise JourneyError("assertion present must be true")
-            if "equals" in assertion:
-                validate_template(
-                    assertion["equals"],
-                    available_references,
-                    f"step {step_id} assertion",
+        assertion_fields = ["assertions"]
+        if schema_version == SCHEMA_VERSION_V2:
+            assertion_fields.extend(["initial_assertions", "replay_assertions"])
+        for assertion_field in assertion_fields:
+            validate_assertions(
+                raw_step.get(assertion_field, []),
+                available_references,
+                step_id,
+                assertion_field,
+                schema_version == SCHEMA_VERSION_V2,
+            )
+        if kind == "observe" and not capture and not raw_step.get("assertions"):
+            raise JourneyError("observe steps require an assertion or typed capture")
+        if schema_version == SCHEMA_VERSION_V2 and kind == "positive":
+            if not raw_step.get("initial_assertions") or not raw_step.get(
+                "replay_assertions"
+            ):
+                raise JourneyError(
+                    "schema v2 positive commands require initial_assertions and replay_assertions"
                 )
+        elif schema_version == SCHEMA_VERSION_V2 and (
+            raw_step.get("initial_assertions") is not None
+            or raw_step.get("replay_assertions") is not None
+        ):
+            raise JourneyError(
+                "initial_assertions and replay_assertions are valid only for positive commands"
+            )
 
         available_references.update(f"{step_id}.{name}" for name in capture)
 
@@ -630,9 +778,34 @@ def validate_plan(plan: dict[str, Any]) -> None:
         raise JourneyError("plan must contain at least one explicit negative probe")
 
 
-def validate_pointer(pointer: object, label: str) -> str:
+def decode_pointer_parts(pointer: str) -> list[str]:
+    if pointer == "":
+        return []
+    parts: list[str] = []
+    for encoded_part in pointer[1:].split("/"):
+        index = 0
+        while index < len(encoded_part):
+            if encoded_part[index] != "~":
+                index += 1
+                continue
+            if index + 1 >= len(encoded_part) or encoded_part[index + 1] not in "01":
+                raise JourneyError("JSON pointer contains an invalid escape")
+            index += 2
+        parts.append(encoded_part.replace("~1", "/").replace("~0", "~"))
+    return parts
+
+
+def validate_pointer(
+    pointer: object, label: str, *, require_non_root: bool = False
+) -> str:
     if not isinstance(pointer, str) or (pointer != "" and not pointer.startswith("/")):
         raise JourneyError(f"{label} has an invalid JSON pointer")
+    try:
+        parts = decode_pointer_parts(pointer)
+    except JourneyError as exc:
+        raise JourneyError(f"{label} has an invalid JSON pointer escape") from exc
+    if require_non_root and (not pointer or not any(parts)):
+        raise JourneyError(f"{label} must target a non-root JSON pointer")
     return pointer
 
 
@@ -640,8 +813,7 @@ def pointer_get(value: Any, pointer: str) -> Any:
     if pointer == "":
         return value
     current = value
-    for encoded_part in pointer[1:].split("/"):
-        part = encoded_part.replace("~1", "/").replace("~0", "~")
+    for part in decode_pointer_parts(pointer):
         if isinstance(current, dict) and part in current:
             current = current[part]
         elif isinstance(current, list) and part.isdigit() and int(part) < len(current):
@@ -736,13 +908,14 @@ def http_json(
     step: dict[str, Any],
     body: dict[str, Any] | None,
     encoded_query: str,
-    credential_values: dict[str, str],
+    credential_values: dict[str, dict[str, str]],
     timeout: float,
+    schema_version: int,
 ) -> tuple[int, Any]:
-    role = step["role"]
+    alias, role = credential_identity(step, schema_version, credential_values)
     headers = {"Accept": "application/json"}
-    if role != "none":
-        headers["Authorization"] = f"Bearer {credential_values[role]}"
+    if role != "none" and alias is not None:
+        headers["Authorization"] = f"Bearer {credential_values[alias]['secret']}"
     data = None
     if body is not None:
         data = canonical_json(body)
@@ -843,11 +1016,15 @@ def public_safe(value: Any) -> bool:
 
 
 def load_ledger(
-    path: Path, plan_digest: str, journey_id: str, target_origin: str
+    path: Path,
+    schema_version: int,
+    plan_digest: str,
+    journey_id: str,
+    target_origin: str,
 ) -> dict[str, Any]:
     if not path.exists():
         return {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": schema_version,
             "journey_id": journey_id,
             "plan_digest": plan_digest,
             "target_origin": target_origin,
@@ -865,7 +1042,7 @@ def load_ledger(
             "chain_tip",
             "completed",
         }
-        or ledger.get("schema_version") != SCHEMA_VERSION
+        or ledger.get("schema_version") != schema_version
         or ledger.get("journey_id") != journey_id
         or ledger.get("plan_digest") != plan_digest
         or ledger.get("target_origin") != target_origin
@@ -905,6 +1082,13 @@ def validate_completed_prefix(
         "request_digest",
         "status",
     }
+    if plan["schema_version"] == SCHEMA_VERSION_V2:
+        expected_fields |= {
+            "attempt_count",
+            "auth_alias_digest",
+            "auth_role",
+            "response_contract_digest",
+        }
     steps_by_id = {step["id"]: step for step in plan["steps"]}
     prior = ZERO_DIGEST
     for step_id in plan_step_ids[: len(completed_ids)]:
@@ -931,6 +1115,7 @@ def validate_completed_prefix(
             raise JourneyError(f"resume ledger captures are invalid for step {step_id}")
         for name, value in record["captures"].items():
             validate_capture(value, capture_specifications[name]["type"])
+        replay_contract = replay_contract_for_step(step, plan["schema_version"])
         if (
             record["operation_id"]
             != stable_operation_id(plan["journey_id"], step_id)
@@ -940,12 +1125,33 @@ def validate_completed_prefix(
             or record["path"] != step["path"]
             or record["checkpoint"] != step.get("checkpoint")
             or record["status"] not in step.get("expected_status", [200])
-            or record["replay_contract"] != "server_response_verified"
+            or record["replay_contract"] != replay_contract
             or record["prior_record_digest"] != prior
             or record["record_digest"] != record_digest(record)
             or not public_safe(record)
         ):
             raise JourneyError(f"resume ledger semantics are invalid for step {step_id}")
+        if plan["schema_version"] == SCHEMA_VERSION_V2:
+            alias = step.get("credential_alias")
+            is_observe = step.get("kind", "positive") == "observe"
+            expected_max_attempts = (
+                step["observe"]["max_attempts"] if is_observe else 1
+            )
+            allow_mismatch = step.get("allow_route_mismatch") is True
+            if (
+                record["auth_alias_digest"] != credential_alias_digest(alias)
+                or record["auth_role"] not in ALLOWED_ROLES
+                or (record["auth_role"] != step["route_role"] and not allow_mismatch)
+                or (record["auth_role"] == step["route_role"] and allow_mismatch)
+                or not isinstance(record["attempt_count"], int)
+                or isinstance(record["attempt_count"], bool)
+                or not 1 <= record["attempt_count"] <= expected_max_attempts
+                or not isinstance(record["response_contract_digest"], str)
+                or not DIGEST_RE.fullmatch(record["response_contract_digest"])
+                or record["response_contract_digest"]
+                != response_contract_digest(record["status"], record["captures"])
+            ):
+                raise JourneyError(f"resume ledger v2 binding is invalid for step {step_id}")
         prior = record["record_digest"]
     if chain_tip != prior:
         raise JourneyError("resume ledger record chain is inconsistent")
@@ -955,11 +1161,9 @@ def validate_evidence_binding(
     path: Path,
     ledger: dict[str, Any],
     plan: dict[str, Any],
-) -> None:
+) -> bool:
     if not path.exists():
-        if ledger["completed"]:
-            raise JourneyError("resume evidence is missing for a non-empty ledger")
-        return
+        return bool(ledger["completed"])
     evidence = load_json(path, "journey evidence")
     required = {
         "schema_version",
@@ -982,17 +1186,18 @@ def validate_evidence_binding(
         and isinstance(replay_steps, list)
         and all(isinstance(item, str) for item in replay_steps)
     )
+    record_count = evidence.get("record_count")
     if (
         set(evidence) != required
         or not structurally_valid
-        or evidence.get("schema_version") != SCHEMA_VERSION
+        or evidence.get("schema_version") != plan["schema_version"]
         or evidence.get("journey_id") != ledger["journey_id"]
         or evidence.get("plan_digest") != ledger["plan_digest"]
         or evidence.get("provider_mode") != "token_free"
         or evidence.get("target_origin") != ledger["target_origin"]
-        or evidence.get("record_chain_tip") != ledger["chain_tip"]
-        or evidence.get("record_count") != len(ledger["completed"])
-        or isinstance(evidence.get("record_count"), bool)
+        or not isinstance(record_count, int)
+        or isinstance(record_count, bool)
+        or not 0 <= record_count <= len(ledger["completed"])
         or evidence.get("result") not in {"in_progress", "checkpoint_reached", "complete"}
         or (
             evidence.get("result") == "checkpoint_reached"
@@ -1012,23 +1217,45 @@ def validate_evidence_binding(
                 if step["id"] in ledger["completed"]
             }
         )
-        or not isinstance(evidence.get("steps"), list)
         or [item.get("id") for item in evidence["steps"]]
-        != [step["id"] for step in plan["steps"] if step["id"] in ledger["completed"]]
+        != [step["id"] for step in plan["steps"][:record_count]]
         or any(
             item != {"id": step_id, **ledger["completed"][step_id]}
             for item, step_id in zip(
                 evidence["steps"],
-                (
-                    step["id"]
-                    for step in plan["steps"]
-                    if step["id"] in ledger["completed"]
-                ),
+                (step["id"] for step in plan["steps"][:record_count]),
             )
         )
         or not public_safe(evidence)
     ):
         raise JourneyError("journey evidence does not match the resume ledger")
+    prefix_tip = (
+        ZERO_DIGEST
+        if record_count == 0
+        else ledger["completed"][plan["steps"][record_count - 1]["id"]][
+            "record_digest"
+        ]
+    )
+    last_checkpoint = (
+        None if record_count == 0 else plan["steps"][record_count - 1].get("checkpoint")
+    )
+    if (
+        evidence["record_chain_tip"] != prefix_tip
+        or len(evidence["steps"]) != record_count
+        or not set(evidence["replay_verified_steps"]).issubset(
+            {step["id"] for step in plan["steps"][:record_count]}
+        )
+        or (
+            evidence["result"] == "checkpoint_reached"
+            and (last_checkpoint is None or evidence["stopped_at"] != last_checkpoint)
+        )
+        or (
+            evidence["result"] == "complete"
+            and record_count != len(plan["steps"])
+        )
+    ):
+        raise JourneyError("journey evidence is not a canonical ledger prefix")
+    return record_count < len(ledger["completed"])
 
 
 def completed_references(completed: dict[str, Any]) -> dict[str, Any]:
@@ -1042,17 +1269,41 @@ def completed_references(completed: dict[str, Any]) -> dict[str, Any]:
 
 
 def resolve_credential_values(
-    plan: dict[str, Any], credential_references: dict[str, str]
-) -> dict[str, str]:
+    plan: dict[str, Any], credential_references: dict[str, Any]
+) -> dict[str, dict[str, str]]:
     if not isinstance(credential_references, dict):
         raise JourneyError("credential references must be an object")
-    required = {step["role"] for step in plan["steps"]} - {"none"}
+    schema_version = plan["schema_version"]
+    if schema_version == SCHEMA_VERSION:
+        required = {step["role"] for step in plan["steps"]} - {"none"}
+        normalized = {
+            role: {"role": role, "env": env_name}
+            for role, env_name in credential_references.items()
+        }
+        identity_label = "role"
+    else:
+        required = {
+            step["credential_alias"]
+            for step in plan["steps"]
+            if step["route_role"] != "none"
+        }
+        normalized = credential_references
+        identity_label = "alias"
     if set(credential_references) != required:
         missing = sorted(required - set(credential_references))
         if missing:
-            raise JourneyError(f"credential reference is missing for role {missing[0]}")
-        raise JourneyError("credential references contain unused roles")
-    env_names = list(credential_references.values())
+            raise JourneyError(
+                f"credential reference is missing for {identity_label} {missing[0]}"
+            )
+        raise JourneyError(f"credential references contain unused {identity_label}s")
+    if any(
+        not isinstance(binding, dict)
+        or set(binding) != {"role", "env"}
+        or binding["role"] not in ALLOWED_ROLES - {"none"}
+        for binding in normalized.values()
+    ):
+        raise JourneyError("credential alias binding is invalid")
+    env_names = [binding["env"] for binding in normalized.values()]
     if any(
         not isinstance(name, str) or not ENV_NAME_RE.fullmatch(name)
         for name in env_names
@@ -1061,11 +1312,16 @@ def resolve_credential_values(
     if len(env_names) != len(set(env_names)):
         raise JourneyError("credential environment references must be role-separated")
 
-    values: dict[str, str] = {}
-    for role, env_name in credential_references.items():
+    values: dict[str, dict[str, str]] = {}
+    seen_secrets: set[str] = set()
+    for alias, binding in normalized.items():
+        role = binding["role"]
+        env_name = binding["env"]
         secret = os.environ.get(env_name)
         if secret is None or not secret:
-            raise JourneyError(f"credential environment is unavailable for role {role}")
+            raise JourneyError(
+                f"credential environment is unavailable for {identity_label} {alias}"
+            )
         secret_size = len(secret.encode("utf-8"))
         if (
             not MIN_SECRET_BYTES <= secret_size <= MAX_SECRET_BYTES
@@ -1075,11 +1331,40 @@ def resolve_credential_values(
                 for character in secret
             )
         ):
-            raise JourneyError(f"credential value is unsafe for role {role}")
-        if secret in values.values():
+            if schema_version == SCHEMA_VERSION:
+                raise JourneyError(f"credential value is unsafe for role {role}")
+            raise JourneyError(f"credential value is unsafe for alias {alias}")
+        if secret in seen_secrets:
             raise JourneyError("credential values must be role-separated")
-        values[role] = secret
+        seen_secrets.add(secret)
+        values[alias] = {"role": role, "secret": secret}
+
+    for step in plan["steps"]:
+        route_role = step["route_role"]
+        if route_role == "none":
+            continue
+        alias = step["role"] if schema_version == SCHEMA_VERSION else step["credential_alias"]
+        credential_role = values[alias]["role"]
+        mismatch = credential_role != route_role
+        allow_mismatch = step.get("allow_route_mismatch") is True
+        if mismatch and not (step.get("kind", "positive") == "negative" and allow_mismatch):
+            raise JourneyError(f"step {step['id']} crosses its authenticated route")
+        if allow_mismatch and (
+            step.get("kind", "positive") != "negative" or not mismatch
+        ):
+            raise JourneyError(
+                "allow_route_mismatch is valid only for an explicit negative"
+            )
     return values
+
+
+def credential_identity(
+    step: dict[str, Any], schema_version: int, credential_values: dict[str, dict[str, str]]
+) -> tuple[str | None, str]:
+    if step["route_role"] == "none":
+        return None, "none"
+    alias = step["role"] if schema_version == SCHEMA_VERSION else step["credential_alias"]
+    return alias, credential_values[alias]["role"]
 
 
 def contains_credential(value: Any, credential_values: set[str]) -> bool:
@@ -1116,7 +1401,7 @@ def build_evidence(
     replay_verified_steps: set[str],
 ) -> dict[str, Any]:
     evidence = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": plan["schema_version"],
         "journey_id": ledger["journey_id"],
         "plan_digest": ledger["plan_digest"],
         "provider_mode": "token_free",
@@ -1142,6 +1427,8 @@ def resolved_request(
     references: dict[str, Any],
     operation_id: str,
     credential_secrets: set[str],
+    schema_version: int,
+    credential_values: dict[str, dict[str, str]],
 ) -> tuple[dict[str, Any] | None, str, str]:
     body = None
     if step["method"] == "POST":
@@ -1158,8 +1445,8 @@ def resolved_request(
             f"request query contains credential material at step {step['id']}"
         )
     encoded_query = encode_query(query)
-    request_digest = digest(
-        {
+    if schema_version == SCHEMA_VERSION:
+        request_material = {
             "method": step["method"],
             "path": step["path"],
             "query": encoded_query,
@@ -1167,8 +1454,53 @@ def resolved_request(
             "route_role": step["route_role"],
             "body": body,
         }
-    )
+    else:
+        alias, credential_role = credential_identity(
+            step, schema_version, credential_values
+        )
+        request_material = {
+            "schema_version": SCHEMA_VERSION_V2,
+            "method": step["method"],
+            "path": step["path"],
+            "query": encoded_query,
+            "credential_alias": alias,
+            "credential_role": credential_role,
+            "route_role": step["route_role"],
+            "body": body,
+        }
+    request_digest = digest(request_material)
     return body, encoded_query, request_digest
+
+
+def response_contract_digest(status: int, captures: dict[str, Any]) -> str:
+    return digest(
+        {
+            "domain": "m0-response-contract-v2",
+            "schema_version": SCHEMA_VERSION_V2,
+            "status": status,
+            "captures": captures,
+        }
+    )
+
+
+def credential_alias_digest(alias: str | None) -> str:
+    return digest(
+        {
+            "domain": "m0-credential-alias-v2",
+            "schema_version": SCHEMA_VERSION_V2,
+            "alias": alias,
+        }
+    )
+
+
+def replay_contract_for_step(step: dict[str, Any], schema_version: int) -> str:
+    if schema_version == SCHEMA_VERSION:
+        return "server_response_verified"
+    if step.get("kind", "positive") == "observe":
+        return "bounded_observe_v2"
+    if step.get("kind", "positive") == "positive":
+        return "idempotent_command_v2"
+    return "server_response_verified_v2"
 
 
 def observe_step(
@@ -1176,34 +1508,81 @@ def observe_step(
     step: dict[str, Any],
     body: dict[str, Any] | None,
     encoded_query: str,
-    credential_values: dict[str, str],
+    credential_values: dict[str, dict[str, str]],
     credential_secrets: set[str],
     references: dict[str, Any],
     operation_id: str,
     timeout: float,
-) -> tuple[int, dict[str, Any]]:
-    status, payload = http_json(
-        base_url, step, body, encoded_query, credential_values, timeout
+    schema_version: int,
+    assertions: list[dict[str, Any]],
+) -> tuple[int, dict[str, Any], int]:
+    observe = step.get("observe")
+    max_attempts = observe["max_attempts"] if observe is not None else 1
+    deadline = (
+        time.monotonic() + observe["max_elapsed_ms"] / 1_000
+        if observe is not None
+        else None
     )
-    if response_is_unavailable(status, payload):
-        raise JourneyError(f"required adapter is unavailable at step {step['id']}")
-    if status not in step.get("expected_status", [200]):
-        raise JourneyError(f"unexpected HTTP status at step {step['id']}")
-    evaluate_assertions(step.get("assertions", []), payload, references, operation_id)
-    captures: dict[str, Any] = {}
-    for name, specification in step.get("capture", {}).items():
-        captures[name] = validate_capture(
-            pointer_get(payload, specification["pointer"]), specification["type"]
+    retry_statuses = set(observe["retry_statuses"]) if observe is not None else set()
+    last_error: JourneyError | None = None
+    for attempt in range(1, max_attempts + 1):
+        attempt_timeout = timeout
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            attempt_timeout = min(timeout, remaining)
+        status, payload = http_json(
+            base_url,
+            step,
+            body,
+            encoded_query,
+            credential_values,
+            attempt_timeout,
+            schema_version,
         )
-        if contains_credential(captures[name], credential_secrets):
-            raise JourneyError(f"step {step['id']} attempted to capture a credential")
-    return status, captures
+        if response_is_unavailable(status, payload):
+            raise JourneyError(f"required adapter is unavailable at step {step['id']}")
+        if status in retry_statuses:
+            last_error = JourneyError(f"observe status is not ready at step {step['id']}")
+        elif status not in step.get("expected_status", [200]):
+            raise JourneyError(f"unexpected HTTP status at step {step['id']}")
+        else:
+            try:
+                evaluate_assertions(assertions, payload, references, operation_id)
+                captures: dict[str, Any] = {}
+                for name, specification in step.get("capture", {}).items():
+                    captures[name] = validate_capture(
+                        pointer_get(payload, specification["pointer"]),
+                        specification["type"],
+                    )
+            except JourneyError as exc:
+                if observe is None:
+                    raise
+                last_error = exc
+            else:
+                if any(
+                    contains_credential(value, credential_secrets)
+                    for value in captures.values()
+                ):
+                    raise JourneyError(
+                        f"step {step['id']} attempted to capture a credential"
+                    )
+                return status, captures, attempt
+        if attempt == max_attempts:
+            break
+        interval = observe["interval_ms"] / 1_000
+        if deadline is not None and time.monotonic() + interval >= deadline:
+            break
+        if interval:
+            time.sleep(interval)
+    raise JourneyError(f"observe bounds exhausted at step {step['id']}") from last_error
 
 
 def _run_journey_locked(
     plan: dict[str, Any],
     base_url: str,
-    credential_values: dict[str, str],
+    credential_values: dict[str, dict[str, str]],
     ledger_path: Path,
     evidence_path: Path,
     timeout: float,
@@ -1211,11 +1590,21 @@ def _run_journey_locked(
 ) -> dict[str, Any]:
     plan_digest = digest(plan)
     journey_id = plan["journey_id"]
-    credential_secrets = set(credential_values.values())
-    ledger = load_ledger(ledger_path, plan_digest, journey_id, base_url)
+    schema_version = plan["schema_version"]
+    credential_secrets = {
+        binding["secret"] for binding in credential_values.values()
+    }
+    ledger = load_ledger(
+        ledger_path, schema_version, plan_digest, journey_id, base_url
+    )
     completed = ledger["completed"]
     validate_completed_prefix(plan, completed, ledger["chain_tip"])
-    validate_evidence_binding(evidence_path, ledger, plan)
+    evidence_needs_repair = validate_evidence_binding(evidence_path, ledger, plan)
+    if evidence_needs_repair:
+        atomic_json_write(
+            evidence_path,
+            build_evidence(plan, ledger, "in_progress", None, set()),
+        )
     references = completed_references(completed)
     stopped_at: str | None = None
     replay_verified_steps: set[str] = set()
@@ -1224,7 +1613,12 @@ def _run_journey_locked(
         step_id = step["id"]
         operation_id = stable_operation_id(journey_id, step_id)
         body, encoded_query, request_digest = resolved_request(
-            step, references, operation_id, credential_secrets
+            step,
+            references,
+            operation_id,
+            credential_secrets,
+            schema_version,
+            credential_values,
         )
         existing = completed.get(step_id)
         if existing is not None:
@@ -1235,7 +1629,13 @@ def _run_journey_locked(
                 or existing.get("query") != encoded_query
             ):
                 raise JourneyError(f"resume conflict for completed step {step_id}")
-            status, captures = observe_step(
+            replay_assertions = (
+                step.get("assertions", [])
+                if schema_version == SCHEMA_VERSION
+                or step.get("kind", "positive") != "positive"
+                else step.get("assertions", []) + step["replay_assertions"]
+            )
+            status, captures, _attempt_count = observe_step(
                 base_url,
                 step,
                 body,
@@ -1245,6 +1645,8 @@ def _run_journey_locked(
                 references,
                 operation_id,
                 timeout,
+                schema_version,
+                replay_assertions,
             )
             if status != existing["status"] or captures != existing["captures"]:
                 raise JourneyError(
@@ -1256,7 +1658,13 @@ def _run_journey_locked(
                 build_evidence(plan, ledger, "in_progress", None, replay_verified_steps),
             )
         else:
-            status, captures = observe_step(
+            initial_assertions = (
+                step.get("assertions", [])
+                if schema_version == SCHEMA_VERSION
+                or step.get("kind", "positive") != "positive"
+                else step.get("assertions", []) + step["initial_assertions"]
+            )
+            status, captures, attempt_count = observe_step(
                 base_url,
                 step,
                 body,
@@ -1266,6 +1674,8 @@ def _run_journey_locked(
                 references,
                 operation_id,
                 timeout,
+                schema_version,
+                initial_assertions,
             )
             record = {
                 "captures": captures,
@@ -1281,6 +1691,23 @@ def _run_journey_locked(
                 "request_digest": request_digest,
                 "status": status,
             }
+            if schema_version == SCHEMA_VERSION_V2:
+                alias, credential_role = credential_identity(
+                    step, schema_version, credential_values
+                )
+                record.update(
+                    {
+                        "attempt_count": attempt_count,
+                        "auth_alias_digest": credential_alias_digest(alias),
+                        "auth_role": credential_role,
+                        "response_contract_digest": response_contract_digest(
+                            status, captures
+                        ),
+                        "replay_contract": replay_contract_for_step(
+                            step, schema_version
+                        ),
+                    }
+                )
             record["record_digest"] = record_digest(record)
             if not public_safe(record):
                 raise JourneyError(f"step {step_id} produced non-public evidence")
@@ -1313,7 +1740,7 @@ def _run_journey_locked(
 def run_journey(
     plan: dict[str, Any],
     base_url: str,
-    credential_references: dict[str, str],
+    credential_references: dict[str, Any],
     ledger_path: Path,
     evidence_path: Path,
     timeout: float,
@@ -1363,7 +1790,9 @@ def main(argv: list[str] | None = None) -> int:
         plan = load_json(args.plan, "journey plan")
         ledger = safe_output_path(args.ledger, "ledger")
         evidence = safe_output_path(args.evidence, "evidence")
-        credential_references = validate_credentials(args.credential)
+        credential_references = validate_credentials(
+            args.credential, plan.get("schema_version")
+        )
         result = run_journey(
             plan,
             args.base_url,
