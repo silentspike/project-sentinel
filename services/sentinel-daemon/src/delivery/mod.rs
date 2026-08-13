@@ -1,11 +1,12 @@
 //! Independent QA, release, delivery, and product-lineage core (#696).
 //!
-//! Productive workflow/workbench/event adapters are deliberately absent until the
-//! #695/#694 dependencies are merged and explicitly wired. The versioned core can
-//! be built and tested with deterministic ports without changing daemon startup.
+//! The local aggregate, idempotency, journal, and outbox have a configured redb
+//! composition. Productive workflow/workbench/effect/publication authorities are
+//! explicit fail-closed ports until their versioned adapters are wired.
 
 mod digest;
 mod error;
+mod lineage;
 mod ports;
 mod schema;
 mod service;
@@ -14,6 +15,7 @@ mod store;
 
 pub use digest::ContentDigest;
 pub use error::DeliveryError;
+pub use lineage::*;
 pub use ports::*;
 pub use schema::*;
 pub use service::*;

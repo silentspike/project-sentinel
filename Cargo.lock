@@ -4480,6 +4480,7 @@ dependencies = [
  "futures",
  "redb",
  "reqwest",
+ "rustix",
  "sentinel-cluster-control",
  "sentinel-common",
  "sentinel-ebpf",

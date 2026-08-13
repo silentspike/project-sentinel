@@ -1,6 +1,14 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    path::{Path, PathBuf},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use rustix::fs::{open, openat, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -8,6 +16,7 @@ use super::{
     digest::ContentDigest,
     error::DeliveryError,
     ports::{PublicationReceiptV1, PublicationRequestV1},
+    lineage::validate_delivery_aggregate_references,
     state::DeliveryAggregateV1,
 };
 
@@ -93,8 +102,8 @@ struct DeliveryEventEnvelopeV1 {
     committed_at_ms: u64,
 }
 
-/// Narrow persistence seam. Productive wiring is owned by #732 and must
-/// implement this contract with the canonical trajectory authority.
+/// Narrow persistence seam for the #696 delivery aggregate and its local
+/// idempotency/journal boundary.
 pub trait DeliveryAggregateStorePort: Send + Sync {
     fn load(
         &self,
@@ -117,8 +126,8 @@ pub trait DeliveryAggregateStorePort: Send + Sync {
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError>;
 }
 
-/// Publication-state seam owned by #733. Productive implementations read and
-/// acknowledge only the outbox rows created by the canonical #732 append.
+/// Publication-state seam for the local durable outbox. A productive publisher
+/// acknowledges only the exact digest-bound row returned by this contract.
 pub trait DeliveryPublicationStatePort: Send + Sync {
     fn pending_publications(&self) -> Result<Vec<DeliveryOutboxEntryV1>, DeliveryError>;
 
@@ -129,16 +138,191 @@ pub trait DeliveryPublicationStatePort: Send + Sync {
     ) -> Result<(), DeliveryError>;
 }
 
-/// Deterministic redb adapter used by dependency-independent core tests only.
-/// It is not the productive #732 trajectory or #733 publication authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeliveryStoreConfigV1 {
+    approved_root: PathBuf,
+    path: PathBuf,
+    root_identity: (u64, u64),
+    file_identity: Option<(u64, u64)>,
+}
+
+impl DeliveryStoreConfigV1 {
+    pub fn new(
+        approved_root: impl Into<PathBuf>,
+        relative_file: impl AsRef<Path>,
+    ) -> Result<Self, DeliveryError> {
+        let approved_root = approved_root.into();
+        let relative_file = relative_file.as_ref();
+        if !approved_root.is_absolute()
+            || relative_file.components().count() != 1
+            || relative_file.file_name().is_none()
+        {
+            return Err(DeliveryError::Validation(
+                "delivery store requires an absolute approved root and one relative file name"
+                    .to_string(),
+            ));
+        }
+        let root_metadata = std::fs::symlink_metadata(&approved_root).map_err(|error| {
+            DeliveryError::Validation(format!("approved delivery root is unavailable: {error}"))
+        })?;
+        let canonical_root = approved_root.canonicalize().map_err(|error| {
+            DeliveryError::Validation(format!("approved delivery root is invalid: {error}"))
+        })?;
+        if root_metadata.file_type().is_symlink()
+            || !root_metadata.is_dir()
+            || canonical_root != approved_root
+        {
+            return Err(DeliveryError::Validation(
+                "approved delivery root must be a canonical non-symlink directory".to_string(),
+            ));
+        }
+        #[cfg(unix)]
+        if root_metadata.permissions().mode() & 0o7777 != 0o700
+            || root_metadata.uid() != rustix::process::geteuid().as_raw()
+        {
+            return Err(DeliveryError::Validation(
+                "approved delivery root must be owned by the effective daemon uid and mode 0700"
+                    .to_string(),
+            ));
+        }
+        let path = canonical_root.join(relative_file);
+        let file_identity = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                validate_store_file_metadata(&metadata)?;
+                Some(metadata_identity(&metadata))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(DeliveryError::Validation(format!(
+                    "delivery store file is unavailable: {error}"
+                )))
+            }
+        };
+        Ok(Self {
+            approved_root: canonical_root,
+            path,
+            root_identity: metadata_identity(&root_metadata),
+            file_identity,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn approved_root(&self) -> &Path {
+        &self.approved_root
+    }
+}
+
+/// Local durable #696 aggregate, idempotency, journal, and publication-outbox
+/// authority. External event publication remains an explicitly injected port.
 pub struct DeliveryStore {
     db: Database,
+    _pinned_file: File,
 }
 
 impl DeliveryStore {
+    pub fn open(config: &DeliveryStoreConfigV1) -> Result<Self, DeliveryError> {
+        let root_fd = open(
+            config.approved_root(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            DeliveryError::Storage(format!("cannot pin approved delivery root: {error}"))
+        })?;
+        let root_file = File::from(root_fd);
+        let root_metadata = root_file.metadata().map_err(|error| {
+            DeliveryError::Storage(format!("cannot inspect pinned delivery root: {error}"))
+        })?;
+        validate_store_root_metadata(&root_metadata)?;
+        if metadata_identity(&root_metadata) != config.root_identity {
+            return Err(DeliveryError::Validation(
+                "approved delivery root identity changed before open".to_string(),
+            ));
+        }
+
+        let file_name = config.path().file_name().ok_or_else(|| {
+            DeliveryError::Validation("delivery store file name disappeared".to_string())
+        })?;
+        let (flags, mode) = if config.file_identity.is_some() {
+            (
+                OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+        } else {
+            (
+                OFlags::RDWR
+                    | OFlags::CREATE
+                    | OFlags::EXCL
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
+            )
+        };
+        let file_fd = openat(&root_file, file_name, flags, mode).map_err(|error| {
+            DeliveryError::Storage(format!("cannot pin protected delivery store: {error}"))
+        })?;
+        let pinned_file = File::from(file_fd);
+        let pinned_metadata = pinned_file.metadata().map_err(|error| {
+            DeliveryError::Storage(format!("cannot inspect pinned delivery store: {error}"))
+        })?;
+        validate_store_file_metadata(&pinned_metadata)?;
+        if let Some(expected) = config.file_identity {
+            if metadata_identity(&pinned_metadata) != expected {
+                return Err(DeliveryError::Validation(
+                    "delivery store file identity changed before open".to_string(),
+                ));
+            }
+        }
+
+        let redb_file = pinned_file.try_clone().map_err(|error| {
+            DeliveryError::Storage(format!("cannot duplicate pinned delivery store: {error}"))
+        })?;
+        let store = Self::open_file(redb_file, pinned_file)?;
+        let path_metadata = std::fs::symlink_metadata(config.path()).map_err(|error| {
+            DeliveryError::Storage(format!("delivery store path disappeared after open: {error}"))
+        })?;
+        validate_store_file_metadata(&path_metadata)?;
+        if metadata_identity(&path_metadata) != metadata_identity(&pinned_metadata)
+            || path_metadata.file_type().is_symlink()
+        {
+            return Err(DeliveryError::Validation(
+                "delivery store path no longer names the pinned file".to_string(),
+            ));
+        }
+        let reopened_metadata = store._pinned_file.metadata().map_err(|error| {
+            DeliveryError::Storage(format!("cannot recheck pinned delivery store: {error}"))
+        })?;
+        validate_store_file_metadata(&reopened_metadata)?;
+        if metadata_identity(&reopened_metadata) != metadata_identity(&pinned_metadata) {
+            return Err(DeliveryError::Validation(
+                "delivery store descriptor identity changed during open".to_string(),
+            ));
+        }
+        Ok(store)
+    }
+
     #[doc(hidden)]
     pub fn open_test_only(path: &Path) -> Result<Self, DeliveryError> {
+        Self::open_path(path)
+    }
+
+    fn open_path(path: &Path) -> Result<Self, DeliveryError> {
         let db = Database::create(path)?;
+        let pinned_file = File::open(path).map_err(|error| {
+            DeliveryError::Storage(format!("cannot retain delivery test store descriptor: {error}"))
+        })?;
+        Self::initialize_open_database(db, pinned_file)
+    }
+
+    fn open_file(redb_file: File, pinned_file: File) -> Result<Self, DeliveryError> {
+        let db = Database::builder().create_file(redb_file)?;
+        Self::initialize_open_database(db, pinned_file)
+    }
+
+    fn initialize_open_database(db: Database, pinned_file: File) -> Result<Self, DeliveryError> {
         let write = db.begin_write()?;
         {
             let _ = write.open_table(META)?;
@@ -148,8 +332,12 @@ impl DeliveryStore {
             let _ = write.open_table(OUTBOX)?;
         }
         write.commit()?;
-        let store = Self { db };
+        let store = Self {
+            db,
+            _pinned_file: pinned_file,
+        };
         store.initialize_schema()?;
+        store.health()?;
         Ok(store)
     }
 
@@ -240,6 +428,7 @@ impl DeliveryStore {
         &self,
         request: &DeliveryCommitRequestV1,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        validate_delivery_aggregate_references(&request.aggregate)?;
         validate_component("tenant_id", &request.tenant_id)?;
         validate_component("project_id", &request.project_id)?;
         validate_component("principal_id", &request.principal_id)?;
@@ -514,6 +703,22 @@ impl DeliveryStore {
         Ok(())
     }
 
+    #[doc(hidden)]
+    pub fn replace_aggregate_test_only(
+        &self,
+        aggregate: &DeliveryAggregateV1,
+    ) -> Result<(), DeliveryError> {
+        let key = aggregate_key(&aggregate.tenant_id, &aggregate.project_id)?;
+        let bytes = serde_json::to_vec(aggregate)?;
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(AGGREGATES)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
     pub fn health(&self) -> Result<(), DeliveryError> {
         self.initialize_schema()?;
         let read = self.db.begin_read()?;
@@ -522,6 +727,7 @@ impl DeliveryStore {
         for row in aggregates.iter()? {
             let (key, value) = row?;
             let aggregate: DeliveryAggregateV1 = decode(value.value(), "aggregate")?;
+            validate_delivery_aggregate_references(&aggregate)?;
             if aggregate.schema_version != SCHEMA_VERSION
                 || key.value() != aggregate_key(&aggregate.tenant_id, &aggregate.project_id)?
             {
@@ -746,6 +952,40 @@ impl DeliveryStore {
         }
         Ok(())
     }
+}
+
+fn validate_store_root_metadata(root: &std::fs::Metadata) -> Result<(), DeliveryError> {
+    if !root.is_dir()
+        || root.permissions().mode() & 0o7777 != 0o700
+        || root.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(DeliveryError::Validation(
+            "approved delivery root must remain euid-owned mode 0700".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_store_file_metadata(file: &std::fs::Metadata) -> Result<(), DeliveryError> {
+    if file.file_type().is_symlink() || !file.is_file() {
+        return Err(DeliveryError::Validation(
+            "delivery store must be a regular non-symlink file".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    if file.permissions().mode() & 0o7777 != 0o600
+        || file.uid() != rustix::process::geteuid().as_raw()
+        || file.nlink() != 1
+    {
+        return Err(DeliveryError::Validation(
+            "delivery store must be euid-owned mode 0600 with one hard link".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
 }
 
 impl DeliveryAggregateStorePort for DeliveryStore {
