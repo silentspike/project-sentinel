@@ -2,6 +2,38 @@
 
 Deployment-Artefakte fuer Project Sentinel auf der Ziel-VM.
 
+## Single-node M0 release provisioning
+
+`provision-m0-single-node.sh` installs one complete, stopped M0 release from a
+schema-v1 release manifest. The manifest is the sole artifact inventory: the
+provisioner requires the exact canonical set, including all 60 agent configs,
+the health-monitor unit/timer/script, the web project and authoring profiles,
+the product-acceptance contract, and the separately packaged `nats-server`
+binary. Missing, extra, duplicate, source-swapped, type-swapped, or hash-mismatched
+entries fail before target files are changed.
+
+The operator supplies both the approved Git SHA and the SHA-256 of the raw
+manifest. Sources must be regular, single-link, owner-controlled files below
+the source root. All required Sentinel units must be stopped. Production
+staging is restricted to `/work/tmp/project-sentinel/`; `/tmp` is never used.
+
+```bash
+sudo bash deploy/provision-m0-single-node.sh \
+  --manifest /work/tmp/project-sentinel/release/release-manifest.json \
+  --expected-manifest-sha256 "${APPROVED_MANIFEST_SHA256}" \
+  --expected-git-sha "${APPROVED_GIT_SHA}" \
+  --source-root /work/tmp/project-sentinel/release \
+  --stage-root /work/tmp/project-sentinel/m0-provision
+```
+
+Installed ownership is `root:root`; binaries and scripts use mode `0755`, while
+configs and systemd units use `0644`. Existing files are captured in the
+owner-only staging area before replacement. A partial installation rolls back
+the changed files and emits `provision-receipt.json` with a bounded, public-safe
+status. The provisioner never copies secrets, identity, databases, or runtime
+state, and it never starts, enables, reloads, or restarts a service. Service
+activation and runtime acceptance are separate, explicitly authorized steps.
+
 ## Ziel-VM
 
 - Host: `ubuntu@<deploy-vm>` (Proxmox VM)
