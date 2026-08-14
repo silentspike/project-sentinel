@@ -5,17 +5,20 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/silentspike/project-sentinel/pkg/sentinel-go/eventstore"
 	"github.com/silentspike/project-sentinel/pkg/sentinel-go/messaging"
@@ -118,21 +121,8 @@ func main() {
 	}
 	logger.Info("nats streams ensured")
 
-	// Health endpoint
-	healthMux := http.NewServeMux()
-	healthMux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"status":"ok","service":"sentinel-nats-bridge"}`)
-	})
-	healthMux.HandleFunc("GET /ready", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if !nc.IsConnected() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprint(w, `{"status":"not_ready","reason":"nats disconnected"}`)
-			return
-		}
-		fmt.Fprint(w, `{"status":"ok","service":"sentinel-nats-bridge"}`)
-	})
+	readiness := &readinessState{}
+	healthMux := newHealthHandler(store, nc, readiness)
 	healthServer := &http.Server{
 		Addr:         cfg.Server.HealthBindAddr,
 		Handler:      healthMux,
@@ -150,7 +140,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go pollLoop(ctx, logger, store, nc, cfg)
+	go pollLoop(ctx, logger, store, js, readiness, cfg)
 
 	// Wait for shutdown signal
 	quit := make(chan os.Signal, 1)
@@ -174,76 +164,191 @@ func main() {
 // maxRetries is the maximum number of publish attempts before marking an outbox entry as failed.
 const maxRetries = 5
 
-// pollLoop continuously polls the outbox for pending entries and publishes them to NATS.
-func pollLoop(ctx context.Context, logger *slog.Logger, store *eventstore.Store, nc *nats.Conn, cfg Config) {
+type outboxStore interface {
+	GetOutboxBatch(limit int) ([]eventstore.OutboxPublishEntry, error)
+	MarkPublishedCAS(id int64, eventID, operationID string) error
+	MarkRetryCAS(id int64, eventID, operationID, reason string) error
+	MarkFailedCAS(id int64, eventID, operationID, reason string) error
+	OutboxCounts() (eventstore.OutboxStatusCounts, error)
+}
+
+type jetStreamPublisher interface {
+	PublishMsg(context.Context, *nats.Msg, ...jetstream.PublishOpt) (*jetstream.PubAck, error)
+}
+
+type natsConnectionState interface {
+	IsConnected() bool
+}
+
+type readinessState struct {
+	initialScanComplete atomic.Bool
+}
+
+type readinessResponse struct {
+	Status       string `json:"status"`
+	Service      string `json:"service"`
+	Reason       string `json:"reason,omitempty"`
+	Pending      int64  `json:"pending,omitempty"`
+	Failed       int64  `json:"failed,omitempty"`
+	NonPublished int64  `json:"nonpublished,omitempty"`
+}
+
+func newHealthHandler(
+	store outboxStore,
+	connection natsConnectionState,
+	readiness *readinessState,
+) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		writeReadinessJSON(w, http.StatusOK, readinessResponse{
+			Status:  "ok",
+			Service: "sentinel-nats-bridge",
+		})
+	})
+	mux.HandleFunc("GET /ready", func(w http.ResponseWriter, _ *http.Request) {
+		status, response := currentReadiness(store, connection, readiness)
+		writeReadinessJSON(w, status, response)
+	})
+	return mux
+}
+
+func currentReadiness(
+	store outboxStore,
+	connection natsConnectionState,
+	readiness *readinessState,
+) (int, readinessResponse) {
+	response := readinessResponse{Status: "not_ready", Service: "sentinel-nats-bridge"}
+	if !connection.IsConnected() {
+		response.Reason = "nats_disconnected"
+		return http.StatusServiceUnavailable, response
+	}
+	if !readiness.initialScanComplete.Load() {
+		response.Reason = "initial_scan_pending"
+		return http.StatusServiceUnavailable, response
+	}
+	counts, err := store.OutboxCounts()
+	if err != nil {
+		response.Reason = "outbox_status_unavailable"
+		return http.StatusServiceUnavailable, response
+	}
+	response.Pending = counts.Pending
+	response.Failed = counts.Failed
+	response.NonPublished = counts.NonPublished
+	switch {
+	case counts.Failed != 0:
+		response.Reason = "outbox_failed"
+	case counts.Pending != 0:
+		response.Reason = "outbox_pending"
+	case counts.NonPublished != 0:
+		response.Reason = "outbox_nonpublished"
+	default:
+		response.Status = "ok"
+		return http.StatusOK, response
+	}
+	return http.StatusServiceUnavailable, response
+}
+
+func writeReadinessJSON(w http.ResponseWriter, status int, response readinessResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		slog.Error("health response encode failed", "error", err)
+	}
+}
+
+// pollLoop drains immediately on startup and then retries after each poll
+// interval. A sweep never continues past an uncertain store or broker effect.
+func pollLoop(
+	ctx context.Context,
+	logger *slog.Logger,
+	store outboxStore,
+	publisher jetStreamPublisher,
+	readiness *readinessState,
+	cfg Config,
+) {
 	ticker := time.NewTicker(time.Duration(cfg.EventStore.PollIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
 	totalPublished := int64(0)
 
 	for {
+		published, err := drainOutbox(ctx, store, publisher, readiness, cfg.EventStore.BatchSize)
+		totalPublished += int64(published)
+		if published != 0 {
+			logger.Info("outbox entries published", "count", published, "total", totalPublished)
+		}
+		if err != nil && ctx.Err() == nil {
+			logger.Error("outbox drain stopped", "error", err)
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			entries, err := store.GetOutboxBatch(cfg.EventStore.BatchSize)
-			if err != nil {
-				logger.Error("outbox poll failed", "error", err)
-				continue
-			}
-			if len(entries) == 0 {
-				continue
-			}
-
-			var publishedIDs []int64
-			for _, entry := range entries {
-				subject := messaging.BuildEventSubject(entry.EventType, entry.AggregateID)
-
-				msg := &nats.Msg{
-					Subject: subject,
-					Data:    []byte(entry.Payload),
-					Header:  nats.Header{},
-				}
-				msg.Header.Set("Nats-Msg-Id", entry.OperationID)
-				msg.Header.Set("X-Event-ID", entry.EventID)
-				msg.Header.Set("X-Event-Type", entry.EventType)
-				msg.Header.Set("X-Aggregate-ID", entry.AggregateID)
-				msg.Header.Set("X-Tick", strconv.FormatInt(entry.Tick, 10))
-				msg.Header.Set("X-Correlation-ID", entry.CorrelationID)
-
-				if err := nc.PublishMsg(msg); err != nil {
-					logger.Error("publish failed",
-						"subject", subject,
-						"outbox_id", entry.OutboxID,
-						"retry", entry.RetryCount,
-						"error", err,
-					)
-					if entry.RetryCount+1 >= maxRetries {
-						if markErr := store.MarkFailed(entry.OutboxID); markErr != nil {
-							logger.Error("mark failed error", "outbox_id", entry.OutboxID, "error", markErr)
-						}
-					} else {
-						if markErr := store.MarkRetry(entry.OutboxID, err.Error()); markErr != nil {
-							logger.Error("mark retry error", "outbox_id", entry.OutboxID, "error", markErr)
-						}
-					}
-					continue
-				}
-				publishedIDs = append(publishedIDs, entry.OutboxID)
-			}
-
-			if len(publishedIDs) > 0 {
-				if err := store.MarkPublished(publishedIDs); err != nil {
-					logger.Error("mark published failed", "count", len(publishedIDs), "error", err)
-				}
-				totalPublished += int64(len(publishedIDs))
-				logger.Info("outbox entries published",
-					"count", len(publishedIDs),
-					"total", totalPublished,
-				)
-			}
 		}
 	}
+}
+
+func drainOutbox(
+	ctx context.Context,
+	store outboxStore,
+	publisher jetStreamPublisher,
+	readiness *readinessState,
+	batchSize int,
+) (int, error) {
+	totalPublished := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return totalPublished, err
+		}
+		entries, err := store.GetOutboxBatch(batchSize)
+		if err != nil {
+			return totalPublished, fmt.Errorf("get outbox batch: %w", err)
+		}
+		if len(entries) == 0 {
+			readiness.initialScanComplete.Store(true)
+			return totalPublished, nil
+		}
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return totalPublished, err
+			}
+			msg := buildPublishMessage(entry)
+			ack, err := publisher.PublishMsg(ctx, msg)
+			if err != nil {
+				if transitionErr := markPublishFailure(store, entry); transitionErr != nil {
+					return totalPublished, fmt.Errorf("publish failed and retry transition failed: %w", transitionErr)
+				}
+				return totalPublished, fmt.Errorf("JetStream publish failed: %w", err)
+			}
+			if ack == nil {
+				return totalPublished, fmt.Errorf("JetStream publish returned no PubAck")
+			}
+			if err := store.MarkPublishedCAS(entry.OutboxID, entry.EventID, entry.OperationID); err != nil {
+				return totalPublished, fmt.Errorf("PubAck adoption failed: %w", err)
+			}
+			totalPublished++
+		}
+	}
+}
+
+func markPublishFailure(store outboxStore, entry eventstore.OutboxPublishEntry) error {
+	const reason = "jetstream_publish_failed"
+	if entry.RetryCount+1 >= maxRetries {
+		return store.MarkFailedCAS(entry.OutboxID, entry.EventID, entry.OperationID, reason)
+	}
+	return store.MarkRetryCAS(entry.OutboxID, entry.EventID, entry.OperationID, reason)
+}
+
+func buildPublishMessage(entry eventstore.OutboxPublishEntry) *nats.Msg {
+	subject := messaging.BuildEventSubject(entry.EventType, entry.AggregateID)
+	msg := &nats.Msg{Subject: subject, Data: []byte(entry.Payload), Header: nats.Header{}}
+	msg.Header.Set("Nats-Msg-Id", entry.OperationID)
+	msg.Header.Set("X-Event-ID", entry.EventID)
+	msg.Header.Set("X-Event-Type", entry.EventType)
+	msg.Header.Set("X-Aggregate-ID", entry.AggregateID)
+	msg.Header.Set("X-Tick", strconv.FormatInt(entry.Tick, 10))
+	msg.Header.Set("X-Correlation-ID", entry.CorrelationID)
+	return msg
 }
 
 func envOrDefault(key, defaultVal string) string {
