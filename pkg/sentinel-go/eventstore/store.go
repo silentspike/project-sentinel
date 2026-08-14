@@ -244,7 +244,7 @@ func (s *Store) GetEventsSince(afterID int64, limit int) ([]DomainEvent, int64, 
 	defer func() { _ = rows.Close() }()
 
 	var events []DomainEvent
-	var maxID int64 = afterID
+	maxID := afterID
 	for rows.Next() {
 		var rowID int64
 		var e DomainEvent
@@ -340,6 +340,15 @@ type OutboxPublishEntry struct {
 	RetryCount    int
 }
 
+// OutboxStatusCounts is the public-safe readiness summary for the durable
+// publication boundary. NonPublished includes pending, failed, and any
+// unrecognized non-terminal status.
+type OutboxStatusCounts struct {
+	Pending      int64
+	Failed       int64
+	NonPublished int64
+}
+
 // GetOutboxBatch returns up to limit pending outbox entries joined with event metadata.
 func (s *Store) GetOutboxBatch(limit int) ([]OutboxPublishEntry, error) {
 	if limit <= 0 {
@@ -367,42 +376,87 @@ func (s *Store) GetOutboxBatch(limit int) ([]OutboxPublishEntry, error) {
 	return entries, rows.Err()
 }
 
-// MarkPublished sets status='published' and published_at=now for the given IDs.
-func (s *Store) MarkPublished(ids []int64) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	tx, err := s.db.Begin()
+// OutboxCounts returns the durable publication state used by bridge readiness.
+func (s *Store) OutboxCounts() (OutboxStatusCounts, error) {
+	var counts OutboxStatusCounts
+	err := s.db.QueryRow(`SELECT
+		COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status <> 'published' THEN 1 ELSE 0 END), 0)
+		FROM outbox`).Scan(&counts.Pending, &counts.Failed, &counts.NonPublished)
 	if err != nil {
-		return fmt.Errorf("outbox mark published begin: %w", err)
+		return OutboxStatusCounts{}, fmt.Errorf("outbox count states: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
-
-	now := time.Now().UnixMilli()
-	for _, id := range ids {
-		if _, err := tx.Exec(`UPDATE outbox SET status = 'published', published_at = ?
-			WHERE id = ?`, now, id); err != nil {
-			return fmt.Errorf("outbox mark published id=%d: %w", id, err)
-		}
-	}
-	return tx.Commit()
+	return counts, nil
 }
 
-// MarkRetry increments retry_count and sets last_error for a failed publish attempt.
-func (s *Store) MarkRetry(id int64, errMsg string) error {
-	_, err := s.db.Exec(`UPDATE outbox SET retry_count = retry_count + 1, last_error = ?
-		WHERE id = ?`, errMsg, id)
-	if err != nil {
-		return fmt.Errorf("outbox mark retry id=%d: %w", id, err)
-	}
-	return nil
+// MarkPublishedCAS acknowledges exactly the pending row and event operation
+// that received a synchronous JetStream PubAck.
+func (s *Store) MarkPublishedCAS(id int64, eventID, operationID string) error {
+	return s.transitionOutboxCAS(
+		id,
+		eventID,
+		operationID,
+		`UPDATE outbox SET status = 'published', published_at = ?, last_error = NULL
+		 WHERE id = ? AND event_id = ? AND status = 'pending'
+		 AND EXISTS (
+			SELECT 1 FROM events e
+			WHERE e.event_id = outbox.event_id AND e.operation_id = ?
+		 )`,
+		time.Now().UnixMilli(),
+	)
 }
 
-// MarkFailed sets status='failed' for an outbox entry that exceeded max retries.
-func (s *Store) MarkFailed(id int64) error {
-	_, err := s.db.Exec(`UPDATE outbox SET status = 'failed' WHERE id = ?`, id)
+// MarkRetryCAS records a retry only while the exact event operation remains
+// pending. The supplied reason must be a stable public-safe code.
+func (s *Store) MarkRetryCAS(id int64, eventID, operationID, reason string) error {
+	return s.transitionOutboxCAS(
+		id,
+		eventID,
+		operationID,
+		`UPDATE outbox SET retry_count = retry_count + 1, last_error = ?
+		 WHERE id = ? AND event_id = ? AND status = 'pending'
+		 AND EXISTS (
+			SELECT 1 FROM events e
+			WHERE e.event_id = outbox.event_id AND e.operation_id = ?
+		 )`,
+		reason,
+	)
+}
+
+// MarkFailedCAS terminally fails only the exact pending event operation.
+func (s *Store) MarkFailedCAS(id int64, eventID, operationID, reason string) error {
+	return s.transitionOutboxCAS(
+		id,
+		eventID,
+		operationID,
+		`UPDATE outbox SET status = 'failed', retry_count = retry_count + 1, last_error = ?
+		 WHERE id = ? AND event_id = ? AND status = 'pending'
+		 AND EXISTS (
+			SELECT 1 FROM events e
+			WHERE e.event_id = outbox.event_id AND e.operation_id = ?
+		 )`,
+		reason,
+	)
+}
+
+func (s *Store) transitionOutboxCAS(
+	id int64,
+	eventID string,
+	operationID string,
+	statement string,
+	value any,
+) error {
+	result, err := s.db.Exec(statement, value, id, eventID, operationID)
 	if err != nil {
-		return fmt.Errorf("outbox mark failed id=%d: %w", id, err)
+		return fmt.Errorf("outbox transition id=%d: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("outbox transition rows id=%d: %w", id, err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("outbox transition rejected id=%d: expected 1 pending row, changed %d", id, rows)
 	}
 	return nil
 }
