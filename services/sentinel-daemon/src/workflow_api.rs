@@ -1,5 +1,7 @@
 //! Authenticated M0 company workflow and productive Workbench integration.
 
+mod delivery_runtime;
+
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::fs::OpenOptions;
@@ -11,8 +13,9 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use sentinel_common::{
-    AgentId, CommandRule, WorkbenchArtifactRef, WorkbenchRequest, WorkbenchResourceLimits,
-    WorkbenchTool, WORKBENCH_RUNTIME_BWRAP, WORKBENCH_SCHEMA_VERSION,
+    events::{DomainEvent, DomainEventPayload}, AgentId, CommandRule, WorkbenchArtifactRef,
+    WorkbenchRequest, WorkbenchResourceLimits, WorkbenchTool, WORKBENCH_RUNTIME_BWRAP,
+    WORKBENCH_SCHEMA_VERSION,
 };
 use sentinel_workflow::{
     sealed_output_bundle_digest, ArtifactInputV1, AuthenticatedCompanyPrincipalV1, CommandRuleV1,
@@ -28,10 +31,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::delivery::{
+    ConfiguredDeliveryCore, DeliveryStoreConfigV1,
+};
 use crate::workbench::{
     dispatch_workbench, WorkbenchAuthoritySnapshot, WorkbenchAuthoritySource,
     WorkbenchDispatchCommand, WorkbenchInvocationRecord, WorkbenchInvocationState,
     WorkbenchProfile,
+};
+use delivery_runtime::{
+    LimboDeliveryEffects, LimboDeliveryPublication, WorkflowDeliveryIntegration,
+    WorkflowWorkItemGate,
 };
 
 pub const CUSTOMER_COMMAND_PATH: &str = "/customer/workflow/commands";
@@ -42,6 +52,8 @@ pub const OPERATOR_PROJECT_PATH: &str = "/operator/workflow/projects";
 pub const OPERATOR_WORK_ITEM_PATH: &str = "/operator/workflow/work-items";
 pub const OPERATOR_PROJECTION_PATH: &str = "/operator/workflow/projections";
 pub const OPERATOR_EVENTS_PATH: &str = "/operator/workflow/events";
+pub const DELIVERY_COMMAND_PATH: &str = "/company/delivery/commands";
+pub const DELIVERY_LINEAGE_PATH: &str = "/company/delivery/lineage";
 pub const MAX_WORKFLOW_BODY_BYTES: usize = 256 * 1024;
 
 const PRINCIPAL_SCHEMA_VERSION: u16 = 1;
@@ -58,6 +70,12 @@ type ProductWorkflowCore = WorkflowCore<
     Arc<dyn WorkExecutionPort>,
     Arc<dyn CompletionEvidencePort>,
     Arc<dyn GateEvidencePort>,
+>;
+
+type ProductDeliveryCore = ConfiguredDeliveryCore<
+    WorkflowDeliveryIntegration,
+    LimboDeliveryEffects,
+    LimboDeliveryPublication,
 >;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -971,6 +989,87 @@ struct ExecutionPlanEnvelope {
     plan: ExecutionPlanV1,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryCommandEnvelope {
+    idempotency_key: String,
+    command: ProductDeliveryCommand,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+enum ProductDeliveryCommand {
+    RegisterCandidate {
+        candidate: crate::delivery::ReleaseCandidateV1,
+    },
+    AssignQa {
+        tenant_id: String,
+        project_id: String,
+        candidate_id: String,
+        plan: crate::delivery::QaEvaluationPlanV1,
+        run: crate::delivery::QaEvaluationRunReceiptV1,
+    },
+    TransitionQa {
+        tenant_id: String,
+        project_id: String,
+        run_id: String,
+        next: crate::delivery::QaRunState,
+    },
+    ExecuteQa {
+        tenant_id: String,
+        project_id: String,
+        run_id: String,
+    },
+    ImportEvidenceGraph {
+        tenant_id: String,
+        project_id: String,
+        run_id: String,
+        graph: crate::delivery::QaEvidenceGraphV1,
+    },
+    RecordGate {
+        tenant_id: String,
+        project_id: String,
+        run_id: String,
+        gate: crate::delivery::QaReleaseGateReceiptV1,
+    },
+    RecordReviewBundle {
+        tenant_id: String,
+        project_id: String,
+        run_id: String,
+        review: crate::delivery::ReviewV1,
+        test_run: crate::delivery::TestRunV1,
+        findings: Vec<crate::delivery::FindingV1>,
+        approval: Option<crate::delivery::ApprovalV1>,
+    },
+    Promote {
+        tenant_id: String,
+        project_id: String,
+        candidate_id: String,
+        manifest: crate::delivery::ReleaseManifestV1,
+        release: crate::delivery::ReleaseV1,
+    },
+    IssueDelivery {
+        project_id: String,
+        receipt: crate::delivery::DeliveryReceiptV1,
+    },
+    CustomerAction {
+        tenant_id: String,
+        project_id: String,
+        feedback: crate::delivery::CustomerFeedbackV1,
+        acceptance: Option<crate::delivery::AcceptanceV1>,
+    },
+    Rollback {
+        tenant_id: String,
+        project_id: String,
+        rollback: crate::delivery::RollbackV1,
+    },
+    Closeout {
+        tenant_id: String,
+        project_id: String,
+        closeout: crate::delivery::ProjectCloseoutV1,
+    },
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowHealthSnapshot {
@@ -982,6 +1081,8 @@ pub struct WorkflowHealthSnapshot {
     pub pending_execution: usize,
     pub pending_completion: usize,
     pub pending_gate: usize,
+    pub delivery_ready: bool,
+    pub delivery_publication_pending: usize,
     pub last_error: Option<String>,
 }
 
@@ -993,9 +1094,11 @@ pub struct WorkflowHttpResponse {
 
 pub struct WorkflowApi {
     core: Arc<ProductWorkflowCore>,
+    delivery: Option<Arc<ProductDeliveryCore>>,
     store: Arc<WorkflowStore>,
     principals: Arc<PrincipalAuthenticator>,
     authority: Option<Arc<CompanyAuthority>>,
+    event_store: Option<sentinel_limbo::EventStore>,
     mutation_fence: RwLock<()>,
     enabled: bool,
     scan_succeeded: AtomicBool,
@@ -1021,6 +1124,8 @@ impl WorkflowApi {
         data_dir: &Path,
         config_dir: &Path,
         agent_capabilities: HashMap<AgentId, BTreeSet<String>>,
+        event_store: sentinel_limbo::EventStore,
+        workbench_artifact_roots: HashMap<AgentId, PathBuf>,
     ) -> Result<Self, WorkflowError> {
         let enabled = workflow_enabled()?;
         let store_path = if enabled {
@@ -1042,12 +1147,13 @@ impl WorkflowApi {
         let (profile, profile_digest) =
             WorkbenchProfile::load(config_dir.join("workbench-profiles/web-authoring-v1.toml"))
                 .map_err(|_| workflow_unavailable())?;
+        let agent_capabilities = Arc::new(agent_capabilities);
         let authority = Arc::new(CompanyAuthority {
             store: Arc::clone(&store),
             principals: Arc::clone(&principals),
             workbench_profile: profile,
             workbench_profile_digest: profile_digest,
-            agent_capabilities: Arc::new(agent_capabilities),
+            agent_capabilities: Arc::clone(&agent_capabilities),
         });
         let workbench = Arc::new(WorkbenchExecutionAdapter {
             store: Arc::clone(&store),
@@ -1056,7 +1162,35 @@ impl WorkflowApi {
         let organization: Arc<dyn sentinel_workflow::OrganizationRuntimePort> = authority.clone();
         let execution: Arc<dyn WorkExecutionPort> = workbench.clone();
         let completion: Arc<dyn CompletionEvidencePort> = workbench;
-        let gate: Arc<dyn GateEvidencePort> = Arc::new(UnavailableGateEvidencePort);
+        let (qa_profile, qa_profile_digest) =
+            WorkbenchProfile::load(config_dir.join("workbench-profiles/web-qa-v1.toml"))
+                .map_err(|_| workflow_unavailable())?;
+        let delivery_integration = WorkflowDeliveryIntegration::new(
+            Arc::clone(&store),
+            Arc::clone(&principals),
+            qa_profile,
+            qa_profile_digest,
+            agent_capabilities,
+            Arc::new(workbench_artifact_roots),
+        );
+        let gate: Arc<dyn GateEvidencePort> =
+            Arc::new(WorkflowWorkItemGate::new(delivery_integration.clone()));
+        let delivery_config = DeliveryStoreConfigV1::new(
+            data_dir.join("company-delivery"),
+            "company-delivery.redb",
+        )
+        .map_err(|_| workflow_unavailable())?;
+        let delivery = ConfiguredDeliveryCore::open(
+            &delivery_config,
+            delivery_integration,
+            LimboDeliveryEffects::new(
+                event_store.clone(),
+                Arc::clone(&store),
+                Arc::clone(&principals),
+            ),
+            LimboDeliveryPublication::new(event_store.clone()),
+        )
+        .map_err(|_| workflow_unavailable())?;
         Ok(Self {
             core: Arc::new(WorkflowCore::new(
                 Arc::clone(&store),
@@ -1065,9 +1199,11 @@ impl WorkflowApi {
                 completion,
                 gate,
             )),
+            delivery: Some(Arc::new(delivery)),
             store,
             principals,
             authority: Some(authority),
+            event_store: Some(event_store),
             mutation_fence: RwLock::new(()),
             enabled: true,
             scan_succeeded: AtomicBool::new(false),
@@ -1092,9 +1228,11 @@ impl WorkflowApi {
                 completion,
                 gate,
             )),
+            delivery: None,
             store,
             principals: Arc::new(PrincipalAuthenticator::default()),
             authority: None,
+            event_store: None,
             mutation_fence: RwLock::new(()),
             enabled: false,
             scan_succeeded: AtomicBool::new(false),
@@ -1146,6 +1284,8 @@ impl WorkflowApi {
             ("GET", OPERATOR_WORK_ITEM_PATH) => self.work_item(&principal, path),
             ("GET", OPERATOR_PROJECTION_PATH) => self.projection(&principal, path),
             ("GET", OPERATOR_EVENTS_PATH) => self.events(&principal, path),
+            ("POST", DELIVERY_COMMAND_PATH) => self.delivery_command(&principal, body),
+            ("GET", DELIVERY_LINEAGE_PATH) => self.delivery_lineage(&principal, path),
             _ => json_error(
                 405,
                 "method_not_allowed",
@@ -1173,14 +1313,11 @@ impl WorkflowApi {
             Ok(value) => value,
             Err(response) => return response,
         };
-        if matches!(
-            envelope.command,
-            CompanyWorkflowCommandV1::ApplyWorkTransition { .. }
-        ) {
+        if is_internal_company_command(&envelope.command) {
             return json_error(
                 403,
                 "evidence_required",
-                "work transitions are derived from sealed execution evidence",
+                "command is derived from sealed execution or delivery evidence",
                 false,
             );
         }
@@ -1376,6 +1513,297 @@ impl WorkflowApi {
         }
     }
 
+    fn delivery_command(
+        &self,
+        principal: &BoundPrincipal,
+        body: &[u8],
+    ) -> WorkflowHttpResponse {
+        let Some(delivery) = self.delivery.as_ref() else {
+            return json_error(
+                503,
+                "delivery_unavailable",
+                "delivery authority is unavailable",
+                true,
+            );
+        };
+        let envelope: DeliveryCommandEnvelope = match decode_body(body) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        if envelope.idempotency_key.is_empty() || envelope.idempotency_key.len() > 128 {
+            return json_error(400, "invalid_input", "idempotency_key is invalid", false);
+        }
+        let Some(delivery_principal) = delivery_principal(&principal.principal) else {
+            return json_error(
+                403,
+                "authority_conflict",
+                "principal has no delivery authority",
+                false,
+            );
+        };
+        let context = crate::delivery::CommandContextV1 {
+            principal: delivery_principal,
+            idempotency_key: envelope.idempotency_key,
+            now_ms: now_unix_ms(),
+        };
+        let Ok(_guard) = self.mutation_fence.read() else {
+            return json_error(503, "workflow_busy", "workflow recovery is active", true);
+        };
+        let result = match envelope.command {
+            ProductDeliveryCommand::RegisterCandidate { candidate } => delivery
+                .register_candidate(&context, candidate)
+                .and_then(delivery_json),
+            ProductDeliveryCommand::AssignQa {
+                tenant_id,
+                project_id,
+                candidate_id,
+                plan,
+                run,
+            } => delivery
+                .assign_qa(
+                    &context,
+                    &tenant_id,
+                    &project_id,
+                    &candidate_id,
+                    plan,
+                    run,
+                )
+                .and_then(delivery_json),
+            ProductDeliveryCommand::TransitionQa {
+                tenant_id,
+                project_id,
+                run_id,
+                next,
+            } => delivery
+                .transition_qa(&context, &tenant_id, &project_id, &run_id, next)
+                .and_then(delivery_json),
+            ProductDeliveryCommand::ExecuteQa {
+                tenant_id,
+                project_id,
+                run_id,
+            } => delivery
+                .execute_qa(&context, &tenant_id, &project_id, &run_id)
+                .and_then(delivery_json),
+            ProductDeliveryCommand::ImportEvidenceGraph {
+                tenant_id,
+                project_id,
+                run_id,
+                graph,
+            } => delivery
+                .import_evidence_graph(&context, &tenant_id, &project_id, &run_id, graph)
+                .and_then(delivery_json),
+            ProductDeliveryCommand::RecordGate {
+                tenant_id,
+                project_id,
+                run_id,
+                gate,
+            } => delivery
+                .record_gate(&context, &tenant_id, &project_id, &run_id, gate)
+                .and_then(delivery_json),
+            ProductDeliveryCommand::RecordReviewBundle {
+                tenant_id,
+                project_id,
+                run_id,
+                review,
+                test_run,
+                findings,
+                approval,
+            } => delivery
+                .record_review_bundle(
+                    &context,
+                    &tenant_id,
+                    &project_id,
+                    &run_id,
+                    review,
+                    test_run,
+                    findings,
+                    approval,
+                )
+                .and_then(delivery_json),
+            ProductDeliveryCommand::Promote {
+                tenant_id,
+                project_id,
+                candidate_id,
+                manifest,
+                release,
+            } => delivery
+                .promote(
+                    &context,
+                    &tenant_id,
+                    &project_id,
+                    &candidate_id,
+                    manifest,
+                    release,
+                )
+                .and_then(delivery_json),
+            ProductDeliveryCommand::IssueDelivery {
+                project_id,
+                receipt,
+            } => delivery
+                .issue_delivery(&context, &project_id, receipt)
+                .and_then(delivery_json),
+            ProductDeliveryCommand::CustomerAction {
+                tenant_id,
+                project_id,
+                feedback,
+                acceptance,
+            } => delivery
+                .customer_action(&context, &tenant_id, &project_id, feedback, acceptance)
+                .and_then(delivery_json),
+            ProductDeliveryCommand::Rollback {
+                tenant_id,
+                project_id,
+                rollback,
+            } => delivery
+                .rollback(&context, &tenant_id, &project_id, rollback)
+                .and_then(delivery_json),
+            ProductDeliveryCommand::Closeout {
+                tenant_id,
+                project_id,
+                closeout,
+            } => delivery
+                .closeout(&context, &tenant_id, &project_id, closeout)
+                .and_then(delivery_json),
+        };
+        match result {
+            Ok(value) => json(200, &value),
+            Err(error) => delivery_error(error),
+        }
+    }
+
+    fn delivery_lineage(
+        &self,
+        principal: &BoundPrincipal,
+        path: &str,
+    ) -> WorkflowHttpResponse {
+        let Some(delivery) = self.delivery.as_ref() else {
+            return json_error(
+                503,
+                "delivery_unavailable",
+                "delivery authority is unavailable",
+                true,
+            );
+        };
+        let (Some(tenant_id), Some(project_id)) = (
+            query_parameter(path, "tenant_id"),
+            query_parameter(path, "project_id"),
+        ) else {
+            return json_error(
+                400,
+                "invalid_input",
+                "tenant_id and project_id are required",
+                false,
+            );
+        };
+        let Some(delivery_principal) = delivery_principal(&principal.principal) else {
+            return json_error(
+                403,
+                "authority_conflict",
+                "principal has no delivery authority",
+                false,
+            );
+        };
+        let context = crate::delivery::CommandContextV1 {
+            principal: delivery_principal,
+            idempotency_key: format!("read-lineage-{tenant_id}-{project_id}"),
+            now_ms: now_unix_ms(),
+        };
+        match delivery.read_public_lineage(&context, tenant_id, project_id) {
+            Ok(value) => {
+                if principal.principal.role == CompanyRoleV1::Gaia {
+                    if let Err(error) = self.record_gaia_oversight(
+                        principal,
+                        tenant_id,
+                        project_id,
+                        &value,
+                    ) {
+                        return delivery_error(error);
+                    }
+                }
+                json(200, &value)
+            }
+            Err(error) => delivery_error(error),
+        }
+    }
+
+    fn record_gaia_oversight(
+        &self,
+        principal: &BoundPrincipal,
+        tenant_id: &str,
+        project_id: &str,
+        lineage: &crate::delivery::PublicDeliveryLineageDtoV1,
+    ) -> Result<(), crate::delivery::DeliveryError> {
+        let event_store = self.event_store.as_ref().ok_or_else(|| {
+            crate::delivery::DeliveryError::AdapterUnavailable {
+                dependency: "gaia_oversight_event_store",
+                reason: "event store is unavailable".to_string(),
+            }
+        })?;
+        let mut canonical = lineage.clone();
+        canonical.read_at_ms = 0;
+        let lineage_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&canonical)
+                    .map_err(|error| crate::delivery::DeliveryError::Storage(error.to_string()))?
+            )
+        );
+        let payload = DomainEventPayload::GaiaProjectOversightObserved {
+            tenant_id: tenant_id.to_string(),
+            project_id: project_id.to_string(),
+            project_revision: lineage.revision,
+            lineage_digest: lineage_digest.clone(),
+            observer_principal_id: principal.principal.principal_id.clone(),
+            observer_authority_generation: principal.principal.authority_generation,
+        };
+        let operation_id = format!(
+            "gaia-oversight:{tenant_id}:{project_id}:{}:{}:{}",
+            lineage.revision,
+            principal.principal.principal_id,
+            principal.principal.authority_generation
+        );
+        let event_identity = format!(
+            "{:x}",
+            Sha256::digest(format!("{operation_id}:{lineage_digest}").as_bytes())
+        );
+        let event = DomainEvent {
+            event_id: format!("gaia-oversight-{event_identity}"),
+            event_type: payload.event_type_str().to_string(),
+            aggregate_id: format!("PROJECT:{tenant_id}:{project_id}"),
+            payload: payload.to_json(),
+            correlation_id: project_id.to_string(),
+            causation_id: None,
+            operation_id: operation_id.clone(),
+            tick: 0,
+            timestamp_ms: now_unix_ms(),
+            schema_version: 1,
+            compensation_type: "none".to_string(),
+        };
+        if let Some(existing) = event_store
+            .event_by_operation_id(&operation_id)
+            .map_err(|error| crate::delivery::DeliveryError::Storage(error.to_string()))?
+        {
+            if existing.event_id == event.event_id
+                && existing.event_type == event.event_type
+                && existing.aggregate_id == event.aggregate_id
+                && existing.payload == event.payload
+                && existing.correlation_id == event.correlation_id
+                && existing.operation_id == event.operation_id
+                && existing.schema_version == event.schema_version
+                && existing.compensation_type == event.compensation_type
+            {
+                return Ok(());
+            }
+            return Err(crate::delivery::DeliveryError::Conflict(
+                "Gaia oversight operation is already bound to different lineage".to_string(),
+            ));
+        }
+        event_store
+            .append_event(&event)
+            .map_err(|error| crate::delivery::DeliveryError::Storage(error.to_string()))?;
+        Ok(())
+    }
+
     pub fn reconcile_pending(&self) {
         self.reconcile_pending_until(|| false);
     }
@@ -1425,6 +1853,9 @@ impl WorkflowApi {
             self.sync_company_state(&work)?;
         }
         self.reconcile_company_state_page()?;
+        if let Some(delivery) = self.delivery.as_ref() {
+            delivery.publish_pending().map_err(delivery_workflow_error)?;
+        }
         Ok(())
     }
 
@@ -1598,7 +2029,15 @@ impl WorkflowApi {
         let pending_gate = self.store.pending_gate_evidence(MAX_RECONCILE_BATCH);
         let last_error = self.last_error.lock().ok().and_then(|value| value.clone());
         let canonical_event_cursor = self.store.company_event_cursor();
-        let dependencies_ready = self.core.dependencies_ready();
+        let delivery_ready = self
+            .delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.readiness().is_ok());
+        let delivery_publication_pending = self
+            .delivery
+            .as_ref()
+            .and_then(|delivery| delivery.pending_publication_count().ok());
+        let dependencies_ready = self.core.dependencies_ready() && delivery_ready;
         let ready = self.enabled
             && dependencies_ready
             && self.scan_succeeded.load(Ordering::Acquire)
@@ -1606,6 +2045,7 @@ impl WorkflowApi {
             && pending_execution.is_ok()
             && pending_completion.is_ok()
             && pending_gate.is_ok()
+            && delivery_publication_pending == Some(0)
             && canonical_event_cursor.is_ok();
         WorkflowHealthSnapshot {
             enabled: self.enabled,
@@ -1628,6 +2068,9 @@ impl WorkflowApi {
             pending_gate: pending_gate
                 .map(|value| value.len())
                 .unwrap_or(MAX_RECONCILE_BATCH),
+            delivery_ready,
+            delivery_publication_pending: delivery_publication_pending
+                .unwrap_or(MAX_RECONCILE_BATCH),
             last_error,
         }
     }
@@ -1646,6 +2089,19 @@ fn workflow_persistence_failure() -> WorkflowError {
         WorkflowErrorCode::PersistenceFailure,
         true,
         "workflow synchronization state is unavailable",
+    )
+}
+
+fn delivery_workflow_error(error: crate::delivery::DeliveryError) -> WorkflowError {
+    WorkflowError::new(
+        WorkflowErrorCode::PersistenceFailure,
+        true,
+        match error {
+            crate::delivery::DeliveryError::AdapterUnavailable { .. } => {
+                "delivery adapter is unavailable"
+            }
+            _ => "delivery reconciliation failed",
+        },
     )
 }
 
@@ -1794,6 +2250,8 @@ fn is_workflow_path(path: &str) -> bool {
             | OPERATOR_WORK_ITEM_PATH
             | OPERATOR_PROJECTION_PATH
             | OPERATOR_EVENTS_PATH
+            | DELIVERY_COMMAND_PATH
+            | DELIVERY_LINEAGE_PATH
     )
 }
 
@@ -1865,6 +2323,65 @@ fn workflow_error(error: WorkflowError) -> WorkflowHttpResponse {
         error.message,
         error.retryable,
     )
+}
+
+fn delivery_principal(
+    principal: &AuthenticatedCompanyPrincipalV1,
+) -> Option<crate::delivery::PrincipalV1> {
+    use crate::delivery::AuthorityRole;
+
+    let roles = match principal.role {
+        CompanyRoleV1::Customer => BTreeSet::from([AuthorityRole::Customer]),
+        CompanyRoleV1::Designer | CompanyRoleV1::Developer => {
+            BTreeSet::from([AuthorityRole::Developer])
+        }
+        CompanyRoleV1::Qa => BTreeSet::from([AuthorityRole::Qa]),
+        CompanyRoleV1::ReleaseManager => BTreeSet::from([AuthorityRole::ReleaseManager]),
+        CompanyRoleV1::Gaia => BTreeSet::from([AuthorityRole::GaiaObserver]),
+        CompanyRoleV1::Sales
+        | CompanyRoleV1::ProjectManager
+        | CompanyRoleV1::TechnicalLead => return None,
+    };
+    Some(crate::delivery::PrincipalV1 {
+        tenant_id: principal.tenant_id.0.clone(),
+        principal_id: principal.principal_id.clone(),
+        authority_generation: principal.authority_generation,
+        roles,
+    })
+}
+
+fn is_internal_company_command(command: &CompanyWorkflowCommandV1) -> bool {
+    matches!(
+        command,
+        CompanyWorkflowCommandV1::ApplyWorkTransition { .. }
+            | CompanyWorkflowCommandV1::CreateGovernedRework { .. }
+    )
+}
+
+fn delivery_json<T: Serialize>(value: T) -> Result<serde_json::Value, crate::delivery::DeliveryError> {
+    serde_json::to_value(value).map_err(|error| crate::delivery::DeliveryError::Storage(error.to_string()))
+}
+
+fn delivery_error(error: crate::delivery::DeliveryError) -> WorkflowHttpResponse {
+    use crate::delivery::DeliveryError;
+
+    let (status, code, retryable) = match error {
+        DeliveryError::NotFound(_) => (404, "not_found", false),
+        DeliveryError::AuthorityDenied(_) => (403, "authority_conflict", false),
+        DeliveryError::Conflict(_)
+        | DeliveryError::IdempotencyConflict { .. }
+        | DeliveryError::RevisionConflict { .. } => (409, "delivery_conflict", false),
+        DeliveryError::AdapterUnavailable { .. } | DeliveryError::Storage(_) => {
+            (503, "delivery_unavailable", true)
+        }
+        DeliveryError::CorruptStore(_) => (503, "delivery_corrupt", false),
+        DeliveryError::InvalidDigest(_)
+        | DeliveryError::InvalidState { .. }
+        | DeliveryError::MissingEvidence(_)
+        | DeliveryError::StaleEvidence(_)
+        | DeliveryError::Validation(_) => (422, "delivery_rejected", false),
+    };
+    json_error(status, code, "delivery command was rejected", retryable)
 }
 
 fn workflow_error_code(code: WorkflowErrorCode) -> &'static str {
@@ -1999,6 +2516,104 @@ mod tests {
     }
 
     #[test]
+    fn gaia_lineage_observation_is_idempotent_and_grants_no_mutation_role() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = sentinel_limbo::EventStore::open(
+            directory.path().join("events.db").to_str().unwrap(),
+        )
+        .unwrap();
+        let mut api = WorkflowApi::disabled().unwrap();
+        api.event_store = Some(events.clone());
+        let principals = PrincipalAuthenticator::new(vec![(
+            "g".repeat(32),
+            PrincipalBinding {
+                credential_name: "gaia-test".to_owned(),
+                tenant_id: TenantId::parse("tenant-m0").unwrap(),
+                principal_id: "gaia-9".to_owned(),
+                kind: CompanyPrincipalKindV1::Agent,
+                role: CompanyRoleV1::Gaia,
+                customer_id: None,
+                agent_id: Some(AgentId(9)),
+                authority_generation: 4,
+            },
+        )])
+        .unwrap();
+        let gaia = principals.principal("gaia-9").unwrap();
+        let delivery_principal = delivery_principal(&gaia.principal).unwrap();
+        assert_eq!(
+            delivery_principal.roles,
+            BTreeSet::from([crate::delivery::AuthorityRole::GaiaObserver])
+        );
+        let lineage = crate::delivery::PublicDeliveryLineageDtoV1 {
+            schema_version: crate::delivery::DELIVERY_SCHEMA_V1,
+            server_redacted: true,
+            project_label: "Project delivery".to_owned(),
+            revision: 8,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            blockers: Vec::new(),
+            adapter_ready: true,
+            authority_generation: 4,
+            read_at_ms: 100,
+        };
+
+        api.record_gaia_oversight(&gaia, "tenant-m0", "project-m0", &lineage)
+            .unwrap();
+        let mut replay = lineage.clone();
+        replay.read_at_ms = 200;
+        api.record_gaia_oversight(&gaia, "tenant-m0", "project-m0", &replay)
+            .unwrap();
+
+        let event = events
+            .event_by_operation_id("gaia-oversight:tenant-m0:project-m0:8:gaia-9:4")
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.event_type, "gaia_project_oversight_observed");
+        assert!(matches!(
+            serde_json::from_str::<DomainEventPayload>(&event.payload).unwrap(),
+            DomainEventPayload::GaiaProjectOversightObserved {
+                project_revision: 8,
+                observer_authority_generation: 4,
+                ..
+            }
+        ));
+        assert_eq!(events.get_latest_event_id().unwrap(), 1);
+    }
+
+    #[test]
+    fn evidence_derived_company_commands_are_not_public_http_commands() {
+        let transition = CompanyWorkflowCommandV1::ApplyWorkTransition {
+            project_id: ProjectId::parse("project-m0").unwrap(),
+            expected_version: 1,
+            receipt: sentinel_workflow::WorkTransitionReceiptV1 {
+                schema_version: sentinel_workflow::COMPANY_DOMAIN_SCHEMA_VERSION,
+                project_id: ProjectId::parse("project-m0").unwrap(),
+                work_item_id: WorkItemId::parse("work-m0").unwrap(),
+                expected_project_version: 1,
+                expected_work_version: 1,
+                expected_assignment_version: 1,
+                from_state: sentinel_workflow::CompanyWorkStateV1::Assigned,
+                to_state: sentinel_workflow::CompanyWorkStateV1::Running,
+                output_receipts: Vec::new(),
+                gate_receipt: None,
+                phase_a_evidence_digest: "a".repeat(64),
+                reason_ref: "sealed-workbench-evidence".to_string(),
+                occurred_at_unix_ms: 1,
+            },
+        };
+        let rework = CompanyWorkflowCommandV1::CreateGovernedRework {
+            project_id: ProjectId::parse("project-m0").unwrap(),
+            expected_version: 1,
+            source_candidate_digest: "b".repeat(64),
+            feedback_digest: "c".repeat(64),
+            source_delivery_id: "delivery-m0".to_string(),
+        };
+
+        assert!(is_internal_company_command(&transition));
+        assert!(is_internal_company_command(&rework));
+    }
+
+    #[test]
     fn principal_binding_file_rejects_mutable_and_aliased_authority() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("company-principals.json");
@@ -2087,6 +2702,7 @@ mod tests {
                 digest: "b".repeat(64),
             },
             budget_micros: 1,
+            rework: None,
         };
         assert_eq!(validate_execution_contract(&plan, &spec), Ok(()));
 

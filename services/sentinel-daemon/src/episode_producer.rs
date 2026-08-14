@@ -598,6 +598,22 @@ impl EpisodeProducer {
                 continue;
             }
 
+            if let Err(diagnostic) = validate_episode_payload(&payload) {
+                if !self.quarantine_event(
+                    event_store,
+                    *source_row_id,
+                    event,
+                    episode_subject(&payload),
+                    request_digest,
+                    effect_reference_tick,
+                    EpisodeProjectionQuarantineReason::MalformedRelevantPayload,
+                    diagnostic,
+                ) {
+                    break;
+                }
+                continue;
+            }
+
             if let Some(subject) = episode_subject(&payload) {
                 match self
                     .hippocampus
@@ -1206,6 +1222,12 @@ impl EpisodeProducer {
             return EpisodeProjectionSourceClassification::Quarantined {
                 affected_subject: payload_subject,
                 reason: EpisodeProjectionQuarantineReason::EventTypeMismatch,
+            };
+        }
+        if validate_episode_payload(&payload).is_err() {
+            return EpisodeProjectionSourceClassification::Quarantined {
+                affected_subject: payload_subject,
+                reason: EpisodeProjectionQuarantineReason::MalformedRelevantPayload,
             };
         }
         match self.episode_agent(&payload) {
@@ -1856,6 +1878,39 @@ impl EpisodeProducer {
                 ))
             }
 
+            DomainEventPayload::ProjectCloseoutPublished {
+                project_id,
+                release_id,
+                acceptance_id,
+                candidate_digest,
+                lessons_digest,
+                ..
+            } => {
+                let candidate_prefix = candidate_digest.get(..16)?;
+                let lessons_prefix = lessons_digest.get(..16)?;
+                Some((
+                    "_building".to_string(),
+                    Episode {
+                    id: episode_id,
+                    agent_name: "_building".to_string(),
+                    summary: format!(
+                        "Project {project_id} closed with accepted release {release_id} ({acceptance_id})"
+                    ),
+                    relevance: 0.95,
+                    emotion: 0.35,
+                    repetitions: 1,
+                    hours_ago,
+                    participants: vec![],
+                    tags: vec![
+                        "project_closeout".to_string(),
+                        "customer_accepted".to_string(),
+                        format!("candidate:{candidate_prefix}"),
+                        format!("lessons:{lessons_prefix}"),
+                    ],
+                },
+                ))
+            }
+
             // Andere Event-Typen sind nicht episoden-relevant
             _ => None,
         }
@@ -1891,7 +1946,10 @@ fn projection_identity_map(agents: &[(u16, String)]) -> anyhow::Result<HashMap<u
 fn is_episode_event_type(event_type: &str) -> bool {
     matches!(
         event_type,
-        "agent_action_received" | "bio_action_performed" | "chaos_triggered"
+        "agent_action_received"
+            | "bio_action_performed"
+            | "chaos_triggered"
+            | "project_closeout_published"
     )
 }
 
@@ -2038,6 +2096,62 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn validate_episode_payload(payload: &DomainEventPayload) -> Result<(), &'static str> {
+    let DomainEventPayload::ProjectCloseoutPublished {
+        tenant_id,
+        project_id,
+        project_generation,
+        project_digest,
+        candidate_id,
+        candidate_generation,
+        candidate_digest,
+        release_id,
+        release_generation,
+        release_digest,
+        acceptance_id,
+        acceptance_generation,
+        acceptance_digest,
+        decisions_digest,
+        artifact_inventory_digest,
+        failures_digest,
+        lessons_digest,
+    } = payload
+    else {
+        return Ok(());
+    };
+    let identities = [
+        tenant_id.as_str(),
+        project_id.as_str(),
+        candidate_id.as_str(),
+        release_id.as_str(),
+        acceptance_id.as_str(),
+    ];
+    let digests = [
+        project_digest.as_str(),
+        candidate_digest.as_str(),
+        release_digest.as_str(),
+        acceptance_digest.as_str(),
+        decisions_digest.as_str(),
+        artifact_inventory_digest.as_str(),
+        failures_digest.as_str(),
+        lessons_digest.as_str(),
+    ];
+    if identities.iter().any(|value| {
+        value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
+    }) || [
+        *project_generation,
+        *candidate_generation,
+        *release_generation,
+        *acceptance_generation,
+    ]
+    .contains(&0)
+        || digests.iter().any(|value| !is_sha256_hex(value))
+    {
+        return Err("project closeout identity, generation, or digest is invalid");
+    }
+    Ok(())
+}
+
 fn stable_episode_id(
     subject: EpisodeProjectionSubject,
     source_event_id: &str,
@@ -2073,13 +2187,19 @@ fn episode_subject(payload: &DomainEventPayload) -> Option<EpisodeProjectionSubj
         | DomainEventPayload::BioActionPerformed { agent_id, .. } => AgentId::new(agent_id.0)
             .ok()
             .map(|agent_id| EpisodeProjectionSubject::Agent { agent_id }),
-        DomainEventPayload::ChaosTriggered { .. } => Some(EpisodeProjectionSubject::Building),
+        DomainEventPayload::ChaosTriggered { .. }
+        | DomainEventPayload::ProjectCloseoutPublished { .. } => {
+            Some(EpisodeProjectionSubject::Building)
+        }
         _ => None,
     }
 }
 
 fn projection_subject_from_event(event: &DomainEvent) -> Option<EpisodeProjectionSubject> {
-    if event.event_type == "chaos_triggered" {
+    if matches!(
+        event.event_type.as_str(),
+        "chaos_triggered" | "project_closeout_published"
+    ) {
         return Some(EpisodeProjectionSubject::Building);
     }
     let raw_id = event.aggregate_id.strip_prefix("AGENT-")?;
@@ -3049,6 +3169,100 @@ mod tests {
         assert_eq!(name, "_building");
         assert!(episode.summary.contains("Chaos"));
         assert_eq!(episode.relevance, 0.7);
+    }
+
+    fn project_closeout_payload(candidate_digest: &str) -> DomainEventPayload {
+        DomainEventPayload::ProjectCloseoutPublished {
+            tenant_id: "tenant-a".to_string(),
+            project_id: "project-a".to_string(),
+            project_generation: 7,
+            project_digest:
+                "1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            candidate_id: "candidate-a".to_string(),
+            candidate_generation: 3,
+            candidate_digest: candidate_digest.to_string(),
+            release_id: "release-a".to_string(),
+            release_generation: 2,
+            release_digest:
+                "2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            acceptance_id: "acceptance-a".to_string(),
+            acceptance_generation: 1,
+            acceptance_digest:
+                "3333333333333333333333333333333333333333333333333333333333333333"
+                    .to_string(),
+            decisions_digest:
+                "4444444444444444444444444444444444444444444444444444444444444444"
+                    .to_string(),
+            artifact_inventory_digest:
+                "5555555555555555555555555555555555555555555555555555555555555555"
+                    .to_string(),
+            failures_digest:
+                "6666666666666666666666666666666666666666666666666666666666666666"
+                    .to_string(),
+            lessons_digest:
+                "7777777777777777777777777777777777777777777777777777777777777777"
+                    .to_string(),
+        }
+    }
+
+    #[test]
+    fn project_closeout_produces_source_linked_building_episode() {
+        let (hippocampus, dir) = temp_hippocampus();
+        let event_store = temp_event_store(&dir);
+        let producer = EpisodeProducer::new(hippocampus, &[], &event_store).unwrap();
+        let candidate_digest =
+            "8888888888888888888888888888888888888888888888888888888888888888";
+
+        let (name, episode) = producer
+            .event_to_episode(&project_closeout_payload(candidate_digest), 15, 0.0)
+            .expect("valid closeout must enter episodic memory");
+
+        assert_eq!(name, "_building");
+        assert_eq!(episode.agent_name, "_building");
+        assert_eq!(episode.relevance, 0.95);
+        assert!(episode.summary.contains("project-a"));
+        assert!(episode.summary.contains("release-a"));
+        assert!(episode.tags.contains(&"project_closeout".to_string()));
+        assert!(episode
+            .tags
+            .contains(&"candidate:8888888888888888".to_string()));
+        assert!(episode
+            .tags
+            .contains(&"lessons:7777777777777777".to_string()));
+    }
+
+    #[test]
+    fn malformed_project_closeout_digest_is_rejected_without_panicking() {
+        let (hippocampus, dir) = temp_hippocampus();
+        let event_store = temp_event_store(&dir);
+        let mut producer = EpisodeProducer::new(hippocampus, &[], &event_store).unwrap();
+        let source_row_id = append_payload(
+            &event_store,
+            &project_closeout_payload("short"),
+            10,
+        );
+
+        assert!(producer
+            .event_to_episode(&project_closeout_payload("short"), 16, 0.0)
+            .is_none());
+        assert_eq!(producer.tick(&event_store, 20, 1.0), 0);
+        assert_eq!(producer.last_event_id, source_row_id);
+        let quarantines = producer
+            .hippocampus()
+            .store()
+            .list_episode_projection_quarantine()
+            .unwrap();
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(
+            quarantines[0].reason,
+            EpisodeProjectionQuarantineReason::MalformedRelevantPayload
+        );
+        assert_eq!(
+            quarantines[0].affected_subject,
+            Some(EpisodeProjectionSubject::Building)
+        );
     }
 
     #[test]

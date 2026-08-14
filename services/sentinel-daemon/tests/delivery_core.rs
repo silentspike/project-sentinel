@@ -897,6 +897,9 @@ impl DeliveryEffectPort for FakeEffects {
                 &format!("effect-{:?}", request.kind).to_ascii_lowercase(),
                 1,
             ),
+            affected_refs: (request.kind == DeliveryEffectKind::GovernedRework)
+                .then(|| vec![reference("rework-item-1", 1)])
+                .unwrap_or_default(),
             issuer: "test-effects".to_string(),
             issued_at_ms: 1,
             receipt_digest: ContentDigest::zero(),
@@ -956,6 +959,7 @@ impl DeliveryEffectPort for WrongTargetEffects {
             actor_authority_receipt_digest: request.actor_authority_receipt_digest.clone(),
             actor_authority_identity_digest: request.actor_authority_identity_digest.clone(),
             effect_ref: reference("wrong-target-effect", 1),
+            affected_refs: Vec::new(),
             issuer: "test-effects".to_string(),
             issued_at_ms: 1,
             receipt_digest: ContentDigest::zero(),
@@ -994,6 +998,7 @@ impl DeliveryEffectPort for WrongAuthorityIdentityEffects {
             actor_authority_receipt_digest: request.actor_authority_receipt_digest.clone(),
             actor_authority_identity_digest: digest("forged-authority-identity"),
             effect_ref: reference("wrong-authority-effect", 1),
+            affected_refs: Vec::new(),
             issuer: "test-effects".to_string(),
             issued_at_ms: 1,
             receipt_digest: ContentDigest::zero(),
@@ -1045,6 +1050,9 @@ impl DeliveryEffectPort for DurableFakeEffects {
             actor_authority_receipt_digest: request.actor_authority_receipt_digest.clone(),
             actor_authority_identity_digest: request.actor_authority_identity_digest.clone(),
             effect_ref: reference("durable-effect-1", 1),
+            affected_refs: (request.kind == DeliveryEffectKind::GovernedRework)
+                .then(|| vec![reference("rework-item-1", 1)])
+                .unwrap_or_default(),
             issuer: "test-durable-effect-saga".to_string(),
             issued_at_ms: 1,
             receipt_digest: ContentDigest::zero(),
@@ -3818,10 +3826,12 @@ fn external_request_seals_reject_incomplete_authority_and_reference_bindings() {
         candidate: reference("candidate-1", 1),
         qa_plan: reference("plan-1", 1),
         qa_run: reference("run-1", 1),
+        candidate_artifacts: candidate(1, &["developer-1"]).artifacts,
         assigned_qa: qa.clone(),
         authority_receipt_digest: digest("authority-receipt"),
         authority_identity_digest: digest("authority-identity"),
         invocation: reference("invocation-1", 1),
+        started_at_ms: 100,
         request_digest: ContentDigest::zero(),
     };
     for mut invalid in [
@@ -3840,6 +3850,11 @@ fn external_request_seals_reject_incomplete_authority_and_reference_bindings() {
             value.assigned_qa.tenant_id = "tenant-b".to_string();
             value
         },
+        {
+            let mut value = valid_workbench.clone();
+            value.started_at_ms = 0;
+            value
+        },
     ] {
         invalid.request_digest = ContentDigest::zero();
         assert!(matches!(invalid.seal(), Err(DeliveryError::Validation(_))));
@@ -3854,6 +3869,9 @@ fn external_request_seals_reject_incomplete_authority_and_reference_bindings() {
         candidate: Some(reference("candidate-1", 1)),
         subject: reference("release-current", 2),
         target: Some(reference("release-previous", 1)),
+        feedback_digest: None,
+        closeout_memory: None,
+        occurred_at_ms: 50,
         actor: principal("release-manager", AuthorityRole::ReleaseManager),
         actor_authority_receipt_digest: digest("effect-authority-receipt"),
         actor_authority_identity_digest: digest("effect-authority-identity"),
@@ -3915,10 +3933,12 @@ fn renewed_authority_receipt_does_not_change_external_operation_identity() {
         candidate: reference("candidate-1", 1),
         qa_plan: reference("plan-1", 1),
         qa_run: reference("run-1", 1),
+        candidate_artifacts: candidate(1, &["developer-1"]).artifacts,
         assigned_qa: qa.clone(),
         authority_receipt_digest: authority.receipt_digest.clone(),
         authority_identity_digest: authority_identity.clone(),
         invocation: reference("qa-invocation-1", 1),
+        started_at_ms: 100,
         request_digest: ContentDigest::zero(),
     }
     .seal()
@@ -3965,6 +3985,9 @@ fn renewed_authority_receipt_does_not_change_external_operation_identity() {
         candidate: Some(reference("candidate-1", 1)),
         subject: reference("release-from", 2),
         target: Some(reference("release-to", 1)),
+        feedback_digest: None,
+        closeout_memory: None,
+        occurred_at_ms: 50,
         actor: effect_actor,
         actor_authority_receipt_digest: effect_authority.receipt_digest.clone(),
         actor_authority_identity_digest: effect_authority_identity.clone(),
@@ -4052,6 +4075,9 @@ fn effect_saga_rejects_outcome_from_another_authority_lineage() {
         candidate: Some(reference("candidate-1", 1)),
         subject: reference("release-from", 2),
         target: Some(reference("release-to", 1)),
+        feedback_digest: None,
+        closeout_memory: None,
+        occurred_at_ms: 50,
         actor,
         actor_authority_receipt_digest: old_authority.receipt_digest.clone(),
         actor_authority_identity_digest: old_authority.stable_identity_digest().unwrap(),

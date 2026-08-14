@@ -400,6 +400,19 @@ pub struct CompanyWorkItemSpecV1 {
     pub outputs: Vec<WorkOutputContractV1>,
     pub quality_gate: QualityGateBindingV1,
     pub budget_micros: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rework: Option<GovernedReworkBindingV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedReworkBindingV1 {
+    pub operation_id: Uuid,
+    pub source_work_item_id: WorkItemId,
+    pub source_delivery_id: String,
+    pub source_candidate_digest: String,
+    pub feedback_digest: String,
+    pub generation: u64,
 }
 
 impl CompanyWorkItemSpecV1 {
@@ -449,6 +462,18 @@ impl CompanyWorkItemSpecV1 {
         if self.quality_gate.generation == 0 {
             return Err(invalid("quality gate binding is invalid"));
         }
+        if let Some(rework) = &self.rework {
+            if rework.operation_id.is_nil() {
+                return Err(invalid("governed rework operation is invalid"));
+            }
+            rework.source_work_item_id.validate()?;
+            validate_identifier(&rework.source_delivery_id)?;
+            validate_digest(&rework.source_candidate_digest)?;
+            validate_digest(&rework.feedback_digest)?;
+            if rework.generation == 0 || rework.source_work_item_id == self.work_item_id {
+                return Err(invalid("governed rework binding is invalid"));
+            }
+        }
         Ok(())
     }
 }
@@ -488,6 +513,12 @@ pub struct CompanyWorkItemV1 {
     pub output_receipts: Vec<WorkOutputReceiptV1>,
     pub gate_receipt: Option<QualityGateReceiptBindingV1>,
     pub transition_history: Vec<StateTransitionAuditV1>,
+}
+
+impl CompanyWorkItemV1 {
+    pub fn canonical_digest(&self) -> Result<String, WorkflowError> {
+        canonical_sha256("sentinel.workflow.company-work-item.v1", self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -722,6 +753,13 @@ pub enum CompanyWorkflowCommandV1 {
         request_id: String,
         expected_version: u64,
         feedback_ref: String,
+    },
+    CreateGovernedRework {
+        project_id: ProjectId,
+        expected_version: u64,
+        source_candidate_digest: String,
+        feedback_digest: String,
+        source_delivery_id: String,
     },
     PlanWorkGraph {
         project_id: ProjectId,
@@ -1124,6 +1162,7 @@ mod tests {
                 digest: DIGEST.to_owned(),
             },
             budget_micros: 1,
+            rework: None,
         }
     }
 

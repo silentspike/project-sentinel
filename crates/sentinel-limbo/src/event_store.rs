@@ -2341,6 +2341,45 @@ impl EventStore {
         Ok(exists)
     }
 
+    /// Returns the exact immutable event claimed by a stable operation id.
+    ///
+    /// Effect adapters use this readback to distinguish an idempotent retry
+    /// from an operation-id collision with different content. The lookup sees
+    /// the append-only authority regardless of replay-frontier visibility.
+    pub fn event_by_operation_id(
+        &self,
+        operation_id: &str,
+    ) -> anyhow::Result<Option<DomainEvent>> {
+        if operation_id.is_empty() {
+            anyhow::bail!("operation_id must not be empty");
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("Lock poisoned: {error}"))?;
+        conn.query_row(
+            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE operation_id = ?1",
+            params![operation_id],
+            |row| {
+                Ok(DomainEvent {
+                    event_id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    aggregate_id: row.get(2)?,
+                    payload: row.get(3)?,
+                    correlation_id: row.get(4)?,
+                    causation_id: row.get(5)?,
+                    operation_id: row.get(6)?,
+                    tick: row.get::<_, i64>(7)? as u64,
+                    timestamp_ms: row.get::<_, i64>(8)? as u64,
+                    schema_version: row.get(9)?,
+                    compensation_type: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Atomar: Event + Outbox-Eintrag in einer Transaktion (AC1, AC3).
     ///
     /// Nutzt operation_id als Idempotenz-Key (UNIQUE INDEX).

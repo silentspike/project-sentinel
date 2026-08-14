@@ -12,6 +12,7 @@ install -d -o root -g root -m 0755 \
   /opt/sentinel /opt/sentinel/bin /opt/sentinel/config /opt/sentinel/scripts
 install -d -o "${SENTINEL_USER}" -g "${SENTINEL_USER}" -m 0750 \
   /opt/sentinel/data /opt/sentinel/logs
+install -d -o root -g root -m 0700 /opt/sentinel/data/company-delivery
 install -d -o "${SENTINEL_USER}" -g "${SENTINEL_USER}" -m 0700 \
   /opt/sentinel/data/gaia-console /opt/sentinel/data/gaia-console/sessions
 

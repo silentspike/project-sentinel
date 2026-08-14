@@ -431,6 +431,7 @@ fn is_project_event_type(value: &str) -> bool {
             | "project_question_resolved"
             | "project_action_recorded"
             | "project_action_resolved"
+            | "project_governed_rework_created"
     )
 }
 
@@ -606,6 +607,21 @@ impl WorkflowStore {
         let value = get_entity(&connection, tenant_id, "project", &project_id.0)?;
         if let Some(project) = &value {
             validate_project(project)?;
+        }
+        Ok(value)
+    }
+
+    pub fn company_agreement(
+        &self,
+        tenant_id: &TenantId,
+        agreement_id: &str,
+    ) -> Result<Option<AgreementV1>, WorkflowError> {
+        tenant_id.validate()?;
+        validate_identifier(agreement_id)?;
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        let value = get_entity(&connection, tenant_id, "agreement", agreement_id)?;
+        if let Some(agreement) = &value {
+            validate_agreement(agreement)?;
         }
         Ok(value)
     }
@@ -1227,6 +1243,24 @@ fn apply_company_command(
             )?;
             Ok(CompanyWorkflowResponseV1::CustomerRequest(request))
         }
+        CompanyWorkflowCommandV1::CreateGovernedRework {
+            project_id,
+            expected_version,
+            source_candidate_digest,
+            feedback_digest,
+            source_delivery_id,
+        } => apply_governed_rework(
+            transaction,
+            principal,
+            operation_id,
+            operation_digest,
+            project_id,
+            *expected_version,
+            source_candidate_digest,
+            feedback_digest,
+            source_delivery_id,
+            now_ms,
+        ),
         _ => mutate_project(
             transaction,
             principal,
@@ -1236,6 +1270,182 @@ fn apply_company_command(
             now_ms,
         ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_governed_rework(
+    transaction: &Transaction<'_>,
+    principal: &AuthenticatedCompanyPrincipalV1,
+    operation_id: Uuid,
+    operation_digest: &str,
+    project_id: &ProjectId,
+    expected_version: u64,
+    source_candidate_digest: &str,
+    feedback_digest: &str,
+    source_delivery_id: &str,
+    now_ms: u64,
+) -> Result<CompanyWorkflowResponseV1, WorkflowError> {
+    require_role(principal, &[CompanyRoleV1::Customer])?;
+    validate_digest(source_candidate_digest)?;
+    validate_digest(feedback_digest)?;
+    validate_identifier(source_delivery_id)?;
+    let mut project: ProjectV1 =
+        get_entity(transaction, &principal.tenant_id, "project", &project_id.0)?
+            .ok_or_else(not_found)?;
+    require_non_regressing_time(now_ms, project.updated_at_unix_ms)?;
+    require_version(project.version, expected_version)?;
+    if project.lifecycle_state != ProjectLifecycleStateV1::DeliveryCandidate
+        || project.work_items.is_empty()
+        || project
+            .work_items
+            .values()
+            .any(|work| work.state != CompanyWorkStateV1::Done)
+    {
+        return Err(transition());
+    }
+    let agreement: AgreementV1 = get_entity(
+        transaction,
+        &principal.tenant_id,
+        "agreement",
+        &project.agreement_id,
+    )?
+    .ok_or_else(corrupt)?;
+    if agreement.accepted_by != principal.principal_id
+        || principal.customer_id.as_deref() != Some(agreement.customer_id.as_str())
+    {
+        return Err(unauthorized());
+    }
+
+    let current_generation = project
+        .work_items
+        .values()
+        .map(|work| work.spec.rework.as_ref().map_or(0, |binding| binding.generation))
+        .max()
+        .unwrap_or(0);
+    let sources = project
+        .work_items
+        .values()
+        .filter(|work| {
+            work.spec
+                .rework
+                .as_ref()
+                .map_or(current_generation == 0, |binding| {
+                    binding.generation == current_generation
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if sources.is_empty() || project.work_items.len().saturating_add(sources.len()) > MAX_AGGREGATE_ITEMS {
+        return Err(invalid("governed rework would exceed the project work limit"));
+    }
+    let existing_budget = project.work_items.values().try_fold(0_u64, |total, work| {
+        total.checked_add(work.spec.budget_micros)
+    });
+    let rework_budget = sources.iter().try_fold(0_u64, |total, work| {
+        total.checked_add(work.spec.budget_micros)
+    });
+    if existing_budget
+        .and_then(|total| rework_budget.and_then(|rework| total.checked_add(rework)))
+        .is_none_or(|total| total > project.cost_ceiling_micros)
+    {
+        return Err(invalid("governed rework exceeds the project cost ceiling"));
+    }
+    let next_generation = current_generation
+        .checked_add(1)
+        .ok_or_else(|| invalid("governed rework generation overflow"))?;
+    let mut mapped_ids = BTreeMap::new();
+    for source in &sources {
+        let digest = canonical_sha256(
+            "sentinel.workflow.governed-rework-item.v1",
+            &(
+                &principal.tenant_id,
+                project_id,
+                operation_id,
+                &source.spec.work_item_id,
+                next_generation,
+            ),
+        )?;
+        mapped_ids.insert(
+            source.spec.work_item_id.clone(),
+            crate::WorkItemId::parse(format!("rework-{}", &digest[..24]))?,
+        );
+    }
+    let mut created = Vec::with_capacity(sources.len());
+    for source in sources {
+        let mut spec = source.spec.clone();
+        let new_id = mapped_ids
+            .get(&source.spec.work_item_id)
+            .cloned()
+            .ok_or_else(corrupt)?;
+        spec.work_item_id = new_id.clone();
+        spec.dependency_ids = source
+            .spec
+            .dependency_ids
+            .iter()
+            .map(|dependency| mapped_ids.get(dependency).cloned().ok_or_else(corrupt))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        for input in &mut spec.inputs {
+            input.producer_work_item_id = mapped_ids
+                .get(&input.producer_work_item_id)
+                .cloned()
+                .ok_or_else(corrupt)?;
+        }
+        spec.rework = Some(GovernedReworkBindingV1 {
+            operation_id,
+            source_work_item_id: source.spec.work_item_id,
+            source_delivery_id: source_delivery_id.to_string(),
+            source_candidate_digest: source_candidate_digest.to_string(),
+            feedback_digest: feedback_digest.to_string(),
+            generation: next_generation,
+        });
+        let state = if spec.dependency_ids.is_empty() {
+            CompanyWorkStateV1::Ready
+        } else {
+            CompanyWorkStateV1::DependencyPending
+        };
+        created.push((
+            new_id,
+            CompanyWorkItemV1 {
+                spec,
+                state,
+                version: 1,
+                assignments: Vec::new(),
+                output_receipts: Vec::new(),
+                gate_receipt: None,
+                transition_history: Vec::new(),
+            },
+        ));
+    }
+    for (id, work) in created {
+        if project.work_items.insert(id, work).is_some() {
+            return Err(corrupt());
+        }
+    }
+    project.lifecycle_state = ProjectLifecycleStateV1::Active;
+    project.version = project
+        .version
+        .checked_add(1)
+        .ok_or_else(|| invalid("project version overflow"))?;
+    project.updated_at_unix_ms = now_ms;
+    validate_project(&project)?;
+    put_entity(
+        transaction,
+        &principal.tenant_id,
+        "project",
+        &project.project_id.0,
+        project.version,
+        &project,
+    )?;
+    append_project_snapshot(
+        transaction,
+        principal,
+        operation_id,
+        operation_digest,
+        "project_governed_rework_created",
+        &project,
+        now_ms,
+    )?;
+    Ok(CompanyWorkflowResponseV1::Project(project))
 }
 
 fn mutate_project(
@@ -2252,6 +2462,11 @@ fn project_target(command: &CompanyWorkflowCommandV1) -> Option<(&ProjectId, u64
             expected_version,
             ..
         }
+        | CompanyWorkflowCommandV1::CreateGovernedRework {
+            project_id,
+            expected_version,
+            ..
+        }
         | CompanyWorkflowCommandV1::ActivateProject {
             project_id,
             expected_version,
@@ -2858,6 +3073,23 @@ fn validate_work_graph_if_present(
         .map(|value| value.spec.clone())
         .collect::<Vec<_>>();
     validate_work_graph(&specs)?;
+    for item in items.values() {
+        if let Some(binding) = &item.spec.rework {
+            let source = items
+                .get(&binding.source_work_item_id)
+                .ok_or_else(corrupt)?;
+            let expected_generation = source
+                .spec
+                .rework
+                .as_ref()
+                .map_or(1, |source_binding| source_binding.generation.saturating_add(1));
+            if source.state != CompanyWorkStateV1::Done
+                || binding.generation != expected_generation
+            {
+                return Err(corrupt());
+            }
+        }
+    }
     for (id, item) in items {
         if id != &item.spec.work_item_id
             || item.version == 0
@@ -4513,6 +4745,7 @@ mod tests {
                         digest: DIGEST.to_owned(),
                     },
                     budget_micros: 100,
+                    rework: None,
                 },
                 state: CompanyWorkStateV1::Assigned,
                 version: 2,

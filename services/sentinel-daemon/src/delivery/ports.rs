@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use super::{
     digest::ContentDigest,
     error::DeliveryError,
-    schema::{AuthorityRole, PrincipalV1, QaHarnessOutcome, VersionedRefV1, DELIVERY_SCHEMA_V1},
+    schema::{
+        ArtifactRefV1, AuthorityRole, PrincipalV1, QaHarnessOutcome, VersionedRefV1,
+        DELIVERY_SCHEMA_V1,
+    },
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,10 +252,12 @@ pub struct WorkbenchEvidenceRequestV1 {
     pub candidate: VersionedRefV1,
     pub qa_plan: VersionedRefV1,
     pub qa_run: VersionedRefV1,
+    pub candidate_artifacts: Vec<ArtifactRefV1>,
     pub assigned_qa: PrincipalV1,
     pub authority_receipt_digest: ContentDigest,
     pub authority_identity_digest: ContentDigest,
     pub invocation: VersionedRefV1,
+    pub started_at_ms: u64,
     pub request_digest: ContentDigest,
 }
 
@@ -273,12 +278,24 @@ impl WorkbenchEvidenceRequestV1 {
             || !valid_versioned_ref(&self.candidate)
             || !valid_versioned_ref(&self.qa_plan)
             || !valid_versioned_ref(&self.qa_run)
+            || self.candidate_artifacts.is_empty()
+            || self.candidate_artifacts.len() > 64
+            || self.candidate_artifacts.iter().any(|artifact| {
+                !valid_wire_id(&artifact.artifact_id)
+                    || artifact.generation == 0
+                    || artifact.digest == ContentDigest::zero()
+                    || artifact.media_type.is_empty()
+                    || artifact.media_type.len() > 128
+                    || !artifact.media_type.contains('/')
+                    || !valid_wire_id(&artifact.owner_principal_id)
+            })
             || !valid_principal(&self.assigned_qa)
             || self.assigned_qa.tenant_id != self.tenant_id
             || !self.assigned_qa.has_role(AuthorityRole::Qa)
             || self.authority_receipt_digest == ContentDigest::zero()
             || self.authority_identity_digest == ContentDigest::zero()
             || !valid_versioned_ref(&self.invocation)
+            || self.started_at_ms == 0
         {
             return Err(DeliveryError::Validation(
                 "workbench request identity or authority binding is invalid".to_string(),
@@ -382,6 +399,7 @@ pub struct PublicationRequestV1 {
     pub row_identity: String,
     pub payload_digest: ContentDigest,
     pub payload: Vec<u8>,
+    pub occurred_at_ms: u64,
     pub request_digest: ContentDigest,
 }
 
@@ -393,6 +411,11 @@ impl PublicationRequestV1 {
     }
 
     pub fn seal(mut self) -> Result<Self, DeliveryError> {
+        if self.occurred_at_ms == 0 {
+            return Err(DeliveryError::Validation(
+                "publication occurrence time is invalid".to_string(),
+            ));
+        }
         self.request_digest = self.computed_digest()?;
         Ok(self)
     }
@@ -456,6 +479,16 @@ pub enum DeliveryEffectKind {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CloseoutMemorySourceV1 {
+    pub acceptance: VersionedRefV1,
+    pub decisions_digest: ContentDigest,
+    pub artifact_inventory_digest: ContentDigest,
+    pub failures_digest: ContentDigest,
+    pub lessons_digest: ContentDigest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeliveryEffectRequestV1 {
     pub schema_version: u16,
     pub operation_id: String,
@@ -465,6 +498,11 @@ pub struct DeliveryEffectRequestV1 {
     pub candidate: Option<VersionedRefV1>,
     pub subject: VersionedRefV1,
     pub target: Option<VersionedRefV1>,
+    #[serde(default)]
+    pub feedback_digest: Option<ContentDigest>,
+    #[serde(default)]
+    pub closeout_memory: Option<CloseoutMemorySourceV1>,
+    pub occurred_at_ms: u64,
     pub actor: PrincipalV1,
     pub actor_authority_receipt_digest: ContentDigest,
     pub actor_authority_identity_digest: ContentDigest,
@@ -483,9 +521,11 @@ impl DeliveryEffectRequestV1 {
 
     pub fn seal(mut self) -> Result<Self, DeliveryError> {
         let legal_effect_shape = match self.kind {
-            DeliveryEffectKind::Rollout | DeliveryEffectKind::MemoryPublication => {
+            DeliveryEffectKind::Rollout => {
                 self.candidate.is_some()
                     && self.target.is_none()
+                    && self.feedback_digest.is_none()
+                    && self.closeout_memory.is_none()
                     && self.actor.has_role(AuthorityRole::ReleaseManager)
             }
             DeliveryEffectKind::Rollback => {
@@ -494,12 +534,29 @@ impl DeliveryEffectRequestV1 {
                         .target
                         .as_ref()
                         .is_some_and(|target| target != &self.subject)
+                    && self.feedback_digest.is_none()
+                    && self.closeout_memory.is_none()
                     && self.actor.has_role(AuthorityRole::ReleaseManager)
             }
             DeliveryEffectKind::GovernedRework => {
                 self.candidate.is_some()
                     && self.target.is_none()
+                    && self.feedback_digest.as_ref().is_some_and(|value| *value != ContentDigest::zero())
+                    && self.closeout_memory.is_none()
                     && self.actor.has_role(AuthorityRole::Customer)
+            }
+            DeliveryEffectKind::MemoryPublication => {
+                self.candidate.is_some()
+                    && self.target.is_none()
+                    && self.feedback_digest.is_none()
+                    && self.closeout_memory.as_ref().is_some_and(|source| {
+                        valid_versioned_ref(&source.acceptance)
+                            && source.decisions_digest != ContentDigest::zero()
+                            && source.artifact_inventory_digest != ContentDigest::zero()
+                            && source.failures_digest != ContentDigest::zero()
+                            && source.lessons_digest != ContentDigest::zero()
+                    })
+                    && self.actor.has_role(AuthorityRole::ReleaseManager)
             }
         };
         if self.schema_version != DELIVERY_SCHEMA_V1
@@ -515,6 +572,7 @@ impl DeliveryEffectRequestV1 {
             || self.actor.tenant_id != self.tenant_id
             || self.actor_authority_receipt_digest == ContentDigest::zero()
             || self.actor_authority_identity_digest == ContentDigest::zero()
+            || self.occurred_at_ms == 0
             || self
                 .target
                 .as_ref()
@@ -546,6 +604,8 @@ pub struct DeliveryEffectReceiptV1 {
     pub actor_authority_receipt_digest: ContentDigest,
     pub actor_authority_identity_digest: ContentDigest,
     pub effect_ref: VersionedRefV1,
+    #[serde(default)]
+    pub affected_refs: Vec<VersionedRefV1>,
     pub issuer: String,
     pub issued_at_ms: u64,
     pub receipt_digest: ContentDigest,
@@ -654,7 +714,7 @@ pub fn expected_effect_saga_contract_digest() -> ContentDigest {
     ContentDigest::of_domain(
         "effect-saga-contract",
         DELIVERY_SCHEMA_V1,
-        &"delivery-effect-saga-v1",
+        &"delivery-effect-saga-v2",
     )
     .expect("constant effect saga contract must be canonical")
 }
