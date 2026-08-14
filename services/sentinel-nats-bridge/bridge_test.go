@@ -1,14 +1,166 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/silentspike/project-sentinel/pkg/sentinel-go/eventstore"
 	"github.com/silentspike/project-sentinel/pkg/sentinel-go/messaging"
 )
+
+type fakeOutboxStore struct {
+	mu                   sync.Mutex
+	entries              []eventstore.OutboxPublishEntry
+	failed               int64
+	unknown              int64
+	countErr             error
+	failPublishedOnce    bool
+	cancelAfterFirstMark context.CancelFunc
+	markedPublished      int
+	events               *[]string
+}
+
+func (s *fakeOutboxStore) GetOutboxBatch(limit int) ([]eventstore.OutboxPublishEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit > len(s.entries) {
+		limit = len(s.entries)
+	}
+	return append([]eventstore.OutboxPublishEntry(nil), s.entries[:limit]...), nil
+}
+
+func (s *fakeOutboxStore) MarkPublishedCAS(id int64, eventID, operationID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.events != nil {
+		*s.events = append(*s.events, fmt.Sprintf("cas:%d", id))
+	}
+	if s.failPublishedOnce {
+		s.failPublishedOnce = false
+		return errors.New("injected CAS failure")
+	}
+	index := -1
+	for i, entry := range s.entries {
+		if entry.OutboxID == id && entry.EventID == eventID && entry.OperationID == operationID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return errors.New("CAS mismatch")
+	}
+	s.entries = append(s.entries[:index], s.entries[index+1:]...)
+	s.markedPublished++
+	if s.markedPublished == 1 && s.cancelAfterFirstMark != nil {
+		s.cancelAfterFirstMark()
+	}
+	return nil
+}
+
+func (s *fakeOutboxStore) MarkRetryCAS(id int64, eventID, operationID, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.entries {
+		entry := &s.entries[i]
+		if entry.OutboxID == id && entry.EventID == eventID && entry.OperationID == operationID {
+			entry.RetryCount++
+			return nil
+		}
+	}
+	return errors.New("retry CAS mismatch")
+}
+
+func (s *fakeOutboxStore) MarkFailedCAS(id int64, eventID, operationID, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, entry := range s.entries {
+		if entry.OutboxID == id && entry.EventID == eventID && entry.OperationID == operationID {
+			s.entries = append(s.entries[:i], s.entries[i+1:]...)
+			s.failed++
+			return nil
+		}
+	}
+	return errors.New("failed CAS mismatch")
+}
+
+func (s *fakeOutboxStore) OutboxCounts() (eventstore.OutboxStatusCounts, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.countErr != nil {
+		return eventstore.OutboxStatusCounts{}, s.countErr
+	}
+	pending := int64(len(s.entries))
+	return eventstore.OutboxStatusCounts{
+		Pending:      pending,
+		Failed:       s.failed,
+		NonPublished: pending + s.failed + s.unknown,
+	}, nil
+}
+
+type fakePublisher struct {
+	mu       sync.Mutex
+	calls    int
+	unique   map[string]struct{}
+	failCall int
+	nilAck   bool
+	events   *[]string
+}
+
+func (p *fakePublisher) PublishMsg(
+	_ context.Context,
+	msg *nats.Msg,
+	_ ...jetstream.PublishOpt,
+) (*jetstream.PubAck, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	id := msg.Header.Get("Nats-Msg-Id")
+	if p.unique == nil {
+		p.unique = make(map[string]struct{})
+	}
+	p.unique[id] = struct{}{}
+	if p.events != nil {
+		*p.events = append(*p.events, "publish:"+id)
+	}
+	if p.failCall == p.calls {
+		return nil, errors.New("injected publish failure")
+	}
+	if p.nilAck {
+		return nil, nil
+	}
+	return &jetstream.PubAck{Stream: "SENTINEL_EVENTS", Sequence: 1}, nil
+}
+
+type fakeConnection bool
+
+func (c fakeConnection) IsConnected() bool { return bool(c) }
+
+func makeOutboxEntries(count int) []eventstore.OutboxPublishEntry {
+	entries := make([]eventstore.OutboxPublishEntry, count)
+	for i := range entries {
+		entries[i] = eventstore.OutboxPublishEntry{
+			OutboxID:      int64(i + 1),
+			EventID:       fmt.Sprintf("event-%d", i+1),
+			EventType:     "agent_chat",
+			AggregateID:   "AGENT-01",
+			OperationID:   fmt.Sprintf("operation-%d", i+1),
+			CorrelationID: "correlation-1",
+			Tick:          int64(i + 1),
+			Payload:       `{"message":"bounded"}`,
+		}
+	}
+	return entries
+}
 
 func TestBuildPublishMessage(t *testing.T) {
 	evt := eventstore.DomainEvent{
@@ -163,7 +315,7 @@ func TestGetEventsSince(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	// Insert 3 events
 	for i := 0; i < 3; i++ {
@@ -212,5 +364,148 @@ func TestGetEventsSince(t *testing.T) {
 	}
 	if len(events3) != 2 {
 		t.Errorf("got %d events with limit=2, want 2", len(events3))
+	}
+}
+
+func TestDrainOutboxConsumesMoreThanTwoBatchesInOneSweep(t *testing.T) {
+	store := &fakeOutboxStore{entries: makeOutboxEntries(7)}
+	publisher := &fakePublisher{}
+	readiness := &readinessState{}
+
+	published, err := drainOutbox(context.Background(), store, publisher, readiness, 2)
+	if err != nil {
+		t.Fatalf("drainOutbox: %v", err)
+	}
+	if published != 7 || publisher.calls != 7 || store.markedPublished != 7 {
+		t.Fatalf("published=%d calls=%d marks=%d, want 7/7/7", published, publisher.calls, store.markedPublished)
+	}
+	if !readiness.initialScanComplete.Load() {
+		t.Fatal("successful empty scan did not close initial readiness gate")
+	}
+}
+
+func TestDrainOutboxCancellationStopsBetweenEntries(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &fakeOutboxStore{entries: makeOutboxEntries(3), cancelAfterFirstMark: cancel}
+	publisher := &fakePublisher{}
+
+	published, err := drainOutbox(ctx, store, publisher, &readinessState{}, 3)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want context cancellation", err)
+	}
+	if published != 1 || publisher.calls != 1 || store.markedPublished != 1 {
+		t.Fatalf("published=%d calls=%d marks=%d, want 1/1/1", published, publisher.calls, store.markedPublished)
+	}
+}
+
+func TestDrainOutboxWaitsForPubAckBeforeCAS(t *testing.T) {
+	var events []string
+	store := &fakeOutboxStore{entries: makeOutboxEntries(1), events: &events}
+	publisher := &fakePublisher{events: &events}
+
+	if _, err := drainOutbox(context.Background(), store, publisher, &readinessState{}, 1); err != nil {
+		t.Fatalf("drainOutbox: %v", err)
+	}
+	want := []string{"publish:operation-1", "cas:1"}
+	if fmt.Sprint(events) != fmt.Sprint(want) {
+		t.Fatalf("effect order=%v, want %v", events, want)
+	}
+}
+
+func TestDrainOutboxAckThenCASFailureRetriesOneEffectiveMessage(t *testing.T) {
+	store := &fakeOutboxStore{entries: makeOutboxEntries(1), failPublishedOnce: true}
+	publisher := &fakePublisher{}
+	readiness := &readinessState{}
+
+	if _, err := drainOutbox(context.Background(), store, publisher, readiness, 1); err == nil {
+		t.Fatal("first drain accepted injected CAS failure")
+	}
+	if readiness.initialScanComplete.Load() {
+		t.Fatal("failed sweep closed initial readiness gate")
+	}
+	if published, err := drainOutbox(context.Background(), store, publisher, readiness, 1); err != nil || published != 1 {
+		t.Fatalf("retry published=%d err=%v, want one adopted row", published, err)
+	}
+	if publisher.calls != 2 || len(publisher.unique) != 1 {
+		t.Fatalf("broker calls=%d unique message IDs=%d, want 2 calls/1 effective ID", publisher.calls, len(publisher.unique))
+	}
+}
+
+func TestDrainOutboxStopsAfterPublishFailure(t *testing.T) {
+	store := &fakeOutboxStore{entries: makeOutboxEntries(3)}
+	publisher := &fakePublisher{failCall: 1}
+
+	published, err := drainOutbox(context.Background(), store, publisher, &readinessState{}, 3)
+	if err == nil || published != 0 || publisher.calls != 1 {
+		t.Fatalf("published=%d calls=%d err=%v, want stopped first failure", published, publisher.calls, err)
+	}
+	if store.entries[0].RetryCount != 1 {
+		t.Fatalf("retry_count=%d, want 1", store.entries[0].RetryCount)
+	}
+}
+
+func TestReadinessTransitionsAreFailClosedAndPublicSafe(t *testing.T) {
+	store := &fakeOutboxStore{}
+	state := &readinessState{}
+	tests := []struct {
+		name       string
+		connected  bool
+		scanned    bool
+		entries    int
+		failed     int64
+		unknown    int64
+		countErr   error
+		wantStatus int
+		wantReason string
+	}{
+		{name: "disconnected", wantStatus: 503, wantReason: "nats_disconnected"},
+		{name: "scan pending", connected: true, wantStatus: 503, wantReason: "initial_scan_pending"},
+		{name: "count error", connected: true, scanned: true, countErr: errors.New("PRIVATE db path"), wantStatus: 503, wantReason: "outbox_status_unavailable"},
+		{name: "pending", connected: true, scanned: true, entries: 2, wantStatus: 503, wantReason: "outbox_pending"},
+		{name: "failed", connected: true, scanned: true, failed: 1, wantStatus: 503, wantReason: "outbox_failed"},
+		{name: "unknown", connected: true, scanned: true, unknown: 1, wantStatus: 503, wantReason: "outbox_nonpublished"},
+		{name: "ready", connected: true, scanned: true, wantStatus: 200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store.entries = makeOutboxEntries(tt.entries)
+			store.failed = tt.failed
+			store.unknown = tt.unknown
+			store.countErr = tt.countErr
+			state.initialScanComplete.Store(tt.scanned)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/ready", nil)
+			newHealthHandler(store, fakeConnection(tt.connected), state).ServeHTTP(recorder, request)
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status=%d, want %d", recorder.Code, tt.wantStatus)
+			}
+			var response readinessResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if response.Reason != tt.wantReason {
+				t.Fatalf("reason=%q, want %q", response.Reason, tt.wantReason)
+			}
+			if tt.countErr != nil && strings.Contains(recorder.Body.String(), "PRIVATE") {
+				t.Fatal("readiness leaked private store diagnostics")
+			}
+		})
+	}
+}
+
+func TestHealthRemainsLivenessWhenDependenciesAreUnavailable(t *testing.T) {
+	store := &fakeOutboxStore{countErr: errors.New("store unavailable")}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/health", nil)
+	newHealthHandler(store, fakeConnection(false), &readinessState{}).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("health status=%d, want %d", recorder.Code, http.StatusOK)
+	}
+	var response readinessResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode health response: %v", err)
+	}
+	if response.Status != "ok" || response.Reason != "" {
+		t.Fatalf("health response=%+v, want unconditional liveness", response)
 	}
 }
