@@ -1004,7 +1004,7 @@ enum ProductDeliveryCommand {
         tenant_id: String,
         project_id: String,
         candidate_id: String,
-        plan: crate::delivery::QaEvaluationPlanV1,
+        plan: Box<crate::delivery::QaEvaluationPlanV1>,
         run: crate::delivery::QaEvaluationRunReceiptV1,
     },
     TransitionQa {
@@ -1552,7 +1552,14 @@ impl WorkflowApi {
                 plan,
                 run,
             } => delivery
-                .assign_qa(&context, &tenant_id, &project_id, &candidate_id, plan, run)
+                .assign_qa(
+                    &context,
+                    &tenant_id,
+                    &project_id,
+                    &candidate_id,
+                    *plan,
+                    run,
+                )
                 .and_then(delivery_json),
             ProductDeliveryCommand::TransitionQa {
                 tenant_id,
