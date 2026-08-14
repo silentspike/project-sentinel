@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -39,6 +40,25 @@ pub trait OrganizationRuntimePort: Send + Sync {
     ) -> Result<RuntimeAuthoritySnapshotV1, WorkflowPortError>;
 }
 
+impl<T> OrganizationRuntimePort for Arc<T>
+where
+    T: OrganizationRuntimePort + ?Sized,
+{
+    fn readiness(&self) -> DependencyReadiness {
+        (**self).readiness()
+    }
+
+    fn authority_snapshot(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+        work_item_id: &WorkItemId,
+        agent_id: AgentId,
+    ) -> Result<RuntimeAuthoritySnapshotV1, WorkflowPortError> {
+        (**self).authority_snapshot(tenant_id, project_id, work_item_id, agent_id)
+    }
+}
+
 /// Typed observation of an already durable Workbench invocation.
 ///
 /// `reconcile` never creates a second invocation. The production adapter maps
@@ -67,6 +87,22 @@ pub trait WorkExecutionPort: Send + Sync {
     ) -> Result<WorkExecutionObservation, WorkflowPortError>;
 }
 
+impl<T> WorkExecutionPort for Arc<T>
+where
+    T: WorkExecutionPort + ?Sized,
+{
+    fn readiness(&self) -> DependencyReadiness {
+        (**self).readiness()
+    }
+
+    fn reconcile(
+        &self,
+        request: &PendingExecutionV1,
+    ) -> Result<WorkExecutionObservation, WorkflowPortError> {
+        (**self).reconcile(request)
+    }
+}
+
 /// Opaque #694 root completion evidence.
 ///
 /// API callers cannot construct or submit this receipt. Only the configured
@@ -93,6 +129,22 @@ pub trait CompletionEvidencePort: Send + Sync {
     ) -> Result<Box<dyn TerminalExecutionEvidence>, WorkflowPortError>;
 }
 
+impl<T> CompletionEvidencePort for Arc<T>
+where
+    T: CompletionEvidencePort + ?Sized,
+{
+    fn readiness(&self) -> DependencyReadiness {
+        (**self).readiness()
+    }
+
+    fn terminal_evidence(
+        &self,
+        request: &PendingCompletionEvidenceV1,
+    ) -> Result<Box<dyn TerminalExecutionEvidence>, WorkflowPortError> {
+        (**self).terminal_evidence(request)
+    }
+}
+
 /// Independent work-item QA receipt. It is deliberately distinct from the
 /// Workbench completion evidence and is not owned by #694.
 pub trait IndependentGateEvidence: Send + Sync {
@@ -114,6 +166,22 @@ pub trait GateEvidencePort: Send + Sync {
         &self,
         request: &PendingGateEvidenceV1,
     ) -> Result<Box<dyn IndependentGateEvidence>, WorkflowPortError>;
+}
+
+impl<T> GateEvidencePort for Arc<T>
+where
+    T: GateEvidencePort + ?Sized,
+{
+    fn readiness(&self) -> DependencyReadiness {
+        (**self).readiness()
+    }
+
+    fn gate_evidence(
+        &self,
+        request: &PendingGateEvidenceV1,
+    ) -> Result<Box<dyn IndependentGateEvidence>, WorkflowPortError> {
+        (**self).gate_evidence(request)
+    }
 }
 
 #[derive(Debug, Default)]

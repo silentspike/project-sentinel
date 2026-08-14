@@ -79,7 +79,7 @@ impl AuthenticatedCompanyPrincipalV1 {
         format!("company-v1:{}:{}", self.tenant_id.0, self.principal_id)
     }
 
-    pub(crate) fn binding_digest(&self) -> Result<String, WorkflowError> {
+    pub fn binding_digest(&self) -> Result<String, WorkflowError> {
         canonical_sha256("sentinel.workflow.company-principal.v1", self)
     }
 }
@@ -470,6 +470,12 @@ pub struct AssignmentV1 {
     pub assigned_by: String,
     pub created_at_unix_ms: u64,
     pub ended_at_unix_ms: Option<u64>,
+}
+
+impl AssignmentV1 {
+    pub fn canonical_digest(&self) -> Result<String, WorkflowError> {
+        canonical_sha256("sentinel.workflow.assignment.v1", self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -918,6 +924,23 @@ pub struct ProjectProjectionV1 {
     pub source_sequence: u64,
     pub project: ProjectV1,
     pub projection_digest: String,
+}
+
+/// Validated protected read model for one durable project-domain event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompanyProjectEventViewV1 {
+    pub sequence: u64,
+    pub event_id: String,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub event_type: String,
+    pub operation_id: Uuid,
+    pub principal_id: String,
+    pub principal_kind: CompanyPrincipalKindV1,
+    pub principal_role: CompanyRoleV1,
+    pub created_at_unix_ms: u64,
+    pub project: ProjectV1,
 }
 
 pub(crate) fn validate_work_graph(items: &[CompanyWorkItemSpecV1]) -> Result<(), WorkflowError> {

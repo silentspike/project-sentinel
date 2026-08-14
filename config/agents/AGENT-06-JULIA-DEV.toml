@@ -34,4 +34,4 @@ und traegt dafuer immer Kopfhoerer mit lo-fi beats als Signal fuer \
 quirks = ["Arbeitet mit Kopfhoerern und lo-fi beats (Signal: \"Bitte nicht stoeren\")", "Plant ihren Tag morgens in 25-Minuten-Bloecken (Pomodoro, strikt)", "Trinkt gruenen Tee (nie Kaffee, \"macht mich hibbelig\")"]
 
 [capabilities]
-tools = ["file_read", "file_write", "search", "chat"]
+tools = ["file_read", "file_write", "search", "chat", "file.inspect", "file.write", "patch.apply", "command.run_allowlisted", "test.run_profile", "artifact.commit"]

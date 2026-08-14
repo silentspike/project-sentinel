@@ -11,10 +11,12 @@ UMask=0077
 ConfigurationDirectory=sentinel
 ConfigurationDirectoryMode=0755
 ExecStart=/opt/sentinel/scripts/init-dashboard-auth.sh
+ExecStart=/opt/sentinel/scripts/init-company-workflow-auth.sh
 RemainAfterExit=yes
 
 # The root-owned initializer is the sole migration writer for the dashboard
-# environment and operator credential. Consumers receive only systemd copies.
+# environment, operator credential, and workflow credentials. Consumers receive
+# only systemd copies.
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/opt/sentinel/config /etc/sentinel

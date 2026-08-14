@@ -473,6 +473,20 @@ fn expected_company_tables() -> BTreeSet<String> {
 }
 
 impl WorkflowStore {
+    /// Returns the durable company-domain event frontier used by readiness and
+    /// restart evidence. Zero is a valid frontier before the first command.
+    pub fn company_event_cursor(&self) -> Result<u64, WorkflowError> {
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        let cursor: i64 = connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence),0) FROM company_events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(WorkflowError::from)?;
+        stored_u64(cursor)
+    }
+
     pub fn apply_company_command(
         &self,
         principal: &AuthenticatedCompanyPrincipalV1,
@@ -638,6 +652,74 @@ impl WorkflowStore {
                 Ok(projection)
             })
             .transpose()
+    }
+
+    pub fn company_project_events_since(
+        &self,
+        tenant_id: &TenantId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<CompanyProjectEventViewV1>, WorkflowError> {
+        tenant_id.validate()?;
+        if !(1..=1_000).contains(&limit) {
+            return Err(invalid("company event read limit is invalid"));
+        }
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence,event_id,tenant_id,project_id,event_type,operation_id,operation_digest,principal_id,principal_kind,principal_role,agent_id,customer_id,authority_generation,authority_digest,authority_binding_digest,payload,payload_digest,created_at_ms FROM company_events WHERE tenant_id=?1 AND project_id IS NOT NULL AND sequence>?2 ORDER BY sequence LIMIT ?3",
+            )
+            .map_err(WorkflowError::from)?;
+        let rows = statement
+            .query_map(
+                params![
+                    tenant_id.0,
+                    sql_u64(after)?,
+                    i64::try_from(limit)
+                        .map_err(|_| invalid("company event read limit is invalid"))?
+                ],
+                |row| {
+                    Ok(CompanyEventRow {
+                        sequence: row.get(0)?,
+                        event_id: row.get(1)?,
+                        tenant_id: row.get(2)?,
+                        project_id: row.get(3)?,
+                        event_type: row.get(4)?,
+                        operation_id: row.get(5)?,
+                        operation_digest: row.get(6)?,
+                        principal_id: row.get(7)?,
+                        principal_kind: row.get(8)?,
+                        principal_role: row.get(9)?,
+                        agent_id: row.get(10)?,
+                        customer_id: row.get(11)?,
+                        authority_generation: row.get(12)?,
+                        authority_digest: row.get(13)?,
+                        authority_binding_digest: row.get(14)?,
+                        payload: row.get(15)?,
+                        payload_digest: row.get(16)?,
+                        created_at_ms: row.get(17)?,
+                    })
+                },
+            )
+            .map_err(WorkflowError::from)?;
+        rows.map(|row| {
+            let row = row.map_err(WorkflowError::from)?;
+            let (sequence, project) = validate_project_snapshot_event(&connection, &row)?;
+            Ok(CompanyProjectEventViewV1 {
+                sequence,
+                event_id: row.event_id,
+                tenant_id: project.tenant_id.clone(),
+                project_id: project.project_id.clone(),
+                event_type: row.event_type,
+                operation_id: Uuid::parse_str(&row.operation_id).map_err(|_| corrupt())?,
+                principal_id: row.principal_id,
+                principal_kind: parse_principal_kind(&row.principal_kind)?,
+                principal_role: parse_company_role(&row.principal_role)?,
+                created_at_unix_ms: stored_u64(row.created_at_ms)?,
+                project,
+            })
+        })
+        .collect()
     }
 
     pub fn rebuild_company_project_projections(&self) -> Result<usize, WorkflowError> {

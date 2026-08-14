@@ -9,8 +9,8 @@ use sentinel_workflow::{
     OrganizationRuntimePort, OutputExpectationV1, PendingCompletionEvidenceV1, PendingExecutionV1,
     PendingGateEvidenceV1, PrincipalAuthorityV1, ProjectId, RuntimeAuthoritySnapshotV1,
     SealedArtifactEvidenceV1, SealedOutputEvidenceV1, TenantId, TerminalExecutionEvidence,
-    WorkExecutionObservation, WorkExecutionPort, WorkItemExecutionV1, WorkItemId, WorkItemState,
-    WorkflowCore, WorkflowErrorCode, WorkflowPortError, WorkflowStore,
+    UnavailableGateEvidencePort, WorkExecutionObservation, WorkExecutionPort, WorkItemExecutionV1,
+    WorkItemId, WorkItemState, WorkflowCore, WorkflowErrorCode, WorkflowPortError, WorkflowStore,
     EXECUTION_PLAN_SCHEMA_VERSION, WORKFLOW_SCHEMA_VERSION, WORKFLOW_STORE_SCHEMA_VERSION,
 };
 use uuid::Uuid;
@@ -301,7 +301,7 @@ fn authority() -> RuntimeAuthoritySnapshotV1 {
         capabilities: BTreeSet::from([
             "artifact.commit".to_owned(),
             "file.write".to_owned(),
-            "test.run".to_owned(),
+            "test.run_profile".to_owned(),
         ]),
     }
 }
@@ -450,6 +450,28 @@ fn core(
         },
         FakeGate::default(),
     )
+}
+
+#[test]
+fn aggregate_readiness_requires_every_productive_port() {
+    let directory = tempfile::tempdir().unwrap();
+    assert!(core(&directory.path().join("ready.sqlite"), Vec::new()).dependencies_ready());
+
+    let unavailable_gate = WorkflowCore::new(
+        WorkflowStore::open(directory.path().join("unavailable.sqlite")).unwrap(),
+        FakeOrganization {
+            snapshot: Arc::new(Mutex::new(authority())),
+        },
+        FakeExecution {
+            observations: Arc::new(Mutex::new(VecDeque::new())),
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        FakeCompletion {
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        UnavailableGateEvidencePort,
+    );
+    assert!(!unavailable_gate.dependencies_ready());
 }
 
 fn execution_row_snapshot(database: &std::path::Path) -> Vec<u8> {
@@ -732,7 +754,7 @@ fn canonical_path_topology_rejects_overlap_but_preserves_siblings_and_reads() {
 
     let mut sibling_patch = plan(1);
     sibling_patch.steps[0].inputs = vec![make_input("input-a", "src/generated")];
-    sibling_patch.steps[0].capabilities = BTreeSet::from(["file.patch".to_owned()]);
+    sibling_patch.steps[0].capabilities = BTreeSet::from(["patch.apply".to_owned()]);
     sibling_patch.steps[0].tool = ExecutionToolV1::ApplyPatch {
         path: "src2/index.html".to_owned(),
         expected_sha256: "b".repeat(64),
@@ -846,7 +868,7 @@ fn canonical_path_topology_rejects_overlap_but_preserves_siblings_and_reads() {
     ] {
         let mut patch_overlap = plan(1);
         patch_overlap.steps[0].inputs = vec![make_input("input-a", mount)];
-        patch_overlap.steps[0].capabilities = BTreeSet::from(["file.patch".to_owned()]);
+        patch_overlap.steps[0].capabilities = BTreeSet::from(["patch.apply".to_owned()]);
         patch_overlap.steps[0].tool = ExecutionToolV1::ApplyPatch {
             path: destination.to_owned(),
             expected_sha256: "b".repeat(64),
