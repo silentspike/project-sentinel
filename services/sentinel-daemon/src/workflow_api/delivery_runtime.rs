@@ -630,6 +630,7 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
             || request.request_digest != request.computed_digest()?
             || request.contract_version != DELIVERY_SCHEMA_V1
             || request.contract_digest != expected_integration_contract_digest()
+            || request.validated_at_ms == 0
         {
             return Err(DeliveryError::StaleEvidence(
                 "delivery authority request is not current".to_string(),
@@ -643,7 +644,7 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
                 "delivery role or generation is stale".to_string(),
             ));
         }
-        let issued_at_ms = now_ms();
+        let issued_at_ms = request.validated_at_ms;
         AuthorityReceiptV1 {
             schema_version: DELIVERY_SCHEMA_V1,
             request_digest: request.request_digest.clone(),

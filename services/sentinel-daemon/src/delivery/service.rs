@@ -2216,6 +2216,7 @@ where
             operation: operation.to_string(),
             contract_version,
             contract_digest: contract_digest.clone(),
+            validated_at_ms: now_ms,
             request_digest: ContentDigest::zero(),
         }
         .seal()?;
