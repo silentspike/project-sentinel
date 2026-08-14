@@ -765,12 +765,12 @@ impl WorkbenchExecutor {
                         .old
                         .len()
                         .checked_mul(count)
-                        .ok_or_else(|| patch_expansion_error())?;
+                        .ok_or_else(patch_expansion_error)?;
                     let added = replacement
                         .new
                         .len()
                         .checked_mul(count)
-                        .ok_or_else(|| patch_expansion_error())?;
+                        .ok_or_else(patch_expansion_error)?;
                     let projected = updated
                         .len()
                         .checked_sub(removed)
@@ -2202,10 +2202,8 @@ fn atomic_write_bound(
     if let Some(expected_identity) = expected_identity {
         verify_bounded_file_path_identity(destination, expected_identity)?;
     }
-    if destination.exists() {
-        if existing_file_equals(destination, bytes)? {
-            return Ok(());
-        }
+    if destination.exists() && existing_file_equals(destination, bytes)? {
+        return Ok(());
     }
     let parent = destination.parent().ok_or_else(|| {
         ExecutionError::workspace("invalid_path", "destination has no workspace parent")

@@ -2497,7 +2497,7 @@ mod tests {
             .open(&path)
             .expect("create secure workbench profile fixture");
         profile
-            .write_all(&profile_bytes)
+            .write_all(profile_bytes)
             .expect("write exact workbench profile fixture bytes");
         profile
             .sync_all()
@@ -3655,7 +3655,6 @@ mod tests {
             .unwrap()
             .contains("PRIVATE-RESULT"));
 
-        drop(coordinator);
         drop(store);
         assert!(!fs::read(directory.path().join("workbench.redb"))
             .unwrap()
