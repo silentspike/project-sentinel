@@ -1023,11 +1023,12 @@ impl WorkflowApi {
         agent_capabilities: HashMap<AgentId, BTreeSet<String>>,
     ) -> Result<Self, WorkflowError> {
         let enabled = workflow_enabled()?;
-        let store = Arc::new(WorkflowStore::open(
-            enabled
-                .then(|| data_dir.join("company-workflow.sqlite"))
-                .unwrap_or_else(|| PathBuf::from(":memory:")),
-        )?);
+        let store_path = if enabled {
+            data_dir.join("company-workflow.sqlite")
+        } else {
+            PathBuf::from(":memory:")
+        };
+        let store = Arc::new(WorkflowStore::open(store_path)?);
         if !enabled {
             return Self::new_disabled(store);
         }
