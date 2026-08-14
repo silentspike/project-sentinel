@@ -31,6 +31,14 @@ dependencies = [
 [[package]]
 name = "agent-runtime"
 version = "0.1.0"
+dependencies = [
+ "nix 0.30.1",
+ "sentinel-common",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
 
 [[package]]
 name = "ahash"
@@ -4506,6 +4514,7 @@ dependencies = [
  "sha2",
  "syn",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "toml 1.0.6+spec-1.1.0",
  "tracing",

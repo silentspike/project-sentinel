@@ -28,9 +28,11 @@ MAX_COMMAND_BYTES = 64 * 1024
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 CREATED_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+OWNER_PAIR_RE = re.compile(r"^(0|[1-9][0-9]{0,9}):(0|[1-9][0-9]{0,9})$")
 PRODUCTION_STAGE_PREFIX = Path("/work/tmp/project-sentinel")
 STOPPED_UNITS = {
     "nats-server.service",
+    "sentinel-auth-init.service",
     "sentinel-daemon.service",
     "sentinel-dashboard-backend.service",
     "sentinel-gaia-loop.service",
@@ -106,6 +108,7 @@ def artifact_authority() -> dict[str, tuple[str, str]]:
         "/opt/sentinel/config/company.toml": ("config/company.toml", "config"),
         "/opt/sentinel/config/controlplane.toml": ("config/controlplane.toml", "config"),
         "/etc/nats/nats.conf": ("config/nats.conf", "config"),
+        "/etc/systemd/system/sentinel-auth-init.service": ("deploy/systemd/sentinel-auth-init.service", "systemd"),
         "/etc/systemd/system/sentinel-daemon.service": ("deploy/systemd/sentinel-daemon.service", "systemd"),
         "/etc/systemd/system/sentinel-gateway.service": ("deploy/systemd/sentinel-gateway.service", "systemd"),
         "/etc/systemd/system/sentinel-judge.service": ("deploy/systemd/sentinel-judge.service", "systemd"),
@@ -145,6 +148,18 @@ def artifact_authority() -> dict[str, tuple[str, str]]:
 
 AUTHORITY = artifact_authority()
 TARGET_MODES = {"binary": 0o755, "script": 0o755, "config": 0o644, "systemd": 0o644}
+LEGACY_PARENT_DIRS = {
+    "/opt/sentinel",
+    "/opt/sentinel/bin",
+    "/opt/sentinel/config",
+    "/opt/sentinel/config/agents",
+    "/opt/sentinel/config/product-acceptance",
+    "/opt/sentinel/config/work-profiles",
+    "/opt/sentinel/config/workbench-profiles",
+    "/opt/sentinel/scripts",
+    "/opt/sentinel/share",
+}
+CANONICAL_DIR_MODE = 0o755
 
 
 class ProvisionError(Exception):
@@ -331,13 +346,32 @@ def validate_manifest(args: argparse.Namespace) -> tuple[list[dict[str, Any]], s
     return sorted(verified, key=lambda row: row["path"]), actual_manifest_sha
 
 
-def validate_fake_contract(args: argparse.Namespace) -> tuple[int, int]:
+def parse_owner_pairs(values: list[str], reason: str) -> set[tuple[int, int]]:
+    result: set[tuple[int, int]] = set()
+    for value in values:
+        match = OWNER_PAIR_RE.fullmatch(value)
+        if match is None:
+            fail(reason)
+        pair = (int(match.group(1)), int(match.group(2)))
+        if pair[0] > 2**32 - 2 or pair[1] > 2**32 - 2 or pair in result:
+            fail(reason)
+        result.add(pair)
+    return result
+
+
+def owner_pair_allowed(uid: int, gid: int, allowed: set[tuple[int, int]]) -> bool:
+    return (uid, gid) in allowed
+
+
+def validate_fake_contract(args: argparse.Namespace) -> tuple[int, int, set[tuple[int, int]]]:
     production = args.target_root == Path("/")
     if production:
         if os.geteuid() != 0 or args.service_state_file is not None or args.fail_after is not None:
             fail("production_authority_invalid")
         if args.install_uid != 0 or args.install_gid != 0:
             fail("install_owner_invalid")
+        if not args.approved_legacy_owner or args.test_legacy_owner:
+            fail("legacy_owner_contract_invalid")
         try:
             args.stage_root.relative_to(PRODUCTION_STAGE_PREFIX)
         except ValueError:
@@ -347,7 +381,16 @@ def validate_fake_contract(args: argparse.Namespace) -> tuple[int, int]:
             fail("install_owner_invalid")
         if args.service_state_file is None:
             fail("fake_service_state_required")
-    return args.install_uid, args.install_gid
+        if args.approved_legacy_owner:
+            fail("production_legacy_owner_not_allowed")
+    legacy = parse_owner_pairs(
+        args.approved_legacy_owner if production else args.test_legacy_owner,
+        "legacy_owner_contract_invalid" if production else "test_legacy_owner_contract_invalid",
+    )
+    canonical = (args.install_uid, args.install_gid)
+    if canonical in legacy:
+        fail("legacy_owner_contract_invalid" if production else "test_legacy_owner_contract_invalid")
+    return args.install_uid, args.install_gid, {canonical, *legacy}
 
 
 def validate_existing_chain(path: Path, uid: int, gid: int) -> None:
@@ -370,6 +413,93 @@ def target_path(root: Path, destination: str) -> Path:
     return root.joinpath(*safe_parts(destination, absolute=True))
 
 
+def canonical_parent_chain(destination: str) -> list[tuple[str, Path]]:
+    parts = safe_parts(destination, absolute=True)[:-1]
+    result: list[tuple[str, Path]] = []
+    current = Path("/")
+    canonical = ""
+    for part in parts:
+        current /= part
+        canonical += f"/{part}"
+        result.append((canonical, current))
+    return result
+
+
+def validate_migratable_mode(info: os.stat_result, reason: str) -> None:
+    if info.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX | 0o002):
+        fail(reason)
+
+
+def metadata_record(path: str, kind: str, info: os.stat_result, mode: int) -> dict[str, Any]:
+    return {
+        "path": path,
+        "kind": kind,
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "mode": stat.S_IMODE(info.st_mode),
+        "nlink": info.st_nlink,
+        "target_mode": mode,
+    }
+
+
+def plan_legacy_takeover(
+    args: argparse.Namespace,
+    rows: list[dict[str, Any]],
+    uid: int,
+    gid: int,
+    allowed_pairs: set[tuple[int, int]],
+) -> list[dict[str, Any]]:
+    validate_existing_chain(args.target_root, uid, gid)
+    directory_records: dict[str, dict[str, Any]] = {}
+    file_records: list[dict[str, Any]] = []
+    for row in rows:
+        target = target_path(args.target_root, row["path"])
+        for canonical_path, relative_path in canonical_parent_chain(row["path"]):
+            concrete = args.target_root.joinpath(*relative_path.parts[1:])
+            try:
+                info = os.lstat(concrete)
+            except FileNotFoundError:
+                break
+            if stat.S_ISLNK(info.st_mode):
+                fail("target_parent_symlink")
+            if not stat.S_ISDIR(info.st_mode):
+                fail("target_parent_invalid")
+            if canonical_path in LEGACY_PARENT_DIRS:
+                if not owner_pair_allowed(info.st_uid, info.st_gid, allowed_pairs):
+                    fail("target_parent_foreign_owner")
+                validate_migratable_mode(info, "target_parent_authority_invalid")
+                if (
+                    (info.st_uid, info.st_gid) != (uid, gid)
+                    or stat.S_IMODE(info.st_mode) != CANONICAL_DIR_MODE
+                ):
+                    directory_records.setdefault(
+                        canonical_path,
+                        metadata_record(canonical_path, "directory", info, CANONICAL_DIR_MODE),
+                    )
+            elif (
+                (info.st_uid, info.st_gid) != (uid, gid)
+                or info.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX | 0o022)
+            ):
+                fail("target_parent_authority_invalid")
+        try:
+            info = os.lstat(target)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            fail("target_file_authority_invalid")
+        if not owner_pair_allowed(info.st_uid, info.st_gid, allowed_pairs):
+            fail("target_file_foreign_owner")
+        validate_migratable_mode(info, "target_file_owner_or_mode_invalid")
+        mode = TARGET_MODES[row["type"]]
+        if (info.st_uid, info.st_gid) != (uid, gid) or stat.S_IMODE(info.st_mode) != mode:
+            file_records.append(metadata_record(row["path"], "file", info, mode))
+    return [directory_records[path] for path in sorted(directory_records)] + sorted(
+        file_records, key=lambda record: record["path"]
+    )
+
+
 def validate_targets(args: argparse.Namespace, rows: list[dict[str, Any]], uid: int, gid: int) -> None:
     validate_existing_chain(args.target_root, uid, gid)
     for row in rows:
@@ -383,6 +513,105 @@ def validate_targets(args: argparse.Namespace, rows: list[dict[str, Any]], uid: 
             fail("target_file_authority_invalid")
         if info.st_uid != uid or info.st_gid != gid or stat.S_IMODE(info.st_mode) != TARGET_MODES[row["type"]]:
             fail("target_file_owner_or_mode_invalid")
+
+
+def open_takeover_record(args: argparse.Namespace, record: dict[str, Any]) -> int:
+    parts = safe_parts(record["path"], absolute=True)
+    fd = os.open(args.target_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for index, part in enumerate(parts):
+            is_leaf = index == len(parts) - 1
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            if not is_leaf or record["kind"] == "directory":
+                flags |= os.O_DIRECTORY
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def record_identity_matches(info: os.stat_result, record: dict[str, Any]) -> bool:
+    expected_type = stat.S_ISDIR(info.st_mode) if record["kind"] == "directory" else stat.S_ISREG(info.st_mode)
+    return expected_type and all(
+        (
+            info.st_dev == record["dev"],
+            info.st_ino == record["ino"],
+            info.st_uid == record["uid"],
+            info.st_gid == record["gid"],
+            stat.S_IMODE(info.st_mode) == record["mode"],
+            info.st_nlink == record["nlink"],
+        )
+    )
+
+
+def write_takeover_state(operation: Path, records: list[dict[str, Any]]) -> None:
+    state = operation / "legacy-owner-state.json"
+    fd = os.open(state, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        data = canonical({"schema_version": SCHEMA_VERSION, "records": records})
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    directory_fd = os.open(operation, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def apply_takeover_record(args: argparse.Namespace, record: dict[str, Any], uid: int, gid: int) -> None:
+    fd = open_takeover_record(args, record)
+    try:
+        if not record_identity_matches(os.fstat(fd), record):
+            fail("target_identity_changed")
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, record["target_mode"])
+        updated = os.fstat(fd)
+        if (
+            updated.st_uid != uid
+            or updated.st_gid != gid
+            or stat.S_IMODE(updated.st_mode) != record["target_mode"]
+        ):
+            fail("target_takeover_failed")
+    finally:
+        os.close(fd)
+
+
+def verify_takeover_record_identity(args: argparse.Namespace, record: dict[str, Any]) -> None:
+    fd = open_takeover_record(args, record)
+    try:
+        if not record_identity_matches(os.fstat(fd), record):
+            fail("target_identity_changed")
+    finally:
+        os.close(fd)
+
+
+def restore_takeover_record(
+    args: argparse.Namespace, record: dict[str, Any], *, replaced: bool
+) -> None:
+    fd = open_takeover_record(args, record)
+    try:
+        info = os.fstat(fd)
+        valid_type = stat.S_ISDIR(info.st_mode) if record["kind"] == "directory" else stat.S_ISREG(info.st_mode)
+        if not valid_type or (record["kind"] == "file" and info.st_nlink != 1):
+            fail("rollback_target_invalid")
+        if not replaced and (info.st_dev != record["dev"] or info.st_ino != record["ino"]):
+            fail("rollback_target_identity_changed")
+        os.fchown(fd, record["uid"], record["gid"])
+        os.fchmod(fd, record["mode"])
+        restored = os.fstat(fd)
+        if (
+            restored.st_uid != record["uid"]
+            or restored.st_gid != record["gid"]
+            or stat.S_IMODE(restored.st_mode) != record["mode"]
+        ):
+            fail("rollback_metadata_mismatch")
+    finally:
+        os.close(fd)
 
 
 def command(argv: list[str]) -> bytes:
@@ -610,17 +839,19 @@ def prepare_stage(args: argparse.Namespace) -> tuple[int, Path]:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     lock_fd: int | None = None
     operation: Path | None = None
-    changed: list[tuple[Path, Path | None, int, int, int]] = []
+    changed: list[tuple[Path, Path | None, int, int, int, str]] = []
     created_dirs: list[Path] = []
+    takeover_records: list[dict[str, Any]] = []
+    takeover_applied: list[dict[str, Any]] = []
     target_mutation_started = False
     try:
-        uid, gid = validate_fake_contract(args)
+        uid, gid, allowed_owner_pairs = validate_fake_contract(args)
         lock_fd, operation = prepare_stage(args)
         if args.inject_pre_mutation_error:
             raise RuntimeError(f"injected private detail at {args.stage_root}")
         rows, manifest_sha = validate_manifest(args)
         validate_services(args)
-        validate_targets(args, rows, uid, gid)
+        plan_legacy_takeover(args, rows, uid, gid, allowed_owner_pairs)
 
         incoming = operation / "incoming"
         rollback = operation / "rollback"
@@ -643,7 +874,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         # Recheck every target and service immediately before host mutation.
         validate_services(args)
+        takeover_records = plan_legacy_takeover(
+            args, rows, uid, gid, allowed_owner_pairs
+        )
+        write_takeover_state(operation, takeover_records)
+        if args.test_identity_mismatch and takeover_records:
+            takeover_records[0]["ino"] += 1
+        for record in takeover_records:
+            verify_takeover_record_identity(args, record)
+        for record in takeover_records:
+            target_mutation_started = True
+            takeover_applied.append(record)
+            apply_takeover_record(args, record, uid, gid)
+            if (
+                args.test_fail_takeover_after is not None
+                and len(takeover_applied) >= args.test_fail_takeover_after
+            ):
+                fail("injected_takeover_failure")
         validate_targets(args, rows, uid, gid)
+        original_metadata = {record["path"]: record for record in takeover_records}
         applied = 0
         target_mutation_started = True
         for index, row in enumerate(rows):
@@ -665,9 +914,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 backup_digest, _ = copy_and_hash(target, backup, stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid)
                 if backup_digest != current_digest:
                     fail("rollback_capture_mismatch")
-                changed.append((target, backup, stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid))
+                original = original_metadata.get(row["path"])
+                changed.append((
+                    target,
+                    backup,
+                    original["mode"] if original is not None else stat.S_IMODE(info.st_mode),
+                    original["uid"] if original is not None else info.st_uid,
+                    original["gid"] if original is not None else info.st_gid,
+                    row["path"],
+                ))
             else:
-                changed.append((target, None, 0, 0, 0))
+                changed.append((target, None, 0, 0, 0, row["path"]))
             temp = target.parent / f".{target.name}.m0-new"
             if temp.exists() or temp.is_symlink():
                 fail("target_temp_exists")
@@ -692,6 +949,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         receipt = {"schema_version": SCHEMA_VERSION, "status": "COMPLETE",
                    "git_sha": args.expected_git_sha, "manifest_sha256": manifest_sha,
                    "artifact_count": len(rows), "changed_count": applied,
+                   "legacy_migration": {
+                       "status": "COMPLETE",
+                       "directory_count": sum(record["kind"] == "directory" for record in takeover_records),
+                       "file_count": sum(record["kind"] == "file" for record in takeover_records),
+                   },
                    "artifact_set_digest": hashlib.sha256(canonical(sorted(row["sha256"] for row in rows))).hexdigest(),
                    "services_started": False}
         receipt["receipt_sha256"] = write_receipt(args.stage_root, receipt)
@@ -707,7 +969,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     pass
             raise ProvisionError(reason) from exc
         rollback_ok = True
-        for target, backup, mode, old_uid, old_gid in reversed(changed):
+        replaced_paths: set[str] = set()
+        for target, backup, mode, old_uid, old_gid, canonical_path in reversed(changed):
             try:
                 if backup is None:
                     target.unlink(missing_ok=True)
@@ -721,6 +984,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         os.fsync(parent_fd)
                     finally:
                         os.close(parent_fd)
+                    replaced_paths.add(canonical_path)
+            except Exception:
+                rollback_ok = False
+        for record in reversed(takeover_applied):
+            try:
+                restore_takeover_record(
+                    args, record, replaced=record["path"] in replaced_paths
+                )
             except Exception:
                 rollback_ok = False
         for directory in reversed(created_dirs):
@@ -731,7 +1002,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         receipt = {"schema_version": SCHEMA_VERSION,
                    "status": "ROLLED_BACK" if rollback_ok else "ROLLBACK_FAILED",
                    "reason": reason, "git_sha": args.expected_git_sha,
-                   "artifact_count": len(AUTHORITY), "services_started": False}
+                   "artifact_count": len(AUTHORITY), "services_started": False,
+                   "legacy_migration": {
+                       "status": "ROLLED_BACK" if rollback_ok else "ROLLBACK_FAILED",
+                       "directory_count": sum(record["kind"] == "directory" for record in takeover_applied),
+                       "file_count": sum(record["kind"] == "file" for record in takeover_applied),
+                   }}
         try:
             receipt["receipt_sha256"] = write_receipt(args.stage_root, receipt)
         except Exception:
@@ -756,9 +1032,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage-root", type=Path, required=True)
     parser.add_argument("--install-uid", type=int, default=0)
     parser.add_argument("--install-gid", type=int, default=0)
+    parser.add_argument("--approved-legacy-owner", action="append", default=[])
     parser.add_argument("--service-state-file", type=Path)
     parser.add_argument("--fail-after", type=int)
     parser.add_argument("--inject-pre-mutation-error", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--test-legacy-owner", action="append", default=[], help=argparse.SUPPRESS)
+    parser.add_argument("--test-fail-takeover-after", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--test-identity-mismatch", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     for name in ("manifest", "source_root", "target_root", "stage_root"):
         safe_abs(getattr(args, name))
@@ -766,7 +1046,13 @@ def parse_args() -> argparse.Namespace:
         safe_abs(args.service_state_file)
     if args.fail_after is not None and args.fail_after < 1:
         fail("fail_after_invalid")
-    if args.target_root == Path("/") and args.inject_pre_mutation_error:
+    if args.test_fail_takeover_after is not None and args.test_fail_takeover_after < 1:
+        fail("test_fail_takeover_after_invalid")
+    if args.target_root == Path("/") and (
+        args.inject_pre_mutation_error
+        or args.test_identity_mismatch
+        or args.test_fail_takeover_after is not None
+    ):
         fail("production_authority_invalid")
     return args
 

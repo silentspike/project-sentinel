@@ -34,8 +34,10 @@ ARTIFACT_DEFS=(
   "config/rooms.toml|/opt/sentinel/config/rooms.toml|config"
   "config/company.toml|/opt/sentinel/config/company.toml|config"
   "config/controlplane.toml|/opt/sentinel/config/controlplane.toml|config"
+  "config/workbench-profiles/web-authoring-v1.toml|/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml|config"
   "config/nats.conf|/etc/nats/nats.conf|config"
   # systemd units
+  "deploy/systemd/sentinel-auth-init.service|/etc/systemd/system/sentinel-auth-init.service|systemd"
   "deploy/systemd/sentinel-daemon.service|/etc/systemd/system/sentinel-daemon.service|systemd"
   "deploy/systemd/sentinel-gateway.service|/etc/systemd/system/sentinel-gateway.service|systemd"
   "deploy/systemd/sentinel-judge.service|/etc/systemd/system/sentinel-judge.service|systemd"

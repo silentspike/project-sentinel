@@ -1,5 +1,8 @@
 use std::collections::HashMap;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,6 +13,9 @@ use sentinel_common::nano_runtime::{
     NanoIsolationReport, NanoRecoveryResult, NanoRuntime, NanoRuntimeControlAction,
     NanoRuntimeControlResult, NanoRuntimeResources, NanoSnapshot, NanoSnapshotSemantics,
     NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
+};
+use sentinel_common::{
+    WorkbenchArtifactRef, WorkbenchMessage, WorkbenchOutcome, WorkbenchRequest, WorkbenchTool,
 };
 use sentinel_fs::artifact::ArtifactPlane;
 use sentinel_fs::home_manifest::{self, HomeManifest, RestorePolicy};
@@ -71,6 +77,8 @@ struct WorkbenchExchange {
     instance_id: uuid::Uuid,
     invocation_id: String,
     request_digest: String,
+    input_digest: String,
+    artifact_authority: Option<WorkbenchArtifactAuthority>,
     cancel_requested_at_ms: Option<u64>,
     cancel_digest: Option<String>,
     deadline_cancel_digest: Option<String>,
@@ -82,6 +90,56 @@ struct WorkbenchExchange {
     terminal_error: Option<NanoExecError>,
     finalized: bool,
     cleanup_pending: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WorkbenchArtifactAuthority {
+    workload_id: String,
+    invocation_id: String,
+    input_digest: String,
+    project_id: String,
+    work_item_id: String,
+    workspace_id: String,
+    agent_id: u16,
+    runtime_key: String,
+    tool_profile: String,
+    tool_profile_digest: String,
+    policy_digest: String,
+    expected_package: Option<WorkbenchPackageExpectation>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkbenchPackageExpectation {
+    artifact_kind: String,
+    media_type: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundArtifactManifest {
+    schema_version: u16,
+    invocation_id: String,
+    input_digest: String,
+    project_id: String,
+    work_item_id: String,
+    workspace_id: String,
+    agent_id: u16,
+    artifact_kind: String,
+    media_type: String,
+    runtime_key: String,
+    tool_profile: String,
+    tool_profile_digest: String,
+    policy_digest: String,
+    entries: Vec<BoundArtifactEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundArtifactEntry {
+    path: String,
+    blob_id: String,
+    sha256: String,
+    size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +160,8 @@ const DEFAULT_HOME_CAS_DIR: &str = "/ram/agents/.sentinel-home-cas";
 const DEFAULT_AGENT_HOME_ROOT: &str = "/ram/agents";
 const MAX_WORKBENCH_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKBENCH_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_WORKBENCH_ARTIFACT_MANIFEST_BYTES: u64 = 1024 * 1024;
+const WORKBENCH_RECOVERY_DEADLINE_MS: u64 = 5_000;
 
 fn exec_error(
     code: NanoExecErrorCode,
@@ -112,13 +172,62 @@ fn exec_error(
 }
 
 fn frame_digest(input: &str) -> String {
-    let digest = Sha256::digest(input.as_bytes());
+    hex_sha256_bytes(input.as_bytes())
+}
+
+fn hex_sha256_bytes(input: &[u8]) -> String {
+    let digest = Sha256::digest(input);
     let mut output = String::with_capacity(64);
     for byte in digest {
         use std::fmt::Write as _;
         let _ = write!(output, "{byte:02x}");
     }
     output
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+impl WorkbenchArtifactAuthority {
+    fn from_request(workload_id: &str, request: &WorkbenchRequest) -> Self {
+        let expected_package = match &request.tool {
+            WorkbenchTool::PackageArtifact {
+                artifact_kind,
+                media_type,
+                ..
+            } => Some(WorkbenchPackageExpectation {
+                artifact_kind: artifact_kind.clone(),
+                media_type: media_type.clone(),
+            }),
+            _ => None,
+        };
+        Self {
+            workload_id: workload_id.to_string(),
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            project_id: request.project_id.clone(),
+            work_item_id: request.work_item_id.clone(),
+            workspace_id: request.workspace_id.clone(),
+            agent_id: request.agent_id.0,
+            runtime_key: request.runtime_key.clone(),
+            tool_profile: request.tool_profile.clone(),
+            tool_profile_digest: request.tool_profile_digest.clone(),
+            policy_digest: request.policy_digest.clone(),
+            expected_package,
+        }
+    }
+}
+
+fn is_workbench_agent_runtime(command: &[String]) -> bool {
+    command.first().is_some_and(|program| {
+        std::path::Path::new(program)
+            .file_name()
+            .is_some_and(|name| name == "agent-runtime")
+    })
 }
 
 fn parse_control_frame(input: &str) -> Result<serde_json::Value> {
@@ -149,6 +258,581 @@ fn parse_control_frame(input: &str) -> Result<serde_json::Value> {
     })
 }
 
+fn validate_terminal_artifacts(
+    host_agent_root: &std::path::Path,
+    authority: &WorkbenchArtifactAuthority,
+    message: &WorkbenchMessage,
+) -> Result<()> {
+    let WorkbenchMessage::Result {
+        invocation_id,
+        input_digest,
+        outcome,
+        artifacts,
+        ..
+    } = message
+    else {
+        return Ok(());
+    };
+    if invocation_id != &authority.invocation_id || input_digest != &authority.input_digest {
+        return Err(exec_error(
+            NanoExecErrorCode::InvocationConflict,
+            false,
+            "workbench result authority binding is invalid",
+        ));
+    }
+    if *outcome != WorkbenchOutcome::Succeeded {
+        if artifacts.is_empty() {
+            return Ok(());
+        }
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "failed workbench result cannot publish artifacts",
+        ));
+    }
+    match authority.expected_package.as_ref() {
+        None if artifacts.is_empty() => Ok(()),
+        None => Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "non-package workbench result cannot publish artifacts",
+        )),
+        Some(expected) if artifacts.len() == 1 => {
+            validate_artifact_manifest(host_agent_root, authority, expected, &artifacts[0])
+        }
+        Some(_) => Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "package workbench result must publish exactly one artifact",
+        )),
+    }
+}
+
+fn validate_artifact_manifest(
+    host_agent_root: &std::path::Path,
+    authority: &WorkbenchArtifactAuthority,
+    expected: &WorkbenchPackageExpectation,
+    artifact: &WorkbenchArtifactRef,
+) -> Result<()> {
+    if artifact.artifact_kind != expected.artifact_kind
+        || artifact.media_type != expected.media_type
+        || !valid_sha256(&artifact.sha256)
+        || artifact.artifact_id != format!("sha256:{}", artifact.sha256)
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact reference conflicts with its request binding",
+        ));
+    }
+    let relative = safe_relative_path(&artifact.manifest_path)?;
+    if relative.components().count() != 1
+        || !matches!(
+            relative.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact manifest path is not canonical",
+        ));
+    }
+    let artifact_root = bind_workbench_artifact_scope(
+        host_agent_root,
+        &authority.workload_id,
+        &authority.project_id,
+        &authority.work_item_id,
+    )?;
+    let manifest_path = artifact_root.join(relative);
+    let metadata = std::fs::symlink_metadata(&manifest_path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact manifest is missing",
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_WORKBENCH_ARTIFACT_MANIFEST_BYTES
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact manifest is outside its integrity boundary",
+        ));
+    }
+    let manifest_path = std::fs::canonicalize(&manifest_path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact manifest cannot be resolved",
+        )
+    })?;
+    if !manifest_path.starts_with(&artifact_root) {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact manifest escaped its authority scope",
+        ));
+    }
+    let manifest_name = manifest_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            exec_error(
+                NanoExecErrorCode::ProtocolViolation,
+                false,
+                "workbench artifact manifest name is invalid",
+            )
+        })?;
+    let scope = open_pinned_artifact_directory(&artifact_root)?;
+    let mut manifest_file = open_scoped_artifact_file(
+        &scope,
+        manifest_name,
+        MAX_WORKBENCH_ARTIFACT_MANIFEST_BYTES,
+        None,
+    )?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut manifest_file)
+        .take(MAX_WORKBENCH_ARTIFACT_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            exec_error(
+                NanoExecErrorCode::ProtocolViolation,
+                false,
+                "workbench artifact manifest cannot be read",
+            )
+        })?;
+    revalidate_scoped_artifact_file(&scope, manifest_name, &manifest_file)?;
+    if hex_sha256_bytes(&bytes) != artifact.sha256 {
+        return Err(exec_error(
+            NanoExecErrorCode::DigestConflict,
+            false,
+            "workbench artifact manifest digest conflicts with its reference",
+        ));
+    }
+    let manifest: BoundArtifactManifest = serde_json::from_slice(&bytes).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::InvalidFrame,
+            false,
+            "workbench artifact manifest is invalid",
+        )
+    })?;
+    if manifest.schema_version != 1
+        || manifest.invocation_id != authority.invocation_id
+        || manifest.input_digest != authority.input_digest
+        || manifest.project_id != authority.project_id
+        || manifest.work_item_id != authority.work_item_id
+        || manifest.workspace_id != authority.workspace_id
+        || manifest.agent_id != authority.agent_id
+        || manifest.artifact_kind != expected.artifact_kind
+        || manifest.media_type != expected.media_type
+        || manifest.runtime_key != authority.runtime_key
+        || manifest.tool_profile != authority.tool_profile
+        || manifest.tool_profile_digest != authority.tool_profile_digest
+        || manifest.policy_digest != authority.policy_digest
+        || manifest.entries.is_empty()
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact manifest authority binding is invalid",
+        ));
+    }
+    let blobs_root = canonical_child_directory(&artifact_root, "blobs")?;
+    let blobs = open_pinned_artifact_directory(&blobs_root)?;
+    let mut total_size = 0_u64;
+    for entry in manifest.entries {
+        let _ = safe_relative_path(&entry.path)?;
+        if !valid_sha256(&entry.sha256) || entry.blob_id != format!("sha256:{}", entry.sha256) {
+            return Err(exec_error(
+                NanoExecErrorCode::ProtocolViolation,
+                false,
+                "workbench artifact manifest contains an invalid blob binding",
+            ));
+        }
+        total_size = total_size.checked_add(entry.size_bytes).ok_or_else(|| {
+            exec_error(
+                NanoExecErrorCode::OutputLimitExceeded,
+                false,
+                "workbench artifact size overflowed its boundary",
+            )
+        })?;
+        let mut blob = open_scoped_artifact_file(
+            &blobs,
+            &entry.sha256,
+            entry.size_bytes,
+            Some(entry.size_bytes),
+        )?;
+        let mut blob_bytes = Vec::new();
+        std::io::Read::by_ref(&mut blob)
+            .take(entry.size_bytes.saturating_add(1))
+            .read_to_end(&mut blob_bytes)
+            .map_err(|_| {
+                exec_error(
+                    NanoExecErrorCode::ProtocolViolation,
+                    false,
+                    "workbench artifact blob cannot be read",
+                )
+            })?;
+        revalidate_scoped_artifact_file(&blobs, &entry.sha256, &blob)?;
+        let digest = hex_sha256_bytes(&blob_bytes);
+        if digest != entry.sha256 {
+            return Err(exec_error(
+                NanoExecErrorCode::DigestConflict,
+                false,
+                "workbench artifact blob digest conflicts with its manifest",
+            ));
+        }
+    }
+    if total_size != artifact.size_bytes {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact size conflicts with its manifest",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactFileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+}
+
+impl ArtifactFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+        }
+    }
+}
+
+fn current_process_uid() -> Result<u32> {
+    std::fs::metadata("/proc/self")
+        .map(|metadata| metadata.uid())
+        .map_err(|_| {
+            exec_error(
+                NanoExecErrorCode::ProtocolViolation,
+                false,
+                "workbench artifact owner cannot be verified",
+            )
+        })
+}
+
+fn open_pinned_artifact_directory(path: &std::path::Path) -> Result<File> {
+    let before = std::fs::symlink_metadata(path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact directory cannot be inspected",
+        )
+    })?;
+    if before.file_type().is_symlink() || !before.is_dir() {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact directory identity is invalid",
+        ));
+    }
+    let directory = File::open(path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact directory cannot be opened",
+        )
+    })?;
+    let opened = directory.metadata().map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact directory cannot be verified",
+        )
+    })?;
+    if before.dev() != opened.dev() || before.ino() != opened.ino() {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact directory identity changed",
+        ));
+    }
+    Ok(directory)
+}
+
+fn open_scoped_artifact_file(
+    directory: &File,
+    name: &str,
+    max_bytes: u64,
+    exact_size: Option<u64>,
+) -> Result<File> {
+    open_scoped_artifact_file_with(directory, name, max_bytes, exact_size, |path| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    })
+}
+
+fn open_scoped_artifact_file_with<Open>(
+    directory: &File,
+    name: &str,
+    max_bytes: u64,
+    exact_size: Option<u64>,
+    open: Open,
+) -> Result<File>
+where
+    Open: FnOnce(&std::path::Path) -> std::io::Result<File>,
+{
+    safe_scope_component(name)?;
+    let path = PathBuf::from(format!("/proc/self/fd/{}/{}", directory.as_raw_fd(), name));
+    let before = std::fs::symlink_metadata(&path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file cannot be inspected",
+        )
+    })?;
+    validate_artifact_file_metadata(&before, max_bytes, exact_size)?;
+    let expected = ArtifactFileIdentity::from_metadata(&before);
+    let file = open(&path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file cannot be opened",
+        )
+    })?;
+    let opened = file.metadata().map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file cannot be verified",
+        )
+    })?;
+    validate_artifact_file_metadata(&opened, max_bytes, exact_size)?;
+    if ArtifactFileIdentity::from_metadata(&opened) != expected {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file identity changed before open",
+        ));
+    }
+    Ok(file)
+}
+
+fn validate_artifact_file_metadata(
+    metadata: &std::fs::Metadata,
+    max_bytes: u64,
+    exact_size: Option<u64>,
+) -> Result<()> {
+    let mode = metadata.mode() & 0o7777;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.nlink() != 1
+        || metadata.uid() != current_process_uid()?
+        || mode & 0o7022 != 0
+        || metadata.len() > max_bytes
+        || exact_size.is_some_and(|size| metadata.len() != size)
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file ownership or mode is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn revalidate_scoped_artifact_file(directory: &File, name: &str, file: &File) -> Result<()> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}/{}", directory.as_raw_fd(), name));
+    let opened = file.metadata().map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file cannot be revalidated",
+        )
+    })?;
+    let path_metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file disappeared during read",
+        )
+    })?;
+    validate_artifact_file_metadata(&opened, opened.len(), Some(opened.len()))?;
+    validate_artifact_file_metadata(&path_metadata, opened.len(), Some(opened.len()))?;
+    if ArtifactFileIdentity::from_metadata(&path_metadata)
+        != ArtifactFileIdentity::from_metadata(&opened)
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact file identity changed during read",
+        ));
+    }
+    Ok(())
+}
+
+fn bind_workbench_artifact_scope(
+    host_agent_root: &std::path::Path,
+    expected_workload_id: &str,
+    project_id: &str,
+    work_item_id: &str,
+) -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let agent_root = canonical_real_directory(host_agent_root)?;
+    let marker = agent_root.join(".nano-runtime");
+    let marker_metadata = std::fs::symlink_metadata(&marker).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench agent artifact authority marker is unavailable",
+        )
+    })?;
+    if marker_metadata.file_type().is_symlink()
+        || !marker_metadata.is_file()
+        || marker_metadata.nlink() != 1
+        || std::fs::read_to_string(&marker).ok().as_deref() != Some(expected_workload_id)
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench agent artifact authority marker is invalid",
+        ));
+    }
+    let artifacts = canonical_child_directory(&agent_root, "artifacts")?;
+    let project = canonical_child_directory(&artifacts, safe_scope_component(project_id)?)?;
+    canonical_child_directory(&project, safe_scope_component(work_item_id)?)
+}
+
+fn safe_scope_component(value: &str) -> Result<&str> {
+    let mut components = std::path::Path::new(value).components();
+    if value.is_empty()
+        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact scope component is invalid",
+        ));
+    }
+    Ok(value)
+}
+
+fn canonical_child_directory(parent: &std::path::Path, child: &str) -> Result<std::path::PathBuf> {
+    let path = parent.join(child);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact scope directory is unavailable",
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact scope directory is invalid",
+        ));
+    }
+    let canonical = std::fs::canonicalize(&path).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact scope directory cannot be resolved",
+        )
+    })?;
+    if canonical.parent() != Some(parent) {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact scope escaped its authority base",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn canonical_real_directory(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let mut current = std::path::PathBuf::new();
+    if !path.is_absolute() {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact authority base is not absolute",
+        ));
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => current.push(std::path::MAIN_SEPARATOR_STR),
+            std::path::Component::Normal(component) => current.push(component),
+            _ => {
+                return Err(exec_error(
+                    NanoExecErrorCode::ProtocolViolation,
+                    false,
+                    "workbench artifact authority base is not canonical",
+                ))
+            }
+        }
+        let metadata = std::fs::symlink_metadata(&current).map_err(|_| {
+            exec_error(
+                NanoExecErrorCode::ProtocolViolation,
+                false,
+                "workbench artifact authority base is unavailable",
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(exec_error(
+                NanoExecErrorCode::ProtocolViolation,
+                false,
+                "workbench artifact authority base contains an invalid component",
+            ));
+        }
+    }
+    let canonical = std::fs::canonicalize(&current).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact authority base cannot be resolved",
+        )
+    })?;
+    if canonical != current {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact authority base changed identity",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn safe_relative_path(path: &str) -> Result<&std::path::Path> {
+    let path = std::path::Path::new(path);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::ProtocolViolation,
+            false,
+            "workbench artifact path escaped its authority scope",
+        ));
+    }
+    Ok(path)
+}
+
 fn require_schema_version(value: Option<&serde_json::Value>) -> Result<()> {
     match value.and_then(serde_json::Value::as_u64) {
         Some(1) => Ok(()),
@@ -167,6 +851,7 @@ pub struct BwrapNanoRuntime {
     /// never snapshot are unaffected).
     cas_dir: PathBuf,
     agent_home_root: PathBuf,
+    fs_mount: Option<PathBuf>,
     workloads: HashMap<String, BwrapWorkloadState>,
     handles: HashMap<String, SandboxHandle>,
     processes: HashMap<String, AgentProcess>,
@@ -187,6 +872,7 @@ impl BwrapNanoRuntime {
             enforcer,
             cas_dir: cas_dir.into(),
             agent_home_root: PathBuf::from(DEFAULT_AGENT_HOME_ROOT),
+            fs_mount: None,
             workloads: HashMap::new(),
             handles: HashMap::new(),
             processes: HashMap::new(),
@@ -206,7 +892,9 @@ impl BwrapNanoRuntime {
     /// Keep daemon FUSE routing identical when bwrap lifecycle ownership moves
     /// behind the NanoRuntime adapter.
     pub fn set_fs_mount(&mut self, mount: impl Into<String>) {
-        self.enforcer.set_fs_mount(mount.into());
+        let mount = mount.into();
+        self.fs_mount = Some(PathBuf::from(&mount));
+        self.enforcer.set_fs_mount(mount);
     }
 
     #[cfg(test)]
@@ -235,6 +923,17 @@ impl BwrapNanoRuntime {
 
     fn home_dir(&self, agent_name: &str) -> PathBuf {
         self.agent_home_root.join(agent_name)
+    }
+
+    fn workbench_host_root(&self, workload_id: &str) -> Result<PathBuf> {
+        let state = self
+            .workloads
+            .get(workload_id)
+            .ok_or_else(|| anyhow!("workbench workload state is unavailable"))?;
+        Ok(match self.fs_mount.as_ref() {
+            Some(mount) => mount.join(workload_id),
+            None => self.agent_home_root.join(&state.workload.agent_name),
+        })
     }
 
     fn write_marker(&self, agent_name: &str, workload_id: &str) -> Result<()> {
@@ -616,6 +1315,7 @@ impl BwrapNanoRuntime {
                 .expect("pending spawn inserted")
                 .state
                 .command;
+            let workbench_process = is_workbench_agent_runtime(command);
             let process = start_process(&self.enforcer, &agent_name, &workload_id, command)
                 .with_context(|| format!("bwrap start_agent_process failed for {agent_name}"))?;
             let pid = process.pid;
@@ -623,11 +1323,26 @@ impl BwrapNanoRuntime {
                 .pending_spawns
                 .get_mut(&workload_id)
                 .expect("pending spawn inserted");
-            transaction
+            let handle = transaction
                 .handle
                 .as_mut()
-                .expect("setup completed before process start")
-                .bwrap_pid = Some(pid);
+                .expect("setup completed before process start");
+            if workbench_process {
+                let attestation = process
+                    .workbench_isolation_attestation()
+                    .context("workbench process returned without isolation attestation")?;
+                anyhow::ensure!(
+                    handle.cgroup_created
+                        && process.child_pid == Some(attestation.child_pid)
+                        && attestation.landlock_abi > 0,
+                    "workbench process isolation evidence is incomplete"
+                );
+                // These flags are published only after the exact child, cgroup,
+                // netns and post-Landlock exec evidence have all succeeded.
+                handle.landlock_applied = true;
+                handle.network_isolated = true;
+            }
+            handle.bwrap_pid = Some(pid);
             transaction.process = Some(process);
             checkpoint(BwrapSpawnStage::ProcessStarted)?;
             Ok(pid)
@@ -674,7 +1389,11 @@ impl BwrapNanoRuntime {
         self.spawn_state_with(
             state,
             |enforcer, agent_name, workload_id, command| {
-                enforcer.start_agent_process(agent_name, Some(workload_id), command)
+                if is_workbench_agent_runtime(command) {
+                    enforcer.start_workbench_process(agent_name, Some(workload_id), command)
+                } else {
+                    enforcer.start_agent_process(agent_name, Some(workload_id), command)
+                }
             },
             |_| Ok(()),
         )
@@ -738,16 +1457,107 @@ impl BwrapNanoRuntime {
         {
             return Ok(());
         }
-        self.teardown_runtime_resources(workload_id).map_err(|_| {
+        let productive_workbench = self
+            .workloads
+            .get(workload_id)
+            .is_some_and(|state| is_workbench_agent_runtime(&state.command));
+        let cleanup = if productive_workbench {
+            self.recycle_workbench_runtime(workload_id)
+        } else {
+            self.teardown_runtime_resources(workload_id).map(|_| ())
+        };
+        cleanup.map_err(|_| {
             exec_error(
                 NanoExecErrorCode::ChannelDisconnected,
                 true,
-                "workbench cleanup remains pending",
+                "workbench runtime recycle remains pending",
             )
         })?;
         if let Some(exchange) = self.exchanges.get_mut(workload_id) {
             exchange.cleanup_pending = false;
         }
+        Ok(())
+    }
+
+    fn recycle_workbench_runtime(&mut self, workload_id: &str) -> Result<()> {
+        self.recycle_workbench_runtime_with(
+            workload_id,
+            |enforcer, previous, agent_name, workload_id, command| {
+                enforcer.teardown_agent(&previous)?;
+                let mut handle = enforcer
+                    .setup_agent(agent_name, &CgroupLimits::default())
+                    .with_context(|| format!("recreate workbench cgroup for {agent_name}"))?;
+                let process = enforcer
+                    .start_workbench_process(agent_name, Some(workload_id), command)
+                    .with_context(|| format!("restart agent-runtime for {agent_name}"))?;
+                handle.bwrap_pid = Some(process.pid);
+                let attestation = process
+                    .workbench_isolation_attestation()
+                    .context("restarted workbench process lacks isolation attestation")?;
+                anyhow::ensure!(
+                    handle.cgroup_created
+                        && process.child_pid == Some(attestation.child_pid)
+                        && attestation.landlock_abi > 0,
+                    "restarted workbench process isolation evidence is incomplete"
+                );
+                handle.landlock_applied = true;
+                handle.network_isolated = true;
+                Ok((handle, process))
+            },
+        )
+    }
+
+    fn recycle_workbench_runtime_with<Replace>(
+        &mut self,
+        workload_id: &str,
+        replace: Replace,
+    ) -> Result<()>
+    where
+        Replace: FnOnce(
+            &SandboxEnforcer,
+            SandboxHandle,
+            &str,
+            &str,
+            &[String],
+        ) -> Result<(SandboxHandle, AgentProcess)>,
+    {
+        let process = self.processes.get(workload_id).ok_or_else(|| {
+            anyhow!("workbench runtime process is unavailable during terminal recycle")
+        })?;
+        let supervision = process.protocol_supervision_snapshot();
+        anyhow::ensure!(
+            supervision.terminal_finalized && process.owned_process_reaped(),
+            "workbench runtime is not quiescent enough to recycle"
+        );
+        let (agent_name, command) = self
+            .workloads
+            .get(workload_id)
+            .map(|state| (state.workload.agent_name.clone(), state.command.clone()))
+            .ok_or_else(|| anyhow!("workbench workload state is unavailable during recycle"))?;
+        anyhow::ensure!(
+            is_workbench_agent_runtime(&command),
+            "terminal protocol recycle is limited to agent-runtime workloads"
+        );
+
+        if let Some(process) = self.processes.get_mut(workload_id) {
+            process.join_protocol_reader();
+        }
+        let previous = self
+            .handles
+            .get(workload_id)
+            .cloned()
+            .map(|previous| {
+                teardown_handle_after_owned_process_reap(
+                    previous,
+                    true,
+                    supervision.cgroup_quiesced,
+                )
+            })
+            .ok_or_else(|| anyhow!("workbench sandbox handle is unavailable during recycle"))?;
+        let (handle, process) =
+            replace(&self.enforcer, previous, &agent_name, workload_id, &command)?;
+        self.handles.insert(workload_id.to_string(), handle);
+        self.processes.insert(workload_id.to_string(), process);
         Ok(())
     }
 
@@ -796,16 +1606,20 @@ impl BwrapNanoRuntime {
                 "workbench start requires an execute frame",
             ));
         }
-        let request = frame
-            .get("request")
-            .and_then(|value| value.as_object())
-            .ok_or_else(|| {
-                exec_error(
-                    NanoExecErrorCode::InvalidFrame,
-                    false,
-                    "workbench execute frame lacks a request object",
-                )
-            })?;
+        let request_value = frame.get("request").cloned().ok_or_else(|| {
+            exec_error(
+                NanoExecErrorCode::InvalidFrame,
+                false,
+                "workbench execute frame lacks a request object",
+            )
+        })?;
+        let request = request_value.as_object().ok_or_else(|| {
+            exec_error(
+                NanoExecErrorCode::InvalidFrame,
+                false,
+                "workbench execute frame lacks a request object",
+            )
+        })?;
         require_schema_version(request.get("schema_version"))?;
         let invocation_id = request
             .get("invocation_id")
@@ -830,6 +1644,15 @@ impl BwrapNanoRuntime {
                 )
             })?;
         let request_digest = frame_digest(input);
+        let input_digest = request
+            .get("input_digest")
+            .and_then(|value| value.as_str())
+            .filter(|value| valid_sha256(value))
+            .map(str::to_string)
+            .unwrap_or_else(|| request_digest.clone());
+        let artifact_authority = serde_json::from_value::<WorkbenchRequest>(request_value)
+            .ok()
+            .map(|request| WorkbenchArtifactAuthority::from_request(&handle.workload_id, &request));
         if self.exchanges.contains_key(&handle.workload_id) {
             self.validate_exchange_handle(handle)?;
             self.retry_pending_exchange_cleanup(&handle.workload_id)?;
@@ -843,29 +1666,33 @@ impl BwrapNanoRuntime {
                 .get(&handle.workload_id)
                 .expect("exchange retained after cleanup retry");
             if exchange.invocation_id != invocation_id {
-                return Err(exec_error(
-                    NanoExecErrorCode::InvocationConflict,
-                    false,
-                    "workbench workload already has another invocation",
-                ));
+                if !exchange.finalized || exchange.cleanup_pending {
+                    return Err(exec_error(
+                        NanoExecErrorCode::InvocationConflict,
+                        false,
+                        "workbench workload already has another invocation",
+                    ));
+                }
+                self.exchanges.remove(&handle.workload_id);
+            } else {
+                if exchange.request_digest != request_digest {
+                    return Err(exec_error(
+                        NanoExecErrorCode::DigestConflict,
+                        false,
+                        "workbench invocation request digest conflicts with retained state",
+                    ));
+                }
+                if let Some(failure) = exchange.terminal_error.as_ref() {
+                    return Err(failure.clone().into());
+                }
+                return workbench_exec_result(
+                    handle,
+                    true,
+                    &invocation_id,
+                    exchange_state_with_supervision(exchange, supervision),
+                    exchange_messages_with_supervision(exchange, supervision),
+                );
             }
-            if exchange.request_digest != request_digest {
-                return Err(exec_error(
-                    NanoExecErrorCode::DigestConflict,
-                    false,
-                    "workbench invocation request digest conflicts with retained state",
-                ));
-            }
-            if let Some(failure) = exchange.terminal_error.as_ref() {
-                return Err(failure.clone().into());
-            }
-            return workbench_exec_result(
-                handle,
-                true,
-                &invocation_id,
-                exchange_state_with_supervision(exchange, supervision),
-                exchange_messages_with_supervision(exchange, supervision),
-            );
         }
         if deadline_unix_ms <= unix_time_ms() {
             return Err(exec_error(
@@ -891,6 +1718,8 @@ impl BwrapNanoRuntime {
                 instance_id: handle.instance_id,
                 invocation_id: invocation_id.clone(),
                 request_digest,
+                input_digest,
+                artifact_authority,
                 cancel_requested_at_ms: None,
                 cancel_digest: None,
                 deadline_cancel_digest: None,
@@ -915,6 +1744,142 @@ impl BwrapNanoRuntime {
             .processes
             .get_mut(&handle.workload_id)
             .expect("workload retained after channel validation")
+            .start_protocol_supervision(&invocation_id, deadline_unix_ms, input);
+        if let Err(failure) = supervision_started {
+            let (code, message) = supervision_failure_contract(failure);
+            return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
+        }
+        workbench_exec_result(handle, true, &invocation_id, "accepted", Vec::new())
+    }
+
+    fn recover_workbench_exchange(
+        &mut self,
+        handle: &NanoHandle,
+        input: &str,
+    ) -> Result<NanoExecResult> {
+        if handle.runtime_key != RUNTIME_BWRAP_LANDLOCK {
+            return Err(exec_error(
+                NanoExecErrorCode::UnsupportedRuntime,
+                false,
+                "workbench recovery requires the bwrap runtime",
+            ));
+        }
+        let frame = parse_control_frame(input)?;
+        if frame.get("kind").and_then(|value| value.as_str()) != Some("recover") {
+            return Err(exec_error(
+                NanoExecErrorCode::InvalidFrame,
+                false,
+                "workbench recovery requires a recover frame",
+            ));
+        }
+        require_schema_version(frame.get("schema_version"))?;
+        let invocation_id = frame
+            .get("invocation_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                exec_error(
+                    NanoExecErrorCode::InvalidFrame,
+                    false,
+                    "workbench recovery frame lacks an invocation id",
+                )
+            })?
+            .to_string();
+        let input_digest = frame
+            .get("input_digest")
+            .and_then(|value| value.as_str())
+            .filter(|value| valid_sha256(value))
+            .ok_or_else(|| {
+                exec_error(
+                    NanoExecErrorCode::InvalidFrame,
+                    false,
+                    "workbench recovery frame lacks a canonical input digest",
+                )
+            })?
+            .to_string();
+
+        if self.exchanges.contains_key(&handle.workload_id) {
+            self.validate_exchange_handle(handle)?;
+            self.retry_pending_exchange_cleanup(&handle.workload_id)?;
+            let supervision = self.synchronize_protocol_supervision(&handle.workload_id);
+            if let Some(failure) = supervision.and_then(|snapshot| snapshot.failure) {
+                let (code, message) = supervision_failure_contract(failure);
+                return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
+            }
+            let exchange = self
+                .exchanges
+                .get(&handle.workload_id)
+                .expect("exchange retained after recovery cleanup retry");
+            if exchange.invocation_id != invocation_id {
+                return Err(exec_error(
+                    NanoExecErrorCode::InvocationConflict,
+                    false,
+                    "workbench recovery invocation conflicts with retained state",
+                ));
+            }
+            if exchange.input_digest != input_digest {
+                return Err(exec_error(
+                    NanoExecErrorCode::DigestConflict,
+                    false,
+                    "workbench recovery digest conflicts with retained state",
+                ));
+            }
+            if let Some(failure) = exchange.terminal_error.as_ref() {
+                return Err(failure.clone().into());
+            }
+            return workbench_exec_result(
+                handle,
+                true,
+                &invocation_id,
+                exchange_state_with_supervision(exchange, supervision),
+                exchange_messages_with_supervision(exchange, supervision),
+            );
+        }
+
+        let channel_available = self
+            .processes
+            .get(&handle.workload_id)
+            .ok_or_else(|| {
+                exec_error(
+                    NanoExecErrorCode::WorkloadUnavailable,
+                    false,
+                    "workbench workload process is unavailable",
+                )
+            })?
+            .protocol_channel_available();
+        self.exchanges.insert(
+            handle.workload_id.clone(),
+            WorkbenchExchange {
+                instance_id: handle.instance_id,
+                invocation_id: invocation_id.clone(),
+                request_digest: input_digest.clone(),
+                input_digest,
+                artifact_authority: None,
+                cancel_requested_at_ms: None,
+                cancel_digest: None,
+                deadline_cancel_digest: None,
+                cancel_origin: None,
+                messages: Vec::new(),
+                retained_bytes: 0,
+                result_seen: false,
+                terminal: None,
+                terminal_error: None,
+                finalized: false,
+                cleanup_pending: false,
+            },
+        );
+        if !channel_available {
+            return Err(self.fail_workbench_exchange(
+                &handle.workload_id,
+                NanoExecErrorCode::ChannelUnavailable,
+                "workbench protocol channel is unavailable",
+            ));
+        }
+        let deadline_unix_ms = unix_time_ms().saturating_add(WORKBENCH_RECOVERY_DEADLINE_MS);
+        let supervision_started = self
+            .processes
+            .get_mut(&handle.workload_id)
+            .expect("workload retained after recovery channel validation")
             .start_protocol_supervision(&invocation_id, deadline_unix_ms, input);
         if let Err(failure) = supervision_started {
             let (code, message) = supervision_failure_contract(failure);
@@ -1226,6 +2191,13 @@ impl BwrapNanoRuntime {
             );
         }
         let mut violation = None;
+        let host_agent_root = self.workbench_host_root(&handle.workload_id)?;
+        let artifact_authority = self
+            .exchanges
+            .get(&handle.workload_id)
+            .expect("exchange validated before output binding")
+            .artifact_authority
+            .clone();
         {
             let exchange = self
                 .exchanges
@@ -1242,6 +2214,11 @@ impl BwrapNanoRuntime {
                     break;
                 }
                 let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    violation = Some(NanoExecErrorCode::InvalidFrame);
+                    break;
+                };
+                let Ok(bound_message) = serde_json::from_value::<WorkbenchMessage>(message.clone())
+                else {
                     violation = Some(NanoExecErrorCode::InvalidFrame);
                     break;
                 };
@@ -1263,6 +2240,13 @@ impl BwrapNanoRuntime {
                 match message.get("kind").and_then(|value| value.as_str()) {
                     Some("result") => {
                         if exchange.result_seen || exchange.terminal.is_some() {
+                            violation = Some(NanoExecErrorCode::ProtocolViolation);
+                            break;
+                        }
+                        if artifact_authority.as_ref().is_some_and(|authority| {
+                            validate_terminal_artifacts(&host_agent_root, authority, &bound_message)
+                                .is_err()
+                        }) {
                             violation = Some(NanoExecErrorCode::ProtocolViolation);
                             break;
                         }
@@ -1309,23 +2293,17 @@ impl BwrapNanoRuntime {
                 exchange.messages.push(message);
             }
         }
-        if violation.is_some() {
+        if let Some(violation) = violation {
             let supervision = self.synchronize_protocol_supervision(&handle.workload_id);
             if let Some(failure) = supervision.and_then(|snapshot| snapshot.failure) {
                 let (code, message) = supervision_failure_contract(failure);
                 return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
             }
-            let exchange = self
-                .exchanges
-                .get(&handle.workload_id)
-                .expect("exchange retained while protocol cleanup completes");
-            return workbench_exec_result(
-                handle,
-                true,
-                invocation_id,
-                exchange_state_with_supervision(exchange, supervision),
-                exchange_messages_with_supervision(exchange, supervision),
-            );
+            return Err(self.fail_workbench_exchange(
+                &handle.workload_id,
+                violation,
+                "workbench output failed its protocol or artifact binding",
+            ));
         }
         let supervision = self.synchronize_protocol_supervision(&handle.workload_id);
         let exchange_is_terminal = self
@@ -1640,6 +2618,18 @@ impl NanoRuntime for BwrapNanoRuntime {
             }
             "workbench_poll" => self.poll_workbench_exchange(handle, &request.input),
             "workbench_cancel" => self.cancel_workbench_exchange(handle, &request.input),
+            "workbench_recover" => {
+                if !self.exchanges.contains_key(&handle.workload_id)
+                    && self.health(handle)?.state != NanoHealthState::Healthy
+                {
+                    return Err(exec_error(
+                        NanoExecErrorCode::WorkloadUnavailable,
+                        false,
+                        "workbench workload is not healthy",
+                    ));
+                }
+                self.recover_workbench_exchange(handle, &request.input)
+            }
             _ => Err(exec_error(
                 NanoExecErrorCode::UnsupportedOperation,
                 false,
@@ -2097,6 +3087,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workbench_spawn_without_exact_isolation_attestation_rolls_back_all_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime =
+            BwrapNanoRuntime::with_test_dirs(temp.path().join("cas"), temp.path().join("homes"));
+        let workload_id = "AGENT-42";
+        let mut state = transactional_fixture_state(workload_id, "workbench-agent");
+        state.command = vec!["/usr/bin/agent-runtime".to_string()];
+        let error = runtime
+            .spawn_state_with(
+                state,
+                |_, _, _, _| AgentProcess::launch_fixture(),
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("isolation attestation"));
+        assert!(!runtime.pending_spawns.contains_key(workload_id));
+        assert!(!runtime.workloads.contains_key(workload_id));
+        assert!(!runtime.handles.contains_key(workload_id));
+        assert!(!runtime.processes.contains_key(workload_id));
+        assert!(!temp
+            .path()
+            .join("homes/workbench-agent/.nano-runtime")
+            .exists());
+    }
+
+    #[test]
+    fn sandbox_artifact_scope_rejects_symlink_components_and_foreign_agent_base() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let agent_root = directory.path().join("AGENT-07");
+        let artifacts = agent_root.join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(agent_root.join(".nano-runtime"), "AGENT-07").unwrap();
+        let foreign_scope = directory.path().join("foreign-scope");
+        std::fs::create_dir_all(foreign_scope.join("work-04")).unwrap();
+
+        symlink(&foreign_scope, artifacts.join("project-01")).unwrap();
+        assert!(
+            bind_workbench_artifact_scope(&agent_root, "AGENT-07", "project-01", "work-04",)
+                .is_err()
+        );
+        std::fs::remove_file(artifacts.join("project-01")).unwrap();
+
+        let project = artifacts.join("project-01");
+        std::fs::create_dir(&project).unwrap();
+        symlink(foreign_scope.join("work-04"), project.join("work-04")).unwrap();
+        assert!(
+            bind_workbench_artifact_scope(&agent_root, "AGENT-07", "project-01", "work-04",)
+                .is_err()
+        );
+
+        let foreign_agent = directory.path().join("AGENT-08");
+        std::fs::create_dir_all(foreign_agent.join("artifacts/project-01").join("work-04"))
+            .unwrap();
+        std::fs::write(foreign_agent.join(".nano-runtime"), "AGENT-08").unwrap();
+        assert!(
+            bind_workbench_artifact_scope(&foreign_agent, "AGENT-07", "project-01", "work-04",)
+                .is_err()
+        );
+
+        let safe_scope = directory.path().join("safe-files");
+        std::fs::create_dir(&safe_scope).unwrap();
+        let manifest = safe_scope.join("manifest.json");
+        std::fs::write(&manifest, b"{}").unwrap();
+        let pinned = open_pinned_artifact_directory(&safe_scope).unwrap();
+        open_scoped_artifact_file(&pinned, "manifest.json", 16, None).unwrap();
+
+        let hardlink = safe_scope.join("manifest-hardlink.json");
+        std::fs::hard_link(&manifest, &hardlink).unwrap();
+        assert!(open_scoped_artifact_file(&pinned, "manifest.json", 16, None).is_err());
+        std::fs::remove_file(hardlink).unwrap();
+
+        for mode in [0o4644, 0o2644, 0o1644] {
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(open_scoped_artifact_file(&pinned, "manifest.json", 16, None).is_err());
+        }
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let replacement = safe_scope.join("replacement.json");
+        std::fs::write(&replacement, b"[]").unwrap();
+        assert!(
+            open_scoped_artifact_file_with(&pinned, "manifest.json", 16, None, |path| {
+                std::fs::rename(&replacement, &manifest)?;
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(path)
+            },)
+            .is_err()
+        );
+    }
+
     fn insert_protocol_fixture(
         runtime: &mut BwrapNanoRuntime,
         workload_id: &str,
@@ -2149,6 +3233,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn attested_workbench_protocol_reports_exact_instance_and_all_isolation_barriers() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2998";
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let mut process = AgentProcess::launch_protocol_fixture(&[]).unwrap();
+        let child_pid = process.pid;
+        process.install_workbench_isolation_attestation(child_pid, 4);
+        let workload_id = "AGENT-42";
+        let handle = insert_protocol_process(&mut runtime, workload_id, process);
+        let sandbox = runtime.handles.get_mut(workload_id).unwrap();
+        sandbox.cgroup_created = true;
+        sandbox.landlock_applied = true;
+        sandbox.network_isolated = true;
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap();
+        let resources = runtime.resources(&handle).unwrap();
+        assert_eq!(resources.instance_id, Some(handle.instance_id));
+        assert_eq!(resources.child_pid, Some(child_pid));
+        assert!(resources.cgroup_created);
+        assert!(resources.landlock_applied);
+        assert!(resources.network_isolated);
+    }
+
     fn start_frame(invocation_id: &str, deadline_unix_ms: u64) -> String {
         serde_json::to_string(&serde_json::json!({
             "kind": "execute",
@@ -2159,6 +3273,44 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    fn successful_result_frame(
+        invocation_id: &str,
+        input_digest: &str,
+        output: serde_json::Value,
+    ) -> String {
+        serde_json::json!({
+            "kind": "result",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "input_digest": input_digest,
+            "outcome": "succeeded",
+            "resources": {
+                "duration_ms": 1,
+                "cpu_time_ms": 0,
+                "peak_memory_bytes": 0,
+                "peak_process_count": 0,
+                "bytes_read": 0,
+                "bytes_written": 0,
+                "artifact_bytes": 0
+            },
+            "artifacts": [],
+            "output": output,
+            "error": null
+        })
+        .to_string()
+    }
+
+    fn completed_progress_frame(invocation_id: &str) -> String {
+        serde_json::json!({
+            "kind": "progress",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "stage": "completed",
+            "elapsed_ms": 1
+        })
+        .to_string()
     }
 
     #[test]
@@ -2191,6 +3343,16 @@ mod tests {
             "kind": "poll",
             "schema_version": 1,
             "invocation_id": invocation_id
+        }))
+        .unwrap()
+    }
+
+    fn recover_frame(invocation_id: &str, input_digest: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "kind": "recover",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "input_digest": input_digest
         }))
         .unwrap()
     }
@@ -2379,13 +3541,280 @@ mod tests {
     }
 
     #[test]
+    fn terminal_invocation_recycles_agent_runtime_for_a_second_serial_invocation() {
+        let first_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2981";
+        let second_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2982";
+        let temp = tempfile::tempdir().unwrap();
+        let first_record = temp.path().join("first-input.jsonl");
+        let first_descendant = temp.path().join("first-descendant.pid");
+        let first_result = format!(
+            r#"{{"kind":"result","schema_version":1,"invocation_id":"{first_id}","input_digest":"{}","outcome":"succeeded","resources":{{"duration_ms":1,"cpu_time_ms":0,"peak_memory_bytes":0,"peak_process_count":0,"bytes_read":0,"bytes_written":0,"artifact_bytes":0}},"artifacts":[],"output":{{}},"error":null}}"#,
+            "a".repeat(64)
+        );
+        let first_completed = format!(
+            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{first_id}","stage":"completed","elapsed_ms":1}}"#
+        );
+        let first_process = AgentProcess::launch_recording_protocol_fixture(
+            &[&first_result, &first_completed],
+            &first_record,
+            &first_descendant,
+        )
+        .unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "serial-workbench", first_process);
+        runtime
+            .workloads
+            .get_mut(&handle.workload_id)
+            .unwrap()
+            .command = vec!["/usr/bin/agent-runtime".to_string()];
+        let first_start = start_frame(first_id, unix_time_ms() + 10_000);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: first_start.clone(),
+                },
+            )
+            .unwrap();
+        for _ in 0..200 {
+            if runtime.processes[&handle.workload_id]
+                .protocol_supervision_snapshot()
+                .terminal_finalized
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            runtime.processes[&handle.workload_id]
+                .protocol_supervision_snapshot()
+                .terminal_finalized
+        );
+        {
+            let exchange = runtime.exchanges.get_mut(&handle.workload_id).unwrap();
+            exchange.messages = vec![
+                serde_json::from_str(&first_result).unwrap(),
+                serde_json::from_str(&first_completed).unwrap(),
+            ];
+            exchange.result_seen = true;
+            exchange.terminal = Some(WorkbenchTerminal::Succeeded);
+            exchange.finalized = true;
+            exchange.cleanup_pending = true;
+        }
+
+        let second_record = temp.path().join("second-input.jsonl");
+        let second_descendant = temp.path().join("second-descendant.pid");
+        let second_result = format!(
+            r#"{{"kind":"result","schema_version":1,"invocation_id":"{second_id}","input_digest":"{}","outcome":"succeeded","resources":{{"duration_ms":1,"cpu_time_ms":0,"peak_memory_bytes":0,"peak_process_count":0,"bytes_read":0,"bytes_written":0,"artifact_bytes":0}},"artifacts":[],"output":{{}},"error":null}}"#,
+            "b".repeat(64)
+        );
+        let second_completed = format!(
+            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{second_id}","stage":"completed","elapsed_ms":1}}"#
+        );
+        runtime
+            .recycle_workbench_runtime_with(&handle.workload_id, |_, mut previous, _, _, _| {
+                let process = AgentProcess::launch_recording_protocol_fixture(
+                    &[&second_result, &second_completed],
+                    &second_record,
+                    &second_descendant,
+                )?;
+                previous.bwrap_pid = Some(process.pid);
+                Ok((previous, process))
+            })
+            .unwrap();
+        runtime
+            .exchanges
+            .get_mut(&handle.workload_id)
+            .unwrap()
+            .cleanup_pending = false;
+
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: first_start,
+                },
+            )
+            .unwrap();
+        assert!(replay.output.contains("completed"));
+        assert!(
+            !second_record.exists(),
+            "terminal replay reached the replacement runtime"
+        );
+
+        let second_start = start_frame(second_id, unix_time_ms() + 10_000);
+        let accepted = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: second_start.clone(),
+                },
+            )
+            .unwrap();
+        assert!(accepted.output.contains("accepted"));
+        assert_eq!(
+            wait_for_recorded_lines(&second_record, 1).trim(),
+            second_start,
+            "second invocation did not use the same exact NanoHandle once"
+        );
+        let duplicate = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: second_start,
+                },
+            )
+            .unwrap();
+        assert!(duplicate.output.contains("pending") || duplicate.output.contains("completed"));
+        assert_eq!(
+            wait_for_recorded_lines(&second_record, 1).lines().count(),
+            1
+        );
+        runtime
+            .workloads
+            .get_mut(&handle.workload_id)
+            .unwrap()
+            .command
+            .clear();
+        let terminal = (0..100).find_map(|_| {
+            let result = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_poll".to_string(),
+                        input: poll_frame(second_id),
+                    },
+                )
+                .unwrap();
+            (serde_json::from_str::<serde_json::Value>(&result.output).unwrap()["state"].as_str()
+                == Some("completed"))
+            .then_some(result)
+            .or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                None
+            })
+        });
+        assert!(terminal.is_some());
+    }
+
+    #[test]
+    fn recovery_is_effect_free_digest_bound_and_replayable_after_cleanup() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2902";
+        let input_digest = "a".repeat(64);
+        let result = format!(
+            r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_id}","input_digest":"{input_digest}","outcome":"succeeded","resources":{{"duration_ms":1,"cpu_time_ms":0,"peak_memory_bytes":0,"peak_process_count":0,"bytes_read":0,"bytes_written":0,"artifact_bytes":0}},"artifacts":[],"output":{{}},"error":null}}"#
+        );
+        let completed = format!(
+            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_id}","stage":"completed","elapsed_ms":1}}"#
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let record_path = temp.path().join("recovery-input.jsonl");
+        let descendant_pid_path = temp.path().join("recovery-descendant.pid");
+        let process = AgentProcess::launch_recording_protocol_fixture(
+            &[&result, &completed],
+            &record_path,
+            &descendant_pid_path,
+        )
+        .unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "protocol-recovery", process);
+        let recover = recover_frame(invocation_id, &input_digest);
+
+        let accepted = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_recover".to_string(),
+                    input: recover.clone(),
+                },
+            )
+            .unwrap();
+        assert!(accepted.output.contains("accepted"));
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_recover".to_string(),
+                    input: recover,
+                },
+            )
+            .unwrap();
+        assert!(replay.output.contains("pending") || replay.output.contains("completed"));
+
+        let terminal = (0..100)
+            .find_map(|_| {
+                let result = runtime
+                    .exec(
+                        &handle,
+                        NanoExecRequest {
+                            operation: "workbench_poll".to_string(),
+                            input: poll_frame(invocation_id),
+                        },
+                    )
+                    .unwrap();
+                let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+                if output["state"] == "completed" {
+                    Some(result)
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    None
+                }
+            })
+            .expect("recovery receipt did not reach its retained terminal state");
+        assert!(!runtime.processes.contains_key(&handle.workload_id));
+        let terminal_replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap();
+        assert_eq!(terminal_replay.output, terminal.output);
+
+        let digest_error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_recover".to_string(),
+                    input: recover_frame(invocation_id, &"b".repeat(64)),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&digest_error, NanoExecErrorCode::DigestConflict);
+        let mut stale = handle.clone();
+        stale.instance_id = uuid::Uuid::new_v4();
+        let stale_error = runtime
+            .exec(
+                &stale,
+                NanoExecRequest {
+                    operation: "workbench_recover".to_string(),
+                    input: recover_frame(invocation_id, &input_digest),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&stale_error, NanoExecErrorCode::WorkloadUnavailable);
+
+        let recorded = wait_for_recorded_lines(&record_path, 1);
+        assert_eq!(recorded.lines().count(), 1);
+        let frame: serde_json::Value =
+            serde_json::from_str(recorded.lines().next().unwrap()).unwrap();
+        assert_eq!(frame["kind"], "recover");
+        assert_eq!(frame["input_digest"], input_digest);
+    }
+
+    #[test]
     fn foreign_poll_is_rejected_before_matching_output_is_consumed() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2910";
+        let start = start_frame(invocation_id, unix_time_ms() + 10_000);
         let result =
-            format!(r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_id}"}}"#);
-        let completed = format!(
-            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_id}","stage":"completed"}}"#
-        );
+            successful_result_frame(invocation_id, &frame_digest(&start), serde_json::json!({}));
+        let completed = completed_progress_frame(invocation_id);
         let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
         let handle = insert_protocol_fixture(
             &mut runtime,
@@ -2397,7 +3826,7 @@ mod tests {
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_start".to_string(),
-                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                    input: start,
                 },
             )
             .unwrap();
@@ -2437,18 +3866,20 @@ mod tests {
     fn concurrent_workloads_cannot_cross_wire_protocol_frames() {
         let invocation_a = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2918";
         let invocation_b = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2919";
-        let result_a = format!(
-            r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_a}","output":{{"marker":"A"}}}}"#
+        let start_a = start_frame(invocation_a, unix_time_ms() + 10_000);
+        let start_b = start_frame(invocation_b, unix_time_ms() + 10_000);
+        let result_a = successful_result_frame(
+            invocation_a,
+            &frame_digest(&start_a),
+            serde_json::json!({"marker": "A"}),
         );
-        let completed_a = format!(
-            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_a}","stage":"completed"}}"#
+        let completed_a = completed_progress_frame(invocation_a);
+        let result_b = successful_result_frame(
+            invocation_b,
+            &frame_digest(&start_b),
+            serde_json::json!({"marker": "B"}),
         );
-        let result_b = format!(
-            r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_b}","output":{{"marker":"B"}}}}"#
-        );
-        let completed_b = format!(
-            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_b}","stage":"completed"}}"#
-        );
+        let completed_b = completed_progress_frame(invocation_b);
         let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
         let handle_a = insert_protocol_fixture(
             &mut runtime,
@@ -2463,13 +3894,13 @@ mod tests {
         let mut registry = sentinel_common::nano_runtime::NanoRuntimeRegistry::new(None);
         registry.register(runtime).unwrap();
 
-        for (handle, invocation_id) in [(&handle_a, invocation_a), (&handle_b, invocation_b)] {
+        for (handle, start) in [(&handle_a, start_a), (&handle_b, start_b)] {
             registry
                 .exec(
                     handle,
                     NanoExecRequest {
                         operation: "workbench_start".to_string(),
-                        input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                        input: start,
                     },
                 )
                 .unwrap();
@@ -2595,11 +4026,10 @@ mod tests {
     #[test]
     fn retained_exchange_rejects_stale_incarnation_without_consuming_or_tearing_down() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2930";
+        let start = start_frame(invocation_id, unix_time_ms() + 10_000);
         let result =
-            format!(r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_id}"}}"#);
-        let completed = format!(
-            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_id}","stage":"completed"}}"#
-        );
+            successful_result_frame(invocation_id, &frame_digest(&start), serde_json::json!({}));
+        let completed = completed_progress_frame(invocation_id);
         let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
         let handle = insert_protocol_fixture(
             &mut runtime,
@@ -2611,7 +4041,7 @@ mod tests {
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_start".to_string(),
-                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                    input: start,
                 },
             )
             .unwrap();
@@ -3306,19 +4736,10 @@ mod tests {
     #[test]
     fn completed_frame_is_not_published_before_post_terminal_validation() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2933";
-        let result = serde_json::json!({
-            "kind": "result",
-            "schema_version": 1,
-            "invocation_id": invocation_id
-        })
-        .to_string();
-        let completed = serde_json::json!({
-            "kind": "progress",
-            "schema_version": 1,
-            "invocation_id": invocation_id,
-            "stage": "completed"
-        })
-        .to_string();
+        let start = start_frame(invocation_id, unix_time_ms() + 10_000);
+        let result =
+            successful_result_frame(invocation_id, &frame_digest(&start), serde_json::json!({}));
+        let completed = completed_progress_frame(invocation_id);
         let extra = serde_json::json!({
             "kind": "progress",
             "schema_version": 1,
@@ -3341,7 +4762,7 @@ mod tests {
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_start".to_string(),
-                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                    input: start,
                 },
             )
             .unwrap();

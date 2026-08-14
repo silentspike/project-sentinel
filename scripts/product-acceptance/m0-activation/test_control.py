@@ -106,6 +106,7 @@ class FakeRunner:
         self.show_rounds: dict[str, int] = {}
         self.terminal_failure_unit: str | None = None
         self.terminal_failure_result = "exit-code"
+        self.auth_init_fails = False
         self.active_oneshot: str | None = None
         self.oneshot_finish_after_rounds: dict[str, int] = {}
         self.oneshot_failure = False
@@ -154,6 +155,14 @@ class FakeRunner:
                 return control.Result(0)
             if verb == "start":
                 self.after_target_start = True
+                if self.auth_init_fails:
+                    self.states[control.AUTH_INIT].update(
+                        ActiveState="failed", SubState="failed", Result="exit-code"
+                    )
+                    self.states[control.TARGET].update(
+                        ActiveState="failed", SubState="failed", Result="dependency"
+                    )
+                    return control.Result(self.target_start_returncode)
                 for unit in control.ALL_UNITS:
                     if self.partial_start_at == unit:
                         break
@@ -219,6 +228,8 @@ class FakeRunner:
     def _ready(self, unit: str) -> None:
         if unit == control.TARGET:
             sub = "active"
+        elif unit == control.AUTH_INIT:
+            sub = "exited"
         elif unit in control.TIMERS:
             sub = "waiting"
         else:
@@ -510,7 +521,36 @@ class ControlTests(unittest.TestCase):
     def test_repository_target_topology_is_the_controller_authority(self) -> None:
         target = (HERE.parents[2] / "deploy/systemd/sentinel.target").read_text()
         wants = next(line for line in target.splitlines() if line.startswith("Wants="))
+        requires = next(
+            line for line in target.splitlines() if line.startswith("Requires=")
+        )
         self.assertEqual(tuple(wants.removeprefix("Wants=").split()), control.TOPOLOGY)
+        self.assertEqual(requires, f"Requires={control.AUTH_INIT}")
+
+    def test_auth_init_failure_prevents_credential_consumers_and_rolls_back(self) -> None:
+        self.runner.auth_init_fails = True
+        with self.assertRaisesRegex(control.ControlError, "activation_unit_failed"):
+            self.fixture.activate(self.runner)
+        consumers = {
+            "sentinel-daemon.service",
+            "sentinel-gateway.service",
+            "sentinel-dashboard-backend.service",
+        }
+        self.assertTrue(
+            all(
+                self.runner.states[unit]["ActiveState"] == "inactive"
+                for unit in consumers
+            )
+        )
+        self.assertFalse(
+            any(
+                call[:2] == (str(control.PYTHON), str(control.PREFLIGHT_PROGRAM))
+                for call in self.runner.calls
+            )
+        )
+        self.assertEqual(
+            json.loads(self.fixture.activation.read_text())["status"], "ROLLED_BACK"
+        )
 
     def test_forged_stale_receipt_and_wrong_authority_fail_before_command(self) -> None:
         cases = (
