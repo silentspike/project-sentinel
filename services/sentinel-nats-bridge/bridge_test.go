@@ -23,7 +23,9 @@ type fakeOutboxStore struct {
 	entries              []eventstore.OutboxPublishEntry
 	failed               int64
 	unknown              int64
+	batchErr             error
 	countErr             error
+	retryErr             error
 	failPublishedOnce    bool
 	cancelAfterFirstMark context.CancelFunc
 	markedPublished      int
@@ -33,6 +35,9 @@ type fakeOutboxStore struct {
 func (s *fakeOutboxStore) GetOutboxBatch(limit int) ([]eventstore.OutboxPublishEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.batchErr != nil {
+		return nil, s.batchErr
+	}
 	if limit > len(s.entries) {
 		limit = len(s.entries)
 	}
@@ -70,6 +75,9 @@ func (s *fakeOutboxStore) MarkPublishedCAS(id int64, eventID, operationID string
 func (s *fakeOutboxStore) MarkRetryCAS(id int64, eventID, operationID, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.retryErr != nil {
+		return s.retryErr
+	}
 	for i := range s.entries {
 		entry := &s.entries[i]
 		if entry.OutboxID == id && entry.EventID == eventID && entry.OperationID == operationID {
@@ -441,6 +449,59 @@ func TestDrainOutboxStopsAfterPublishFailure(t *testing.T) {
 	}
 	if store.entries[0].RetryCount != 1 {
 		t.Fatalf("retry_count=%d, want 1", store.entries[0].RetryCount)
+	}
+}
+
+func TestDrainOutboxStopsAfterBatchReadFailure(t *testing.T) {
+	store := &fakeOutboxStore{
+		entries:  makeOutboxEntries(2),
+		batchErr: errors.New("injected batch read failure"),
+	}
+	publisher := &fakePublisher{}
+	readiness := &readinessState{}
+
+	published, err := drainOutbox(context.Background(), store, publisher, readiness, 2)
+	if err == nil || published != 0 || publisher.calls != 0 {
+		t.Fatalf("published=%d calls=%d err=%v, want no effect after batch read failure", published, publisher.calls, err)
+	}
+	if readiness.initialScanComplete.Load() {
+		t.Fatal("failed batch read closed the initial readiness gate")
+	}
+}
+
+func TestDrainOutboxStopsAfterMissingPubAck(t *testing.T) {
+	store := &fakeOutboxStore{entries: makeOutboxEntries(2)}
+	publisher := &fakePublisher{nilAck: true}
+	readiness := &readinessState{}
+
+	published, err := drainOutbox(context.Background(), store, publisher, readiness, 2)
+	if err == nil || published != 0 || publisher.calls != 1 || store.markedPublished != 0 {
+		t.Fatalf(
+			"published=%d calls=%d marks=%d err=%v, want one publish and no adoption",
+			published,
+			publisher.calls,
+			store.markedPublished,
+			err,
+		)
+	}
+	if readiness.initialScanComplete.Load() {
+		t.Fatal("missing PubAck closed the initial readiness gate")
+	}
+}
+
+func TestDrainOutboxStopsWhenPublishFailureCannotRecordRetry(t *testing.T) {
+	store := &fakeOutboxStore{
+		entries:  makeOutboxEntries(2),
+		retryErr: errors.New("injected retry transition failure"),
+	}
+	publisher := &fakePublisher{failCall: 1}
+
+	published, err := drainOutbox(context.Background(), store, publisher, &readinessState{}, 2)
+	if err == nil || published != 0 || publisher.calls != 1 {
+		t.Fatalf("published=%d calls=%d err=%v, want fail-closed retry transition", published, publisher.calls, err)
+	}
+	if store.entries[0].RetryCount != 0 {
+		t.Fatalf("retry_count=%d, want unchanged row after rejected transition", store.entries[0].RetryCount)
 	}
 }
 
