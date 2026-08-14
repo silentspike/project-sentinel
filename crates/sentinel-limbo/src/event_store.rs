@@ -2346,10 +2346,7 @@ impl EventStore {
     /// Effect adapters use this readback to distinguish an idempotent retry
     /// from an operation-id collision with different content. The lookup sees
     /// the append-only authority regardless of replay-frontier visibility.
-    pub fn event_by_operation_id(
-        &self,
-        operation_id: &str,
-    ) -> anyhow::Result<Option<DomainEvent>> {
+    pub fn event_by_operation_id(&self, operation_id: &str) -> anyhow::Result<Option<DomainEvent>> {
         if operation_id.is_empty() {
             anyhow::bail!("operation_id must not be empty");
         }

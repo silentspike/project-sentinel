@@ -1518,12 +1518,8 @@ pub(crate) fn stage_verified_artifact_inputs(
             .file_name()
             .into_string()
             .map_err(|_| WorkbenchStoreError::OutputRejected)?;
-        let scope = bind_daemon_artifact_scope(
-            &source_base,
-            source_agent,
-            project_id,
-            &work_item_id,
-        )?;
+        let scope =
+            bind_daemon_artifact_scope(&source_base, source_agent, project_id, &work_item_id)?;
         let candidate = scope.join(format!("{manifest_digest}.manifest.json"));
         match fs::symlink_metadata(&candidate) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
@@ -1576,9 +1572,10 @@ pub(crate) fn stage_verified_artifact_inputs(
         .parent()
         .ok_or(WorkbenchStoreError::OutputRejected)?;
     validate_agent_runtime_marker(destination_agent_root, destination_agent)?;
-    let destination_inputs = canonical_daemon_real_directory(
-        &canonical_daemon_child_directory(destination_agent_root, "inputs")?,
-    )?;
+    let destination_inputs = canonical_daemon_real_directory(&canonical_daemon_child_directory(
+        destination_agent_root,
+        "inputs",
+    )?)?;
     let destination_project = secure_child_directory(&destination_inputs, project_id)?;
     let destination_scope = secure_child_directory(&destination_project, destination_work_item_id)?;
     let mut result = Vec::with_capacity(manifest.entries.len());
@@ -1622,7 +1619,11 @@ pub(crate) fn stage_verified_artifact_inputs(
             .ok_or(WorkbenchStoreError::OutputRejected)?;
         let destination = destination_parent.join(file_name);
         match fs::hard_link(
-            format!("/proc/self/fd/{}/{}", source_blob_dir.as_raw_fd(), entry.sha256),
+            format!(
+                "/proc/self/fd/{}/{}",
+                source_blob_dir.as_raw_fd(),
+                entry.sha256
+            ),
             &destination,
         ) {
             Ok(()) => {}
@@ -1658,7 +1659,8 @@ pub(crate) fn stage_verified_artifact_inputs(
 
 fn validate_agent_runtime_marker(root: &Path, agent_id: AgentId) -> anyhow::Result<()> {
     let marker = root.join(".nano-runtime");
-    let metadata = fs::symlink_metadata(&marker).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let metadata =
+        fs::symlink_metadata(&marker).map_err(|_| WorkbenchStoreError::OutputRejected)?;
     let expected = format!("AGENT-{:02}", agent_id.0);
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -1679,14 +1681,15 @@ fn secure_child_directory(parent: &Path, child: &str) -> anyhow::Result<PathBuf>
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700).create(&path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+            builder
+                .mode(0o700)
+                .create(&path)
+                .map_err(|_| WorkbenchStoreError::OutputRejected)?;
         }
         Err(_) => return Err(WorkbenchStoreError::OutputRejected.into()),
     }
     let metadata = fs::symlink_metadata(&path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.mode() & 0o7777 != 0o700
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.mode() & 0o7777 != 0o700
     {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }

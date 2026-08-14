@@ -4,28 +4,26 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use sentinel_common::{
-    AgentId, DomainEvent, DomainEventPayload, WorkbenchRequest, WorkbenchResourceLimits, WorkbenchTool,
-    WORKBENCH_RUNTIME_BWRAP, WORKBENCH_SCHEMA_VERSION,
+    AgentId, DomainEvent, DomainEventPayload, WorkbenchRequest, WorkbenchResourceLimits,
+    WorkbenchTool, WORKBENCH_RUNTIME_BWRAP, WORKBENCH_SCHEMA_VERSION,
 };
 use sentinel_limbo::EventStore;
 use sentinel_workflow::{
-    CompanyRoleV1, CompanyWorkStateV1, CompanyWorkflowCommandV1,
-    CompanyWorkflowResponseV1, DependencyReadiness, GateEvidencePort, IndependentGateEvidence,
-    PendingGateEvidenceV1, ProjectId, ProjectLifecycleStateV1, TenantId, WorkflowPortError,
-    WorkflowStore,
+    CompanyRoleV1, CompanyWorkStateV1, CompanyWorkflowCommandV1, CompanyWorkflowResponseV1,
+    DependencyReadiness, GateEvidencePort, IndependentGateEvidence, PendingGateEvidenceV1,
+    ProjectId, ProjectLifecycleStateV1, TenantId, WorkflowPortError, WorkflowStore,
 };
 
 use crate::delivery::{
     expected_effect_saga_contract_digest, expected_integration_contract_digest,
     expected_publication_contract_digest, expected_workbench_execution_saga_contract_digest,
-    AdapterReadiness, AuthorityReceiptV1, AuthorityRole,
-    AuthorityValidationRequestV1, CandidateAuthorityQueryV1, CandidateAuthoritySnapshotV1,
-    ContentDigest, DeliveryEffectPort, DeliveryEffectReceiptV1, DeliveryEffectRequestV1,
-    DeliveryError, DeliveryIntegrationPort, DeliveryPublicationPort, PrincipalV1,
-    PublicationReceiptV1, PublicationRequestV1, VersionedRefV1, WorkbenchEvidenceReceiptV1,
-    WorkbenchEvidenceRequestV1, WorkflowLineageEdgeV1, WorkflowLineageKindV1,
-    WorkflowLineageNodeV1, WorkflowLineageQueryV1, WorkflowLineageSnapshotV1,
-    WorkflowLineageStateV1, DELIVERY_SCHEMA_V1,
+    AdapterReadiness, AuthorityReceiptV1, AuthorityRole, AuthorityValidationRequestV1,
+    CandidateAuthorityQueryV1, CandidateAuthoritySnapshotV1, ContentDigest, DeliveryEffectPort,
+    DeliveryEffectReceiptV1, DeliveryEffectRequestV1, DeliveryError, DeliveryIntegrationPort,
+    DeliveryPublicationPort, PrincipalV1, PublicationReceiptV1, PublicationRequestV1,
+    VersionedRefV1, WorkbenchEvidenceReceiptV1, WorkbenchEvidenceRequestV1, WorkflowLineageEdgeV1,
+    WorkflowLineageKindV1, WorkflowLineageNodeV1, WorkflowLineageQueryV1,
+    WorkflowLineageSnapshotV1, WorkflowLineageStateV1, DELIVERY_SCHEMA_V1,
 };
 use crate::workbench::{
     dispatch_workbench, stage_verified_artifact_inputs, WorkbenchAuthoritySnapshot,
@@ -209,9 +207,11 @@ impl WorkflowDeliveryIntegration {
         ) -> WorkbenchDispatchCommand,
     ) -> Result<crate::workbench::WorkbenchCoordinatorUpdate, DeliveryError> {
         let (response, receiver) = mpsc::sync_channel(1);
-        dispatch_workbench(command(response)).map_err(|error| DeliveryError::AdapterUnavailable {
-            dependency: "workbench_qa_execution",
-            reason: error.to_string(),
+        dispatch_workbench(command(response)).map_err(|error| {
+            DeliveryError::AdapterUnavailable {
+                dependency: "workbench_qa_execution",
+                reason: error.to_string(),
+            }
         })?;
         match receiver.recv_timeout(Duration::from_secs(35)) {
             Ok(Ok(update)) => Ok(update),
@@ -280,7 +280,9 @@ impl WorkflowDeliveryIntegration {
             .principals
             .principal(principal_id)
             .filter(|bound| bound.principal.tenant_id.0 == tenant_id)
-            .ok_or_else(|| DeliveryError::AuthorityDenied("principal is not current".to_string()))?;
+            .ok_or_else(|| {
+                DeliveryError::AuthorityDenied("principal is not current".to_string())
+            })?;
         let roles = delivery_roles(bound.principal.role);
         if roles.is_empty() {
             return Err(DeliveryError::AuthorityDenied(
@@ -338,9 +340,15 @@ impl WorkflowDeliveryIntegration {
             .map(|principal_id| self.mapped_principal(tenant_id, &principal_id))
             .collect::<Result<Vec<_>, _>>()?;
         principals.sort_by(|left, right| left.principal_id.cmp(&right.principal_id));
-        if !principals.iter().any(|value| value.has_role(AuthorityRole::Customer))
-            || !principals.iter().any(|value| value.has_role(AuthorityRole::Developer))
-            || !principals.iter().any(|value| value.has_role(AuthorityRole::Qa))
+        if !principals
+            .iter()
+            .any(|value| value.has_role(AuthorityRole::Customer))
+            || !principals
+                .iter()
+                .any(|value| value.has_role(AuthorityRole::Developer))
+            || !principals
+                .iter()
+                .any(|value| value.has_role(AuthorityRole::Qa))
             || !principals
                 .iter()
                 .any(|value| value.has_role(AuthorityRole::ReleaseManager))
@@ -587,9 +595,7 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
             let state = match blocker.state {
                 sentinel_workflow::BlockerStateV1::Resolved => WorkflowLineageStateV1::Clear,
                 sentinel_workflow::BlockerStateV1::Open
-                | sentinel_workflow::BlockerStateV1::Escalated => {
-                    WorkflowLineageStateV1::Blocked
-                }
+                | sentinel_workflow::BlockerStateV1::Escalated => WorkflowLineageStateV1::Blocked,
             };
             let node = Self::push_node(
                 &mut nodes,
@@ -1117,8 +1123,7 @@ impl GateEvidencePort for WorkflowWorkItemGate {
             .terminal_execution_evidence
             .as_ref()
             .filter(|value| {
-                value.receipt_id == request.execution_receipt_id
-                    && !value.artifacts.is_empty()
+                value.receipt_id == request.execution_receipt_id && !value.artifacts.is_empty()
             })
             .ok_or(WorkflowPortError::AuthorityConflict)?;
         let project = self
@@ -1269,7 +1274,9 @@ impl GateEvidencePort for WorkflowWorkItemGate {
             profile_digest: request.expectation.profile_digest.clone(),
             subject_digest: request.subject_digest.clone(),
             required_checks_digest: request.required_checks_digest.clone(),
-            completed_at_ms: record.completed_at_ms.expect("completion was checked above"),
+            completed_at_ms: record
+                .completed_at_ms
+                .expect("completion was checked above"),
         }))
     }
 }
@@ -1332,18 +1339,21 @@ impl LimboDeliveryEffects {
                     && delivery_roles(bound.principal.role) == request.actor.roles
             })
             .ok_or_else(|| {
-                DeliveryError::AuthorityDenied("rework customer authority is not current".to_string())
+                DeliveryError::AuthorityDenied(
+                    "rework customer authority is not current".to_string(),
+                )
             })?;
         let feedback_digest = request.feedback_digest.as_ref().ok_or_else(|| {
             DeliveryError::Validation("rework feedback digest is absent".to_string())
         })?;
-        let candidate = request.candidate.as_ref().ok_or_else(|| {
-            DeliveryError::Validation("rework candidate is absent".to_string())
-        })?;
+        let candidate = request
+            .candidate
+            .as_ref()
+            .ok_or_else(|| DeliveryError::Validation("rework candidate is absent".to_string()))?;
         let operation_uuid =
             uuid_from_digest(request.request_digest.as_str()).map_err(storage_error)?;
         let operation_id = uuid::Uuid::parse_str(&operation_uuid)
-        .map_err(|error| DeliveryError::Validation(error.to_string()))?;
+            .map_err(|error| DeliveryError::Validation(error.to_string()))?;
         let outcome = self
             .workflow
             .apply_company_command(
@@ -1493,46 +1503,45 @@ impl DeliveryPublicationPort for LimboDeliveryPublication {
 }
 
 fn effect_event(request: &DeliveryEffectRequestV1) -> Result<DomainEvent, DeliveryError> {
-    let (event_type, payload) = if request.kind
-        == crate::delivery::DeliveryEffectKind::MemoryPublication
-    {
-        let source = request.closeout_memory.as_ref().ok_or_else(|| {
-            DeliveryError::Validation("closeout memory source is absent".to_string())
-        })?;
-        let candidate = request.candidate.as_ref().ok_or_else(|| {
-            DeliveryError::Validation("closeout candidate is absent".to_string())
-        })?;
-        let payload = DomainEventPayload::ProjectCloseoutPublished {
-            tenant_id: request.tenant_id.clone(),
-            project_id: request.project.id.clone(),
-            project_generation: request.project.generation,
-            project_digest: request.project.digest.as_str().to_string(),
-            candidate_id: candidate.id.clone(),
-            candidate_generation: candidate.generation,
-            candidate_digest: candidate.digest.as_str().to_string(),
-            release_id: request.subject.id.clone(),
-            release_generation: request.subject.generation,
-            release_digest: request.subject.digest.as_str().to_string(),
-            acceptance_id: source.acceptance.id.clone(),
-            acceptance_generation: source.acceptance.generation,
-            acceptance_digest: source.acceptance.digest.as_str().to_string(),
-            decisions_digest: source.decisions_digest.as_str().to_string(),
-            artifact_inventory_digest: source.artifact_inventory_digest.as_str().to_string(),
-            failures_digest: source.failures_digest.as_str().to_string(),
-            lessons_digest: source.lessons_digest.as_str().to_string(),
+    let (event_type, payload) =
+        if request.kind == crate::delivery::DeliveryEffectKind::MemoryPublication {
+            let source = request.closeout_memory.as_ref().ok_or_else(|| {
+                DeliveryError::Validation("closeout memory source is absent".to_string())
+            })?;
+            let candidate = request.candidate.as_ref().ok_or_else(|| {
+                DeliveryError::Validation("closeout candidate is absent".to_string())
+            })?;
+            let payload = DomainEventPayload::ProjectCloseoutPublished {
+                tenant_id: request.tenant_id.clone(),
+                project_id: request.project.id.clone(),
+                project_generation: request.project.generation,
+                project_digest: request.project.digest.as_str().to_string(),
+                candidate_id: candidate.id.clone(),
+                candidate_generation: candidate.generation,
+                candidate_digest: candidate.digest.as_str().to_string(),
+                release_id: request.subject.id.clone(),
+                release_generation: request.subject.generation,
+                release_digest: request.subject.digest.as_str().to_string(),
+                acceptance_id: source.acceptance.id.clone(),
+                acceptance_generation: source.acceptance.generation,
+                acceptance_digest: source.acceptance.digest.as_str().to_string(),
+                decisions_digest: source.decisions_digest.as_str().to_string(),
+                artifact_inventory_digest: source.artifact_inventory_digest.as_str().to_string(),
+                failures_digest: source.failures_digest.as_str().to_string(),
+                lessons_digest: source.lessons_digest.as_str().to_string(),
+            };
+            (
+                "project_closeout_published".to_string(),
+                serde_json::to_string(&payload)
+                    .map_err(|error| DeliveryError::Storage(error.to_string()))?,
+            )
+        } else {
+            (
+                format!("delivery_effect_{:?}", request.kind).to_ascii_lowercase(),
+                String::from_utf8(ContentDigest::canonical_bytes(request)?)
+                    .map_err(|error| DeliveryError::Storage(error.to_string()))?,
+            )
         };
-        (
-            "project_closeout_published".to_string(),
-            serde_json::to_string(&payload)
-                .map_err(|error| DeliveryError::Storage(error.to_string()))?,
-        )
-    } else {
-        (
-            format!("delivery_effect_{:?}", request.kind).to_ascii_lowercase(),
-            String::from_utf8(ContentDigest::canonical_bytes(request)?)
-                .map_err(|error| DeliveryError::Storage(error.to_string()))?,
-        )
-    };
     Ok(DomainEvent {
         event_id: format!("delivery-effect-{}", request.request_digest.as_str()),
         event_type,
@@ -1567,7 +1576,9 @@ fn ensure_or_append_event(
     let existing = store
         .event_by_operation_id(&expected.operation_id)
         .map_err(storage_error)?
-        .ok_or_else(|| DeliveryError::Storage("delivery event disappeared after commit".to_string()))?;
+        .ok_or_else(|| {
+            DeliveryError::Storage("delivery event disappeared after commit".to_string())
+        })?;
     same_event(&existing, expected)
 }
 
@@ -1601,9 +1612,9 @@ fn delivery_roles(role: CompanyRoleV1) -> BTreeSet<AuthorityRole> {
         CompanyRoleV1::Qa => BTreeSet::from([AuthorityRole::Qa]),
         CompanyRoleV1::ReleaseManager => BTreeSet::from([AuthorityRole::ReleaseManager]),
         CompanyRoleV1::Gaia => BTreeSet::from([AuthorityRole::GaiaObserver]),
-        CompanyRoleV1::Sales
-        | CompanyRoleV1::ProjectManager
-        | CompanyRoleV1::TechnicalLead => BTreeSet::new(),
+        CompanyRoleV1::Sales | CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead => {
+            BTreeSet::new()
+        }
     }
 }
 
@@ -1698,7 +1709,8 @@ mod tests {
     #[test]
     fn effect_and_publication_retries_reuse_the_exact_committed_event() {
         let directory = tempfile::tempdir().unwrap();
-        let events = EventStore::open(directory.path().join("events.db").to_str().unwrap()).unwrap();
+        let events =
+            EventStore::open(directory.path().join("events.db").to_str().unwrap()).unwrap();
         let effect_request = DeliveryEffectRequestV1 {
             schema_version: DELIVERY_SCHEMA_V1,
             operation_id: "memory:tenant-a:project-a:retry".to_string(),

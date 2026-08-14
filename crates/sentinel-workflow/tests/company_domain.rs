@@ -1403,7 +1403,10 @@ fn customer_rework_reopens_delivery_candidate_with_new_linked_work_and_exact_rep
     let CompanyWorkflowResponseV1::Project(project) = project else {
         panic!()
     };
-    assert_eq!(project.lifecycle_state, ProjectLifecycleStateV1::DeliveryCandidate);
+    assert_eq!(
+        project.lifecycle_state,
+        ProjectLifecycleStateV1::DeliveryCandidate
+    );
     let original = project.work_items[&WorkItemId::parse("original-work").unwrap()].clone();
     let rework = CompanyWorkflowCommandV1::CreateGovernedRework {
         project_id: state.project_id.clone(),
@@ -1461,7 +1464,10 @@ fn customer_rework_reopens_delivery_candidate_with_new_linked_work_and_exact_rep
         .apply_company_command(&state.customer, Uuid::from_u128(187), &rework, 188)
         .unwrap();
     assert!(replay.replayed);
-    assert_eq!(replay.response, CompanyWorkflowResponseV1::Project(reopened));
+    assert_eq!(
+        replay.response,
+        CompanyWorkflowResponseV1::Project(reopened)
+    );
 }
 
 #[test]

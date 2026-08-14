@@ -2136,15 +2136,16 @@ fn validate_episode_payload(payload: &DomainEventPayload) -> Result<(), &'static
         failures_digest.as_str(),
         lessons_digest.as_str(),
     ];
-    if identities.iter().any(|value| {
-        value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
-    }) || [
-        *project_generation,
-        *candidate_generation,
-        *release_generation,
-        *acceptance_generation,
-    ]
-    .contains(&0)
+    if identities
+        .iter()
+        .any(|value| value.is_empty() || value.len() > 128 || value.chars().any(char::is_control))
+        || [
+            *project_generation,
+            *candidate_generation,
+            *release_generation,
+            *acceptance_generation,
+        ]
+        .contains(&0)
         || digests.iter().any(|value| !is_sha256_hex(value))
     {
         return Err("project closeout identity, generation, or digest is invalid");
@@ -3176,34 +3177,27 @@ mod tests {
             tenant_id: "tenant-a".to_string(),
             project_id: "project-a".to_string(),
             project_generation: 7,
-            project_digest:
-                "1111111111111111111111111111111111111111111111111111111111111111"
-                    .to_string(),
+            project_digest: "1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
             candidate_id: "candidate-a".to_string(),
             candidate_generation: 3,
             candidate_digest: candidate_digest.to_string(),
             release_id: "release-a".to_string(),
             release_generation: 2,
-            release_digest:
-                "2222222222222222222222222222222222222222222222222222222222222222"
-                    .to_string(),
+            release_digest: "2222222222222222222222222222222222222222222222222222222222222222"
+                .to_string(),
             acceptance_id: "acceptance-a".to_string(),
             acceptance_generation: 1,
-            acceptance_digest:
-                "3333333333333333333333333333333333333333333333333333333333333333"
-                    .to_string(),
-            decisions_digest:
-                "4444444444444444444444444444444444444444444444444444444444444444"
-                    .to_string(),
+            acceptance_digest: "3333333333333333333333333333333333333333333333333333333333333333"
+                .to_string(),
+            decisions_digest: "4444444444444444444444444444444444444444444444444444444444444444"
+                .to_string(),
             artifact_inventory_digest:
-                "5555555555555555555555555555555555555555555555555555555555555555"
-                    .to_string(),
-            failures_digest:
-                "6666666666666666666666666666666666666666666666666666666666666666"
-                    .to_string(),
-            lessons_digest:
-                "7777777777777777777777777777777777777777777777777777777777777777"
-                    .to_string(),
+                "5555555555555555555555555555555555555555555555555555555555555555".to_string(),
+            failures_digest: "6666666666666666666666666666666666666666666666666666666666666666"
+                .to_string(),
+            lessons_digest: "7777777777777777777777777777777777777777777777777777777777777777"
+                .to_string(),
         }
     }
 
@@ -3212,8 +3206,7 @@ mod tests {
         let (hippocampus, dir) = temp_hippocampus();
         let event_store = temp_event_store(&dir);
         let producer = EpisodeProducer::new(hippocampus, &[], &event_store).unwrap();
-        let candidate_digest =
-            "8888888888888888888888888888888888888888888888888888888888888888";
+        let candidate_digest = "8888888888888888888888888888888888888888888888888888888888888888";
 
         let (name, episode) = producer
             .event_to_episode(&project_closeout_payload(candidate_digest), 15, 0.0)
@@ -3238,11 +3231,7 @@ mod tests {
         let (hippocampus, dir) = temp_hippocampus();
         let event_store = temp_event_store(&dir);
         let mut producer = EpisodeProducer::new(hippocampus, &[], &event_store).unwrap();
-        let source_row_id = append_payload(
-            &event_store,
-            &project_closeout_payload("short"),
-            10,
-        );
+        let source_row_id = append_payload(&event_store, &project_closeout_payload("short"), 10);
 
         assert!(producer
             .event_to_episode(&project_closeout_payload("short"), 16, 0.0)

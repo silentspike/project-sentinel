@@ -547,7 +547,10 @@ impl DeliveryEffectRequestV1 {
             DeliveryEffectKind::GovernedRework => {
                 self.candidate.is_some()
                     && self.target.is_none()
-                    && self.feedback_digest.as_ref().is_some_and(|value| *value != ContentDigest::zero())
+                    && self
+                        .feedback_digest
+                        .as_ref()
+                        .is_some_and(|value| *value != ContentDigest::zero())
                     && self.closeout_memory.is_none()
                     && self.actor.has_role(AuthorityRole::Customer)
             }
