@@ -4508,6 +4508,7 @@ dependencies = [
  "sentinel-sandbox",
  "sentinel-telemetry",
  "sentinel-wasm",
+ "sentinel-workflow",
  "sentinel-zenoh",
  "serde",
  "serde_json",

@@ -361,24 +361,21 @@ impl CompanyAuthority {
         let runtime = self
             .snapshot(tenant_id, project_id, work_item_id, agent_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let project = self
-            .store
-            .company_project(tenant_id, project_id)?
-            .ok_or_else(|| anyhow::anyhow!("company project is unavailable"))?;
-        let work = project
-            .work_items
-            .get(work_item_id)
-            .ok_or_else(|| anyhow::anyhow!("company work item is unavailable"))?;
-        let assignment = work
-            .assignments
-            .iter()
-            .find(|value| value.active)
-            .ok_or_else(|| anyhow::anyhow!("company assignment is unavailable"))?;
-        let role_capabilities = role_capabilities(assignment.role, &self.workbench_profile);
+        let principal = self
+            .principals
+            .principal(&runtime.principal.principal_id)
+            .filter(|principal| {
+                principal.execution_authority == runtime.principal
+                    && principal.principal.agent_id == Some(agent_id)
+                    && principal.principal.tenant_id == *tenant_id
+            })
+            .ok_or_else(|| anyhow::anyhow!("workbench principal authority changed"))?;
+        let role = principal.principal.role;
+        let role_capabilities = role_capabilities(role, &self.workbench_profile);
         Ok(WorkbenchAuthoritySnapshot {
             agent_id,
             caller_id: runtime.principal.principal_id,
-            caller_role: role_name(assignment.role).to_owned(),
+            caller_role: role_name(role).to_owned(),
             project_id: project_id.0.clone(),
             work_item_id: work_item_id.0.clone(),
             assignment_version: runtime.assignment_version,
@@ -512,6 +509,9 @@ impl WorkbenchExecutionAdapter {
             &work.work_item_id,
             work.agent_id,
         )?;
+        if !work.plan.authority_matches(&authority) {
+            return Err(WorkflowPortError::AuthorityConflict);
+        }
         let caller = self
             .authority
             .principals
@@ -1000,6 +1000,7 @@ pub struct WorkflowApi {
     enabled: bool,
     scan_succeeded: AtomicBool,
     last_error: Mutex<Option<String>>,
+    company_sync_cursor: Mutex<Option<(TenantId, ProjectId, WorkItemId)>>,
 }
 
 impl std::fmt::Debug for WorkflowApi {
@@ -1070,6 +1071,7 @@ impl WorkflowApi {
             enabled: true,
             scan_succeeded: AtomicBool::new(false),
             last_error: Mutex::new(None),
+            company_sync_cursor: Mutex::new(None),
         })
     }
 
@@ -1096,6 +1098,7 @@ impl WorkflowApi {
             enabled: false,
             scan_succeeded: AtomicBool::new(false),
             last_error: Mutex::new(None),
+            company_sync_cursor: Mutex::new(None),
         })
     }
 
@@ -1420,6 +1423,36 @@ impl WorkflowApi {
             let work = self.core.reconcile_gate_evidence(&pending, now_unix_ms())?;
             self.sync_company_state(&work)?;
         }
+        self.reconcile_company_state_page()?;
+        Ok(())
+    }
+
+    fn reconcile_company_state_page(&self) -> Result<(), WorkflowError> {
+        let cursor = self
+            .company_sync_cursor
+            .lock()
+            .map_err(|_| workflow_persistence_failure())?
+            .clone();
+        let page = self.store.workflow_items_after(
+            cursor
+                .as_ref()
+                .map(|(tenant, project, work)| (tenant, project, work)),
+            MAX_RECONCILE_BATCH,
+        )?;
+        for execution in &page {
+            self.sync_company_state(execution)?;
+        }
+        let next = page.last().map(|execution| {
+            (
+                execution.tenant_id.clone(),
+                execution.project_id.clone(),
+                execution.work_item_id.clone(),
+            )
+        });
+        *self
+            .company_sync_cursor
+            .lock()
+            .map_err(|_| workflow_persistence_failure())? = next;
         Ok(())
     }
 
@@ -1427,102 +1460,134 @@ impl WorkflowApi {
         &self,
         execution: &sentinel_workflow::WorkItemExecutionV1,
     ) -> Result<(), WorkflowError> {
-        let project = self
-            .store
-            .company_project(&execution.tenant_id, &execution.project_id)?
-            .ok_or_else(|| {
-                WorkflowError::new(WorkflowErrorCode::NotFound, false, "project not found")
-            })?;
-        let work = project
-            .work_items
-            .get(&execution.work_item_id)
-            .ok_or_else(|| {
-                WorkflowError::new(WorkflowErrorCode::NotFound, false, "work item not found")
-            })?;
-        let assignment = work
-            .assignments
-            .iter()
-            .find(|value| value.active)
-            .ok_or_else(|| {
-                WorkflowError::new(
+        for _ in 0..3 {
+            let project = self
+                .store
+                .company_project(&execution.tenant_id, &execution.project_id)?
+                .ok_or_else(|| {
+                    WorkflowError::new(WorkflowErrorCode::NotFound, false, "project not found")
+                })?;
+            let work = project
+                .work_items
+                .get(&execution.work_item_id)
+                .ok_or_else(|| {
+                    WorkflowError::new(WorkflowErrorCode::NotFound, false, "work item not found")
+                })?;
+            let assignment = work
+                .assignments
+                .iter()
+                .find(|value| value.active)
+                .ok_or_else(|| {
+                    WorkflowError::new(
+                        WorkflowErrorCode::AuthorityConflict,
+                        false,
+                        "assignment unavailable",
+                    )
+                })?;
+            let Some(target) = company_transition_target(execution.state, work.state)? else {
+                return Ok(());
+            };
+            let current_authority = self
+                .authority
+                .as_ref()
+                .ok_or_else(workflow_unavailable)?
+                .snapshot(
+                    &execution.tenant_id,
+                    &execution.project_id,
+                    &execution.work_item_id,
+                    execution.agent_id,
+                )
+                .map_err(company_sync_authority_error)?;
+            if !execution.plan.authority_matches(&current_authority) {
+                return Err(WorkflowError::new(
                     WorkflowErrorCode::AuthorityConflict,
                     false,
-                    "assignment unavailable",
-                )
-            })?;
-        let Some(target) = company_transition_target(execution.state, work.state) else {
-            return Ok(());
-        };
-        let principal = if target == sentinel_workflow::CompanyWorkStateV1::Done {
-            independent_gate_principal(
-                &project.governance.participants,
-                assignment.agent_id,
-                &self.principals,
-            )?
-        } else {
-            project
-                .governance
-                .participants
-                .iter()
-                .find(|value| value.agent_id == assignment.agent_id)
-                .and_then(|value| self.principals.principal(&value.principal_id))
-                .ok_or_else(principal_unavailable)?
-        };
-        let outputs = execution
-            .terminal_execution_evidence
-            .as_ref()
-            .map(|evidence| {
-                work.spec
-                    .outputs
-                    .iter()
-                    .zip(&evidence.outputs)
-                    .map(
-                        |(contract, output)| sentinel_workflow::WorkOutputReceiptV1 {
-                            name: contract.name.clone(),
-                            contract_generation: contract.contract_generation,
-                            contract_digest: contract.contract_digest.clone(),
-                            content_digest: output.digest.clone(),
-                        },
-                    )
-                    .collect()
-            })
-            .unwrap_or_default();
-        let gate_receipt = company_gate_receipt(target, execution.gate_evidence.as_ref())?;
-        let receipt = sentinel_workflow::WorkTransitionReceiptV1 {
-            schema_version: sentinel_workflow::COMPANY_DOMAIN_SCHEMA_VERSION,
-            project_id: project.project_id.clone(),
-            work_item_id: execution.work_item_id.clone(),
-            expected_project_version: project.version,
-            expected_work_version: work.version,
-            expected_assignment_version: assignment.assignment_version,
-            from_state: work.state,
-            to_state: target,
-            output_receipts: outputs,
-            gate_receipt,
-            phase_a_evidence_digest: execution.plan.request_digest.clone(),
-            reason_ref: if target == sentinel_workflow::CompanyWorkStateV1::Done {
-                "independent-quality-gate-evidence".to_owned()
+                    "company transition authority changed after execution",
+                ));
+            }
+            let principal = if target == sentinel_workflow::CompanyWorkStateV1::Done {
+                independent_gate_principal(
+                    &project.governance.participants,
+                    assignment.agent_id,
+                    &self.principals,
+                )?
             } else {
-                "sealed-workbench-evidence".to_owned()
-            },
-            occurred_at_unix_ms: now_unix_ms(),
-        };
-        let command = CompanyWorkflowCommandV1::ApplyWorkTransition {
-            project_id: project.project_id,
-            expected_version: project.version,
-            receipt,
-        };
-        let operation_id = stable_operation_id(
-            "work-transition",
-            &execution.plan.request_digest,
-            execution.version,
-        );
-        self.core.apply_company_command(
-            &principal.principal,
-            operation_id,
-            &command,
-            now_unix_ms(),
-        )?;
+                project
+                    .governance
+                    .participants
+                    .iter()
+                    .find(|value| value.agent_id == assignment.agent_id)
+                    .and_then(|value| self.principals.principal(&value.principal_id))
+                    .ok_or_else(principal_unavailable)?
+            };
+            let outputs = if matches!(
+                target,
+                sentinel_workflow::CompanyWorkStateV1::InReview
+                    | sentinel_workflow::CompanyWorkStateV1::Done
+            ) {
+                execution
+                    .terminal_execution_evidence
+                    .as_ref()
+                    .map(|evidence| {
+                        work.spec
+                            .outputs
+                            .iter()
+                            .zip(&evidence.outputs)
+                            .map(
+                                |(contract, output)| sentinel_workflow::WorkOutputReceiptV1 {
+                                    name: contract.name.clone(),
+                                    contract_generation: contract.contract_generation,
+                                    contract_digest: contract.contract_digest.clone(),
+                                    content_digest: output.digest.clone(),
+                                },
+                            )
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let gate_receipt = company_gate_receipt(target, execution.gate_evidence.as_ref())?;
+            let occurred_at = now_unix_ms();
+            let receipt = sentinel_workflow::WorkTransitionReceiptV1 {
+                schema_version: sentinel_workflow::COMPANY_DOMAIN_SCHEMA_VERSION,
+                project_id: project.project_id.clone(),
+                work_item_id: execution.work_item_id.clone(),
+                expected_project_version: project.version,
+                expected_work_version: work.version,
+                expected_assignment_version: assignment.assignment_version,
+                from_state: work.state,
+                to_state: target,
+                output_receipts: outputs,
+                gate_receipt,
+                phase_a_evidence_digest: execution.plan.request_digest.clone(),
+                reason_ref: match target {
+                    sentinel_workflow::CompanyWorkStateV1::Done => {
+                        "independent-quality-gate-evidence"
+                    }
+                    sentinel_workflow::CompanyWorkStateV1::Blocked => "workbench-execution-blocked",
+                    _ => "sealed-workbench-evidence",
+                }
+                .to_owned(),
+                occurred_at_unix_ms: occurred_at,
+            };
+            let command = CompanyWorkflowCommandV1::ApplyWorkTransition {
+                project_id: project.project_id,
+                expected_version: project.version,
+                receipt,
+            };
+            let operation_id = stable_operation_id(
+                company_transition_operation(target),
+                &execution.plan.request_digest,
+                execution.version,
+            );
+            self.core.apply_company_command(
+                &principal.principal,
+                operation_id,
+                &command,
+                occurred_at,
+            )?;
+        }
         Ok(())
     }
 
@@ -1575,24 +1640,90 @@ fn principal_unavailable() -> WorkflowError {
     )
 }
 
+fn workflow_persistence_failure() -> WorkflowError {
+    WorkflowError::new(
+        WorkflowErrorCode::PersistenceFailure,
+        true,
+        "workflow synchronization state is unavailable",
+    )
+}
+
+fn company_sync_authority_error(error: WorkflowPortError) -> WorkflowError {
+    match error {
+        WorkflowPortError::Unavailable => WorkflowError::new(
+            WorkflowErrorCode::OrganizationUnavailable,
+            true,
+            "company transition authority is unavailable",
+        ),
+        _ => WorkflowError::new(
+            WorkflowErrorCode::AuthorityConflict,
+            false,
+            "company transition authority is invalid or stale",
+        ),
+    }
+}
+
 fn company_transition_target(
     execution: sentinel_workflow::WorkItemState,
     company: sentinel_workflow::CompanyWorkStateV1,
-) -> Option<sentinel_workflow::CompanyWorkStateV1> {
-    match (execution, company) {
+) -> Result<Option<sentinel_workflow::CompanyWorkStateV1>, WorkflowError> {
+    let target = match (execution, company) {
         (
             sentinel_workflow::WorkItemState::InProgress,
             sentinel_workflow::CompanyWorkStateV1::Assigned,
         ) => Some(sentinel_workflow::CompanyWorkStateV1::InProgress),
         (
-            sentinel_workflow::WorkItemState::InReview,
+            sentinel_workflow::WorkItemState::InReview | sentinel_workflow::WorkItemState::Done,
+            sentinel_workflow::CompanyWorkStateV1::Assigned,
+        ) => Some(sentinel_workflow::CompanyWorkStateV1::InProgress),
+        (
+            sentinel_workflow::WorkItemState::InReview | sentinel_workflow::WorkItemState::Done,
             sentinel_workflow::CompanyWorkStateV1::InProgress,
         ) => Some(sentinel_workflow::CompanyWorkStateV1::InReview),
         (
             sentinel_workflow::WorkItemState::Done,
             sentinel_workflow::CompanyWorkStateV1::InReview,
         ) => Some(sentinel_workflow::CompanyWorkStateV1::Done),
-        _ => None,
+        (
+            sentinel_workflow::WorkItemState::Blocked | sentinel_workflow::WorkItemState::Cancelled,
+            sentinel_workflow::CompanyWorkStateV1::Assigned
+            | sentinel_workflow::CompanyWorkStateV1::InProgress,
+        ) => Some(sentinel_workflow::CompanyWorkStateV1::Blocked),
+        (
+            sentinel_workflow::WorkItemState::Assigned | sentinel_workflow::WorkItemState::Claimed,
+            sentinel_workflow::CompanyWorkStateV1::Assigned,
+        )
+        | (
+            sentinel_workflow::WorkItemState::InProgress,
+            sentinel_workflow::CompanyWorkStateV1::InProgress,
+        )
+        | (
+            sentinel_workflow::WorkItemState::InReview,
+            sentinel_workflow::CompanyWorkStateV1::InReview,
+        )
+        | (sentinel_workflow::WorkItemState::Done, sentinel_workflow::CompanyWorkStateV1::Done)
+        | (
+            sentinel_workflow::WorkItemState::Blocked | sentinel_workflow::WorkItemState::Cancelled,
+            sentinel_workflow::CompanyWorkStateV1::Blocked,
+        ) => None,
+        _ => {
+            return Err(WorkflowError::new(
+                WorkflowErrorCode::AuthorityConflict,
+                false,
+                "company and execution work states cannot be reconciled",
+            ))
+        }
+    };
+    Ok(target)
+}
+
+fn company_transition_operation(target: sentinel_workflow::CompanyWorkStateV1) -> &'static str {
+    match target {
+        sentinel_workflow::CompanyWorkStateV1::InProgress => "work-transition-in-progress",
+        sentinel_workflow::CompanyWorkStateV1::InReview => "work-transition-in-review",
+        sentinel_workflow::CompanyWorkStateV1::Done => "work-transition-done",
+        sentinel_workflow::CompanyWorkStateV1::Blocked => "work-transition-blocked",
+        _ => "work-transition-invalid",
     }
 }
 
@@ -1619,11 +1750,11 @@ fn company_gate_receipt(
     }))
 }
 
-fn independent_gate_principal<'a>(
+fn independent_gate_principal(
     participants: &[sentinel_workflow::ParticipantBindingV1],
     assignee: AgentId,
-    principals: &'a PrincipalAuthenticator,
-) -> Result<&'a BoundPrincipal, WorkflowError> {
+    principals: &PrincipalAuthenticator,
+) -> Result<BoundPrincipal, WorkflowError> {
     [CompanyRoleV1::Qa, CompanyRoleV1::ReleaseManager]
         .into_iter()
         .find_map(|role| {
@@ -1976,12 +2107,29 @@ mod tests {
         use sentinel_workflow::{CompanyWorkStateV1, GateEvidenceReadbackV1, WorkItemState};
 
         assert_eq!(
-            company_transition_target(WorkItemState::Done, CompanyWorkStateV1::InReview),
+            company_transition_target(WorkItemState::Done, CompanyWorkStateV1::InReview).unwrap(),
             Some(CompanyWorkStateV1::Done)
         );
         assert_eq!(
-            company_transition_target(WorkItemState::Done, CompanyWorkStateV1::InProgress),
+            company_transition_target(WorkItemState::Done, CompanyWorkStateV1::InProgress).unwrap(),
+            Some(CompanyWorkStateV1::InReview)
+        );
+        assert_eq!(
+            company_transition_target(WorkItemState::Done, CompanyWorkStateV1::Assigned).unwrap(),
+            Some(CompanyWorkStateV1::InProgress)
+        );
+        assert_eq!(
+            company_transition_target(WorkItemState::Assigned, CompanyWorkStateV1::Assigned)
+                .unwrap(),
             None
+        );
+        assert_eq!(
+            company_transition_target(WorkItemState::Blocked, CompanyWorkStateV1::InProgress)
+                .unwrap(),
+            Some(CompanyWorkStateV1::Blocked)
+        );
+        assert!(
+            company_transition_target(WorkItemState::InProgress, CompanyWorkStateV1::Done).is_err()
         );
         assert!(company_gate_receipt(CompanyWorkStateV1::Done, None).is_err());
 
