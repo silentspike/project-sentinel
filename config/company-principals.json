@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "bindings": [
+    {
+      "credential_name": "workflow-customer",
+      "tenant_id": "m0-company",
+      "principal_id": "customer-m0",
+      "kind": "customer",
+      "role": "customer",
+      "customer_id": "customer-m0",
+      "agent_id": null,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-sales",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-11-sales",
+      "kind": "agent",
+      "role": "sales",
+      "customer_id": null,
+      "agent_id": 11,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-project-manager",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-09-project-manager",
+      "kind": "agent",
+      "role": "project_manager",
+      "customer_id": null,
+      "agent_id": 9,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-technical-lead",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-05-technical-lead",
+      "kind": "agent",
+      "role": "technical_lead",
+      "customer_id": null,
+      "agent_id": 5,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-designer",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-03-designer",
+      "kind": "agent",
+      "role": "designer",
+      "customer_id": null,
+      "agent_id": 3,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-developer",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-06-developer",
+      "kind": "agent",
+      "role": "developer",
+      "customer_id": null,
+      "agent_id": 6,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-qa",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-55-qa",
+      "kind": "agent",
+      "role": "qa",
+      "customer_id": null,
+      "agent_id": 55,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-release-manager",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-56-release-manager",
+      "kind": "agent",
+      "role": "release_manager",
+      "customer_id": null,
+      "agent_id": 56,
+      "authority_generation": 1
+    }
+  ]
+}

@@ -1923,6 +1923,17 @@ async fn run_owner_snapshot_reconciliation(
     }
 }
 
+fn join_workflow_reconciler(handle: std::thread::JoinHandle<()>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    handle.join().is_ok()
+}
+
 /// Startet den Daemon-Hauptloop.
 ///
 /// 1. Oeffnet EventStore + StateStore
@@ -2747,6 +2758,38 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     };
     let operator_room_ids = room_distances.all_rooms().to_vec();
 
+    let workflow_agent_capabilities = all_agents
+        .iter()
+        .map(|agent| {
+            let capabilities = agent
+                .capabilities
+                .tools
+                .iter()
+                .filter(|capability| {
+                    matches!(
+                        capability.as_str(),
+                        "file.inspect"
+                            | "file.write"
+                            | "patch.apply"
+                            | "command.run_allowlisted"
+                            | "test.run_profile"
+                            | "artifact.commit"
+                    )
+                })
+                .cloned()
+                .collect();
+            (AgentId(agent.identity.id), capabilities)
+        })
+        .collect();
+    let workflow_api = Arc::new(
+        crate::workflow_api::WorkflowApi::open(
+            data_dir,
+            &config.config_dir,
+            workflow_agent_capabilities,
+        )
+        .context("initialize M0 company workflow")?,
+    );
+
     // -- Platform LLM Analyzer starten (daemon-interner Background-Worker) --
     #[cfg(feature = "llm")]
     let platform_llm_analyzer = {
@@ -2799,6 +2842,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 Arc::clone(&state_store),
                 Arc::clone(&platform_state),
                 Arc::clone(&runtime_health),
+                Arc::clone(&workflow_api),
                 Arc::clone(&episode_projection_admission),
                 episode_projection_tx.clone(),
                 Arc::clone(&security_runtime_state),
@@ -2842,6 +2886,18 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let events_db_path = events_path.to_string_lossy().to_string();
     let ecs_platform_state = Arc::clone(&platform_state);
     let ecs_runtime_health = Arc::clone(&runtime_health);
+    let workflow_reconciler = Arc::clone(&workflow_api);
+    let workflow_shutdown = Arc::clone(&shutdown);
+    let workflow_reconcile_handle = std::thread::Builder::new()
+        .name("company-workflow-reconcile".into())
+        .spawn(move || {
+            while !workflow_shutdown.load(Ordering::SeqCst) {
+                workflow_reconciler
+                    .reconcile_pending_until(|| workflow_shutdown.load(Ordering::SeqCst));
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        })
+        .context("start M0 company workflow reconciler")?;
     let ecs_llm_circuit_open = Arc::clone(&llm_circuit_open);
     let ecs_llm_activity_ticks = Arc::clone(&llm_activity_ticks);
     let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
@@ -3145,6 +3201,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- Graceful Shutdown --
     info!("Shutdown eingeleitet...");
     shutdown.store(true, Ordering::SeqCst);
+    // The reconciler's bounded Workbench response wait is five seconds. Give
+    // an in-flight batch one extra second while keeping the existing ECS join
+    // inside systemd's 15-second stop budget.
+    if !join_workflow_reconciler(workflow_reconcile_handle, Duration::from_secs(6)) {
+        warn!("Company-Workflow-Reconciler konnte nicht sauber beendet werden");
+    }
     if let Some(handle) = operator_api_handle {
         handle.abort();
     }
@@ -11363,6 +11425,25 @@ mod tests {
     use std::sync::Arc;
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn workflow_reconciler_observes_shutdown_and_joins() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_stopped = Arc::clone(&stopped);
+        let handle = std::thread::spawn(move || {
+            while !worker_shutdown.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker_stopped.store(true, Ordering::SeqCst);
+        });
+
+        shutdown.store(true, Ordering::SeqCst);
+
+        assert!(join_workflow_reconciler(handle, Duration::from_secs(1)));
+        assert!(stopped.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn episode_projection_cutover_restarts_after_secret_and_config_removal() {

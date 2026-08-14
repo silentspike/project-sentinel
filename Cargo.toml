@@ -23,6 +23,7 @@ members = [
     "crates/sentinel-runtime",
     "crates/sentinel-hippocampus",
     "crates/sentinel-gaia-memory",
+    "crates/sentinel-workflow",
     "crates/sentinel-projection",
     "crates/sentinel-fs",
     "crates/sentinel-console-plane",
