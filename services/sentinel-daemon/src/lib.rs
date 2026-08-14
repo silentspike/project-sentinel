@@ -11,6 +11,7 @@ pub mod config;
 pub mod config_apply;
 pub mod config_persist;
 pub mod controlplane;
+pub mod delivery;
 pub mod ebpf;
 pub mod episode_producer;
 pub mod evolution_task;

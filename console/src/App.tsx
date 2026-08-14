@@ -25,6 +25,7 @@ import { SynthesisView } from "./views/SynthesisView";
 import { CostView } from "./views/CostView";
 import { OrgChartView } from "./views/OrgChartView";
 import { AgentDeepView } from "./views/AgentDeepView";
+import { DeliveryView } from "./views/DeliveryView";
 
 // Mobile-Breakpoint via matchMedia (Desktop=Tiling, Mobile=BottomTabBar).
 function useIsMobile() {
@@ -128,6 +129,7 @@ export default function App(): JSX.Element {
   const [authed, setAuthed] = createSignal(false);
   const isMobile = useIsMobile();
   const [tab, setTab] = createSignal<PanelKind>("agents");
+  const [deliveryOpen, setDeliveryOpen] = createSignal(false);
 
   onMount(async () => {
     setAuthed(await authStatus());
@@ -141,6 +143,12 @@ export default function App(): JSX.Element {
   return (
     <Show when={authed()} fallback={<Login onOk={() => setAuthed(true)} />}>
       <div data-testid="shell" style={{ height: "100%", display: "flex", "flex-direction": "column" }}>
+        <nav data-testid="product-navigation" style={{ display: "flex", padding: "6px var(--gap)", "border-bottom": "1px solid var(--border)", background: "var(--surface-0)" }}>
+          <button data-testid="open-delivery" onClick={() => setDeliveryOpen((open) => !open)}>
+            {deliveryOpen() ? "Back to workspace" : "Delivery"}
+          </button>
+        </nav>
+        <Show when={!deliveryOpen()} fallback={<main data-testid="delivery-product-surface" style={{ flex: 1, "min-height": 0 }}><DeliveryView /></main>}>
         <Show
           when={!isMobile()}
           fallback={
@@ -170,6 +178,7 @@ export default function App(): JSX.Element {
           <main data-testid="tiling-root" style={{ flex: 1, "min-height": 0, padding: "var(--gap)" }}>
             <Tiling node={tilingTree.root} renderPanel={renderPanel} />
           </main>
+        </Show>
         </Show>
       </div>
       <ToastContainer />
