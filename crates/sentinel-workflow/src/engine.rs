@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::digest::constant_time_eq;
 use crate::model::{sealed_output_bundle_digest, validate_digest, validate_identifier};
 use crate::{
@@ -9,7 +11,7 @@ use crate::{
 };
 
 pub struct WorkflowCore<O, E, C, G> {
-    store: WorkflowStore,
+    store: Arc<WorkflowStore>,
     organization: O,
     execution: E,
     completion: C,
@@ -24,14 +26,14 @@ where
     G: GateEvidencePort,
 {
     pub fn new(
-        store: WorkflowStore,
+        store: impl Into<Arc<WorkflowStore>>,
         organization: O,
         execution: E,
         completion: C,
         gate: G,
     ) -> Self {
         Self {
-            store,
+            store: store.into(),
             organization,
             execution,
             completion,
@@ -41,6 +43,17 @@ where
 
     pub fn store(&self) -> &WorkflowStore {
         &self.store
+    }
+
+    pub fn dependencies_ready(&self) -> bool {
+        [
+            self.organization.readiness(),
+            self.execution.readiness(),
+            self.completion.readiness(),
+            self.gate.readiness(),
+        ]
+        .into_iter()
+        .all(|readiness| readiness == DependencyReadiness::Ready)
     }
 
     pub fn apply_company_command(

@@ -254,6 +254,23 @@ The daemon validates authorization before dispatch. The runtime validates reques
 
 Stdout/stderr are bounded and redacted. Full private logs may live in protected runtime storage; public events carry structured summaries and safe references.
 
+### Productive workflow service
+
+The daemon exposes the bounded workflow through separate authenticated customer and agent command surfaces. Caller-supplied display names, roles, tenant IDs, assignment IDs, and authority digests are never credentials. A root-owned principal binding maps independent systemd credentials to one tenant, principal kind, company role, and authority generation; the daemon derives the authority digest from the credential bytes and rejects missing, aliased, mutable, or ambiguous bindings.
+
+The productive service composes four explicit ports:
+
+1. organization authority from the current durable project, assignment, hierarchy, profile, and agent capability set;
+2. work execution through the exact #694 Workbench invocation and bwrap NanoRuntime handle;
+3. completion evidence from the terminal, digest-bound Workbench record and immutable artifact manifests;
+4. independent gate evidence from the #696 QA and delivery composition.
+
+Readiness is fail closed until every port is ready, the workflow store can be read, and at least one complete recovery scan has succeeded. A successful empty scan is not sufficient while a required port is unavailable. Recovery uses stable plan, invocation, operation, and evidence identities: it probes or resumes existing work and never creates a second tool effect merely because the daemon restarted or a response timed out.
+
+The workflow store is the command and recovery authority for customer requests, agreements, projects, work graphs, assignments, decisions, blockers, execution linkage, and company projections. Workbench redb remains the authority for tool execution and artifacts; #696 remains the authority for QA, promotion, release, and delivery. These stores exchange sealed identifiers and digests rather than sharing mutable ownership.
+
+During shutdown the workflow reconciler stops accepting another batch and is joined before the ECS runtime is torn down. If it cannot quiesce within the bounded shutdown window, shutdown is reported degraded rather than claiming a clean workflow stop.
+
 ## Runtime and Security Contract
 
 The production daemon selects runtimes through `NanoRuntimeRegistry`. `web-project-v1` selects bwrap for tool-bearing work. Secure-runtime unavailability is a typed failure, never permission to run on the host or fall back to ECS-only.

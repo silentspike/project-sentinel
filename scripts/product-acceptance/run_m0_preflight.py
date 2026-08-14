@@ -300,6 +300,14 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
         "scripts/product-acceptance/m0-readiness/readiness.py",
         "script",
     ),
+    "/opt/sentinel/scripts/init-company-workflow-auth.sh": (
+        "deploy/scripts/init-company-workflow-auth.sh",
+        "script",
+    ),
+    "/opt/sentinel/config/company-principals.json": (
+        "config/company-principals.json",
+        "config",
+    ),
     str(M0_PROFILE_PATH): ("config/work-profiles/web-project-v1.toml", "config"),
     str(M0_WORKBENCH_PROFILE_PATH): (
         "config/workbench-profiles/web-authoring-v1.toml",

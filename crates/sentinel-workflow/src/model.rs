@@ -239,9 +239,9 @@ impl ExecutionToolV1 {
         match self {
             Self::InspectFile { .. } => "file.inspect",
             Self::WriteFile { .. } => "file.write",
-            Self::ApplyPatch { .. } => "file.patch",
+            Self::ApplyPatch { .. } => "patch.apply",
             Self::RunCommand { .. } => "command.run_allowlisted",
-            Self::RunTests { .. } => "test.run",
+            Self::RunTests { .. } => "test.run_profile",
             Self::PackageArtifact { .. } => "artifact.commit",
         }
     }

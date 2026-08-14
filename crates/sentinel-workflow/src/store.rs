@@ -397,6 +397,15 @@ impl WorkflowStore {
         Ok(work_item)
     }
 
+    /// Returns the exact durable execution context after validating that the
+    /// supplied outbox request is still the current stored request.
+    pub fn execution_context(
+        &self,
+        request: &PendingExecutionV1,
+    ) -> Result<WorkItemExecutionV1, WorkflowError> {
+        self.execution_work_item(request)
+    }
+
     pub(crate) fn record_execution_observation(
         &self,
         request: &PendingExecutionV1,
@@ -498,6 +507,15 @@ impl WorkflowStore {
             .ok_or_else(corrupt_store)?;
         let completed = validate_completion_request(&connection, &work_item, request)?;
         Ok((work_item, completed))
+    }
+
+    /// Returns the exact durable completion context and whether its evidence
+    /// has already been adopted.
+    pub fn completion_context(
+        &self,
+        request: &PendingCompletionEvidenceV1,
+    ) -> Result<(WorkItemExecutionV1, bool), WorkflowError> {
+        self.completion_work_item(request)
     }
 
     pub(crate) fn record_terminal_evidence(

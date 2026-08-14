@@ -34,6 +34,7 @@ ARTIFACT_DEFS=(
   "config/rooms.toml|/opt/sentinel/config/rooms.toml|config"
   "config/company.toml|/opt/sentinel/config/company.toml|config"
   "config/controlplane.toml|/opt/sentinel/config/controlplane.toml|config"
+  "config/company-principals.json|/opt/sentinel/config/company-principals.json|config"
   "config/workbench-profiles/web-authoring-v1.toml|/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml|config"
   "config/nats.conf|/etc/nats/nats.conf|config"
   # systemd units
@@ -54,6 +55,7 @@ ARTIFACT_DEFS=(
   "deploy/scripts/init-dirs.sh|/opt/sentinel/scripts/init-dirs.sh|script"
   "deploy/scripts/init-runtime-base-dirs.sh|/opt/sentinel/scripts/init-runtime-base-dirs.sh|script"
   "deploy/scripts/init-dashboard-auth.sh|/opt/sentinel/scripts/init-dashboard-auth.sh|script"
+  "deploy/scripts/init-company-workflow-auth.sh|/opt/sentinel/scripts/init-company-workflow-auth.sh|script"
   "deploy/scripts/install-native-claude.sh|/opt/sentinel/scripts/install-native-claude.sh|script"
   "deploy/scripts/init-hugepages.sh|/opt/sentinel/scripts/init-hugepages.sh|script"
   "deploy/scripts/init-sysctl.sh|/opt/sentinel/scripts/init-sysctl.sh|script"

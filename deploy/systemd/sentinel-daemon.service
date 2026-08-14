@@ -26,10 +26,19 @@ LoadCredential=caller-agent-runtime:/etc/sentinel/credentials/caller-agent-runti
 LoadCredential=caller-platform:/etc/sentinel/credentials/caller-platform
 LoadCredential=caller-evolution:/etc/sentinel/credentials/caller-evolution
 LoadCredential=operator-api:/etc/sentinel/credentials/operator-api
+LoadCredential=workflow-customer:/etc/sentinel/credentials/workflow-customer
+LoadCredential=workflow-sales:/etc/sentinel/credentials/workflow-sales
+LoadCredential=workflow-project-manager:/etc/sentinel/credentials/workflow-project-manager
+LoadCredential=workflow-technical-lead:/etc/sentinel/credentials/workflow-technical-lead
+LoadCredential=workflow-designer:/etc/sentinel/credentials/workflow-designer
+LoadCredential=workflow-developer:/etc/sentinel/credentials/workflow-developer
+LoadCredential=workflow-qa:/etc/sentinel/credentials/workflow-qa
+LoadCredential=workflow-release-manager:/etc/sentinel/credentials/workflow-release-manager
 Environment=SENTINEL_AGENT_RUNTIME_CREDENTIAL_FILE=%d/caller-agent-runtime
 Environment=SENTINEL_PLATFORM_CREDENTIAL_FILE=%d/caller-platform
 Environment=SENTINEL_EVOLUTION_CREDENTIAL_FILE=%d/caller-evolution
 Environment=SENTINEL_OPERATOR_CREDENTIAL_FILE=%d/operator-api
+Environment=SENTINEL_COMPANY_WORKFLOW_ENABLED=true
 # Cutover invariant: remain false until the independent hierarchy projection
 # has backfilled to the recorded boundary.
 Environment=SENTINEL_LLM_USAGE_V2_ENABLED=false
