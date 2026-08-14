@@ -2,7 +2,7 @@ module github.com/silentspike/project-sentinel/services/sentinel-nats-bridge
 
 go 1.26.0
 
-toolchain go1.26.4
+toolchain go1.26.6
 
 require (
 	github.com/BurntSushi/toml v1.6.0
