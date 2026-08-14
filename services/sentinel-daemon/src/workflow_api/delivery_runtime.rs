@@ -1340,9 +1340,9 @@ impl LimboDeliveryEffects {
         let candidate = request.candidate.as_ref().ok_or_else(|| {
             DeliveryError::Validation("rework candidate is absent".to_string())
         })?;
-        let operation_id = uuid::Uuid::parse_str(
-            &uuid_from_digest(request.request_digest.as_str())?
-        )
+        let operation_uuid =
+            uuid_from_digest(request.request_digest.as_str()).map_err(storage_error)?;
+        let operation_id = uuid::Uuid::parse_str(&operation_uuid)
         .map_err(|error| DeliveryError::Validation(error.to_string()))?;
         let outcome = self
             .workflow

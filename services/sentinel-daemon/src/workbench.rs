@@ -1671,7 +1671,7 @@ fn validate_agent_runtime_marker(root: &Path, agent_id: AgentId) -> anyhow::Resu
 }
 
 fn secure_child_directory(parent: &Path, child: &str) -> anyhow::Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
 
     let child = daemon_scope_component(child)?;
     let path = parent.join(child);
