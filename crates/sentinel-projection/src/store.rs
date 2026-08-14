@@ -164,6 +164,28 @@ CREATE TABLE IF NOT EXISTS task_kanban (
     updated_at INTEGER NOT NULL
 )";
 
+const CREATE_WORKBENCH_INVOCATIONS: &str = "
+CREATE TABLE IF NOT EXISTS workbench_invocations (
+    invocation_id TEXT PRIMARY KEY,
+    agent_id INTEGER NOT NULL,
+    project_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    tool_class TEXT NOT NULL,
+    runtime_key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    cpu_time_ms INTEGER NOT NULL DEFAULT 0,
+    peak_memory_bytes INTEGER NOT NULL DEFAULT 0,
+    peak_process_count INTEGER NOT NULL DEFAULT 0,
+    bytes_read INTEGER NOT NULL DEFAULT 0,
+    bytes_written INTEGER NOT NULL DEFAULT 0,
+    artifact_bytes INTEGER NOT NULL DEFAULT 0,
+    artifact_ids TEXT NOT NULL DEFAULT '[]',
+    error_code TEXT,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+)";
+
 const CREATE_PROJECTION_WATERMARKS: &str = "
 CREATE TABLE IF NOT EXISTS projection_watermarks (
     projection_name TEXT PRIMARY KEY,
@@ -177,6 +199,8 @@ CREATE INDEX IF NOT EXISTS idx_room_live_view_last_event_id ON room_live_view(la
 CREATE INDEX IF NOT EXISTS idx_kpi_1m_last_event_id ON kpi_1m(last_event_id);
 CREATE INDEX IF NOT EXISTS idx_cost_by_agent_last_event_id ON cost_by_agent(last_event_id);
 CREATE INDEX IF NOT EXISTS idx_cost_by_hierarchy_tier_last_event_id ON cost_by_hierarchy_tier(last_event_id);
+CREATE INDEX IF NOT EXISTS idx_workbench_invocations_last_event_id ON workbench_invocations(last_event_id);
+CREATE INDEX IF NOT EXISTS idx_workbench_invocations_agent_id ON workbench_invocations(agent_id);
 ";
 
 const PROJECTION_NAME: &str = "sentinel-projection";
@@ -210,6 +234,7 @@ impl ReadModelStore {
         conn.execute_batch(CREATE_COST_HIERARCHY_PROJECTION_META)?;
         conn.execute_batch(CREATE_COST_TIMESERIES)?;
         conn.execute_batch(CREATE_TASK_KANBAN)?;
+        conn.execute_batch(CREATE_WORKBENCH_INVOCATIONS)?;
         conn.execute_batch(CREATE_PROJECTION_WATERMARKS)?;
         conn.execute_batch(CREATE_WATERMARK_INDEXES)?;
 
@@ -362,6 +387,7 @@ impl ReadModelStore {
                updated_at = 0
              WHERE id = 1;
              DELETE FROM cost_timeseries;
+             DELETE FROM workbench_invocations;
              DELETE FROM projection_watermarks;",
         )?;
         info!("All read model tables cleared");
@@ -537,6 +563,51 @@ impl ReadModelStore {
         }
         Ok(agents)
     }
+
+    pub fn get_workbench_invocation(
+        &self,
+        invocation_id: &str,
+    ) -> anyhow::Result<Option<WorkbenchInvocationView>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let result = conn.query_row(
+            "SELECT invocation_id, agent_id, project_id, work_item_id, tool_class,
+                    runtime_key, state, duration_ms, cpu_time_ms, peak_memory_bytes,
+                    peak_process_count, bytes_read, bytes_written, artifact_bytes,
+                    artifact_ids, error_code, last_event_id
+             FROM workbench_invocations WHERE invocation_id = ?1",
+            params![invocation_id],
+            |row| {
+                let artifact_ids: String = row.get(14)?;
+                Ok(WorkbenchInvocationView {
+                    invocation_id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    project_id: row.get(2)?,
+                    work_item_id: row.get(3)?,
+                    tool_class: row.get(4)?,
+                    runtime_key: row.get(5)?,
+                    state: row.get(6)?,
+                    duration_ms: row.get(7)?,
+                    cpu_time_ms: row.get(8)?,
+                    peak_memory_bytes: row.get(9)?,
+                    peak_process_count: row.get(10)?,
+                    bytes_read: row.get(11)?,
+                    bytes_written: row.get(12)?,
+                    artifact_bytes: row.get(13)?,
+                    artifact_ids: serde_json::from_str(&artifact_ids).unwrap_or_default(),
+                    error_code: row.get(15)?,
+                    last_event_id: row.get(16)?,
+                })
+            },
+        );
+        match result {
+            Ok(view) => Ok(Some(view)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 /// #427: eine Zeile aus einer der drei Cost-Read-Models. `key` ist die agent_id
@@ -674,6 +745,27 @@ pub struct RoomView {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkbenchInvocationView {
+    pub invocation_id: String,
+    pub agent_id: i64,
+    pub project_id: String,
+    pub work_item_id: String,
+    pub tool_class: String,
+    pub runtime_key: String,
+    pub state: String,
+    pub duration_ms: i64,
+    pub cpu_time_ms: i64,
+    pub peak_memory_bytes: i64,
+    pub peak_process_count: i64,
+    pub bytes_read: i64,
+    pub bytes_written: i64,
+    pub artifact_bytes: i64,
+    pub artifact_ids: Vec<String>,
+    pub error_code: Option<String>,
+    pub last_event_id: i64,
+}
+
 // ── ReadModelTransaction ─────────────────────────
 
 /// Transaktions-Wrapper fuer Batch-Updates auf den Read Models.
@@ -717,6 +809,77 @@ impl<'a> ReadModelTransaction<'a> {
                last_event_id = MAX(projection_watermarks.last_event_id, ?2),
                updated_at = ?3",
             params![projection_name, row_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Upserts the latest safe state of one workbench invocation. Private tool
+    /// output is structurally absent from this read model.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_workbench_invocation(
+        &self,
+        invocation_id: &str,
+        agent_id: u16,
+        project_id: &str,
+        work_item_id: &str,
+        tool_class: &str,
+        runtime_key: &str,
+        state: &str,
+        resources: &sentinel_common::WorkbenchResourceUsage,
+        artifact_ids: &[String],
+        error_code: Option<&str>,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        let artifact_ids = serde_json::to_string(artifact_ids)?;
+        self.guard.execute(
+            "INSERT INTO workbench_invocations (
+               invocation_id, agent_id, project_id, work_item_id, tool_class,
+               runtime_key, state, duration_ms, cpu_time_ms, peak_memory_bytes,
+               peak_process_count, bytes_read, bytes_written, artifact_bytes,
+               artifact_ids, error_code, last_event_id, updated_at
+             ) VALUES (
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+               ?15, ?16, ?17, ?18
+             )
+             ON CONFLICT(invocation_id) DO UPDATE SET
+               agent_id = excluded.agent_id,
+               project_id = excluded.project_id,
+               work_item_id = excluded.work_item_id,
+               tool_class = excluded.tool_class,
+               runtime_key = excluded.runtime_key,
+               state = excluded.state,
+               duration_ms = excluded.duration_ms,
+               cpu_time_ms = excluded.cpu_time_ms,
+               peak_memory_bytes = excluded.peak_memory_bytes,
+               peak_process_count = excluded.peak_process_count,
+               bytes_read = excluded.bytes_read,
+               bytes_written = excluded.bytes_written,
+               artifact_bytes = excluded.artifact_bytes,
+               artifact_ids = excluded.artifact_ids,
+               error_code = excluded.error_code,
+               last_event_id = excluded.last_event_id,
+               updated_at = excluded.updated_at
+             WHERE excluded.last_event_id > workbench_invocations.last_event_id",
+            params![
+                invocation_id,
+                agent_id,
+                project_id,
+                work_item_id,
+                tool_class,
+                runtime_key,
+                state,
+                i64::try_from(resources.duration_ms)?,
+                i64::try_from(resources.cpu_time_ms)?,
+                i64::try_from(resources.peak_memory_bytes)?,
+                resources.peak_process_count,
+                i64::try_from(resources.bytes_read)?,
+                i64::try_from(resources.bytes_written)?,
+                i64::try_from(resources.artifact_bytes)?,
+                artifact_ids,
+                error_code,
+                row_id,
+                now_ms(),
+            ],
         )?;
         Ok(())
     }

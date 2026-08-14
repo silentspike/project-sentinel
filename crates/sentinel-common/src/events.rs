@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent_config::HierarchyTier;
-use crate::{AgentId, EventType, RoomStimulusType, TaskId};
+use crate::{AgentId, EventType, RoomStimulusType, TaskId, WorkbenchResourceUsage};
 
 /// Provenance of the cost attached to one provider pipeline response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -425,6 +425,21 @@ pub enum DomainEventPayload {
         /// Wall-Clock-Dauer der Bootstrap-Saga in Millisekunden.
         duration_ms: u64,
     },
+    /// Safe, projection-only state transition for one capability-scoped workbench
+    /// invocation. Private tool output and workspace content are never included.
+    WorkbenchInvocationUpdated {
+        invocation_id: String,
+        agent_id: AgentId,
+        project_id: String,
+        work_item_id: String,
+        tool_class: String,
+        runtime_key: String,
+        state: String,
+        resources: WorkbenchResourceUsage,
+        artifact_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_code: Option<String>,
+    },
     /// #427: Token-/Kosten-Telemetrie eines einzelnen LLM-Calls (pro Agent + Tier,
     /// cache-aware). Vom Daemon (`llm_bridge`) aus der echten Provider-Usage emittiert;
     /// die Cost-Information lebt EINMAL im Event-Store (SSOT) und wird per Cost-Projektion
@@ -501,6 +516,7 @@ impl DomainEventPayload {
             Self::MigrationCompleted { .. } => "migration_completed",
             Self::PsiBandChanged { .. } => "psi_band_changed",
             Self::NodeProvisioned { .. } => "node_provisioned",
+            Self::WorkbenchInvocationUpdated { .. } => "workbench_invocation_updated",
             Self::AgentLlmUsage { .. } => "agent_llm_usage",
         }
     }

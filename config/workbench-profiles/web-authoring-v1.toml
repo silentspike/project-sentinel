@@ -1,0 +1,34 @@
+schema_version = 1
+id = "web-authoring-v1"
+runtime_key = "bwrap-landlock"
+network = "deny"
+environment = { HOME = "/workspace", LANG = "C.UTF-8", LC_ALL = "C.UTF-8", PATH = "/usr/bin:/bin" }
+capabilities = [
+  "artifact.commit",
+  "command.run_allowlisted",
+  "file.inspect",
+  "file.write",
+  "patch.apply",
+  "test.run_profile",
+]
+output_artifact_kinds = ["source_tree"]
+
+[resource_ceilings]
+wall_time_ms = 30000
+cpu_time_ms = 10000
+memory_bytes = 134217728
+process_count = 16
+file_bytes = 8388608
+stdout_bytes = 65536
+stderr_bytes = 65536
+
+[[command_rules]]
+program = "node"
+required_arg_prefix = ["--check"]
+max_args = 2
+
+[[test_suites]]
+id = "javascript-syntax"
+program = "node"
+required_arg_prefix = ["--check"]
+max_args = 2

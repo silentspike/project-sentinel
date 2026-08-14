@@ -33,6 +33,7 @@ impl ResourceProfile {
                 cpu_quota_us: 25_000,
                 cpu_period_us: 100_000,
                 memory_bytes: 128 * 1024 * 1024,
+                process_count: 32,
                 io_max_iops: 100,
                 io_max_bps: 5 * 1024 * 1024,
             },
@@ -41,6 +42,7 @@ impl ResourceProfile {
                 cpu_quota_us: 200_000,
                 cpu_period_us: 100_000,
                 memory_bytes: 512 * 1024 * 1024,
+                process_count: 128,
                 io_max_iops: 1000,
                 io_max_bps: 50 * 1024 * 1024,
             },
@@ -48,6 +50,7 @@ impl ResourceProfile {
                 cpu_quota_us: 10_000,
                 cpu_period_us: 100_000,
                 memory_bytes: 64 * 1024 * 1024,
+                process_count: 8,
                 io_max_iops: 50,
                 io_max_bps: 2 * 1024 * 1024,
             },
@@ -72,6 +75,7 @@ pub struct CgroupLimits {
     pub cpu_quota_us: u64,  // 100000 = 100% einer CPU
     pub cpu_period_us: u64, // 100000 = 100ms
     pub memory_bytes: u64,  // 256 * 1024 * 1024 = 256MB
+    pub process_count: u32, // cgroup pids.max
     pub io_max_iops: u32,   // 300
     pub io_max_bps: u64,    // 10 * 1024 * 1024 = 10MB/s
 }
@@ -82,6 +86,7 @@ impl Default for CgroupLimits {
             cpu_quota_us: 100_000,
             cpu_period_us: 100_000,
             memory_bytes: 256 * 1024 * 1024,
+            process_count: 64,
             io_max_iops: 300,
             io_max_bps: 10 * 1024 * 1024,
         }
@@ -239,6 +244,10 @@ pub fn create_cgroup(name: &str, limits: &CgroupLimits) -> Result<CgroupSetup> {
     )
     .with_context(|| format!("Failed to write memory.max for {name}"))?;
 
+    std::fs::write(format!("{path}/pids.max"), limits.process_count.to_string())
+        .with_context(|| format!("Failed to write pids.max for {name}"))?;
+    info!("cgroup {name}: pids.max = {}", limits.process_count);
+
     // IO limits (best-effort — controller may not be delegated)
     let io_max_path = format!("{path}/io.max");
     let io_available = if std::path::Path::new(&io_max_path).exists() {
@@ -297,6 +306,9 @@ pub fn resize_cgroup(name: &str, limits: &CgroupLimits) -> Result<()> {
     let safe_max = limits.memory_bytes.max(current_bytes + 16 * 1024 * 1024);
     std::fs::write(format!("{path}/memory.max"), safe_max.to_string())
         .with_context(|| format!("Failed to resize memory.max for {name}"))?;
+
+    std::fs::write(format!("{path}/pids.max"), limits.process_count.to_string())
+        .with_context(|| format!("Failed to resize pids.max for {name}"))?;
 
     // IO — best-effort (Controller muss delegiert sein)
     let io_max_path = format!("{path}/io.max");

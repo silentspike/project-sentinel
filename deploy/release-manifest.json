@@ -100,6 +100,12 @@
       "type": "config"
     },
     {
+      "path": "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml",
+      "source": "config/workbench-profiles/web-authoring-v1.toml",
+      "sha256": "6e352d4f34b33cb1f8cd2fa0f94ae6a6b9b2b49165b60f65b2e40ba68f078286",
+      "type": "config"
+    },
+    {
       "path": "/etc/nats/nats.conf",
       "source": "config/nats.conf",
       "sha256": "3ab5bb5d9fa5a1b51dc4f4d575be81ecd568a4b16a2b157b7d38d3242f6d309f",
