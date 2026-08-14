@@ -2593,7 +2593,7 @@ mod tests {
                 expected_work_version: 1,
                 expected_assignment_version: 1,
                 from_state: sentinel_workflow::CompanyWorkStateV1::Assigned,
-                to_state: sentinel_workflow::CompanyWorkStateV1::Running,
+                to_state: sentinel_workflow::CompanyWorkStateV1::InProgress,
                 output_receipts: Vec::new(),
                 gate_receipt: None,
                 phase_a_evidence_digest: "a".repeat(64),

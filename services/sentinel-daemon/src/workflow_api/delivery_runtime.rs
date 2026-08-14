@@ -1580,6 +1580,7 @@ fn same_event(existing: &DomainEvent, expected: &DomainEvent) -> Result<(), Deli
         && existing.causation_id == expected.causation_id
         && existing.operation_id == expected.operation_id
         && existing.tick == expected.tick
+        && existing.timestamp_ms == expected.timestamp_ms
         && existing.schema_version == expected.schema_version
         && existing.compensation_type == expected.compensation_type
     {
@@ -1731,6 +1732,12 @@ mod tests {
         let effect = effect_event(&effect_request).unwrap();
         ensure_or_append_event(&events, &effect, None).unwrap();
         ensure_or_append_event(&events, &effect, None).unwrap();
+        let mut conflicting_effect = effect.clone();
+        conflicting_effect.timestamp_ms += 1;
+        assert!(matches!(
+            ensure_or_append_event(&events, &conflicting_effect, None),
+            Err(DeliveryError::Conflict(_))
+        ));
 
         let publication = PublicationRequestV1 {
             schema_version: DELIVERY_SCHEMA_V1,
