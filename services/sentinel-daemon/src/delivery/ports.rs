@@ -176,6 +176,7 @@ pub struct AuthorityValidationRequestV1 {
     pub operation: String,
     pub contract_version: u16,
     pub contract_digest: ContentDigest,
+    pub validated_at_ms: u64,
     pub request_digest: ContentDigest,
 }
 
@@ -191,6 +192,11 @@ impl AuthorityValidationRequestV1 {
     }
 
     pub fn seal(mut self) -> Result<Self, DeliveryError> {
+        if self.validated_at_ms == 0 {
+            return Err(DeliveryError::Validation(
+                "authority validation time is invalid".to_string(),
+            ));
+        }
         self.request_digest = self.computed_digest()?;
         Ok(self)
     }
