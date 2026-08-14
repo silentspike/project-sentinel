@@ -549,6 +549,7 @@ impl DeliveryStore {
             row_identity,
             payload_digest: event_digest.clone(),
             payload: envelope_bytes,
+            occurred_at_ms: request.committed_at_ms,
             request_digest: ContentDigest::zero(),
         }
         .seal()?;

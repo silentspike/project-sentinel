@@ -32,6 +32,7 @@ class CompanyWorkflowWiringTests(unittest.TestCase):
         self.case = root / str(uuid.uuid4())
         self.case.mkdir(mode=0o700)
         self.credentials = self.case / "credentials"
+        self.workflow_data = self.case / "company-delivery"
 
     def tearDown(self) -> None:
         shutil.rmtree(self.case, ignore_errors=True)
@@ -42,6 +43,7 @@ class CompanyWorkflowWiringTests(unittest.TestCase):
             {
                 "SENTINEL_WORKFLOW_AUTH_TEST_ROOT": str(self.case),
                 "SENTINEL_WORKFLOW_CREDENTIAL_DIR": str(self.credentials),
+                "SENTINEL_WORKFLOW_DATA_DIR": str(self.workflow_data),
             }
         )
         return subprocess.run(
@@ -66,6 +68,8 @@ class CompanyWorkflowWiringTests(unittest.TestCase):
             self.assertEqual(len(values[path.name]), 64)
             self.assertNotIn(values[path.name], first.stdout + first.stderr)
         self.assertEqual(len(values), 8)
+        self.assertTrue(self.workflow_data.is_dir())
+        self.assertEqual(self.workflow_data.stat().st_mode & 0o777, 0o700)
 
         second = self.run_init()
         self.assertEqual(second.returncode, 0, second.stderr)
@@ -100,12 +104,20 @@ class CompanyWorkflowWiringTests(unittest.TestCase):
             ),
             1,
         )
+        self.assertIn("ReadWritePaths=/opt/sentinel/config /opt/sentinel/data /etc/sentinel", auth)
 
     def test_initializer_rejects_symlinked_credential(self) -> None:
         self.credentials.mkdir(mode=0o700)
         foreign = self.case / "foreign"
         foreign.write_text("x" * 64, encoding="ascii")
         (self.credentials / "workflow-customer").symlink_to(foreign)
+        result = self.run_init()
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_initializer_rejects_symlinked_workflow_data_root(self) -> None:
+        foreign = self.case / "foreign-data"
+        foreign.mkdir(mode=0o700)
+        self.workflow_data.symlink_to(foreign, target_is_directory=True)
         result = self.run_init()
         self.assertNotEqual(result.returncode, 0)
 

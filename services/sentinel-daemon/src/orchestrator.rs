@@ -742,56 +742,141 @@ fn process_workbench_dispatch(
             runtimes,
             owner_registry,
         };
-        let coordinator = crate::workbench::WorkbenchCoordinator::new(
-            &service.store,
-            &service.profile,
-            &service.profile_digest,
-        );
         let (result, response) = match command {
             crate::workbench::WorkbenchDispatchCommand::Submit {
                 request,
                 authority,
                 response,
-            } => (
-                coordinator.submit(&mut runtime, &request, authority.as_ref(), now_ms),
-                response,
-            ),
+            } => {
+                let profile = if request.tool_profile == service.profile.id {
+                    (&service.profile, service.profile_digest.as_str())
+                } else if request.tool_profile == service.qa_profile.id {
+                    (&service.qa_profile, service.qa_profile_digest.as_str())
+                } else {
+                    let error = anyhow::anyhow!("unknown workbench profile");
+                    if response.send(Err(error)).is_err() {
+                        warn!("workbench requester disconnected before profile rejection");
+                    }
+                    continue;
+                };
+                let coordinator = crate::workbench::WorkbenchCoordinator::new(
+                    &service.store,
+                    profile.0,
+                    profile.1,
+                );
+                (
+                    coordinator.submit(&mut runtime, &request, authority.as_ref(), now_ms),
+                    response,
+                )
+            }
             crate::workbench::WorkbenchDispatchCommand::Poll {
                 invocation_id,
                 authority,
                 response,
-            } => (
-                coordinator.poll(&mut runtime, &invocation_id, authority.as_ref(), now_ms),
-                response,
-            ),
+            } => {
+                let use_qa_profile = match workbench_invocation_uses_qa_profile(
+                    service,
+                    &invocation_id,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if response.send(Err(error)).is_err() {
+                            warn!("workbench requester disconnected before profile rejection");
+                        }
+                        continue;
+                    }
+                };
+                let (profile, profile_digest) = if use_qa_profile {
+                    (&service.qa_profile, service.qa_profile_digest.as_str())
+                } else {
+                    (&service.profile, service.profile_digest.as_str())
+                };
+                let coordinator = crate::workbench::WorkbenchCoordinator::new(
+                    &service.store,
+                    profile,
+                    profile_digest,
+                );
+                (
+                    coordinator.poll(&mut runtime, &invocation_id, authority.as_ref(), now_ms),
+                    response,
+                )
+            }
             crate::workbench::WorkbenchDispatchCommand::Recover {
                 invocation_id,
                 authority,
                 response,
-            } => (
-                coordinator.recover_executing(
+            } => {
+                let use_qa_profile = match workbench_invocation_uses_qa_profile(
+                    service,
+                    &invocation_id,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if response.send(Err(error)).is_err() {
+                            warn!("workbench requester disconnected before profile rejection");
+                        }
+                        continue;
+                    }
+                };
+                let (profile, profile_digest) = if use_qa_profile {
+                    (&service.qa_profile, service.qa_profile_digest.as_str())
+                } else {
+                    (&service.profile, service.profile_digest.as_str())
+                };
+                let coordinator = crate::workbench::WorkbenchCoordinator::new(
+                    &service.store,
+                    profile,
+                    profile_digest,
+                );
+                (
+                    coordinator.recover_executing(
                     &mut runtime,
                     &invocation_id,
                     authority.as_ref(),
                     now_ms,
                 ),
-                response,
-            ),
+                    response,
+                )
+            }
             crate::workbench::WorkbenchDispatchCommand::Cancel {
                 invocation_id,
                 reason,
                 authority,
                 response,
-            } => (
-                coordinator.cancel(
+            } => {
+                let use_qa_profile = match workbench_invocation_uses_qa_profile(
+                    service,
+                    &invocation_id,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if response.send(Err(error)).is_err() {
+                            warn!("workbench requester disconnected before profile rejection");
+                        }
+                        continue;
+                    }
+                };
+                let (profile, profile_digest) = if use_qa_profile {
+                    (&service.qa_profile, service.qa_profile_digest.as_str())
+                } else {
+                    (&service.profile, service.profile_digest.as_str())
+                };
+                let coordinator = crate::workbench::WorkbenchCoordinator::new(
+                    &service.store,
+                    profile,
+                    profile_digest,
+                );
+                (
+                    coordinator.cancel(
                     &mut runtime,
                     &invocation_id,
                     &reason,
                     authority.as_ref(),
                     now_ms,
                 ),
-                response,
-            ),
+                    response,
+                )
+            }
         };
         let result = result.and_then(|update| {
             crate::workbench::publish_workbench_records(event_store, &update.records, tick)?;
@@ -800,6 +885,35 @@ fn process_workbench_dispatch(
         if response.send(result).is_err() {
             warn!("workbench requester disconnected before receiving its durable outcome");
         }
+    }
+}
+
+fn workbench_invocation_uses_qa_profile(
+    service: &crate::workbench::WorkbenchService,
+    invocation_id: &str,
+) -> anyhow::Result<bool> {
+    let record = service
+        .store
+        .load(invocation_id)?
+        .ok_or_else(|| anyhow::anyhow!("workbench invocation is not reserved"))?;
+    workbench_profile_is_qa(
+        &record.tool_profile,
+        &service.profile.id,
+        &service.qa_profile.id,
+    )
+}
+
+fn workbench_profile_is_qa(
+    record_profile: &str,
+    authoring_profile: &str,
+    qa_profile: &str,
+) -> anyhow::Result<bool> {
+    if record_profile == qa_profile {
+        Ok(true)
+    } else if record_profile == authoring_profile {
+        Ok(false)
+    } else {
+        anyhow::bail!("workbench invocation uses an unknown profile")
     }
 }
 
@@ -2344,7 +2458,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         }
     };
 
-    let workbench_artifact_roots = all_agents
+    let workbench_artifact_roots: std::collections::HashMap<_, _> = all_agents
         .iter()
         .map(|agent| {
             let raw_agent_id = agent.identity.id;
@@ -2361,7 +2475,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     crate::workbench::install_workbench_service(
         data_dir,
         &config.config_dir,
-        workbench_artifact_roots,
+        workbench_artifact_roots.clone(),
     )
     .context("initialize durable agent workbench service")?;
 
@@ -2786,6 +2900,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             data_dir,
             &config.config_dir,
             workflow_agent_capabilities,
+            event_store.as_ref().clone(),
+            workbench_artifact_roots,
         )
         .context("initialize M0 company workflow")?,
     );
@@ -11425,6 +11541,28 @@ mod tests {
     use std::sync::Arc;
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn workbench_follow_up_dispatch_retains_the_reserved_profile() {
+        assert!(!workbench_profile_is_qa(
+            "web-authoring-v1",
+            "web-authoring-v1",
+            "web-qa-v1"
+        )
+        .unwrap());
+        assert!(workbench_profile_is_qa(
+            "web-qa-v1",
+            "web-authoring-v1",
+            "web-qa-v1"
+        )
+        .unwrap());
+        assert!(workbench_profile_is_qa(
+            "foreign-profile",
+            "web-authoring-v1",
+            "web-qa-v1"
+        )
+        .is_err());
+    }
 
     #[test]
     fn workflow_reconciler_observes_shutdown_and_joins() {

@@ -14,6 +14,13 @@ export class DeliveryLineageUnavailable extends Error {
 export async function fetchPublicDeliveryLineage(
   signal?: AbortSignal,
 ): Promise<PublicDeliveryLineageDto> {
+  const search = new URLSearchParams(globalThis.location?.search ?? "");
+  const tenantId = search.get("tenant_id");
+  const projectId = search.get("project_id");
+  if (!safeScope(tenantId) || !safeScope(projectId)) {
+    throw new DeliveryLineageUnavailable();
+  }
+  const endpoint = `/api/v1/delivery/lineage?tenant_id=${encodeURIComponent(tenantId)}&project_id=${encodeURIComponent(projectId)}`;
   const requestAbort = new AbortController();
   const abortFromCaller = () => requestAbort.abort(signal?.reason);
   if (signal?.aborted) abortFromCaller();
@@ -24,7 +31,7 @@ export async function fetchPublicDeliveryLineage(
   );
   let response: Response;
   try {
-    response = await fetch("/api/v1/delivery/lineage", {
+    response = await fetch(endpoint, {
       method: "GET",
       credentials: "include",
       headers: { accept: "application/json" },
@@ -52,6 +59,10 @@ export async function fetchPublicDeliveryLineage(
     clearTimeout(deadline);
     signal?.removeEventListener("abort", abortFromCaller);
   }
+}
+
+function safeScope(value: string | null): value is string {
+  return value !== null && /^[A-Za-z0-9._-]{1,128}$/.test(value);
 }
 
 async function readBoundedBody(response: Response, signal: AbortSignal): Promise<Uint8Array> {

@@ -2,11 +2,13 @@
 
 Issue: #696
 
-Status: dependency-independent core with a configured local store and reachable
-authenticated Console surface. The server HTTP handler, productive authority,
-effect, workbench, and publication adapters, single-node deployment, browser
-acceptance, memory publication, and live benchmarks remain gated on the
-explicitly named dependencies and later ORC authorization.
+Status: integrated M0 source candidate with a configured local store,
+authenticated daemon command and lineage handlers, current workflow authority,
+the #694 Workbench QA adapter, Limbo event/outbox publication, and the
+authenticated Console surface. Final-main gates, single-node deployment,
+browser acceptance, governed rework, release activation/rollback, memory
+publication, and live benchmarks remain gated on the explicitly named direct
+M0 work and later ORC authorization.
 
 ## 1. Purpose and authority boundary
 
@@ -18,16 +20,17 @@ claim as QA evidence, or let one principal span implementation, QA, release, and
 customer authority.
 
 Every durable record is tenant- and project-scoped, versioned, generation-bound,
-and digest-bound. The dependency-independent tests supply `PrincipalV1`, but
-productive callers may not: the future authenticated API adapter must derive the
-principal and roles server-side, then obtain an opaque current-authority receipt
-immediately before every sensitive command. The core rejects receipt, adapter
-contract, tenant, role, actor, generation, digest, and validity mismatches.
+and digest-bound. Tests may supply `PrincipalV1`, but productive callers may
+not: the authenticated API derives the principal and roles server-side from a
+root-provisioned credential binding, then obtains an opaque current-authority
+receipt immediately before every sensitive command. The core rejects receipt,
+adapter contract, tenant, role, actor, generation, digest, and validity
+mismatches.
 
-The dependency-independent module lives under
-`services/sentinel-daemon/src/delivery`. It deliberately does not modify the
-existing workflow, runtime, common event, event-store, projection, or operator
-API ownership surfaces.
+The reusable state machine and store live under
+`services/sentinel-daemon/src/delivery`. Product composition lives at the
+existing workflow, Workbench, Limbo/EventStore, operator API, dashboard-backend,
+and Console ownership surfaces instead of introducing a second authority.
 
 ## 2. Runtime and rollout contract
 
@@ -37,9 +40,9 @@ API ownership surfaces.
 - Forbidden targets in this phase: every VM, Proxmox host, and cluster node.
 - Live benchmark target in this phase: none.
 - Rollback in this phase: revert the delivery-core commit.
-- Productive runtime activation: blocked until the #694 and #695 adapters are
-  integrated, ORC grants the integrated phase, and an issue-specific snapshot
-  and rollback plan exist.
+- Productive runtime activation: blocked until the exact #694 and #695 heads
+  are merged into final Main, the integrated gates pass, ORC grants the runtime
+  phase, and an issue-specific snapshot and rollback plan exist.
 
 The daemon library remains startable when productive integration is absent.
 `DeliveryStoreConfigV1` opens the local redb authority only beneath an approved,
@@ -51,12 +54,9 @@ not claim productive readiness. The productive composition exposes no raw
 core accessor or public port-bypass constructor: command-specific configured
 methods check exactly the authorities their operation needs. A local commit may
 queue its durable outbox while the broker is unavailable, but cannot bypass its
-workflow, workbench, or effect authority. The three unavailable adapters preserve
-normal daemon startup while failing dependent calls closed.
-
-The #696 changelog entry remains deferred until the overlapping #694
-`CHANGELOG.md` delta is merged; this correction deliberately does not edit that
-shared file.
+workflow, workbench, or effect authority. The disabled feature path preserves
+normal daemon startup with typed unavailable ports; the enabled path constructs
+the exact configured adapters or fails startup closed.
 
 ## 3. Canonical data contract
 
@@ -225,11 +225,12 @@ with `duplicate=true`; different content under the same
 tenant/principal/command/key namespace is a typed conflict.
 
 This narrow local ownership is sufficient for the original #696 M0 journey and
-does not claim the broad #732/#733 CQRS program. Publication into the application
-event chain remains a separately injected adapter. Its stable idempotency key is
-the exact `(operation_id, request_digest)`; replay after publisher success and a
-caller crash must return the identical receipt/effective event. The contract
-does not claim exactly-once transport.
+does not claim the broad #732/#733 CQRS program. Publication remains a separately
+injected port, while the product composition binds that port to Limbo/EventStore
+and its outbox. Its stable idempotency key is the exact
+`(operation_id, request_digest)`; replay after publisher success and a caller
+crash must return the identical receipt/effective event. The contract does not
+claim exactly-once transport.
 
 The outbox uses a stable namespaced operation ID:
 
@@ -251,12 +252,13 @@ store health check before reading or sending a pending row. A decodable outbox
 entry beside a corrupt aggregate, journal, idempotency binding, or cross-record
 reference therefore produces zero publisher calls.
 
-The test fixture's `health()` decodes every table and validates schema, aggregate
+The store `health()` path decodes every table and validates schema, aggregate
 key/revision, contiguous journal history, domain-separated envelope digest,
 journal/outbox linkage, canonical payload bytes, publication receipt, and
 the full idempotency key/tenant/principal/command/caller-key receipt binding.
-Connecting this to Sentinel's event/CQRS chain is deferred
-to #732/#733.
+The narrow product adapter appends the exact event and outbox request to Limbo;
+broad transport retention and generalized CQRS work remain owned by #732/#733
+and are not prerequisites for this path.
 
 ## 7. Narrow integration port
 
@@ -294,8 +296,9 @@ arbitrary/private labels, and stale authority fail closed. Authority receipt,
 candidate-authority, query, and workflow generations converge before the
 adapter call; principal and candidate authority are read again afterward and
 must be identity-, generation-, digest-, and aggregate-revision-equal before a
-DTO byte is accepted. The adapter remains deferred, but the versioned input now
-exists and cannot be fabricated from the local delivery aggregate.
+DTO byte is accepted. `WorkflowDeliveryIntegration` implements this adapter
+against the authoritative #695 store and principal bindings; the versioned
+input cannot be fabricated from the local delivery aggregate.
 
 The QA request is called outside any writer transaction. It binds tenant,
 project, exact candidate, plan, run ID and generation, assigned QA principal and
@@ -355,24 +358,28 @@ The gate derives its inventories from
 that graph; caller-supplied nonzero digest flags or
 aggregation-policy-as-calibration substitutions are not sufficient.
 
-`execution_saga_readiness` is a separate exact #694 contract. Until a
-productive #694 adapter can durably claim the stable request before execution,
-persist the opaque outcome before returning, and reconcile that outcome after
-crash/disconnect, execution is typed unavailable. The deterministic fake proves
-effect-once reconciliation after local adoption failure and cross-run replay
-rejection; it is not productive authority.
+`execution_saga_readiness` is a separate exact #694 contract. The product
+adapter derives a QA-scoped Workbench request from current workflow authority,
+uses the stable invocation for submit/poll/recovery, and adopts only the sealed
+terminal receipt for the exact candidate artifacts. The request binds its
+deadline to the durable QA-run start time, so a retry reuses byte-identical
+input even after caller restart. Follow-up poll, recovery, and cancellation
+select the profile recorded by the reservation; a QA invocation can never
+silently fall back to the authoring profile. The deterministic fake
+still proves effect-once reconciliation after local adoption failure and
+cross-run replay rejection independently of that productive adapter.
 
 Workbench execution and external delivery effects use distinct canonical
 readiness digests (`workbench-execution-saga-v1` and
-`delivery-effect-saga-v1`). The #694 workbench port cannot satisfy #710 effect
-readiness and the #710 effect port cannot satisfy #694 workbench readiness;
+`delivery-effect-saga-v2`). The #694 workbench port cannot satisfy delivery-effect
+readiness and the delivery-effect port cannot satisfy #694 workbench readiness;
 swapped, stale, zero-generation, or wrong-version contracts fail before either
 port is invoked.
 
 The command readiness probe is command-specific. Authority-only commands require
 the integration contract; `ExecuteQa` additionally requires the exact #694
 workbench saga; and promotion/rollout, rollback, governed rework, and closeout
-memory publication additionally require the exact #710 effect saga. There is no
+memory publication additionally require the exact effect saga. There is no
 general `Ready` response that omits a dependency required by the requested
 command.
 
@@ -387,9 +394,11 @@ authority, or malformed workflow lineage still fails closed.
 ## 8. External-effect sagas
 
 Rollout/rollback, governed #695 rework creation, and closeout memory publication
-are behind `DeliveryEffectPort`, unavailable by default. Each request binds a
+are behind `DeliveryEffectPort`, unavailable by default. The M0 composition uses
+the narrow Limbo/workflow adapter; broader external-effect hardening remains
+separate. Each request binds a
 stable operation ID, tenant, project, candidate, subject, optional target,
-actor, operation kind, and request digest. Rollback binds both exact source and
+actor, operation kind, feedback or closeout source, and request digest. Rollback binds both exact source and
 target release references and their digests. The short-lived authority receipt
 is carried for authorization/audit but excluded from the stable request digest.
 Sealing rejects noncanonical tenant, principal, candidate, subject, or target
@@ -401,7 +410,7 @@ included in the request digest and repeated exactly by the receipt. The trusted
 receipt returns an opaque effect reference and exact operation, source, target,
 actor, authority identity, request, tenant, project, and candidate bindings.
 
-The effect happens outside the local transaction. A Ready #710 adapter must
+The effect happens outside the delivery-store transaction. A Ready adapter must
 durably claim `(operation_id, request_digest)` before the real effect, persist
 the sealed outcome before returning, and replay/reconcile that same outcome on
 retry after caller crash, disconnect, or local revision conflict. The core then
@@ -446,8 +455,10 @@ must additionally enforce:
 - restored generations must match before readiness.
 
 This core stores and validates the imported graph and legal pass/fail/harness
-gate matrices, but intentionally does not implement a productive runner,
-provider, sandbox, retention job, or #709/#710 effect engine.
+gate matrices. The integrated path adds the deterministic `sentinel-web-qa`
+runner and work-item gate through #694's sandbox; it intentionally does not add
+a model/provider evaluator, a retention job, or the broad #709/#710 effect
+engine.
 
 ## 10. Console lineage surface
 
@@ -476,10 +487,12 @@ reachable without exposing their private identifiers.
 Response-local node IDs are canonical sequence numbers and the project label is
 generic; neither is a truncated hash of tenant, project, record, principal,
 artifact, or infrastructure authority. Required public evidence digests remain
-visible. The server DTO builder requires fresh authority and full configured
-composition readiness. The actual HTTP handler and productive #694/#695
-adapters are not in this owned scope and therefore remain absent: the reachable
-surface correctly renders unavailable until that later seam is wired.
+visible. The server DTO builder requires fresh authority and configured lineage
+readiness. The daemon exposes the authenticated lineage handler, and the
+dashboard backend proxies it with a root-provisioned read credential, exact
+tenant/project scope, a hard streamed body limit, and generic fail-closed errors.
+The surface remains unavailable whenever any required authority or store
+validation fails.
 Defense-in-depth client validation rejects:
 
 - schema version;
@@ -501,7 +514,7 @@ generations, manifests, releases, deliveries, acceptances, rollback history, and
 closeouts form one recovery participant. Broad recovery implementation remains
 owned by #722 and is not pulled into this M0 slice.
 
-Before productive activation, recovery integration must:
+Before runtime deployment, recovery integration must:
 
 1. fence all delivery writers;
 2. flush and record the canonical store generation and outbox frontier;
@@ -520,26 +533,26 @@ rollback, closeout, unpublished outbox row, or recovery frontier.
 
 ## 12. Verification matrix
 
-| Criterion | Dependency-independent status |
+| Criterion | Integrated source status |
 | --- | --- |
 | AC-1 schemas and legal transitions | Implemented and testable |
 | AC-2 independent authority | Exact authenticated workflow participants are rechecked for candidate, QA, release, and customer delivery boundaries; live probes deferred |
-| AC-3 productive #694 suite | Port and fake only; productive execution deferred |
+| AC-3 productive #694 suite | Workflow-derived Workbench QA adapter and deterministic web QA runner implemented; final-main and live artifact/evidence readback deferred |
 | AC-4 missing/stale/different gate | Core negative tests cover missing approval, unresolved findings, expiry, plan-digest substitution and incomplete evidence; broader runner matrix deferred |
-| AC-5 immutable manifest | Core rejects ID reuse and binds exact gate/candidate/authority; canonical #732 append deferred |
-| AC-6 customer flow | Core records/transitions and current workflow-recipient authority checks implemented; authenticated API/browser and productive delivery effect deferred |
-| AC-7 rework history | Governed-rework request/receipt saga implemented with fake; productive #695 effect deferred |
-| AC-8 rollback | Exact source+target receipt, stable operation, revision-conflict reconciliation and restart-safe local adoption tested with a durable fake; productive #710 rollout/rollback effect deferred |
-| AC-9 Console lineage | Authenticated App navigation, strict fetch/parser, graph-integrity validation and unavailable-safe public DTO surface implemented; server handler, productive adapters and live criterion OPEN |
-| AC-10 memory closeout | Receipt-gated saga and restart readback tested with fake; productive memory path deferred |
-| AC-11 Gaia oversight | No bypass surface added; productive observation deferred |
+| AC-5 immutable manifest | Core rejects ID reuse and binds exact gate/candidate/authority; narrow Limbo publication is wired without requiring broad #732 work |
+| AC-6 customer flow | Authenticated command/lineage APIs and Console path are wired; final preview/customer browser journey and runtime evidence remain open |
+| AC-7 rework history | Customer-authorized request changes create a new dependency-preserving #695 work generation bound to the prior work item, delivery, candidate, and feedback; replay returns the exact same references while prior history remains immutable; final-main and live evidence remain open |
+| AC-8 rollback | Exact source+target receipt, stable operation, revision-conflict reconciliation, active-release pointer transition, and restart-safe local adoption are implemented; live rollback/restore evidence remains open |
+| AC-9 Console lineage | Authenticated daemon handler, credentialed bounded backend proxy, strict client parser and graph-integrity validation are implemented; live browser/API/event agreement remains open |
+| AC-10 memory closeout | Accepted closeout emits a typed source-linked Limbo event that the existing EpisodeProducer stores under the Building subject for Night-Run/background consolidation; malformed provenance is quarantined; final-main and live readback remain open |
+| AC-11 Gaia oversight | Gaia can read only the server-redacted delivery lineage; each stable revision observation writes one idempotent audit event, while Gaia receives no customer, QA, release, or workflow mutation role; live positive/negative probes remain open |
 | AC-12 restart/idempotency | Configured local store, QA outcome reconciliation, pre-I/O store validation, replay-idempotent publisher receipt, outbox, effect revision-conflict retry, rollback and closeout boundaries covered; productive adapter crash matrix deferred |
 | AC-13 `.240` journey | Not authorized in this phase |
 | AC-14 canonical QA schemas | Plan, dataset, run, case, deterministic, flake and gate core are versioned and strictly validated; PARTIAL because model/calibration authority and the productive import lane remain #749/dependency deferred |
 | AC-15 deterministic/probabilistic split | Deterministic bindings are implemented; populated model/grader evidence is typed unavailable and model/calibration activation remains #749-deferred |
-| AC-16 sandbox/capability enforcement | Contract fields only; #694 implementation deferred |
+| AC-16 sandbox/capability enforcement | Productive QA requests use #694's bwrap Workbench with current authority, staged read-only candidate inputs, the checked-in QA profile and bounded resources; live proof deferred |
 | AC-17 retry/flake append-only history | Gapless sealed per-case attempt history, retained fail-to-pass evidence, derived terminal status, current QA ownership, and graph-bound passing regression disposition are implemented; productive evaluator/property/restart proof deferred |
-| AC-18 #709/#710 effects | Distinct #694-workbench/#710-effect fail-closed readiness plus stable operation/intent/outcome/reconcile contracts and deterministic fake proof; productive integration deferred |
+| AC-18 #709/#710 effects | Distinct #694-workbench/effect fail-closed readiness plus stable operation/intent/outcome/reconcile contracts and the narrow productive M0 adapter are implemented; broader #710 external-effect hardening remains separate |
 | AC-19 #722 recovery | Participant contract documented; recovery integration deferred |
 | AC-20 complete gate negative matrix | Core accepts explicit no-retry/no-seed plans, exact cross-inventory source reuse, and a fully evidenced resolved retry while rejecting zero plan inputs, inconsistent retries, fixture substitution, empty/malformed/duplicate/local-or-graph-wide locator-conflicting sources, relabeled slices, duplicate results, attempt gaps/duplicates/lost failures, PASS without deterministic evidence, invented/stale/failed regression refs, stale/forged flake dispositions, unresolved findings, any populated model/grader evidence, fake calibration, and illegal pass/fail/harness summaries; productive evaluator/retention negatives deferred |
 
@@ -553,13 +566,14 @@ effect, retention, and recovery integrations.
 
 ## 13. Final integration sequence
 
-1. Merge the productive #694 workbench dispatcher and its opaque,
-   request-deduplicated evidence receipt.
-2. Merge the #695 workflow authority and linked-work-item/currentness adapter.
-3. Wire the declared authenticated lineage HTTP handler and application-event
-   publication adapter in their owners' scopes.
-4. Add the delivery store to the approved #722 recovery participant set.
-5. Validate the already reachable Console component against the productive
+1. Merge the exact productive #694 Workbench and #695 workflow heads.
+2. Compile and verify governed rework, release activation/rollback,
+   source-linked memory publication, and Gaia observation on final Main.
+3. Re-run the authenticated handler, Limbo publication, Workbench QA, and
+   restart/failure matrix on final Main.
+4. Preserve the narrow local recovery and rollback evidence required by the M0
+   journey; broad #722 follow-up work remains post-M0.
+5. Validate the reachable Console component against the productive
    public-safe projection.
 6. Re-run canonical Rust and Console gates on final main.
 7. Obtain ORC code approval and an explicit `.240` runtime authorization.

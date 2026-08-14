@@ -636,7 +636,12 @@ where
             digest: run.request_digest.clone(),
         };
         let invocation = VersionedRefV1 {
-            id: format!("qa:{}:{}:{}", tenant_id, project_id, run.run_id),
+            id: stable_workbench_invocation_id(
+                tenant_id,
+                project_id,
+                &run_ref,
+                &authority_before.principal,
+            )?,
             generation: run.generation,
             digest: ContentDigest::of_domain(
                 "workbench-invocation",
@@ -651,10 +656,19 @@ where
             candidate: plan.candidate.clone(),
             qa_plan: run.plan.clone(),
             qa_run: run_ref.clone(),
+            candidate_artifacts: aggregate
+                .candidates
+                .get(&plan.candidate.id)
+                .ok_or_else(|| DeliveryError::CorruptStore("candidate missing".to_string()))?
+                .artifacts
+                .clone(),
             assigned_qa: authority_before.principal.clone(),
             authority_receipt_digest: authority_before.receipt_digest.clone(),
             authority_identity_digest: authority_before.stable_identity_digest()?,
             invocation,
+            started_at_ms: run.started_at_ms.ok_or_else(|| {
+                DeliveryError::CorruptStore("running QA has no stable start time".to_string())
+            })?,
             request_digest: ContentDigest::zero(),
         }
         .seal()?;
@@ -1386,6 +1400,9 @@ where
             candidate: Some(manifest.candidate.clone()),
             subject: release.manifest.clone(),
             target: None,
+            feedback_digest: None,
+            closeout_memory: None,
+            occurred_at_ms: context.now_ms,
             actor: release_authority.principal.clone(),
             actor_authority_receipt_digest: release_authority.receipt_digest.clone(),
             actor_authority_identity_digest: release_authority.stable_identity_digest()?,
@@ -1721,6 +1738,9 @@ where
                 candidate: Some(manifest.candidate.clone()),
                 subject: feedback.delivery.clone(),
                 target: None,
+                feedback_digest: Some(feedback.feedback_digest.clone()),
+                closeout_memory: None,
+                occurred_at_ms: context.now_ms,
                 actor: customer_authority.principal.clone(),
                 actor_authority_receipt_digest: customer_authority.receipt_digest.clone(),
                 actor_authority_identity_digest: customer_authority.stable_identity_digest()?,
@@ -1741,7 +1761,12 @@ where
                 ));
             }
             validate_effect_receipt(&request, &receipt, &authority_after, context.now_ms)?;
-            feedback.requested_work_item_refs = vec![receipt.effect_ref];
+            if receipt.affected_refs.is_empty() {
+                return Err(DeliveryError::MissingEvidence(
+                    "governed rework work items".to_string(),
+                ));
+            }
+            feedback.requested_work_item_refs = receipt.affected_refs;
             feedback = feedback.seal()?;
         }
         let delivery = aggregate
@@ -1857,6 +1882,9 @@ where
             candidate: Some(from_manifest.candidate.clone()),
             subject: rollback.from_release.clone(),
             target: Some(rollback.to_release.clone()),
+            feedback_digest: None,
+            closeout_memory: None,
+            occurred_at_ms: context.now_ms,
             actor: rollback_authority.principal.clone(),
             actor_authority_receipt_digest: rollback_authority.receipt_digest.clone(),
             actor_authority_identity_digest: rollback_authority.stable_identity_digest()?,
@@ -2019,6 +2047,15 @@ where
             candidate: Some(manifest.candidate.clone()),
             subject: closeout.accepted_release.clone(),
             target: None,
+            feedback_digest: None,
+            closeout_memory: Some(super::ports::CloseoutMemorySourceV1 {
+                acceptance: closeout.acceptance.clone(),
+                decisions_digest: closeout.decisions_digest.clone(),
+                artifact_inventory_digest: closeout.artifact_inventory_digest.clone(),
+                failures_digest: closeout.failures_digest.clone(),
+                lessons_digest: closeout.lessons_digest.clone(),
+            }),
+            occurred_at_ms: context.now_ms,
             actor: closeout_authority.principal.clone(),
             actor_authority_receipt_digest: closeout_authority.receipt_digest.clone(),
             actor_authority_identity_digest: closeout_authority.stable_identity_digest()?,
@@ -3553,6 +3590,15 @@ fn validate_effect_receipt(
     authority: &AuthorityReceiptV1,
     now_ms: u64,
 ) -> Result<(), DeliveryError> {
+    for reference in &receipt.affected_refs {
+        validate_ref("effect affected reference", reference)?;
+    }
+    let affected_shape_valid = match request.kind {
+        DeliveryEffectKind::GovernedRework => !receipt.affected_refs.is_empty(),
+        DeliveryEffectKind::Rollout
+        | DeliveryEffectKind::Rollback
+        | DeliveryEffectKind::MemoryPublication => receipt.affected_refs.is_empty(),
+    };
     if receipt.schema_version != DELIVERY_SCHEMA_V1
         || receipt.receipt_digest != receipt.computed_digest()?
         || receipt.operation_id != request.operation_id
@@ -3573,6 +3619,7 @@ fn validate_effect_receipt(
         || receipt.effect_ref.digest == ContentDigest::zero()
         || receipt.effect_ref.generation == 0
         || receipt.effect_ref.id.is_empty()
+        || !affected_shape_valid
         || receipt.issuer.is_empty()
         || receipt.issued_at_ms > now_ms
     {
@@ -3589,6 +3636,28 @@ fn same_authority_identity(left: &AuthorityReceiptV1, right: &AuthorityReceiptV1
         && left.contract_authority_generation == right.contract_authority_generation
         && left.contract_digest == right.contract_digest
         && left.issuer == right.issuer
+}
+
+fn stable_workbench_invocation_id(
+    tenant_id: &str,
+    project_id: &str,
+    run: &VersionedRefV1,
+    principal: &PrincipalV1,
+) -> Result<String, DeliveryError> {
+    let digest = ContentDigest::of_domain(
+        "workbench-invocation",
+        DELIVERY_SCHEMA_V1,
+        &(tenant_id, project_id, run, principal),
+    )?;
+    let hex = digest.as_str();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
 }
 
 fn require_saga_readiness(

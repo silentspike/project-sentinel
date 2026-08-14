@@ -64,7 +64,12 @@ function snapshot(): PublicDeliveryLineageDto {
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  window.history.replaceState({}, "", "/");
 });
+
+function setDeliveryScope(): void {
+  window.history.replaceState({}, "", "/?tenant_id=m0-company&project_id=project-42");
+}
 
 describe("delivery lineage model", () => {
   it("validates the server-redacted digest-bound DTO", () => {
@@ -133,6 +138,7 @@ describe("delivery lineage model", () => {
   });
 
   it("fetches only the authenticated server-redacted DTO contract", async () => {
+    setDeliveryScope();
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify(snapshot()), {
         status: 200,
@@ -143,12 +149,13 @@ describe("delivery lineage model", () => {
 
     await expect(fetchPublicDeliveryLineage()).resolves.toEqual(snapshot());
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/v1/delivery/lineage",
+      "/api/v1/delivery/lineage?tenant_id=m0-company&project_id=project-42",
       expect.objectContaining({ method: "GET", credentials: "include" }),
     );
   });
 
   it("rejects oversized declared and streamed bodies before decoding", async () => {
+    setDeliveryScope();
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValueOnce(
@@ -189,6 +196,7 @@ describe("delivery lineage model", () => {
   });
 
   it("accepts exact JSON media types and rejects JSONP", async () => {
+    setDeliveryScope();
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -215,6 +223,7 @@ describe("delivery lineage model", () => {
   });
 
   it("aborts stalled fetches and bodies at the internal deadline without leaking timers", async () => {
+    setDeliveryScope();
     vi.useFakeTimers();
     vi.stubGlobal(
       "fetch",
@@ -260,6 +269,7 @@ describe("delivery lineage model", () => {
   });
 
   it("combines caller cancellation with its deadline and cleans up the timeout", async () => {
+    setDeliveryScope();
     vi.useFakeTimers();
     const controller = new AbortController();
     vi.stubGlobal(
