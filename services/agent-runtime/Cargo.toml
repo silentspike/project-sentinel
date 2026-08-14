@@ -6,6 +6,12 @@ license = "MIT"
 publish = false
 description = "Lightweight sandbox process for sentinel agents (runs inside bwrap)"
 
-# Intentionally zero external dependencies.
-# agent-runtime runs inside bwrap with minimal footprint.
 [dependencies]
+nix = { version = "0.30", features = ["feature", "signal"] }
+sentinel-common = { path = "../../crates/sentinel-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

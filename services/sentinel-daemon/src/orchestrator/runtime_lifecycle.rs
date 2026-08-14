@@ -6,9 +6,9 @@
 
 use anyhow::Result;
 use sentinel_common::nano_runtime::{
-    NanoHandle, NanoHealth, NanoRecoveryResult, NanoRuntimeControlAction, NanoRuntimeControlResult,
-    NanoRuntimeRegistry, NanoRuntimeResources, NanoSnapshot, NanoStopResult, NanoWorkloadSpec,
-    RUNTIME_BWRAP_LANDLOCK,
+    NanoExecRequest, NanoExecResult, NanoHandle, NanoHealth, NanoRecoveryResult,
+    NanoRuntimeControlAction, NanoRuntimeControlResult, NanoRuntimeRegistry, NanoRuntimeResources,
+    NanoSnapshot, NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
 };
 use sentinel_runtime::EcsNativeRuntime;
 use sentinel_sandbox::BwrapNanoRuntime;
@@ -54,6 +54,14 @@ impl RuntimeAdapterOwner {
 
     pub(super) fn resources(&mut self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
         self.registry.resources(handle)
+    }
+
+    pub(super) fn exec(
+        &mut self,
+        handle: &NanoHandle,
+        request: NanoExecRequest,
+    ) -> Result<NanoExecResult> {
+        self.registry.exec(handle, request)
     }
 
     pub(super) fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {

@@ -24,6 +24,7 @@ pub mod room;
 pub mod route;
 pub mod snapshot_codec;
 pub mod types;
+pub mod workbench;
 
 pub use agent_config::{legacy_hierarchy_tier_from_role, HierarchyTier};
 pub use anti_entropy::{CasInventory, GenerationSummary, InventoryPage};
@@ -54,6 +55,7 @@ pub use snapshot_codec::{
     SnapshotCursor,
 };
 pub use types::*;
+pub use workbench::*;
 
 #[cfg(kani)]
 mod kani;

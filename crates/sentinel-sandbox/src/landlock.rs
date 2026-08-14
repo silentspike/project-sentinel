@@ -13,6 +13,29 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
+/// ABI whose filesystem rights are requested by the current Sentinel ruleset.
+pub const LANDLOCK_RULESET_ABI: u8 = 4;
+
+/// Kernel result returned after the irreversible `restrict_self` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandlockEnforcement {
+    FullyEnforced { abi: u8 },
+    PartiallyEnforced,
+    NotEnforced,
+}
+
+/// Returns the measured ABI only when the irreversible ruleset result exactly
+/// satisfies the workbench contract.
+pub fn workbench_fully_enforced_abi(
+    enforcement: LandlockEnforcement,
+    expected_abi: u8,
+) -> Option<u8> {
+    match enforcement {
+        LandlockEnforcement::FullyEnforced { abi } if abi == expected_abi => Some(abi),
+        _ => None,
+    }
+}
+
 /// Landlock filesystem ruleset for agent isolation.
 #[derive(Debug, Clone)]
 pub struct LandlockRuleset {
@@ -28,6 +51,9 @@ impl LandlockRuleset {
     fn default_exec_paths() -> Vec<PathBuf> {
         vec![
             PathBuf::from("/usr/bin/agent-runtime"),
+            // M0 web-authoring profile: syntax validation only; arguments are
+            // separately constrained by the digest-bound command policy.
+            PathBuf::from("/usr/bin/node"),
             PathBuf::from("/breakout-helper"),
             // Dynamically linked ELF binaries also need their loader executable.
             PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
@@ -51,10 +77,18 @@ impl LandlockRuleset {
                 PathBuf::from("/usr"),
                 PathBuf::from("/lib"),
                 PathBuf::from("/lib64"),
+                // bwrap creates a private PID namespace; this read grant is
+                // required for bounded process-group resource accounting and
+                // cannot expose host process metadata.
+                PathBuf::from("/proc"),
             ],
             write_paths: vec![
                 PathBuf::from(format!("/home/{name}")),
+                PathBuf::from("/workspace"),
+                PathBuf::from("/artifacts"),
                 PathBuf::from("/tmp"),
+                // Command stdio uses Stdio::null after Landlock is active.
+                PathBuf::from("/dev/null"),
             ],
             exec_paths: Self::default_exec_paths(),
         }
@@ -74,6 +108,16 @@ impl LandlockRuleset {
     /// Must be called in the bwrap child process BEFORE exec'ing the agent.
     /// Returns true if fully or partially enforced, false if not enforced.
     pub fn apply(&self) -> Result<bool> {
+        Ok(matches!(
+            self.apply_status()?,
+            LandlockEnforcement::FullyEnforced { .. } | LandlockEnforcement::PartiallyEnforced
+        ))
+    }
+
+    /// Applies the ruleset and returns the actual irreversible enforcement
+    /// result. Workbench callers must require `FullyEnforced`; the general
+    /// agent path may retain its existing best-effort policy.
+    pub fn apply_status(&self) -> Result<LandlockEnforcement> {
         use landlock::*;
 
         let abi = ABI::V4;
@@ -125,15 +169,17 @@ impl LandlockRuleset {
         match restriction.ruleset {
             RulesetStatus::FullyEnforced => {
                 info!("Landlock fully enforced");
-                Ok(true)
+                Ok(LandlockEnforcement::FullyEnforced {
+                    abi: LANDLOCK_RULESET_ABI,
+                })
             }
             RulesetStatus::PartiallyEnforced => {
                 warn!("Landlock partially enforced (kernel ABI may be older)");
-                Ok(true)
+                Ok(LandlockEnforcement::PartiallyEnforced)
             }
             RulesetStatus::NotEnforced => {
                 warn!("Landlock not enforced");
-                Ok(false)
+                Ok(LandlockEnforcement::NotEnforced)
             }
         }
     }
@@ -171,13 +217,18 @@ mod tests {
         assert!(rs.read_paths.contains(&PathBuf::from("/company")));
         assert!(rs.read_paths.contains(&PathBuf::from("/etc/resolv.conf")));
         assert!(rs.read_paths.contains(&PathBuf::from("/usr")));
+        assert!(rs.read_paths.contains(&PathBuf::from("/proc")));
         assert!(rs.read_paths.contains(&PathBuf::from("/lib")));
         assert!(rs.read_paths.contains(&PathBuf::from("/lib64")));
         assert!(rs.write_paths.contains(&PathBuf::from("/home/thomas")));
+        assert!(rs.write_paths.contains(&PathBuf::from("/workspace")));
+        assert!(rs.write_paths.contains(&PathBuf::from("/artifacts")));
         assert!(rs.write_paths.contains(&PathBuf::from("/tmp")));
+        assert!(rs.write_paths.contains(&PathBuf::from("/dev/null")));
         assert!(rs
             .exec_paths
             .contains(&PathBuf::from("/usr/bin/agent-runtime")));
+        assert!(rs.exec_paths.contains(&PathBuf::from("/usr/bin/node")));
         assert!(rs.exec_paths.contains(&PathBuf::from("/breakout-helper")));
         assert!(rs
             .exec_paths
@@ -214,5 +265,38 @@ mod tests {
         assert!(rs1.write_paths.contains(&PathBuf::from("/home/thomas")));
         assert!(rs2.write_paths.contains(&PathBuf::from("/home/lisa")));
         assert!(!rs1.write_paths.contains(&PathBuf::from("/home/lisa")));
+    }
+
+    #[test]
+    fn workbench_rejects_partial_missing_and_mismatched_enforcement() {
+        assert_eq!(
+            workbench_fully_enforced_abi(
+                LandlockEnforcement::FullyEnforced {
+                    abi: LANDLOCK_RULESET_ABI,
+                },
+                LANDLOCK_RULESET_ABI,
+            ),
+            Some(LANDLOCK_RULESET_ABI)
+        );
+        assert_eq!(
+            workbench_fully_enforced_abi(
+                LandlockEnforcement::FullyEnforced {
+                    abi: LANDLOCK_RULESET_ABI,
+                },
+                LANDLOCK_RULESET_ABI - 1,
+            ),
+            None
+        );
+        assert_eq!(
+            workbench_fully_enforced_abi(
+                LandlockEnforcement::PartiallyEnforced,
+                LANDLOCK_RULESET_ABI,
+            ),
+            None
+        );
+        assert_eq!(
+            workbench_fully_enforced_abi(LandlockEnforcement::NotEnforced, LANDLOCK_RULESET_ABI,),
+            None
+        );
     }
 }

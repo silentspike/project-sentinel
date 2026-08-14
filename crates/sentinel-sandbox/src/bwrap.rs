@@ -19,6 +19,12 @@ const INFO_FD: RawFd = 3;
 /// eight info-JSON writes happen back-to-back once bwrap reaches the info dump,
 /// so the budget only covers reaching that point under a heavy spawn burst.
 const INFO_FD_TIMEOUT_MS: libc::c_int = 5000;
+const WORKBENCH_ENVIRONMENT: [(&str, &str); 4] = [
+    ("HOME", "/workspace"),
+    ("LANG", "C.UTF-8"),
+    ("LC_ALL", "C.UTF-8"),
+    ("PATH", "/usr/bin:/bin"),
+];
 
 /// Result of spawning a bwrap sandbox.
 ///
@@ -87,9 +93,16 @@ pub struct BwrapConfig {
     pub hostname: String,
     pub readonly_binds: Vec<(String, String)>, // (host, guest)
     pub writable_binds: Vec<(String, String)>, // (host, guest)
+    /// Read-only child mounts installed after writable parents (workbench inputs).
+    pub readonly_overlay_binds: Vec<(String, String)>,
     pub tmpfs: Vec<String>,
     pub share_net: bool,
     pub die_with_parent: bool,
+    /// Clear the parent daemon environment before starting the sandbox.
+    pub clear_environment: bool,
+    /// Missing host binds are fatal for profiles whose isolation contract is
+    /// defined by those exact paths (the agent workbench).
+    pub require_all_binds: bool,
     /// Mount /proc inside the sandbox (TOGAF: --proc /proc).
     pub proc_mount: Option<String>,
     /// Mount /dev inside the sandbox (TOGAF: --dev /dev).
@@ -129,12 +142,15 @@ impl BwrapConfig {
                 // Agent-Home writable (TOGAF: --bind /ram/agents/{name} /home/{name})
                 (format!("/ram/agents/{name}"), format!("/home/{name}")),
             ],
+            readonly_overlay_binds: Vec::new(),
             tmpfs: vec!["/tmp".to_string()],
             // #75 full cage: agents make NO network calls (agent-runtime has no
             // network code); the daemon proxies all LLM traffic to the Cortex
             // Gateway on the host. No --share-net -> own netns, loopback only.
             share_net: false,
             die_with_parent: true,
+            clear_environment: false,
+            require_all_binds: false,
             // TOGAF: --proc /proc
             proc_mount: Some("/proc".to_string()),
             // TOGAF: --dev /dev
@@ -155,6 +171,46 @@ impl BwrapConfig {
             format!("{fs_mount}/{host_agent_dir}"),
             format!("/home/{guest_name}"),
         ));
+        self
+    }
+
+    /// Mounts the agent-owned workbench roots at the stable protocol paths.
+    ///
+    /// The backing directories remain inside the same per-agent filesystem;
+    /// the additional binds do not expose any host path outside that boundary.
+    pub fn with_workbench_roots(mut self, host_agent_root: &Path) -> Self {
+        self.readonly_overlay_binds.push((
+            host_agent_root
+                .join("inputs")
+                .to_string_lossy()
+                .into_owned(),
+            "/workspace/.inputs".to_string(),
+        ));
+        self.writable_binds.push((
+            host_agent_root
+                .join("workspaces")
+                .to_string_lossy()
+                .into_owned(),
+            "/workspace".to_string(),
+        ));
+        self.writable_binds.push((
+            host_agent_root
+                .join("artifacts")
+                .to_string_lossy()
+                .into_owned(),
+            "/artifacts".to_string(),
+        ));
+        self
+    }
+
+    /// Removes broad host-data binds that are not part of the workbench profile.
+    pub fn for_workbench(mut self) -> Self {
+        self.readonly_binds
+            .retain(|(_, guest)| guest != "/company" && guest != "/etc/resolv.conf");
+        self.writable_binds
+            .retain(|(_, guest)| !guest.starts_with("/home/"));
+        self.clear_environment = true;
+        self.require_all_binds = true;
         self
     }
 
@@ -189,7 +245,7 @@ impl BwrapConfig {
     /// be verified against `child_pid`, since the supervisor stays in the root
     /// netns by design — #75).
     pub fn spawn(&self, command: &[String]) -> Result<SpawnedSandbox> {
-        let config = self.with_existing_host_binds();
+        let config = self.with_existing_host_binds()?;
         let mut args = config.to_args();
         // bwrap writes `{"child-pid": N, ...}` to --info-fd once the sandbox is
         // set up. Options must precede the command.
@@ -211,6 +267,9 @@ impl BwrapConfig {
         let (read_fd, write_fd) = (fds[0], fds[1]);
 
         let mut cmd = Command::new("bwrap");
+        if config.clear_environment {
+            cmd.env_clear().envs(WORKBENCH_ENVIRONMENT);
+        }
         cmd.args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -264,8 +323,22 @@ impl BwrapConfig {
         Ok(SpawnedSandbox { child, child_pid })
     }
 
-    fn with_existing_host_binds(&self) -> Self {
+    fn with_existing_host_binds(&self) -> Result<Self> {
         let mut config = self.clone();
+        if self.require_all_binds {
+            for (host, guest) in self
+                .readonly_binds
+                .iter()
+                .chain(&self.writable_binds)
+                .chain(&self.readonly_overlay_binds)
+            {
+                anyhow::ensure!(
+                    Path::new(host).exists(),
+                    "required bwrap bind '{host}' -> '{guest}' is missing"
+                );
+            }
+            return Ok(config);
+        }
         config.readonly_binds.retain(|(host, guest)| {
             let exists = Path::new(host).exists();
             if !exists {
@@ -288,7 +361,18 @@ impl BwrapConfig {
             }
             exists
         });
-        config
+        config.readonly_overlay_binds.retain(|(host, guest)| {
+            let exists = Path::new(host).exists();
+            if !exists {
+                warn!(
+                    host = host.as_str(),
+                    guest = guest.as_str(),
+                    "Skipping bwrap readonly overlay because host path is missing"
+                );
+            }
+            exists
+        });
+        Ok(config)
     }
 
     /// Generiert bwrap CLI-Argumente.
@@ -316,6 +400,13 @@ impl BwrapConfig {
         // writable binds
         for (host, guest) in &self.writable_binds {
             args.push("--bind".to_string());
+            args.push(host.clone());
+            args.push(guest.clone());
+        }
+
+        // readonly overlays must follow their writable parent mount.
+        for (host, guest) in &self.readonly_overlay_binds {
+            args.push("--ro-bind".to_string());
             args.push(host.clone());
             args.push(guest.clone());
         }
@@ -555,6 +646,65 @@ mod tests {
         assert!(args.contains(&"--bind".to_string()));
         assert!(args.contains(&"/ram/agents/test".to_string()));
         assert!(args.contains(&"/home/test".to_string()));
+    }
+
+    #[test]
+    fn workbench_roots_stay_inside_the_agent_backing_directory() {
+        let config = BwrapConfig::for_agent("test")
+            .for_workbench()
+            .with_workbench_roots(Path::new("/ram/agents/test"));
+        assert!(config.writable_binds.contains(&(
+            "/ram/agents/test/workspaces".to_string(),
+            "/workspace".to_string(),
+        )));
+        assert!(!config
+            .readonly_binds
+            .iter()
+            .any(|(_, guest)| guest == "/company" || guest == "/etc/resolv.conf"));
+        assert!(!config
+            .writable_binds
+            .iter()
+            .any(|(_, guest)| guest.starts_with("/home/")));
+        assert!(config.clear_environment);
+        assert!(config.writable_binds.contains(&(
+            "/ram/agents/test/artifacts".to_string(),
+            "/artifacts".to_string(),
+        )));
+        assert!(config.readonly_overlay_binds.contains(&(
+            "/ram/agents/test/inputs".to_string(),
+            "/workspace/.inputs".to_string(),
+        )));
+        assert!(config.require_all_binds);
+        assert_eq!(
+            WORKBENCH_ENVIRONMENT,
+            [
+                ("HOME", "/workspace"),
+                ("LANG", "C.UTF-8"),
+                ("LC_ALL", "C.UTF-8"),
+                ("PATH", "/usr/bin:/bin"),
+            ]
+        );
+        let args = config.to_args();
+        let workspace = args
+            .windows(3)
+            .position(|args| {
+                args[0] == "--bind"
+                    && args[1] == "/ram/agents/test/workspaces"
+                    && args[2] == "/workspace"
+            })
+            .unwrap();
+        let inputs = args
+            .windows(3)
+            .position(|args| {
+                args[0] == "--ro-bind"
+                    && args[1] == "/ram/agents/test/inputs"
+                    && args[2] == "/workspace/.inputs"
+            })
+            .unwrap();
+        assert!(
+            workspace < inputs,
+            "read-only input overlay must be mounted last"
+        );
     }
 
     #[test]
