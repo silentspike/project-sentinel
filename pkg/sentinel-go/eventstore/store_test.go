@@ -251,6 +251,81 @@ func TestConcurrentWrites(t *testing.T) {
 	}
 }
 
+func TestOutboxPublishedCASBindsPendingRowEventAndOperation(t *testing.T) {
+	store, _ := tempDB(t)
+	event := makeEvent("op-cas-001")
+	if err := store.AppendWithOutbox(event, "test/topic"); err != nil {
+		t.Fatalf("AppendWithOutbox: %v", err)
+	}
+	entries, err := store.GetOutboxBatch(10)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("GetOutboxBatch len=%d err=%v, want one", len(entries), err)
+	}
+	entry := entries[0]
+
+	for name, mutate := range map[string]func(*OutboxPublishEntry){
+		"wrong id":        func(value *OutboxPublishEntry) { value.OutboxID++ },
+		"wrong event":     func(value *OutboxPublishEntry) { value.EventID = "event-other" },
+		"wrong operation": func(value *OutboxPublishEntry) { value.OperationID = "operation-other" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			mismatched := entry
+			mutate(&mismatched)
+			if err := store.MarkPublishedCAS(mismatched.OutboxID, mismatched.EventID, mismatched.OperationID); err == nil {
+				t.Fatal("mismatched CAS unexpectedly succeeded")
+			}
+			counts, countErr := store.OutboxCounts()
+			if countErr != nil || counts.Pending != 1 {
+				t.Fatalf("pending=%d err=%v, want unchanged pending row", counts.Pending, countErr)
+			}
+		})
+	}
+
+	if err := store.MarkPublishedCAS(entry.OutboxID, entry.EventID, entry.OperationID); err != nil {
+		t.Fatalf("exact CAS: %v", err)
+	}
+	if err := store.MarkPublishedCAS(entry.OutboxID, entry.EventID, entry.OperationID); err == nil {
+		t.Fatal("duplicate CAS unexpectedly succeeded")
+	}
+	counts, err := store.OutboxCounts()
+	if err != nil || counts != (OutboxStatusCounts{}) {
+		t.Fatalf("counts=%+v err=%v, want fully published", counts, err)
+	}
+}
+
+func TestOutboxRetryAndFailureCASRemainExact(t *testing.T) {
+	store, _ := tempDB(t)
+	event := makeEvent("op-failure-cas-001")
+	if err := store.AppendWithOutbox(event, "test/topic"); err != nil {
+		t.Fatalf("AppendWithOutbox: %v", err)
+	}
+	entries, err := store.GetOutboxBatch(1)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("GetOutboxBatch len=%d err=%v", len(entries), err)
+	}
+	entry := entries[0]
+	if err := store.MarkRetryCAS(entry.OutboxID, entry.EventID, "wrong-operation", "publish_failed"); err == nil {
+		t.Fatal("retry accepted wrong operation")
+	}
+	if err := store.MarkRetryCAS(entry.OutboxID, entry.EventID, entry.OperationID, "publish_failed"); err != nil {
+		t.Fatalf("exact retry: %v", err)
+	}
+	entries, err = store.GetOutboxBatch(1)
+	if err != nil || entries[0].RetryCount != 1 {
+		t.Fatalf("retry_count=%d err=%v, want 1", entries[0].RetryCount, err)
+	}
+	if err := store.MarkFailedCAS(entry.OutboxID, "wrong-event", entry.OperationID, "publish_failed"); err == nil {
+		t.Fatal("failure accepted wrong event")
+	}
+	if err := store.MarkFailedCAS(entry.OutboxID, entry.EventID, entry.OperationID, "publish_failed"); err != nil {
+		t.Fatalf("exact failure: %v", err)
+	}
+	counts, err := store.OutboxCounts()
+	if err != nil || counts.Pending != 0 || counts.Failed != 1 || counts.NonPublished != 1 {
+		t.Fatalf("counts=%+v err=%v, want terminal failed row", counts, err)
+	}
+}
+
 func TestGenerateUUID(t *testing.T) {
 	uuid := GenerateUUID()
 	// UUIDv4 format: 8-4-4-4-12 = 36 chars
