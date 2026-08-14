@@ -1552,14 +1552,7 @@ impl WorkflowApi {
                 plan,
                 run,
             } => delivery
-                .assign_qa(
-                    &context,
-                    &tenant_id,
-                    &project_id,
-                    &candidate_id,
-                    *plan,
-                    run,
-                )
+                .assign_qa(&context, &tenant_id, &project_id, &candidate_id, *plan, run)
                 .and_then(delivery_json),
             ProductDeliveryCommand::TransitionQa {
                 tenant_id,
