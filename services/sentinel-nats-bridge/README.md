@@ -7,9 +7,23 @@
 ## Interfaces
 
 - Polls `outbox` rows from the configured event-store path.
-- Publishes to NATS subjects using `pkg/sentinel-go/messaging`.
+- Drains the backlog immediately at startup and processes consecutive bounded
+  batches until no pending row remains.
+- Publishes synchronously to JetStream using a stable `Nats-Msg-Id`; only a
+  returned PubAck permits the exact outbox row to transition to `published`.
 - Health server exposes `GET /health` and `GET /ready` on the configured health port.
 - Retries publishes and marks failed entries after the retry limit.
+
+`GET /health` is process liveness. `GET /ready` is fail-closed until the first
+successful outbox scan has completed, NATS is connected, and the durable store
+reports zero pending, failed, or otherwise non-published rows. The endpoint
+returns only stable reason codes and counts, never database or broker errors.
+
+The SQLite adoption step is a compare-and-set bound to the outbox ID, event ID,
+operation ID, and `pending` state. If PubAck succeeds but that compare-and-set
+does not, the sweep stops. The next poll republishes the same stable message ID,
+allowing JetStream deduplication to retain one effective broker event before
+the row is adopted locally.
 
 ## Dependencies
 
