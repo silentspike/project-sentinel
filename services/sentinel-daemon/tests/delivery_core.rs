@@ -897,9 +897,11 @@ impl DeliveryEffectPort for FakeEffects {
                 &format!("effect-{:?}", request.kind).to_ascii_lowercase(),
                 1,
             ),
-            affected_refs: (request.kind == DeliveryEffectKind::GovernedRework)
-                .then(|| vec![reference("rework-item-1", 1)])
-                .unwrap_or_default(),
+            affected_refs: if request.kind == DeliveryEffectKind::GovernedRework {
+                vec![reference("rework-item-1", 1)]
+            } else {
+                Vec::new()
+            },
             issuer: "test-effects".to_string(),
             issued_at_ms: 1,
             receipt_digest: ContentDigest::zero(),
@@ -1050,9 +1052,11 @@ impl DeliveryEffectPort for DurableFakeEffects {
             actor_authority_receipt_digest: request.actor_authority_receipt_digest.clone(),
             actor_authority_identity_digest: request.actor_authority_identity_digest.clone(),
             effect_ref: reference("durable-effect-1", 1),
-            affected_refs: (request.kind == DeliveryEffectKind::GovernedRework)
-                .then(|| vec![reference("rework-item-1", 1)])
-                .unwrap_or_default(),
+            affected_refs: if request.kind == DeliveryEffectKind::GovernedRework {
+                vec![reference("rework-item-1", 1)]
+            } else {
+                Vec::new()
+            },
             issuer: "test-durable-effect-saga".to_string(),
             issued_at_ms: 1,
             receipt_digest: ContentDigest::zero(),
