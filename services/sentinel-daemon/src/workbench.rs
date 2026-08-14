@@ -567,6 +567,11 @@ pub struct WorkbenchInvocationRecord {
     pub started_at_ms: Option<u64>,
     pub completed_at_ms: Option<u64>,
     pub resources: Option<WorkbenchResourceUsage>,
+    /// Digest of the validated terminal tool result. Private result fields are
+    /// never stored; this digest is the restart-safe evidence consumed by the
+    /// company workflow completion adapter.
+    #[serde(default)]
+    pub result_digest: Option<String>,
     #[serde(default)]
     pub artifacts: Vec<WorkbenchArtifactRef>,
     pub error: Option<WorkbenchErrorInfo>,
@@ -611,6 +616,7 @@ impl WorkbenchInvocationRecord {
             started_at_ms: None,
             completed_at_ms: None,
             resources: None,
+            result_digest: None,
             artifacts: Vec::new(),
             error: None,
         }
@@ -675,6 +681,30 @@ fn invocation_state_name(state: WorkbenchInvocationState) -> &'static str {
         WorkbenchInvocationState::TimedOut => "timed_out",
         WorkbenchInvocationState::UnknownOutcome => "unknown_outcome",
     }
+}
+
+fn terminal_result_digest(
+    outcome: WorkbenchOutcome,
+    output: &BTreeMap<String, String>,
+    artifacts: &[WorkbenchArtifactRef],
+) -> Option<String> {
+    if outcome != WorkbenchOutcome::Succeeded {
+        return None;
+    }
+    if let [artifact] = artifacts {
+        return Some(artifact.sha256.clone());
+    }
+    if let Some(digest) = output
+        .get("sha256")
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Some(digest.to_ascii_lowercase());
+    }
+    serde_json::to_vec(output).ok().map(|encoded| {
+        let mut bytes = b"sentinel.workbench.terminal-output.v1\0".to_vec();
+        bytes.extend_from_slice(&encoded);
+        hex_sha256(&bytes)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -822,7 +852,7 @@ impl WorkbenchInvocationStore {
             outcome,
             resources,
             artifacts,
-            output: _,
+            output,
             error,
         } = message
         else {
@@ -837,6 +867,8 @@ impl WorkbenchInvocationStore {
             if record.state == next && record.state.is_terminal() {
                 if record.resources.as_ref() != Some(resources)
                     || record.artifacts != *artifacts
+                    || record.result_digest.as_deref()
+                        != terminal_result_digest(*outcome, output, artifacts).as_deref()
                     || record.error.as_ref() != safe_error.as_ref()
                 {
                     return Err(WorkbenchStoreError::ResultDigestConflict.into());
@@ -860,6 +892,7 @@ impl WorkbenchInvocationStore {
             record.state = next;
             record.completed_at_ms = Some(now_ms);
             record.resources = Some(resources.clone());
+            record.result_digest = terminal_result_digest(*outcome, output, artifacts);
             record.artifacts = artifacts.clone();
             record.error = safe_error.clone();
             Ok(())

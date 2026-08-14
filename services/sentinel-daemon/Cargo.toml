@@ -33,6 +33,7 @@ sentinel-telemetry = { path = "../../crates/sentinel-telemetry" }
 sentinel-ebpf = { path = "../../crates/sentinel-ebpf" }
 sentinel-hippocampus = { path = "../../crates/sentinel-hippocampus" }
 sentinel-wasm = { path = "../../crates/sentinel-wasm" }
+sentinel-workflow = { path = "../../crates/sentinel-workflow" }
 sentinel-fs = { path = "../../crates/sentinel-fs", optional = true }
 bevy_ecs = { workspace = true }
 redb = { workspace = true }

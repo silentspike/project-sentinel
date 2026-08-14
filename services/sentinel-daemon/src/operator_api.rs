@@ -500,6 +500,7 @@ struct AppState {
     state_store: Arc<StateStore>,
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
+    workflow_api: Arc<crate::workflow_api::WorkflowApi>,
     episode_projection_admission: SharedEpisodeProjectionAdmissionState,
     episode_projection_tx: mpsc::Sender<EpisodeProjectionOperatorCommand>,
     security_runtime_state: SharedSecurityRuntimeState,
@@ -726,6 +727,7 @@ pub async fn start_server(
     state_store: Arc<sentinel_redb::StateStore>,
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
+    workflow_api: Arc<crate::workflow_api::WorkflowApi>,
     episode_projection_admission: SharedEpisodeProjectionAdmissionState,
     episode_projection_tx: mpsc::Sender<EpisodeProjectionOperatorCommand>,
     security_runtime_state: SharedSecurityRuntimeState,
@@ -764,6 +766,7 @@ pub async fn start_server(
         state_store,
         platform_state,
         runtime_health,
+        workflow_api,
         episode_projection_admission,
         episode_projection_tx,
         security_runtime_state,
@@ -811,6 +814,18 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
     let path_only = request_path(&request.path);
     let query = parse_query_params(&request.path);
 
+    if let Some(response) = state.workflow_api.handle(
+        &request.method,
+        &request.path,
+        &request.headers,
+        &request.body,
+    ) {
+        return HttpResponse {
+            status: response.status,
+            body: response.body,
+        };
+    }
+
     // GET-Endpoints ohne Auth (read-only)
     if request.method == "GET" {
         let authorized = if path_only == OPERATOR_EPISODE_PROJECTION_PATH {
@@ -852,7 +867,20 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 }
             },
             OPERATOR_RUNTIME_HEALTH_PATH => match state.runtime_health.read() {
-                Ok(snapshot) => json_response(200, snapshot.clone()),
+                Ok(snapshot) => match serde_json::to_value(snapshot.clone()) {
+                    Ok(mut payload) => {
+                        if let Some(object) = payload.as_object_mut() {
+                            object.insert(
+                                "company_workflow".to_owned(),
+                                serde_json::to_value(state.workflow_api.health())
+                                    .unwrap_or(serde_json::Value::Null),
+                            );
+                        }
+                        json_response(200, payload)
+                    }
+                    Err(_) => ApiError::ServiceUnavailable("Runtime-Health nicht serialisierbar")
+                        .to_response(),
+                },
                 Err(_) => {
                     ApiError::ServiceUnavailable("Runtime-Health nicht verfuegbar").to_response()
                 }
@@ -3754,6 +3782,9 @@ async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRe
 
 fn max_body_bytes_for_path(path: &str) -> usize {
     match request_path(path) {
+        crate::workflow_api::CUSTOMER_COMMAND_PATH
+        | crate::workflow_api::OPERATOR_COMMAND_PATH
+        | crate::workflow_api::AGENT_COMMAND_PATH => crate::workflow_api::MAX_WORKFLOW_BODY_BYTES,
         OPERATOR_APICP_SNAPSHOT_PATH => MAX_APICP_SNAPSHOT_BODY_BYTES,
         OPERATOR_CONFIG_APPLY_PATH => MAX_CONFIG_APPLY_BODY_BYTES,
         _ => MAX_BODY_BYTES,
@@ -3951,6 +3982,7 @@ mod tests {
                     }],
                 },
             )),
+            workflow_api: Arc::new(crate::workflow_api::WorkflowApi::disabled().unwrap()),
             episode_projection_admission: Arc::new(std::sync::RwLock::new(
                 crate::episode_producer::EpisodeProjectionAdmissionSnapshot::default(),
             )),
@@ -5589,6 +5621,9 @@ mod tests {
         assert_eq!(payload.stale_runtime_entries, 2);
         assert_eq!(payload.agents.len(), 1);
         assert_eq!(payload.agents[0].agent_id, 7);
+        let payload: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(payload["company_workflow"]["enabled"], false);
+        assert_eq!(payload["company_workflow"]["status"], "disabled");
     }
 
     #[test]

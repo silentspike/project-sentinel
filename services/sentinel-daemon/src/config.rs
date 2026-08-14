@@ -961,7 +961,7 @@ fn read_operator_credential_with_hook(
     Ok(value)
 }
 
-fn read_operator_credential(path: &Path) -> Result<String> {
+pub(crate) fn read_operator_credential(path: &Path) -> Result<String> {
     read_operator_credential_with_hook(path, || Ok(()))
 }
 
