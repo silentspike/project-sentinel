@@ -310,9 +310,21 @@ id = "web-authoring-v1"
                 "ActiveState": "active",
                 "SubState": "active",
                 "FragmentPath": "/etc/systemd/system/sentinel.target",
-                "Wants": " ".join(sorted(preflight.REQUIRED_UNITS)),
+                "Wants": " ".join(sorted(preflight.TARGET_WANTS)),
+                "Requires": preflight.AUTH_INIT_UNIT,
                 "NeedDaemonReload": "no",
             }
+        }
+        facts[preflight.AUTH_INIT_UNIT] = {
+            "Id": preflight.AUTH_INIT_UNIT,
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "exited",
+            "Result": "success",
+            "FragmentPath": f"/etc/systemd/system/{preflight.AUTH_INIT_UNIT}",
+            "NeedDaemonReload": "no",
+            "ExecMainCode": "1",
+            "ExecMainStatus": "0",
         }
         self.main_pids = {
             unit: 2000 + index
@@ -686,6 +698,22 @@ class PreflightTests(unittest.TestCase):
         result = self.run_fixture()
         self.assertEqual(self.check(result, "systemd_units")["reason"], "systemd_unit_not_ready")
 
+    def test_auth_init_must_be_terminal_success_before_consumers_are_ready(self) -> None:
+        for field, value in (
+            ("ActiveState", "failed"),
+            ("SubState", "running"),
+            ("Result", "exit-code"),
+            ("ExecMainStatus", "1"),
+        ):
+            with self.subTest(field=field):
+                fixture = Fixture()
+                fixture.unit_facts[preflight.AUTH_INIT_UNIT][field] = value
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertEqual(
+                    self.check(result, "systemd_units")["reason"],
+                    "systemd_auth_init_not_ready",
+                )
+
     def test_target_and_timer_omit_inapplicable_properties_but_bad_state_fails(self) -> None:
         target = self.fixture.unit_facts[preflight.TARGET_UNIT]
         timer = self.fixture.unit_facts["sentinel-nightrun.timer"]
@@ -879,6 +907,14 @@ class PreflightTests(unittest.TestCase):
         self.fixture.unit_facts[preflight.TARGET_UNIT]["Wants"] = " ".join(wants[:-1] + [wants[0]])
         result = self.run_fixture()
         self.assertEqual(self.check(result, "systemd_units")["reason"], "systemd_required_set_mismatch")
+
+        fixture = Fixture()
+        fixture.unit_facts[preflight.TARGET_UNIT]["Requires"] = ""
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(
+            self.check(result, "systemd_units")["reason"],
+            "systemd_required_set_mismatch",
+        )
 
     def test_runtime_drift_and_stale_entry_fail(self) -> None:
         runtime = self.fixture.http_payloads["runtime_health"]

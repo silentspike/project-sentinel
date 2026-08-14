@@ -7,6 +7,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROVISIONER="${REPO_ROOT}/deploy/provision-runtime-base.sh"
 CONTRACT="${REPO_ROOT}/deploy/runtime-base.env"
 MANIFEST="${REPO_ROOT}/deploy/generate-manifest.sh"
+RELEASE_MANIFEST="${REPO_ROOT}/deploy/release-manifest.json"
+DEPLOY_PREFLIGHT="${REPO_ROOT}/deploy/deploy-preflight.sh"
+WORKBENCH_PROFILE="${REPO_ROOT}/config/workbench-profiles/web-authoring-v1.toml"
 UNIT="${REPO_ROOT}/deploy/systemd/sentinel-daemon.service"
 SYSCTL="${REPO_ROOT}/deploy/vm-config/99-sentinel-bwrap.conf"
 BASE_DIRS="${REPO_ROOT}/deploy/scripts/init-runtime-base-dirs.sh"
@@ -67,6 +70,10 @@ require_once "${MANIFEST}" 'deploy/scripts/init-runtime-base-dirs.sh|/opt/sentin
 require_once "${MANIFEST}" 'deploy/runtime-base.env|/opt/sentinel/share/runtime-base.env|config'
 require_once "${MANIFEST}" 'deploy/apt/sentinel-runtime.pref|/etc/apt/preferences.d/sentinel-runtime|config'
 require_once "${MANIFEST}" 'deploy/vm-config/99-sentinel-bwrap.conf|/etc/sysctl.d/99-sentinel-bwrap.conf|config'
+require_once "${MANIFEST}" 'config/workbench-profiles/web-authoring-v1.toml|/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml|config'
+require_once "${RELEASE_MANIFEST}" '"path": "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml"'
+require_once "${RELEASE_MANIFEST}" '"sha256": "6e352d4f34b33cb1f8cd2fa0f94ae6a6b9b2b49165b60f65b2e40ba68f078286"'
+require_once "${WORKBENCH_PROFILE}" 'environment = { HOME = "/workspace", LANG = "C.UTF-8", LC_ALL = "C.UTF-8", PATH = "/usr/bin:/bin" }'
 
 # These are deliberately literal fragments from the remote heredoc.
 # shellcheck disable=SC2016
@@ -125,10 +132,53 @@ fi
 check_tmp_root="${RUNTIME_BASE_CHECK_TMPDIR:-${REPO_ROOT}}"
 fresh_fixture="$(mktemp -d "${check_tmp_root}/.runtime-base-fresh.XXXXXX")"
 protected_fixture="$(mktemp -d "${check_tmp_root}/.runtime-base-protected.XXXXXX")"
+preflight_fixture="$(mktemp -d "${check_tmp_root}/.workbench-preflight.XXXXXX")"
 cleanup() {
-  rm -rf -- "${fresh_fixture}" "${protected_fixture}"
+  rm -rf -- "${fresh_fixture}" "${protected_fixture}" "${preflight_fixture}"
 }
 trap cleanup EXIT HUP INT TERM
+
+mkdir -p "${preflight_fixture}/bin"
+cat >"${preflight_fixture}/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+case "${WORKBENCH_PREFLIGHT_FIXTURE:-match}" in
+  match)
+    printf '%s  %s\n' \
+      '6e352d4f34b33cb1f8cd2fa0f94ae6a6b9b2b49165b60f65b2e40ba68f078286' \
+      '/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml'
+    ;;
+  missing) printf 'MISSING\n' ;;
+  mismatch)
+    printf '%064d  %s\n' 0 '/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml'
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod 0700 "${preflight_fixture}/bin/ssh"
+cat >"${preflight_fixture}/manifest.json" <<'EOF'
+{
+  "version": "1.0",
+  "artifacts": [
+    {
+      "path": "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml",
+      "source": "config/workbench-profiles/web-authoring-v1.toml",
+      "sha256": "6e352d4f34b33cb1f8cd2fa0f94ae6a6b9b2b49165b60f65b2e40ba68f078286",
+      "type": "config"
+    }
+  ]
+}
+EOF
+PATH="${preflight_fixture}/bin:${PATH}" \
+  WORKBENCH_PREFLIGHT_FIXTURE=match \
+  bash "${DEPLOY_PREFLIGHT}" fixture "${preflight_fixture}/manifest.json" >/dev/null
+for rejected_fixture in missing mismatch; do
+  if PATH="${preflight_fixture}/bin:${PATH}" \
+    WORKBENCH_PREFLIGHT_FIXTURE="${rejected_fixture}" \
+    bash "${DEPLOY_PREFLIGHT}" fixture "${preflight_fixture}/manifest.json" >/dev/null 2>&1; then
+    echo "FAIL: deploy preflight accepted ${rejected_fixture} workbench profile" >&2
+    exit 1
+  fi
+done
 
 for _ in 1 2; do
   SENTINEL_ROOT_PREFIX="${fresh_fixture}" \

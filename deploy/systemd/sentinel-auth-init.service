@@ -1,0 +1,24 @@
+[Unit]
+Description=Sentinel Operator Credential Initialization
+Documentation=https://github.com/silentspike/project-sentinel/issues/650
+Before=sentinel-daemon.service sentinel-gateway.service sentinel-dashboard-backend.service sentinel-nightrun.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ConfigurationDirectory=sentinel
+ConfigurationDirectoryMode=0755
+ExecStart=/opt/sentinel/scripts/init-dashboard-auth.sh
+RemainAfterExit=yes
+
+# The root-owned initializer is the sole migration writer for the dashboard
+# environment and operator credential. Consumers receive only systemd copies.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/sentinel/config /etc/sentinel
+PrivateTmp=true
+
+[Install]
+WantedBy=sentinel.target

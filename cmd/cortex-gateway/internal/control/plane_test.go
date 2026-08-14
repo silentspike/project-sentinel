@@ -384,6 +384,82 @@ func TestPlane_HandleUpdateConfig_TrafficControlFields(t *testing.T) {
 	}
 }
 
+func TestConfigRejectsAPICPActivationAtomicallyWhenRestartIsRequired(t *testing.T) {
+	cfg := NewConfig("anthropic-direct")
+	cfg.SetAPICPActivationValidator(func() error {
+		return &APICPRestartRequiredError{}
+	})
+	before := cfg.Get()
+
+	err := cfg.Update(map[string]interface{}{
+		"apicp_enabled": true,
+		"temperature":   1.25,
+	})
+	var restartRequired *APICPRestartRequiredError
+	if !errors.As(err, &restartRequired) {
+		t.Fatalf("error = %v, want typed APICP restart requirement", err)
+	}
+	after := cfg.Get()
+	if after.APICPEnabled != before.APICPEnabled || after.Temperature != before.Temperature {
+		t.Fatalf("mixed rejected update mutated config: before=%+v after=%+v", before, after)
+	}
+
+	if err := cfg.Update(map[string]interface{}{"temperature": 1.25}); err != nil {
+		t.Fatalf("non-APICP update failed: %v", err)
+	}
+	if got := cfg.Get().Temperature; got != 1.25 {
+		t.Fatalf("temperature = %v, want 1.25", got)
+	}
+}
+
+func TestPlaneRejectsMixedAPICPActivationPatchWithoutMutation(t *testing.T) {
+	cfg := NewConfig("anthropic-direct")
+	cfg.SetAPICPActivationValidator(func() error {
+		return &APICPRestartRequiredError{}
+	})
+	before := cfg.Get()
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPatch,
+		"/control/config",
+		strings.NewReader(`{"apicp_enabled":true,"max_tokens":1024}`),
+	)
+	NewPlane(cfg, testLogger()).Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422: %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "requires a gateway restart") {
+		t.Fatalf("response does not expose restart-required outcome: %s", recorder.Body.String())
+	}
+	after := cfg.Get()
+	if after.APICPEnabled != before.APICPEnabled || after.MaxTokens != before.MaxTokens {
+		t.Fatalf("rejected mixed PATCH mutated config: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestConfigAllowsAPICPDisableButRejectsSubsequentRuntimeEnable(t *testing.T) {
+	cfg := NewConfig("anthropic-direct")
+	if err := cfg.Update(map[string]interface{}{"apicp_enabled": true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg.SetAPICPActivationValidator(func() error {
+		return &APICPRestartRequiredError{}
+	})
+	if err := cfg.Update(map[string]interface{}{"apicp_enabled": false}); err != nil {
+		t.Fatalf("true-to-false update failed: %v", err)
+	}
+	if cfg.Get().APICPEnabled {
+		t.Fatal("APICP remained enabled after permitted disable")
+	}
+	before := cfg.Get()
+	if err := cfg.Update(map[string]interface{}{"apicp_enabled": true}); err == nil {
+		t.Fatal("runtime APICP reactivation was accepted")
+	}
+	if after := cfg.Get(); after.APICPEnabled != before.APICPEnabled {
+		t.Fatalf("rejected activation mutated config: before=%+v after=%+v", before, after)
+	}
+}
+
 // TestPlane_HandleUpdateConfig_Invalid tests rejection of invalid updates.
 func TestPlane_HandleUpdateConfig_Invalid(t *testing.T) {
 	cfg := NewConfig("claude")
