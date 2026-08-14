@@ -474,6 +474,29 @@ fn aggregate_readiness_requires_every_productive_port() {
     assert!(!unavailable_gate.dependencies_ready());
 }
 
+#[test]
+fn durable_work_item_keyset_scan_restarts_after_the_last_row() {
+    let store = WorkflowStore::open(":memory:").unwrap();
+    let plan = plan(1);
+    store.admit_plan(&plan, &authority(), NOW).unwrap();
+
+    let first = store.workflow_items_after(None, 1).unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].work_item_id, plan.work_item_id);
+    assert!(store
+        .workflow_items_after(
+            Some((
+                &first[0].tenant_id,
+                &first[0].project_id,
+                &first[0].work_item_id,
+            )),
+            1,
+        )
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.workflow_items_after(None, 1).unwrap()[0], first[0]);
+}
+
 fn execution_row_snapshot(database: &std::path::Path) -> Vec<u8> {
     let connection = rusqlite::Connection::open(database).unwrap();
     let row: (String, String, String, String, String, i64, String, Vec<u8>, i64, i64) = connection

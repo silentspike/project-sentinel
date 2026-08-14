@@ -347,6 +347,78 @@ impl WorkflowStore {
         read_work_item(&connection, tenant_id, project_id, work_item_id)
     }
 
+    /// Returns a stable keyset page for rebuilding the company-domain view
+    /// from durable execution state after a crash between the two commits.
+    pub fn workflow_items_after(
+        &self,
+        after: Option<(&crate::TenantId, &crate::ProjectId, &crate::WorkItemId)>,
+        limit: usize,
+    ) -> Result<Vec<WorkItemExecutionV1>, WorkflowError> {
+        if let Some((tenant_id, project_id, work_item_id)) = after {
+            tenant_id.validate()?;
+            project_id.validate()?;
+            work_item_id.validate()?;
+        }
+        let connection = self.lock()?;
+        let mut statement = if after.is_some() {
+            connection
+                .prepare(
+                    "SELECT tenant_id,project_id,work_item_id FROM workflow_work_items \
+                     WHERE (tenant_id,project_id,work_item_id) > (?1,?2,?3) \
+                     ORDER BY tenant_id,project_id,work_item_id LIMIT ?4",
+                )
+                .map_err(map_sqlite_error)?
+        } else {
+            connection
+                .prepare(
+                    "SELECT tenant_id,project_id,work_item_id FROM workflow_work_items \
+                     ORDER BY tenant_id,project_id,work_item_id LIMIT ?1",
+                )
+                .map_err(map_sqlite_error)?
+        };
+        let bounded_limit = limit.clamp(1, 100) as i64;
+        let keys = if let Some((tenant_id, project_id, work_item_id)) = after {
+            statement
+                .query_map(
+                    params![tenant_id.0, project_id.0, work_item_id.0, bounded_limit],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .map_err(map_sqlite_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_sqlite_error)?
+        } else {
+            statement
+                .query_map([bounded_limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(map_sqlite_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_sqlite_error)?
+        };
+        drop(statement);
+        keys.into_iter()
+            .map(|(tenant, project, work_item)| {
+                read_work_item(
+                    &connection,
+                    &crate::TenantId(tenant),
+                    &crate::ProjectId(project),
+                    &crate::WorkItemId(work_item),
+                )?
+                .ok_or_else(corrupt_store)
+            })
+            .collect()
+    }
+
     pub fn pending_executions(
         &self,
         limit: usize,
