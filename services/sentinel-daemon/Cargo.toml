@@ -37,6 +37,7 @@ sentinel-workflow = { path = "../../crates/sentinel-workflow" }
 sentinel-fs = { path = "../../crates/sentinel-fs", optional = true }
 bevy_ecs = { workspace = true }
 redb = { workspace = true }
+rustix = { version = "1.1", features = ["fs", "process"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
