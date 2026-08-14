@@ -1319,7 +1319,12 @@ fn apply_governed_rework(
     let current_generation = project
         .work_items
         .values()
-        .map(|work| work.spec.rework.as_ref().map_or(0, |binding| binding.generation))
+        .map(|work| {
+            work.spec
+                .rework
+                .as_ref()
+                .map_or(0, |binding| binding.generation)
+        })
         .max()
         .unwrap_or(0);
     let sources = project
@@ -1335,8 +1340,12 @@ fn apply_governed_rework(
         })
         .cloned()
         .collect::<Vec<_>>();
-    if sources.is_empty() || project.work_items.len().saturating_add(sources.len()) > MAX_AGGREGATE_ITEMS {
-        return Err(invalid("governed rework would exceed the project work limit"));
+    if sources.is_empty()
+        || project.work_items.len().saturating_add(sources.len()) > MAX_AGGREGATE_ITEMS
+    {
+        return Err(invalid(
+            "governed rework would exceed the project work limit",
+        ));
     }
     let existing_budget = project.work_items.values().try_fold(0_u64, |total, work| {
         total.checked_add(work.spec.budget_micros)
@@ -3078,13 +3087,10 @@ fn validate_work_graph_if_present(
             let source = items
                 .get(&binding.source_work_item_id)
                 .ok_or_else(corrupt)?;
-            let expected_generation = source
-                .spec
-                .rework
-                .as_ref()
-                .map_or(1, |source_binding| source_binding.generation.saturating_add(1));
-            if source.state != CompanyWorkStateV1::Done
-                || binding.generation != expected_generation
+            let expected_generation = source.spec.rework.as_ref().map_or(1, |source_binding| {
+                source_binding.generation.saturating_add(1)
+            });
+            if source.state != CompanyWorkStateV1::Done || binding.generation != expected_generation
             {
                 return Err(corrupt());
             }

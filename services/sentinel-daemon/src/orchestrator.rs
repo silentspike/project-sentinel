@@ -774,18 +774,16 @@ fn process_workbench_dispatch(
                 authority,
                 response,
             } => {
-                let use_qa_profile = match workbench_invocation_uses_qa_profile(
-                    service,
-                    &invocation_id,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        if response.send(Err(error)).is_err() {
-                            warn!("workbench requester disconnected before profile rejection");
+                let use_qa_profile =
+                    match workbench_invocation_uses_qa_profile(service, &invocation_id) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            if response.send(Err(error)).is_err() {
+                                warn!("workbench requester disconnected before profile rejection");
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                };
+                    };
                 let (profile, profile_digest) = if use_qa_profile {
                     (&service.qa_profile, service.qa_profile_digest.as_str())
                 } else {
@@ -806,18 +804,16 @@ fn process_workbench_dispatch(
                 authority,
                 response,
             } => {
-                let use_qa_profile = match workbench_invocation_uses_qa_profile(
-                    service,
-                    &invocation_id,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        if response.send(Err(error)).is_err() {
-                            warn!("workbench requester disconnected before profile rejection");
+                let use_qa_profile =
+                    match workbench_invocation_uses_qa_profile(service, &invocation_id) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            if response.send(Err(error)).is_err() {
+                                warn!("workbench requester disconnected before profile rejection");
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                };
+                    };
                 let (profile, profile_digest) = if use_qa_profile {
                     (&service.qa_profile, service.qa_profile_digest.as_str())
                 } else {
@@ -830,11 +826,11 @@ fn process_workbench_dispatch(
                 );
                 (
                     coordinator.recover_executing(
-                    &mut runtime,
-                    &invocation_id,
-                    authority.as_ref(),
-                    now_ms,
-                ),
+                        &mut runtime,
+                        &invocation_id,
+                        authority.as_ref(),
+                        now_ms,
+                    ),
                     response,
                 )
             }
@@ -844,18 +840,16 @@ fn process_workbench_dispatch(
                 authority,
                 response,
             } => {
-                let use_qa_profile = match workbench_invocation_uses_qa_profile(
-                    service,
-                    &invocation_id,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        if response.send(Err(error)).is_err() {
-                            warn!("workbench requester disconnected before profile rejection");
+                let use_qa_profile =
+                    match workbench_invocation_uses_qa_profile(service, &invocation_id) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            if response.send(Err(error)).is_err() {
+                                warn!("workbench requester disconnected before profile rejection");
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                };
+                    };
                 let (profile, profile_digest) = if use_qa_profile {
                     (&service.qa_profile, service.qa_profile_digest.as_str())
                 } else {
@@ -868,12 +862,12 @@ fn process_workbench_dispatch(
                 );
                 (
                     coordinator.cancel(
-                    &mut runtime,
-                    &invocation_id,
-                    &reason,
-                    authority.as_ref(),
-                    now_ms,
-                ),
+                        &mut runtime,
+                        &invocation_id,
+                        &reason,
+                        authority.as_ref(),
+                        now_ms,
+                    ),
                     response,
                 )
             }
@@ -11544,24 +11538,13 @@ mod tests {
 
     #[test]
     fn workbench_follow_up_dispatch_retains_the_reserved_profile() {
-        assert!(!workbench_profile_is_qa(
-            "web-authoring-v1",
-            "web-authoring-v1",
-            "web-qa-v1"
-        )
-        .unwrap());
-        assert!(workbench_profile_is_qa(
-            "web-qa-v1",
-            "web-authoring-v1",
-            "web-qa-v1"
-        )
-        .unwrap());
-        assert!(workbench_profile_is_qa(
-            "foreign-profile",
-            "web-authoring-v1",
-            "web-qa-v1"
-        )
-        .is_err());
+        assert!(
+            !workbench_profile_is_qa("web-authoring-v1", "web-authoring-v1", "web-qa-v1").unwrap()
+        );
+        assert!(workbench_profile_is_qa("web-qa-v1", "web-authoring-v1", "web-qa-v1").unwrap());
+        assert!(
+            workbench_profile_is_qa("foreign-profile", "web-authoring-v1", "web-qa-v1").is_err()
+        );
     }
 
     #[test]

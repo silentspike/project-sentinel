@@ -13,9 +13,9 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use sentinel_common::{
-    events::{DomainEvent, DomainEventPayload}, AgentId, CommandRule, WorkbenchArtifactRef,
-    WorkbenchRequest, WorkbenchResourceLimits, WorkbenchTool, WORKBENCH_RUNTIME_BWRAP,
-    WORKBENCH_SCHEMA_VERSION,
+    events::{DomainEvent, DomainEventPayload},
+    AgentId, CommandRule, WorkbenchArtifactRef, WorkbenchRequest, WorkbenchResourceLimits,
+    WorkbenchTool, WORKBENCH_RUNTIME_BWRAP, WORKBENCH_SCHEMA_VERSION,
 };
 use sentinel_workflow::{
     sealed_output_bundle_digest, ArtifactInputV1, AuthenticatedCompanyPrincipalV1, CommandRuleV1,
@@ -31,9 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::delivery::{
-    ConfiguredDeliveryCore, DeliveryStoreConfigV1,
-};
+use crate::delivery::{ConfiguredDeliveryCore, DeliveryStoreConfigV1};
 use crate::workbench::{
     dispatch_workbench, WorkbenchAuthoritySnapshot, WorkbenchAuthoritySource,
     WorkbenchDispatchCommand, WorkbenchInvocationRecord, WorkbenchInvocationState,
@@ -1175,11 +1173,9 @@ impl WorkflowApi {
         );
         let gate: Arc<dyn GateEvidencePort> =
             Arc::new(WorkflowWorkItemGate::new(delivery_integration.clone()));
-        let delivery_config = DeliveryStoreConfigV1::new(
-            data_dir.join("company-delivery"),
-            "company-delivery.redb",
-        )
-        .map_err(|_| workflow_unavailable())?;
+        let delivery_config =
+            DeliveryStoreConfigV1::new(data_dir.join("company-delivery"), "company-delivery.redb")
+                .map_err(|_| workflow_unavailable())?;
         let delivery = ConfiguredDeliveryCore::open(
             &delivery_config,
             delivery_integration,
@@ -1513,11 +1509,7 @@ impl WorkflowApi {
         }
     }
 
-    fn delivery_command(
-        &self,
-        principal: &BoundPrincipal,
-        body: &[u8],
-    ) -> WorkflowHttpResponse {
+    fn delivery_command(&self, principal: &BoundPrincipal, body: &[u8]) -> WorkflowHttpResponse {
         let Some(delivery) = self.delivery.as_ref() else {
             return json_error(
                 503,
@@ -1560,14 +1552,7 @@ impl WorkflowApi {
                 plan,
                 run,
             } => delivery
-                .assign_qa(
-                    &context,
-                    &tenant_id,
-                    &project_id,
-                    &candidate_id,
-                    plan,
-                    run,
-                )
+                .assign_qa(&context, &tenant_id, &project_id, &candidate_id, plan, run)
                 .and_then(delivery_json),
             ProductDeliveryCommand::TransitionQa {
                 tenant_id,
@@ -1671,11 +1656,7 @@ impl WorkflowApi {
         }
     }
 
-    fn delivery_lineage(
-        &self,
-        principal: &BoundPrincipal,
-        path: &str,
-    ) -> WorkflowHttpResponse {
+    fn delivery_lineage(&self, principal: &BoundPrincipal, path: &str) -> WorkflowHttpResponse {
         let Some(delivery) = self.delivery.as_ref() else {
             return json_error(
                 503,
@@ -1711,12 +1692,9 @@ impl WorkflowApi {
         match delivery.read_public_lineage(&context, tenant_id, project_id) {
             Ok(value) => {
                 if principal.principal.role == CompanyRoleV1::Gaia {
-                    if let Err(error) = self.record_gaia_oversight(
-                        principal,
-                        tenant_id,
-                        project_id,
-                        &value,
-                    ) {
+                    if let Err(error) =
+                        self.record_gaia_oversight(principal, tenant_id, project_id, &value)
+                    {
                         return delivery_error(error);
                     }
                 }
@@ -1854,7 +1832,9 @@ impl WorkflowApi {
         }
         self.reconcile_company_state_page()?;
         if let Some(delivery) = self.delivery.as_ref() {
-            delivery.publish_pending().map_err(delivery_workflow_error)?;
+            delivery
+                .publish_pending()
+                .map_err(delivery_workflow_error)?;
         }
         Ok(())
     }
@@ -2338,9 +2318,9 @@ fn delivery_principal(
         CompanyRoleV1::Qa => BTreeSet::from([AuthorityRole::Qa]),
         CompanyRoleV1::ReleaseManager => BTreeSet::from([AuthorityRole::ReleaseManager]),
         CompanyRoleV1::Gaia => BTreeSet::from([AuthorityRole::GaiaObserver]),
-        CompanyRoleV1::Sales
-        | CompanyRoleV1::ProjectManager
-        | CompanyRoleV1::TechnicalLead => return None,
+        CompanyRoleV1::Sales | CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead => {
+            return None
+        }
     };
     Some(crate::delivery::PrincipalV1 {
         tenant_id: principal.tenant_id.0.clone(),
@@ -2358,8 +2338,11 @@ fn is_internal_company_command(command: &CompanyWorkflowCommandV1) -> bool {
     )
 }
 
-fn delivery_json<T: Serialize>(value: T) -> Result<serde_json::Value, crate::delivery::DeliveryError> {
-    serde_json::to_value(value).map_err(|error| crate::delivery::DeliveryError::Storage(error.to_string()))
+fn delivery_json<T: Serialize>(
+    value: T,
+) -> Result<serde_json::Value, crate::delivery::DeliveryError> {
+    serde_json::to_value(value)
+        .map_err(|error| crate::delivery::DeliveryError::Storage(error.to_string()))
 }
 
 fn delivery_error(error: crate::delivery::DeliveryError) -> WorkflowHttpResponse {
@@ -2518,10 +2501,9 @@ mod tests {
     #[test]
     fn gaia_lineage_observation_is_idempotent_and_grants_no_mutation_role() {
         let directory = tempfile::tempdir().unwrap();
-        let events = sentinel_limbo::EventStore::open(
-            directory.path().join("events.db").to_str().unwrap(),
-        )
-        .unwrap();
+        let events =
+            sentinel_limbo::EventStore::open(directory.path().join("events.db").to_str().unwrap())
+                .unwrap();
         let mut api = WorkflowApi::disabled().unwrap();
         api.event_store = Some(events.clone());
         let principals = PrincipalAuthenticator::new(vec![(

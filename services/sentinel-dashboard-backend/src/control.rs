@@ -208,7 +208,10 @@ pub async fn delivery_lineage(
     };
     let response = st
         .http
-        .get(format!("{}/company/delivery/lineage", st.config.operator_url))
+        .get(format!(
+            "{}/company/delivery/lineage",
+            st.config.operator_url
+        ))
         .query(&[
             ("tenant_id", query.tenant_id.as_str()),
             ("project_id", query.project_id.as_str()),
@@ -228,17 +231,15 @@ pub async fn delivery_lineage(
                 .into_response();
         }
     };
-    let status = StatusCode::from_u16(response.status().as_u16())
-        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type_is_json = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| {
             value.eq_ignore_ascii_case("application/json")
-                || value
-                    .to_ascii_lowercase()
-                    .starts_with("application/json;")
+                || value.to_ascii_lowercase().starts_with("application/json;")
         });
     if !content_type_is_json
         || response
