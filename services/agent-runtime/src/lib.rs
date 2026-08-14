@@ -3233,6 +3233,8 @@ mod tests {
         };
         let mut bytes = fs::read(&manifest_path).unwrap();
         bytes.push(b' ');
+        // Simulate an actor with storage-level authority bypassing the immutable mode.
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(&manifest_path, bytes).unwrap();
 
         let restarted = WorkbenchExecutor::new(&workspace, &artifacts);
