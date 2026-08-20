@@ -20,6 +20,7 @@ import tempfile
 import time
 from typing import Any
 from urllib import error, parse, request
+import uuid
 
 
 SCHEMA_VERSION = 1
@@ -37,6 +38,7 @@ MAX_OBSERVE_INTERVAL_MS = 2_000
 MAX_OBSERVE_ELAPSED_MS = 30_000
 OBSERVE_RETRY_STATUSES = {404, 409, 425, 429}
 ALLOWED_ROLES = {"agent", "customer", "none", "operator"}
+ALLOWED_ROUTE_ROLES = ALLOWED_ROLES | {"company"}
 NO_AUTH_PATHS = {"/health", "/readiness"}
 PHASES = (
     "readiness",
@@ -50,6 +52,7 @@ PHASES = (
 MUTATING_PHASES = PHASES[1:]
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,239}$")
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+DELIVERY_DIGEST_DOMAIN_RE = re.compile(r"^[a-z0-9-]{1,96}$")
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 SENSITIVE_KEY_RE = re.compile(
     r"(?:authorization|cookie|credential|password|prompt|secret|token)", re.IGNORECASE
@@ -121,8 +124,37 @@ def digest(value: Any) -> str:
     return hashlib.sha256(canonical_json(value)).hexdigest()
 
 
-def stable_operation_id(journey_id: str, step_id: str) -> str:
+def delivery_digest(record_type: str, schema_version: int, value: Any) -> str:
+    if (
+        not isinstance(record_type, str)
+        or not DELIVERY_DIGEST_DOMAIN_RE.fullmatch(record_type)
+        or not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or not 1 <= schema_version <= 0xFFFF
+    ):
+        raise JourneyError("delivery digest domain is invalid")
+    encoded = canonical_json(value)
+    hasher = hashlib.sha256()
+    hasher.update(b"sentinel.delivery.digest\0")
+    hasher.update(schema_version.to_bytes(2, "big"))
+    hasher.update(len(record_type).to_bytes(4, "big"))
+    hasher.update(record_type.encode("ascii"))
+    hasher.update(len(encoded).to_bytes(8, "big"))
+    hasher.update(encoded)
+    return hasher.hexdigest()
+
+
+def stable_operation_id(
+    journey_id: str, step_id: str, schema_version: int = SCHEMA_VERSION
+) -> str:
     suffix = hashlib.sha256(f"{journey_id}\0{step_id}".encode("ascii")).hexdigest()[:24]
+    if schema_version == SCHEMA_VERSION_V2:
+        raw = bytearray(
+            hashlib.sha256(f"{journey_id}\0{step_id}".encode("ascii")).digest()[:16]
+        )
+        raw[6] = (raw[6] & 0x0F) | 0x50
+        raw[8] = (raw[8] & 0x3F) | 0x80
+        return str(uuid.UUID(bytes=bytes(raw)))
     return f"m0-{suffix}"
 
 
@@ -360,7 +392,21 @@ def derived_route_role(path: str) -> str:
     for role in ("customer", "operator", "agent"):
         if path.startswith(f"/{role}/"):
             return role
+    if path.startswith("/company/"):
+        return "company"
     raise JourneyError("HTTP path is outside the authority route contract")
+
+
+def credential_role_allowed(route_role: str, credential_role: str) -> bool:
+    if route_role == "none":
+        return credential_role == "none"
+    if route_role in {"customer", "agent"}:
+        return credential_role == route_role
+    if route_role == "operator":
+        return credential_role in {"agent", "operator"}
+    if route_role == "company":
+        return credential_role in {"agent", "customer", "operator"}
+    return False
 
 
 def validate_public_structure(value: Any, label: str) -> None:
@@ -428,6 +474,22 @@ def validate_template(value: Any, available_references: set[str], label: str) ->
     if "$ref" in value:
         if set(value) != {"$ref"} or value["$ref"] not in available_references:
             raise JourneyError(f"{label} references an unavailable capture")
+        return
+    if "$delivery_digest" in value:
+        if set(value) != {"$delivery_digest"}:
+            raise JourneyError(f"{label} has an invalid delivery-digest template")
+        specification = value["$delivery_digest"]
+        if not isinstance(specification, dict) or set(specification) != {
+            "record_type",
+            "schema_version",
+            "value",
+        }:
+            raise JourneyError(f"{label} has an invalid delivery-digest template")
+        delivery_digest(
+            specification["record_type"], specification["schema_version"], {}
+        )
+        validate_template(specification["value"], available_references, label)
+        validate_public_structure(specification["value"], label)
         return
     for item in value.values():
         validate_template(item, available_references, label)
@@ -601,7 +663,7 @@ def validate_plan(plan: dict[str, Any]) -> None:
         path = validate_path(raw_step.get("path"), step_id)
         route_authority = derived_route_role(path)
         route_role = raw_step.get("route_role")
-        if route_role not in ALLOWED_ROLES:
+        if route_role not in ALLOWED_ROUTE_ROLES:
             raise JourneyError(f"step {step_id} has an invalid route authority role")
         if route_role != route_authority:
             raise JourneyError(f"step {step_id} spoofs its derived route authority")
@@ -677,9 +739,14 @@ def validate_plan(plan: dict[str, Any]) -> None:
         if kind == "positive":
             if method != "POST":
                 raise JourneyError("positive M0 commands must use POST")
-            if raw_step["body"].get("operation_id") != {"$operation_id": True}:
+            stable_keys = {
+                key
+                for key in ("operation_id", "idempotency_key")
+                if raw_step["body"].get(key) == {"$operation_id": True}
+            }
+            if len(stable_keys) != 1:
                 raise JourneyError(
-                    "positive M0 commands require the stable operation_id template"
+                    "positive M0 commands require exactly one stable operation key"
                 )
         if kind == "observe":
             if schema_version != SCHEMA_VERSION_V2:
@@ -854,6 +921,18 @@ def resolve_template(value: Any, references: dict[str, Any], operation_id: str) 
             if not isinstance(reference, str) or reference not in references:
                 raise JourneyError("request references an unavailable capture")
             return references[reference]
+        if set(value) == {"$delivery_digest"}:
+            specification = value["$delivery_digest"]
+            if not isinstance(specification, dict):
+                raise JourneyError("delivery digest template is invalid")
+            resolved = resolve_template(
+                specification.get("value"), references, operation_id
+            )
+            return delivery_digest(
+                specification.get("record_type"),
+                specification.get("schema_version"),
+                resolved,
+            )
         return {
             key: resolve_template(item, references, operation_id)
             for key, item in value.items()
@@ -1118,7 +1197,7 @@ def validate_completed_prefix(
         replay_contract = replay_contract_for_step(step, plan["schema_version"])
         if (
             record["operation_id"]
-            != stable_operation_id(plan["journey_id"], step_id)
+            != stable_operation_id(plan["journey_id"], step_id, plan["schema_version"])
             or record["phase"] != step["phase"]
             or record["kind"] != step.get("kind", "positive")
             or record["method"] != step["method"]
@@ -1141,8 +1220,14 @@ def validate_completed_prefix(
             if (
                 record["auth_alias_digest"] != credential_alias_digest(alias)
                 or record["auth_role"] not in ALLOWED_ROLES
-                or (record["auth_role"] != step["route_role"] and not allow_mismatch)
-                or (record["auth_role"] == step["route_role"] and allow_mismatch)
+                or (
+                    not credential_role_allowed(step["route_role"], record["auth_role"])
+                    and not allow_mismatch
+                )
+                or (
+                    credential_role_allowed(step["route_role"], record["auth_role"])
+                    and allow_mismatch
+                )
                 or not isinstance(record["attempt_count"], int)
                 or isinstance(record["attempt_count"], bool)
                 or not 1 <= record["attempt_count"] <= expected_max_attempts
@@ -1345,7 +1430,7 @@ def resolve_credential_values(
             continue
         alias = step["role"] if schema_version == SCHEMA_VERSION else step["credential_alias"]
         credential_role = values[alias]["role"]
-        mismatch = credential_role != route_role
+        mismatch = not credential_role_allowed(route_role, credential_role)
         allow_mismatch = step.get("allow_route_mismatch") is True
         if mismatch and not (step.get("kind", "positive") == "negative" and allow_mismatch):
             raise JourneyError(f"step {step['id']} crosses its authenticated route")
@@ -1458,6 +1543,10 @@ def resolved_request(
         alias, credential_role = credential_identity(
             step, schema_version, credential_values
         )
+        mismatch = not credential_role_allowed(step["route_role"], credential_role)
+        allow_mismatch = step.get("allow_route_mismatch") is True
+        if mismatch != allow_mismatch:
+            raise JourneyError(f"step {step['id']} crosses its authenticated route")
         request_material = {
             "schema_version": SCHEMA_VERSION_V2,
             "method": step["method"],
@@ -1611,7 +1700,7 @@ def _run_journey_locked(
 
     for step in plan["steps"]:
         step_id = step["id"]
-        operation_id = stable_operation_id(journey_id, step_id)
+        operation_id = stable_operation_id(journey_id, step_id, schema_version)
         body, encoded_query, request_digest = resolved_request(
             step,
             references,

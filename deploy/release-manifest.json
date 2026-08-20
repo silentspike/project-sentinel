@@ -102,7 +102,7 @@
     {
       "path": "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml",
       "source": "config/workbench-profiles/web-authoring-v1.toml",
-      "sha256": "6e352d4f34b33cb1f8cd2fa0f94ae6a6b9b2b49165b60f65b2e40ba68f078286",
+      "sha256": "e7e704d11a951e97d8246385f99cfa4c0fa835e4de2eec8e1272ce7dfae712a6",
       "type": "config"
     },
     {

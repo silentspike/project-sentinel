@@ -146,6 +146,10 @@ class FakeHandler(BaseHTTPRequestHandler):
                 "release-secret-value",
             },
             "/customer/delivery/commands": {"customer-secret-value"},
+            "/company/delivery/commands": {
+                "release-secret-value",
+                "customer-secret-value",
+            },
         }
         expected = expected_tokens.get(path)
         if expected is not None and authorization not in {
@@ -161,8 +165,11 @@ class FakeHandler(BaseHTTPRequestHandler):
             return
 
         replayed = False
-        if body is not None and isinstance(body.get("operation_id"), str):
-            operation_key = (path, body["operation_id"])
+        operation_id = None if body is None else body.get("operation_id")
+        if body is not None and operation_id is None:
+            operation_id = body.get("idempotency_key")
+        if isinstance(operation_id, str):
+            operation_key = (path, operation_id)
             replayed = operation_key in state.seen_operations
             if not replayed:
                 state.seen_operations.add(operation_key)
@@ -199,6 +206,13 @@ class FakeHandler(BaseHTTPRequestHandler):
             "/customer/delivery/commands": {
                 "acceptance_id": "acceptance-1",
                 "delivery_id": "delivery-1",
+                "state": "accepted",
+            },
+            "/company/delivery/commands": {
+                "acceptance_id": "acceptance-1",
+                "artifact_digest": DIGEST_B,
+                "delivery_id": "delivery-1",
+                "release_id": "release-1",
                 "state": "accepted",
             },
         }
@@ -439,6 +453,10 @@ def canonical_plan_v2() -> dict[str, object]:
             step["replay_assertions"] = [
                 {"pointer": f"/{marker}", "equals": True}
             ]
+        if step["id"] in {"qa_release", "delivery", "acceptance"}:
+            step["path"] = "/company/delivery/commands"
+            step["route_role"] = "company"
+            step["body"]["idempotency_key"] = step["body"].pop("operation_id")
     observe = {
         "id": "observe_project",
         "phase": "governed_project",
@@ -643,7 +661,7 @@ class JourneyRunnerTests(unittest.TestCase):
             self.state.effective_mutations["/operator/workflow/commands"], 1
         )
         self.assertEqual(
-            self.state.effective_mutations["/operator/delivery/commands"], 2
+            self.state.effective_mutations["/company/delivery/commands"], 3
         )
         self.assertIn("qa_release", replayed["replay_verified_steps"])
         self.assertIn("delivery", replayed["replay_verified_steps"])
@@ -653,6 +671,12 @@ class JourneyRunnerTests(unittest.TestCase):
             runner.credential_alias_digest("customer_primary"),
         )
         self.assertEqual(records["submit"]["auth_role"], "customer")
+        self.assertRegex(
+            records["submit"]["operation_id"],
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        )
+        self.assertEqual(records["delivery"]["auth_role"], "operator")
+        self.assertEqual(records["acceptance"]["auth_role"], "customer")
         self.assertEqual(records["submit"]["replay_contract"], "idempotent_command_v2")
         self.assertRegex(records["submit"]["response_contract_digest"], r"^[0-9a-f]{64}$")
         self.assertEqual(
@@ -728,6 +752,45 @@ class JourneyRunnerTests(unittest.TestCase):
                 self.evidence,
                 1.0,
             )
+
+    def test_v2_delivery_digest_template_matches_rust_domain_and_resolves_refs(self) -> None:
+        self.assertEqual(
+            runner.delivery_digest("qa-plan", 1, {"a": 1, "b": ["x", "y"]}),
+            "fa68b8a7096f0867a5223eff0cae25339bc50f5f110ea78584e43897989956a5",
+        )
+        template = {
+            "$delivery_digest": {
+                "record_type": "release-candidate",
+                "schema_version": 1,
+                "value": {
+                    "project_id": {"$ref": "project.project_id"},
+                    "generation": 1,
+                },
+            }
+        }
+        runner.validate_template(template, {"project.project_id"}, "candidate")
+        resolved = runner.resolve_template(
+            template,
+            {"project.project_id": "project-m0"},
+            "018f3f32-4f01-7f2c-a6c1-f6f4a81b2809",
+        )
+        self.assertEqual(
+            resolved,
+            runner.delivery_digest(
+                "release-candidate",
+                1,
+                {"generation": 1, "project_id": "project-m0"},
+            ),
+        )
+
+        for malformed in (
+            {"$delivery_digest": {"record_type": "QA_PLAN", "schema_version": 1, "value": {}}},
+            {"$delivery_digest": {"record_type": "qa-plan", "schema_version": 0, "value": {}}},
+            {"$delivery_digest": {"record_type": "qa-plan", "schema_version": 1}},
+            {"$delivery_digest": {"record_type": "qa-plan", "schema_version": 1, "value": {}, "extra": True}},
+        ):
+            with self.assertRaises(runner.JourneyError):
+                runner.validate_template(malformed, set(), "candidate")
 
     def test_v2_observe_is_bounded_and_replayed_against_exact_captures(self) -> None:
         self.state.response_sequences["/operator/observe"] = [
