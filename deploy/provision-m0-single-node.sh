@@ -128,6 +128,7 @@ def artifact_authority() -> dict[str, tuple[str, str]]:
         "/etc/systemd/system/sentinel.target": ("deploy/systemd/sentinel.target", "systemd"),
         "/opt/sentinel/scripts/init-cgroups.sh": ("deploy/scripts/init-cgroups.sh", "script"),
         "/opt/sentinel/scripts/init-dirs.sh": ("deploy/scripts/init-dirs.sh", "script"),
+        "/opt/sentinel/scripts/init-m0-runtime-dirs.py": ("deploy/scripts/init-m0-runtime-dirs.py", "script"),
         "/opt/sentinel/scripts/init-runtime-base-dirs.sh": ("deploy/scripts/init-runtime-base-dirs.sh", "script"),
         "/opt/sentinel/scripts/init-dashboard-auth.sh": ("deploy/scripts/init-dashboard-auth.sh", "script"),
         "/opt/sentinel/scripts/init-company-workflow-auth.sh": ("deploy/scripts/init-company-workflow-auth.sh", "script"),

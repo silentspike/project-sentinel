@@ -1,5 +1,5 @@
 [Unit]
-Description=Sentinel Operator Credential Initialization
+Description=Sentinel Runtime and Credential Initialization
 Documentation=https://github.com/silentspike/project-sentinel/issues/650
 Before=sentinel-daemon.service sentinel-gateway.service sentinel-dashboard-backend.service sentinel-nightrun.service
 
@@ -10,6 +10,7 @@ Group=root
 UMask=0077
 ConfigurationDirectory=sentinel
 ConfigurationDirectoryMode=0755
+ExecStart=/usr/bin/python3 /opt/sentinel/scripts/init-m0-runtime-dirs.py
 ExecStart=/opt/sentinel/scripts/init-dashboard-auth.sh
 ExecStart=/opt/sentinel/scripts/init-company-workflow-auth.sh
 RemainAfterExit=yes
