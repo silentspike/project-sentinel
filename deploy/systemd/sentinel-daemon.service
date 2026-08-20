@@ -13,6 +13,7 @@ User=root
 Group=root
 WorkingDirectory=/opt/sentinel
 EnvironmentFile=-/etc/sentinel/env
+ExecStartPre=/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml initialize-episode-projection
 ExecStart=/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml
 ExecStartPost=/usr/bin/python3 /opt/sentinel/scripts/m0-readiness.py daemon --credential-file /etc/sentinel/credentials/operator-api --timeout-seconds 120
 Restart=on-failure
