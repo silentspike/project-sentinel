@@ -1,8 +1,9 @@
 [Unit]
 Description=Sentinel Gaia Console readiness loop (#442)
 Documentation=https://github.com/silentspike/project-sentinel/issues/442
-After=network-online.target nats-server.service sentinel-daemon.service
+After=network-online.target nats-server.service sentinel-daemon.service sentinel-auth-init.service
 Wants=network-online.target nats-server.service
+Requires=sentinel-auth-init.service
 StartLimitBurst=5
 StartLimitIntervalSec=300
 
