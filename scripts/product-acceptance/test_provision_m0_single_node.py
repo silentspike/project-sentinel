@@ -183,6 +183,16 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
         self.assertEqual(list(self.fixture.target.iterdir()), [])
         self.assertFalse((self.fixture.stage / "provision-receipt.json").exists())
 
+    def test_preflight_and_provisioner_artifact_authorities_are_identical(self) -> None:
+        self.assertEqual(PROVISION_CORE["artifact_authority"](), AUTHORITY)
+        sources = {source for source, _kind in AUTHORITY.values()}
+        self.assertTrue({
+            "console/dist/index.html",
+            "console/dist/assets/app.js",
+            "console/dist/assets/app.js.map",
+            "console/dist/assets/index.css",
+        }.issubset(sources))
+
     def test_complete_fake_root_install_and_receipt(self) -> None:
         result = self.fixture.run()
         self.assertEqual(result.returncode, 0, result.stderr)

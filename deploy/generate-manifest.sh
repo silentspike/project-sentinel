@@ -24,6 +24,11 @@ ARTIFACT_DEFS=(
   "cmd/cortex-gateway/cortex-gateway|/opt/sentinel/bin/cortex-gateway|binary"
   "services/sentinel-judge/sentinel-judge|/opt/sentinel/bin/sentinel-judge|binary"
   "services/sentinel-nats-bridge/sentinel-nats-bridge|/opt/sentinel/bin/sentinel-nats-bridge|binary"
+  # Console bundle (stable filenames are enforced by console/vite.config.ts)
+  "console/dist/index.html|/opt/sentinel/console-dist/index.html|config"
+  "console/dist/assets/app.js|/opt/sentinel/console-dist/assets/app.js|config"
+  "console/dist/assets/app.js.map|/opt/sentinel/console-dist/assets/app.js.map|config"
+  "console/dist/assets/index.css|/opt/sentinel/console-dist/assets/index.css|config"
   # Configs
   "config/daemon.toml|/opt/sentinel/config/daemon.toml|config"
   "config/cortex-gateway.toml|/opt/sentinel/config/cortex-gateway.toml|config"
@@ -63,6 +68,11 @@ ARTIFACT_DEFS=(
   "deploy/scripts/init-hugepages.sh|/opt/sentinel/scripts/init-hugepages.sh|script"
   "deploy/scripts/init-sysctl.sh|/opt/sentinel/scripts/init-sysctl.sh|script"
   "deploy/scripts/init-tmpfs.sh|/opt/sentinel/scripts/init-tmpfs.sh|script"
+  "scripts/product-acceptance/run_m0_preflight.py|/opt/sentinel/scripts/product-acceptance/run_m0_preflight.py|script"
+  "scripts/product-acceptance/run_m0_journey.py|/opt/sentinel/scripts/product-acceptance/run_m0_journey.py|script"
+  "scripts/product-acceptance/m0-activation/control.py|/opt/sentinel/scripts/product-acceptance/m0-activation/control.py|script"
+  "scripts/product-acceptance/m0-journey-v2.json|/opt/sentinel/config/product-acceptance/m0-journey-v2.json|config"
+  "scripts/product-acceptance/m0-restart-control-v1.json|/opt/sentinel/config/product-acceptance/m0-restart-control-v1.json|config"
   # Host runtime-base contract
   "deploy/runtime-base.env|/opt/sentinel/share/runtime-base.env|config"
   "deploy/apt/sentinel-runtime.pref|/etc/apt/preferences.d/sentinel-runtime|config"

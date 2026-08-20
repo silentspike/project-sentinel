@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::digest::{canonical_sha256, constant_time_eq};
+use crate::digest::{canonical_sha256, constant_time_eq, validate_sha256};
 use crate::model::{execution_subject_digest, step_digest};
 use crate::{
     ExecutionEvidenceReadbackV1, ExecutionPlanV1, ExecutionReconcileState, GateEvidenceReadbackV1,
@@ -332,6 +332,55 @@ impl WorkflowStore {
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok((false, work_item))
+    }
+
+    pub fn reserve_operation_timestamp(
+        &self,
+        namespace: &str,
+        operation_id: Uuid,
+        request_digest: &str,
+        now_ms: u64,
+    ) -> Result<(bool, u64), WorkflowError> {
+        if namespace.is_empty()
+            || namespace.len() > 256
+            || !namespace.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.')
+            })
+            || operation_id.is_nil()
+            || !validate_sha256(request_digest)
+        {
+            return Err(WorkflowError::new(
+                WorkflowErrorCode::InvalidInput,
+                false,
+                "operation timestamp reservation is invalid",
+            ));
+        }
+        let mut connection = self.lock()?;
+        let transaction = immediate(&mut connection)?;
+        if let Some((stored_digest, response, stored_at_ms)) =
+            read_operation(&transaction, namespace, &operation_id.to_string())?
+        {
+            if !constant_time_eq(&stored_digest, request_digest) {
+                return Err(idempotency_conflict());
+            }
+            let stored_at_ms = stored_u64(stored_at_ms)?;
+            let response_at_ms: u64 = decode(&response)?;
+            if response_at_ms != stored_at_ms || stored_at_ms > now_ms {
+                return Err(corrupt_store());
+            }
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok((true, stored_at_ms));
+        }
+        insert_operation(
+            &transaction,
+            namespace,
+            &operation_id.to_string(),
+            request_digest,
+            &now_ms,
+            now_ms,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok((false, now_ms))
     }
 
     pub fn work_item(
@@ -2198,6 +2247,7 @@ mod tests {
 
     use serde::ser::Error as _;
     use serde::{Serialize, Serializer};
+    use uuid::Uuid;
 
     use super::{encode, sql_u64, WorkflowStore, SCHEMA};
     use crate::WorkflowErrorCode;
@@ -2234,6 +2284,39 @@ mod tests {
         let poisoned = store.pending_executions(1).unwrap_err();
         assert_eq!(poisoned.code, WorkflowErrorCode::PersistenceFailure);
         assert!(!poisoned.retryable);
+    }
+
+    #[test]
+    fn operation_timestamp_reservation_is_durable_and_content_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workflow.sqlite");
+        let operation_id = Uuid::parse_str("018f3f32-4f01-7f2c-a6c1-f6f4a81b2809").unwrap();
+        let namespace = "delivery-intent-v1:tenant-m0:release-8:1";
+        let digest = "a".repeat(64);
+
+        let store = WorkflowStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .reserve_operation_timestamp(namespace, operation_id, &digest, 100)
+                .unwrap(),
+            (false, 100)
+        );
+        drop(store);
+
+        let reopened = WorkflowStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .reserve_operation_timestamp(namespace, operation_id, &digest, 200)
+                .unwrap(),
+            (true, 100)
+        );
+        assert_eq!(
+            reopened
+                .reserve_operation_timestamp(namespace, operation_id, &"b".repeat(64), 200)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::IdempotencyConflict
+        );
     }
 
     fn create_v1_store(path: &Path) {
