@@ -2920,7 +2920,12 @@ fn validate_generation_snapshot(
                 && candidate.archived_episodes.len() <= MAX_EPISODES_PER_AGENT,
             "episode projection generation exceeds bounded retention"
         );
-        let mut episode_ids = HashSet::new();
+        let receipt_episode_ids: HashSet<u64> = candidate
+            .receipts
+            .iter()
+            .map(|receipt| receipt.episode_id)
+            .collect();
+        let mut receipt_backed_episode_ids = HashSet::new();
         for episode in candidate
             .live_episodes
             .iter()
@@ -2930,16 +2935,16 @@ fn validate_generation_snapshot(
                 episode.agent_name == candidate.agent.agent_name,
                 "episode projection generation episode/storage locator mismatch"
             );
-            anyhow::ensure!(
-                episode_ids.insert(episode.id),
-                "duplicate episode ID in projection generation subject"
-            );
+            // Legacy buckets predate stable projection identities and may reuse
+            // an ID. Their ordered payload bytes remain covered by the cutover
+            // and generation digests. Receipt-backed IDs must stay unique.
+            if receipt_episode_ids.contains(&episode.id) {
+                anyhow::ensure!(
+                    receipt_backed_episode_ids.insert(episode.id),
+                    "duplicate receipt-backed episode ID in projection generation subject"
+                );
+            }
         }
-        let receipt_episode_ids: HashSet<u64> = candidate
-            .receipts
-            .iter()
-            .map(|receipt| receipt.episode_id)
-            .collect();
         if !permits_receiptless_legacy_root(descriptor, snapshot) {
             for episode in &candidate.live_episodes {
                 anyhow::ensure!(
@@ -5166,6 +5171,48 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&store.load_archive("Thomas").unwrap()).unwrap(),
             serde_json::to_vec(std::slice::from_ref(&legacy)).unwrap()
+        );
+    }
+
+    #[test]
+    fn recovery_cut_preserves_duplicate_legacy_ids_without_weakening_receipt_identity() {
+        let _guard = PROJECTION_TEST_LOCK.lock().unwrap();
+        let (store, dir) = temp_store();
+        let path = dir.path().join("test-hippocampus.redb");
+        let legacy = vec![
+            make_episode(77, "first legacy episode"),
+            make_episode(77, "second legacy episode"),
+        ];
+        store.store_episodes("Thomas", &legacy).unwrap();
+        store
+            .initialize_episode_projection_cutover(&cutover_receipt(0), &[projection_agent()])
+            .unwrap();
+        let root = store.load_episode_projection_generation_status().unwrap();
+        drop(store);
+
+        let store = HippocampusStore::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            store.load_episode_projection_generation_status().unwrap(),
+            root
+        );
+        assert_eq!(
+            serde_json::to_vec(&store.load_episodes("Thomas").unwrap()).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
+        store.archive_and_clear_episodes("Thomas", &legacy).unwrap();
+
+        let active = root.active_generation_id;
+        let evidence = EpisodeProjectionSourceCutEvidence {
+            coverage: root.generations[0].snapshot_source_cut.clone(),
+            entries: Vec::new(),
+        };
+        let candidate = generation_candidate_from_current(&store, &active, &evidence);
+        store
+            .begin_episode_projection_generation(&candidate, &active, &evidence)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&store.load_archive("Thomas").unwrap()).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
         );
     }
 
