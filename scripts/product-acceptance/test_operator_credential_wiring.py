@@ -257,12 +257,8 @@ class OperatorCredentialWiringTests(unittest.TestCase):
             1,
         )
         self.assertIn(
-            "Environment=SENTINEL_OPERATOR_CREDENTIAL_FILE=%d/operator-api",
-            source,
-        )
-        self.assertIn(
-            "m0-readiness.py nightrun --credential-environment "
-            "SENTINEL_OPERATOR_CREDENTIAL_FILE",
+            "m0-readiness.py nightrun --credential-file "
+            "/etc/sentinel/credentials/operator-api",
             source,
         )
         self.assertNotIn("curl", source)

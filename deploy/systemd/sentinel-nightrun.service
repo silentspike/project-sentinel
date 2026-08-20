@@ -9,10 +9,9 @@ Type=oneshot
 WorkingDirectory=/opt/sentinel
 ExecCondition=/usr/bin/systemctl --quiet is-active sentinel-daemon.service
 LoadCredential=operator-api:/etc/sentinel/credentials/operator-api
-Environment=SENTINEL_OPERATOR_CREDENTIAL_FILE=%d/operator-api
-# The bounded helper reads the credential from its systemd-owned file. No
-# bearer value is exposed through argv or the journal.
-ExecStart=/usr/bin/python3 /opt/sentinel/scripts/m0-readiness.py nightrun --credential-environment SENTINEL_OPERATOR_CREDENTIAL_FILE --timeout-seconds 45
+# The bounded root helper reads the canonical credential file directly because
+# systemd does not expose its credential mount to hardened control processes.
+ExecStart=/usr/bin/python3 /opt/sentinel/scripts/m0-readiness.py nightrun --credential-file /etc/sentinel/credentials/operator-api --timeout-seconds 45
 TimeoutStartSec=60
 MemoryMax=64M
 
