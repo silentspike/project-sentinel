@@ -34,7 +34,7 @@ Environment=SENTINEL_DAEMON_PROMETHEUS_URL=http://127.0.0.1:9090
 Environment=SENTINEL_PROJECTION_DB=/opt/sentinel/data/projection.db
 Environment=SENTINEL_EVENTS_DB=/opt/sentinel/data/events.db
 Environment=SENTINEL_DASHBOARD_BUNDLE_DIR=/opt/sentinel/console-dist
-Environment=SENTINEL_DASHBOARD_CERT_DIR=/opt/sentinel/console-cert
+Environment=SENTINEL_DASHBOARD_CERT_DIR=/opt/sentinel/data/dashboard-cert
 Environment=SENTINEL_GAIA_CONSOLE_DIR=/opt/sentinel/data/gaia-console
 Environment=SENTINEL_GAIA_CLAUDE_BIN=/opt/sentinel/bin/claude
 Environment=SENTINEL_GAIA_COMPANY_CONTEXT=/opt/sentinel/config/company-context.md
@@ -64,10 +64,10 @@ SyslogIdentifier=sentinel-dashboard-backend
 # Security Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-# Projection-DB nur lesen (Backend oeffnet read-only); Cert-Dir schreiben
-# (self-signed beim Start); Gaia Console writes only explicit session streams.
+# Projection-DB nur lesen (Backend oeffnet read-only); the private dashboard
+# certificate state and Gaia Console session streams are the only writable children.
 ReadOnlyPaths=/opt/sentinel/data /opt/sentinel/console-dist
-ReadWritePaths=/opt/sentinel/console-cert /opt/sentinel/data/gaia-console
+ReadWritePaths=/opt/sentinel/data/dashboard-cert /opt/sentinel/data/gaia-console
 PrivateTmp=true
 
 [Install]

@@ -124,7 +124,7 @@ HTTP_CONTRACTS = (
     ("episode_projection", "http://127.0.0.1:8084/operator/episode-projection", "operator", None, None),
 )
 DASHBOARD_ORIGIN = "https://127.0.0.1:8001"
-DASHBOARD_CERT_PATH = Path("/opt/sentinel/console-cert/console-cert.pem")
+DASHBOARD_CERT_PATH = Path("/opt/sentinel/data/dashboard-cert/console-cert.pem")
 CANONICAL_AGENT_FILES = {
     "AGENT-01-THOMAS-CEO.toml",
     "AGENT-02-LISA-DESIGN.toml",
