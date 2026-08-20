@@ -224,24 +224,24 @@ def read_credential(path: Path) -> str:
 
 def resolve_credential_path(
     credential_file: Path | None,
-    credential_name: str | None,
+    credential_environment: str | None,
     *,
     environment: Mapping[str, str] | None = None,
 ) -> Path:
     if credential_file is not None:
-        if credential_name is not None:
+        if credential_environment is not None:
             fail("arguments_invalid")
         return credential_file
-    if credential_name != "operator-api":
+    if credential_environment != "SENTINEL_OPERATOR_CREDENTIAL_FILE":
         fail("arguments_invalid")
     variables = os.environ if environment is None else environment
-    directory = variables.get("CREDENTIALS_DIRECTORY")
-    if not directory:
+    value = variables.get(credential_environment)
+    if not value:
         fail("credential_unavailable")
-    root = Path(directory)
-    if not root.is_absolute():
+    path = Path(value)
+    if not path.is_absolute():
         fail("credential_path_invalid")
-    return root / credential_name
+    return path
 
 
 def request_json(
@@ -567,7 +567,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         if name != "nats":
             source = child.add_mutually_exclusive_group(required=True)
             source.add_argument("--credential-file", type=Path)
-            source.add_argument("--credential-name", choices=("operator-api",))
+            source.add_argument(
+                "--credential-environment",
+                choices=("SENTINEL_OPERATOR_CREDENTIAL_FILE",),
+            )
     return parser.parse_args(argv)
 
 
@@ -581,7 +584,7 @@ def run(argv: list[str]) -> int:
             details = check_nats(timeout)
         else:
             credential_file = resolve_credential_path(
-                args.credential_file, args.credential_name
+                args.credential_file, args.credential_environment
             )
             if check == "daemon":
                 details = check_daemon(timeout, credential_file)
