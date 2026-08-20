@@ -13,6 +13,7 @@ import sys
 
 GAIA_CONSOLE = PurePosixPath("/opt/sentinel/data/gaia-console")
 GAIA_SESSIONS = GAIA_CONSOLE / "sessions"
+DASHBOARD_CERTS = PurePosixPath("/opt/sentinel/data/dashboard-cert")
 TEST_ROOT_ENV = "SENTINEL_M0_RUNTIME_DIRS_TEST_ROOT"
 
 
@@ -171,6 +172,10 @@ def initialize() -> None:
                 os.close(sessions_fd)
             finally:
                 os.close(gaia_fd)
+            dashboard_certs_fd = ensure_private_directory(
+                current_fd, DASHBOARD_CERTS.name, target_uid, target_gid
+            )
+            os.close(dashboard_certs_fd)
         finally:
             os.close(current_fd)
     finally:
@@ -189,7 +194,7 @@ def main() -> int:
             reason = "runtime_directory_operation_failed"
         print(f"ERROR: {reason}", file=sys.stderr)
         return 1
-    print("m0_runtime_dirs=verified directories=2 mode=0700")
+    print("m0_runtime_dirs=verified directories=3 mode=0700")
     return 0
 
 

@@ -38,6 +38,7 @@ class M0RuntimeDirectoryTests(unittest.TestCase):
             current /= component
             current.mkdir(mode=mode)
         self.gaia = current / "gaia-console"
+        self.dashboard_certs = current / "dashboard-cert"
 
     def tearDown(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
@@ -62,9 +63,9 @@ class M0RuntimeDirectoryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 result.stdout,
-                "m0_runtime_dirs=verified directories=2 mode=0700\n",
+                "m0_runtime_dirs=verified directories=3 mode=0700\n",
             )
-        for path in (self.gaia, self.gaia / "sessions"):
+        for path in (self.gaia, self.gaia / "sessions", self.dashboard_certs):
             self.assertTrue(path.is_dir())
             self.assertFalse(path.is_symlink())
             self.assertEqual(path.stat().st_uid, os.geteuid())
@@ -84,7 +85,7 @@ class M0RuntimeDirectoryTests(unittest.TestCase):
         self.assertEqual(retained.stat().st_mode & 0o777, 0o600)
 
     def test_symlink_file_and_unsafe_parent_fail_closed(self) -> None:
-        cases = ("symlink", "file", "unsafe-parent")
+        cases = ("symlink", "file", "dashboard-symlink", "unsafe-parent")
         for case in cases:
             with self.subTest(case=case):
                 shutil.rmtree(self.root)
@@ -95,6 +96,10 @@ class M0RuntimeDirectoryTests(unittest.TestCase):
                     self.gaia.symlink_to(foreign, target_is_directory=True)
                 elif case == "file":
                     self.gaia.write_text("not-a-directory", encoding="ascii")
+                elif case == "dashboard-symlink":
+                    foreign = self.root / "foreign"
+                    foreign.mkdir(mode=0o700)
+                    self.dashboard_certs.symlink_to(foreign, target_is_directory=True)
                 else:
                     (self.root / "opt/sentinel/data").chmod(0o777)
                 result = self.run_initializer()
@@ -124,6 +129,14 @@ class M0RuntimeDirectoryTests(unittest.TestCase):
                 requires.removeprefix("Requires=").split(),
             )
             self.assertIn("/opt/sentinel/data/gaia-console", consumer)
+        self.assertIn(
+            "Environment=SENTINEL_DASHBOARD_CERT_DIR=/opt/sentinel/data/dashboard-cert",
+            dashboard,
+        )
+        self.assertIn(
+            "ReadWritePaths=/opt/sentinel/data/dashboard-cert /opt/sentinel/data/gaia-console",
+            dashboard,
+        )
 
     def test_release_authorities_include_the_initializer_exactly_once(self) -> None:
         source = "deploy/scripts/init-m0-runtime-dirs.py"
