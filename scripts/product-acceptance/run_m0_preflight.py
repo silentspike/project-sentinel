@@ -74,6 +74,10 @@ M0_WORKBENCH_PROFILE_PATH = Path(
     "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml"
 )
 M0_QA_PROFILE_PATH = Path("/opt/sentinel/config/workbench-profiles/web-qa-v1.toml")
+M0_JOURNEY_PATH = Path("/opt/sentinel/config/product-acceptance/m0-journey-v2.json")
+M0_RESTART_CONTROL_PATH = Path(
+    "/opt/sentinel/config/product-acceptance/m0-restart-control-v1.json"
+)
 EXPECTED_LISTENERS = {
     ("tcp", "ipv4", "127.0.0.1", 4222),
     ("tcp", "ipv4", "127.0.0.1", 8001),
@@ -204,6 +208,19 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
         "binary",
     ),
     "/usr/local/bin/nats-server": ("external/nats-server", "binary"),
+    "/opt/sentinel/console-dist/index.html": ("console/dist/index.html", "config"),
+    "/opt/sentinel/console-dist/assets/app.js": (
+        "console/dist/assets/app.js",
+        "config",
+    ),
+    "/opt/sentinel/console-dist/assets/app.js.map": (
+        "console/dist/assets/app.js.map",
+        "config",
+    ),
+    "/opt/sentinel/console-dist/assets/index.css": (
+        "console/dist/assets/index.css",
+        "config",
+    ),
     "/opt/sentinel/config/daemon.toml": ("config/daemon.toml", "config"),
     "/opt/sentinel/config/cortex-gateway.toml": ("config/cortex-gateway.toml", "config"),
     "/opt/sentinel/config/nightrun.toml": ("config/nightrun.toml", "config"),
@@ -321,6 +338,23 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
         "script",
     ),
     str(M0_CONTRACT_PATH): ("scripts/product-acceptance/m0-contract.toml", "config"),
+    str(M0_JOURNEY_PATH): ("scripts/product-acceptance/m0-journey-v2.json", "config"),
+    str(M0_RESTART_CONTROL_PATH): (
+        "scripts/product-acceptance/m0-restart-control-v1.json",
+        "config",
+    ),
+    "/opt/sentinel/scripts/product-acceptance/run_m0_preflight.py": (
+        "scripts/product-acceptance/run_m0_preflight.py",
+        "script",
+    ),
+    "/opt/sentinel/scripts/product-acceptance/run_m0_journey.py": (
+        "scripts/product-acceptance/run_m0_journey.py",
+        "script",
+    ),
+    "/opt/sentinel/scripts/product-acceptance/m0-activation/control.py": (
+        "scripts/product-acceptance/m0-activation/control.py",
+        "script",
+    ),
 }
 CANONICAL_RELEASE_ARTIFACTS.update(
     {

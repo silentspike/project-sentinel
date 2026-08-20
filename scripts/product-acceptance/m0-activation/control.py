@@ -34,7 +34,11 @@ ACTIVATION_POLL_SECONDS = 1.0
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SAFE_UNIT_RE = re.compile(r"^[a-z0-9][a-z0-9@_.-]{0,127}\.(?:service|timer|target)$")
-CREDENTIAL_RE = re.compile(r"^(?:agent|customer|operator)=[A-Z][A-Z0-9_]{0,127}$")
+CREDENTIAL_RE = re.compile(
+    r"^(?:(?:agent|customer|operator)|"
+    r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,239}:(?:agent|customer|operator))="
+    r"[A-Z][A-Z0-9_]{0,127}$"
+)
 HERE = Path(__file__).resolve().parent
 PRODUCT_ACCEPTANCE = HERE.parent
 PREFLIGHT_PROGRAM = PRODUCT_ACCEPTANCE / "run_m0_preflight.py"

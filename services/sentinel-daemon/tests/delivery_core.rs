@@ -2135,6 +2135,33 @@ fn qa_effect_uses_stable_request_and_is_not_repeated_on_retry() {
     assert!(!first.0.duplicate);
     assert!(duplicate.0.duplicate);
     assert_eq!(first.1.receipt_digest, duplicate.1.receipt_digest);
+
+    let run_ref = VersionedRefV1 {
+        id: "run-1".to_string(),
+        generation: 1,
+        digest: digest("run-request"),
+    };
+    core.import_evidence_graph(
+        &context("qa-1", AuthorityRole::Qa, "evidence-1", 145),
+        "tenant-a",
+        "project-1",
+        "run-1",
+        evidence_graph(&run_ref, &plan.plan_digest, &first.1),
+    )
+    .unwrap();
+    core.transition_qa(
+        &context("qa-1", AuthorityRole::Qa, "complete-1", 150),
+        "tenant-a",
+        "project-1",
+        "run-1",
+        QaRunState::CompletedPass,
+    )
+    .unwrap();
+    let terminal_duplicate = core
+        .execute_qa(&effect_context, "tenant-a", "project-1", "run-1")
+        .unwrap();
+    assert!(terminal_duplicate.0.duplicate);
+    assert_eq!(first.1.receipt_digest, terminal_duplicate.1.receipt_digest);
     assert_eq!(qa_calls.load(Ordering::SeqCst), 1);
 }
 

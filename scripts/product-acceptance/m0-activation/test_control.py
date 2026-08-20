@@ -984,6 +984,37 @@ class ControlTests(unittest.TestCase):
             {step["id"]: 1 for step in self.fixture.plan["steps"]},
         )
 
+    def test_schema_v2_alias_credentials_are_forwarded_without_secret_disclosure(self) -> None:
+        reference = "customer_primary:customer=M0_TEST_CUSTOMER_CREDENTIAL"
+        argv = (
+            str(control.PYTHON),
+            str(control.JOURNEY_PROGRAM),
+            "--credential",
+            reference,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"M0_TEST_CUSTOMER_CREDENTIAL": "c" * 32},
+            clear=False,
+        ):
+            environment = control.child_environment(argv)
+        self.assertEqual(environment["M0_TEST_CUSTOMER_CREDENTIAL"], "c" * 32)
+        self.assertNotIn("customer_primary", environment)
+        self.assertEqual(
+            control.journey_command(
+                control.JourneyArgs(
+                    self.fixture.plan_path,
+                    "http://127.0.0.1:8084",
+                    (reference,),
+                    self.fixture.ledger,
+                    self.fixture.evidence,
+                    5.0,
+                ),
+                "after_customer_request",
+            )[-3:],
+            (reference, "--stop-after-checkpoint", "after_customer_request"),
+        )
+
     def test_journey_ssot_rejects_tampered_ledger_and_evidence_before_restart(self) -> None:
         mutations = (
             "empty_ledger", "empty_evidence", "noncanonical_ledger",
