@@ -119,6 +119,11 @@ class OperatorCredentialWiringTests(unittest.TestCase):
         )
         self.assertNotIn("SENTINEL_OPERATOR_API_KEY_FILE=", daemon_source)
         self.assertIn(
+            "ExecStartPre=/opt/sentinel/bin/sentinel-daemon --config "
+            "/opt/sentinel/config/daemon.toml initialize-episode-projection\n",
+            daemon_source,
+        )
+        self.assertIn(
             "Environment=SENTINEL_OPERATOR_API_KEY_FILE=%d/operator-api\n",
             gateway_source,
         )

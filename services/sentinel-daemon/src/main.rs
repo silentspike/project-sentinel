@@ -42,6 +42,8 @@ enum Command {
         #[arg(long)]
         key: PathBuf,
     },
+    /// Explicitly initialize or validate durable episode projection control.
+    InitializeEpisodeProjection,
 }
 
 fn main() -> ExitCode {
@@ -57,14 +59,14 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            error!(error = %e, "Daemon fehlgeschlagen");
+            error!(error = ?e, "Daemon fehlgeschlagen");
             ExitCode::from(1)
         }
     }
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
-    if let Some(Command::GenerateControlIdentity { alias, cert, key }) = cli.command {
+    if let Some(Command::GenerateControlIdentity { alias, cert, key }) = &cli.command {
         if let Some(parent) = cert.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -72,7 +74,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let identity =
-            sentinel_cluster_control::NodeCertificate::load_or_generate(&cert, &key, &alias)?;
+            sentinel_cluster_control::NodeCertificate::load_or_generate(cert, key, alias)?;
         println!("{}", identity.fingerprint());
         return Ok(());
     }
@@ -93,6 +95,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         max_agents = config.max_agents,
         "Konfiguration geladen"
     );
+
+    if matches!(cli.command, Some(Command::InitializeEpisodeProjection)) {
+        let receipt = initialize_episode_projection(&config)?;
+        println!("{}", serde_json::to_string(&receipt)?);
+        return Ok(());
+    }
 
     // TOGAF Cluster 12 (#495): optionale Cluster-Identität. Ohne [daemon.cluster]
     // bleibt der Daemon im Single-Node-Modus (Verhalten unverändert).
@@ -119,6 +127,42 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     // Tokio Runtime fuer async I/O
     let runtime = tokio::runtime::Runtime::new().context("Tokio Runtime erstellen")?;
     runtime.block_on(sentinel_daemon::orchestrator::run(config))
+}
+
+fn initialize_episode_projection(
+    config: &DaemonConfig,
+) -> anyhow::Result<sentinel_daemon::episode_producer::EpisodeProjectionBootstrapReceipt> {
+    use sentinel_common::agent_config::load_all_agents_with_validation;
+
+    let agents_dir = config.config_dir.join("agents");
+    let all_agents =
+        load_all_agents_with_validation(&agents_dir, config.agent_config_validation()?)
+            .with_context(|| format!("Agents laden: {}", agents_dir.display()))?;
+    let agents = all_agents
+        .iter()
+        .map(|agent| (agent.identity.id, agent.identity.name.clone()))
+        .collect::<Vec<_>>();
+    let events_path = config.data_dir.join("events.db");
+    let event_store = sentinel_limbo::EventStore::open(
+        events_path.to_str().context("events.db Pfad nicht UTF-8")?,
+    )
+    .context("EventStore fuer Episode-Projection-Bootstrap oeffnen")?;
+    let hippocampus_path = config.data_dir.join("hippocampus.redb");
+    let hippocampus = sentinel_hippocampus::HippocampusService::open(
+        hippocampus_path
+            .to_str()
+            .context("hippocampus.redb Pfad nicht UTF-8")?,
+    )
+    .context("Hippocampus fuer Episode-Projection-Bootstrap oeffnen")?;
+
+    sentinel_daemon::episode_producer::initialize_episode_projection_bootstrap(
+        hippocampus,
+        &agents,
+        &event_store,
+        config.operator_api.shared_secret.as_deref(),
+        config.tick_rate_ms,
+    )
+    .context("Episode-Projection explizit initialisieren")
 }
 
 fn load_runtime_config(

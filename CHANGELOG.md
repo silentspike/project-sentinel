@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Issue #650 live-activation correction: initialize the durable episode projection through an explicit, idempotent, operator-authenticated daemon preflight. Fresh stores start at the beginning, while non-empty legacy memory is sealed at the exact EventStore head without deleting or replaying existing episodes; subsequent starts validate the durable cutover receipt without requiring mutable config proofs.
 - Issue #650 live-activation correction: provision a dedicated root-owned workbench authority directory before daemon startup and keep the durable invocation store there, instead of requiring ownership of the shared multi-service data root.
 - Issue #650 live-activation correction: hardened systemd control-process readiness probes now read only the canonical root-owned operator credential file, avoiding the per-process credential mount that systemd does not expose to `ExecStartPost` while retaining descriptor-pinned path, ownership, mode, and content validation.
 - Issue #650 live-activation correction: moved the dashboard's generated self-signed certificate state from the legacy root-owned console directory into a dedicated private runtime directory created by the canonical pre-service initializer, preserving operator-managed certificate material while allowing the unprivileged dashboard service to start without a manual ownership change.
