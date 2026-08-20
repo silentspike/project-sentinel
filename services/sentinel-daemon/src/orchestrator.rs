@@ -2466,8 +2466,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             (agent_id, host_root.join("artifacts"))
         })
         .collect();
+    let workbench_data_dir = data_dir.join("company-workbench");
     crate::workbench::install_workbench_service(
-        data_dir,
+        &workbench_data_dir,
         &config.config_dir,
         workbench_artifact_roots.clone(),
     )
