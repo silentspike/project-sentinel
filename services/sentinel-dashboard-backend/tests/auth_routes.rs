@@ -4,6 +4,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use sentinel_dashboard_backend::{auth, build_app, AppState, Config};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 /// Test-State mit gesetztem Dashboard-Key + nicht existierender projection.db (authed-Read erreicht
@@ -18,7 +19,7 @@ fn test_state() -> AppState {
     AppState::new(config).unwrap()
 }
 
-const READ_ROUTES: [&str; 13] = [
+const READ_ROUTES: [&str; 14] = [
     "/api/agents",
     "/api/rooms",
     "/api/rooms/kueche/detail",
@@ -32,6 +33,7 @@ const READ_ROUTES: [&str; 13] = [
     "/api/cockpit/incident/test-event",
     "/api/events",
     "/api/events/types",
+    "/api/v1/delivery/lineage?tenant_id=m0-company&project_id=project-42",
 ];
 
 const CONTROL_GET_ROUTES: [&str; 9] = [
@@ -244,4 +246,76 @@ async fn cert_hash_can_be_null_for_provided_cert_mode() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["hash"].is_null());
     assert_eq!(json["algorithm"], "sha-256");
+}
+
+#[tokio::test]
+async fn delivery_lineage_requires_the_dedicated_workflow_credential() {
+    let state = test_state();
+    let token = state.sessions.create();
+    let response = build_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/delivery/lineage?tenant_id=m0-company&project_id=project-42")
+                .header(header::COOKIE, format!("{}={token}", auth::SESSION_COOKIE))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn delivery_lineage_proxies_the_exact_scope_with_bearer_authority() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let operator_url = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = vec![0_u8; 8192];
+        let read = stream.read(&mut request).await.unwrap();
+        let request = String::from_utf8(request[..read].to_vec()).unwrap();
+        let body = r#"{"server_redacted":true,"project_label":"project-42"}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        request
+    });
+
+    let mut state = test_state();
+    state.config = std::sync::Arc::new({
+        let mut config = (*state.config).clone();
+        config.operator_url = operator_url;
+        config.workflow_read_credential = Some("workflow-read-secret".into());
+        config
+    });
+    let token = state.sessions.create();
+    let response = build_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/delivery/lineage?tenant_id=m0-company&project_id=project-42")
+                .header(header::COOKIE, format!("{}={token}", auth::SESSION_COOKIE))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["project_label"],
+        "project-42"
+    );
+
+    let request = upstream.await.unwrap().to_ascii_lowercase();
+    assert!(request.starts_with(
+        "get /company/delivery/lineage?tenant_id=m0-company&project_id=project-42 http/1.1\r\n"
+    ));
+    assert!(request.contains("\r\nauthorization: bearer workflow-read-secret\r\n"));
 }

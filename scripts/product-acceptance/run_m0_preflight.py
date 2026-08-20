@@ -73,6 +73,7 @@ M0_PROFILE_PATH = Path("/opt/sentinel/config/work-profiles/web-project-v1.toml")
 M0_WORKBENCH_PROFILE_PATH = Path(
     "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml"
 )
+M0_QA_PROFILE_PATH = Path("/opt/sentinel/config/workbench-profiles/web-qa-v1.toml")
 EXPECTED_LISTENERS = {
     ("tcp", "ipv4", "127.0.0.1", 4222),
     ("tcp", "ipv4", "127.0.0.1", 8001),
@@ -312,6 +313,12 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
     str(M0_WORKBENCH_PROFILE_PATH): (
         "config/workbench-profiles/web-authoring-v1.toml",
         "config",
+    ),
+    str(M0_QA_PROFILE_PATH): ("config/workbench-profiles/web-qa-v1.toml", "config"),
+    "/usr/bin/sentinel-web-qa": ("deploy/scripts/web-qa-v1.py", "script"),
+    "/usr/bin/sentinel-work-item-gate": (
+        "deploy/scripts/work-item-gate-v1.py",
+        "script",
     ),
     str(M0_CONTRACT_PATH): ("scripts/product-acceptance/m0-contract.toml", "config"),
 }

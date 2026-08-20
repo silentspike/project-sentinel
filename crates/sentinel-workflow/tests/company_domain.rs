@@ -326,6 +326,7 @@ fn work(
             digest: DIGEST.to_owned(),
         },
         budget_micros: budget,
+        rework: None,
     }
 }
 
@@ -1276,6 +1277,197 @@ fn dependency_contracts_gate_assignment_and_unlock_only_after_bound_output_and_q
         "dependency-contract-satisfied"
     );
     assert_eq!(project.lifecycle_state, ProjectLifecycleStateV1::Active);
+}
+
+#[test]
+fn customer_rework_reopens_delivery_candidate_with_new_linked_work_and_exact_replay() {
+    let state = journey();
+    let project = command(
+        &state.store,
+        &state.pm,
+        180,
+        CompanyWorkflowCommandV1::PlanWorkGraph {
+            project_id: state.project_id.clone(),
+            expected_version: 1,
+            items: vec![work(
+                "original-work",
+                CompanyRoleV1::Developer,
+                &["rust"],
+                &[],
+                100,
+            )],
+        },
+        180,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    let project = command(
+        &state.store,
+        &state.pm,
+        181,
+        CompanyWorkflowCommandV1::ActivateProject {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            reason_ref: "approved-plan".to_owned(),
+        },
+        181,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    let project = command(
+        &state.store,
+        &state.pm,
+        182,
+        CompanyWorkflowCommandV1::AssignWork {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: WorkItemId::parse("original-work").unwrap(),
+            agent_id: AgentId(2),
+            organization_generation: 1,
+            organization_digest: DIGEST.to_owned(),
+            reason_ref: "owner".to_owned(),
+        },
+        182,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    let project = command(
+        &state.store,
+        &state.developer,
+        183,
+        transition(
+            &state.project_id,
+            project.version,
+            "original-work",
+            2,
+            1,
+            CompanyWorkStateV1::Assigned,
+            CompanyWorkStateV1::InProgress,
+            Vec::new(),
+            None,
+            183,
+        ),
+        183,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    let project = command(
+        &state.store,
+        &state.developer,
+        184,
+        transition(
+            &state.project_id,
+            project.version,
+            "original-work",
+            3,
+            1,
+            CompanyWorkStateV1::InProgress,
+            CompanyWorkStateV1::InReview,
+            output_receipt(),
+            None,
+            184,
+        ),
+        184,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    let project = command(
+        &state.store,
+        &state.qa,
+        185,
+        transition(
+            &state.project_id,
+            project.version,
+            "original-work",
+            4,
+            1,
+            CompanyWorkStateV1::InReview,
+            CompanyWorkStateV1::Done,
+            output_receipt(),
+            Some(QualityGateReceiptBindingV1 {
+                gate_id: "web-work-item-qa-v1".to_owned(),
+                generation: 1,
+                gate_digest: DIGEST.to_owned(),
+                subject_digest: OTHER_DIGEST.to_owned(),
+                passed: true,
+            }),
+            185,
+        ),
+        185,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    assert_eq!(
+        project.lifecycle_state,
+        ProjectLifecycleStateV1::DeliveryCandidate
+    );
+    let original = project.work_items[&WorkItemId::parse("original-work").unwrap()].clone();
+    let rework = CompanyWorkflowCommandV1::CreateGovernedRework {
+        project_id: state.project_id.clone(),
+        expected_version: project.version,
+        source_candidate_digest: OTHER_DIGEST.to_owned(),
+        feedback_digest: DIGEST.to_owned(),
+        source_delivery_id: "delivery-1".to_owned(),
+    };
+    let foreign_customer = principal(
+        "tenant-a",
+        "customer-b",
+        CompanyPrincipalKindV1::Customer,
+        CompanyRoleV1::Customer,
+        Some("customer-b"),
+        None,
+    );
+    assert_eq!(
+        state
+            .store
+            .apply_company_command(&foreign_customer, Uuid::from_u128(186), &rework, 186)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+    let first = state
+        .store
+        .apply_company_command(&state.customer, Uuid::from_u128(187), &rework, 187)
+        .unwrap();
+    assert!(!first.replayed);
+    let CompanyWorkflowResponseV1::Project(reopened) = first.response else {
+        panic!()
+    };
+    assert_eq!(reopened.lifecycle_state, ProjectLifecycleStateV1::Active);
+    assert_eq!(reopened.work_items.len(), 2);
+    assert_eq!(
+        reopened.work_items[&WorkItemId::parse("original-work").unwrap()],
+        original
+    );
+    let created = reopened
+        .work_items
+        .values()
+        .find(|work| work.spec.rework.is_some())
+        .unwrap();
+    let binding = created.spec.rework.as_ref().unwrap();
+    assert_eq!(binding.operation_id, Uuid::from_u128(187));
+    assert_eq!(binding.source_work_item_id.0, "original-work");
+    assert_eq!(binding.source_delivery_id, "delivery-1");
+    assert_eq!(binding.source_candidate_digest, OTHER_DIGEST);
+    assert_eq!(binding.feedback_digest, DIGEST);
+    assert_eq!(binding.generation, 1);
+    assert_eq!(created.state, CompanyWorkStateV1::Ready);
+    assert!(created.assignments.is_empty());
+    let replay = state
+        .store
+        .apply_company_command(&state.customer, Uuid::from_u128(187), &rework, 188)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(
+        replay.response,
+        CompanyWorkflowResponseV1::Project(reopened)
+    );
 }
 
 #[test]

@@ -62,6 +62,12 @@ const NON_AGENT_EVENT_TYPES: &[&str] = &[
     "task_blocked",
     // #427: cost telemetry is projection-only — it changes no live view.
     "agent_llm_usage",
+    "migration_completed",
+    "psi_band_changed",
+    "node_provisioned",
+    "workbench_invocation_updated",
+    "project_closeout_published",
+    "gaia_project_oversight_observed",
 ];
 
 const ROOM_EVENT_TYPES: &[&str] = &[
@@ -123,6 +129,12 @@ const KNOWN_EVENT_TYPES: &[&str] = &[
     "operator_broadcast_sent",
     "operator_dm_sent",
     "config_applied",
+    "migration_completed",
+    "psi_band_changed",
+    "node_provisioned",
+    "workbench_invocation_updated",
+    "project_closeout_published",
+    "gaia_project_oversight_observed",
     "agent_llm_usage",
 ];
 
@@ -433,6 +445,12 @@ mod tests {
         "operator_broadcast_sent",
         "operator_dm_sent",
         "config_applied",
+        "migration_completed",
+        "psi_band_changed",
+        "node_provisioned",
+        "workbench_invocation_updated",
+        "project_closeout_published",
+        "gaia_project_oversight_observed",
         "agent_llm_usage",
     ];
 
