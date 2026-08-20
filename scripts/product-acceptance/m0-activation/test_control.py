@@ -384,6 +384,9 @@ class Fixture:
             "manifest_sha256": self.manifest_sha, "artifact_count": 111,
             "changed_count": 111,
             "artifact_set_digest": control.digest(sorted(artifact_digests)),
+            "legacy_migration": {
+                "status": "COMPLETE", "directory_count": 7, "file_count": 17,
+            },
             "services_started": False,
         }
         self.provision.write_bytes(encoded(unsigned))
@@ -418,6 +421,9 @@ class Fixture:
             "manifest_sha256": self.manifest_sha, "artifact_count": artifact_count,
             "changed_count": artifact_count if changed_count is None else changed_count,
             "artifact_set_digest": control.digest(sorted(digests)),
+            "legacy_migration": {
+                "status": "COMPLETE", "directory_count": 7, "file_count": 17,
+            },
             "services_started": False,
         }
         self.provision.write_bytes(encoded(receipt))
@@ -603,6 +609,7 @@ class ControlTests(unittest.TestCase):
         )
         self.assertEqual(result["artifact_count"], 7)
         self.assertEqual(result["changed_count"], 3)
+        self.assertEqual(result["legacy_migration"]["status"], "COMPLETE")
 
         for field, value in (
             ("artifact_count", 8),
@@ -623,6 +630,37 @@ class ControlTests(unittest.TestCase):
                         bad.provision, bad.provision_sha, bad.manifest,
                         bad.manifest_sha, bad.git_sha,
                     )
+
+        for field, value in (
+            ("status", "ROLLED_BACK"),
+            ("directory_count", -1),
+            ("file_count", True),
+        ):
+            with self.subTest(legacy_migration=field):
+                bad = Fixture(self.root / f"bad-provision-legacy-{field}")
+                bad.rewrite_provision(7, changed_count=3)
+                receipt = json.loads(bad.provision.read_text())
+                receipt["legacy_migration"][field] = value
+                bad.provision.write_bytes(encoded(receipt))
+                bad.provision_sha = control.digest_bytes(bad.provision.read_bytes())
+                with self.assertRaisesRegex(
+                    control.ControlError, "provision_receipt_authority_mismatch"
+                ):
+                    control.validate_provision_authority(
+                        bad.provision, bad.provision_sha, bad.manifest,
+                        bad.manifest_sha, bad.git_sha,
+                    )
+
+        missing = Fixture(self.root / "bad-provision-legacy-missing")
+        receipt = json.loads(missing.provision.read_text())
+        del receipt["legacy_migration"]
+        missing.provision.write_bytes(encoded(receipt))
+        missing.provision_sha = control.digest_bytes(missing.provision.read_bytes())
+        with self.assertRaisesRegex(control.ControlError, "provision_receipt_shape"):
+            control.validate_provision_authority(
+                missing.provision, missing.provision_sha, missing.manifest,
+                missing.manifest_sha, missing.git_sha,
+            )
 
     def test_running_or_failed_unit_stops_before_daemon_reload(self) -> None:
         for field, value in (("ActiveState", "active"), ("Result", "exit-code")):
