@@ -440,6 +440,39 @@ pub enum DomainEventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_code: Option<String>,
     },
+    /// Accepted project closeout projected into the existing episodic memory path.
+    /// Only source identities and digests are carried; workflow authority remains
+    /// in the company and delivery stores.
+    ProjectCloseoutPublished {
+        tenant_id: String,
+        project_id: String,
+        project_generation: u64,
+        project_digest: String,
+        candidate_id: String,
+        candidate_generation: u64,
+        candidate_digest: String,
+        release_id: String,
+        release_generation: u64,
+        release_digest: String,
+        acceptance_id: String,
+        acceptance_generation: u64,
+        acceptance_digest: String,
+        decisions_digest: String,
+        artifact_inventory_digest: String,
+        failures_digest: String,
+        lessons_digest: String,
+    },
+    /// A Gaia principal read the server-redacted delivery lineage. This is an
+    /// audit observation only and never grants workflow or delivery mutation
+    /// authority.
+    GaiaProjectOversightObserved {
+        tenant_id: String,
+        project_id: String,
+        project_revision: u64,
+        lineage_digest: String,
+        observer_principal_id: String,
+        observer_authority_generation: u64,
+    },
     /// #427: Token-/Kosten-Telemetrie eines einzelnen LLM-Calls (pro Agent + Tier,
     /// cache-aware). Vom Daemon (`llm_bridge`) aus der echten Provider-Usage emittiert;
     /// die Cost-Information lebt EINMAL im Event-Store (SSOT) und wird per Cost-Projektion
@@ -517,6 +550,8 @@ impl DomainEventPayload {
             Self::PsiBandChanged { .. } => "psi_band_changed",
             Self::NodeProvisioned { .. } => "node_provisioned",
             Self::WorkbenchInvocationUpdated { .. } => "workbench_invocation_updated",
+            Self::ProjectCloseoutPublished { .. } => "project_closeout_published",
+            Self::GaiaProjectOversightObserved { .. } => "gaia_project_oversight_observed",
             Self::AgentLlmUsage { .. } => "agent_llm_usage",
         }
     }

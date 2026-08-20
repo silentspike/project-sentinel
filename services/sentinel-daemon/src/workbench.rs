@@ -1494,6 +1494,233 @@ fn validate_concrete_artifact_manifest(
     Ok(())
 }
 
+pub(crate) fn stage_verified_artifact_inputs(
+    artifact_roots: &HashMap<AgentId, PathBuf>,
+    source_agent: AgentId,
+    destination_agent: AgentId,
+    project_id: &str,
+    destination_work_item_id: &str,
+    manifest_digest: &str,
+) -> anyhow::Result<Vec<sentinel_common::WorkbenchInputRef>> {
+    if !valid_lower_sha256(manifest_digest) {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let source_base = artifact_roots
+        .get(&source_agent)
+        .ok_or(WorkbenchStoreError::OutputRejected)?;
+    let source_base = canonical_daemon_real_directory(source_base)?;
+    let source_project =
+        canonical_daemon_child_directory(&source_base, daemon_scope_component(project_id)?)?;
+    let mut matches = Vec::new();
+    let mut entries = fs::read_dir(&source_project)
+        .map_err(|_| WorkbenchStoreError::OutputRejected)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    if entries.len() > 64 {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let work_item_id = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        let scope =
+            bind_daemon_artifact_scope(&source_base, source_agent, project_id, &work_item_id)?;
+        let candidate = scope.join(format!("{manifest_digest}.manifest.json"));
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                matches.push(scope)
+            }
+            Ok(_) => return Err(WorkbenchStoreError::OutputRejected.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(WorkbenchStoreError::OutputRejected.into()),
+        }
+    }
+    if matches.len() != 1 {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let source_scope = matches.pop().expect("exactly one source scope");
+    let source_directory = open_pinned_daemon_artifact_directory(&source_scope)?;
+    let manifest_name = format!("{manifest_digest}.manifest.json");
+    let mut manifest_file = open_scoped_daemon_artifact_file(
+        &source_directory,
+        &manifest_name,
+        MAX_ARTIFACT_MANIFEST_BYTES,
+        None,
+    )?;
+    let mut bytes = Vec::new();
+    manifest_file
+        .by_ref()
+        .take(MAX_ARTIFACT_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    revalidate_scoped_daemon_artifact_file(&source_directory, &manifest_name, &manifest_file)?;
+    if hex_sha256(&bytes) != manifest_digest {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let manifest: VerifiedArtifactManifest =
+        serde_json::from_slice(&bytes).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    if manifest.schema_version != WORKBENCH_SCHEMA_VERSION
+        || manifest.project_id != project_id
+        || manifest.agent_id != source_agent.0
+        || manifest.artifact_kind != "source_tree"
+        || manifest.entries.is_empty()
+        || manifest.entries.len() > 64
+    {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+
+    let source_blobs = canonical_daemon_child_directory(&source_scope, "blobs")?;
+    let destination_artifacts = artifact_roots
+        .get(&destination_agent)
+        .ok_or(WorkbenchStoreError::OutputRejected)?;
+    let destination_agent_root = destination_artifacts
+        .parent()
+        .ok_or(WorkbenchStoreError::OutputRejected)?;
+    validate_agent_runtime_marker(destination_agent_root, destination_agent)?;
+    let destination_inputs = canonical_daemon_real_directory(&canonical_daemon_child_directory(
+        destination_agent_root,
+        "inputs",
+    )?)?;
+    let destination_project = secure_child_directory(&destination_inputs, project_id)?;
+    let destination_scope = secure_child_directory(&destination_project, destination_work_item_id)?;
+    let mut result = Vec::with_capacity(manifest.entries.len());
+    let mut paths = BTreeSet::new();
+    for entry in manifest.entries {
+        if !is_canonical_relative_path(&entry.path)
+            || !valid_lower_sha256(&entry.sha256)
+            || entry.blob_id != format!("sha256:{}", entry.sha256)
+            || !paths.insert(entry.path.clone())
+        {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        }
+        let source_blob_dir = open_pinned_daemon_artifact_directory(&source_blobs)?;
+        let mut source_blob = open_scoped_daemon_artifact_file(
+            &source_blob_dir,
+            &entry.sha256,
+            entry.size_bytes,
+            Some(entry.size_bytes),
+        )?;
+        let source_metadata = source_blob
+            .metadata()
+            .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        if source_metadata.mode() & 0o222 != 0 {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        }
+        let mut blob_bytes = Vec::new();
+        source_blob
+            .by_ref()
+            .take(entry.size_bytes.saturating_add(1))
+            .read_to_end(&mut blob_bytes)
+            .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        revalidate_scoped_daemon_artifact_file(&source_blob_dir, &entry.sha256, &source_blob)?;
+        if blob_bytes.len() as u64 != entry.size_bytes || hex_sha256(&blob_bytes) != entry.sha256 {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        }
+        let relative = Path::new(&entry.path);
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let destination_parent = secure_descendant_directories(&destination_scope, parent)?;
+        let file_name = relative
+            .file_name()
+            .ok_or(WorkbenchStoreError::OutputRejected)?;
+        let destination = destination_parent.join(file_name);
+        match fs::hard_link(
+            format!(
+                "/proc/self/fd/{}/{}",
+                source_blob_dir.as_raw_fd(),
+                entry.sha256
+            ),
+            &destination,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC)
+                    .open(&destination)
+                    .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+                let metadata = existing
+                    .metadata()
+                    .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+                if metadata.dev() != source_metadata.dev()
+                    || metadata.ino() != source_metadata.ino()
+                    || metadata.len() != source_metadata.len()
+                    || metadata.mode() & 0o222 != 0
+                {
+                    return Err(WorkbenchStoreError::OutputRejected.into());
+                }
+            }
+            Err(_) => return Err(WorkbenchStoreError::OutputRejected.into()),
+        }
+        result.push(sentinel_common::WorkbenchInputRef {
+            artifact_id: entry.blob_id,
+            sha256: entry.sha256,
+            mount_path: entry.path,
+            media_type: manifest.media_type.clone(),
+        });
+    }
+    result.sort_by(|left, right| left.mount_path.cmp(&right.mount_path));
+    Ok(result)
+}
+
+fn validate_agent_runtime_marker(root: &Path, agent_id: AgentId) -> anyhow::Result<()> {
+    let marker = root.join(".nano-runtime");
+    let metadata =
+        fs::symlink_metadata(&marker).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let expected = format!("AGENT-{:02}", agent_id.0);
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.nlink() != 1
+        || fs::read_to_string(marker).ok().as_deref() != Some(expected.as_str())
+    {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    Ok(())
+}
+
+fn secure_child_directory(parent: &Path, child: &str) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let child = daemon_scope_component(child)?;
+    let path = parent.join(child);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder
+                .mode(0o700)
+                .create(&path)
+                .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        }
+        Err(_) => return Err(WorkbenchStoreError::OutputRejected.into()),
+    }
+    let metadata = fs::symlink_metadata(&path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let canonical = fs::canonicalize(&path).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    if canonical.parent() != Some(parent) {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    Ok(canonical)
+}
+
+fn secure_descendant_directories(root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        };
+        let component = component
+            .to_str()
+            .ok_or(WorkbenchStoreError::OutputRejected)?;
+        current = secure_child_directory(&current, component)?;
+    }
+    Ok(current)
+}
+
 fn is_canonical_relative_path(value: &str) -> bool {
     let path = Path::new(value);
     if value.is_empty() || path.is_absolute() {
@@ -1925,6 +2152,8 @@ pub(crate) struct WorkbenchService {
     pub(crate) store: WorkbenchInvocationStore,
     pub(crate) profile: WorkbenchProfile,
     pub(crate) profile_digest: String,
+    pub(crate) qa_profile: WorkbenchProfile,
+    pub(crate) qa_profile_digest: String,
     pub(crate) receiver: mpsc::Receiver<WorkbenchDispatchCommand>,
 }
 
@@ -1942,6 +2171,11 @@ pub(crate) fn install_workbench_service(
     }
     let (profile, profile_digest) =
         WorkbenchProfile::load(config_dir.join("workbench-profiles/web-authoring-v1.toml"))?;
+    let (qa_profile, qa_profile_digest) =
+        WorkbenchProfile::load(config_dir.join("workbench-profiles/web-qa-v1.toml"))?;
+    if qa_profile.id == profile.id {
+        bail!("workbench profile identifiers must be unique");
+    }
     let store = WorkbenchInvocationStore::open_with_artifact_roots(
         data_dir.join("workbench.redb"),
         artifact_roots,
@@ -1952,6 +2186,8 @@ pub(crate) fn install_workbench_service(
         store,
         profile,
         profile_digest,
+        qa_profile,
+        qa_profile_digest,
         receiver,
     });
     Ok(())
