@@ -19,6 +19,7 @@ DASHBOARD_UNIT = REPO_ROOT / "deploy/systemd/sentinel-dashboard-backend.service"
 MANIFEST_GENERATOR = REPO_ROOT / "deploy/generate-manifest.sh"
 PROVISIONER = REPO_ROOT / "deploy/provision-m0-single-node.sh"
 PREFLIGHT = REPO_ROOT / "scripts/product-acceptance/run_m0_preflight.py"
+ORCHESTRATOR = REPO_ROOT / "services/sentinel-daemon/src/orchestrator.rs"
 
 
 class M0RuntimeDirectoryTests(unittest.TestCase):
@@ -39,6 +40,7 @@ class M0RuntimeDirectoryTests(unittest.TestCase):
             current.mkdir(mode=mode)
         self.gaia = current / "gaia-console"
         self.dashboard_certs = current / "dashboard-cert"
+        self.workbench_store = current / "company-workbench"
 
     def tearDown(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
@@ -63,9 +65,14 @@ class M0RuntimeDirectoryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 result.stdout,
-                "m0_runtime_dirs=verified directories=3 mode=0700\n",
+                "m0_runtime_dirs=verified directories=4 mode=0700\n",
             )
-        for path in (self.gaia, self.gaia / "sessions", self.dashboard_certs):
+        for path in (
+            self.gaia,
+            self.gaia / "sessions",
+            self.dashboard_certs,
+            self.workbench_store,
+        ):
             self.assertTrue(path.is_dir())
             self.assertFalse(path.is_symlink())
             self.assertEqual(path.stat().st_uid, os.geteuid())
@@ -85,7 +92,13 @@ class M0RuntimeDirectoryTests(unittest.TestCase):
         self.assertEqual(retained.stat().st_mode & 0o777, 0o600)
 
     def test_symlink_file_and_unsafe_parent_fail_closed(self) -> None:
-        cases = ("symlink", "file", "dashboard-symlink", "unsafe-parent")
+        cases = (
+            "symlink",
+            "file",
+            "dashboard-symlink",
+            "workbench-symlink",
+            "unsafe-parent",
+        )
         for case in cases:
             with self.subTest(case=case):
                 shutil.rmtree(self.root)
@@ -100,6 +113,10 @@ class M0RuntimeDirectoryTests(unittest.TestCase):
                     foreign = self.root / "foreign"
                     foreign.mkdir(mode=0o700)
                     self.dashboard_certs.symlink_to(foreign, target_is_directory=True)
+                elif case == "workbench-symlink":
+                    foreign = self.root / "foreign"
+                    foreign.mkdir(mode=0o700)
+                    self.workbench_store.symlink_to(foreign, target_is_directory=True)
                 else:
                     (self.root / "opt/sentinel/data").chmod(0o777)
                 result = self.run_initializer()
@@ -137,6 +154,13 @@ class M0RuntimeDirectoryTests(unittest.TestCase):
             "ReadWritePaths=/opt/sentinel/data/dashboard-cert /opt/sentinel/data/gaia-console",
             dashboard,
         )
+
+        daemon = (REPO_ROOT / "deploy/systemd/sentinel-daemon.service").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("sentinel-auth-init.service", daemon)
+        orchestrator = ORCHESTRATOR.read_text(encoding="utf-8")
+        self.assertIn('data_dir.join("company-workbench")', orchestrator)
 
     def test_release_authorities_include_the_initializer_exactly_once(self) -> None:
         source = "deploy/scripts/init-m0-runtime-dirs.py"
