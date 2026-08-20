@@ -2252,7 +2252,8 @@ fn immutable_write(
             false,
         ));
     }
-    atomic_write(destination, bytes, invocation_id, attempt)
+    atomic_write(destination, bytes, invocation_id, attempt)?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o444)).map_err(workspace_io_error)
 }
 
 fn read_bounded_file(path: &Path, limit: usize) -> Result<Vec<u8>, ExecutionError> {
@@ -3232,6 +3233,8 @@ mod tests {
         };
         let mut bytes = fs::read(&manifest_path).unwrap();
         bytes.push(b' ');
+        // Simulate an actor with storage-level authority bypassing the immutable mode.
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(&manifest_path, bytes).unwrap();
 
         let restarted = WorkbenchExecutor::new(&workspace, &artifacts);

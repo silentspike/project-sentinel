@@ -704,6 +704,15 @@ impl WorkflowStore {
         Ok((work_item, completed))
     }
 
+    /// Returns the exact durable work-item gate context and whether its
+    /// independent evidence has already been adopted.
+    pub fn gate_context(
+        &self,
+        request: &PendingGateEvidenceV1,
+    ) -> Result<(WorkItemExecutionV1, bool), WorkflowError> {
+        self.gate_work_item(request)
+    }
+
     pub(crate) fn record_gate_evidence(
         &self,
         request: &PendingGateEvidenceV1,

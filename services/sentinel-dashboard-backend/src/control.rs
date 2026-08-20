@@ -15,6 +15,7 @@ use serde_json::json;
 use crate::AppState;
 
 const OPERATOR_KEY_HEADER: &str = "x-sentinel-operator-key";
+const MAX_DELIVERY_LINEAGE_BYTES: u64 = 256 * 1024;
 
 /// Generischer Upstream-Forward: Status + Body werden durchgereicht (JSON).
 /// `pub(crate)`: auch von `config::apply` (#420) fuer den Daemon-Config-Apply-Proxy genutzt.
@@ -178,6 +179,112 @@ pub async fn operator_chat(State(st): State<AppState>, body: Bytes) -> Response 
         Some(body),
     )
     .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeliveryLineageQuery {
+    tenant_id: String,
+    project_id: String,
+}
+
+/// GET /api/v1/delivery/lineage -> authenticated, server-redacted daemon lineage.
+pub async fn delivery_lineage(
+    State(st): State<AppState>,
+    Query(query): Query<DeliveryLineageQuery>,
+) -> Response {
+    if !safe_delivery_scope(&query.tenant_id) || !safe_delivery_scope(&query.project_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid delivery scope"})),
+        )
+            .into_response();
+    }
+    let Some(credential) = st.config.workflow_read_credential.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "delivery lineage credential unavailable"})),
+        )
+            .into_response();
+    };
+    let response = st
+        .http
+        .get(format!(
+            "{}/company/delivery/lineage",
+            st.config.operator_url
+        ))
+        .query(&[
+            ("tenant_id", query.tenant_id.as_str()),
+            ("project_id", query.project_id.as_str()),
+        ])
+        .bearer_auth(credential)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await;
+    let mut response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(error = %error, "delivery lineage upstream unavailable");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "delivery lineage unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type_is_json = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("application/json")
+                || value.to_ascii_lowercase().starts_with("application/json;")
+        });
+    if !content_type_is_json
+        || response
+            .content_length()
+            .is_some_and(|length| length > MAX_DELIVERY_LINEAGE_BYTES)
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "invalid delivery lineage response"})),
+        )
+            .into_response();
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk))
+                if body.len().saturating_add(chunk.len())
+                    <= MAX_DELIVERY_LINEAGE_BYTES as usize =>
+            {
+                body.extend_from_slice(&chunk);
+            }
+            Ok(Some(_)) | Err(_) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": "invalid delivery lineage response"})),
+                )
+                    .into_response();
+            }
+            Ok(None) => break,
+        }
+    }
+    (
+        status,
+        [(reqwest::header::CONTENT_TYPE.as_str(), "application/json")],
+        body,
+    )
+        .into_response()
+}
+
+fn safe_delivery_scope(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 // ── Gateway-Control (:8081) ──

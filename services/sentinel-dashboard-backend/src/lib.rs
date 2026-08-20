@@ -35,6 +35,7 @@ pub mod tls;
 pub mod wt;
 
 pub const OPERATOR_API_KEY_FILE_ENV: &str = "SENTINEL_OPERATOR_API_KEY_FILE";
+pub const WORKFLOW_READ_CREDENTIAL_FILE_ENV: &str = "SENTINEL_WORKFLOW_READ_CREDENTIAL_FILE";
 pub const CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
 const OPERATOR_API_KEY_ENV: &str = "SENTINEL_OPERATOR_API_KEY";
 const CREDENTIAL_MIN_BYTES: usize = 32;
@@ -43,6 +44,7 @@ const O_DIRECTORY: i32 = 0o200000;
 const O_NONBLOCK: i32 = 0o4000;
 const O_NOFOLLOW: i32 = 0o400000;
 const OPERATOR_CREDENTIAL_NAME: &str = "operator-api";
+const WORKFLOW_READ_CREDENTIAL_NAME: &str = "workflow-release-manager";
 
 /// Runtime configuration (env-driven, plus the self-signed cert hash computed at startup).
 #[derive(Clone)]
@@ -59,6 +61,8 @@ pub struct Config {
     pub operator_key: Option<String>,
     /// Trusted-parent-only credential directory hidden from Gaia model children.
     pub operator_credential_directory: Option<String>,
+    /// File-only release-manager credential used only for the redacted delivery lineage proxy.
+    pub workflow_read_credential: Option<String>,
     /// Gateway-Control-Basis-URL, Default `http://127.0.0.1:8081`.
     pub gateway_url: String,
     /// Gateway-Proxy-Basis-URL fuer Pipeline-Metrics, Default `http://127.0.0.1:8080`.
@@ -137,6 +141,10 @@ impl fmt::Debug for Config {
             .field("wt_bind", &self.wt_bind)
             .field("operator_url", &self.operator_url)
             .field("operator_key_configured", &self.operator_key.is_some())
+            .field(
+                "workflow_read_credential_configured",
+                &self.workflow_read_credential.is_some(),
+            )
             .field(
                 "operator_credential_directory_configured",
                 &self.operator_credential_directory.is_some(),
@@ -390,6 +398,8 @@ impl Config {
         let credential_file = read_env(OPERATOR_API_KEY_FILE_ENV).filter(|value| !value.is_empty());
         let credentials_directory =
             read_env(CREDENTIALS_DIRECTORY_ENV).filter(|value| !value.is_empty());
+        let workflow_read_file =
+            read_env(WORKFLOW_READ_CREDENTIAL_FILE_ENV).filter(|value| !value.is_empty());
         let mut config = Self::from_env_values(|key| read_env(key));
         let direct_key = config.operator_key.take();
         anyhow::ensure!(
@@ -410,6 +420,15 @@ impl Config {
             "operator API credential path must be the systemd credential leaf"
         );
         config.operator_key = Some(read_operator_api_credential(Path::new(&path))?);
+        if let Some(workflow_path) = workflow_read_file {
+            anyhow::ensure!(
+                Path::new(&workflow_path)
+                    == Path::new(&directory).join(WORKFLOW_READ_CREDENTIAL_NAME),
+                "workflow read credential path must be the systemd credential leaf"
+            );
+            config.workflow_read_credential =
+                Some(read_operator_api_credential(Path::new(&workflow_path))?);
+        }
         config.operator_credential_directory = Some(directory);
         Ok(config)
     }
@@ -432,6 +451,7 @@ impl Config {
                 .unwrap_or_else(|| "http://127.0.0.1:8084".into()),
             operator_key: env(OPERATOR_API_KEY_ENV),
             operator_credential_directory: None,
+            workflow_read_credential: None,
             gateway_url: env("CORTEX_GATEWAY_CONTROL_URL")
                 .unwrap_or_else(|| "http://127.0.0.1:8081".into()),
             gateway_proxy_url: env("CORTEX_GATEWAY_PROXY_URL")
@@ -637,6 +657,13 @@ pub fn build_app(state: AppState) -> axum::Router {
             auth::require_auth,
         ));
 
+    let delivery_routes = axum::Router::new()
+        .route("/lineage", get(control::delivery_lineage))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
     // #420: Config Read+Write — EIGENE Gruppe (NICHT `/control/config`, das proxyt die Gateway-LLM-Config).
     // READ geparst (agents/rooms) + daemon.toml-Rohtext; WRITE validiert + proxyt an #425 (Daemon=Schreiber).
     let config_routes = axum::Router::new()
@@ -686,7 +713,8 @@ pub fn build_app(state: AppState) -> axum::Router {
         .nest("/control", control_routes)
         .nest("/operator", operator_routes)
         .nest("/config", config_routes)
-        .nest("/gaia", gaia_routes);
+        .nest("/gaia", gaia_routes)
+        .nest("/v1/delivery", delivery_routes);
 
     axum::Router::new()
         .nest("/api", api)
