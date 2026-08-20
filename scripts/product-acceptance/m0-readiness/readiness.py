@@ -14,7 +14,7 @@ import re
 import stat
 import sys
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 
 
 SCHEMA_VERSION = 1
@@ -31,6 +31,7 @@ MIN_CREDENTIAL_BYTES = 32
 MAX_DIAGNOSTIC_BYTES = 128
 MAX_TIMEOUT_SECONDS = 300.0
 SAFE_CREDENTIAL_ROOTS = (Path("/run/credentials"), Path("/work/tmp/project-sentinel"))
+SAFE_CREDENTIAL_FILES = frozenset({Path("/etc/sentinel/credentials/operator-api")})
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -92,7 +93,9 @@ def validate_timeout(value: float) -> float:
 def _safe_credential_path(path: Path) -> None:
     if not path.is_absolute() or ".." in path.parts:
         fail("credential_path_invalid")
-    if not any(path.is_relative_to(root) for root in SAFE_CREDENTIAL_ROOTS):
+    if path not in SAFE_CREDENTIAL_FILES and not any(
+        path.is_relative_to(root) for root in SAFE_CREDENTIAL_ROOTS
+    ):
         fail("credential_path_invalid")
 
 
@@ -220,28 +223,6 @@ def read_credential(path: Path) -> str:
     ):
         fail("credential_invalid")
     return value
-
-
-def resolve_credential_path(
-    credential_file: Path | None,
-    credential_environment: str | None,
-    *,
-    environment: Mapping[str, str] | None = None,
-) -> Path:
-    if credential_file is not None:
-        if credential_environment is not None:
-            fail("arguments_invalid")
-        return credential_file
-    if credential_environment != "SENTINEL_OPERATOR_CREDENTIAL_FILE":
-        fail("arguments_invalid")
-    variables = os.environ if environment is None else environment
-    value = variables.get(credential_environment)
-    if not value:
-        fail("credential_unavailable")
-    path = Path(value)
-    if not path.is_absolute():
-        fail("credential_path_invalid")
-    return path
 
 
 def request_json(
@@ -565,12 +546,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         child = subparsers.add_parser(name)
         child.add_argument("--timeout-seconds", required=True, type=float)
         if name != "nats":
-            source = child.add_mutually_exclusive_group(required=True)
-            source.add_argument("--credential-file", type=Path)
-            source.add_argument(
-                "--credential-environment",
-                choices=("SENTINEL_OPERATOR_CREDENTIAL_FILE",),
-            )
+            child.add_argument("--credential-file", required=True, type=Path)
     return parser.parse_args(argv)
 
 
@@ -582,14 +558,10 @@ def run(argv: list[str]) -> int:
         timeout = validate_timeout(args.timeout_seconds)
         if check == "nats":
             details = check_nats(timeout)
+        elif check == "daemon":
+            details = check_daemon(timeout, args.credential_file)
         else:
-            credential_file = resolve_credential_path(
-                args.credential_file, args.credential_environment
-            )
-            if check == "daemon":
-                details = check_daemon(timeout, credential_file)
-            else:
-                details = trigger_nightrun(timeout, credential_file)
+            details = trigger_nightrun(timeout, args.credential_file)
         sys.stdout.buffer.write(canonical_json(result_payload(check, details)))
         return 0
     except ReadinessError as exc:

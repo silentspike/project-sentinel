@@ -113,8 +113,8 @@ def validate_topology(units: dict[str, str], health_script: str) -> None:
     if "Environment=SENTINEL_OPERATOR_CREDENTIAL_FILE=%d/operator-api" not in daemon:
         raise ValueError("daemon_operator_credential_binding_missing")
     if (
-        "m0-readiness.py daemon --credential-environment "
-        "SENTINEL_OPERATOR_CREDENTIAL_FILE"
+        "m0-readiness.py daemon --credential-file "
+        "/etc/sentinel/credentials/operator-api"
     ) not in daemon:
         raise ValueError("daemon_operator_credential_gate_missing")
     if "sentinel-projection.service" in daemon:
@@ -136,8 +136,8 @@ def validate_topology(units: dict[str, str], health_script: str) -> None:
     if "ExecCondition=" in health_service:
         raise ValueError("health_monitor_blind_spot")
     if (
-        "m0-readiness.py nightrun --credential-environment "
-        "SENTINEL_OPERATOR_CREDENTIAL_FILE"
+        "m0-readiness.py nightrun --credential-file "
+        "/etc/sentinel/credentials/operator-api"
     ) not in nightrun_service:
         raise ValueError("nightrun_credential_gate_missing")
     if "ExecCondition=/usr/bin/systemctl --quiet is-active sentinel-daemon.service" not in nightrun_service:
@@ -459,43 +459,14 @@ class ReadinessTests(unittest.TestCase):
         self.credential.write_bytes(b"x" * 32 + b"\n")
         self.assert_code("credential_invalid", lambda: readiness.read_credential(self.credential))
 
-    def test_systemd_credential_path_resolves_from_fixed_environment_binding(self) -> None:
-        resolved = readiness.resolve_credential_path(
-            None,
-            "SENTINEL_OPERATOR_CREDENTIAL_FILE",
-            environment={"SENTINEL_OPERATOR_CREDENTIAL_FILE": str(self.credential)},
-        )
-        self.assertEqual(resolved, self.credential)
-        self.assertEqual(readiness.read_credential(resolved), SECRET)
-
-        self.assert_code(
-            "credential_unavailable",
-            lambda: readiness.resolve_credential_path(
-                None, "SENTINEL_OPERATOR_CREDENTIAL_FILE", environment={}
-            ),
+    def test_canonical_operator_credential_is_the_only_allowed_etc_file(self) -> None:
+        readiness._safe_credential_path(
+            Path("/etc/sentinel/credentials/operator-api")
         )
         self.assert_code(
             "credential_path_invalid",
-            lambda: readiness.resolve_credential_path(
-                None,
-                "SENTINEL_OPERATOR_CREDENTIAL_FILE",
-                environment={"SENTINEL_OPERATOR_CREDENTIAL_FILE": "relative"},
-            ),
-        )
-        self.assert_code(
-            "arguments_invalid",
-            lambda: readiness.resolve_credential_path(
-                self.credential,
-                "SENTINEL_OPERATOR_CREDENTIAL_FILE",
-                environment={"SENTINEL_OPERATOR_CREDENTIAL_FILE": str(self.credential)},
-            ),
-        )
-        self.assert_code(
-            "arguments_invalid",
-            lambda: readiness.resolve_credential_path(
-                None,
-                "UNTRUSTED_CREDENTIAL_FILE",
-                environment={"UNTRUSTED_CREDENTIAL_FILE": str(self.credential)},
+            lambda: readiness._safe_credential_path(
+                Path("/etc/sentinel/credentials/another-secret")
             ),
         )
 
@@ -742,8 +713,8 @@ class TopologyTests(unittest.TestCase):
         self.assertIn("After=network-online.target nats-server.service", daemon)
         self.assertIn("Requires=nats-server.service", daemon)
         self.assertIn(
-            "m0-readiness.py daemon --credential-environment "
-            "SENTINEL_OPERATOR_CREDENTIAL_FILE",
+            "m0-readiness.py daemon --credential-file "
+            "/etc/sentinel/credentials/operator-api",
             daemon,
         )
         self.assertIn("LoadCredential=operator-api:/etc/sentinel/credentials/operator-api", daemon)
@@ -770,12 +741,8 @@ class TopologyTests(unittest.TestCase):
         self.assertNotIn("Requires=sentinel-daemon.service", nightrun_timer)
         self.assertIn("ExecCondition=/usr/bin/systemctl --quiet is-active sentinel-daemon.service", nightrun_service)
         self.assertIn(
-            "Environment=SENTINEL_OPERATOR_CREDENTIAL_FILE=%d/operator-api",
-            nightrun_service,
-        )
-        self.assertIn(
-            "m0-readiness.py nightrun --credential-environment "
-            "SENTINEL_OPERATOR_CREDENTIAL_FILE",
+            "m0-readiness.py nightrun --credential-file "
+            "/etc/sentinel/credentials/operator-api",
             nightrun_service,
         )
 
@@ -828,7 +795,7 @@ check_service nats nats-server.service nats '' '' 5 observe
         leaked_nightrun["sentinel-nightrun.service"] = leaked_nightrun[
             "sentinel-nightrun.service"
         ].replace(
-            "ExecStart=/usr/bin/python3 /opt/sentinel/scripts/m0-readiness.py nightrun --credential-environment SENTINEL_OPERATOR_CREDENTIAL_FILE --timeout-seconds 45",
+            "ExecStart=/usr/bin/python3 /opt/sentinel/scripts/m0-readiness.py nightrun --credential-file /etc/sentinel/credentials/operator-api --timeout-seconds 45",
             'ExecStart=/usr/bin/curl -H "Authorization: Bearer secret"',
         )
         mutations.append(leaked_nightrun)
