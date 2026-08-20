@@ -1090,6 +1090,20 @@ fn multi_step_execution_reaches_review_before_independent_gate_allows_done() {
     let done = core.reconcile_gate_evidence(&gate, NOW + 21).unwrap();
     assert_eq!(done.state, WorkItemState::Done);
     assert!(done.gate_evidence.is_some());
+
+    let replayed = core
+        .store()
+        .admit_plan(&plan, &authority(), NOW + 22)
+        .unwrap();
+    assert!(replayed.0);
+    assert_eq!(replayed.1, admitted);
+    assert!(core.store().pending_executions(10).unwrap().is_empty());
+    assert!(core
+        .store()
+        .pending_completion_evidence(10)
+        .unwrap()
+        .is_empty());
+    assert!(core.store().pending_gate_evidence(10).unwrap().is_empty());
 }
 
 #[test]

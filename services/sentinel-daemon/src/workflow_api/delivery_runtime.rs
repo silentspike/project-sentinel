@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -17,10 +17,13 @@ use sentinel_workflow::{
 use crate::delivery::{
     expected_effect_saga_contract_digest, expected_integration_contract_digest,
     expected_publication_contract_digest, expected_workbench_execution_saga_contract_digest,
-    AdapterReadiness, AuthorityReceiptV1, AuthorityRole, AuthorityValidationRequestV1,
-    CandidateAuthorityQueryV1, CandidateAuthoritySnapshotV1, ContentDigest, DeliveryEffectPort,
-    DeliveryEffectReceiptV1, DeliveryEffectRequestV1, DeliveryError, DeliveryIntegrationPort,
-    DeliveryPublicationPort, PrincipalV1, PublicationReceiptV1, PublicationRequestV1,
+    qa_evidence_inventory_digest, AdapterReadiness, AuthorityReceiptV1, AuthorityRole,
+    AuthorityValidationRequestV1, CandidateAuthorityQueryV1, CandidateAuthoritySnapshotV1,
+    ContentDigest, DataControlV1, DatasetSplit, DeliveryEffectPort, DeliveryEffectReceiptV1,
+    DeliveryEffectRequestV1, DeliveryError, DeliveryIntegrationPort, DeliveryPublicationPort,
+    PrincipalV1, PublicationReceiptV1, PublicationRequestV1, QaCaseAttemptEvidenceV1,
+    QaCaseOutcome, QaCaseReasonCode, QaCaseResultV1, QaDatasetCaseV1,
+    QaDeterministicAssertionResultV1, QaEvidenceGraphV1, QaHarnessOutcome, SourceTupleV1,
     VersionedRefV1, WorkbenchEvidenceReceiptV1, WorkbenchEvidenceRequestV1, WorkflowLineageEdgeV1,
     WorkflowLineageKindV1, WorkflowLineageNodeV1, WorkflowLineageQueryV1,
     WorkflowLineageSnapshotV1, WorkflowLineageStateV1, DELIVERY_SCHEMA_V1,
@@ -35,6 +38,12 @@ use super::PrincipalAuthenticator;
 
 const DELIVERY_AUTHORITY_GENERATION: u64 = 1;
 const DELIVERY_EVENT_TOPIC: &str = "sentinel.delivery.events";
+
+type M0QaEvidenceComponents = (
+    Vec<QaDatasetCaseV1>,
+    Vec<QaCaseResultV1>,
+    Vec<QaDeterministicAssertionResultV1>,
+);
 
 #[derive(Clone)]
 pub(super) struct WorkflowWorkItemGate {
@@ -728,6 +737,8 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
                     &request.project.id,
                     &work_item_id,
                     artifact.digest.as_str(),
+                    None,
+                    &artifact.media_type,
                 )
                 .map_err(storage_error)?,
             );
@@ -870,6 +881,202 @@ fn qa_work_item_id(invocation_id: &str) -> anyhow::Result<String> {
     Ok(format!("qa-{}", &compact[..24]))
 }
 
+fn m0_qa_digest(label: &str) -> Result<ContentDigest, DeliveryError> {
+    ContentDigest::of_domain("m0-web-qa", DELIVERY_SCHEMA_V1, &label)
+}
+
+fn m0_qa_data_control() -> Result<DataControlV1, DeliveryError> {
+    Ok(DataControlV1 {
+        classification: "internal".to_string(),
+        encryption_key_owner: "sentinel".to_string(),
+        access_policy_digest: m0_qa_digest("fixture-access-policy")?,
+        redaction_policy_digest: m0_qa_digest("fixture-redaction-policy")?,
+        retention_frontier: VersionedRefV1 {
+            id: "m0-web-qa-retention".to_string(),
+            generation: 1,
+            digest: m0_qa_digest("fixture-retention-frontier")?,
+        },
+        audit_policy_digest: m0_qa_digest("fixture-audit-policy")?,
+    })
+}
+
+pub(super) fn m0_qa_fixture_cases() -> Result<Vec<QaDatasetCaseV1>, DeliveryError> {
+    let source = SourceTupleV1 {
+        owner: "project-sentinel".to_string(),
+        source_type: "repository_fixture".to_string(),
+        id: "web-qa-v1".to_string(),
+        generation: 1,
+        digest: m0_qa_digest("web-qa-v1-source")?,
+    };
+    [
+        ("web-security", true, "security"),
+        ("web-structure", true, "structure"),
+        ("web-visual", false, "visual"),
+    ]
+    .into_iter()
+    .map(|(case_id, required, surface)| {
+        Ok(QaDatasetCaseV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            case_id: case_id.to_string(),
+            generation: 1,
+            split: DatasetSplit::HiddenHoldout,
+            required,
+            required_class: if required {
+                "deterministic".to_string()
+            } else {
+                "optional".to_string()
+            },
+            slices: BTreeMap::from([("surface".to_string(), surface.to_string())]),
+            input_digest: m0_qa_digest(&format!("{case_id}-input"))?,
+            oracle_digest: m0_qa_digest(&format!("{case_id}-oracle"))?,
+            provenance: vec![source.clone()],
+            license: "project-sentinel-internal".to_string(),
+            access_policy_digest: m0_qa_digest("fixture-access-policy")?,
+            contamination_policy_digest: m0_qa_digest("fixture-contamination-policy")?,
+            retired_at_ms: None,
+            superseded_by: None,
+            data_control: m0_qa_data_control()?,
+        })
+    })
+    .collect()
+}
+
+fn m0_qa_evidence_components(
+    run: &VersionedRefV1,
+    plan_digest: &ContentDigest,
+    harness_outcome: QaHarnessOutcome,
+    output_digest: &ContentDigest,
+    logs_digest: &ContentDigest,
+) -> Result<M0QaEvidenceComponents, DeliveryError> {
+    let cases = m0_qa_fixture_cases()?;
+    let outcome = match harness_outcome {
+        QaHarnessOutcome::Pass => QaCaseOutcome::Pass,
+        QaHarnessOutcome::Fail => QaCaseOutcome::Fail,
+        QaHarnessOutcome::Error => QaCaseOutcome::Error,
+    };
+    let reason_code = match outcome {
+        QaCaseOutcome::Pass => QaCaseReasonCode::Verified,
+        QaCaseOutcome::Fail => QaCaseReasonCode::AssertionFailed,
+        QaCaseOutcome::Error => QaCaseReasonCode::HarnessError,
+        _ => {
+            return Err(DeliveryError::Validation(
+                "M0 QA produced an unsupported outcome".to_string(),
+            ))
+        }
+    };
+    let deterministic_results = cases
+        .iter()
+        .filter(|case| case.required)
+        .map(|case| {
+            let case_digest =
+                ContentDigest::of_domain("qa-dataset-case", DELIVERY_SCHEMA_V1, case)?;
+            Ok(QaDeterministicAssertionResultV1 {
+                schema_version: DELIVERY_SCHEMA_V1,
+                assertion_id: format!("assertion-{}", case.case_id),
+                generation: 1,
+                plan_digest: plan_digest.clone(),
+                case_digest,
+                assertion_digest: ContentDigest::of_domain(
+                    "m0-web-qa-assertion",
+                    DELIVERY_SCHEMA_V1,
+                    &(&case.case_id, output_digest, logs_digest),
+                )?,
+                oracle_digest: case.oracle_digest.clone(),
+                input_digest: case.input_digest.clone(),
+                evidence_digest: ContentDigest::of_domain(
+                    "m0-web-qa-evidence",
+                    DELIVERY_SCHEMA_V1,
+                    &(&case.case_id, output_digest, logs_digest),
+                )?,
+                actual_digest: output_digest.clone(),
+                passed: outcome == QaCaseOutcome::Pass,
+            })
+        })
+        .collect::<Result<Vec<_>, DeliveryError>>()?;
+    let case_results = cases
+        .iter()
+        .filter(|case| case.required)
+        .zip(&deterministic_results)
+        .map(|(case, assertion)| {
+            let case_ref = VersionedRefV1 {
+                id: case.case_id.clone(),
+                generation: case.generation,
+                digest: ContentDigest::of_domain("qa-dataset-case", DELIVERY_SCHEMA_V1, case)?,
+            };
+            let assertion_ref = VersionedRefV1 {
+                id: assertion.assertion_id.clone(),
+                generation: assertion.generation,
+                digest: ContentDigest::of_domain(
+                    "qa-deterministic-result",
+                    DELIVERY_SCHEMA_V1,
+                    assertion,
+                )?,
+            };
+            let attempt = QaCaseAttemptEvidenceV1 {
+                schema_version: DELIVERY_SCHEMA_V1,
+                attempt_id: format!("attempt-{}-1", case.case_id),
+                generation: 1,
+                attempt_number: 1,
+                run: run.clone(),
+                case_ref: case_ref.clone(),
+                outcome,
+                reason_code,
+                assertion_refs: vec![assertion_ref.clone()],
+                attempt_digest: ContentDigest::zero(),
+            }
+            .seal()?;
+            Ok(QaCaseResultV1 {
+                schema_version: DELIVERY_SCHEMA_V1,
+                result_id: format!("result-{}", case.case_id),
+                generation: 1,
+                run: run.clone(),
+                case_ref,
+                outcome,
+                required: true,
+                reason_code,
+                sources: case.provenance.clone(),
+                assertion_refs: vec![assertion_ref],
+                grader_refs: vec![],
+                slices: case.slices.clone(),
+                attempts: 1,
+                attempt_history: vec![attempt],
+                disposition: None,
+            })
+        })
+        .collect::<Result<Vec<_>, DeliveryError>>()?;
+    Ok((cases, case_results, deterministic_results))
+}
+
+pub(super) fn m0_qa_evidence_graph(
+    run: &VersionedRefV1,
+    plan_digest: &ContentDigest,
+    receipt: &WorkbenchEvidenceReceiptV1,
+) -> Result<QaEvidenceGraphV1, DeliveryError> {
+    let (dataset_cases, case_results, deterministic_results) = m0_qa_evidence_components(
+        run,
+        plan_digest,
+        receipt.harness_outcome,
+        &receipt.output_digest,
+        &receipt.logs_digest,
+    )?;
+    QaEvidenceGraphV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        run: run.clone(),
+        workbench_receipt: VersionedRefV1 {
+            id: receipt.invocation.id.clone(),
+            generation: receipt.invocation.generation,
+            digest: receipt.receipt_digest.clone(),
+        },
+        dataset_cases,
+        case_results,
+        deterministic_results,
+        model_results: vec![],
+        flake_dispositions: vec![],
+        graph_digest: ContentDigest::zero(),
+    }
+    .seal()
+}
+
 fn qa_receipt(
     request: &WorkbenchEvidenceRequestV1,
     workbench_request: &WorkbenchRequest,
@@ -923,6 +1130,33 @@ fn qa_receipt(
             ),
         )?,
     };
+    let logs_digest = ContentDigest::of_domain(
+        "qa-safe-log-summary",
+        DELIVERY_SCHEMA_V1,
+        &(&record.state, &record.error, &record.resources),
+    )?;
+    let (dataset_cases, case_results, deterministic_results) = m0_qa_evidence_components(
+        &request.qa_run,
+        &request.qa_plan.digest,
+        harness_outcome,
+        &output_digest,
+        &logs_digest,
+    )?;
+    let result_inventory_digest = qa_evidence_inventory_digest(&QaEvidenceGraphV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        run: request.qa_run.clone(),
+        workbench_receipt: VersionedRefV1 {
+            id: request.invocation.id.clone(),
+            generation: request.invocation.generation,
+            digest: ContentDigest::zero(),
+        },
+        dataset_cases,
+        case_results,
+        deterministic_results,
+        model_results: vec![],
+        flake_dispositions: vec![],
+        graph_digest: ContentDigest::zero(),
+    })?;
     WorkbenchEvidenceReceiptV1 {
         schema_version: DELIVERY_SCHEMA_V1,
         invocation: request.invocation.clone(),
@@ -943,21 +1177,8 @@ fn qa_receipt(
                 &request.assigned_qa,
             ),
         )?,
-        result_inventory_digest: ContentDigest::of_domain(
-            "qa-result-inventory",
-            DELIVERY_SCHEMA_V1,
-            &(
-                &record.state,
-                &record.result_digest,
-                &record.resources,
-                &record.artifacts,
-            ),
-        )?,
-        logs_digest: ContentDigest::of_domain(
-            "qa-safe-log-summary",
-            DELIVERY_SCHEMA_V1,
-            &(&record.state, &record.error, &record.resources),
-        )?,
+        result_inventory_digest,
+        logs_digest,
         screenshots_digest: None,
         failure_classification_digest: ContentDigest::of_domain(
             "qa-failure-classification",
@@ -1166,6 +1387,8 @@ impl GateEvidencePort for WorkflowWorkItemGate {
                     &work.project_id.0,
                     &work_item_id,
                     &artifact.digest,
+                    Some(&artifact.artifact_kind),
+                    &artifact.media_type,
                 )
                 .map_err(|_| WorkflowPortError::Rejected)?,
             );
@@ -1649,6 +1872,115 @@ mod tests {
             generation,
             digest: digest(id),
         }
+    }
+
+    #[test]
+    fn qa_receipt_inventory_matches_the_canonical_evidence_graph() {
+        let qa = PrincipalV1 {
+            tenant_id: "tenant-a".to_string(),
+            principal_id: "qa-a".to_string(),
+            authority_generation: 1,
+            roles: BTreeSet::from([AuthorityRole::Qa]),
+        };
+        let request = WorkbenchEvidenceRequestV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            tenant_id: "tenant-a".to_string(),
+            project: reference("project-a", 1),
+            candidate: reference("candidate-a", 1),
+            qa_plan: reference("qa-plan-a", 1),
+            qa_run: reference("qa-run-a", 1),
+            candidate_artifacts: vec![crate::delivery::ArtifactRefV1 {
+                artifact_id: "artifact-a".to_string(),
+                generation: 1,
+                digest: digest("artifact-a"),
+                media_type: "application/octet-stream".to_string(),
+                owner_principal_id: "developer-a".to_string(),
+            }],
+            assigned_qa: qa,
+            authority_receipt_digest: digest("authority-receipt"),
+            authority_identity_digest: digest("authority-identity"),
+            invocation: reference("invocation-a", 1),
+            started_at_ms: 100,
+            request_digest: digest("workbench-request"),
+        };
+        let workbench_request = WorkbenchRequest {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation.id.clone(),
+            agent_id: AgentId(7),
+            project_id: request.project.id.clone(),
+            work_item_id: "qa-work-a".to_string(),
+            workspace_id: "workspace-a".to_string(),
+            caller_id: request.assigned_qa.principal_id.clone(),
+            caller_role: "qa".to_string(),
+            assignment_version: 1,
+            credential_generation: 1,
+            policy_digest: digest("policy").as_str().to_string(),
+            tool_profile: "web-qa-v1".to_string(),
+            tool_profile_digest: digest("profile").as_str().to_string(),
+            runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
+            capabilities: BTreeSet::from(["test.run_profile".to_string()]),
+            output_artifact_kinds: BTreeSet::new(),
+            inputs: Vec::new(),
+            command_policy: Vec::new(),
+            resource_limits: WorkbenchResourceLimits {
+                wall_time_ms: 1_000,
+                cpu_time_ms: 1_000,
+                memory_bytes: 1_048_576,
+                process_count: 1,
+                file_bytes: 4_096,
+                stdout_bytes: 4_096,
+                stderr_bytes: 4_096,
+            },
+            deadline_unix_ms: 2_000,
+            attempt: 1,
+            tool: WorkbenchTool::RunTests {
+                suite_id: "web-qa-v1".to_string(),
+                program: "sentinel-web-qa".to_string(),
+                args: Vec::new(),
+            },
+            input_digest: request.request_digest.as_str().to_string(),
+        };
+        let record = WorkbenchInvocationRecord {
+            store_schema_version: 2,
+            invocation_id: workbench_request.invocation_id.clone(),
+            request_digest: workbench_request.input_digest.clone(),
+            agent_id: workbench_request.agent_id,
+            project_id: workbench_request.project_id.clone(),
+            work_item_id: workbench_request.work_item_id.clone(),
+            workspace_id: workbench_request.workspace_id.clone(),
+            caller_id: workbench_request.caller_id.clone(),
+            caller_role: workbench_request.caller_role.clone(),
+            assignment_version: workbench_request.assignment_version,
+            credential_generation: workbench_request.credential_generation,
+            policy_digest: workbench_request.policy_digest.clone(),
+            tool_profile: workbench_request.tool_profile.clone(),
+            tool_profile_digest: workbench_request.tool_profile_digest.clone(),
+            runtime_key: workbench_request.runtime_key.clone(),
+            tool_class: "test.run_profile".to_string(),
+            package_artifact_kind: None,
+            package_media_type: None,
+            capabilities: workbench_request.capabilities.clone(),
+            output_artifact_kinds: BTreeSet::new(),
+            attempt: 1,
+            state: WorkbenchInvocationState::Succeeded,
+            reserved_at_ms: 100,
+            started_at_ms: Some(100),
+            completed_at_ms: Some(101),
+            resources: None,
+            result_digest: Some(digest("qa-result").as_str().to_string()),
+            artifacts: Vec::new(),
+            error: None,
+        };
+
+        let receipt = qa_receipt(&request, &workbench_request, &record).unwrap();
+        let graph =
+            m0_qa_evidence_graph(&request.qa_run, &request.qa_plan.digest, &receipt).unwrap();
+
+        assert_eq!(
+            receipt.result_inventory_digest,
+            qa_evidence_inventory_digest(&graph).unwrap()
+        );
+        assert_eq!(receipt.harness_outcome, QaHarnessOutcome::Pass);
     }
 
     #[test]

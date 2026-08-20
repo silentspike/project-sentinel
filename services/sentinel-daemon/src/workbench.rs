@@ -101,7 +101,7 @@ impl WorkbenchProfile {
             || !request
                 .command_policy
                 .iter()
-                .all(|rule| self.command_rules.contains(rule))
+                .all(|rule| self.command_rule_is_narrowing(rule))
         {
             bail!("workbench request exceeds or mismatches its immutable profile");
         }
@@ -131,6 +131,13 @@ impl WorkbenchProfile {
             }
         }
         Ok(())
+    }
+
+    fn command_rule_is_narrowing(&self, requested: &sentinel_common::CommandRule) -> bool {
+        self.command_rules.iter().any(|granted| {
+            requested.max_args <= granted.max_args
+                && granted.allows(&requested.program, &requested.required_arg_prefix)
+        })
     }
 
     fn validate_definition(&self) -> anyhow::Result<()> {
@@ -1494,6 +1501,8 @@ pub(crate) fn stage_verified_artifact_inputs(
     project_id: &str,
     destination_work_item_id: &str,
     manifest_digest: &str,
+    expected_artifact_kind: Option<&str>,
+    expected_media_type: &str,
 ) -> anyhow::Result<Vec<sentinel_common::WorkbenchInputRef>> {
     if !valid_lower_sha256(manifest_digest) {
         return Err(WorkbenchStoreError::OutputRejected.into());
@@ -1557,7 +1566,9 @@ pub(crate) fn stage_verified_artifact_inputs(
     if manifest.schema_version != WORKBENCH_SCHEMA_VERSION
         || manifest.project_id != project_id
         || manifest.agent_id != source_agent.0
-        || manifest.artifact_kind != "source_tree"
+        || daemon_scope_component(&manifest.artifact_kind).is_err()
+        || expected_artifact_kind.is_some_and(|value| value != manifest.artifact_kind)
+        || manifest.media_type != expected_media_type
         || manifest.entries.is_empty()
         || manifest.entries.len() > 64
     {
@@ -1618,34 +1629,13 @@ pub(crate) fn stage_verified_artifact_inputs(
             .file_name()
             .ok_or(WorkbenchStoreError::OutputRejected)?;
         let destination = destination_parent.join(file_name);
-        match fs::hard_link(
-            format!(
-                "/proc/self/fd/{}/{}",
-                source_blob_dir.as_raw_fd(),
-                entry.sha256
-            ),
+        install_verified_input_copy(
+            &destination_parent,
+            file_name,
             &destination,
-        ) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC)
-                    .open(&destination)
-                    .map_err(|_| WorkbenchStoreError::OutputRejected)?;
-                let metadata = existing
-                    .metadata()
-                    .map_err(|_| WorkbenchStoreError::OutputRejected)?;
-                if metadata.dev() != source_metadata.dev()
-                    || metadata.ino() != source_metadata.ino()
-                    || metadata.len() != source_metadata.len()
-                    || metadata.mode() & 0o222 != 0
-                {
-                    return Err(WorkbenchStoreError::OutputRejected.into());
-                }
-            }
-            Err(_) => return Err(WorkbenchStoreError::OutputRejected.into()),
-        }
+            &entry.sha256,
+            &blob_bytes,
+        )?;
         result.push(sentinel_common::WorkbenchInputRef {
             artifact_id: entry.blob_id,
             sha256: entry.sha256,
@@ -1655,6 +1645,91 @@ pub(crate) fn stage_verified_artifact_inputs(
     }
     result.sort_by(|left, right| left.mount_path.cmp(&right.mount_path));
     Ok(result)
+}
+
+fn install_verified_input_copy(
+    destination_parent: &Path,
+    file_name: &std::ffi::OsStr,
+    destination: &Path,
+    expected_sha256: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    if !valid_lower_sha256(expected_sha256)
+        || file_name
+            .to_str()
+            .and_then(|value| daemon_scope_component(value).ok())
+            .is_none()
+    {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    if fs::symlink_metadata(destination).is_ok() {
+        return validate_existing_input_copy(destination, expected_sha256, bytes.len() as u64);
+    }
+
+    let temporary =
+        destination_parent.join(format!(".stage-{expected_sha256}-{}", uuid::Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC)
+        .open(&temporary)
+        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let installed = (|| -> anyhow::Result<()> {
+        std::io::Write::write_all(&mut file, bytes)
+            .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        file.sync_all()
+            .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        file.set_permissions(fs::Permissions::from_mode(0o444))
+            .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+        validate_daemon_artifact_file_metadata(
+            &metadata,
+            bytes.len() as u64,
+            Some(bytes.len() as u64),
+        )?;
+        match fs::hard_link(&temporary, destination) {
+            Ok(()) => {
+                fs::remove_file(&temporary).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(&temporary).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+            }
+            Err(_) => return Err(WorkbenchStoreError::OutputRejected.into()),
+        }
+        validate_existing_input_copy(destination, expected_sha256, bytes.len() as u64)
+    })();
+    if installed.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    installed
+}
+
+fn validate_existing_input_copy(
+    destination: &Path,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> anyhow::Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC)
+        .open(destination)
+        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    validate_daemon_artifact_file_metadata(&metadata, expected_size, Some(expected_size))?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(expected_size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| WorkbenchStoreError::OutputRejected)?;
+    if bytes.len() as u64 != expected_size || hex_sha256(&bytes) != expected_sha256 {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    Ok(())
 }
 
 fn validate_agent_runtime_marker(root: &Path, agent_id: AgentId) -> anyhow::Result<()> {
@@ -3021,11 +3096,27 @@ mod tests {
     fn immutable_profile_binds_runtime_capabilities_and_resource_ceilings() {
         let profile_authority = secure_test_workbench_profile_authority();
         let (profile, digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
+        assert_eq!(
+            profile.output_artifact_kinds,
+            BTreeSet::from([
+                "design_specification".to_string(),
+                "source_tree".to_string(),
+            ])
+        );
         let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2809");
         request.tool_profile_digest = digest.clone();
         request.input_digest = request.canonical_digest().unwrap();
         profile.authorize_request(&digest, &request).unwrap();
 
+        request.output_artifact_kinds = BTreeSet::from(["design_specification".to_string()]);
+        request.input_digest = request.canonical_digest().unwrap();
+        profile.authorize_request(&digest, &request).unwrap();
+
+        request.output_artifact_kinds = BTreeSet::from(["foreign_artifact".to_string()]);
+        request.input_digest = request.canonical_digest().unwrap();
+        assert!(profile.authorize_request(&digest, &request).is_err());
+
+        request.output_artifact_kinds = BTreeSet::from(["source_tree".to_string()]);
         request.resource_limits.memory_bytes = profile.resource_ceilings.memory_bytes + 1;
         request.input_digest = request.canonical_digest().unwrap();
         assert!(profile
@@ -3047,6 +3138,15 @@ mod tests {
             args: vec!["--check".to_string(), "src/app.js".to_string()],
         };
         request.tool_profile_digest = digest.clone();
+        request.input_digest = request.canonical_digest().unwrap();
+        request.validate_at(1_900_000_000_000).unwrap();
+        profile.authorize_request(&digest, &request).unwrap();
+
+        request.command_policy = vec![sentinel_common::CommandRule {
+            program: "node".to_string(),
+            required_arg_prefix: vec!["--check".to_string(), "src/app.js".to_string()],
+            max_args: 2,
+        }];
         request.input_digest = request.canonical_digest().unwrap();
         request.validate_at(1_900_000_000_000).unwrap();
         profile.authorize_request(&digest, &request).unwrap();
@@ -3556,6 +3656,117 @@ mod tests {
                     .custom_flags(LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC)
                     .open(path)
             },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn artifact_input_staging_accepts_the_bound_design_contract_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_agent = AgentId(3);
+        let destination_agent = AgentId(6);
+        let source_root = directory.path().join("agent-03");
+        let destination_root = directory.path().join("agent-06");
+        let source_artifacts = source_root.join("artifacts");
+        let destination_artifacts = destination_root.join("artifacts");
+        let source_scope = source_artifacts.join("project-m0").join("design-site");
+        fs::create_dir_all(source_scope.join("blobs")).unwrap();
+        fs::create_dir_all(&destination_artifacts).unwrap();
+        fs::create_dir(destination_root.join("inputs")).unwrap();
+        fs::write(source_root.join(".nano-runtime"), "AGENT-03").unwrap();
+        fs::write(destination_root.join(".nano-runtime"), "AGENT-06").unwrap();
+
+        let blob = b"# Bound design";
+        let blob_digest = hex_sha256(blob);
+        let blob_path = source_scope.join("blobs").join(&blob_digest);
+        fs::write(&blob_path, blob).unwrap();
+        fs::set_permissions(&blob_path, fs::Permissions::from_mode(0o444)).unwrap();
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schema_version": WORKBENCH_SCHEMA_VERSION,
+            "invocation_id": "018f3f32-4f01-7f2c-a6c1-f6f4a81b2897",
+            "input_digest": "a".repeat(64),
+            "project_id": "project-m0",
+            "work_item_id": "design-site",
+            "workspace_id": "project-m0:design-site",
+            "agent_id": source_agent.0,
+            "artifact_kind": "design_specification",
+            "media_type": "text/markdown",
+            "runtime_key": WORKBENCH_RUNTIME_BWRAP,
+            "tool_profile": "web-authoring-v1",
+            "tool_profile_digest": "b".repeat(64),
+            "policy_digest": "c".repeat(64),
+            "entries": [{
+                "path": "design.md",
+                "blob_id": format!("sha256:{blob_digest}"),
+                "sha256": blob_digest,
+                "size_bytes": blob.len(),
+            }],
+        }))
+        .unwrap();
+        let manifest_digest = hex_sha256(&manifest);
+        fs::write(
+            source_scope.join(format!("{manifest_digest}.manifest.json")),
+            manifest,
+        )
+        .unwrap();
+        let roots = HashMap::from([
+            (source_agent, source_artifacts),
+            (destination_agent, destination_artifacts),
+        ]);
+
+        let staged = stage_verified_artifact_inputs(
+            &roots,
+            source_agent,
+            destination_agent,
+            "project-m0",
+            "build-site",
+            &manifest_digest,
+            Some("design_specification"),
+            "text/markdown",
+        )
+        .unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].mount_path, "design.md");
+        assert_eq!(staged[0].sha256, blob_digest);
+        let replayed = stage_verified_artifact_inputs(
+            &roots,
+            source_agent,
+            destination_agent,
+            "project-m0",
+            "build-site",
+            &manifest_digest,
+            Some("design_specification"),
+            "text/markdown",
+        )
+        .unwrap();
+        assert_eq!(replayed, staged);
+        assert_eq!(fs::metadata(&blob_path).unwrap().nlink(), 1);
+        assert_eq!(
+            fs::metadata(destination_root.join("inputs/project-m0/build-site/design.md"))
+                .unwrap()
+                .nlink(),
+            1
+        );
+        assert!(stage_verified_artifact_inputs(
+            &roots,
+            source_agent,
+            destination_agent,
+            "project-m0",
+            "build-site",
+            &manifest_digest,
+            Some("source_tree"),
+            "text/markdown",
+        )
+        .is_err());
+        assert!(stage_verified_artifact_inputs(
+            &roots,
+            source_agent,
+            destination_agent,
+            "project-m0",
+            "build-site",
+            &manifest_digest,
+            Some("design_specification"),
+            "application/octet-stream",
         )
         .is_err());
     }

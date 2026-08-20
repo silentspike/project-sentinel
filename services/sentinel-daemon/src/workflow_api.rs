@@ -1,5 +1,6 @@
 //! Authenticated M0 company workflow and productive Workbench integration.
 
+mod delivery_intent;
 mod delivery_runtime;
 
 use std::collections::{BTreeSet, HashMap};
@@ -18,14 +19,16 @@ use sentinel_common::{
     WorkbenchTool, WORKBENCH_RUNTIME_BWRAP, WORKBENCH_SCHEMA_VERSION,
 };
 use sentinel_workflow::{
-    sealed_output_bundle_digest, ArtifactInputV1, AuthenticatedCompanyPrincipalV1, CommandRuleV1,
-    CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkflowCommandV1, CompletionEvidencePort,
-    DependencyReadiness, ExecutionPlanV1, ExecutionReconcileState, ExecutionToolV1,
-    GateEvidencePort, PendingCompletionEvidenceV1, PendingExecutionV1, PrincipalAuthorityV1,
-    ProjectId, RuntimeAuthoritySnapshotV1, SealedArtifactEvidenceV1, SealedOutputEvidenceV1,
-    TenantId, TerminalExecutionEvidence, UnavailableGateEvidencePort, WorkExecutionObservation,
-    WorkExecutionPort, WorkItemId, WorkflowCore, WorkflowError, WorkflowErrorCode,
-    WorkflowPortError, WorkflowStore, WORKFLOW_SCHEMA_VERSION,
+    sealed_output_bundle_digest, ArtifactExpectationV1, ArtifactInputV1,
+    AuthenticatedCompanyPrincipalV1, CommandRuleV1, CompanyPrincipalKindV1, CompanyRoleV1,
+    CompanyWorkflowCommandV1, CompletionEvidencePort, DependencyReadiness, ExecutionPlanV1,
+    ExecutionReconcileState, ExecutionResourceBoundsV1, ExecutionStepV1, ExecutionToolV1,
+    GateEvidencePort, GateExpectationV1, OutputExpectationV1, PendingCompletionEvidenceV1,
+    PendingExecutionV1, PrincipalAuthorityV1, ProjectId, RuntimeAuthoritySnapshotV1,
+    SealedArtifactEvidenceV1, SealedOutputEvidenceV1, TenantId, TerminalExecutionEvidence,
+    UnavailableGateEvidencePort, WorkExecutionObservation, WorkExecutionPort, WorkItemId,
+    WorkflowCore, WorkflowError, WorkflowErrorCode, WorkflowPortError, WorkflowStore,
+    EXECUTION_PLAN_SCHEMA_VERSION, WORKFLOW_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,9 +36,9 @@ use uuid::Uuid;
 
 use crate::delivery::{ConfiguredDeliveryCore, DeliveryStoreConfigV1};
 use crate::workbench::{
-    dispatch_workbench, WorkbenchAuthoritySnapshot, WorkbenchAuthoritySource,
-    WorkbenchDispatchCommand, WorkbenchInvocationRecord, WorkbenchInvocationState,
-    WorkbenchProfile,
+    dispatch_workbench, stage_verified_artifact_inputs, WorkbenchAuthoritySnapshot,
+    WorkbenchAuthoritySource, WorkbenchDispatchCommand, WorkbenchInvocationRecord,
+    WorkbenchInvocationState, WorkbenchProfile,
 };
 use delivery_runtime::{
     LimboDeliveryEffects, LimboDeliveryPublication, WorkflowDeliveryIntegration,
@@ -51,7 +54,9 @@ pub const OPERATOR_WORK_ITEM_PATH: &str = "/operator/workflow/work-items";
 pub const OPERATOR_PROJECTION_PATH: &str = "/operator/workflow/projections";
 pub const OPERATOR_EVENTS_PATH: &str = "/operator/workflow/events";
 pub const DELIVERY_COMMAND_PATH: &str = "/company/delivery/commands";
+pub const DELIVERY_INTENT_PATH: &str = "/company/delivery/intents";
 pub const DELIVERY_LINEAGE_PATH: &str = "/company/delivery/lineage";
+pub const WORKFLOW_READINESS_PATH: &str = "/company/workflow/readiness";
 pub const MAX_WORKFLOW_BODY_BYTES: usize = 256 * 1024;
 
 const PRINCIPAL_SCHEMA_VERSION: u16 = 1;
@@ -60,6 +65,8 @@ const RUNTIME_GENERATION: u64 = 1;
 const DISPATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RECONCILE_BATCH: usize = 32;
 const MAX_PRINCIPAL_BINDINGS_BYTES: u64 = 1024 * 1024;
+const MAX_EXECUTION_INTENT_STEPS: usize = 16;
+const EXECUTION_INTENT_OVERHEAD_MS: u64 = 30_000;
 const LINUX_O_NOFOLLOW: i32 = 0o400000;
 const LINUX_O_CLOEXEC: i32 = 0o2000000;
 
@@ -254,6 +261,7 @@ struct CompanyAuthority {
     workbench_profile: WorkbenchProfile,
     workbench_profile_digest: String,
     agent_capabilities: Arc<HashMap<AgentId, BTreeSet<String>>>,
+    artifact_roots: Arc<HashMap<AgentId, PathBuf>>,
 }
 
 impl CompanyAuthority {
@@ -276,6 +284,17 @@ impl CompanyAuthority {
         project_id: &ProjectId,
         work_item_id: &WorkItemId,
         agent_id: AgentId,
+    ) -> Result<RuntimeAuthoritySnapshotV1, WorkflowPortError> {
+        self.snapshot_for_admission(tenant_id, project_id, work_item_id, agent_id, true)
+    }
+
+    fn snapshot_for_admission(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+        work_item_id: &WorkItemId,
+        agent_id: AgentId,
+        require_serving_state: bool,
     ) -> Result<RuntimeAuthoritySnapshotV1, WorkflowPortError> {
         let project = self
             .store
@@ -310,12 +329,13 @@ impl CompanyAuthority {
             || assignment.profile.digest != self.workbench_profile_digest
             || assignment.profile.generation != PROFILE_GENERATION
             || project.governance.project_profile.profile_id != "web-project-v1"
-            || !matches!(
-                work.state,
-                sentinel_workflow::CompanyWorkStateV1::Assigned
-                    | sentinel_workflow::CompanyWorkStateV1::InProgress
-                    | sentinel_workflow::CompanyWorkStateV1::InReview
-            )
+            || (require_serving_state
+                && !matches!(
+                    work.state,
+                    sentinel_workflow::CompanyWorkStateV1::Assigned
+                        | sentinel_workflow::CompanyWorkStateV1::InProgress
+                        | sentinel_workflow::CompanyWorkStateV1::InReview
+                ))
         {
             return Err(WorkflowPortError::AuthorityConflict);
         }
@@ -367,6 +387,230 @@ impl CompanyAuthority {
         Ok(snapshot)
     }
 
+    fn plan_from_intent(
+        &self,
+        principal: &BoundPrincipal,
+        operation_id: Uuid,
+        intent: &ExecutionIntentV1,
+        now_ms: u64,
+    ) -> Result<ExecutionIntentAdmission, WorkflowError> {
+        let agent_id = principal
+            .principal
+            .agent_id
+            .ok_or_else(execution_authority_conflict)?;
+        let project = self
+            .store
+            .company_project(&principal.principal.tenant_id, &intent.project_id)?
+            .ok_or_else(|| {
+                WorkflowError::new(
+                    WorkflowErrorCode::NotFound,
+                    false,
+                    "execution project was not found",
+                )
+            })?;
+        let spec = project
+            .work_items
+            .get(&intent.work_item_id)
+            .ok_or_else(|| {
+                WorkflowError::new(
+                    WorkflowErrorCode::NotFound,
+                    false,
+                    "execution work item was not found",
+                )
+            })?;
+        let existing = self.store.work_item(
+            &principal.principal.tenant_id,
+            &intent.project_id,
+            &intent.work_item_id,
+        )?;
+        if let Some(existing) = existing {
+            if existing.plan.plan_id == operation_id {
+                let authority = self
+                    .snapshot_for_admission(
+                        &principal.principal.tenant_id,
+                        &intent.project_id,
+                        &intent.work_item_id,
+                        agent_id,
+                        false,
+                    )
+                    .map_err(execution_intent_port_error)?;
+                if authority.principal != principal.execution_authority
+                    || !existing.plan.authority_matches(&authority)
+                {
+                    return Err(execution_authority_conflict());
+                }
+                if !execution_intent_matches_plan(intent, &existing.plan) {
+                    return Err(WorkflowError::new(
+                        WorkflowErrorCode::IdempotencyConflict,
+                        false,
+                        "execution intent content changed for an existing operation",
+                    ));
+                }
+                return Ok(ExecutionIntentAdmission {
+                    plan: existing.plan,
+                    authority,
+                    replay: true,
+                });
+            }
+
+            let authority = self
+                .snapshot(
+                    &principal.principal.tenant_id,
+                    &intent.project_id,
+                    &intent.work_item_id,
+                    agent_id,
+                )
+                .map_err(execution_intent_port_error)?;
+            if authority.principal != principal.execution_authority {
+                return Err(execution_authority_conflict());
+            }
+            return Err(WorkflowError::new(
+                WorkflowErrorCode::VersionConflict,
+                false,
+                "work item already has a different execution intent",
+            ));
+        }
+
+        let authority = self
+            .snapshot(
+                &principal.principal.tenant_id,
+                &intent.project_id,
+                &intent.work_item_id,
+                agent_id,
+            )
+            .map_err(execution_intent_port_error)?;
+        if authority.principal != principal.execution_authority {
+            return Err(execution_authority_conflict());
+        }
+        let inputs = self.materialize_execution_inputs(&project, &spec.spec, agent_id)?;
+        let execution_ms = self
+            .workbench_profile
+            .resource_ceilings
+            .wall_time_ms
+            .checked_mul(intent.tools.len() as u64)
+            .and_then(|value| value.checked_add(EXECUTION_INTENT_OVERHEAD_MS))
+            .ok_or_else(execution_intent_invalid)?;
+        let created_at_unix_ms = now_ms;
+        let deadline_unix_ms = now_ms
+            .checked_add(execution_ms)
+            .ok_or_else(execution_intent_invalid)?;
+        let plan = build_execution_plan(
+            operation_id,
+            &authority,
+            &spec.spec,
+            inputs,
+            &self.workbench_profile,
+            intent,
+            created_at_unix_ms,
+            deadline_unix_ms,
+        )?;
+        Ok(ExecutionIntentAdmission {
+            plan,
+            authority,
+            replay: false,
+        })
+    }
+
+    fn materialize_execution_inputs(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        spec: &sentinel_workflow::CompanyWorkItemSpecV1,
+        destination_agent: AgentId,
+    ) -> Result<Vec<ArtifactInputV1>, WorkflowError> {
+        let mut inputs = Vec::new();
+        for binding in &spec.inputs {
+            let producer = project
+                .work_items
+                .get(&binding.producer_work_item_id)
+                .ok_or_else(execution_authority_conflict)?;
+            let assignment = producer
+                .assignments
+                .iter()
+                .find(|value| value.active)
+                .ok_or_else(execution_authority_conflict)?;
+            let output_contract = producer
+                .spec
+                .outputs
+                .iter()
+                .find(|value| value.name == binding.producer_output_name)
+                .ok_or_else(execution_authority_conflict)?;
+            let output_receipt = producer
+                .output_receipts
+                .iter()
+                .find(|value| value.name == binding.producer_output_name)
+                .ok_or_else(execution_authority_conflict)?;
+            if producer.state != sentinel_workflow::CompanyWorkStateV1::Done
+                || output_contract.contract_generation != binding.expected_contract_generation
+                || output_contract.contract_digest != binding.expected_contract_digest
+                || output_receipt.contract_generation != binding.expected_contract_generation
+                || output_receipt.contract_digest != binding.expected_contract_digest
+            {
+                return Err(execution_authority_conflict());
+            }
+            let execution = self
+                .store
+                .work_item(
+                    &project.tenant_id,
+                    &project.project_id,
+                    &binding.producer_work_item_id,
+                )?
+                .ok_or_else(execution_authority_conflict)?;
+            let terminal = execution
+                .terminal_execution_evidence
+                .as_ref()
+                .filter(|_| execution.state == sentinel_workflow::WorkItemState::Done)
+                .ok_or_else(execution_authority_conflict)?;
+            let output = terminal
+                .outputs
+                .iter()
+                .find(|value| value.name == binding.producer_output_name)
+                .filter(|value| value.digest == output_receipt.content_digest)
+                .ok_or_else(execution_authority_conflict)?;
+            let matching_artifacts = terminal
+                .artifacts
+                .iter()
+                .filter(|value| {
+                    value.artifact_kind == output.kind
+                        && value.media_type == output_contract.media_type
+                })
+                .collect::<Vec<_>>();
+            let [artifact] = matching_artifacts.as_slice() else {
+                return Err(execution_authority_conflict());
+            };
+            let staged = stage_verified_artifact_inputs(
+                &self.artifact_roots,
+                assignment.agent_id,
+                destination_agent,
+                &project.project_id.0,
+                &spec.work_item_id.0,
+                &artifact.digest,
+                Some(&artifact.artifact_kind),
+                &artifact.media_type,
+            )
+            .map_err(|_| execution_input_unavailable())?;
+            if staged.is_empty() {
+                return Err(execution_authority_conflict());
+            }
+            inputs.extend(staged.into_iter().map(|value| ArtifactInputV1 {
+                artifact_id: value.artifact_id,
+                digest: value.sha256,
+                media_type: value.media_type,
+                mount_path: value.mount_path,
+            }));
+        }
+        inputs.sort_by(|left, right| {
+            left.mount_path
+                .cmp(&right.mount_path)
+                .then_with(|| left.artifact_id.cmp(&right.artifact_id))
+        });
+        if inputs.windows(2).any(|pair| {
+            pair[0].mount_path == pair[1].mount_path || pair[0].artifact_id == pair[1].artifact_id
+        }) {
+            return Err(execution_authority_conflict());
+        }
+        Ok(inputs)
+    }
+
     fn workbench_snapshot(
         &self,
         tenant_id: &TenantId,
@@ -407,6 +651,204 @@ impl CompanyAuthority {
             project_capabilities: runtime.capabilities.clone(),
             profile_capabilities: self.workbench_profile.capabilities.clone(),
         })
+    }
+}
+
+fn build_execution_plan(
+    operation_id: Uuid,
+    authority: &RuntimeAuthoritySnapshotV1,
+    spec: &sentinel_workflow::CompanyWorkItemSpecV1,
+    inputs: Vec<ArtifactInputV1>,
+    profile: &WorkbenchProfile,
+    intent: &ExecutionIntentV1,
+    created_at_unix_ms: u64,
+    deadline_unix_ms: u64,
+) -> Result<ExecutionPlanV1, WorkflowError> {
+    if operation_id.is_nil()
+        || intent.tools.is_empty()
+        || intent.tools.len() > MAX_EXECUTION_INTENT_STEPS
+        || deadline_unix_ms <= created_at_unix_ms
+        || spec.outputs.len() != 1
+        || authority.project_id != intent.project_id
+        || authority.work_item_id != intent.work_item_id
+    {
+        return Err(execution_intent_invalid());
+    }
+    let artifact_kind = match spec.required_role {
+        CompanyRoleV1::Designer => "design_specification",
+        CompanyRoleV1::Developer => "source_tree",
+        _ => return Err(execution_authority_conflict()),
+    };
+    let output = &spec.outputs[0];
+    let final_tool = intent.tools.last().ok_or_else(execution_intent_invalid)?;
+    let (final_media_type, final_paths) = match final_tool {
+        ExecutionToolV1::PackageArtifact {
+            artifact_kind: observed_kind,
+            media_type,
+            paths,
+        } if observed_kind == artifact_kind && media_type == &output.media_type => {
+            (media_type.clone(), paths.clone())
+        }
+        _ => return Err(execution_intent_invalid()),
+    };
+    if intent.tools[..intent.tools.len() - 1]
+        .iter()
+        .any(|tool| matches!(tool, ExecutionToolV1::PackageArtifact { .. }))
+    {
+        return Err(execution_intent_invalid());
+    }
+    let workspace_id = format!("{}:{}", intent.project_id.0, intent.work_item_id.0);
+    let gate_expectation = GateExpectationV1 {
+        profile_id: spec.quality_gate.gate_id.clone(),
+        profile_generation: spec.quality_gate.generation,
+        profile_digest: spec.quality_gate.digest.clone(),
+        required_checks: BTreeSet::from(["html_structure".to_owned()]),
+    };
+    let output_expectation = OutputExpectationV1 {
+        name: output.name.clone(),
+        kind: artifact_kind.to_owned(),
+        required: true,
+        digest_algorithm: output.digest_algorithm.clone(),
+    };
+    let resource_bounds = ExecutionResourceBoundsV1 {
+        wall_time_ms: profile.resource_ceilings.wall_time_ms,
+        cpu_time_ms: profile.resource_ceilings.cpu_time_ms,
+        memory_bytes: profile.resource_ceilings.memory_bytes,
+        process_count: profile.resource_ceilings.process_count,
+        file_bytes: profile.resource_ceilings.file_bytes,
+        stdout_bytes: profile.resource_ceilings.stdout_bytes,
+        stderr_bytes: profile.resource_ceilings.stderr_bytes,
+    };
+    let operation_digest = operation_id.to_string();
+    let mut steps = Vec::with_capacity(intent.tools.len());
+    for (index, tool) in intent.tools.iter().cloned().enumerate() {
+        let required_capability = tool.required_capability().to_owned();
+        if !authority.capabilities.contains(&required_capability) {
+            return Err(execution_authority_conflict());
+        }
+        let command_policy = match &tool {
+            ExecutionToolV1::RunCommand { program, args } => {
+                if !profile
+                    .command_rules
+                    .iter()
+                    .any(|rule| rule.allows(program, args))
+                {
+                    return Err(execution_intent_invalid());
+                }
+                vec![CommandRuleV1 {
+                    program: program.clone(),
+                    required_arg_prefix: args.clone(),
+                    max_args: u16::try_from(args.len()).map_err(|_| execution_intent_invalid())?,
+                }]
+            }
+            _ => Vec::new(),
+        };
+        let artifacts = if index + 1 == intent.tools.len() {
+            vec![ArtifactExpectationV1 {
+                artifact_kind: artifact_kind.to_owned(),
+                media_type: final_media_type.clone(),
+                required_paths: final_paths.clone(),
+            }]
+        } else {
+            Vec::new()
+        };
+        let ordinal = u16::try_from(index).map_err(|_| execution_intent_invalid())?;
+        steps.push(ExecutionStepV1 {
+            step_id: stable_operation_id(
+                "sentinel.workflow.execution-intent-step.v1",
+                &operation_digest,
+                u64::from(ordinal) + 1,
+            ),
+            invocation_id: stable_operation_id(
+                "sentinel.workflow.execution-intent-invocation.v1",
+                &operation_digest,
+                u64::from(ordinal) + 1,
+            ),
+            ordinal,
+            workspace_id: workspace_id.clone(),
+            capabilities: BTreeSet::from([required_capability]),
+            inputs: inputs.clone(),
+            command_policy,
+            tool,
+            outputs: vec![output_expectation.clone()],
+            artifacts,
+            gate_expectation: gate_expectation.clone(),
+            resource_bounds: resource_bounds.clone(),
+            deadline_unix_ms,
+        });
+    }
+    ExecutionPlanV1 {
+        schema_version: EXECUTION_PLAN_SCHEMA_VERSION,
+        plan_id: operation_id,
+        tenant_id: authority.tenant_id.clone(),
+        project_id: authority.project_id.clone(),
+        work_item_id: authority.work_item_id.clone(),
+        agent_id: authority.agent_id,
+        workspace_id,
+        assignment_version: authority.assignment_version,
+        assignment_digest: authority.assignment_digest.clone(),
+        organization_generation: authority.organization_generation,
+        organization_digest: authority.organization_digest.clone(),
+        principal: authority.principal.clone(),
+        profile_id: authority.profile_id.clone(),
+        profile_generation: authority.profile_generation,
+        profile_digest: authority.profile_digest.clone(),
+        runtime_key: authority.runtime_key.clone(),
+        runtime_generation: authority.runtime_generation,
+        runtime_digest: authority.runtime_digest.clone(),
+        policy_generation: authority.policy_generation,
+        policy_digest: authority.policy_digest.clone(),
+        created_at_unix_ms,
+        deadline_unix_ms,
+        steps,
+        request_digest: String::new(),
+    }
+    .bind_digest()
+}
+
+fn execution_intent_invalid() -> WorkflowError {
+    WorkflowError::new(
+        WorkflowErrorCode::InvalidInput,
+        false,
+        "execution intent is invalid or exceeds the bounded M0 profile",
+    )
+}
+
+fn execution_authority_conflict() -> WorkflowError {
+    WorkflowError::new(
+        WorkflowErrorCode::AuthorityConflict,
+        false,
+        "execution intent authority is invalid or stale",
+    )
+}
+
+fn execution_input_unavailable() -> WorkflowError {
+    WorkflowError::new(
+        WorkflowErrorCode::ExecutionUnavailable,
+        true,
+        "execution dependency artifact is unavailable",
+    )
+}
+
+fn execution_intent_port_error(error: WorkflowPortError) -> WorkflowError {
+    match error {
+        WorkflowPortError::Unavailable => WorkflowError::new(
+            WorkflowErrorCode::OrganizationUnavailable,
+            true,
+            "execution authority is unavailable",
+        ),
+        WorkflowPortError::AuthorityConflict => execution_authority_conflict(),
+        WorkflowPortError::Rejected => execution_intent_invalid(),
+        WorkflowPortError::TimedOut => WorkflowError::new(
+            WorkflowErrorCode::OrganizationUnavailable,
+            true,
+            "execution authority lookup timed out",
+        ),
+        WorkflowPortError::UnknownOutcome => WorkflowError::new(
+            WorkflowErrorCode::UnknownOutcome,
+            true,
+            "execution authority outcome is unknown",
+        ),
     }
 }
 
@@ -465,7 +907,17 @@ fn validate_execution_contract(
     spec: &sentinel_workflow::CompanyWorkItemSpecV1,
 ) -> Result<(), WorkflowPortError> {
     let final_step = plan.steps.last().ok_or(WorkflowPortError::Rejected)?;
-    if final_step.outputs.len() != spec.outputs.len()
+    let derived_inputs = plan
+        .steps
+        .first()
+        .map(|step| step.inputs.as_slice())
+        .ok_or(WorkflowPortError::Rejected)?;
+    if spec.inputs.is_empty() != derived_inputs.is_empty()
+        || plan
+            .steps
+            .iter()
+            .any(|step| step.inputs.as_slice() != derived_inputs)
+        || final_step.outputs.len() != spec.outputs.len()
         || final_step.outputs.iter().any(|observed| {
             !observed.required
                 || !spec.outputs.iter().any(|expected| {
@@ -480,6 +932,17 @@ fn validate_execution_contract(
         return Err(WorkflowPortError::AuthorityConflict);
     }
     Ok(())
+}
+
+fn execution_intent_matches_plan(intent: &ExecutionIntentV1, plan: &ExecutionPlanV1) -> bool {
+    intent.project_id == plan.project_id
+        && intent.work_item_id == plan.work_item_id
+        && intent.tools.len() == plan.steps.len()
+        && intent
+            .tools
+            .iter()
+            .zip(&plan.steps)
+            .all(|(tool, step)| tool == &step.tool)
 }
 
 fn role_capabilities(role: CompanyRoleV1, profile: &WorkbenchProfile) -> BTreeSet<String> {
@@ -989,6 +1452,34 @@ struct ExecutionPlanEnvelope {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ExecutionIntentEnvelope {
+    operation_id: Uuid,
+    intent: ExecutionIntentV1,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionIntentV1 {
+    project_id: ProjectId,
+    work_item_id: WorkItemId,
+    tools: Vec<ExecutionToolV1>,
+}
+
+struct ExecutionIntentAdmission {
+    plan: ExecutionPlanV1,
+    authority: RuntimeAuthoritySnapshotV1,
+    replay: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionAdmissionResponse {
+    replayed: bool,
+    work_item: sentinel_workflow::WorkItemExecutionV1,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeliveryCommandEnvelope {
     idempotency_key: String,
     command: ProductDeliveryCommand,
@@ -1152,6 +1643,7 @@ impl WorkflowApi {
             workbench_profile: profile,
             workbench_profile_digest: profile_digest,
             agent_capabilities: Arc::clone(&agent_capabilities),
+            artifact_roots: Arc::new(workbench_artifact_roots.clone()),
         });
         let workbench = Arc::new(WorkbenchExecutionAdapter {
             store: Arc::clone(&store),
@@ -1281,7 +1773,9 @@ impl WorkflowApi {
             ("GET", OPERATOR_PROJECTION_PATH) => self.projection(&principal, path),
             ("GET", OPERATOR_EVENTS_PATH) => self.events(&principal, path),
             ("POST", DELIVERY_COMMAND_PATH) => self.delivery_command(&principal, body),
+            ("POST", DELIVERY_INTENT_PATH) => delivery_intent::handle(self, &principal, body),
             ("GET", DELIVERY_LINEAGE_PATH) => self.delivery_lineage(&principal, path),
+            ("GET", WORKFLOW_READINESS_PATH) => json(200, &self.health()),
             _ => json_error(
                 405,
                 "method_not_allowed",
@@ -1374,6 +1868,52 @@ impl WorkflowApi {
             let result = self.core.admit_plan(&envelope.plan, now_unix_ms());
             return match result {
                 Ok((replayed, work_item)) => json(200, &(replayed, work_item)),
+                Err(error) => workflow_error(error),
+            };
+        }
+        if let Ok(envelope) = serde_json::from_slice::<ExecutionIntentEnvelope>(body) {
+            let Ok(_guard) = self.mutation_fence.read() else {
+                return json_error(503, "workflow_busy", "workflow recovery is active", true);
+            };
+            let Some(authority) = self.authority.as_ref() else {
+                return json_error(
+                    503,
+                    "workflow_unavailable",
+                    "workflow authority is unavailable",
+                    true,
+                );
+            };
+            let admission = match authority.plan_from_intent(
+                principal,
+                envelope.operation_id,
+                &envelope.intent,
+                now_unix_ms(),
+            ) {
+                Ok(admission) => admission,
+                Err(error) => return workflow_error(error),
+            };
+            if authority.validate_plan_contract(&admission.plan).is_err() {
+                return json_error(
+                    403,
+                    "authority_conflict",
+                    "derived execution plan contract is stale",
+                    false,
+                );
+            }
+            let result = if admission.replay {
+                self.store
+                    .admit_plan(&admission.plan, &admission.authority, now_unix_ms())
+            } else {
+                self.core.admit_plan(&admission.plan, now_unix_ms())
+            };
+            return match result {
+                Ok((replayed, work_item)) => json(
+                    200,
+                    &ExecutionAdmissionResponse {
+                        replayed,
+                        work_item,
+                    },
+                ),
                 Err(error) => workflow_error(error),
             };
         }
@@ -2231,7 +2771,9 @@ fn is_workflow_path(path: &str) -> bool {
             | OPERATOR_PROJECTION_PATH
             | OPERATOR_EVENTS_PATH
             | DELIVERY_COMMAND_PATH
+            | DELIVERY_INTENT_PATH
             | DELIVERY_LINEAGE_PATH
+            | WORKFLOW_READINESS_PATH
     )
 }
 
@@ -2662,7 +3204,7 @@ mod tests {
             steps: vec![step],
             request_digest: "9".repeat(64),
         };
-        let spec = sentinel_workflow::CompanyWorkItemSpecV1 {
+        let mut spec = sentinel_workflow::CompanyWorkItemSpecV1 {
             work_item_id: plan.work_item_id.clone(),
             title: "Site".to_owned(),
             objective: "Build site".to_owned(),
@@ -2688,6 +3230,27 @@ mod tests {
         };
         assert_eq!(validate_execution_contract(&plan, &spec), Ok(()));
 
+        let producer_id = WorkItemId::parse("design-m0").unwrap();
+        spec.dependency_ids.insert(producer_id.clone());
+        spec.inputs.push(sentinel_workflow::WorkInputContractV1 {
+            name: "design_specification".to_owned(),
+            producer_work_item_id: producer_id,
+            producer_output_name: "design_specification".to_owned(),
+            expected_contract_generation: 1,
+            expected_contract_digest: "7".repeat(64),
+        });
+        assert_eq!(
+            validate_execution_contract(&plan, &spec),
+            Err(WorkflowPortError::AuthorityConflict)
+        );
+        plan.steps[0].inputs.push(ArtifactInputV1 {
+            artifact_id: format!("sha256:{}", "6".repeat(64)),
+            digest: "6".repeat(64),
+            media_type: "text/markdown".to_owned(),
+            mount_path: "design.md".to_owned(),
+        });
+        assert_eq!(validate_execution_contract(&plan, &spec), Ok(()));
+
         plan.steps[0].outputs[0].name = "foreign-output".to_owned();
         assert_eq!(
             validate_execution_contract(&plan, &spec),
@@ -2698,6 +3261,170 @@ mod tests {
         assert_eq!(
             validate_execution_contract(&plan, &spec),
             Err(WorkflowPortError::AuthorityConflict)
+        );
+    }
+
+    #[test]
+    fn execution_intent_derives_all_internal_authority_and_stable_effect_ids() {
+        let operation_id = Uuid::parse_str("018f3f32-4f01-7f2c-a6c1-f6f4a81b2809").unwrap();
+        let authority = RuntimeAuthoritySnapshotV1 {
+            schema_version: WORKFLOW_SCHEMA_VERSION,
+            tenant_id: TenantId::parse("tenant-m0").unwrap(),
+            project_id: ProjectId::parse("project-m0").unwrap(),
+            work_item_id: WorkItemId::parse("work-source").unwrap(),
+            agent_id: AgentId(6),
+            assignment_version: 3,
+            assignment_digest: "a".repeat(64),
+            organization_generation: 7,
+            organization_digest: "b".repeat(64),
+            principal: PrincipalAuthorityV1 {
+                schema_version: WORKFLOW_SCHEMA_VERSION,
+                principal_id: "agent-06-developer".to_owned(),
+                principal_generation: 2,
+                authority_digest: "c".repeat(64),
+            },
+            profile_id: "web-authoring-v1".to_owned(),
+            profile_generation: 1,
+            profile_digest: "d".repeat(64),
+            runtime_key: WORKBENCH_RUNTIME_BWRAP.to_owned(),
+            runtime_generation: 1,
+            runtime_digest: "e".repeat(64),
+            policy_generation: 1,
+            policy_digest: "f".repeat(64),
+            active: true,
+            capabilities: BTreeSet::from([
+                "artifact.commit".to_owned(),
+                "command.run_allowlisted".to_owned(),
+                "file.write".to_owned(),
+            ]),
+        };
+        let profile = WorkbenchProfile {
+            schema_version: 1,
+            id: "web-authoring-v1".to_owned(),
+            runtime_key: WORKBENCH_RUNTIME_BWRAP.to_owned(),
+            network: "deny".to_owned(),
+            environment: std::collections::BTreeMap::new(),
+            capabilities: authority.capabilities.clone(),
+            output_artifact_kinds: BTreeSet::from(["source_tree".to_owned()]),
+            resource_ceilings: WorkbenchResourceLimits {
+                wall_time_ms: 30_000,
+                cpu_time_ms: 10_000,
+                memory_bytes: 134_217_728,
+                process_count: 16,
+                file_bytes: 8_388_608,
+                stdout_bytes: 65_536,
+                stderr_bytes: 65_536,
+            },
+            command_rules: vec![CommandRule {
+                program: "node".to_owned(),
+                required_arg_prefix: vec!["--check".to_owned()],
+                max_args: 2,
+            }],
+            test_suites: Vec::new(),
+        };
+        let spec = sentinel_workflow::CompanyWorkItemSpecV1 {
+            work_item_id: authority.work_item_id.clone(),
+            title: "Website source".to_owned(),
+            objective: "Build the accepted static website".to_owned(),
+            required_role: CompanyRoleV1::Developer,
+            required_specialties: BTreeSet::from(["web_development".to_owned()]),
+            dependency_ids: BTreeSet::new(),
+            owner: AgentId(5),
+            inputs: Vec::new(),
+            outputs: vec![sentinel_workflow::WorkOutputContractV1 {
+                name: "site".to_owned(),
+                media_type: "application/vnd.sentinel.source-tree".to_owned(),
+                digest_algorithm: "sha256".to_owned(),
+                contract_generation: 1,
+                contract_digest: "1".repeat(64),
+            }],
+            quality_gate: sentinel_workflow::QualityGateBindingV1 {
+                gate_id: "web-work-item-qa-v1".to_owned(),
+                generation: 1,
+                digest: "2".repeat(64),
+            },
+            budget_micros: 100,
+            rework: None,
+        };
+        let intent = ExecutionIntentV1 {
+            project_id: authority.project_id.clone(),
+            work_item_id: authority.work_item_id.clone(),
+            tools: vec![
+                ExecutionToolV1::WriteFile {
+                    path: "index.js".to_owned(),
+                    content: "console.log('sentinel');".to_owned(),
+                    expected_sha256: None,
+                },
+                ExecutionToolV1::RunCommand {
+                    program: "node".to_owned(),
+                    args: vec!["--check".to_owned(), "index.js".to_owned()],
+                },
+                ExecutionToolV1::PackageArtifact {
+                    artifact_kind: "source_tree".to_owned(),
+                    media_type: "application/vnd.sentinel.source-tree".to_owned(),
+                    paths: vec!["index.js".to_owned()],
+                },
+            ],
+        };
+
+        let plan = build_execution_plan(
+            operation_id,
+            &authority,
+            &spec,
+            Vec::new(),
+            &profile,
+            &intent,
+            1_000,
+            121_000,
+        )
+        .unwrap();
+        let replay = build_execution_plan(
+            operation_id,
+            &authority,
+            &spec,
+            Vec::new(),
+            &profile,
+            &intent,
+            1_000,
+            121_000,
+        )
+        .unwrap();
+        assert_eq!(plan, replay);
+        assert_eq!(plan.plan_id, operation_id);
+        assert_eq!(plan.assignment_digest, authority.assignment_digest);
+        assert_eq!(plan.policy_digest, authority.policy_digest);
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[1].command_policy[0].max_args, 2);
+        assert_eq!(
+            plan.steps[1].command_policy[0].required_arg_prefix,
+            vec!["--check", "index.js"]
+        );
+        assert!(plan.steps[..2].iter().all(|step| step.artifacts.is_empty()));
+        assert_eq!(plan.steps[2].artifacts[0].artifact_kind, "source_tree");
+        assert!(execution_intent_matches_plan(&intent, &plan));
+        plan.validate_at(2_000).unwrap();
+
+        let mut foreign = intent;
+        foreign.tools[2] = ExecutionToolV1::PackageArtifact {
+            artifact_kind: "foreign_artifact".to_owned(),
+            media_type: "application/vnd.sentinel.source-tree".to_owned(),
+            paths: vec!["index.js".to_owned()],
+        };
+        assert!(!execution_intent_matches_plan(&foreign, &plan));
+        assert_eq!(
+            build_execution_plan(
+                operation_id,
+                &authority,
+                &spec,
+                Vec::new(),
+                &profile,
+                &foreign,
+                1_000,
+                121_000,
+            )
+            .unwrap_err()
+            .code,
+            WorkflowErrorCode::InvalidInput
         );
     }
 
