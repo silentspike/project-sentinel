@@ -72,6 +72,140 @@ pub struct EpisodeProjectionCutoverSeal {
     pub authorization_digest: String,
 }
 
+/// Public-safe outcome of the explicit projection bootstrap command.
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeProjectionBootstrapStatus {
+    Initialized,
+    AlreadyInitialized,
+}
+
+/// Public-safe start-policy classification without persisted proof material.
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeProjectionBootstrapPolicy {
+    Beginning,
+    RecoveryCut,
+    ExplicitPosition,
+}
+
+/// Redacted receipt emitted by the explicit, idempotent bootstrap command.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct EpisodeProjectionBootstrapReceipt {
+    pub schema_version: u32,
+    pub status: EpisodeProjectionBootstrapStatus,
+    pub start_policy: EpisodeProjectionBootstrapPolicy,
+    pub source_row_id: i64,
+    pub projection_version: u32,
+    pub frontier_count: usize,
+    pub legacy_episode_bucket_count: usize,
+}
+
+/// Initialize the projection explicitly before the daemon starts serving.
+///
+/// A fresh store starts at the beginning. A store with legacy episodes is
+/// sealed at the exact current EventStore head with the operator credential.
+/// Once durable control exists, the command only validates and reconciles it.
+pub fn initialize_episode_projection_bootstrap(
+    hippocampus: HippocampusService,
+    agents: &[(u16, String)],
+    event_store: &EventStore,
+    operator_secret: Option<&str>,
+    tick_duration_millis: u64,
+) -> anyhow::Result<EpisodeProjectionBootstrapReceipt> {
+    let existing = hippocampus.store().load_episode_projection_control()?;
+    let legacy_episode_bucket_count = hippocampus
+        .store()
+        .list_agents_with_episodes()?
+        .into_iter()
+        .try_fold(0_usize, |count, agent_name| {
+            let has_episodes = !hippocampus.store().load_episodes(&agent_name)?.is_empty();
+            Ok::<_, anyhow::Error>(count + usize::from(has_episodes))
+        })?;
+
+    let status = if existing.is_some() {
+        EpisodeProjectionBootstrapStatus::AlreadyInitialized
+    } else {
+        EpisodeProjectionBootstrapStatus::Initialized
+    };
+    let producer = match existing {
+        Some(_) => EpisodeProducer::new_with_tick_duration(
+            hippocampus,
+            agents,
+            event_store,
+            tick_duration_millis,
+        )?,
+        None if legacy_episode_bucket_count == 0 => EpisodeProducer::new_with_tick_duration(
+            hippocampus,
+            agents,
+            event_store,
+            tick_duration_millis,
+        )?,
+        None => {
+            let operator_secret = operator_secret.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "legacy episode projection bootstrap requires the operator credential"
+                )
+            })?;
+            let source_row_id = event_store.get_latest_event_id()?;
+            let legacy_material = hippocampus
+                .store()
+                .episode_projection_legacy_state_material()?;
+            let legacy_state_digest = format!("{:x}", Sha256::digest(&legacy_material));
+            let source_cut_digest = event_store_source_cut_digest(event_store, source_row_id)?;
+            let authorization_digest = cutover_authorization_digest(
+                source_row_id,
+                &legacy_state_digest,
+                &source_cut_digest,
+                operator_secret,
+            );
+            EpisodeProducer::new_with_cutover_seal_and_tick_duration(
+                hippocampus,
+                agents,
+                event_store,
+                EpisodeProjectionCutoverSeal {
+                    source_row_id,
+                    legacy_state_digest,
+                    source_cut_digest,
+                    authorization_digest,
+                },
+                Some(operator_secret),
+                tick_duration_millis,
+            )?
+        }
+    };
+
+    let control = producer
+        .hippocampus()
+        .store()
+        .load_episode_projection_control()?
+        .ok_or_else(|| anyhow::anyhow!("episode projection bootstrap did not persist control"))?;
+    let start_policy = match &control.start_policy {
+        EpisodeProjectionStartPolicy::Beginning => EpisodeProjectionBootstrapPolicy::Beginning,
+        EpisodeProjectionStartPolicy::RecoveryCut { .. } => {
+            EpisodeProjectionBootstrapPolicy::RecoveryCut
+        }
+        EpisodeProjectionStartPolicy::ExplicitPosition { .. } => {
+            EpisodeProjectionBootstrapPolicy::ExplicitPosition
+        }
+    };
+    let frontier_count = producer
+        .hippocampus()
+        .store()
+        .list_episode_projection_frontiers()?
+        .len();
+
+    Ok(EpisodeProjectionBootstrapReceipt {
+        schema_version: 1,
+        status,
+        start_policy,
+        source_row_id: control.start_policy.source_row_id(),
+        projection_version: control.projection_version,
+        frontier_count,
+        legacy_episode_bucket_count,
+    })
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EpisodeProjectionBlockerDiagnostic {
     pub source_row_id: i64,
@@ -3684,6 +3818,184 @@ mod tests {
             block,
             sentinel_hippocampus::EpisodeProjectionReadinessBlock::ProjectionUninitialized
         )));
+    }
+
+    #[test]
+    fn episode_projection_bootstrap_initializes_empty_store_once() {
+        let (hippocampus, dir) = temp_hippocampus();
+        let event_store = temp_event_store(&dir);
+        let agents = vec![(1, "Thomas".to_string())];
+
+        let first = initialize_episode_projection_bootstrap(
+            hippocampus,
+            &agents,
+            &event_store,
+            None,
+            EPISODE_PROJECTION_TICK_DURATION_MILLIS,
+        )
+        .unwrap();
+        assert_eq!(
+            first,
+            EpisodeProjectionBootstrapReceipt {
+                schema_version: 1,
+                status: EpisodeProjectionBootstrapStatus::Initialized,
+                start_policy: EpisodeProjectionBootstrapPolicy::Beginning,
+                source_row_id: 0,
+                projection_version: EPISODE_PROJECTION_VERSION,
+                frontier_count: 2,
+                legacy_episode_bucket_count: 0,
+            }
+        );
+
+        let reopened =
+            HippocampusService::open(dir.path().join("test-hippocampus.redb").to_str().unwrap())
+                .unwrap();
+        let second = initialize_episode_projection_bootstrap(
+            reopened,
+            &agents,
+            &event_store,
+            None,
+            EPISODE_PROJECTION_TICK_DURATION_MILLIS,
+        )
+        .unwrap();
+        assert_eq!(
+            second.status,
+            EpisodeProjectionBootstrapStatus::AlreadyInitialized
+        );
+        assert_eq!(
+            second.start_policy,
+            EpisodeProjectionBootstrapPolicy::Beginning
+        );
+    }
+
+    #[test]
+    fn episode_projection_bootstrap_seals_legacy_store_at_eventstore_head() {
+        let (hippocampus, dir) = temp_hippocampus();
+        hippocampus
+            .store()
+            .store_episodes(
+                "Thomas",
+                &[Episode {
+                    id: 77,
+                    agent_name: "Thomas".to_string(),
+                    summary: "Legacy episode".to_string(),
+                    relevance: 0.5,
+                    emotion: 0.2,
+                    repetitions: 1,
+                    hours_ago: 1.0,
+                    participants: Vec::new(),
+                    tags: vec!["legacy".to_string()],
+                }],
+            )
+            .unwrap();
+        let event_store = temp_event_store(&dir);
+        append_payload(
+            &event_store,
+            &DomainEventPayload::TransitCompleted {
+                agent_id: AgentId(1),
+                room_id: "lobby".to_string(),
+            },
+            5,
+        );
+        let source_row_id = append_payload(
+            &event_store,
+            &DomainEventPayload::BioActionPerformed {
+                agent_id: AgentId(1),
+                action: "drink".to_string(),
+            },
+            10,
+        );
+        let agents = vec![(1, "Thomas".to_string())];
+        let operator_secret = "0123456789abcdef0123456789abcdef";
+
+        let first = initialize_episode_projection_bootstrap(
+            hippocampus,
+            &agents,
+            &event_store,
+            Some(operator_secret),
+            EPISODE_PROJECTION_TICK_DURATION_MILLIS,
+        )
+        .unwrap();
+        assert_eq!(first.status, EpisodeProjectionBootstrapStatus::Initialized);
+        assert_eq!(
+            first.start_policy,
+            EpisodeProjectionBootstrapPolicy::RecoveryCut
+        );
+        assert_eq!(first.source_row_id, source_row_id);
+        assert_eq!(first.legacy_episode_bucket_count, 1);
+        assert_eq!(first.frontier_count, 2);
+
+        let reopened =
+            HippocampusService::open(dir.path().join("test-hippocampus.redb").to_str().unwrap())
+                .unwrap();
+        assert_eq!(reopened.store().load_episodes("Thomas").unwrap().len(), 1);
+        let second = initialize_episode_projection_bootstrap(
+            reopened,
+            &agents,
+            &event_store,
+            None,
+            EPISODE_PROJECTION_TICK_DURATION_MILLIS,
+        )
+        .unwrap();
+        assert_eq!(
+            second.status,
+            EpisodeProjectionBootstrapStatus::AlreadyInitialized
+        );
+        assert_eq!(second.source_row_id, source_row_id);
+    }
+
+    #[test]
+    fn episode_projection_bootstrap_rejects_legacy_store_without_strong_secret() {
+        for operator_secret in [None, Some("too-short")] {
+            let (hippocampus, dir) = temp_hippocampus();
+            hippocampus
+                .store()
+                .store_episodes(
+                    "Thomas",
+                    &[Episode {
+                        id: 77,
+                        agent_name: "Thomas".to_string(),
+                        summary: "Legacy episode".to_string(),
+                        relevance: 0.5,
+                        emotion: 0.2,
+                        repetitions: 1,
+                        hours_ago: 1.0,
+                        participants: Vec::new(),
+                        tags: vec!["legacy".to_string()],
+                    }],
+                )
+                .unwrap();
+            let event_store = temp_event_store(&dir);
+
+            let error = initialize_episode_projection_bootstrap(
+                hippocampus,
+                &[(1, "Thomas".to_string())],
+                &event_store,
+                operator_secret,
+                EPISODE_PROJECTION_TICK_DURATION_MILLIS,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("operator credential")
+                    || error.to_string().contains("at least 32 bytes")
+            );
+
+            let reopened = HippocampusService::open(
+                dir.path().join("test-hippocampus.redb").to_str().unwrap(),
+            )
+            .unwrap();
+            assert!(reopened
+                .store()
+                .load_episode_projection_control()
+                .unwrap()
+                .is_none());
+            assert!(reopened
+                .store()
+                .load_episode_projection_cutover_receipt()
+                .unwrap()
+                .is_none());
+            assert_eq!(reopened.store().load_episodes("Thomas").unwrap().len(), 1);
+        }
     }
 
     #[test]
