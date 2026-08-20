@@ -101,7 +101,7 @@ impl WorkbenchProfile {
             || !request
                 .command_policy
                 .iter()
-                .all(|rule| self.command_rules.contains(rule))
+                .all(|rule| self.command_rule_is_narrowing(rule))
         {
             bail!("workbench request exceeds or mismatches its immutable profile");
         }
@@ -131,6 +131,13 @@ impl WorkbenchProfile {
             }
         }
         Ok(())
+    }
+
+    fn command_rule_is_narrowing(&self, requested: &sentinel_common::CommandRule) -> bool {
+        self.command_rules.iter().any(|granted| {
+            requested.max_args <= granted.max_args
+                && granted.allows(&requested.program, &requested.required_arg_prefix)
+        })
     }
 
     fn validate_definition(&self) -> anyhow::Result<()> {
@@ -2785,11 +2792,28 @@ mod tests {
     fn immutable_profile_binds_runtime_capabilities_and_resource_ceilings() {
         let profile_authority = secure_test_workbench_profile_authority();
         let (profile, digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
+        assert_eq!(
+            profile.output_artifact_kinds,
+            BTreeSet::from([
+                "design_specification".to_string(),
+                "source_tree".to_string(),
+            ])
+        );
         let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2809");
         request.tool_profile_digest = digest.clone();
         request.input_digest = request.canonical_digest().unwrap();
         profile.authorize_request(&digest, &request).unwrap();
 
+        request.output_artifact_kinds =
+            BTreeSet::from(["design_specification".to_string()]);
+        request.input_digest = request.canonical_digest().unwrap();
+        profile.authorize_request(&digest, &request).unwrap();
+
+        request.output_artifact_kinds = BTreeSet::from(["foreign_artifact".to_string()]);
+        request.input_digest = request.canonical_digest().unwrap();
+        assert!(profile.authorize_request(&digest, &request).is_err());
+
+        request.output_artifact_kinds = BTreeSet::from(["source_tree".to_string()]);
         request.resource_limits.memory_bytes = profile.resource_ceilings.memory_bytes + 1;
         request.input_digest = request.canonical_digest().unwrap();
         assert!(profile
@@ -2811,6 +2835,15 @@ mod tests {
             args: vec!["--check".to_string(), "src/app.js".to_string()],
         };
         request.tool_profile_digest = digest.clone();
+        request.input_digest = request.canonical_digest().unwrap();
+        request.validate_at(1_900_000_000_000).unwrap();
+        profile.authorize_request(&digest, &request).unwrap();
+
+        request.command_policy = vec![sentinel_common::CommandRule {
+            program: "node".to_string(),
+            required_arg_prefix: vec!["--check".to_string(), "src/app.js".to_string()],
+            max_args: 2,
+        }];
         request.input_digest = request.canonical_digest().unwrap();
         request.validate_at(1_900_000_000_000).unwrap();
         profile.authorize_request(&digest, &request).unwrap();

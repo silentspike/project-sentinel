@@ -11,7 +11,7 @@ capabilities = [
   "patch.apply",
   "test.run_profile",
 ]
-output_artifact_kinds = ["source_tree"]
+output_artifact_kinds = ["design_specification", "source_tree"]
 
 [resource_ceilings]
 wall_time_ms = 30000
