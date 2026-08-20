@@ -3,7 +3,9 @@
 set -euo pipefail
 
 DEFAULT_CREDENTIAL_DIR="/etc/sentinel/credentials"
+DEFAULT_DATA_DIR="/opt/sentinel/data/company-delivery"
 CREDENTIAL_DIR="${SENTINEL_WORKFLOW_CREDENTIAL_DIR:-${DEFAULT_CREDENTIAL_DIR}}"
+DATA_DIR="${SENTINEL_WORKFLOW_DATA_DIR:-${DEFAULT_DATA_DIR}}"
 TEST_ROOT="${SENTINEL_WORKFLOW_AUTH_TEST_ROOT:-}"
 NAMES=(
   workflow-customer
@@ -23,6 +25,8 @@ fail() {
 
 case "${CREDENTIAL_DIR}" in /*) ;; *) fail "credential directory must be absolute" ;; esac
 case "/${CREDENTIAL_DIR}/" in */../*|*/./*) fail "credential directory contains dot components" ;; esac
+case "${DATA_DIR}" in /*) ;; *) fail "workflow data directory must be absolute" ;; esac
+case "/${DATA_DIR}/" in */../*|*/./*) fail "workflow data directory contains dot components" ;; esac
 
 reject_symlink_components() {
   local path="$1"
@@ -38,10 +42,12 @@ reject_symlink_components() {
 }
 
 reject_symlink_components "${CREDENTIAL_DIR}"
+reject_symlink_components "${DATA_DIR}"
 
 if [ -n "${TEST_ROOT}" ]; then
   case "${TEST_ROOT}" in /*) ;; *) fail "test root must be absolute" ;; esac
   case "${CREDENTIAL_DIR}" in "${TEST_ROOT}"/*) ;; *) fail "credential directory escapes test root" ;; esac
+  case "${DATA_DIR}" in "${TEST_ROOT}"/*) ;; *) fail "workflow data directory escapes test root" ;; esac
   [ -d "${TEST_ROOT}" ] && [ ! -L "${TEST_ROOT}" ] || fail "test root is unsafe"
   [ "$(stat -c '%a' -- "${TEST_ROOT}")" = "700" ] || fail "test root mode must be 0700"
   TARGET_USER="$(id -un)"
@@ -49,6 +55,7 @@ if [ -n "${TEST_ROOT}" ]; then
 else
   [ "$(id -u)" -eq 0 ] || fail "workflow credential initialization requires root"
   [ "${CREDENTIAL_DIR}" = "${DEFAULT_CREDENTIAL_DIR}" ] || fail "production directory override is forbidden"
+  [ "${DATA_DIR}" = "${DEFAULT_DATA_DIR}" ] || fail "production data directory override is forbidden"
   TARGET_USER=root
   TARGET_GROUP=root
 fi
@@ -56,6 +63,10 @@ fi
 command -v openssl >/dev/null || fail "openssl is required"
 install -d -o "${TARGET_USER}" -g "${TARGET_GROUP}" -m 0700 "${CREDENTIAL_DIR}"
 [ ! -L "${CREDENTIAL_DIR}" ] || fail "credential directory must not be a symlink"
+install -d -o "${TARGET_USER}" -g "${TARGET_GROUP}" -m 0700 "${DATA_DIR}"
+[ ! -L "${DATA_DIR}" ] || fail "workflow data directory must not be a symlink"
+[ "$(stat -c '%U:%G:%a' -- "${DATA_DIR}")" = "${TARGET_USER}:${TARGET_GROUP}:700" ] \
+  || fail "workflow data directory metadata is invalid"
 
 generated=0
 existing=0

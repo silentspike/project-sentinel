@@ -19,7 +19,7 @@ RemainAfterExit=yes
 # only systemd copies.
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/sentinel/config /etc/sentinel
+ReadWritePaths=/opt/sentinel/config /opt/sentinel/data /etc/sentinel
 PrivateTmp=true
 
 [Install]

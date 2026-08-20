@@ -18,7 +18,9 @@ ExecStart=/opt/sentinel/bin/sentinel-dashboard-backend
 # the daemon operator proxy credential is file-only. See docs/security/dashboard-key-management.md (#474).
 EnvironmentFile=/opt/sentinel/config/dashboard-backend.env
 LoadCredential=operator-api:/etc/sentinel/credentials/operator-api
+LoadCredential=workflow-release-manager:/etc/sentinel/credentials/workflow-release-manager
 Environment=SENTINEL_OPERATOR_API_KEY_FILE=%d/operator-api
+Environment=SENTINEL_WORKFLOW_READ_CREDENTIAL_FILE=%d/workflow-release-manager
 # #474: loopback-only secure default. On-VM access is full (incl. WebTransport); an `ssh -L`
 # tunnel is HTTP-only (WT/QUIC = UDP does not traverse a TCP tunnel; full remote console: #522).
 # Deliberate LAN/third-party exposure: override SENTINEL_DASHBOARD_*_BIND via the env-file above;

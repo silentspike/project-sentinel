@@ -1,0 +1,41 @@
+schema_version = 1
+id = "web-qa-v1"
+runtime_key = "bwrap-landlock"
+network = "deny"
+environment = { HOME = "/workspace", LANG = "C.UTF-8", LC_ALL = "C.UTF-8", PATH = "/usr/bin:/bin" }
+capabilities = [
+  "file.inspect",
+  "test.run_profile",
+]
+output_artifact_kinds = ["qa_evidence"]
+
+[resource_ceilings]
+wall_time_ms = 30000
+cpu_time_ms = 10000
+memory_bytes = 134217728
+process_count = 8
+file_bytes = 8388608
+stdout_bytes = 65536
+stderr_bytes = 65536
+
+[[command_rules]]
+program = "sentinel-web-qa"
+required_arg_prefix = []
+max_args = 64
+
+[[command_rules]]
+program = "sentinel-work-item-gate"
+required_arg_prefix = []
+max_args = 64
+
+[[test_suites]]
+id = "web-qa-v1"
+program = "sentinel-web-qa"
+required_arg_prefix = []
+max_args = 64
+
+[[test_suites]]
+id = "web-work-item-qa-v1"
+program = "sentinel-work-item-gate"
+required_arg_prefix = []
+max_args = 64
