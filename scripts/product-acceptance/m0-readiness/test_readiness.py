@@ -130,7 +130,7 @@ def validate_topology(units: dict[str, str], health_script: str) -> None:
         raise ValueError("health_timer_order_missing")
     if "ExecCondition=" in health_service:
         raise ValueError("health_monitor_blind_spot")
-    if "m0-readiness.py nightrun --credential-file %d/operator-api" not in nightrun_service:
+    if "m0-readiness.py nightrun --credential-name operator-api" not in nightrun_service:
         raise ValueError("nightrun_credential_gate_missing")
     if "ExecCondition=/usr/bin/systemctl --quiet is-active sentinel-daemon.service" not in nightrun_service:
         raise ValueError("nightrun_boot_gate_missing")
@@ -451,6 +451,38 @@ class ReadinessTests(unittest.TestCase):
         self.credential.write_bytes(b"x" * 32 + b"\n")
         self.assert_code("credential_invalid", lambda: readiness.read_credential(self.credential))
 
+    def test_systemd_credential_name_resolves_from_credential_directory(self) -> None:
+        resolved = readiness.resolve_credential_path(
+            None,
+            "operator-api",
+            environment={"CREDENTIALS_DIRECTORY": self.temp.name},
+        )
+        self.assertEqual(resolved, self.credential)
+        self.assertEqual(readiness.read_credential(resolved), SECRET)
+
+        self.assert_code(
+            "credential_unavailable",
+            lambda: readiness.resolve_credential_path(
+                None, "operator-api", environment={}
+            ),
+        )
+        self.assert_code(
+            "credential_path_invalid",
+            lambda: readiness.resolve_credential_path(
+                None,
+                "operator-api",
+                environment={"CREDENTIALS_DIRECTORY": "relative"},
+            ),
+        )
+        self.assert_code(
+            "arguments_invalid",
+            lambda: readiness.resolve_credential_path(
+                self.credential,
+                "operator-api",
+                environment={"CREDENTIALS_DIRECTORY": self.temp.name},
+            ),
+        )
+
     def test_credential_rejects_fifo_short_trailing_owner_and_parent_mode(self) -> None:
         fifo = Path(self.temp.name) / "credential-fifo"
         os.mkfifo(fifo, 0o600)
@@ -693,7 +725,7 @@ class TopologyTests(unittest.TestCase):
         self.assertIn("TimeoutStartSec=300", nats)
         self.assertIn("After=network-online.target nats-server.service", daemon)
         self.assertIn("Requires=nats-server.service", daemon)
-        self.assertIn("m0-readiness.py daemon --credential-file %d/operator-api", daemon)
+        self.assertIn("m0-readiness.py daemon --credential-name operator-api", daemon)
         self.assertIn("LoadCredential=operator-api:/etc/sentinel/credentials/operator-api", daemon)
         self.assertIn("Environment=SENTINEL_OPERATOR_CREDENTIAL_FILE=%d/operator-api", daemon)
         self.assertNotIn("sentinel-projection.service", daemon)
@@ -717,7 +749,7 @@ class TopologyTests(unittest.TestCase):
         self.assertIn("After=sentinel-daemon.service", nightrun_timer)
         self.assertNotIn("Requires=sentinel-daemon.service", nightrun_timer)
         self.assertIn("ExecCondition=/usr/bin/systemctl --quiet is-active sentinel-daemon.service", nightrun_service)
-        self.assertIn("m0-readiness.py nightrun --credential-file %d/operator-api", nightrun_service)
+        self.assertIn("m0-readiness.py nightrun --credential-name operator-api", nightrun_service)
 
     def test_health_monitor_observes_but_never_restarts_nats(self) -> None:
         script = (REPO_ROOT / "deploy/scripts/sentinel-health-monitor.sh").read_text(
@@ -768,7 +800,7 @@ check_service nats nats-server.service nats '' '' 5 observe
         leaked_nightrun["sentinel-nightrun.service"] = leaked_nightrun[
             "sentinel-nightrun.service"
         ].replace(
-            "ExecStart=/usr/bin/python3 /opt/sentinel/scripts/m0-readiness.py nightrun --credential-file %d/operator-api --timeout-seconds 45",
+            "ExecStart=/usr/bin/python3 /opt/sentinel/scripts/m0-readiness.py nightrun --credential-name operator-api --timeout-seconds 45",
             'ExecStart=/usr/bin/curl -H "Authorization: Bearer secret"',
         )
         mutations.append(leaked_nightrun)

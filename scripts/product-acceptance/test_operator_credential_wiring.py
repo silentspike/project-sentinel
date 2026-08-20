@@ -257,7 +257,7 @@ class OperatorCredentialWiringTests(unittest.TestCase):
             1,
         )
         self.assertIn(
-            "m0-readiness.py nightrun --credential-file %d/operator-api",
+            "m0-readiness.py nightrun --credential-name operator-api",
             source,
         )
         self.assertNotIn("curl", source)
