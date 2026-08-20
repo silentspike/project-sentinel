@@ -72,7 +72,7 @@ require_once "${MANIFEST}" 'deploy/apt/sentinel-runtime.pref|/etc/apt/preference
 require_once "${MANIFEST}" 'deploy/vm-config/99-sentinel-bwrap.conf|/etc/sysctl.d/99-sentinel-bwrap.conf|config'
 require_once "${MANIFEST}" 'config/workbench-profiles/web-authoring-v1.toml|/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml|config'
 require_once "${RELEASE_MANIFEST}" '"path": "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml"'
-require_once "${RELEASE_MANIFEST}" '"sha256": "6e352d4f34b33cb1f8cd2fa0f94ae6a6b9b2b49165b60f65b2e40ba68f078286"'
+require_once "${RELEASE_MANIFEST}" '"sha256": "e7e704d11a951e97d8246385f99cfa4c0fa835e4de2eec8e1272ce7dfae712a6"'
 require_once "${WORKBENCH_PROFILE}" 'environment = { HOME = "/workspace", LANG = "C.UTF-8", LC_ALL = "C.UTF-8", PATH = "/usr/bin:/bin" }'
 
 # These are deliberately literal fragments from the remote heredoc.
