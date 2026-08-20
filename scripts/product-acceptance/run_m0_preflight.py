@@ -278,6 +278,10 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
     "/etc/systemd/system/sentinel.target": ("deploy/systemd/sentinel.target", "systemd"),
     "/opt/sentinel/scripts/init-cgroups.sh": ("deploy/scripts/init-cgroups.sh", "script"),
     "/opt/sentinel/scripts/init-dirs.sh": ("deploy/scripts/init-dirs.sh", "script"),
+    "/opt/sentinel/scripts/init-m0-runtime-dirs.py": (
+        "deploy/scripts/init-m0-runtime-dirs.py",
+        "script",
+    ),
     "/opt/sentinel/scripts/init-runtime-base-dirs.sh": (
         "deploy/scripts/init-runtime-base-dirs.sh",
         "script",
