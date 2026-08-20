@@ -629,9 +629,10 @@ def validate_provision_authority(
     if not isinstance(receipt, dict) or set(receipt) != {
         "schema_version", "status", "git_sha", "manifest_sha256",
         "artifact_count", "changed_count", "artifact_set_digest",
-        "services_started",
+        "legacy_migration", "services_started",
     }:
         fail("provision_receipt_shape")
+    legacy_migration = receipt["legacy_migration"]
     if (
         receipt["schema_version"] != 1
         or receipt["status"] != "COMPLETE"
@@ -642,6 +643,13 @@ def validate_provision_authority(
         or not 0 <= receipt["changed_count"] <= artifact_count
         or receipt["services_started"] is not False
         or receipt["artifact_set_digest"] != artifact_set_digest
+        or not isinstance(legacy_migration, dict)
+        or set(legacy_migration) != {"status", "directory_count", "file_count"}
+        or legacy_migration["status"] != "COMPLETE"
+        or type(legacy_migration["directory_count"]) is not int
+        or legacy_migration["directory_count"] < 0
+        or type(legacy_migration["file_count"]) is not int
+        or legacy_migration["file_count"] < 0
     ):
         fail("provision_receipt_authority_mismatch")
     return receipt
