@@ -719,6 +719,15 @@ class TopologyTests(unittest.TestCase):
         )
         self.assertIn("LoadCredential=operator-api:/etc/sentinel/credentials/operator-api", daemon)
         self.assertIn("Environment=SENTINEL_OPERATOR_CREDENTIAL_FILE=%d/operator-api", daemon)
+        bootstrap = (
+            "ExecStartPre=/opt/sentinel/bin/sentinel-daemon --config "
+            "/opt/sentinel/config/daemon.toml initialize-episode-projection"
+        )
+        self.assertIn(bootstrap, daemon)
+        self.assertLess(
+            daemon.index(bootstrap),
+            daemon.index("ExecStart=/opt/sentinel/bin/sentinel-daemon"),
+        )
         self.assertNotIn("sentinel-projection.service", daemon)
 
     def test_bridge_and_judge_require_ready_nats_and_daemon(self) -> None:
