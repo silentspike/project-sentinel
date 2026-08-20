@@ -98,6 +98,10 @@ def artifact_authority() -> dict[str, tuple[str, str]]:
         "/opt/sentinel/bin/sentinel-judge": ("services/sentinel-judge/sentinel-judge", "binary"),
         "/opt/sentinel/bin/sentinel-nats-bridge": ("services/sentinel-nats-bridge/sentinel-nats-bridge", "binary"),
         "/usr/local/bin/nats-server": ("external/nats-server", "binary"),
+        "/opt/sentinel/console-dist/index.html": ("console/dist/index.html", "config"),
+        "/opt/sentinel/console-dist/assets/app.js": ("console/dist/assets/app.js", "config"),
+        "/opt/sentinel/console-dist/assets/app.js.map": ("console/dist/assets/app.js.map", "config"),
+        "/opt/sentinel/console-dist/assets/index.css": ("console/dist/assets/index.css", "config"),
         "/opt/sentinel/config/daemon.toml": ("config/daemon.toml", "config"),
         "/opt/sentinel/config/cortex-gateway.toml": ("config/cortex-gateway.toml", "config"),
         "/opt/sentinel/config/nightrun.toml": ("config/nightrun.toml", "config"),
@@ -135,6 +139,9 @@ def artifact_authority() -> dict[str, tuple[str, str]]:
         "/opt/sentinel/scripts/init-tmpfs.sh": ("deploy/scripts/init-tmpfs.sh", "script"),
         "/opt/sentinel/scripts/sentinel-health-monitor.sh": ("deploy/scripts/sentinel-health-monitor.sh", "script"),
         "/opt/sentinel/scripts/m0-readiness.py": ("scripts/product-acceptance/m0-readiness/readiness.py", "script"),
+        "/opt/sentinel/scripts/product-acceptance/run_m0_preflight.py": ("scripts/product-acceptance/run_m0_preflight.py", "script"),
+        "/opt/sentinel/scripts/product-acceptance/run_m0_journey.py": ("scripts/product-acceptance/run_m0_journey.py", "script"),
+        "/opt/sentinel/scripts/product-acceptance/m0-activation/control.py": ("scripts/product-acceptance/m0-activation/control.py", "script"),
         "/opt/sentinel/share/runtime-base.env": ("deploy/runtime-base.env", "config"),
         "/etc/apt/preferences.d/sentinel-runtime": ("deploy/apt/sentinel-runtime.pref", "config"),
         "/etc/sysctl.d/99-sentinel-bwrap.conf": ("deploy/vm-config/99-sentinel-bwrap.conf", "config"),
@@ -143,6 +150,8 @@ def artifact_authority() -> dict[str, tuple[str, str]]:
         "/opt/sentinel/config/work-profiles/web-project-v1.toml": ("config/work-profiles/web-project-v1.toml", "config"),
         "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml": ("config/workbench-profiles/web-authoring-v1.toml", "config"),
         "/opt/sentinel/config/product-acceptance/m0-contract.toml": ("scripts/product-acceptance/m0-contract.toml", "config"),
+        "/opt/sentinel/config/product-acceptance/m0-journey-v2.json": ("scripts/product-acceptance/m0-journey-v2.json", "config"),
+        "/opt/sentinel/config/product-acceptance/m0-restart-control-v1.json": ("scripts/product-acceptance/m0-restart-control-v1.json", "config"),
     }
     rows.update({
         f"/opt/sentinel/config/agents/{name}": (f"config/agents/{name}", "config")
@@ -156,12 +165,16 @@ TARGET_MODES = {"binary": 0o755, "script": 0o755, "config": 0o644, "systemd": 0o
 LEGACY_PARENT_DIRS = {
     "/opt/sentinel",
     "/opt/sentinel/bin",
+    "/opt/sentinel/console-dist",
+    "/opt/sentinel/console-dist/assets",
     "/opt/sentinel/config",
     "/opt/sentinel/config/agents",
     "/opt/sentinel/config/product-acceptance",
     "/opt/sentinel/config/work-profiles",
     "/opt/sentinel/config/workbench-profiles",
     "/opt/sentinel/scripts",
+    "/opt/sentinel/scripts/product-acceptance",
+    "/opt/sentinel/scripts/product-acceptance/m0-activation",
     "/opt/sentinel/share",
 }
 CANONICAL_DIR_MODE = 0o755

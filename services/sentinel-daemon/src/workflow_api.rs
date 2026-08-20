@@ -1,5 +1,6 @@
 //! Authenticated M0 company workflow and productive Workbench integration.
 
+mod delivery_intent;
 mod delivery_runtime;
 
 use std::collections::{BTreeSet, HashMap};
@@ -35,9 +36,9 @@ use uuid::Uuid;
 
 use crate::delivery::{ConfiguredDeliveryCore, DeliveryStoreConfigV1};
 use crate::workbench::{
-    dispatch_workbench, WorkbenchAuthoritySnapshot, WorkbenchAuthoritySource,
-    WorkbenchDispatchCommand, WorkbenchInvocationRecord, WorkbenchInvocationState,
-    WorkbenchProfile,
+    dispatch_workbench, stage_verified_artifact_inputs, WorkbenchAuthoritySnapshot,
+    WorkbenchAuthoritySource, WorkbenchDispatchCommand, WorkbenchInvocationRecord,
+    WorkbenchInvocationState, WorkbenchProfile,
 };
 use delivery_runtime::{
     LimboDeliveryEffects, LimboDeliveryPublication, WorkflowDeliveryIntegration,
@@ -53,7 +54,9 @@ pub const OPERATOR_WORK_ITEM_PATH: &str = "/operator/workflow/work-items";
 pub const OPERATOR_PROJECTION_PATH: &str = "/operator/workflow/projections";
 pub const OPERATOR_EVENTS_PATH: &str = "/operator/workflow/events";
 pub const DELIVERY_COMMAND_PATH: &str = "/company/delivery/commands";
+pub const DELIVERY_INTENT_PATH: &str = "/company/delivery/intents";
 pub const DELIVERY_LINEAGE_PATH: &str = "/company/delivery/lineage";
+pub const WORKFLOW_READINESS_PATH: &str = "/company/workflow/readiness";
 pub const MAX_WORKFLOW_BODY_BYTES: usize = 256 * 1024;
 
 const PRINCIPAL_SCHEMA_VERSION: u16 = 1;
@@ -258,6 +261,7 @@ struct CompanyAuthority {
     workbench_profile: WorkbenchProfile,
     workbench_profile_digest: String,
     agent_capabilities: Arc<HashMap<AgentId, BTreeSet<String>>>,
+    artifact_roots: Arc<HashMap<AgentId, PathBuf>>,
 }
 
 impl CompanyAuthority {
@@ -280,6 +284,17 @@ impl CompanyAuthority {
         project_id: &ProjectId,
         work_item_id: &WorkItemId,
         agent_id: AgentId,
+    ) -> Result<RuntimeAuthoritySnapshotV1, WorkflowPortError> {
+        self.snapshot_for_admission(tenant_id, project_id, work_item_id, agent_id, true)
+    }
+
+    fn snapshot_for_admission(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+        work_item_id: &WorkItemId,
+        agent_id: AgentId,
+        require_serving_state: bool,
     ) -> Result<RuntimeAuthoritySnapshotV1, WorkflowPortError> {
         let project = self
             .store
@@ -314,12 +329,13 @@ impl CompanyAuthority {
             || assignment.profile.digest != self.workbench_profile_digest
             || assignment.profile.generation != PROFILE_GENERATION
             || project.governance.project_profile.profile_id != "web-project-v1"
-            || !matches!(
-                work.state,
-                sentinel_workflow::CompanyWorkStateV1::Assigned
-                    | sentinel_workflow::CompanyWorkStateV1::InProgress
-                    | sentinel_workflow::CompanyWorkStateV1::InReview
-            )
+            || (require_serving_state
+                && !matches!(
+                    work.state,
+                    sentinel_workflow::CompanyWorkStateV1::Assigned
+                        | sentinel_workflow::CompanyWorkStateV1::InProgress
+                        | sentinel_workflow::CompanyWorkStateV1::InReview
+                ))
         {
             return Err(WorkflowPortError::AuthorityConflict);
         }
@@ -377,7 +393,7 @@ impl CompanyAuthority {
         operation_id: Uuid,
         intent: &ExecutionIntentV1,
         now_ms: u64,
-    ) -> Result<ExecutionPlanV1, WorkflowError> {
+    ) -> Result<ExecutionIntentAdmission, WorkflowError> {
         let agent_id = principal
             .principal
             .agent_id
@@ -402,6 +418,59 @@ impl CompanyAuthority {
                     "execution work item was not found",
                 )
             })?;
+        let existing = self.store.work_item(
+            &principal.principal.tenant_id,
+            &intent.project_id,
+            &intent.work_item_id,
+        )?;
+        if let Some(existing) = existing {
+            if existing.plan.plan_id == operation_id {
+                let authority = self
+                    .snapshot_for_admission(
+                        &principal.principal.tenant_id,
+                        &intent.project_id,
+                        &intent.work_item_id,
+                        agent_id,
+                        false,
+                    )
+                    .map_err(execution_intent_port_error)?;
+                if authority.principal != principal.execution_authority
+                    || !existing.plan.authority_matches(&authority)
+                {
+                    return Err(execution_authority_conflict());
+                }
+                if !execution_intent_matches_plan(intent, &existing.plan) {
+                    return Err(WorkflowError::new(
+                        WorkflowErrorCode::IdempotencyConflict,
+                        false,
+                        "execution intent content changed for an existing operation",
+                    ));
+                }
+                return Ok(ExecutionIntentAdmission {
+                    plan: existing.plan,
+                    authority,
+                    replay: true,
+                });
+            }
+
+            let authority = self
+                .snapshot(
+                    &principal.principal.tenant_id,
+                    &intent.project_id,
+                    &intent.work_item_id,
+                    agent_id,
+                )
+                .map_err(execution_intent_port_error)?;
+            if authority.principal != principal.execution_authority {
+                return Err(execution_authority_conflict());
+            }
+            return Err(WorkflowError::new(
+                WorkflowErrorCode::VersionConflict,
+                false,
+                "work item already has a different execution intent",
+            ));
+        }
+
         let authority = self
             .snapshot(
                 &principal.principal.tenant_id,
@@ -413,49 +482,133 @@ impl CompanyAuthority {
         if authority.principal != principal.execution_authority {
             return Err(execution_authority_conflict());
         }
-
-        let existing = self.store.work_item(
-            &principal.principal.tenant_id,
-            &intent.project_id,
-            &intent.work_item_id,
-        )?;
-        let (created_at_unix_ms, deadline_unix_ms) = match existing {
-            Some(existing) if existing.plan.plan_id == operation_id => (
-                existing.plan.created_at_unix_ms,
-                existing.plan.deadline_unix_ms,
-            ),
-            Some(_) => {
-                return Err(WorkflowError::new(
-                    WorkflowErrorCode::VersionConflict,
-                    false,
-                    "work item already has a different execution intent",
-                ))
-            }
-            None => {
-                let execution_ms = self
-                    .workbench_profile
-                    .resource_ceilings
-                    .wall_time_ms
-                    .checked_mul(intent.tools.len() as u64)
-                    .and_then(|value| value.checked_add(EXECUTION_INTENT_OVERHEAD_MS))
-                    .ok_or_else(execution_intent_invalid)?;
-                (
-                    now_ms,
-                    now_ms
-                        .checked_add(execution_ms)
-                        .ok_or_else(execution_intent_invalid)?,
-                )
-            }
-        };
-        build_execution_plan(
+        let inputs = self.materialize_execution_inputs(&project, &spec.spec, agent_id)?;
+        let execution_ms = self
+            .workbench_profile
+            .resource_ceilings
+            .wall_time_ms
+            .checked_mul(intent.tools.len() as u64)
+            .and_then(|value| value.checked_add(EXECUTION_INTENT_OVERHEAD_MS))
+            .ok_or_else(execution_intent_invalid)?;
+        let created_at_unix_ms = now_ms;
+        let deadline_unix_ms = now_ms
+            .checked_add(execution_ms)
+            .ok_or_else(execution_intent_invalid)?;
+        let plan = build_execution_plan(
             operation_id,
             &authority,
             &spec.spec,
+            inputs,
             &self.workbench_profile,
             intent,
             created_at_unix_ms,
             deadline_unix_ms,
-        )
+        )?;
+        Ok(ExecutionIntentAdmission {
+            plan,
+            authority,
+            replay: false,
+        })
+    }
+
+    fn materialize_execution_inputs(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        spec: &sentinel_workflow::CompanyWorkItemSpecV1,
+        destination_agent: AgentId,
+    ) -> Result<Vec<ArtifactInputV1>, WorkflowError> {
+        let mut inputs = Vec::new();
+        for binding in &spec.inputs {
+            let producer = project
+                .work_items
+                .get(&binding.producer_work_item_id)
+                .ok_or_else(execution_authority_conflict)?;
+            let assignment = producer
+                .assignments
+                .iter()
+                .find(|value| value.active)
+                .ok_or_else(execution_authority_conflict)?;
+            let output_contract = producer
+                .spec
+                .outputs
+                .iter()
+                .find(|value| value.name == binding.producer_output_name)
+                .ok_or_else(execution_authority_conflict)?;
+            let output_receipt = producer
+                .output_receipts
+                .iter()
+                .find(|value| value.name == binding.producer_output_name)
+                .ok_or_else(execution_authority_conflict)?;
+            if producer.state != sentinel_workflow::CompanyWorkStateV1::Done
+                || output_contract.contract_generation != binding.expected_contract_generation
+                || output_contract.contract_digest != binding.expected_contract_digest
+                || output_receipt.contract_generation != binding.expected_contract_generation
+                || output_receipt.contract_digest != binding.expected_contract_digest
+            {
+                return Err(execution_authority_conflict());
+            }
+            let execution = self
+                .store
+                .work_item(
+                    &project.tenant_id,
+                    &project.project_id,
+                    &binding.producer_work_item_id,
+                )?
+                .ok_or_else(execution_authority_conflict)?;
+            let terminal = execution
+                .terminal_execution_evidence
+                .as_ref()
+                .filter(|_| execution.state == sentinel_workflow::WorkItemState::Done)
+                .ok_or_else(execution_authority_conflict)?;
+            let output = terminal
+                .outputs
+                .iter()
+                .find(|value| value.name == binding.producer_output_name)
+                .filter(|value| value.digest == output_receipt.content_digest)
+                .ok_or_else(execution_authority_conflict)?;
+            let matching_artifacts = terminal
+                .artifacts
+                .iter()
+                .filter(|value| {
+                    value.artifact_kind == output.kind
+                        && value.media_type == output_contract.media_type
+                })
+                .collect::<Vec<_>>();
+            let [artifact] = matching_artifacts.as_slice() else {
+                return Err(execution_authority_conflict());
+            };
+            let staged = stage_verified_artifact_inputs(
+                &self.artifact_roots,
+                assignment.agent_id,
+                destination_agent,
+                &project.project_id.0,
+                &spec.work_item_id.0,
+                &artifact.digest,
+                Some(&artifact.artifact_kind),
+                &artifact.media_type,
+            )
+            .map_err(|_| execution_input_unavailable())?;
+            if staged.is_empty() {
+                return Err(execution_authority_conflict());
+            }
+            inputs.extend(staged.into_iter().map(|value| ArtifactInputV1 {
+                artifact_id: value.artifact_id,
+                digest: value.sha256,
+                media_type: value.media_type,
+                mount_path: value.mount_path,
+            }));
+        }
+        inputs.sort_by(|left, right| {
+            left.mount_path
+                .cmp(&right.mount_path)
+                .then_with(|| left.artifact_id.cmp(&right.artifact_id))
+        });
+        if inputs.windows(2).any(|pair| {
+            pair[0].mount_path == pair[1].mount_path || pair[0].artifact_id == pair[1].artifact_id
+        }) {
+            return Err(execution_authority_conflict());
+        }
+        Ok(inputs)
     }
 
     fn workbench_snapshot(
@@ -505,6 +658,7 @@ fn build_execution_plan(
     operation_id: Uuid,
     authority: &RuntimeAuthoritySnapshotV1,
     spec: &sentinel_workflow::CompanyWorkItemSpecV1,
+    inputs: Vec<ArtifactInputV1>,
     profile: &WorkbenchProfile,
     intent: &ExecutionIntentV1,
     created_at_unix_ms: u64,
@@ -613,7 +767,7 @@ fn build_execution_plan(
             ordinal,
             workspace_id: workspace_id.clone(),
             capabilities: BTreeSet::from([required_capability]),
-            inputs: Vec::new(),
+            inputs: inputs.clone(),
             command_policy,
             tool,
             outputs: vec![output_expectation.clone()],
@@ -665,6 +819,14 @@ fn execution_authority_conflict() -> WorkflowError {
         WorkflowErrorCode::AuthorityConflict,
         false,
         "execution intent authority is invalid or stale",
+    )
+}
+
+fn execution_input_unavailable() -> WorkflowError {
+    WorkflowError::new(
+        WorkflowErrorCode::ExecutionUnavailable,
+        true,
+        "execution dependency artifact is unavailable",
     )
 }
 
@@ -745,7 +907,17 @@ fn validate_execution_contract(
     spec: &sentinel_workflow::CompanyWorkItemSpecV1,
 ) -> Result<(), WorkflowPortError> {
     let final_step = plan.steps.last().ok_or(WorkflowPortError::Rejected)?;
-    if final_step.outputs.len() != spec.outputs.len()
+    let derived_inputs = plan
+        .steps
+        .first()
+        .map(|step| step.inputs.as_slice())
+        .ok_or(WorkflowPortError::Rejected)?;
+    if spec.inputs.is_empty() != derived_inputs.is_empty()
+        || plan
+            .steps
+            .iter()
+            .any(|step| step.inputs.as_slice() != derived_inputs)
+        || final_step.outputs.len() != spec.outputs.len()
         || final_step.outputs.iter().any(|observed| {
             !observed.required
                 || !spec.outputs.iter().any(|expected| {
@@ -760,6 +932,17 @@ fn validate_execution_contract(
         return Err(WorkflowPortError::AuthorityConflict);
     }
     Ok(())
+}
+
+fn execution_intent_matches_plan(intent: &ExecutionIntentV1, plan: &ExecutionPlanV1) -> bool {
+    intent.project_id == plan.project_id
+        && intent.work_item_id == plan.work_item_id
+        && intent.tools.len() == plan.steps.len()
+        && intent
+            .tools
+            .iter()
+            .zip(&plan.steps)
+            .all(|(tool, step)| tool == &step.tool)
 }
 
 fn role_capabilities(role: CompanyRoleV1, profile: &WorkbenchProfile) -> BTreeSet<String> {
@@ -1282,6 +1465,12 @@ struct ExecutionIntentV1 {
     tools: Vec<ExecutionToolV1>,
 }
 
+struct ExecutionIntentAdmission {
+    plan: ExecutionPlanV1,
+    authority: RuntimeAuthoritySnapshotV1,
+    replay: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionAdmissionResponse {
@@ -1454,6 +1643,7 @@ impl WorkflowApi {
             workbench_profile: profile,
             workbench_profile_digest: profile_digest,
             agent_capabilities: Arc::clone(&agent_capabilities),
+            artifact_roots: Arc::new(workbench_artifact_roots.clone()),
         });
         let workbench = Arc::new(WorkbenchExecutionAdapter {
             store: Arc::clone(&store),
@@ -1583,7 +1773,9 @@ impl WorkflowApi {
             ("GET", OPERATOR_PROJECTION_PATH) => self.projection(&principal, path),
             ("GET", OPERATOR_EVENTS_PATH) => self.events(&principal, path),
             ("POST", DELIVERY_COMMAND_PATH) => self.delivery_command(&principal, body),
+            ("POST", DELIVERY_INTENT_PATH) => delivery_intent::handle(self, &principal, body),
             ("GET", DELIVERY_LINEAGE_PATH) => self.delivery_lineage(&principal, path),
+            ("GET", WORKFLOW_READINESS_PATH) => json(200, &self.health()),
             _ => json_error(
                 405,
                 "method_not_allowed",
@@ -1691,16 +1883,16 @@ impl WorkflowApi {
                     true,
                 );
             };
-            let plan = match authority.plan_from_intent(
+            let admission = match authority.plan_from_intent(
                 principal,
                 envelope.operation_id,
                 &envelope.intent,
                 now_unix_ms(),
             ) {
-                Ok(plan) => plan,
+                Ok(admission) => admission,
                 Err(error) => return workflow_error(error),
             };
-            if authority.validate_plan_contract(&plan).is_err() {
+            if authority.validate_plan_contract(&admission.plan).is_err() {
                 return json_error(
                     403,
                     "authority_conflict",
@@ -1708,7 +1900,13 @@ impl WorkflowApi {
                     false,
                 );
             }
-            return match self.core.admit_plan(&plan, now_unix_ms()) {
+            let result = if admission.replay {
+                self.store
+                    .admit_plan(&admission.plan, &admission.authority, now_unix_ms())
+            } else {
+                self.core.admit_plan(&admission.plan, now_unix_ms())
+            };
+            return match result {
                 Ok((replayed, work_item)) => json(
                     200,
                     &ExecutionAdmissionResponse {
@@ -2573,7 +2771,9 @@ fn is_workflow_path(path: &str) -> bool {
             | OPERATOR_PROJECTION_PATH
             | OPERATOR_EVENTS_PATH
             | DELIVERY_COMMAND_PATH
+            | DELIVERY_INTENT_PATH
             | DELIVERY_LINEAGE_PATH
+            | WORKFLOW_READINESS_PATH
     )
 }
 
@@ -3004,7 +3204,7 @@ mod tests {
             steps: vec![step],
             request_digest: "9".repeat(64),
         };
-        let spec = sentinel_workflow::CompanyWorkItemSpecV1 {
+        let mut spec = sentinel_workflow::CompanyWorkItemSpecV1 {
             work_item_id: plan.work_item_id.clone(),
             title: "Site".to_owned(),
             objective: "Build site".to_owned(),
@@ -3028,6 +3228,27 @@ mod tests {
             budget_micros: 1,
             rework: None,
         };
+        assert_eq!(validate_execution_contract(&plan, &spec), Ok(()));
+
+        let producer_id = WorkItemId::parse("design-m0").unwrap();
+        spec.dependency_ids.insert(producer_id.clone());
+        spec.inputs.push(sentinel_workflow::WorkInputContractV1 {
+            name: "design_specification".to_owned(),
+            producer_work_item_id: producer_id,
+            producer_output_name: "design_specification".to_owned(),
+            expected_contract_generation: 1,
+            expected_contract_digest: "7".repeat(64),
+        });
+        assert_eq!(
+            validate_execution_contract(&plan, &spec),
+            Err(WorkflowPortError::AuthorityConflict)
+        );
+        plan.steps[0].inputs.push(ArtifactInputV1 {
+            artifact_id: format!("sha256:{}", "6".repeat(64)),
+            digest: "6".repeat(64),
+            media_type: "text/markdown".to_owned(),
+            mount_path: "design.md".to_owned(),
+        });
         assert_eq!(validate_execution_contract(&plan, &spec), Ok(()));
 
         plan.steps[0].outputs[0].name = "foreign-output".to_owned();
@@ -3150,6 +3371,7 @@ mod tests {
             operation_id,
             &authority,
             &spec,
+            Vec::new(),
             &profile,
             &intent,
             1_000,
@@ -3160,6 +3382,7 @@ mod tests {
             operation_id,
             &authority,
             &spec,
+            Vec::new(),
             &profile,
             &intent,
             1_000,
@@ -3176,10 +3399,9 @@ mod tests {
             plan.steps[1].command_policy[0].required_arg_prefix,
             vec!["--check", "index.js"]
         );
-        assert!(plan.steps[..2]
-            .iter()
-            .all(|step| step.artifacts.is_empty()));
+        assert!(plan.steps[..2].iter().all(|step| step.artifacts.is_empty()));
         assert_eq!(plan.steps[2].artifacts[0].artifact_kind, "source_tree");
+        assert!(execution_intent_matches_plan(&intent, &plan));
         plan.validate_at(2_000).unwrap();
 
         let mut foreign = intent;
@@ -3188,11 +3410,13 @@ mod tests {
             media_type: "application/vnd.sentinel.source-tree".to_owned(),
             paths: vec!["index.js".to_owned()],
         };
+        assert!(!execution_intent_matches_plan(&foreign, &plan));
         assert_eq!(
             build_execution_plan(
                 operation_id,
                 &authority,
                 &spec,
+                Vec::new(),
                 &profile,
                 &foreign,
                 1_000,

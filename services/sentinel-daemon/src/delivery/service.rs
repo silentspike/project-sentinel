@@ -618,11 +618,9 @@ where
             .get(run_id)
             .ok_or_else(|| DeliveryError::NotFound(format!("QA run {run_id}")))?
             .clone();
-        if run.state != QaRunState::Running
-            || run.actors.as_slice() != [authority_before.principal.clone()]
-        {
+        if run.actors.as_slice() != [authority_before.principal.clone()] {
             return Err(DeliveryError::AuthorityDenied(
-                "only the exact assigned QA authority may execute a running plan".to_string(),
+                "only the exact assigned QA authority may execute the plan".to_string(),
             ));
         }
         let plan = aggregate
@@ -692,6 +690,11 @@ where
                     )
                 })?;
             return Ok((existing, receipt));
+        }
+        if run.state != QaRunState::Running {
+            return Err(DeliveryError::Conflict(
+                "a fresh QA execution requires the exact running state".to_string(),
+            ));
         }
         // The external effect occurs only after the durable running state exists and
         // no database writer is held.
@@ -2513,6 +2516,14 @@ where
 
     pub fn pending_publication_count(&self) -> Result<usize, DeliveryError> {
         Ok(self.core.store.pending_publications()?.len())
+    }
+
+    pub(crate) fn aggregate(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Result<Option<DeliveryAggregateV1>, DeliveryError> {
+        self.core.store.load(tenant_id, project_id)
     }
 
     #[doc(hidden)]

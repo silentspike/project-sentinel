@@ -5,7 +5,18 @@ import solid from "vite-plugin-solid";
 // Dev-Proxy leitet /api an das deployte #431-Backend (HTTPS, self-signed) weiter.
 export default defineConfig(({ mode }) => ({
   plugins: [solid()],
-  build: { target: "es2022", outDir: "dist", sourcemap: true },
+  build: {
+    target: "es2022",
+    outDir: "dist",
+    sourcemap: true,
+    rollupOptions: {
+      output: {
+        entryFileNames: "assets/app.js",
+        chunkFileNames: "assets/[name].js",
+        assetFileNames: "assets/[name][extname]",
+      },
+    },
+  },
   server: {
     proxy: {
       "/api": {
