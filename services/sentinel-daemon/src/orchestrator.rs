@@ -12,7 +12,7 @@
 
 mod runtime_lifecycle;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -4196,6 +4196,103 @@ fn execute_runtime_reconcile(
     run_runtime_reconcile(&mut reconcile_ctx, request, respawn_backoff, source)
 }
 
+fn runtime_owned_cgroup_names(
+    all_agents: &[AgentConfig],
+    runtime_orch: &RuntimeOrchestrator,
+    nano_runtimes: &DaemonNanoRuntimeRegistry,
+    sandbox_handles: &HashMap<AgentId, SandboxHandle>,
+) -> HashSet<String> {
+    let mut names = runtime_orch
+        .agents()
+        .values()
+        .map(|handle| handle.identity.name.clone())
+        .collect::<HashSet<_>>();
+    for agent_id in nano_runtimes.agent_ids() {
+        if let Some(agent) = all_agents
+            .iter()
+            .find(|agent| agent.identity.id == agent_id.0)
+        {
+            names.insert(agent.identity.name.clone());
+        } else if let Some(handle) = sandbox_handles.get(&agent_id) {
+            names.insert(handle.agent_name.clone());
+        }
+    }
+    names
+}
+
+fn sentinel_cgroup_names() -> Result<BTreeSet<String>> {
+    let entries = match std::fs::read_dir("/sys/fs/cgroup/sentinel") {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeSet::new());
+        }
+        Err(error) => return Err(error).context("read Sentinel cgroup root"),
+    };
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.context("read Sentinel cgroup entry")?;
+        if !entry
+            .file_type()
+            .context("read Sentinel cgroup entry type")?
+            .is_dir()
+        {
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("Sentinel cgroup name is not valid UTF-8"))?;
+        names.insert(name);
+    }
+    Ok(names)
+}
+
+fn cleanup_unowned_cgroups_with<List, Kill, Remove>(
+    cgroup_names: impl IntoIterator<Item = String>,
+    owned_names: &HashSet<String>,
+    mut list_pids: List,
+    mut kill_pids: Kill,
+    mut remove: Remove,
+) -> Result<usize>
+where
+    List: FnMut(&str) -> Result<Vec<u32>>,
+    Kill: FnMut(&str) -> Result<usize>,
+    Remove: FnMut(&str) -> Result<()>,
+{
+    let mut removed = 0usize;
+    for name in cgroup_names {
+        if owned_names.contains(&name) {
+            continue;
+        }
+        let pids =
+            list_pids(&name).with_context(|| format!("inspect unowned Sentinel cgroup {name}"))?;
+        if !pids.is_empty() {
+            kill_pids(&name)
+                .with_context(|| format!("terminate unowned Sentinel cgroup {name}"))?;
+        }
+        remove(&name).with_context(|| format!("remove unowned Sentinel cgroup {name}"))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn cleanup_unowned_sentinel_cgroups(
+    all_agents: &[AgentConfig],
+    runtime_orch: &RuntimeOrchestrator,
+    nano_runtimes: &DaemonNanoRuntimeRegistry,
+    sandbox_handles: &HashMap<AgentId, SandboxHandle>,
+) -> Result<usize> {
+    let owned_names =
+        runtime_owned_cgroup_names(all_agents, runtime_orch, nano_runtimes, sandbox_handles);
+    cleanup_unowned_cgroups_with(
+        sentinel_cgroup_names()?,
+        &owned_names,
+        sentinel_sandbox::cgroups::list_pids_in_cgroup,
+        sentinel_sandbox::cgroups::kill_cgroup_processes,
+        sentinel_sandbox::cgroups::remove_cgroup,
+    )
+}
+
 fn run_runtime_reconcile(
     ctx: &mut RuntimeReconcileContext<'_>,
     request: RuntimeReconcileRequest,
@@ -8199,6 +8296,25 @@ fn ecs_tick_loop(
             .context("re-open owner readiness after verified config apply recovery")?;
     }
 
+    // A stopped daemon can leave empty or stale cgroup-v2 directories for agents
+    // from another shift. They are inside Sentinel's dedicated subtree but are
+    // not owned by any restored runtime handle. Reconcile them before publishing
+    // the first readiness snapshot so a cold start cannot remain permanently
+    // degraded while every active runtime itself is healthy.
+    let startup_orphan_cgroups_removed = cleanup_unowned_sentinel_cgroups(
+        &all_agents,
+        &runtime_orch,
+        &nano_runtimes,
+        &sandbox_handles,
+    )
+    .context("reconcile unowned Sentinel cgroups during startup")?;
+    if startup_orphan_cgroups_removed > 0 {
+        info!(
+            removed = startup_orphan_cgroups_removed,
+            "Startup-Reconcile hat unbesessene Sentinel-cgroups entfernt"
+        );
+    }
+
     // GOLF: Default-Goals fuer alle gespawnten Agents erstellen
     for agent_cfg in &shift_agents {
         let agent_id = AgentId(agent_cfg.identity.id);
@@ -11536,6 +11652,91 @@ mod tests {
     use std::sync::Arc;
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn startup_cgroup_reconcile_preserves_owned_and_cleans_stale_entries() {
+        let owned = HashSet::from(["active-agent".to_string()]);
+        let listed = std::cell::RefCell::new(Vec::new());
+        let killed = std::cell::RefCell::new(Vec::new());
+        let removed = std::cell::RefCell::new(Vec::new());
+
+        let count = cleanup_unowned_cgroups_with(
+            ["active-agent", "empty-orphan", "live-orphan"]
+                .into_iter()
+                .map(str::to_string),
+            &owned,
+            |name| {
+                listed.borrow_mut().push(name.to_string());
+                Ok(if name == "live-orphan" {
+                    vec![1234]
+                } else {
+                    Vec::new()
+                })
+            },
+            |name| {
+                killed.borrow_mut().push(name.to_string());
+                Ok(1)
+            },
+            |name| {
+                removed.borrow_mut().push(name.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(
+            listed.into_inner(),
+            vec!["empty-orphan".to_string(), "live-orphan".to_string()]
+        );
+        assert_eq!(killed.into_inner(), vec!["live-orphan".to_string()]);
+        assert_eq!(
+            removed.into_inner(),
+            vec!["empty-orphan".to_string(), "live-orphan".to_string()]
+        );
+    }
+
+    #[test]
+    fn startup_cgroup_reconcile_fails_closed_before_removing_uninspected_entry() {
+        let removed = std::cell::RefCell::new(Vec::new());
+        let error = cleanup_unowned_cgroups_with(
+            ["unreadable".to_string()],
+            &HashSet::new(),
+            |_name| Err(anyhow!("injected inspection failure")),
+            |_name| Ok(0),
+            |name| {
+                removed.borrow_mut().push(name.to_string());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("inspect unowned Sentinel cgroup unreadable"));
+        assert!(removed.into_inner().is_empty());
+    }
+
+    #[test]
+    fn startup_cgroup_reconcile_fails_closed_when_live_cleanup_fails() {
+        let removed = std::cell::RefCell::new(Vec::new());
+        let error = cleanup_unowned_cgroups_with(
+            ["live-orphan".to_string()],
+            &HashSet::new(),
+            |_name| Ok(vec![1234]),
+            |_name| Err(anyhow!("injected kill failure")),
+            |name| {
+                removed.borrow_mut().push(name.to_string());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("terminate unowned Sentinel cgroup live-orphan"));
+        assert!(removed.into_inner().is_empty());
+    }
 
     #[test]
     fn workbench_follow_up_dispatch_retains_the_reserved_profile() {
