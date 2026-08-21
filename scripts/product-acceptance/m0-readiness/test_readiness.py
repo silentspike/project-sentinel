@@ -86,6 +86,7 @@ def valid_runtime() -> dict[str, object]:
         "last_repair_error": None,
         "worker_states": {
             "ecs_tick_loop": {"running": True, "restart_count": 0, "last_error": None},
+            "episode_projection": {"running": True, "restart_count": 0, "last_error": None},
             "service_health": {"running": True, "restart_count": 0, "last_error": None},
         },
         "agents": [valid_agent(1), valid_agent(2)],
@@ -350,7 +351,15 @@ class ReadinessTests(unittest.TestCase):
             with self.subTest(code=code):
                 self.assert_code(code, lambda payload=payload: readiness.validate_daemon_payload(payload))
 
-        for workers in ({}, {"ecs_tick_loop": valid_runtime()["worker_states"]["ecs_tick_loop"]}):
+        valid_workers = valid_runtime()["worker_states"]
+        for workers in (
+            {},
+            {"ecs_tick_loop": valid_workers["ecs_tick_loop"]},
+            {
+                "ecs_tick_loop": valid_workers["ecs_tick_loop"],
+                "service_health": valid_workers["service_health"],
+            },
+        ):
             payload = valid_runtime()
             payload["worker_states"] = workers
             self.assert_code(
