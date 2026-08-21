@@ -1356,7 +1356,7 @@ def validate_systemd(
             "FragmentPath",
             "NeedDaemonReload",
             "Unit",
-            "LastTriggerUSecMonotonic",
+            "ActiveEnterTimestampMonotonic",
         )
         timer_facts = systemctl_show(timer, timer_properties, deps, timeout)
         if set(timer_facts) != set(timer_properties):
@@ -1373,9 +1373,9 @@ def validate_systemd(
         }
         if any(timer_facts.get(key) != value for key, value in expected_timer.items()):
             raise PreflightError("systemd_timer_not_ready")
-        trigger = systemd_uint(
-            timer_facts.get("LastTriggerUSecMonotonic"),
-            "systemd_timer_never_ran",
+        timer_entered = systemd_uint(
+            timer_facts.get("ActiveEnterTimestampMonotonic"),
+            "systemd_timer_activation_missing",
             positive=True,
         )
         outcome_properties = (
@@ -1417,7 +1417,7 @@ def validate_systemd(
             "systemd_timer_outcome_missing",
             positive=True,
         )
-        if not trigger <= started <= exited:
+        if not timer_entered <= started <= exited:
             raise PreflightError("systemd_timer_outcome_stale")
         timer_outcomes.append(
             {
@@ -1425,7 +1425,7 @@ def validate_systemd(
                 "service": service,
                 "outcome_digest": evidence_digest(
                     {
-                        "trigger": trigger,
+                        "timer_entered": timer_entered,
                         "started": started,
                         "exited": exited,
                         "result": outcome["Result"],
@@ -1824,8 +1824,11 @@ def parse_projection_snapshot(data: bytes) -> tuple[dict[str, int], list[dict[st
                 "sentinel-projection-cost-hierarchy-v2",
             } or name in watermarks:
                 raise PreflightError("store_readback_shape")
+            last_event_id = row.get("last_event_id")
+            if last_event_id is None:
+                raise PreflightError("read_model_projection_lag")
             watermarks[name] = require_int(
-                row.get("last_event_id"), "store_readback_value", minimum=0
+                last_event_id, "store_readback_value", minimum=0
             )
         elif row.get("row_kind") == "agent":
             if row.get("projection_name") is not None or row.get("last_event_id") is not None:
@@ -1842,7 +1845,7 @@ def parse_projection_snapshot(data: bytes) -> tuple[dict[str, int], list[dict[st
         "sentinel-projection",
         "sentinel-projection-cost-hierarchy-v2",
     }:
-        raise PreflightError("store_readback_shape")
+        raise PreflightError("read_model_projection_lag")
     return watermarks, identities
 
 

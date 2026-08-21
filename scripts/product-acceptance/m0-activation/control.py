@@ -416,7 +416,12 @@ def validate_command(argv: tuple[str, ...]) -> None:
     verb = argv[1]
     if verb == "daemon-reload" and len(argv) == 2:
         return
-    if verb == "start" and argv[2:] == ("--no-block", TARGET):
+    if (
+        verb == "start"
+        and len(argv) == 4
+        and argv[2] == "--no-block"
+        and argv[3] in {TARGET, *ONESHOTS}
+    ):
         return
     if verb == "show" and len(argv) == 5 and argv[2] in INSPECT_UNITS:
         return
@@ -891,6 +896,12 @@ def _activate(
         start_failed = result.returncode != 0
         if start_failed:
             fail("target_start_failed")
+        for unit in ONESHOTS:
+            result = invoke(
+                runner, (str(SYSTEMCTL), "start", "--no-block", unit), timeout
+            )
+            if result.returncode != 0:
+                fail("oneshot_start_failed")
         readiness_digest = wait_for_activation(
             runner, preflight, timeout, monotonic() + activation_deadline,
             monotonic, sleeper,
