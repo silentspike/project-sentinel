@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Issue #650 live-activation correction: bind Workbench startup attestation to both the bubblewrap host PID reported by `--info-fd` and the agent-visible PID at the end of the kernel `NSpid` chain, so an isolated PID namespace no longer rejects every valid agent as a mismatched process while stale, malformed, or foreign PID chains remain fail-closed.
 - Issue #650 live-activation correction: traverse the Workbench completion-receipt authority from a non-reading `O_PATH` root anchor so the scoped `/artifacts` store can initialize after strict Landlock enforcement without granting global root-directory read access.
 - Issue #650 live-activation correction: preserve the lightweight heartbeat runtime for ordinary ECS agent sandboxes while selecting the capability-scoped Workbench protocol only when the Landlock wrapper supplies Workbench attestation. Partial attestation remains fail-closed instead of downgrading to the general runtime.
 - Issue #650 live-activation correction: require hard Landlock feature compatibility for attested workbench processes while preserving the general agent best-effort path, mask directory-only Landlock rights from regular-file rules, and make activation rollback dependency-ordered, independently bounded, and explicit about each failed unit so a valid daemon shutdown cannot strand a partially started topology.
