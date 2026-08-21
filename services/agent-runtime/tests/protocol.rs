@@ -31,7 +31,8 @@ struct StartupAttestation {
     wrapper_version: String,
     runtime_version: String,
     landlock_abi: u8,
-    host_pid: u32,
+    #[serde(rename = "host_pid")]
+    namespace_pid: u32,
 }
 
 struct AttestationCleanup(Option<PathBuf>);
@@ -120,7 +121,7 @@ fn spawn_attested_runtime(
     assert_eq!(attestation.wrapper_version, wrapper_version);
     assert_eq!(attestation.runtime_version, WORKBENCH_AGENT_RUNTIME_VERSION);
     assert_eq!(attestation.landlock_abi, TEST_LANDLOCK_ABI);
-    assert_eq!(attestation.host_pid, child.id());
+    assert_eq!(attestation.namespace_pid, child.id());
     fs::remove_file(&attestation_path).unwrap();
     cleanup.0 = None;
     let input = child.stdin.take().unwrap();
