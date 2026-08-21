@@ -6,6 +6,7 @@
 //! messages over stdout. Human diagnostics on stderr never include request data.
 
 use std::collections::BTreeMap;
+use std::env;
 use std::io::{self, BufRead, Write};
 use std::os::unix::fs::OpenOptionsExt as UnixOpenOptionsExt;
 use std::path::PathBuf;
@@ -64,6 +65,53 @@ enum BoundedJsonlRecord {
 }
 
 fn main() {
+    if workbench_mode_requested() {
+        run_workbench();
+    } else {
+        run_general_agent();
+    }
+}
+
+fn workbench_mode_requested() -> bool {
+    [
+        ATTESTATION_NONCE_ENV,
+        ATTESTATION_WRAPPER_VERSION_ENV,
+        ATTESTATION_LANDLOCK_ABI_ENV,
+    ]
+    .into_iter()
+    .any(|name| env::var_os(name).is_some())
+}
+
+fn run_general_agent() {
+    eprintln!("agent-runtime: started (pid={})", std::process::id());
+
+    let running = Arc::new(AtomicBool::new(true));
+    let reader_running = running.clone();
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            match line {
+                Ok(command) if command.trim() == "shutdown" => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        reader_running.store(false, Ordering::Release);
+    });
+
+    write_heartbeat();
+    let mut last_heartbeat = Instant::now();
+    while running.load(Ordering::Acquire) {
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            write_heartbeat();
+            last_heartbeat = Instant::now();
+        }
+        thread::sleep(INPUT_POLL_INTERVAL);
+    }
+
+    eprintln!("agent-runtime: shutting down");
+}
+
+fn run_workbench() {
     let workspace_root = std::env::var_os("SENTINEL_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/workspace"));
