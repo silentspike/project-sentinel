@@ -359,6 +359,85 @@ fn conflicting_root_receipt_temp_keeps_runtime_unavailable_and_preserves_evidenc
 }
 
 #[test]
+fn runtime_without_workbench_attestation_uses_general_agent_mode() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-runtime"))
+        .env_remove("SENTINEL_WORKBENCH_ATTESTATION_NONCE")
+        .env_remove("SENTINEL_WORKBENCH_WRAPPER_VERSION")
+        .env_remove("SENTINEL_WORKBENCH_LANDLOCK_ABI")
+        .env_remove("SENTINEL_WORKSPACE_ROOT")
+        .env_remove("SENTINEL_ARTIFACT_ROOT")
+        .env_remove("SENTINEL_INPUT_ROOT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+
+    thread::sleep(Duration::from_millis(150));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "general agent runtime must remain alive while stdin is open"
+    );
+    writeln!(input, "shutdown").unwrap();
+    input.flush().unwrap();
+    drop(input);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let status = child.wait().unwrap();
+            panic!("general agent runtime did not stop after shutdown: {status}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success());
+
+    let mut diagnostics = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut diagnostics)
+        .unwrap();
+    assert!(diagnostics.contains("general agent started"));
+    assert!(diagnostics.contains("general agent shutting down"));
+    assert!(!diagnostics.contains("workbench started"));
+}
+
+#[test]
+fn partial_workbench_attestation_cannot_downgrade_to_general_agent_mode() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let artifacts = directory.path().join("artifacts");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&artifacts).unwrap();
+    let nonce = next_attestation_nonce();
+    let attestation_path =
+        PathBuf::from(format!("/tmp/.sentinel-workbench-attestation-{nonce}.json"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-runtime"))
+        .env("SENTINEL_WORKSPACE_ROOT", workspace)
+        .env("SENTINEL_ARTIFACT_ROOT", artifacts)
+        .env("SENTINEL_WORKBENCH_ATTESTATION_NONCE", &nonce)
+        .env_remove("SENTINEL_WORKBENCH_WRAPPER_VERSION")
+        .env_remove("SENTINEL_WORKBENCH_LANDLOCK_ABI")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(126));
+    assert!(output.stdout.is_empty());
+    assert!(!attestation_path.exists());
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostics.contains("startup isolation attestation failed"));
+    assert!(!diagnostics.contains("general agent started"));
+}
+
+#[test]
 fn jsonl_process_handles_health_rejection_and_execution() {
     let directory = tempfile::tempdir().unwrap();
     let workspace = directory.path().join("workspace");
