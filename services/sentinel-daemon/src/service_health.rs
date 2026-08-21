@@ -210,10 +210,14 @@ fn start_service(service_name: &str) -> bool {
         .args(["reset-failed", service_name])
         .status();
     std::process::Command::new("systemctl")
-        .args(["start", service_name])
+        .args(start_service_args(service_name))
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+fn start_service_args(service_name: &str) -> [&str; 3] {
+    ["start", "--no-block", service_name]
 }
 
 pub fn restart_service_now(service_name: &str) -> bool {
@@ -231,6 +235,14 @@ pub fn start_service_now(service_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inactive_service_start_is_queued_without_waiting_for_unit_ordering() {
+        assert_eq!(
+            start_service_args("sentinel-projection"),
+            ["start", "--no-block", "sentinel-projection"]
+        );
+    }
 
     #[test]
     fn test_poll_failed_empty_when_no_messages() {

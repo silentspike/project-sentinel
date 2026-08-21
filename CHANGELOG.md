@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Queue Platform Control Plane starts for inactive systemd dependencies with
+  `--no-block`, preventing daemon `ExecStartPost` readiness from deadlocking on
+  units ordered after `sentinel-daemon.service`.
+
 ### Changed
 - Issue #650 live-startup correction: tolerate only the attestation writer's transient zero-length regular file before consuming its nonce-bound payload, revalidate asynchronous service-health observations immediately before starting an inactive service, and prevent a full shift transition from starting after shutdown was requested. Invalid attestation file types/links/sizes remain fail closed, stale service-health observations use idempotent `systemctl start` instead of restarting an already recovered service, projection-lag restarts retain their separate authority, and the ECS shutdown path no longer begins new roster work after SIGTERM.
 - Issue #650 live-preflight correction: ignore syntactically valid listeners outside the protected M0 port set before normalizing host interface suffixes, and classify absent canonical projection offsets during a running full rebuild as bounded `read_model_projection_lag`; protected-listener mismatches and malformed present offsets remain fail closed.
