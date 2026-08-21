@@ -76,7 +76,11 @@ impl PinnedDirectory {
         } else {
             std::env::current_dir()?.join(path)
         };
-        let mut current = open_directory(Path::new("/"))?;
+        // The workbench Landlock profile deliberately grants access only to
+        // its scoped roots, not ReadDir on `/`. Use a non-reading O_PATH
+        // anchor for descriptor-relative traversal; every actual directory in
+        // the chain is still opened and validated normally below.
+        let mut current = open_path_directory(Path::new("/"))?;
         for component in absolute.components() {
             let name = match component {
                 Component::RootDir | Component::CurDir => continue,
@@ -195,6 +199,18 @@ impl PinnedDirectory {
     fn sync(&self) -> std::io::Result<()> {
         self.file.sync_all()
     }
+}
+
+fn open_path_directory(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            nix::libc::O_PATH
+                | nix::libc::O_DIRECTORY
+                | nix::libc::O_NOFOLLOW
+                | nix::libc::O_CLOEXEC,
+        )
+        .open(path)
 }
 
 fn open_directory(path: &Path) -> std::io::Result<File> {
@@ -2674,6 +2690,24 @@ mod tests {
     use sentinel_common::{CommandRule, WorkbenchResourceLimits};
 
     use super::*;
+
+    #[test]
+    fn completion_receipt_chain_uses_a_path_only_root_anchor() {
+        let root = open_path_directory(Path::new("/")).unwrap();
+        let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{}", root.as_raw_fd())).unwrap();
+        let flags = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:\t"))
+            .and_then(|value| u32::from_str_radix(value, 8).ok())
+            .unwrap();
+        assert_ne!(flags & nix::libc::O_PATH as u32, 0);
+
+        let directory = tempfile::tempdir().unwrap();
+        let artifacts = directory.path().join("artifacts");
+        fs::create_dir(&artifacts).unwrap();
+        let opened = PinnedDirectory::open_chain(&artifacts, false).unwrap();
+        assert!(opened.file.metadata().unwrap().is_dir());
+    }
 
     fn request(tool: WorkbenchTool, capability: &str) -> WorkbenchRequest {
         WorkbenchRequest {

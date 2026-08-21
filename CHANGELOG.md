@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Issue #650 live-activation correction: traverse the Workbench completion-receipt authority from a non-reading `O_PATH` root anchor so the scoped `/artifacts` store can initialize after strict Landlock enforcement without granting global root-directory read access.
 - Issue #650 live-activation correction: preserve the lightweight heartbeat runtime for ordinary ECS agent sandboxes while selecting the capability-scoped Workbench protocol only when the Landlock wrapper supplies Workbench attestation. Partial attestation remains fail-closed instead of downgrading to the general runtime.
 - Issue #650 live-activation correction: require hard Landlock feature compatibility for attested workbench processes while preserving the general agent best-effort path, mask directory-only Landlock rights from regular-file rules, and make activation rollback dependency-ordered, independently bounded, and explicit about each failed unit so a valid daemon shutdown cannot strand a partially started topology.
 - Issue #650 live-activation correction: keep mutable workbench input, workspace, and artifact roots on each agent's persistent writable host backing even when the normal agent home is presented through sentinel-fs, and preserve the last concrete readiness failure at a sub-100ms deadline edge.
