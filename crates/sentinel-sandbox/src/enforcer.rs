@@ -53,7 +53,8 @@ struct WorkbenchStartupAttestation {
     wrapper_version: String,
     runtime_version: String,
     landlock_abi: u8,
-    host_pid: u32,
+    #[serde(rename = "host_pid")]
+    namespace_pid: u32,
 }
 
 enum ProtocolFrame {
@@ -2013,6 +2014,7 @@ fn await_workbench_startup_attestation(
                     expected_nonce,
                     expected_landlock_abi,
                     child_pid,
+                    &read_pid_namespace_chain(child_pid)?,
                 )?;
                 std::fs::remove_file(&path)
                     .context("remove consumed workbench startup attestation")?;
@@ -2034,19 +2036,44 @@ fn validate_workbench_startup_attestation(
     expected_nonce: &str,
     expected_landlock_abi: u8,
     expected_child_pid: u32,
+    pid_namespace_chain: &[u32],
 ) -> Result<()> {
     let attestation: WorkbenchStartupAttestation =
         serde_json::from_slice(bytes).context("decode workbench startup attestation")?;
+    let namespace_pid = pid_namespace_chain
+        .last()
+        .copied()
+        .context("workbench child PID namespace identity is unavailable")?;
     ensure!(
         attestation.schema_version == WORKBENCH_ATTESTATION_SCHEMA_VERSION
             && attestation.nonce == expected_nonce
             && attestation.wrapper_version == env!("CARGO_PKG_VERSION")
             && attestation.runtime_version == sentinel_common::WORKBENCH_AGENT_RUNTIME_VERSION
             && attestation.landlock_abi == expected_landlock_abi
-            && attestation.host_pid == expected_child_pid,
+            && pid_namespace_chain.first() == Some(&expected_child_pid)
+            && attestation.namespace_pid == namespace_pid,
         "workbench startup attestation did not match its exact child"
     );
     Ok(())
+}
+
+fn read_pid_namespace_chain(child_pid: u32) -> Result<Vec<u32>> {
+    let path = format!("/proc/{child_pid}/status");
+    let status = std::fs::read_to_string(&path)
+        .with_context(|| format!("read workbench child PID namespace identity from {path}"))?;
+    parse_pid_namespace_chain(&status)
+        .context("workbench child PID namespace identity is malformed")
+}
+
+fn parse_pid_namespace_chain(status: &str) -> Option<Vec<u32>> {
+    let chain = status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))?
+        .split_whitespace()
+        .map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    (!chain.is_empty() && chain.iter().all(|pid| *pid > 0)).then_some(chain)
 }
 
 fn workbench_host_agent_root(agent_name: &str) -> PathBuf {
@@ -2404,9 +2431,29 @@ mod tests {
             env!("CARGO_PKG_VERSION"),
             sentinel_common::WORKBENCH_AGENT_RUNTIME_VERSION,
         );
-        validate_workbench_startup_attestation(&valid, nonce, 4, 4242).unwrap();
-        assert!(validate_workbench_startup_attestation(&valid, nonce, 4, 4243).is_err());
-        assert!(validate_workbench_startup_attestation(&valid, nonce, 3, 4242).is_err());
+        validate_workbench_startup_attestation(&valid, nonce, 4, 4242, &[4242]).unwrap();
+        validate_workbench_startup_attestation(
+            &bytes(
+                2,
+                4,
+                env!("CARGO_PKG_VERSION"),
+                sentinel_common::WORKBENCH_AGENT_RUNTIME_VERSION,
+            ),
+            nonce,
+            4,
+            4242,
+            &[4242, 2],
+        )
+        .unwrap();
+        assert!(validate_workbench_startup_attestation(&valid, nonce, 4, 4243, &[4242]).is_err());
+        assert!(
+            validate_workbench_startup_attestation(&valid, nonce, 4, 4242, &[4243, 4242]).is_err()
+        );
+        assert!(
+            validate_workbench_startup_attestation(&valid, nonce, 4, 4242, &[4242, 2]).is_err()
+        );
+        assert!(validate_workbench_startup_attestation(&valid, nonce, 4, 4242, &[]).is_err());
+        assert!(validate_workbench_startup_attestation(&valid, nonce, 3, 4242, &[4242]).is_err());
         assert!(validate_workbench_startup_attestation(
             &bytes(
                 4242,
@@ -2417,6 +2464,7 @@ mod tests {
             nonce,
             4,
             4242,
+            &[4242],
         )
         .is_err());
         assert!(validate_workbench_startup_attestation(
@@ -2424,9 +2472,16 @@ mod tests {
             nonce,
             4,
             4242,
+            &[4242],
         )
         .is_err());
-        assert!(validate_workbench_startup_attestation(b"{}", nonce, 4, 4242).is_err());
+        assert!(validate_workbench_startup_attestation(b"{}", nonce, 4, 4242, &[4242]).is_err());
+        assert_eq!(
+            parse_pid_namespace_chain("Name:\tagent-runtime\nNSpid:\t4242\t2\n"),
+            Some(vec![4242, 2])
+        );
+        assert_eq!(parse_pid_namespace_chain("NSpid:\t4242\t0\n"), None);
+        assert_eq!(parse_pid_namespace_chain("Name:\tagent-runtime\n"), None);
     }
 
     #[test]
