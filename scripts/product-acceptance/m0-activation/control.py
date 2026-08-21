@@ -28,6 +28,9 @@ CONTROL_LOCK = SAFE_ROOT / ".m0-activation-control.lock"
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_TIMEOUT_SECONDS = 30.0
+# Canonical service units allow up to 15 seconds to stop. Rollback must not
+# inherit a shorter readiness-command timeout and abandon a valid shutdown.
+ROLLBACK_COMMAND_TIMEOUT_SECONDS = 20.0
 MAX_ACTIVATION_DEADLINE_SECONDS = 900.0
 DEFAULT_ACTIVATION_DEADLINE_SECONDS = 300.0
 ACTIVATION_POLL_SECONDS = 1.0
@@ -883,7 +886,11 @@ def _activate(
     if failure is not None:
         for unit in ROLLBACK_ORDER:
             try:
-                result = invoke(runner, (str(SYSTEMCTL), "stop", unit), timeout)
+                result = invoke(
+                    runner,
+                    (str(SYSTEMCTL), "stop", unit),
+                    ROLLBACK_COMMAND_TIMEOUT_SECONDS,
+                )
             except ControlError:
                 rollback_failed = True
                 continue
@@ -891,7 +898,9 @@ def _activate(
                 rollback_failed = True
             else:
                 try:
-                    values = systemctl_show(runner, unit, timeout)
+                    values = systemctl_show(
+                        runner, unit, ROLLBACK_COMMAND_TIMEOUT_SECONDS
+                    )
                     if values["ActiveState"] != "inactive":
                         rollback_failed = True
                 except ControlError:
