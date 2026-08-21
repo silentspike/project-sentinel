@@ -45,6 +45,10 @@ const (
 	shutdownTimeout = 10 * time.Second
 )
 
+func listenTCP4(address string) (net.Listener, error) {
+	return net.Listen("tcp4", address)
+}
+
 //nolint:gocyclo // composition root wires many runtime subsystems in one place
 func main() {
 	// 1. Structured logging via slog
@@ -618,7 +622,12 @@ func main() {
 	// 8. Start servers
 	go func() {
 		logger.Info("proxy server starting", "addr", proxyServer.Addr)
-		if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		listener, err := listenTCP4(proxyServer.Addr)
+		if err != nil {
+			logger.Error("proxy listener failed", "error", err)
+			os.Exit(1)
+		}
+		if err := proxyServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			logger.Error("proxy server failed", "error", err)
 			os.Exit(1)
 		}
@@ -626,7 +635,12 @@ func main() {
 
 	go func() {
 		logger.Info("control plane starting", "addr", controlServer.Addr)
-		if err := controlServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		listener, err := listenTCP4(controlServer.Addr)
+		if err != nil {
+			logger.Error("control listener failed", "error", err)
+			os.Exit(1)
+		}
+		if err := controlServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			logger.Error("control server failed", "error", err)
 			os.Exit(1)
 		}

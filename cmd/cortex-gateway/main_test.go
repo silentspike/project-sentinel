@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -17,6 +18,19 @@ import (
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/synthesis"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/ticksync"
 )
+
+func TestListenTCP4UsesAnIPv4Socket(t *testing.T) {
+	listener, err := listenTCP4("0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	address, ok := listener.Addr().(*net.TCPAddr)
+	if !ok || address.IP.To4() == nil {
+		t.Fatalf("listener address = %#v, want IPv4", listener.Addr())
+	}
+}
 
 type inventoryTestProvider struct {
 	name   string
