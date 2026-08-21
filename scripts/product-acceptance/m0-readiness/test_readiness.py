@@ -117,6 +117,7 @@ def valid_runtime() -> dict[str, object]:
 def validate_topology(units: dict[str, str], health_script: str) -> None:
     nats = units["nats-server.service"]
     daemon = units["sentinel-daemon.service"]
+    projection = units["sentinel-projection.service"]
     bridge = units["sentinel-nats-bridge.service"]
     judge = units["sentinel-judge.service"]
     health_service = units["sentinel-health-monitor.service"]
@@ -141,6 +142,10 @@ def validate_topology(units: dict[str, str], health_script: str) -> None:
         raise ValueError("daemon_operator_credential_gate_missing")
     if "sentinel-projection.service" in daemon:
         raise ValueError("daemon_projection_cycle")
+    if "Requires=sentinel-daemon.service" not in projection:
+        raise ValueError("projection_lifecycle_dependency_missing")
+    if "After=sentinel-daemon.service" in projection:
+        raise ValueError("projection_bootstrap_cycle")
     if "Requires=nats-server.service sentinel-daemon.service" not in bridge:
         raise ValueError("bridge_readiness_dependency_missing")
     if "Requires=nats-server.service sentinel-daemon.service" not in judge:
@@ -815,6 +820,7 @@ class TopologyTests(unittest.TestCase):
         names = (
             "nats-server.service",
             "sentinel-daemon.service",
+            "sentinel-projection.service",
             "sentinel-nats-bridge.service",
             "sentinel-judge.service",
             "sentinel-nightrun.service",
@@ -825,9 +831,10 @@ class TopologyTests(unittest.TestCase):
         )
         return {name: self.unit(name) for name in names}
 
-    def test_nats_and_daemon_have_acyclic_local_readiness_gates(self) -> None:
+    def test_nats_daemon_and_projection_have_acyclic_local_readiness_gates(self) -> None:
         nats = self.unit("nats-server.service")
         daemon = self.unit("sentinel-daemon.service")
+        projection = self.unit("sentinel-projection.service")
         self.assertIn("m0-readiness.py nats --timeout-seconds 285", nats)
         self.assertIn("TimeoutStartSec=300", nats)
         self.assertIn("After=network-online.target nats-server.service", daemon)
@@ -849,6 +856,8 @@ class TopologyTests(unittest.TestCase):
             daemon.index("ExecStart=/opt/sentinel/bin/sentinel-daemon"),
         )
         self.assertNotIn("sentinel-projection.service", daemon)
+        self.assertIn("Requires=sentinel-daemon.service", projection)
+        self.assertNotIn("After=sentinel-daemon.service", projection)
 
     def test_bridge_and_judge_require_ready_nats_and_daemon(self) -> None:
         bridge = self.unit("sentinel-nats-bridge.service")
@@ -920,6 +929,11 @@ check_service nats nats-server.service nats '' '' 5 observe
             "Requires=nats-server.service sentinel-daemon.service", "Requires=nats-server.service"
         )
         mutations.append(no_daemon)
+        projection_cycle = self.units()
+        projection_cycle["sentinel-projection.service"] += (
+            "\nAfter=sentinel-daemon.service\n"
+        )
+        mutations.append(projection_cycle)
         leaked_nightrun = self.units()
         leaked_nightrun["sentinel-nightrun.service"] = leaked_nightrun[
             "sentinel-nightrun.service"

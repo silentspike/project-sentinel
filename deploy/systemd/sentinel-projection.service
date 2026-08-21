@@ -1,7 +1,9 @@
 [Unit]
 Description=Sentinel Projection Worker — CQRS Read-Model Service
 Documentation=https://github.com/silentspike/project-sentinel/issues/53
-After=sentinel-daemon.service
+# The daemon's ExecStartPost requires projection-backed runtime readiness. Keep
+# lifecycle coupling through Requires, but start both units concurrently so the
+# projection can converge while the daemon is still activating.
 Requires=sentinel-daemon.service
 StartLimitBurst=5
 StartLimitIntervalSec=300
