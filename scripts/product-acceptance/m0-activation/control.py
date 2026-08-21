@@ -76,7 +76,21 @@ TOPOLOGY = (
 )
 ALL_UNITS = (AUTH_INIT, *TOPOLOGY, TARGET)
 INSPECT_UNITS = (*ALL_UNITS, *ONESHOTS)
-ROLLBACK_ORDER = (TARGET, *ONESHOTS, *tuple(reversed(TOPOLOGY)), AUTH_INIT)
+ROLLBACK_ORDER = (
+    TARGET,
+    *ONESHOTS,
+    "sentinel-health-monitor.timer",
+    "sentinel-judge.service",
+    "sentinel-nats-bridge.service",
+    "sentinel-nightrun.timer",
+    "sentinel-gaia-loop.service",
+    "sentinel-projection.service",
+    "sentinel-dashboard-backend.service",
+    "sentinel-gateway.service",
+    "sentinel-daemon.service",
+    "nats-server.service",
+    AUTH_INIT,
+)
 BASE_CHILD_ENV = {
     "LC_ALL": "C",
     "PATH": "/usr/bin:/bin",
@@ -869,7 +883,7 @@ def _activate(
     invocation_units = list(ROLLBACK_ORDER)
     failure: str | None = None
     readiness_digest: str | None = None
-    rollback_failed = False
+    rollback_failures: list[dict[str, str]] = []
     try:
         result = invoke(
             runner, (str(SYSTEMCTL), "start", "--no-block", TARGET), timeout
@@ -892,19 +906,24 @@ def _activate(
                     ROLLBACK_COMMAND_TIMEOUT_SECONDS,
                 )
             except ControlError:
-                rollback_failed = True
+                rollback_failures.append({"unit": unit, "reason": "stop_command_failed"})
                 continue
             if result.returncode != 0:
-                rollback_failed = True
+                rollback_failures.append({"unit": unit, "reason": "stop_rejected"})
             else:
                 try:
                     values = systemctl_show(
                         runner, unit, ROLLBACK_COMMAND_TIMEOUT_SECONDS
                     )
                     if values["ActiveState"] != "inactive":
-                        rollback_failed = True
+                        rollback_failures.append(
+                            {"unit": unit, "reason": "unit_still_active"}
+                        )
                 except ControlError:
-                    rollback_failed = True
+                    rollback_failures.append(
+                        {"unit": unit, "reason": "stop_readback_failed"}
+                    )
+        rollback_failed = bool(rollback_failures)
         receipt = {
             "schema_version": SCHEMA_VERSION,
             "status": "ROLLBACK_FAILED" if rollback_failed else "ROLLED_BACK",
@@ -913,6 +932,7 @@ def _activate(
             "manifest_sha256": expected_manifest_sha,
             "provision_receipt_sha256": expected_receipt_sha,
             "started_unit_count": len(invocation_units),
+            "rollback_failures": rollback_failures,
             "readiness_digest": None,
             "m0_acceptance_pass": False,
         }

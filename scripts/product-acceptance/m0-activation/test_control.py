@@ -984,6 +984,17 @@ class ControlTests(unittest.TestCase):
             ],
         )
 
+    def test_rollback_stops_nats_consumers_before_nats(self) -> None:
+        daemon_index = control.ROLLBACK_ORDER.index("sentinel-daemon.service")
+        nats_index = control.ROLLBACK_ORDER.index("nats-server.service")
+        self.assertLess(daemon_index, nats_index)
+        for consumer in (
+            "sentinel-daemon.service",
+            "sentinel-judge.service",
+            "sentinel-nats-bridge.service",
+        ):
+            self.assertLess(control.ROLLBACK_ORDER.index(consumer), nats_index)
+
     def test_partial_failed_start_and_readback_error_stop_full_topology_target_first(self) -> None:
         cases = ("partial_failed_start", "post_start_readback_error")
         for case in cases:
@@ -1035,6 +1046,10 @@ class ControlTests(unittest.TestCase):
             self.fixture.activate(self.runner)
         receipt = json.loads(self.fixture.activation.read_text())
         self.assertEqual(receipt["status"], "ROLLBACK_FAILED")
+        self.assertEqual(
+            receipt["rollback_failures"],
+            [{"unit": control.SERVICES[-1], "reason": "stop_rejected"}],
+        )
 
     def test_restart_controller_replays_same_ledger_and_ids(self) -> None:
         result = self.fixture.restart(self.runner)

@@ -32,6 +32,22 @@ fn compatibility_level(require_full_enforcement: bool) -> landlock::CompatLevel 
     }
 }
 
+fn access_for_path_fd(
+    fd: &landlock::PathFd,
+    requested: landlock::BitFlags<landlock::AccessFs>,
+    abi: landlock::ABI,
+) -> Result<landlock::BitFlags<landlock::AccessFs>> {
+    use nix::sys::stat::{fstat, SFlag};
+
+    let metadata = fstat(fd).context("Failed to inspect Landlock path type")?;
+    let file_type = SFlag::from_bits_truncate(metadata.st_mode);
+    Ok(if file_type.contains(SFlag::S_IFDIR) {
+        requested
+    } else {
+        requested & landlock::AccessFs::from_file(abi)
+    })
+}
+
 /// Returns the measured ABI only when the irreversible ruleset result exactly
 /// satisfies the workbench contract.
 pub fn workbench_fully_enforced_abi(
@@ -161,8 +177,10 @@ impl LandlockRuleset {
         // Read-only paths
         for path in &self.read_paths {
             if path.exists() {
+                let fd = PathFd::new(path)?;
+                let access = access_for_path_fd(&fd, read_access, abi)?;
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(PathFd::new(path)?, read_access))
+                    .add_rule(PathBeneath::new(fd, access))
                     .with_context(|| format!("Failed to add read rule for {}", path.display()))?;
             }
         }
@@ -170,8 +188,10 @@ impl LandlockRuleset {
         // Writable paths — full access except execute
         for path in &self.write_paths {
             if path.exists() {
+                let fd = PathFd::new(path)?;
+                let access = access_for_path_fd(&fd, write_access, abi)?;
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(PathFd::new(path)?, write_access))
+                    .add_rule(PathBeneath::new(fd, access))
                     .with_context(|| format!("Failed to add write rule for {}", path.display()))?;
             }
         }
@@ -179,8 +199,10 @@ impl LandlockRuleset {
         // Executable paths — read + execute
         for path in &self.exec_paths {
             if path.exists() {
+                let fd = PathFd::new(path)?;
+                let access = access_for_path_fd(&fd, exec_access, abi)?;
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(PathFd::new(path)?, exec_access))
+                    .add_rule(PathBeneath::new(fd, access))
                     .with_context(|| format!("Failed to add exec rule for {}", path.display()))?;
             }
         }
@@ -329,5 +351,26 @@ mod tests {
 
         assert_eq!(compatibility_level(false), CompatLevel::BestEffort);
         assert_eq!(compatibility_level(true), CompatLevel::HardRequirement);
+    }
+
+    #[test]
+    fn regular_file_rules_strip_directory_only_access() {
+        use landlock::{Access, AccessFs, ABI};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let file = directory.path().join("resolv.conf");
+        std::fs::write(&file, "nameserver 127.0.0.1\n").expect("write fixture");
+        let requested = AccessFs::from_all(ABI::V4);
+
+        let directory_fd = landlock::PathFd::new(directory.path()).expect("open directory");
+        let file_fd = landlock::PathFd::new(&file).expect("open file");
+        assert_eq!(
+            access_for_path_fd(&directory_fd, requested, ABI::V4).expect("directory access"),
+            requested,
+        );
+        assert_eq!(
+            access_for_path_fd(&file_fd, requested, ABI::V4).expect("file access"),
+            requested & AccessFs::from_file(ABI::V4),
+        );
     }
 }

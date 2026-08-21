@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
 import shutil
@@ -178,7 +179,19 @@ class OperatorCredentialWiringTests(unittest.TestCase):
         self.assertIn('"sentinel-auth-init.service",', provisioner)
         self.assertIn('AUTH_INIT = "sentinel-auth-init.service"', activation)
         self.assertIn("ALL_UNITS = (AUTH_INIT, *TOPOLOGY, TARGET)", activation)
-        self.assertIn("*tuple(reversed(TOPOLOGY)), AUTH_INIT", activation)
+        module = ast.parse(activation)
+        rollback_order = next(
+            node.value
+            for node in module.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "ROLLBACK_ORDER"
+                for target in node.targets
+            )
+        )
+        self.assertIsInstance(rollback_order, ast.Tuple)
+        self.assertIsInstance(rollback_order.elts[-1], ast.Name)
+        self.assertEqual(rollback_order.elts[-1].id, "AUTH_INIT")
 
     def test_productive_operator_consumers_use_file_references_only(self) -> None:
         gateway_main = GATEWAY_MAIN.read_text(encoding="utf-8")
