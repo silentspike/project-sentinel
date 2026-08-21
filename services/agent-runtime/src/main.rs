@@ -83,10 +83,7 @@ fn workbench_mode_requested() -> bool {
 }
 
 fn run_general_agent() {
-    eprintln!(
-        "agent-runtime: general agent started (pid={})",
-        std::process::id()
-    );
+    eprintln!("agent-runtime: started (pid={})", std::process::id());
 
     let running = Arc::new(AtomicBool::new(true));
     let reader_running = running.clone();
@@ -111,7 +108,7 @@ fn run_general_agent() {
         thread::sleep(INPUT_POLL_INTERVAL);
     }
 
-    eprintln!("agent-runtime: general agent shutting down");
+    eprintln!("agent-runtime: shutting down");
 }
 
 fn run_workbench() {
