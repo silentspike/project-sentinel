@@ -25,7 +25,6 @@ import (
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/extraction"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/guardrails"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/intercept"
-	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/mapping"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/resilience"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/sequencing"
@@ -508,7 +507,6 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 				// can encode deterministic targets that plain text extraction would lose.
 				actions := buildSynthesisActions(result.Actions, ph.ext, content)
 				actions = ph.enforceActionPolicy(actions, agentName, requestID, &req)
-				ph.persistActions(actions, agentName, requestID, &req)
 				duration := time.Since(start)
 				pipelineRequestsTotal.WithLabelValues("synthesis", "ok").Inc()
 				pipelineLatency.WithLabelValues("synthesis").Observe(duration.Seconds())
@@ -580,7 +578,6 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 					guardrails.RecordRuntimeSynthesisSavings()
 					actions := buildSynthesisActions(nil, ph.ext, content)
 					actions = ph.enforceActionPolicy(actions, agentName, requestID, &req)
-					ph.persistActions(actions, agentName, requestID, &req)
 					duration := time.Since(start)
 					pipelineRequestsTotal.WithLabelValues("apicp", "ok").Inc()
 					pipelineLatency.WithLabelValues("apicp").Observe(duration.Seconds())
@@ -796,10 +793,10 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	actions := ph.ext.Extract(content)
 	actions = ph.enforceActionPolicy(actions, agentName, requestID, &req)
 
-	// --- Step 8b: Persist extracted actions as events (AC-5) ---
-	ph.persistActions(actions, agentName, requestID, &req)
+	// The daemon owns action application and persists AgentActionReceived only
+	// after ECS accepts the action. Gateway output is an uncommitted proposal.
 
-	// --- Step 8c: API-CP Observation (record call for learning) ---
+	// --- Step 8b: API-CP Observation (record call for learning) ---
 	if ph.observer != nil && snap.APICPEnabled {
 		fp := req.Metadata["synth_fp"]
 		agentID := req.Metadata["agent_id"]
@@ -1337,45 +1334,6 @@ func (ph *PipelineHandler) qualityGateCheck(ctx context.Context, content, agentN
 
 	ph.logger.Warn("quality gate max regen reached", "agent", agentName, "max_regen", snap.QualityMaxRegen)
 	return current
-}
-
-// persistActions writes extracted actions as domain events to the event store (AC-5).
-func (ph *PipelineHandler) persistActions(actions []extraction.ExtractedAction, agentName, requestID string, req *LLMRequest) {
-	if ph.eventStore == nil || len(actions) == 0 || req == nil || req.RequestClass != RequestClassAgentRuntime {
-		return
-	}
-	agentID, err := strconv.ParseUint(strings.TrimSpace(req.Metadata["agent_id"]), 10, 16)
-	if err != nil || agentID == 0 || agentID > maxAgentRuntimeID {
-		ph.logger.Warn("agent action persistence rejected invalid authenticated identity",
-			"request_id", requestID,
-			"agent", agentName,
-		)
-		return
-	}
-	meta := mapping.ActionMeta{
-		AgentID:   uint16(agentID),
-		RequestID: requestID,
-		Tick:      parseTick(req.Metadata),
-	}
-	domainEvents, err := mapping.MapActions(actions, meta)
-	if err != nil {
-		ph.logger.Warn("agent action mapping failed closed",
-			"error", err,
-			"request_id", requestID,
-			"agent", agentName,
-		)
-		return
-	}
-	for _, evt := range domainEvents {
-		topic := fmt.Sprintf("sentinel/cortex/events/%s", evt.AggregateID)
-		if err := ph.eventStore.AppendWithOutbox(evt, topic); err != nil {
-			ph.logger.Warn("event store write failed",
-				"error", err,
-				"request_id", requestID,
-				"agent", agentName,
-			)
-		}
-	}
 }
 
 func (ph *PipelineHandler) enforceActionPolicy(actions []extraction.ExtractedAction, agentName, requestID string, req *LLMRequest) []extraction.ExtractedAction {

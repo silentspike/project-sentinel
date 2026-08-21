@@ -415,7 +415,7 @@ func TestAC_13_10_PromptCompiler(t *testing.T) {
 }
 
 // AC-13-AC5: Command→Event Mapping persistiert Event+Outbox atomar
-func TestAC_13_AC5_CommandEventMapping(t *testing.T) {
+func TestAC_13_AC5_GatewayDoesNotCommitActionProposals(t *testing.T) {
 	// 1. Temp-DB
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "ac5_test.db")
@@ -482,44 +482,29 @@ func TestAC_13_AC5_CommandEventMapping(t *testing.T) {
 		t.Errorf("request_id = %q, want %q", pipelineResp.RequestID, "test-req-ac5-001")
 	}
 
-	// 5. Verify: Event in DB mit event_type="agent_move"
+	// 5. The Gateway returns an action proposal. The daemon applies it and is
+	// the sole producer of the canonical AgentActionReceived event.
+	if len(pipelineResp.Actions) == 0 {
+		t.Fatal("expected an extracted action proposal in the response")
+	}
 	eventCount, err := store.EventCount()
 	if err != nil {
 		t.Fatalf("EventCount: %v", err)
 	}
-	if eventCount == 0 {
-		t.Fatal("expected events in store, got 0")
+	if eventCount != 0 {
+		t.Fatalf("gateway committed %d unapplied action proposals", eventCount)
 	}
 
-	// 6. Verify: Outbox-Eintrag mit status="pending"
+	// 6. No applied-action outbox entry exists before daemon/ECS acceptance.
 	pendingCount, err := store.PendingOutboxCount()
 	if err != nil {
 		t.Fatalf("PendingOutboxCount: %v", err)
 	}
-	if pendingCount == 0 {
-		t.Fatal("expected pending outbox entries, got 0")
+	if pendingCount != 0 {
+		t.Fatalf("gateway created %d unapplied action outbox entries", pendingCount)
 	}
 
-	// 7. Verify: operation_id is deterministic (same Request-ID -> same op_id)
-	moveEvent, err := store.GetEventByOperationID("test-req-ac5-001-0")
-	if err != nil {
-		t.Fatalf("GetEventByOperationID: %v", err)
-	}
-	if moveEvent == nil {
-		// Extraction might create multiple actions; check first action index
-		t.Fatal("expected event with operation_id=test-req-ac5-001-0, got nil")
-	}
-	if moveEvent.AggregateID != "AGENT-03" {
-		t.Errorf("aggregate_id = %q, want %q", moveEvent.AggregateID, "AGENT-03")
-	}
-	if moveEvent.CorrelationID != "test-req-ac5-001" {
-		t.Errorf("correlation_id = %q, want %q", moveEvent.CorrelationID, "test-req-ac5-001")
-	}
-	if moveEvent.Tick != 42 {
-		t.Errorf("tick = %d, want %d", moveEvent.Tick, 42)
-	}
-
-	// 8. Verify: Retry-Idempotenz (gleicher Request nochmal → kein Duplikat)
+	// 7. Retrying the inference request still cannot create an applied event.
 	req2 := httptest.NewRequest(http.MethodPost, "/internal/agent-runtime", strings.NewReader(reqBody))
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Authorization", "Bearer acceptance-agent-runtime")
@@ -528,9 +513,8 @@ func TestAC_13_AC5_CommandEventMapping(t *testing.T) {
 	securedHandler.ServeHTTP(w2, req2)
 
 	eventCountAfterRetry, _ := store.EventCount()
-	if eventCountAfterRetry != eventCount {
-		t.Errorf("after retry: event count changed from %d to %d (should be idempotent)",
-			eventCount, eventCountAfterRetry)
+	if eventCountAfterRetry != 0 {
+		t.Errorf("retry committed %d unapplied action proposals", eventCountAfterRetry)
 	}
 }
 
