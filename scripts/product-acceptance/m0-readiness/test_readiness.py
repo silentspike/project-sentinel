@@ -66,6 +66,27 @@ def valid_agent(agent_id: int) -> dict[str, object]:
     }
 
 
+def valid_projection_ghost(agent_id: int) -> dict[str, object]:
+    return {
+        "agent_id": agent_id,
+        "aggregate_id": f"AGENT-{agent_id:02}",
+        "runtime_present": False,
+        "projection_present": True,
+        "tracked_pid": None,
+        "tracked_pid_alive": False,
+        "tracked_pid_state": None,
+        "cgroup_live_pid_count": 0,
+        "security_runtime_present": False,
+        "adapter_handle_present": False,
+        "adapter_instance_matches": False,
+        "runtime_resources_healthy": False,
+        "adapter_health_state": None,
+        "adapter_observation_error": None,
+        "logical_status": None,
+        "last_repair_status": "unexpected_runtime",
+    }
+
+
 def valid_runtime() -> dict[str, object]:
     return {
         "expected_active_agents": 2,
@@ -291,6 +312,62 @@ class ReadinessTests(unittest.TestCase):
             agent["projection_present"] = False
         self.assertEqual(
             readiness.validate_daemon_payload(payload)["expected_active_agents"], 2
+        )
+
+    def test_daemon_local_gate_ignores_only_quiescent_projection_ghosts(self) -> None:
+        payload = valid_runtime()
+        expected_roster_digest = readiness.validate_daemon_payload(payload)[
+            "roster_digest"
+        ]
+        payload.update(
+            projection_agents=4,
+            projection_drift_detected=True,
+            projection_drift_agents=2,
+            stale_runtime_entries=2,
+            repair_last_status="drift_detected",
+        )
+        payload["agents"].extend(
+            [valid_projection_ghost(16), valid_projection_ghost(17)]
+        )
+
+        result = readiness.validate_daemon_payload(payload)
+
+        self.assertEqual(result["expected_active_agents"], 2)
+        self.assertEqual(result["roster_digest"], expected_roster_digest)
+
+    def test_daemon_local_gate_rejects_non_quiescent_projection_ghosts(self) -> None:
+        mutations = (
+            ("projection_present", False),
+            ("tracked_pid", 2200),
+            ("tracked_pid_alive", True),
+            ("tracked_pid_state", "S"),
+            ("cgroup_live_pid_count", 1),
+            ("security_runtime_present", True),
+            ("adapter_handle_present", True),
+            ("adapter_instance_matches", True),
+            ("runtime_resources_healthy", True),
+            ("adapter_health_state", "healthy"),
+            ("adapter_observation_error", "bounded-error"),
+            ("logical_status", "Active"),
+            ("last_repair_status", "healthy"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                payload = valid_runtime()
+                ghost = valid_projection_ghost(16)
+                ghost[field] = value
+                payload["agents"].append(ghost)
+                self.assert_code(
+                    "daemon_not_initialized",
+                    lambda payload=payload: readiness.validate_daemon_payload(payload),
+                )
+
+    def test_daemon_local_gate_rejects_duplicate_projection_identity(self) -> None:
+        payload = valid_runtime()
+        payload["agents"].append(valid_projection_ghost(1))
+        self.assert_code(
+            "daemon_agent_roster_mismatch",
+            lambda: readiness.validate_daemon_payload(payload),
         )
 
     def test_daemon_waits_for_local_runtime_convergence(self) -> None:
