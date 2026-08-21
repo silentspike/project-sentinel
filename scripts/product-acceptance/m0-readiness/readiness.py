@@ -310,7 +310,7 @@ def wait_for_ready(
     last_code = "readiness_timeout"
     while True:
         remaining = deadline - clock()
-        if remaining <= 0:
+        if remaining < 0.1:
             raise ReadinessError(last_code)
         try:
             return attempt(min(5.0, remaining))

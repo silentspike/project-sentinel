@@ -1408,14 +1408,16 @@ impl SandboxEnforcer {
     pub fn start_workbench_process(
         &self,
         name: &str,
-        fs_host_agent_dir: Option<&str>,
+        _fs_host_agent_dir: Option<&str>,
         command: &[String],
     ) -> Result<AgentProcess> {
         if !self.bwrap_available {
             anyhow::bail!("bwrap not available — cannot start workbench process");
         }
-        let host_agent_root =
-            workbench_host_agent_root(self.fs_mount.as_deref(), name, fs_host_agent_dir);
+        // sentinel-fs is the normal agent-home view, but its POSIX surface does
+        // not own mutable workbench directories. Keep those roots on the
+        // persistent, agent-private host backing that setup_agent() creates.
+        let host_agent_root = workbench_host_agent_root(name);
         prepare_workbench_roots(&host_agent_root)?;
         let config = BwrapConfig::for_agent(name)
             .for_workbench()
@@ -2047,15 +2049,8 @@ fn validate_workbench_startup_attestation(
     Ok(())
 }
 
-fn workbench_host_agent_root(
-    fs_mount: Option<&str>,
-    agent_name: &str,
-    fs_host_agent_dir: Option<&str>,
-) -> PathBuf {
-    match fs_mount {
-        Some(fs_mount) => PathBuf::from(fs_mount).join(fs_host_agent_dir.unwrap_or(agent_name)),
-        None => PathBuf::from("/ram/agents").join(agent_name),
-    }
+fn workbench_host_agent_root(agent_name: &str) -> PathBuf {
+    PathBuf::from("/ram/agents").join(agent_name)
 }
 
 fn landlock_wrapper_path() -> PathBuf {
@@ -2372,14 +2367,10 @@ mod tests {
     }
 
     #[test]
-    fn workbench_roots_cover_default_and_active_fs_backing_fail_closed() {
+    fn workbench_roots_stay_on_writable_agent_backing_with_active_fs_mount() {
         assert_eq!(
-            workbench_host_agent_root(None, "alice", Some("AGENT-01")),
+            workbench_host_agent_root("alice"),
             PathBuf::from("/ram/agents/alice")
-        );
-        assert_eq!(
-            workbench_host_agent_root(Some("/mnt/sentinel-fs"), "alice", Some("AGENT-01")),
-            PathBuf::from("/mnt/sentinel-fs/AGENT-01")
         );
 
         let directory = tempfile::tempdir().unwrap();
