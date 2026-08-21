@@ -17,6 +17,8 @@ set -uo pipefail
 readonly SCRIPT_NAME="sentinel-health-monitor"
 readonly STATE_FILE="/opt/sentinel/data/health-monitor.state"
 readonly EVENT_STORE_DB="/opt/sentinel/data/events.db"
+readonly ACTIVATION_CONTROL_LOCK="/work/tmp/project-sentinel/.m0-activation-control.lock"
+RESTART_LOCK_FD=""
 
 # --- Defaults (overridable via env file) ---
 NTFY_SERVER="${NTFY_SERVER:-https://<ntfy-server>}"
@@ -167,6 +169,78 @@ check_projection_lag() {
     echo "$lag"
 }
 
+acquire_restart_authority() {
+    local parent owner mode previous_umask
+    local file_owner file_mode file_links file_device file_inode
+    local path_device path_inode
+    parent=${ACTIVATION_CONTROL_LOCK%/*}
+
+    if [ ! -d "$parent" ] || [ -L "$parent" ]; then
+        log_error "restart authority unavailable: activation lock parent is unsafe"
+        return 1
+    fi
+    read -r owner mode < <(stat -Lc '%u %a' -- "$parent") || {
+        log_error "restart authority unavailable: activation lock parent cannot be read"
+        return 1
+    }
+    if [ "$owner" != "$(id -u)" ] || [[ "$mode" != "700" && "$mode" != "755" ]]; then
+        log_error "restart authority unavailable: activation lock parent ownership or mode is unsafe"
+        return 1
+    fi
+    if [ -L "$ACTIVATION_CONTROL_LOCK" ]; then
+        log_error "restart authority unavailable: activation lock is a symlink"
+        return 1
+    fi
+
+    previous_umask=$(umask)
+    umask 077
+    if ! exec {RESTART_LOCK_FD}<>"$ACTIVATION_CONTROL_LOCK"; then
+        umask "$previous_umask"
+        log_error "restart authority unavailable: activation lock cannot be opened"
+        return 1
+    fi
+    umask "$previous_umask"
+
+    IFS='|' read -r file_owner file_mode file_links file_device file_inode < <(
+        stat -Lc '%u|%a|%h|%d|%i' -- "/proc/self/fd/$RESTART_LOCK_FD"
+    ) || {
+        exec {RESTART_LOCK_FD}>&-
+        RESTART_LOCK_FD=""
+        log_error "restart authority unavailable: opened activation lock cannot be read"
+        return 1
+    }
+    read -r path_device path_inode < <(
+        stat -Lc '%d %i' -- "$ACTIVATION_CONTROL_LOCK"
+    ) || {
+        exec {RESTART_LOCK_FD}>&-
+        RESTART_LOCK_FD=""
+        log_error "restart authority unavailable: activation lock path cannot be read"
+        return 1
+    }
+    if [ ! -f "/proc/self/fd/$RESTART_LOCK_FD" ] || [ "$file_owner" != "$(id -u)" ] \
+        || [ "$file_mode" != "600" ] || [ "$file_links" != "1" ] \
+        || [ "$file_device" != "$path_device" ] || [ "$file_inode" != "$path_inode" ]; then
+        exec {RESTART_LOCK_FD}>&-
+        RESTART_LOCK_FD=""
+        log_error "restart authority unavailable: activation lock identity is unsafe"
+        return 1
+    fi
+    if ! flock --shared --nonblock "$RESTART_LOCK_FD"; then
+        exec {RESTART_LOCK_FD}>&-
+        RESTART_LOCK_FD=""
+        log_info "restart deferred: activation controller owns the mutation lock"
+        return 1
+    fi
+}
+
+release_restart_authority() {
+    if [ -n "$RESTART_LOCK_FD" ]; then
+        flock --unlock "$RESTART_LOCK_FD" 2>/dev/null || true
+        exec {RESTART_LOCK_FD}>&-
+        RESTART_LOCK_FD=""
+    fi
+}
+
 try_restart() {
     local unit="$1" name="$2"
     local count="${CURR_RESTARTS[$name]:-0}"
@@ -176,18 +250,24 @@ try_restart() {
         return 1
     fi
 
+    if ! acquire_restart_authority; then
+        return 1
+    fi
+
     CURR_RESTARTS[$name]=$((count + 1))
     log_info "$name: restarting (${CURR_RESTARTS[$name]}/$MAX_RESTARTS)"
     systemctl restart "$unit" 2>/dev/null || true
     sleep 3
 
+    local result=1
     if check_systemd_unit "$unit"; then
         log_info "$name: restart successful"
-        return 0
+        result=0
     else
         log_info "$name: restart failed"
-        return 1
     fi
+    release_restart_authority
+    return "$result"
 }
 
 # --- Service Check Logic ---
