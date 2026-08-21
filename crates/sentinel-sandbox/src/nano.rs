@@ -1330,7 +1330,9 @@ impl BwrapNanoRuntime {
                     .context("workbench process returned without isolation attestation")?;
                 anyhow::ensure!(
                     handle.cgroup_created
-                        && process.child_pid == Some(attestation.child_pid)
+                        && process.child_pid == Some(attestation.sandbox_init_pid)
+                        && attestation.runtime_pid > 0
+                        && attestation.runtime_namespace_pid > 1
                         && attestation.landlock_abi > 0,
                     "workbench process isolation evidence is incomplete"
                 );
@@ -1493,7 +1495,9 @@ impl BwrapNanoRuntime {
                     .context("restarted workbench process lacks isolation attestation")?;
                 anyhow::ensure!(
                     handle.cgroup_created
-                        && process.child_pid == Some(attestation.child_pid)
+                        && process.child_pid == Some(attestation.sandbox_init_pid)
+                        && attestation.runtime_pid > 0
+                        && attestation.runtime_namespace_pid > 1
                         && attestation.landlock_abi > 0,
                     "restarted workbench process isolation evidence is incomplete"
                 );
