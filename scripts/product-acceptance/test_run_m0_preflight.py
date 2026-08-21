@@ -439,6 +439,11 @@ id = "web-authoring-v1"
             "zombie_tracked_pids": 0,
             "worker_states": {
                 "ecs_tick_loop": {"running": True, "restart_count": 0, "last_error": None},
+                "episode_projection": {
+                    "running": True,
+                    "restart_count": 0,
+                    "last_error": None,
+                },
                 "service_health": {"running": True, "restart_count": 0, "last_error": None},
             },
             "analysis_queue_depth": 0,
@@ -922,6 +927,20 @@ class PreflightTests(unittest.TestCase):
         runtime["stale_runtime_entries"] = 1
         result = self.run_fixture()
         self.assertEqual(self.check(result, "identity_readiness")["reason"], "runtime_drift")
+
+    def test_runtime_worker_set_requires_productive_episode_projection(self) -> None:
+        for mutate in (
+            lambda workers: workers.pop("episode_projection"),
+            lambda workers: workers.update({"unknown_worker": workers["episode_projection"]}),
+        ):
+            fixture = Fixture()
+            workers = fixture.http_payloads["runtime_health"]["worker_states"]
+            mutate(workers)  # type: ignore[arg-type]
+            result = preflight.evaluate(fixture.inputs(), fixture.deps())
+            self.assertEqual(
+                self.check(result, "identity_readiness")["reason"],
+                "runtime_worker_mismatch",
+            )
 
     def test_full_preflight_rejects_projection_absent_during_daemon_local_boot(self) -> None:
         runtime = self.fixture.http_payloads["runtime_health"]

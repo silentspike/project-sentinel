@@ -350,7 +350,7 @@ def check_nats(
 
 def _validate_worker_states(value: Any) -> None:
     workers = require_object(value, "daemon_worker_state_invalid")
-    required = {"ecs_tick_loop", "service_health"}
+    required = {"ecs_tick_loop", "episode_projection", "service_health"}
     if not set(workers).issubset(required):
         fail("daemon_worker_state_invalid")
     for raw in workers.values():

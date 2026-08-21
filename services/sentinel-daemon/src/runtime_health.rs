@@ -137,6 +137,13 @@ fn adapter_state_is_degraded(agent: &RuntimeHealthAgentSnapshot) -> bool {
         )
 }
 
+fn tracked_process_count(agents: &[RuntimeHealthAgentSnapshot]) -> usize {
+    agents
+        .iter()
+        .filter(|agent| agent.tracked_pid_alive)
+        .count()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeHealthSnapshot {
     pub current_shift: u8,
@@ -491,6 +498,7 @@ fn build_runtime_health_snapshot_with_registry(
         },
     );
 
+    let tracked_processes = tracked_process_count(&agents);
     let mut snapshot = RuntimeHealthSnapshot {
         current_shift,
         expected_active_agents,
@@ -501,7 +509,7 @@ fn build_runtime_health_snapshot_with_registry(
         projection_drift_agents,
         security_runtime_entries: security_state.len(),
         sandbox_handles: sandbox_handles.len(),
-        tracked_processes: agent_processes.len(),
+        tracked_processes,
         live_cgroup_dirs: cgroup_snapshot.live_cgroup_dirs,
         stale_runtime_entries,
         orphan_cgroups,
@@ -1032,6 +1040,28 @@ mod tests {
             );
             assert!(!runtime_core_is_healthy(&active), "{runtime_key}");
         }
+    }
+
+    #[test]
+    fn tracked_process_count_uses_live_runtime_identity_not_legacy_ownership() {
+        let mut live = RuntimeHealthAgentSnapshot {
+            agent_id: 7,
+            aggregate_id: "AGENT-07".to_string(),
+            tracked_pid: Some(std::process::id()),
+            tracked_pid_alive: true,
+            ..RuntimeHealthAgentSnapshot::default()
+        };
+        let dead = RuntimeHealthAgentSnapshot {
+            agent_id: 8,
+            aggregate_id: "AGENT-08".to_string(),
+            tracked_pid: Some(u32::MAX),
+            tracked_pid_alive: false,
+            ..RuntimeHealthAgentSnapshot::default()
+        };
+
+        assert_eq!(tracked_process_count(&[live.clone(), dead]), 1);
+        live.tracked_pid_alive = false;
+        assert_eq!(tracked_process_count(&[live]), 0);
     }
 
     #[test]
