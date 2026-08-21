@@ -269,11 +269,48 @@ func TestPipelineAllowsLegitimateMoveActionWithPolicy(t *testing.T) {
 	if events[0].EventType != "agent_action_received" {
 		t.Fatalf("event type = %q, want agent_action_received", events[0].EventType)
 	}
-	var payload map[string]string
+	if events[0].AggregateID != "AGENT-01" {
+		t.Fatalf("aggregate_id = %q, want AGENT-01", events[0].AggregateID)
+	}
+	var payload map[string]any
 	if err := json.Unmarshal([]byte(events[0].Payload), &payload); err != nil {
 		t.Fatalf("payload unmarshal: %v", err)
 	}
 	if payload["action_type"] != "move" {
 		t.Fatalf("payload action_type = %q, want move", payload["action_type"])
+	}
+	if payload["type"] != "AgentActionReceived" || payload["agent_id"] != float64(1) {
+		t.Fatalf("payload is not canonical DomainEventPayload: %#v", payload)
+	}
+	if payload["target_room"] != "kueche" || payload["source"] != "external" {
+		t.Fatalf("payload target/source mismatch: %#v", payload)
+	}
+}
+
+func TestPersistActionsSkipsPlatformControlplaneResponses(t *testing.T) {
+	store, err := eventstore.Open(filepath.Join(t.TempDir(), "events.db"))
+	if err != nil {
+		t.Fatalf("open event store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	ph := &PipelineHandler{eventStore: store, logger: slog.Default()}
+	actions := []extraction.ExtractedAction{{
+		Type: "chat", Target: "Team", Content: "Ich habe das gehoert.",
+	}}
+	req := &LLMRequest{
+		RequestClass: RequestClassPlatformControlplane,
+		Metadata: map[string]string{
+			"agent_name":        "PLATFORM-CONTROLPLANE",
+			"platform_analysis": "true",
+		},
+	}
+
+	ph.persistActions(actions, "PLATFORM-CONTROLPLANE", "platform-request", req)
+	events, _, err := store.GetEventsSince(0, 10)
+	if err != nil {
+		t.Fatalf("GetEventsSince: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("platform response persisted executable agent events: %+v", events)
 	}
 }

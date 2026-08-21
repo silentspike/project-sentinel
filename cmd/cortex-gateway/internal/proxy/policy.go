@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -17,6 +18,7 @@ const (
 
 const (
 	AgentRuntimeModelPolicyHaiku = "haiku"
+	maxAgentRuntimeID            = 60
 
 	PolicySourceProviderDefault = "provider_default"
 	PolicySourceRequestOverride = "request_override"
@@ -79,10 +81,6 @@ func isPositiveNumericAgentID(value string) bool {
 	if value == "" || value[0] == '0' {
 		return false
 	}
-	for _, r := range value {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
+	id, err := strconv.ParseUint(value, 10, 16)
+	return err == nil && id >= 1 && id <= maxAgentRuntimeID
 }
