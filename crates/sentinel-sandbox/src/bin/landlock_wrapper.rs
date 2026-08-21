@@ -63,7 +63,11 @@ fn main() {
     // Apply Landlock (irreversible)
     let rules =
         sentinel_sandbox::LandlockRuleset::for_agent(agent_name).with_entrypoint_exec(&command[0]);
-    let enforcement = match rules.apply_status() {
+    let enforcement = match if attestation.is_some() {
+        rules.apply_required_status()
+    } else {
+        rules.apply_status()
+    } {
         Ok(enforcement) => enforcement,
         Err(e) => {
             eprintln!("[landlock-wrapper] Landlock apply failed: {e}");

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Issue #650 live-activation correction: require hard Landlock feature compatibility for attested workbench processes while preserving the general agent best-effort path, and give activation rollback an independent bounded systemd stop budget so a valid daemon shutdown cannot strand a partially started topology.
 - Issue #650 live-activation correction: keep mutable workbench input, workspace, and artifact roots on each agent's persistent writable host backing even when the normal agent home is presented through sentinel-fs, and preserve the last concrete readiness failure at a sub-100ms deadline edge.
 - Issue #650 legacy episode cutover: preserve receiptless legacy memories whose historical per-agent IDs are duplicated, while continuing to reject every duplicate receipt-backed projection identity.
 - Issue #650 live-activation correction: initialize the durable episode projection through an explicit, idempotent, operator-authenticated daemon preflight. Fresh stores start at the beginning, while non-empty legacy memory is sealed at the exact EventStore head without deleting or replaying existing episodes; subsequent starts validate the durable cutover receipt without requiring mutable config proofs.

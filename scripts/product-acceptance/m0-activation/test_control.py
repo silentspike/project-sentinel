@@ -861,6 +861,31 @@ class ControlTests(unittest.TestCase):
             "inactive",
         )
 
+    def test_rollback_uses_independent_systemd_stop_budget(self) -> None:
+        self.runner.terminal_failure_unit = "nats-server.service"
+        with self.assertRaisesRegex(control.ControlError, "activation_unit_failed"):
+            self.fixture.activate(self.runner)
+
+        first_stop = next(
+            index for index, call in enumerate(self.runner.calls)
+            if call[1] == "stop"
+        )
+        self.assertTrue(all(
+            timeout == control.ROLLBACK_COMMAND_TIMEOUT_SECONDS
+            for call, timeout in zip(
+                self.runner.calls[first_stop:], self.runner.timeouts[first_stop:]
+            )
+            if call[1] in {"stop", "show"}
+        ))
+        self.assertGreater(
+            control.ROLLBACK_COMMAND_TIMEOUT_SECONDS,
+            self.fixture.preflight().timeout,
+        )
+        self.assertLessEqual(
+            control.ROLLBACK_COMMAND_TIMEOUT_SECONDS,
+            control.MAX_TIMEOUT_SECONDS,
+        )
+
     def test_running_oneshot_that_later_fails_never_reaches_preflight(self) -> None:
         clock = FakeClock()
         unit = "sentinel-nightrun.service"
