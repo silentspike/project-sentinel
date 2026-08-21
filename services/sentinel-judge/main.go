@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,6 +27,11 @@ import (
 	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/service"
 )
 
+func listenTCP4(address string) (net.Listener, error) {
+	return net.Listen("tcp4", address)
+}
+
+//nolint:gocyclo // composition root wires the service lifecycle in one place
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
@@ -133,7 +139,7 @@ func main() {
 	httpHandler.RegisterRoutes(mux)
 
 	httpServer := &http.Server{
-		Addr:         ":" + strconv.Itoa(cfg.Server.Port),
+		Addr:         net.JoinHostPort("0.0.0.0", strconv.Itoa(cfg.Server.Port)),
 		Handler:      mux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
@@ -142,8 +148,13 @@ func main() {
 
 	// Start HTTP server
 	go func() {
-		logger.Info("http server starting", "port", cfg.Server.Port)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.Info("http server starting", "addr", httpServer.Addr)
+		listener, err := listenTCP4(httpServer.Addr)
+		if err != nil {
+			logger.Error("http listener failed", "error", err)
+			os.Exit(1)
+		}
+		if err := httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			logger.Error("http server failed", "error", err)
 			os.Exit(1)
 		}
@@ -175,7 +186,7 @@ func main() {
 	}
 
 	logger.Info("sentinel-judge ready",
-		"http", fmt.Sprintf(":%d", cfg.Server.Port),
+		"http", httpServer.Addr,
 		"nats_consumer", cfg.NATS.ConsumerName,
 		"ebpf_enabled", cfg.EBPF.Enabled,
 	)
