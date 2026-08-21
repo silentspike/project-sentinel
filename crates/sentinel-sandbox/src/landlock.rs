@@ -24,6 +24,14 @@ pub enum LandlockEnforcement {
     NotEnforced,
 }
 
+fn compatibility_level(require_full_enforcement: bool) -> landlock::CompatLevel {
+    if require_full_enforcement {
+        landlock::CompatLevel::HardRequirement
+    } else {
+        landlock::CompatLevel::BestEffort
+    }
+}
+
 /// Returns the measured ABI only when the irreversible ruleset result exactly
 /// satisfies the workbench contract.
 pub fn workbench_fully_enforced_abi(
@@ -118,6 +126,20 @@ impl LandlockRuleset {
     /// result. Workbench callers must require `FullyEnforced`; the general
     /// agent path may retain its existing best-effort policy.
     pub fn apply_status(&self) -> Result<LandlockEnforcement> {
+        self.apply_status_with_compatibility(false)
+    }
+
+    /// Applies the ruleset only when every requested Landlock feature is
+    /// supported. Workbench callers use this fail-closed path because a
+    /// partially enforced sandbox cannot satisfy the execution contract.
+    pub fn apply_required_status(&self) -> Result<LandlockEnforcement> {
+        self.apply_status_with_compatibility(true)
+    }
+
+    fn apply_status_with_compatibility(
+        &self,
+        require_full_enforcement: bool,
+    ) -> Result<LandlockEnforcement> {
         use landlock::*;
 
         let abi = ABI::V4;
@@ -130,6 +152,7 @@ impl LandlockRuleset {
         write_access.remove(AccessFs::Execute);
 
         let mut ruleset = Ruleset::default()
+            .set_compatibility(compatibility_level(require_full_enforcement))
             .handle_access(all_access)
             .context("Failed to handle Landlock access")?
             .create()
@@ -298,5 +321,13 @@ mod tests {
             workbench_fully_enforced_abi(LandlockEnforcement::NotEnforced, LANDLOCK_RULESET_ABI,),
             None
         );
+    }
+
+    #[test]
+    fn workbench_and_general_paths_select_distinct_compatibility_contracts() {
+        use landlock::CompatLevel;
+
+        assert_eq!(compatibility_level(false), CompatLevel::BestEffort);
+        assert_eq!(compatibility_level(true), CompatLevel::HardRequirement);
     }
 }
