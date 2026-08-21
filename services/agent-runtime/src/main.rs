@@ -39,7 +39,8 @@ struct StartupAttestation<'a> {
     wrapper_version: &'a str,
     runtime_version: &'static str,
     landlock_abi: u8,
-    host_pid: u32,
+    #[serde(rename = "host_pid")]
+    namespace_pid: u32,
 }
 
 #[derive(Clone)]
@@ -214,14 +215,14 @@ fn write_startup_attestation() -> io::Result<()> {
         .and_then(|value| value.parse::<u8>().ok())
         .filter(|abi| *abi > 0)
         .ok_or_else(|| io::Error::other("startup Landlock ABI is invalid"))?;
-    let host_pid = host_pid_from_nspid()?;
+    let namespace_pid = namespace_pid_from_nspid()?;
     let attestation = StartupAttestation {
         schema_version: STARTUP_ATTESTATION_SCHEMA_VERSION,
         nonce: &nonce,
         wrapper_version: &wrapper_version,
         runtime_version: env!("CARGO_PKG_VERSION"),
         landlock_abi,
-        host_pid,
+        namespace_pid,
     };
     let bytes = serde_json::to_vec(&attestation)
         .map_err(|_| io::Error::other("encode startup attestation"))?;
@@ -246,17 +247,17 @@ fn valid_attestation_nonce(nonce: &str) -> bool {
         })
 }
 
-fn host_pid_from_nspid() -> io::Result<u32> {
+fn namespace_pid_from_nspid() -> io::Result<u32> {
     let status = std::fs::read_to_string("/proc/self/status")?;
-    parse_host_pid_from_nspid(&status)
-        .ok_or_else(|| io::Error::other("host PID identity is unavailable"))
+    parse_namespace_pid_from_nspid(&status)
+        .ok_or_else(|| io::Error::other("PID namespace identity is unavailable"))
 }
 
-fn parse_host_pid_from_nspid(status: &str) -> Option<u32> {
+fn parse_namespace_pid_from_nspid(status: &str) -> Option<u32> {
     status
         .lines()
         .find_map(|line| line.strip_prefix("NSpid:"))
-        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.split_whitespace().last())
         .and_then(|value| value.parse().ok())
         .filter(|pid| *pid > 0)
 }
@@ -665,7 +666,7 @@ mod startup_attestation_tests {
     use super::*;
 
     #[test]
-    fn startup_attestation_nonce_and_host_pid_are_strict() {
+    fn startup_attestation_nonce_and_namespace_pid_are_strict() {
         assert!(valid_attestation_nonce(
             "018f3f32-4f01-4f2c-a6c1-f6f4a81b2903"
         ));
@@ -674,10 +675,14 @@ mod startup_attestation_tests {
         ));
         assert!(!valid_attestation_nonce("../attestation"));
         assert_eq!(
-            parse_host_pid_from_nspid("Name:\tagent-runtime\nNSpid:\t4242\t1\n"),
-            Some(4242)
+            parse_namespace_pid_from_nspid("Name:\tagent-runtime\nNSpid:\t4242\t2\n"),
+            Some(2)
         );
-        assert_eq!(parse_host_pid_from_nspid("NSpid:\t0\n"), None);
+        assert_eq!(parse_namespace_pid_from_nspid("NSpid:\t0\n"), None);
+        assert_eq!(
+            parse_namespace_pid_from_nspid("Name:\tagent-runtime\n"),
+            None
+        );
     }
 
     #[test]
