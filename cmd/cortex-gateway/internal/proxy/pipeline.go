@@ -1341,17 +1341,33 @@ func (ph *PipelineHandler) qualityGateCheck(ctx context.Context, content, agentN
 
 // persistActions writes extracted actions as domain events to the event store (AC-5).
 func (ph *PipelineHandler) persistActions(actions []extraction.ExtractedAction, agentName, requestID string, req *LLMRequest) {
-	if ph.eventStore == nil || len(actions) == 0 || agentName == "" {
+	if ph.eventStore == nil || len(actions) == 0 || req == nil || req.RequestClass != RequestClassAgentRuntime {
+		return
+	}
+	agentID, err := strconv.ParseUint(strings.TrimSpace(req.Metadata["agent_id"]), 10, 16)
+	if err != nil || agentID == 0 || agentID > maxAgentRuntimeID {
+		ph.logger.Warn("agent action persistence rejected invalid authenticated identity",
+			"request_id", requestID,
+			"agent", agentName,
+		)
 		return
 	}
 	meta := mapping.ActionMeta{
-		AgentName: agentName,
+		AgentID:   uint16(agentID),
 		RequestID: requestID,
 		Tick:      parseTick(req.Metadata),
 	}
-	domainEvents := mapping.MapActions(actions, meta)
+	domainEvents, err := mapping.MapActions(actions, meta)
+	if err != nil {
+		ph.logger.Warn("agent action mapping failed closed",
+			"error", err,
+			"request_id", requestID,
+			"agent", agentName,
+		)
+		return
+	}
 	for _, evt := range domainEvents {
-		topic := fmt.Sprintf("sentinel/cortex/events/%s", agentName)
+		topic := fmt.Sprintf("sentinel/cortex/events/%s", evt.AggregateID)
 		if err := ph.eventStore.AppendWithOutbox(evt, topic); err != nil {
 			ph.logger.Warn("event store write failed",
 				"error", err,
