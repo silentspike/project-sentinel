@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
@@ -865,6 +866,10 @@ class TopologyTests(unittest.TestCase):
             self.assertNotIn("After=sentinel.target", text)
         self.assertNotIn("ExecCondition=", health_service)
         self.assertIn("After=nats-server.service sentinel-daemon.service", health_service)
+        self.assertIn(
+            "ReadWritePaths=/opt/sentinel/data /work/tmp/project-sentinel",
+            health_service,
+        )
         self.assertIn("After=nats-server.service sentinel-daemon.service", health_timer)
         self.assertIn("After=sentinel-daemon.service", nightrun_timer)
         self.assertNotIn("Requires=sentinel-daemon.service", nightrun_timer)
@@ -902,6 +907,92 @@ check_service nats nats-server.service nats '' '' 5 observe
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["restart:sentinel-judge.service"])
+
+    def test_health_monitor_restart_and_activation_are_mutually_exclusive(self) -> None:
+        source = (REPO_ROOT / "deploy/scripts/sentinel-health-monitor.sh").read_text(
+            encoding="utf-8"
+        )
+        activation_control = (
+            REPO_ROOT / "scripts/product-acceptance/m0-activation/control.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('SAFE_ROOT = Path("/work/tmp/project-sentinel")', activation_control)
+        self.assertIn(
+            'CONTROL_LOCK = SAFE_ROOT / ".m0-activation-control.lock"',
+            activation_control,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            lock = root / ".m0-activation-control.lock"
+            script = root / "sentinel-health-monitor.sh"
+            rendered = source.replace(
+                'readonly ACTIVATION_CONTROL_LOCK="/work/tmp/project-sentinel/.m0-activation-control.lock"',
+                f'readonly ACTIVATION_CONTROL_LOCK="{lock}"',
+            )
+            self.assertNotEqual(rendered, source)
+            script.write_text(rendered, encoding="utf-8")
+            script.chmod(0o700)
+
+            descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                blocked = subprocess.run(
+                    [
+                        "/bin/bash",
+                        "-c",
+                        f'''source "{script}"
+log_info() {{ :; }}
+log_error() {{ printf 'error:%s\n' "$*"; }}
+systemctl() {{ printf 'unexpected-restart\n'; }}
+sleep() {{ :; }}
+check_systemd_unit() {{ return 0; }}
+try_restart sentinel-daemon.service daemon || true
+printf 'count:%s\n' "${{CURR_RESTARTS[daemon]:-0}}"
+''',
+                    ],
+                    cwd=REPO_ROOT,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                    check=False,
+                )
+            finally:
+                os.close(descriptor)
+            self.assertEqual(blocked.returncode, 0, blocked.stderr)
+            self.assertEqual(blocked.stdout.splitlines(), ["count:0"])
+
+            allowed = subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    f'''source "{script}"
+log_info() {{ :; }}
+log_error() {{ printf 'error:%s\n' "$*"; }}
+systemctl() {{
+    if flock --exclusive --nonblock "$ACTIVATION_CONTROL_LOCK" -c true; then
+        printf 'controller:acquired\n'
+    else
+        printf 'controller:blocked\n'
+    fi
+}}
+sleep() {{ :; }}
+check_systemd_unit() {{ return 0; }}
+try_restart sentinel-daemon.service daemon
+printf 'count:%s\n' "${{CURR_RESTARTS[daemon]:-0}}"
+''',
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            self.assertEqual(
+                allowed.stdout.splitlines(), ["controller:blocked", "count:1"]
+            )
 
     def test_current_boot_failure_ordering_mutations_are_rejected(self) -> None:
         health_script = (REPO_ROOT / "deploy/scripts/sentinel-health-monitor.sh").read_text(

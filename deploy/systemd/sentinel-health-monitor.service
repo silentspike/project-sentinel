@@ -10,4 +10,4 @@ TimeoutStartSec=30
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sentinel-health-monitor
-ReadWritePaths=/opt/sentinel/data
+ReadWritePaths=/opt/sentinel/data /work/tmp/project-sentinel

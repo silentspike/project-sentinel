@@ -99,7 +99,10 @@ class Fixture:
         authority_path = self.source / PACKAGE.INVENTORY_RELATIVE
         authority_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         authority_path.write_bytes(PREFLIGHT_PATH.read_bytes())
-        authority_path.chmod(0o600)
+        authority_kind = AUTHORITY[
+            "/opt/sentinel/scripts/product-acceptance/run_m0_preflight.py"
+        ][1]
+        authority_path.chmod(SOURCE_MODES[authority_kind])
         self.nats.chmod(0o700)
         self._commit_source()
 
