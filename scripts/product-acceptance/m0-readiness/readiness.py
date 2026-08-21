@@ -372,6 +372,35 @@ def _validate_worker_states(value: Any) -> None:
         fail("daemon_not_initialized")
 
 
+def _validate_projection_only_agent(agent: dict[str, Any]) -> None:
+    if not require_bool(agent.get("projection_present"), "daemon_agent_shape_invalid"):
+        fail("daemon_not_initialized")
+    for field in (
+        "tracked_pid_alive",
+        "security_runtime_present",
+        "adapter_handle_present",
+        "adapter_instance_matches",
+        "runtime_resources_healthy",
+    ):
+        if require_bool(agent.get(field), "daemon_agent_shape_invalid"):
+            fail("daemon_not_initialized")
+    if agent.get("tracked_pid") is not None or agent.get("tracked_pid_state") is not None:
+        fail("daemon_not_initialized")
+    if require_int(
+        agent.get("cgroup_live_pid_count"), "daemon_agent_shape_invalid"
+    ) != 0:
+        fail("daemon_not_initialized")
+    for field in (
+        "adapter_health_state",
+        "adapter_observation_error",
+        "logical_status",
+    ):
+        if agent.get(field) is not None:
+            fail("daemon_not_initialized")
+    if agent.get("last_repair_status") != "unexpected_runtime":
+        fail("daemon_not_initialized")
+
+
 def validate_daemon_payload(payload: dict[str, Any]) -> dict[str, Any]:
     expected = require_int(payload.get("expected_active_agents"), "daemon_count_invalid")
     if expected == 0:
@@ -403,17 +432,30 @@ def validate_daemon_payload(payload: dict[str, Any]) -> dict[str, Any]:
     agents = payload.get("agents")
     if not isinstance(agents, list):
         fail("daemon_agent_shape_invalid")
-    if len(agents) != expected:
-        fail("daemon_not_initialized")
-    identities: set[int] = set()
+    runtime_agents: list[tuple[int, dict[str, Any]]] = []
+    catalog_identities: set[int] = set()
     for raw in agents:
         agent = require_object(raw, "daemon_agent_invalid")
         agent_id = require_int(agent.get("agent_id"), "daemon_agent_invalid", minimum=1)
-        if agent_id in identities or agent.get("aggregate_id") != f"AGENT-{agent_id:02}":
+        if (
+            agent_id in catalog_identities
+            or agent.get("aggregate_id") != f"AGENT-{agent_id:02}"
+        ):
             fail("daemon_agent_roster_mismatch")
+        catalog_identities.add(agent_id)
+        runtime_present = require_bool(
+            agent.get("runtime_present"), "daemon_agent_shape_invalid"
+        )
+        if runtime_present:
+            runtime_agents.append((agent_id, agent))
+        else:
+            _validate_projection_only_agent(agent)
+    if len(runtime_agents) != expected:
+        fail("daemon_not_initialized")
+    identities: set[int] = set()
+    for agent_id, agent in runtime_agents:
         identities.add(agent_id)
         for field in (
-            "runtime_present",
             "tracked_pid_alive",
             "security_runtime_present",
             "adapter_handle_present",
