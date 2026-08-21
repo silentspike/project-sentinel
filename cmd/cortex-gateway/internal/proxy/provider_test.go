@@ -1374,6 +1374,7 @@ func TestClaudeCodeProvider_ParseOutputStream_Success(t *testing.T) {
 	}
 	if resp == nil {
 		t.Fatal("expected non-nil response")
+		return
 	}
 	// Result text should NOT be appended when assistant content exists (avoids duplication)
 	expected := "Hello World"
@@ -1426,6 +1427,7 @@ func TestClaudeCodeProvider_ParseOutputStream_AssistantOnly(t *testing.T) {
 	}
 	if resp == nil {
 		t.Fatal("expected non-nil response for partial stream")
+		return
 	}
 	if resp.Content != "Partial response" {
 		t.Errorf("expected content %q, got %q", "Partial response", resp.Content)
@@ -1450,6 +1452,7 @@ func TestClaudeCodeProvider_ParseOutputStream_SkipsInvalidJSON(t *testing.T) {
 	}
 	if resp == nil {
 		t.Fatal("expected non-nil response")
+		return
 	}
 	// Result text not appended because assistant content exists
 	expected := "valid"
@@ -1468,6 +1471,7 @@ func TestClaudeCodeProvider_ParseOutputStream_EmptyLines(t *testing.T) {
 	}
 	if resp == nil {
 		t.Fatal("expected non-nil response")
+		return
 	}
 	if resp.Content != "ok" {
 		t.Errorf("expected content %q, got %q", "ok", resp.Content)
@@ -1488,6 +1492,7 @@ func TestClaudeCodeProvider_ParseOutputStream_ResultOnly(t *testing.T) {
 	}
 	if resp == nil {
 		t.Fatal("expected non-nil response")
+		return
 	}
 	if resp.Content != "Direct result text" {
 		t.Errorf("expected content %q, got %q", "Direct result text", resp.Content)
