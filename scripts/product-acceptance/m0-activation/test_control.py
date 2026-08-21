@@ -154,7 +154,25 @@ class FakeRunner:
             if verb == "daemon-reload":
                 return control.Result(0)
             if verb == "start":
+                unit = argv[-1]
                 self.after_target_start = True
+                if unit in control.ONESHOTS:
+                    if unit in self.oneshot_finish_after_rounds:
+                        self.states[unit].update(
+                            ActiveState="activating", SubState="start", Result="success"
+                        )
+                    else:
+                        self.states[unit].update(
+                            ActiveState="inactive", SubState="dead", Result="success"
+                        )
+                    if self.nightrun_fails_after_start and unit == "sentinel-nightrun.service":
+                        self.states[unit].update(
+                            ActiveState="failed", SubState="failed", Result="failed"
+                        )
+                        self.readiness_failure = True
+                    return control.Result(0)
+                if unit != control.TARGET:
+                    raise AssertionError(f"unexpected start unit: {unit}")
                 if self.auth_init_fails:
                     self.states[control.AUTH_INIT].update(
                         ActiveState="failed", SubState="failed", Result="exit-code"
@@ -177,11 +195,6 @@ class FakeRunner:
                         ActiveState="failed", SubState="failed",
                         Result=self.terminal_failure_result,
                     )
-                if self.active_oneshot is not None:
-                    self._ready(self.active_oneshot)
-                if self.nightrun_fails_after_start:
-                    self.states["sentinel-nightrun.service"]["Result"] = "failed"
-                    self.readiness_failure = True
                 return control.Result(self.target_start_returncode)
             if verb == "stop":
                 unit = argv[2]
@@ -482,7 +495,7 @@ class ControlTests(unittest.TestCase):
         self.lock_patch.stop()
         shutil.rmtree(self.root, ignore_errors=True)
 
-    def test_activation_success_uses_only_target_and_preflight(self) -> None:
+    def test_activation_success_starts_target_and_current_oneshots(self) -> None:
         result = self.fixture.activate(self.runner)
         self.assertEqual(result["status"], "ACTIVE")
         self.assertEqual(result["started_unit_count"], len(control.ALL_UNITS))
@@ -497,8 +510,31 @@ class ControlTests(unittest.TestCase):
             mutations[1],
             (str(control.SYSTEMCTL), "start", "--no-block", control.TARGET),
         )
-        self.assertEqual(len(mutations), 2)
+        self.assertEqual(
+            mutations[2:4],
+            [
+                (str(control.SYSTEMCTL), "start", "--no-block", unit)
+                for unit in control.ONESHOTS
+            ],
+        )
+        self.assertEqual(len(mutations), 4)
         self.assertFalse(result["m0_acceptance_pass"])
+
+    def test_rejected_oneshot_start_rolls_back_before_preflight(self) -> None:
+        unit = control.ONESHOTS[0]
+        self.runner.fail_command = (
+            str(control.SYSTEMCTL), "start", "--no-block", unit,
+        )
+        with self.assertRaisesRegex(control.ControlError, "oneshot_start_failed"):
+            self.fixture.activate(self.runner)
+        self.assertFalse(any(
+            call[:2] == (str(control.PYTHON), str(control.PREFLIGHT_PROGRAM))
+            for call in self.runner.calls
+        ))
+        self.assertEqual(
+            [call[2] for call in self.runner.calls if call[1] == "stop"],
+            list(control.ROLLBACK_ORDER),
+        )
 
     def test_child_environment_is_exact_and_secret_values_never_enter_argv(self) -> None:
         hostile = {

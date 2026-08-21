@@ -345,7 +345,8 @@ id = "web-authoring-v1"
         for index, (timer, service) in enumerate(
             sorted(preflight.TIMER_SERVICES.items()), start=1
         ):
-            trigger = 1_000_000 * index
+            timer_entered = 900_000 * index
+            service_started = 1_000_000 * index
             facts[timer] = {
                 "Id": timer,
                 "LoadState": "loaded",
@@ -355,7 +356,7 @@ id = "web-authoring-v1"
                 "FragmentPath": f"/etc/systemd/system/{timer}",
                 "NeedDaemonReload": "no",
                 "Unit": service,
-                "LastTriggerUSecMonotonic": str(trigger),
+                "ActiveEnterTimestampMonotonic": str(timer_entered),
             }
             facts[service] = {
                 "Id": service,
@@ -367,8 +368,8 @@ id = "web-authoring-v1"
                 "NeedDaemonReload": "no",
                 "ExecMainCode": "1",
                 "ExecMainStatus": "0",
-                "ExecMainStartTimestampMonotonic": str(trigger + 10),
-                "ExecMainExitTimestampMonotonic": str(trigger + 20),
+                "ExecMainStartTimestampMonotonic": str(service_started),
+                "ExecMainExitTimestampMonotonic": str(service_started + 10),
             }
         return facts
 
@@ -844,17 +845,10 @@ class PreflightTests(unittest.TestCase):
             "manifest_required_artifact_missing",
         )
 
-    def test_timer_triggered_service_outcome_fails_closed(self) -> None:
+    def test_activation_oneshot_outcome_fails_closed(self) -> None:
         timer = "sentinel-health-monitor.timer"
         service = preflight.TIMER_SERVICES[timer]
         mutations = (
-            (
-                "never_run",
-                lambda fixture: fixture.unit_facts[timer].__setitem__(
-                    "LastTriggerUSecMonotonic", "0"
-                ),
-                "systemd_timer_never_ran",
-            ),
             (
                 "running",
                 lambda fixture: fixture.unit_facts[service].update(
@@ -874,16 +868,19 @@ class PreflightTests(unittest.TestCase):
                 lambda fixture: fixture.unit_facts[service].update(
                     {
                         "ExecMainStartTimestampMonotonic": str(
-                            int(
-                                fixture.unit_facts[timer][
-                                    "LastTriggerUSecMonotonic"
-                                ]
-                            )
+                            int(fixture.unit_facts[timer]["ActiveEnterTimestampMonotonic"])
                             - 1
                         )
                     }
                 ),
                 "systemd_timer_outcome_stale",
+            ),
+            (
+                "timer_activation_missing",
+                lambda fixture: fixture.unit_facts[timer].__setitem__(
+                    "ActiveEnterTimestampMonotonic", "0"
+                ),
+                "systemd_timer_activation_missing",
             ),
             (
                 "mismatched_unit",
@@ -905,7 +902,9 @@ class PreflightTests(unittest.TestCase):
                 fixture = Fixture()
                 mutate(fixture)
                 result = preflight.evaluate(fixture.inputs(), fixture.deps())
-                self.assertEqual(self.check(result, "systemd_units")["reason"], reason)
+                self.assertEqual(
+                    self.check(result, "systemd_units")["reason"], reason
+                )
 
     def test_missing_or_duplicate_required_unit_fails(self) -> None:
         wants = self.fixture.unit_facts[preflight.TARGET_UNIT]["Wants"].split()
@@ -1303,6 +1302,36 @@ class PreflightTests(unittest.TestCase):
             self.check(result, "store_projection_backlog")["reason"],
             "read_model_projection_lag",
         )
+
+        for name, mutate, reason in (
+            (
+                "null_watermark",
+                lambda fixture: fixture.projection_store[0].__setitem__(
+                    "last_event_id", None
+                ),
+                "read_model_projection_lag",
+            ),
+            (
+                "missing_watermark",
+                lambda fixture: fixture.projection_store.pop(),
+                "read_model_projection_lag",
+            ),
+            (
+                "malformed_watermark",
+                lambda fixture: fixture.projection_store[0].__setitem__(
+                    "last_event_id", "41"
+                ),
+                "store_readback_value",
+            ),
+        ):
+            with self.subTest(name=name):
+                fixture = Fixture()
+                mutate(fixture)
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertEqual(
+                    self.check(result, "store_projection_backlog")["reason"],
+                    reason,
+                )
 
     def test_episode_frontier_must_equal_global_cut(self) -> None:
         for frontier, reason in (
