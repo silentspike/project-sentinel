@@ -41,7 +41,9 @@ const WORKBENCH_ATTESTATION_MAX_BYTES: u64 = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkbenchIsolationAttestation {
-    pub(crate) child_pid: u32,
+    pub(crate) sandbox_init_pid: u32,
+    pub(crate) runtime_pid: u32,
+    pub(crate) runtime_namespace_pid: u32,
     pub(crate) landlock_abi: u8,
 }
 
@@ -54,6 +56,12 @@ struct WorkbenchStartupAttestation {
     runtime_version: String,
     landlock_abi: u8,
     #[serde(rename = "host_pid")]
+    namespace_pid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkbenchRuntimeIdentity {
+    host_pid: u32,
     namespace_pid: u32,
 }
 
@@ -356,9 +364,9 @@ pub struct AgentProcess {
     /// PID des bwrap-Supervisor-Prozesses (bleibt by-design im Root-netns;
     /// genutzt fuer cgroup-Membership und SIGTERM).
     pub pid: u32,
-    /// PID des sandboxed `agent-runtime` im Agent-netns (aus bwrap `--info-fd`).
-    /// `None`, falls bwrap ihn nicht meldete -> netns-Verifikation entfaellt;
-    /// das bwrap-Exit bleibt das primaere fail-closed-Signal (#75).
+    /// Host-PID des bwrap-Init-Prozesses im Agent-netns (aus `--info-fd`).
+    /// Der Workbench-Pfad loest dessen direktes Runtime-Kind separat auf.
+    /// `None`, falls bwrap den Init-Prozess nicht meldete.
     pub child_pid: Option<u32>,
     /// Child handle — NICHT droppen solange Agent laufen soll.
     child: Arc<Mutex<Child>>,
@@ -737,12 +745,14 @@ impl AgentProcess {
     #[cfg(test)]
     pub(crate) fn install_workbench_isolation_attestation(
         &mut self,
-        child_pid: u32,
+        sandbox_init_pid: u32,
         landlock_abi: u8,
     ) {
-        self.child_pid = Some(child_pid);
+        self.child_pid = Some(sandbox_init_pid);
         self.workbench_isolation = Some(WorkbenchIsolationAttestation {
-            child_pid,
+            sandbox_init_pid,
+            runtime_pid: sandbox_init_pid,
+            runtime_namespace_pid: sandbox_init_pid,
             landlock_abi,
         });
     }
@@ -1318,7 +1328,8 @@ impl SandboxEnforcer {
 
         // #75: no CAP_NET_ADMIN / bridge/veth detection — agents are full-caged
         // by bwrap --unshare-all (needs user namespaces, checked above). The
-        // daemon verifies isolation post-spawn on the sandboxed child PID.
+        // daemon verifies isolation post-spawn on sandbox init and the exact
+        // nonce-attested runtime child.
 
         let enforcer = Self {
             landlock_abi,
@@ -1435,7 +1446,7 @@ impl SandboxEnforcer {
     ) -> Result<AgentProcess> {
         // #75: full cage is unconditional — BwrapConfig::for_agent already sets
         // share_net=false (no --share-net). The daemon verifies isolation
-        // post-spawn on the sandboxed child PID.
+        // post-spawn on sandbox init and the nonce-attested runtime child.
 
         let attestation_nonce =
             require_workbench_attestation.then(|| uuid::Uuid::new_v4().to_string());
@@ -1497,9 +1508,9 @@ impl SandboxEnforcer {
         let pid = process.pid;
         let child_pid = process.child_pid;
 
-        // Add bwrap process to agent's cgroup (supervisor PID — children inherit
-        // the cgroup; this is correct for cgroups, unlike netns which needs the
-        // sandboxed child PID).
+        // Add the bwrap supervisor first. Because bwrap has already created its
+        // PID-namespace init and command child, both are attached explicitly
+        // below rather than inferred from parent cgroup membership.
         if self.cgroup_available {
             process.set_supervised_cgroup(name);
             if let Err(error) = cgroups::add_pid_to_cgroup(name, pid) {
@@ -1513,23 +1524,44 @@ impl SandboxEnforcer {
         }
 
         if require_workbench_attestation {
-            let child_pid = child_pid.context("workbench sandbox did not report its child PID")?;
-            cgroups::add_pid_to_cgroup(name, child_pid)
-                .context("attach exact workbench child to cgroup")?;
+            let sandbox_init_pid =
+                child_pid.context("workbench sandbox did not report its init PID")?;
+            cgroups::add_pid_to_cgroup(name, sandbox_init_pid)
+                .context("attach exact workbench sandbox init to cgroup")?;
             let cgroup_members = cgroups::list_pids_in_cgroup(name)
-                .context("verify exact workbench child cgroup membership")?;
-            validate_workbench_child_boundary(
-                Some(child_pid),
-                cgroup_members.contains(&child_pid),
-                self.verify_agent_netns_isolation(child_pid),
+                .context("verify exact workbench sandbox-init cgroup membership")?;
+            validate_workbench_sandbox_init_boundary(
+                Some(sandbox_init_pid),
+                cgroup_members.contains(&sandbox_init_pid),
+                self.verify_agent_netns_isolation(sandbox_init_pid),
             )?;
             let nonce = attestation_nonce
                 .as_deref()
                 .context("workbench attestation nonce is unavailable")?;
             let abi = landlock_abi.context("workbench Landlock ABI is unavailable")?;
-            await_workbench_startup_attestation(child_pid, nonce, abi)?;
+            let runtime = await_workbench_startup_attestation(sandbox_init_pid, nonce, abi)?;
+            cgroups::add_pid_to_cgroup(name, runtime.host_pid)
+                .context("attach exact workbench runtime to cgroup")?;
+            ensure!(
+                resolve_workbench_runtime_identity(sandbox_init_pid, runtime.namespace_pid,)?
+                    == runtime,
+                "workbench runtime identity changed during cgroup attachment"
+            );
+            let cgroup_members = cgroups::list_pids_in_cgroup(name)
+                .context("verify exact workbench runtime cgroup membership")?;
+            ensure!(
+                cgroup_members.contains(&sandbox_init_pid)
+                    && cgroup_members.contains(&runtime.host_pid),
+                "workbench process tree cgroup membership was not observed"
+            );
+            ensure!(
+                self.verify_agent_netns_isolation(runtime.host_pid) == IsolationStatus::Isolated,
+                "workbench runtime network namespace isolation was not attested"
+            );
             process.workbench_isolation = Some(WorkbenchIsolationAttestation {
-                child_pid,
+                sandbox_init_pid,
+                runtime_pid: runtime.host_pid,
+                runtime_namespace_pid: runtime.namespace_pid,
                 landlock_abi: abi,
             });
         }
@@ -1542,16 +1574,15 @@ impl SandboxEnforcer {
         Ok(process)
     }
 
-    /// Verifies that the sandboxed agent process runs in its own network
-    /// namespace (#75 full cage), comparing `/proc/<child_pid>/ns/net` to the
+    /// Verifies that a sandbox process runs in its own network namespace (#75
+    /// full cage), comparing `/proc/<child_pid>/ns/net` to the
     /// daemon's `/proc/self/ns/net`.
     ///
-    /// `child_pid` MUST be the sandboxed `agent-runtime` PID (from bwrap
-    /// `--info-fd`), NOT the bwrap supervisor PID — the supervisor stays in the
-    /// root netns by design, so verifying it would falsely report every agent
-    /// as un-caged. A transient read failure returns [`IsolationStatus::ProbeError`]
-    /// and MUST NOT be treated as a cage breach; the bwrap exit code is the
-    /// primary fail-closed signal.
+    /// `child_pid` may be bwrap's reported sandbox init or the separately
+    /// resolved runtime child, but never the bwrap supervisor, which stays in
+    /// the root netns. A transient read failure returns
+    /// [`IsolationStatus::ProbeError`] and must not be treated as a cage breach;
+    /// the bwrap exit code is the primary fail-closed signal.
     pub fn verify_agent_netns_isolation(&self, child_pid: u32) -> IsolationStatus {
         let daemon_ns = read_netns_inode("/proc/self/ns/net");
         let agent_ns = read_netns_inode(&format!("/proc/{child_pid}/ns/net"));
@@ -1649,21 +1680,22 @@ fn validate_workbench_static_prerequisites(
     Ok(())
 }
 
-fn validate_workbench_child_boundary(
-    child_pid: Option<u32>,
-    exact_child_in_cgroup: bool,
+fn validate_workbench_sandbox_init_boundary(
+    sandbox_init_pid: Option<u32>,
+    exact_init_in_cgroup: bool,
     network_isolation: IsolationStatus,
 ) -> Result<u32> {
-    let child_pid = child_pid.context("workbench sandbox did not report its child PID")?;
+    let sandbox_init_pid =
+        sandbox_init_pid.context("workbench sandbox did not report its init PID")?;
     ensure!(
-        exact_child_in_cgroup,
-        "workbench child cgroup membership was not observed"
+        exact_init_in_cgroup,
+        "workbench sandbox-init cgroup membership was not observed"
     );
     ensure!(
         network_isolation == IsolationStatus::Isolated,
         "workbench network namespace isolation was not attested"
     );
-    Ok(child_pid)
+    Ok(sandbox_init_pid)
 }
 
 fn protocol_reader_parts(
@@ -1970,16 +2002,16 @@ fn prepare_workbench_roots(host_agent_root: &Path) -> Result<()> {
 }
 
 fn await_workbench_startup_attestation(
-    child_pid: u32,
+    sandbox_init_pid: u32,
     expected_nonce: &str,
     expected_landlock_abi: u8,
-) -> Result<()> {
+) -> Result<WorkbenchRuntimeIdentity> {
     use std::os::unix::fs::MetadataExt;
 
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_millis(WORKBENCH_ATTESTATION_TIMEOUT_MS);
     let path = PathBuf::from(format!(
-        "/proc/{child_pid}/root/tmp/.sentinel-workbench-attestation-{expected_nonce}.json"
+        "/proc/{sandbox_init_pid}/root/tmp/.sentinel-workbench-attestation-{expected_nonce}.json"
     ));
     loop {
         match std::fs::symlink_metadata(&path) {
@@ -2009,16 +2041,17 @@ fn await_workbench_startup_attestation(
                     !bytes.is_empty() && bytes.len() as u64 <= WORKBENCH_ATTESTATION_MAX_BYTES,
                     "workbench startup attestation exceeded its bound"
                 );
-                validate_workbench_startup_attestation(
+                let namespace_pid = validate_workbench_startup_attestation(
                     &bytes,
                     expected_nonce,
                     expected_landlock_abi,
-                    child_pid,
-                    &read_pid_namespace_chain(child_pid)?,
+                    sandbox_init_pid,
+                    &read_pid_namespace_chain(sandbox_init_pid)?,
                 )?;
+                let runtime = resolve_workbench_runtime_identity(sandbox_init_pid, namespace_pid)?;
                 std::fs::remove_file(&path)
                     .context("remove consumed workbench startup attestation")?;
-                return Ok(());
+                return Ok(runtime);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if std::time::Instant::now() >= deadline {
@@ -2035,26 +2068,95 @@ fn validate_workbench_startup_attestation(
     bytes: &[u8],
     expected_nonce: &str,
     expected_landlock_abi: u8,
-    expected_child_pid: u32,
-    pid_namespace_chain: &[u32],
-) -> Result<()> {
+    expected_sandbox_init_pid: u32,
+    sandbox_init_namespace_chain: &[u32],
+) -> Result<u32> {
     let attestation: WorkbenchStartupAttestation =
         serde_json::from_slice(bytes).context("decode workbench startup attestation")?;
-    let namespace_pid = pid_namespace_chain
-        .last()
-        .copied()
-        .context("workbench child PID namespace identity is unavailable")?;
     ensure!(
         attestation.schema_version == WORKBENCH_ATTESTATION_SCHEMA_VERSION
             && attestation.nonce == expected_nonce
             && attestation.wrapper_version == env!("CARGO_PKG_VERSION")
             && attestation.runtime_version == sentinel_common::WORKBENCH_AGENT_RUNTIME_VERSION
             && attestation.landlock_abi == expected_landlock_abi
-            && pid_namespace_chain.first() == Some(&expected_child_pid)
-            && attestation.namespace_pid == namespace_pid,
-        "workbench startup attestation did not match its exact child"
+            && attestation.namespace_pid > 1
+            && sandbox_init_namespace_chain.len() >= 2
+            && sandbox_init_namespace_chain.first() == Some(&expected_sandbox_init_pid)
+            && sandbox_init_namespace_chain.last() == Some(&1),
+        "workbench startup attestation did not match its sandbox init"
     );
-    Ok(())
+    Ok(attestation.namespace_pid)
+}
+
+fn resolve_workbench_runtime_identity(
+    sandbox_init_pid: u32,
+    namespace_pid: u32,
+) -> Result<WorkbenchRuntimeIdentity> {
+    let children_path = format!("/proc/{sandbox_init_pid}/task/{sandbox_init_pid}/children");
+    let children = std::fs::read_to_string(&children_path)
+        .with_context(|| format!("read workbench sandbox-init children from {children_path}"))?;
+    let child_pids = parse_direct_child_pids(&children)
+        .context("workbench sandbox-init child list is malformed or empty")?;
+    let sandbox_pid_namespace = read_namespace_inode(sandbox_init_pid, "pid")
+        .context("read workbench sandbox-init PID namespace")?;
+    let sandbox_net_namespace = read_namespace_inode(sandbox_init_pid, "net")
+        .context("read workbench sandbox-init network namespace")?;
+    let mut matches = Vec::new();
+    for host_pid in child_pids {
+        let chain = read_pid_namespace_chain(host_pid)?;
+        let same_pid_namespace =
+            read_namespace_inode(host_pid, "pid") == Some(sandbox_pid_namespace);
+        let same_net_namespace =
+            read_namespace_inode(host_pid, "net") == Some(sandbox_net_namespace);
+        if workbench_runtime_candidate_matches(
+            host_pid,
+            namespace_pid,
+            &chain,
+            same_pid_namespace,
+            same_net_namespace,
+        ) {
+            matches.push(host_pid);
+        }
+    }
+    ensure!(
+        matches.len() == 1,
+        "workbench startup attestation did not resolve to one exact runtime child"
+    );
+    Ok(WorkbenchRuntimeIdentity {
+        host_pid: matches[0],
+        namespace_pid,
+    })
+}
+
+fn parse_direct_child_pids(children: &str) -> Option<Vec<u32>> {
+    let mut pids = children
+        .split_whitespace()
+        .map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    if pids.is_empty() || pids.len() > 64 || pids.contains(&0) {
+        return None;
+    }
+    let original_len = pids.len();
+    pids.sort_unstable();
+    pids.dedup();
+    (pids.len() == original_len).then_some(pids)
+}
+
+fn workbench_runtime_candidate_matches(
+    host_pid: u32,
+    expected_namespace_pid: u32,
+    pid_namespace_chain: &[u32],
+    same_pid_namespace: bool,
+    same_net_namespace: bool,
+) -> bool {
+    host_pid > 0
+        && expected_namespace_pid > 1
+        && pid_namespace_chain.len() >= 2
+        && pid_namespace_chain.first() == Some(&host_pid)
+        && pid_namespace_chain.last() == Some(&expected_namespace_pid)
+        && same_pid_namespace
+        && same_net_namespace
 }
 
 fn read_pid_namespace_chain(child_pid: u32) -> Result<Vec<u32>> {
@@ -2074,6 +2176,12 @@ fn parse_pid_namespace_chain(status: &str) -> Option<Vec<u32>> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .ok()?;
     (!chain.is_empty() && chain.iter().all(|pid| *pid > 0)).then_some(chain)
+}
+
+fn read_namespace_inode(pid: u32, namespace: &str) -> Option<u64> {
+    let path = format!("/proc/{pid}/ns/{namespace}");
+    let target = std::fs::read_link(path).ok()?;
+    parse_ns_inode(&target.to_string_lossy())
 }
 
 fn workbench_host_agent_root(agent_name: &str) -> PathBuf {
@@ -2414,49 +2522,56 @@ mod tests {
     #[test]
     fn workbench_startup_attestation_is_exact_child_and_version_bound() {
         let nonce = "018f3f32-4f01-4f2c-a6c1-f6f4a81b2903";
-        let bytes = |child_pid: u32, abi: u8, wrapper_version: &str, runtime_version: &str| {
+        let bytes = |namespace_pid: u32, abi: u8, wrapper_version: &str, runtime_version: &str| {
             serde_json::to_vec(&serde_json::json!({
                 "schema_version": WORKBENCH_ATTESTATION_SCHEMA_VERSION,
                 "nonce": nonce,
                 "wrapper_version": wrapper_version,
                 "runtime_version": runtime_version,
                 "landlock_abi": abi,
-                "host_pid": child_pid,
+                "host_pid": namespace_pid,
             }))
             .unwrap()
         };
         let valid = bytes(
-            4242,
+            2,
             4,
             env!("CARGO_PKG_VERSION"),
             sentinel_common::WORKBENCH_AGENT_RUNTIME_VERSION,
         );
-        validate_workbench_startup_attestation(&valid, nonce, 4, 4242, &[4242]).unwrap();
-        validate_workbench_startup_attestation(
-            &bytes(
-                2,
-                4,
-                env!("CARGO_PKG_VERSION"),
-                sentinel_common::WORKBENCH_AGENT_RUNTIME_VERSION,
-            ),
-            nonce,
-            4,
-            4242,
-            &[4242, 2],
-        )
-        .unwrap();
-        assert!(validate_workbench_startup_attestation(&valid, nonce, 4, 4243, &[4242]).is_err());
+        assert_eq!(
+            validate_workbench_startup_attestation(&valid, nonce, 4, 4242, &[4242, 1]).unwrap(),
+            2
+        );
         assert!(
-            validate_workbench_startup_attestation(&valid, nonce, 4, 4242, &[4243, 4242]).is_err()
+            validate_workbench_startup_attestation(&valid, nonce, 4, 4243, &[4242, 1]).is_err()
+        );
+        assert!(
+            validate_workbench_startup_attestation(&valid, nonce, 4, 4242, &[4243, 1]).is_err()
         );
         assert!(
             validate_workbench_startup_attestation(&valid, nonce, 4, 4242, &[4242, 2]).is_err()
         );
-        assert!(validate_workbench_startup_attestation(&valid, nonce, 4, 4242, &[]).is_err());
-        assert!(validate_workbench_startup_attestation(&valid, nonce, 3, 4242, &[4242]).is_err());
+        assert!(validate_workbench_startup_attestation(&valid, nonce, 4, 4242, &[4242]).is_err());
         assert!(validate_workbench_startup_attestation(
             &bytes(
-                4242,
+                1,
+                4,
+                env!("CARGO_PKG_VERSION"),
+                sentinel_common::WORKBENCH_AGENT_RUNTIME_VERSION
+            ),
+            nonce,
+            4,
+            4242,
+            &[4242, 1]
+        )
+        .is_err());
+        assert!(
+            validate_workbench_startup_attestation(&valid, nonce, 3, 4242, &[4242, 1]).is_err()
+        );
+        assert!(validate_workbench_startup_attestation(
+            &bytes(
+                2,
                 4,
                 "foreign",
                 sentinel_common::WORKBENCH_AGENT_RUNTIME_VERSION,
@@ -2464,24 +2579,59 @@ mod tests {
             nonce,
             4,
             4242,
-            &[4242],
+            &[4242, 1],
         )
         .is_err());
         assert!(validate_workbench_startup_attestation(
-            &bytes(4242, 4, env!("CARGO_PKG_VERSION"), "foreign"),
+            &bytes(2, 4, env!("CARGO_PKG_VERSION"), "foreign"),
             nonce,
             4,
             4242,
-            &[4242],
+            &[4242, 1],
         )
         .is_err());
-        assert!(validate_workbench_startup_attestation(b"{}", nonce, 4, 4242, &[4242]).is_err());
+        assert!(validate_workbench_startup_attestation(b"{}", nonce, 4, 4242, &[4242, 1]).is_err());
         assert_eq!(
             parse_pid_namespace_chain("Name:\tagent-runtime\nNSpid:\t4242\t2\n"),
             Some(vec![4242, 2])
         );
         assert_eq!(parse_pid_namespace_chain("NSpid:\t4242\t0\n"), None);
         assert_eq!(parse_pid_namespace_chain("Name:\tagent-runtime\n"), None);
+        assert_eq!(
+            parse_direct_child_pids("4243 4244\n"),
+            Some(vec![4243, 4244])
+        );
+        assert_eq!(parse_direct_child_pids(""), None);
+        assert_eq!(parse_direct_child_pids("4243 4243"), None);
+        assert_eq!(parse_direct_child_pids("4243 invalid"), None);
+        assert!(workbench_runtime_candidate_matches(
+            4243,
+            2,
+            &[4243, 2],
+            true,
+            true,
+        ));
+        assert!(!workbench_runtime_candidate_matches(
+            4243,
+            2,
+            &[4243, 3],
+            true,
+            true,
+        ));
+        assert!(!workbench_runtime_candidate_matches(
+            4243,
+            2,
+            &[4243, 2],
+            false,
+            true,
+        ));
+        assert!(!workbench_runtime_candidate_matches(
+            4243,
+            2,
+            &[4243, 2],
+            true,
+            false,
+        ));
     }
 
     #[test]
@@ -2491,20 +2641,31 @@ mod tests {
         assert!(validate_workbench_static_prerequisites(Some(4), true, false).is_err());
         validate_workbench_static_prerequisites(Some(4), true, true).unwrap();
 
-        assert!(validate_workbench_child_boundary(None, true, IsolationStatus::Isolated).is_err());
         assert!(
-            validate_workbench_child_boundary(Some(42), false, IsolationStatus::Isolated).is_err()
-        );
-        assert!(
-            validate_workbench_child_boundary(Some(42), true, IsolationStatus::NotIsolated,)
+            validate_workbench_sandbox_init_boundary(None, true, IsolationStatus::Isolated)
                 .is_err()
         );
-        assert!(
-            validate_workbench_child_boundary(Some(42), true, IsolationStatus::ProbeError,)
-                .is_err()
-        );
+        assert!(validate_workbench_sandbox_init_boundary(
+            Some(42),
+            false,
+            IsolationStatus::Isolated,
+        )
+        .is_err());
+        assert!(validate_workbench_sandbox_init_boundary(
+            Some(42),
+            true,
+            IsolationStatus::NotIsolated,
+        )
+        .is_err());
+        assert!(validate_workbench_sandbox_init_boundary(
+            Some(42),
+            true,
+            IsolationStatus::ProbeError,
+        )
+        .is_err());
         assert_eq!(
-            validate_workbench_child_boundary(Some(42), true, IsolationStatus::Isolated).unwrap(),
+            validate_workbench_sandbox_init_boundary(Some(42), true, IsolationStatus::Isolated,)
+                .unwrap(),
             42
         );
     }
