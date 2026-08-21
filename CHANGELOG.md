@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Issue #650 live-activation correction: count registry-observed live runtime PIDs instead of the retired legacy process-owner map, and require the productive episode-projection worker in daemon boot and M0 preflight readiness.
 - Issue #650 live-activation correction: distinguish the bubblewrap sandbox-init Host PID reported by `--info-fd` from its nonce-attested direct `agent-runtime` child, resolve the runtime through exact `NSpid` plus PID/network-namespace identity, and move that runtime into the agent cgroup before publishing isolation readiness. This accepts the valid host/init/runtime PID translation while malformed, ambiguous, stale, foreign-namespace, or uncontained runtimes remain fail-closed.
 - Issue #650 live-activation correction: traverse the Workbench completion-receipt authority from a non-reading `O_PATH` root anchor so the scoped `/artifacts` store can initialize after strict Landlock enforcement without granting global root-directory read access.
 - Issue #650 live-activation correction: preserve the lightweight heartbeat runtime for ordinary ECS agent sandboxes while selecting the capability-scoped Workbench protocol only when the Landlock wrapper supplies Workbench attestation. Partial attestation remains fail-closed instead of downgrading to the general runtime.

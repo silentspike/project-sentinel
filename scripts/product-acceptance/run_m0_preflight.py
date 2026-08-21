@@ -1643,7 +1643,7 @@ def validate_identity(roster: dict[int, dict[str, Any]], payloads: dict[str, dic
     if require_int(runtime.get("analysis_queue_depth"), "runtime_shape") != 0:
         raise PreflightError("runtime_queue_backlog")
     worker_states = require_dict(runtime.get("worker_states"), "runtime_shape")
-    if set(worker_states) != {"ecs_tick_loop", "service_health"}:
+    if set(worker_states) != {"ecs_tick_loop", "episode_projection", "service_health"}:
         raise PreflightError("runtime_worker_mismatch")
     for worker in worker_states.values():
         worker = require_dict(worker, "runtime_shape")
