@@ -2016,14 +2016,13 @@ fn await_workbench_startup_attestation(
     loop {
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) => {
-                ensure!(
-                    metadata.is_file()
-                        && !metadata.file_type().is_symlink()
-                        && metadata.nlink() == 1
-                        && metadata.len() > 0
-                        && metadata.len() <= WORKBENCH_ATTESTATION_MAX_BYTES,
-                    "workbench startup attestation failed its file boundary"
-                );
+                if !workbench_startup_attestation_file_ready(&metadata)? {
+                    if std::time::Instant::now() >= deadline {
+                        bail!("workbench startup attestation remained empty");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
                 let file =
                     std::fs::File::open(&path).context("open workbench startup attestation")?;
                 let opened = file
@@ -2062,6 +2061,19 @@ fn await_workbench_startup_attestation(
             Err(error) => return Err(error).context("inspect workbench startup attestation"),
         }
     }
+}
+
+fn workbench_startup_attestation_file_ready(metadata: &std::fs::Metadata) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.nlink() == 1
+            && metadata.len() <= WORKBENCH_ATTESTATION_MAX_BYTES,
+        "workbench startup attestation failed its file boundary"
+    );
+    Ok(metadata.len() > 0)
 }
 
 fn validate_workbench_startup_attestation(
@@ -2632,6 +2644,23 @@ mod tests {
             true,
             false,
         ));
+    }
+
+    #[test]
+    fn workbench_startup_attestation_waits_for_nonempty_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attestation.json");
+        let mut file = std::fs::File::create(&path).unwrap();
+
+        assert!(!workbench_startup_attestation_file_ready(&file.metadata().unwrap()).unwrap());
+
+        file.write_all(b"{}").unwrap();
+        file.sync_all().unwrap();
+        assert!(workbench_startup_attestation_file_ready(&file.metadata().unwrap()).unwrap());
+
+        let second_link = directory.path().join("attestation-hardlink.json");
+        std::fs::hard_link(&path, second_link).unwrap();
+        assert!(workbench_startup_attestation_file_ready(&file.metadata().unwrap()).is_err());
     }
 
     #[test]

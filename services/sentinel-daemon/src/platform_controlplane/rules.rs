@@ -30,6 +30,8 @@ pub enum PlatformSideEffect {
     RestartAgent(AgentId),
     /// Systemd-Service direkt neu starten.
     RestartService(String),
+    /// Nur einen weiterhin inaktiven systemd-Service neu starten.
+    RestartInactiveService(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -217,7 +219,9 @@ pub fn evaluate_rules(
             target: service_name.clone(),
             action_label: "restart_triggered".to_string(),
             description: format!("Service {service_name} ist nicht active — Restart getriggert"),
-            side_effect: Some(PlatformSideEffect::RestartService(service_name.clone())),
+            side_effect: Some(PlatformSideEffect::RestartInactiveService(
+                service_name.clone(),
+            )),
         });
     }
 
@@ -697,7 +701,7 @@ mod tests {
         assert_eq!(actions[0].rule_name, "service_health");
         assert!(matches!(
             &actions[0].side_effect,
-            Some(PlatformSideEffect::RestartService(service)) if service == "sentinel-judge"
+            Some(PlatformSideEffect::RestartInactiveService(service)) if service == "sentinel-judge"
         ));
     }
 
@@ -722,7 +726,7 @@ mod tests {
         assert_eq!(actions[0].action_label, "restart_triggered");
         assert!(matches!(
             &actions[0].side_effect,
-            Some(PlatformSideEffect::RestartService(service)) if service == "sentinel-judge"
+            Some(PlatformSideEffect::RestartInactiveService(service)) if service == "sentinel-judge"
         ));
     }
 

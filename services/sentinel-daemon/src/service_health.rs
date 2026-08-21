@@ -204,12 +204,28 @@ fn restart_service(service_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Startet einen inaktiven Service, ohne einen inzwischen aktiven Service neu zu starten.
+fn start_service(service_name: &str) -> bool {
+    let _ = std::process::Command::new("systemctl")
+        .args(["reset-failed", service_name])
+        .status();
+    std::process::Command::new("systemctl")
+        .args(["start", service_name])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 pub fn restart_service_now(service_name: &str) -> bool {
     restart_service(service_name)
 }
 
 pub fn is_service_active_now(service_name: &str) -> bool {
     is_service_active(service_name)
+}
+
+pub fn start_service_now(service_name: &str) -> bool {
+    start_service(service_name)
 }
 
 #[cfg(test)]
