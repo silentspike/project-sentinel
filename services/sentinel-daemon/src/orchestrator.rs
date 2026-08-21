@@ -9314,6 +9314,29 @@ fn ecs_tick_loop(
                             );
                         }
                     }
+                    crate::platform_controlplane::rules::PlatformSideEffect::RestartInactiveService(
+                        service_name,
+                    ) => {
+                        if crate::service_health::is_service_active_now(&service_name) {
+                            info!(
+                                service = %service_name,
+                                "Veraltete Service-Health-Observation verworfen; Service ist bereits active"
+                            );
+                        } else if crate::service_health::start_service_now(&service_name) {
+                            let active =
+                                crate::service_health::is_service_active_now(&service_name);
+                            info!(
+                                service = %service_name,
+                                active,
+                                "Inaktiver Service nach erneuter Pruefung gestartet"
+                            );
+                        } else {
+                            warn!(
+                                service = %service_name,
+                                "Service-Start nach erneuter Inaktivitaetspruefung fehlgeschlagen"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -9420,6 +9443,16 @@ fn ecs_tick_loop(
             if let Err(e) = controlplane.cycle(&mut world, tick_count) {
                 error!(error = %e, tick = tick_count, "Controlplane-Zyklus fehlgeschlagen");
             }
+        }
+
+        // A stop request can arrive after the tick-start check. Account for the
+        // already executed tick, but do not begin any later roster work.
+        if shutdown.load(Ordering::SeqCst) {
+            if world_background_allowed {
+                tick_count += 1;
+            }
+            drop(owner_tick_barrier);
+            break;
         }
 
         // Shift-Erkennung (alle 60 Ticks = ~1 Minute bei 1s Tick-Rate)
