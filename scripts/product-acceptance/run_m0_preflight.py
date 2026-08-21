@@ -377,10 +377,10 @@ SELECT
   (SELECT COUNT(*) FROM llm_completion_outbox) AS unresolved_llm,
   (SELECT COUNT(*) FROM runtime_config_recovery) AS runtime_recovery,
   (SELECT COUNT(*) FROM runtime_config_apply_recovery) AS config_apply_recovery,
-  COALESCE((SELECT last_event_id FROM projection_offsets
-            WHERE projection_name = 'sentinel-projection'), -1) AS projection_offset,
-  COALESCE((SELECT last_event_id FROM projection_offsets
-            WHERE projection_name = 'sentinel-projection-cost-hierarchy-v2'), -1)
+  (SELECT last_event_id FROM projection_offsets
+   WHERE projection_name = 'sentinel-projection') AS projection_offset,
+  (SELECT last_event_id FROM projection_offsets
+   WHERE projection_name = 'sentinel-projection-cost-hierarchy-v2')
     AS hierarchy_offset;
 """.strip()
 PROJECTION_SNAPSHOT_SQL = """
@@ -1459,6 +1459,8 @@ def split_listener(value: str, family: str) -> tuple[str, int]:
         parsed_port = int(port)
         if not 0 < parsed_port <= 65535:
             raise ValueError
+        if parsed_port not in PROTECTED_LISTENER_PORTS:
+            return host, parsed_port
         if host == "*":
             host = "0.0.0.0" if family == "ipv4" else "::"
         address = ipaddress.ip_address(host)
@@ -1765,14 +1767,24 @@ def validate_identity(roster: dict[int, dict[str, Any]], payloads: dict[str, dic
     }
 
 
-def parse_sqlite_json(data: bytes, expected_keys: set[str]) -> dict[str, int]:
+def parse_sqlite_json(
+    data: bytes,
+    expected_keys: set[str],
+    *,
+    temporal_null_keys: frozenset[str] = frozenset(),
+) -> dict[str, int]:
     value = strict_json(data)
     if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
         raise PreflightError("store_readback_shape")
     row = value[0]
     if set(row) != expected_keys:
         raise PreflightError("store_readback_shape")
-    return {key: require_int(row[key], "store_readback_value") for key in expected_keys}
+    result: dict[str, int] = {}
+    for key in expected_keys:
+        if row[key] is None and key in temporal_null_keys:
+            raise PreflightError("read_model_projection_lag")
+        result[key] = require_int(row[key], "store_readback_value")
+    return result
 
 
 def read_event_cut(inputs: Inputs, deps: Dependencies) -> dict[str, int]:
@@ -1792,6 +1804,7 @@ def read_event_cut(inputs: Inputs, deps: Dependencies) -> dict[str, int]:
             "projection_offset",
             "hierarchy_offset",
         },
+        temporal_null_keys=frozenset({"projection_offset", "hierarchy_offset"}),
     )
 
 

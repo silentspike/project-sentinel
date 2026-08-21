@@ -1129,7 +1129,10 @@ class PreflightTests(unittest.TestCase):
         )
 
     def test_unrelated_listener_is_allowed(self) -> None:
-        self.fixture.listeners_v4 += b"tcp LISTEN 0 128 0.0.0.0:9999 0.0.0.0:*\n"
+        self.fixture.listeners_v4 += (
+            b"tcp LISTEN 0 128 0.0.0.0:9999 0.0.0.0:*\n"
+            b"tcp LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*\n"
+        )
         self.assertTrue(self.run_fixture()["runtime_preflight_pass"])
 
     def test_listener_process_owner_is_required_and_exact(self) -> None:
@@ -1274,6 +1277,25 @@ class PreflightTests(unittest.TestCase):
             self.check(result, "store_projection_backlog")["reason"],
             "publication_or_recovery_backlog",
         )
+
+    def test_missing_event_store_projection_offsets_are_temporal_but_malformed_fail(self) -> None:
+        for key in ("projection_offset", "hierarchy_offset"):
+            with self.subTest(key=key, value=None):
+                fixture = Fixture()
+                fixture.event_store[key] = None
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertEqual(
+                    self.check(result, "store_projection_backlog")["reason"],
+                    "read_model_projection_lag",
+                )
+            with self.subTest(key=key, value="41"):
+                fixture = Fixture()
+                fixture.event_store[key] = "41"
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertEqual(
+                    self.check(result, "store_projection_backlog")["reason"],
+                    "store_readback_value",
+                )
 
     def test_projection_watermarks_and_identities_use_one_snapshot(self) -> None:
         result = self.run_fixture()
