@@ -892,6 +892,14 @@ class ControlTests(unittest.TestCase):
         stops = [call[2] for call in self.runner.calls if call[1] == "stop"]
         self.assertEqual(stops, list(control.ROLLBACK_ORDER))
         self.assertEqual(stops[:3], [control.TARGET, *control.ONESHOTS])
+        self.assertLess(
+            stops.index("sentinel-daemon.service"),
+            stops.index("sentinel-gateway.service"),
+        )
+        self.assertLess(
+            stops.index("sentinel-gateway.service"),
+            stops.index("nats-server.service"),
+        )
         self.assertEqual(
             self.runner.states["sentinel-nightrun.service"]["ActiveState"],
             "inactive",
