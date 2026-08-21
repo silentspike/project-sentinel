@@ -930,10 +930,7 @@ impl BwrapNanoRuntime {
             .workloads
             .get(workload_id)
             .ok_or_else(|| anyhow!("workbench workload state is unavailable"))?;
-        Ok(match self.fs_mount.as_ref() {
-            Some(mount) => mount.join(workload_id),
-            None => self.agent_home_root.join(&state.workload.agent_name),
-        })
+        Ok(self.agent_home_root.join(&state.workload.agent_name))
     }
 
     fn write_marker(&self, agent_name: &str, workload_id: &str) -> Result<()> {
@@ -2908,6 +2905,30 @@ mod tests {
             metadata: Default::default(),
             ecs_snapshot: None,
         }
+    }
+
+    #[test]
+    fn workbench_artifacts_use_writable_agent_backing_with_active_fs_mount() {
+        let temp = tempfile::tempdir().unwrap();
+        let homes = temp.path().join("homes");
+        let mut runtime = BwrapNanoRuntime::with_test_dirs(temp.path().join("cas"), &homes);
+        runtime.set_fs_mount(temp.path().join("sentinel-fs").to_string_lossy());
+        let workload = fixture_workload("AGENT-01", "alice");
+        runtime.workloads.insert(
+            workload.workload_id.clone(),
+            BwrapWorkloadState {
+                instance_id: uuid::Uuid::new_v4(),
+                command: workload.command.clone(),
+                workload,
+                owned_object_ids: Vec::new(),
+                suspended: false,
+            },
+        );
+
+        assert_eq!(
+            runtime.workbench_host_root("AGENT-01").unwrap(),
+            homes.join("alice")
+        );
     }
 
     fn insert_fixture(
