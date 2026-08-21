@@ -486,6 +486,9 @@ def validate_daemon_payload(payload: dict[str, Any]) -> dict[str, Any]:
             fail("daemon_agent_shape_invalid")
         if observation_error is not None:
             fail("daemon_not_initialized")
+        projection_present = require_bool(
+            agent.get("projection_present"), "daemon_agent_shape_invalid"
+        )
         status_pair = (agent.get("logical_status"), agent.get("adapter_health_state"))
         repair_status = agent.get("last_repair_status")
         if any(value is not None and not isinstance(value, str) for value in status_pair):
@@ -493,7 +496,8 @@ def validate_daemon_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if repair_status is not None and not isinstance(repair_status, str):
             fail("daemon_agent_shape_invalid")
         if status_pair in {("Active", "healthy"), ("Sleeping", "healthy")}:
-            if repair_status != "healthy":
+            expected_repair = "healthy" if projection_present else "stale"
+            if repair_status != expected_repair:
                 fail("daemon_not_initialized")
         elif status_pair == ("Suspended", "degraded"):
             if repair_status != "suspended":
