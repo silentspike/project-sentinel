@@ -310,9 +310,29 @@ class ReadinessTests(unittest.TestCase):
         )
         for agent in payload["agents"]:
             agent["projection_present"] = False
+            agent["last_repair_status"] = "stale"
         self.assertEqual(
             readiness.validate_daemon_payload(payload)["expected_active_agents"], 2
         )
+
+    def test_daemon_local_gate_binds_repair_status_to_projection_presence(self) -> None:
+        for projection_present, repair_status in (
+            (False, "healthy"),
+            (True, "stale"),
+        ):
+            with self.subTest(
+                projection_present=projection_present,
+                repair_status=repair_status,
+            ):
+                payload = valid_runtime()
+                payload["agents"][0].update(
+                    projection_present=projection_present,
+                    last_repair_status=repair_status,
+                )
+                self.assert_code(
+                    "daemon_not_initialized",
+                    lambda payload=payload: readiness.validate_daemon_payload(payload),
+                )
 
     def test_daemon_local_gate_ignores_only_quiescent_projection_ghosts(self) -> None:
         payload = valid_runtime()
