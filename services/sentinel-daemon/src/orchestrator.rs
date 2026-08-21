@@ -139,6 +139,8 @@ const PERSONALITY_EVOLUTION_PER_AGENT_FIELD_KEEP: i64 = 2000;
 const PERSONALITY_EVOLUTION_GLOBAL_HIGH_WATER: i64 = 499_000;
 const PERSONALITY_EVOLUTION_GLOBAL_RETAIN: i64 = 490_000;
 const MAX_WORKBENCH_COMMANDS_PER_TICK: usize = 16;
+const STARTUP_RUNTIME_SPAWN_ATTEMPTS: usize = 3;
+const STARTUP_RUNTIME_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn episode_projection_allows_agent(
     state: &SharedEpisodeProjectionAdmissionState,
@@ -1339,7 +1341,7 @@ fn spawn_agent_nano_runtime(
             warn!(
                 agent = %agent_cfg.identity.name,
                 runtime = ?agent_cfg.runtime.nano_runtime,
-                error = %error,
+                error = ?error,
                 "NanoRuntime-Spawn fehlgeschlagen"
             );
             remove_security_runtime_snapshot(security_runtime_state, agent_id);
@@ -1592,6 +1594,51 @@ fn spawn_agent_runtime_stack(
     }
 
     true
+}
+
+fn ensure_startup_logical_runtime(
+    runtime_orch: &mut RuntimeOrchestrator,
+    agent_cfg: &AgentConfig,
+) -> Result<()> {
+    let agent_id = AgentId(agent_cfg.identity.id);
+    if runtime_orch.get_agent_mut(agent_id).is_some() {
+        return Ok(());
+    }
+
+    let identity = AgentIdentity {
+        agent_id,
+        name: agent_cfg.identity.name.clone(),
+        role: agent_cfg.identity.role.clone(),
+    };
+    let (start, end) = shift_hours(agent_cfg.identity.shift_set);
+    let shift = ShiftInfo {
+        shift_set: agent_cfg.identity.shift_set,
+        shift_start_hour: start,
+        shift_end_hour: end,
+        is_on_duty: true,
+    };
+    runtime_orch.spawn_agent(identity, shift, &agent_cfg.preferences.favorite_room)
+}
+
+fn bounded_startup_runtime_spawn<Attempt, Backoff>(
+    max_attempts: usize,
+    mut attempt_spawn: Attempt,
+    mut backoff: Backoff,
+) -> bool
+where
+    Attempt: FnMut(usize) -> bool,
+    Backoff: FnMut(usize),
+{
+    assert!(max_attempts > 0, "startup runtime spawn needs an attempt");
+    for attempt in 1..=max_attempts {
+        if attempt_spawn(attempt) {
+            return true;
+        }
+        if attempt < max_attempts {
+            backoff(attempt);
+        }
+    }
+    false
 }
 
 /// Spawnt einen Agenten sowohl im RuntimeOrchestrator als auch in der ECS World.
@@ -8068,50 +8115,60 @@ fn ecs_tick_loop(
             .with_context(|| {
                 format!("restore startup config apply runtime snapshot for {agent_id}")
             })?;
-        } else if runtime_orch.get_agent_mut(agent_id).is_none() {
-            // Nicht im Orchestrator → neu registrieren (emittiert Lifecycle-Events)
-            let identity = AgentIdentity {
-                agent_id,
-                name: agent_cfg.identity.name.clone(),
-                role: agent_cfg.identity.role.clone(),
-            };
-            let (start, end) = shift_hours(agent_cfg.identity.shift_set);
-            let shift = ShiftInfo {
-                shift_set: agent_cfg.identity.shift_set,
-                shift_start_hour: start,
-                shift_end_hour: end,
-                is_on_duty: true,
-            };
-            if let Err(e) =
-                runtime_orch.spawn_agent(identity, shift, &agent_cfg.preferences.favorite_room)
-            {
-                warn!(agent_id = agent_cfg.identity.id, error = %e, "Agent-Spawn fehlgeschlagen");
+        } else {
+            if let Err(error) = ensure_startup_logical_runtime(&mut runtime_orch, agent_cfg) {
+                warn!(
+                    agent_id = agent_cfg.identity.id,
+                    error = ?error,
+                    "Startup logical agent spawn failed"
+                );
                 continue;
             }
-        }
 
-        if startup_config_apply.is_none()
-            && !spawn_agent_nano_runtime(
-                agent_cfg,
-                &mut nano_runtimes,
-                &sandbox,
-                &mut sandbox_handles,
-                &mut ebpf_collector,
-                &mut agent_processes,
-                &agent_command,
-                &security_runtime_state,
-                fs_mount.as_deref(),
-                Some(event_store_for_isolation.as_ref()),
-            )
-        {
-            if let Err(cleanup_error) = runtime_orch.despawn_agent(agent_id) {
+            let runtime_ready = bounded_startup_runtime_spawn(
+                STARTUP_RUNTIME_SPAWN_ATTEMPTS,
+                |_attempt| {
+                    spawn_agent_nano_runtime(
+                        agent_cfg,
+                        &mut nano_runtimes,
+                        &sandbox,
+                        &mut sandbox_handles,
+                        &mut ebpf_collector,
+                        &mut agent_processes,
+                        &agent_command,
+                        &security_runtime_state,
+                        fs_mount.as_deref(),
+                        Some(event_store_for_isolation.as_ref()),
+                    )
+                },
+                |attempt| {
+                    warn!(
+                        agent_id = %agent_id,
+                        agent = %agent_cfg.identity.name,
+                        attempt,
+                        max_attempts = STARTUP_RUNTIME_SPAWN_ATTEMPTS,
+                        delay_ms = STARTUP_RUNTIME_SPAWN_RETRY_DELAY.as_millis(),
+                        "Transient startup runtime spawn failed; retrying after cleanup"
+                    );
+                    std::thread::sleep(STARTUP_RUNTIME_SPAWN_RETRY_DELAY);
+                },
+            );
+            if !runtime_ready {
+                if let Err(cleanup_error) = runtime_orch.despawn_agent(agent_id) {
+                    error!(
+                        agent_id = %agent_id,
+                        error = ?cleanup_error,
+                        "Startup logical runtime cleanup after exhausted NanoRuntime retries failed"
+                    );
+                }
                 error!(
                     agent_id = %agent_id,
-                    error = %cleanup_error,
-                    "Startup logical runtime rollback after NanoRuntime failure failed"
+                    agent = %agent_cfg.identity.name,
+                    attempts = STARTUP_RUNTIME_SPAWN_ATTEMPTS,
+                    "Startup runtime remained unavailable after bounded retries"
                 );
+                continue;
             }
-            continue;
         }
 
         // #428: restore the suspended state through the selected adapter after
@@ -11633,6 +11690,64 @@ fn ecs_tick_loop(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_runtime_spawn_retries_once_after_a_transient_failure() {
+        let mut attempts = Vec::new();
+        let mut backoffs = Vec::new();
+
+        let ready = bounded_startup_runtime_spawn(
+            STARTUP_RUNTIME_SPAWN_ATTEMPTS,
+            |attempt| {
+                attempts.push(attempt);
+                attempt == 2
+            },
+            |attempt| backoffs.push(attempt),
+        );
+
+        assert!(ready);
+        assert_eq!(attempts, vec![1, 2]);
+        assert_eq!(backoffs, vec![1]);
+    }
+
+    #[test]
+    fn startup_runtime_spawn_stops_after_the_bounded_attempts() {
+        let mut attempts = Vec::new();
+        let mut backoffs = Vec::new();
+
+        let ready = bounded_startup_runtime_spawn(
+            STARTUP_RUNTIME_SPAWN_ATTEMPTS,
+            |attempt| {
+                attempts.push(attempt);
+                false
+            },
+            |attempt| backoffs.push(attempt),
+        );
+
+        assert!(!ready);
+        assert_eq!(attempts, vec![1, 2, 3]);
+        assert_eq!(backoffs, vec![1, 2]);
+    }
+
+    #[test]
+    fn startup_runtime_retry_preserves_an_existing_logical_state() {
+        let original = test_agent_config(46, "Ralf Steinbach", "Software Engineer", 1);
+        let mut runtime_orch = RuntimeOrchestrator::new(60);
+        ensure_startup_logical_runtime(&mut runtime_orch, &original).unwrap();
+        let handle = runtime_orch.get_agent_mut(AgentId(46)).unwrap();
+        handle.status = sentinel_runtime::AgentStatus::Suspended;
+        handle.last_activity_tick = sentinel_common::Tick(1234);
+
+        let changed_config = test_agent_config(46, "Replacement", "Other Role", 2);
+        ensure_startup_logical_runtime(&mut runtime_orch, &changed_config).unwrap();
+
+        let preserved = runtime_orch.get_agent_mut(AgentId(46)).unwrap();
+        assert_eq!(preserved.identity.name, "Ralf Steinbach");
+        assert_eq!(preserved.identity.role, "Software Engineer");
+        assert_eq!(preserved.shift.shift_set, 1);
+        assert_eq!(preserved.status, sentinel_runtime::AgentStatus::Suspended);
+        assert_eq!(preserved.last_activity_tick, sentinel_common::Tick(1234));
+    }
+
     use super::*;
     use crate::controlplane::config::ControlplaneConfig;
     use crate::controlplane::store::ControlplaneStore;
