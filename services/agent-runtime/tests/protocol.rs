@@ -404,8 +404,8 @@ fn runtime_without_workbench_attestation_uses_general_agent_mode() {
         .unwrap()
         .read_to_string(&mut diagnostics)
         .unwrap();
-    assert!(diagnostics.contains("general agent started"));
-    assert!(diagnostics.contains("general agent shutting down"));
+    assert!(diagnostics.contains("agent-runtime: started"));
+    assert!(diagnostics.contains("agent-runtime: shutting down"));
     assert!(!diagnostics.contains("workbench started"));
 }
 
@@ -434,7 +434,7 @@ fn partial_workbench_attestation_cannot_downgrade_to_general_agent_mode() {
     assert!(!attestation_path.exists());
     let diagnostics = String::from_utf8_lossy(&output.stderr);
     assert!(diagnostics.contains("startup isolation attestation failed"));
-    assert!(!diagnostics.contains("general agent started"));
+    assert!(!diagnostics.contains("agent-runtime: started"));
 }
 
 #[test]
