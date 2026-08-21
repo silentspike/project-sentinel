@@ -686,6 +686,20 @@ class ReadinessTests(unittest.TestCase):
         readiness.check_nats(5, recovering, clock=clock, sleeper=clock.sleep)
         self.assertEqual(calls, 3)
 
+    def test_retry_deadline_reports_last_readiness_failure(self) -> None:
+        clock = FakeClock()
+
+        def unavailable(*_args, **_kwargs):
+            clock.now += 0.96
+            raise readiness.ReadinessError("daemon_not_initialized")
+
+        self.assert_code(
+            "daemon_not_initialized",
+            lambda: readiness.check_daemon(
+                1, self.credential, unavailable, clock=clock, sleeper=clock.sleep
+            ),
+        )
+
 
 class TopologyTests(unittest.TestCase):
     def unit(self, name: str) -> str:
