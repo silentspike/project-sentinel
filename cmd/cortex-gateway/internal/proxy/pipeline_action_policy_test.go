@@ -263,49 +263,48 @@ func TestPipelineAllowsLegitimateMoveActionWithPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetEventsSince: %v", err)
 	}
-	if len(events) != 1 {
-		t.Fatalf("expected one persisted action event, got %d: %+v", len(events), events)
-	}
-	if events[0].EventType != "agent_action_received" {
-		t.Fatalf("event type = %q, want agent_action_received", events[0].EventType)
-	}
-	if events[0].AggregateID != "AGENT-01" {
-		t.Fatalf("aggregate_id = %q, want AGENT-01", events[0].AggregateID)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(events[0].Payload), &payload); err != nil {
-		t.Fatalf("payload unmarshal: %v", err)
-	}
-	if payload["action_type"] != "move" {
-		t.Fatalf("payload action_type = %q, want move", payload["action_type"])
-	}
-	if payload["type"] != "AgentActionReceived" || payload["agent_id"] != float64(1) {
-		t.Fatalf("payload is not canonical DomainEventPayload: %#v", payload)
-	}
-	if payload["target_room"] != "kueche" || payload["source"] != "external" {
-		t.Fatalf("payload target/source mismatch: %#v", payload)
+	if len(events) != 0 {
+		t.Fatalf("gateway persisted an unapplied action proposal: %+v", events)
 	}
 }
 
-func TestPersistActionsSkipsPlatformControlplaneResponses(t *testing.T) {
+func TestPipelineDoesNotPersistPlatformControlplaneActions(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register("mock", &pipelineMockProvider{
+		name: "mock",
+		resp: &LLMResponse{
+			Content:      "AKTION: Chat\nZIEL: Team\nINHALT: Ich habe das gehoert.",
+			Model:        "test-model",
+			TokensUsed:   4,
+			FinishReason: "end_turn",
+		},
+	})
 	store, err := eventstore.Open(filepath.Join(t.TempDir(), "events.db"))
 	if err != nil {
 		t.Fatalf("open event store: %v", err)
 	}
 	defer func() { _ = store.Close() }()
-	ph := &PipelineHandler{eventStore: store, logger: slog.Default()}
-	actions := []extraction.ExtractedAction{{
-		Type: "chat", Target: "Team", Content: "Ich habe das gehoert.",
-	}}
-	req := &LLMRequest{
-		RequestClass: RequestClassPlatformControlplane,
-		Metadata: map[string]string{
-			"agent_name":        "PLATFORM-CONTROLPLANE",
-			"platform_analysis": "true",
-		},
+	ph := NewPipelineHandler(PipelineConfig{
+		Registry:     reg,
+		Config:       control.NewConfig("mock"),
+		Compiler:     compiler.New(),
+		Normalizer:   normalizer.New(),
+		Extractor:    extraction.New(),
+		Capabilities: capability.New(),
+		Logger:       slog.Default(),
+		BreakerCfg:   testConfig(),
+		EventStore:   store,
+	})
+	body := `{"messages":[{"role":"user","content":"Analysiere den Zustand."}],"metadata":{"agent_name":"PLATFORM-CONTROLPLANE","platform_analysis":"true"}}`
+	req := httptest.NewRequest(http.MethodPost, "/internal/llm", strings.NewReader(body))
+	req = req.WithContext(callerRoleContext(req.Context(), CallerRolePlatformControlplane))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Request-ID", "platform-request")
+	w := httptest.NewRecorder()
+	ph.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
 	}
-
-	ph.persistActions(actions, "PLATFORM-CONTROLPLANE", "platform-request", req)
 	events, _, err := store.GetEventsSince(0, 10)
 	if err != nil {
 		t.Fatalf("GetEventsSince: %v", err)

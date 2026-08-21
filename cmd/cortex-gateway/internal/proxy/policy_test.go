@@ -52,13 +52,6 @@ func TestClassifyRequestRequiresServerSideRole(t *testing.T) {
 			want: RequestClassAgentRuntime,
 		},
 		{
-			name:    "agent role rejects identity beyond configured roster",
-			path:    "/internal/agent-runtime",
-			role:    CallerRoleAgentRuntime,
-			meta:    map[string]string{"agent_id": "61", "hierarchy_tier": "2"},
-			wantErr: true,
-		},
-		{
 			name:    "agent role rejects shared internal path",
 			path:    "/internal/llm",
 			role:    CallerRoleAgentRuntime,

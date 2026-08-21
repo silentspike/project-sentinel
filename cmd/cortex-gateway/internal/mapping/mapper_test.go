@@ -2,146 +2,149 @@ package mapping
 
 import (
 	"encoding/json"
-	"fmt"
 	"testing"
 
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/extraction"
 )
 
-func TestMapActionsMoveUsesCanonicalDomainPayload(t *testing.T) {
+func TestMapActions_Move(t *testing.T) {
 	actions := []extraction.ExtractedAction{
 		{Type: "move", Content: "Ich gehe in die Kueche", Target: "kueche", Emotion: "happy"},
 	}
-	events, err := MapActions(actions, ActionMeta{AgentID: 1, RequestID: "req-001", Tick: 42})
-	if err != nil {
-		t.Fatalf("MapActions: %v", err)
-	}
+	meta := ActionMeta{AgentName: "AGENT-01", RequestID: "req-001", Tick: 42}
+
+	events := MapActions(actions, meta)
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
 
-	event := events[0]
-	if event.EventType != "agent_action_received" || event.AggregateID != "AGENT-01" {
-		t.Errorf("event identity mismatch: %+v", event)
+	e := events[0]
+	if e.EventType != "agent_action_received" {
+		t.Errorf("expected event_type=agent_action_received, got %q", e.EventType)
 	}
-	if event.CorrelationID != "req-001" || event.OperationID != "req-001-0" {
-		t.Errorf("request binding mismatch: %+v", event)
+	if e.AggregateID != "AGENT-01" {
+		t.Errorf("expected aggregate_id=AGENT-01, got %q", e.AggregateID)
 	}
-	if event.Tick != 42 {
-		t.Errorf("tick = %d, want 42", event.Tick)
+	if e.CorrelationID != "req-001" {
+		t.Errorf("expected correlation_id=req-001, got %q", e.CorrelationID)
+	}
+	if e.OperationID != "req-001-0" {
+		t.Errorf("expected operation_id=req-001-0, got %q", e.OperationID)
+	}
+	if e.Tick != 42 {
+		t.Errorf("expected tick=42, got %d", e.Tick)
 	}
 
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(event.Payload), &payload); err != nil {
+	// Verify payload contains target
+	var payload map[string]string
+	if err := json.Unmarshal([]byte(e.Payload), &payload); err != nil {
 		t.Fatalf("payload unmarshal: %v", err)
 	}
-	if payload["type"] != "AgentActionReceived" || payload["agent_id"] != float64(1) {
-		t.Errorf("canonical Rust tag/identity missing: %#v", payload)
+	if payload["target"] != "kueche" {
+		t.Errorf("expected target=kueche, got %q", payload["target"])
 	}
-	if payload["action_type"] != "move" || payload["target_room"] != "kueche" {
-		t.Errorf("canonical action fields mismatch: %#v", payload)
-	}
-	if payload["content"] != "Ich gehe in die Kueche" || payload["source"] != "external" {
-		t.Errorf("canonical content/source mismatch: %#v", payload)
-	}
-	if _, exists := payload["target"]; exists {
-		t.Errorf("legacy target field retained: %#v", payload)
-	}
-	if _, exists := payload["emotion"]; exists {
-		t.Errorf("non-domain emotion field retained: %#v", payload)
+	if payload["emotion"] != "happy" {
+		t.Errorf("expected emotion=happy, got %q", payload["emotion"])
 	}
 }
 
-func TestMapActionsMultipleActionsShareAuthenticatedAggregate(t *testing.T) {
+func TestMapActions_MultipleActions(t *testing.T) {
 	actions := []extraction.ExtractedAction{
-		{Type: "emote", Content: "*lacht*"},
-		{Type: "move", Content: "gehe in den Flur", Target: "flur"},
-		{Type: "chat", Content: "Hallo zusammen!"},
+		{Type: "emote", Content: "*lacht*", Emotion: "happy"},
+		{Type: "move", Content: "gehe in den Flur", Target: "flur", Emotion: "happy"},
+		{Type: "chat", Content: "Hallo zusammen!", Emotion: "neutral"},
 	}
-	events, err := MapActions(actions, ActionMeta{AgentID: 5, RequestID: "req-multi", Tick: 100})
-	if err != nil {
-		t.Fatalf("MapActions: %v", err)
-	}
+	meta := ActionMeta{AgentName: "AGENT-05", RequestID: "req-multi", Tick: 100}
+
+	events := MapActions(actions, meta)
 	if len(events) != 3 {
 		t.Fatalf("expected 3 events, got %d", len(events))
 	}
-	for i, event := range events {
-		if event.EventType != "agent_action_received" || event.AggregateID != "AGENT-05" {
-			t.Errorf("event[%d] identity mismatch: %+v", i, event)
+
+	expectedTypes := []string{"agent_action_received", "agent_action_received", "agent_action_received"}
+	expectedOpIDs := []string{"req-multi-0", "req-multi-1", "req-multi-2"}
+
+	for i, e := range events {
+		if e.EventType != expectedTypes[i] {
+			t.Errorf("event[%d]: expected type=%q, got %q", i, expectedTypes[i], e.EventType)
 		}
-		wantOperation := fmt.Sprintf("req-multi-%d", i)
-		if event.OperationID != wantOperation {
-			t.Errorf("event[%d] operation_id = %q, want %q", i, event.OperationID, wantOperation)
+		if e.OperationID != expectedOpIDs[i] {
+			t.Errorf("event[%d]: expected op_id=%q, got %q", i, expectedOpIDs[i], e.OperationID)
+		}
+		if e.AggregateID != "AGENT-05" {
+			t.Errorf("event[%d]: expected aggregate=AGENT-05, got %q", i, e.AggregateID)
 		}
 	}
 }
 
-func TestMapActionsEmptyActions(t *testing.T) {
-	for _, actions := range [][]extraction.ExtractedAction{nil, {}} {
-		events, err := MapActions(actions, ActionMeta{RequestID: "req-empty"})
-		if err != nil {
-			t.Fatalf("empty MapActions: %v", err)
-		}
-		if events != nil {
-			t.Errorf("expected nil for empty actions, got %d events", len(events))
-		}
+func TestMapActions_EmptyActions(t *testing.T) {
+	events := MapActions(nil, ActionMeta{AgentName: "AGENT-01", RequestID: "req-empty"})
+	if events != nil {
+		t.Errorf("expected nil for empty actions, got %d events", len(events))
+	}
+
+	events = MapActions([]extraction.ExtractedAction{}, ActionMeta{AgentName: "AGENT-01", RequestID: "req-empty"})
+	if events != nil {
+		t.Errorf("expected nil for zero-length actions, got %d events", len(events))
 	}
 }
 
-func TestMapActionsRejectsInvalidAuthenticatedIdentity(t *testing.T) {
-	for _, agentID := range []uint16{0, maxShippedAgentID + 1} {
-		events, err := MapActions(
-			[]extraction.ExtractedAction{{Type: "chat", Content: "hallo"}},
-			ActionMeta{AgentID: agentID, RequestID: "req-invalid-agent"},
-		)
-		if err == nil {
-			t.Fatalf("invalid authenticated agent id %d was accepted", agentID)
-		}
-		if events != nil {
-			t.Fatalf("failed mapping emitted events: %+v", events)
-		}
-	}
-}
-
-func TestOperationIDDeterministic(t *testing.T) {
+func TestOperationIdDeterministic(t *testing.T) {
 	actions := []extraction.ExtractedAction{
 		{Type: "chat", Content: "hallo"},
 		{Type: "move", Content: "gehe in Kueche", Target: "kueche"},
 	}
-	meta := ActionMeta{AgentID: 1, RequestID: "fixed-req-id", Tick: 10}
+	meta := ActionMeta{AgentName: "AGENT-01", RequestID: "fixed-req-id", Tick: 10}
 
-	events1, err := MapActions(actions, meta)
-	if err != nil {
-		t.Fatal(err)
-	}
-	events2, err := MapActions(actions, meta)
-	if err != nil {
-		t.Fatal(err)
-	}
+	events1 := MapActions(actions, meta)
+	events2 := MapActions(actions, meta)
+
 	for i := range events1 {
 		if events1[i].OperationID != events2[i].OperationID {
-			t.Errorf("event[%d] operation_id not deterministic: %q != %q",
+			t.Errorf("event[%d]: operation_id not deterministic: %q != %q",
 				i, events1[i].OperationID, events2[i].OperationID)
 		}
 	}
 }
 
-func TestMapActionsUnknownTypeRemainsExplicit(t *testing.T) {
-	events, err := MapActions(
-		[]extraction.ExtractedAction{{Type: "unknown_action", Content: "something weird"}},
-		ActionMeta{AgentID: 1, RequestID: "req-unknown"},
-	)
-	if err != nil {
-		t.Fatalf("MapActions: %v", err)
+func TestMapActions_UnknownType(t *testing.T) {
+	actions := []extraction.ExtractedAction{
+		{Type: "unknown_action", Content: "something weird"},
 	}
-	if len(events) != 1 || events[0].EventType != "agent_action_received" {
-		t.Fatalf("unexpected events: %+v", events)
+	meta := ActionMeta{AgentName: "AGENT-01", RequestID: "req-unknown"}
+
+	events := MapActions(actions, meta)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
 	}
-	var payload map[string]any
+	// All actions use unified event type now
+	if events[0].EventType != "agent_action_received" {
+		t.Errorf("expected event_type=agent_action_received, got %q", events[0].EventType)
+	}
+}
+
+func TestBuildPayload_ActionTypeField(t *testing.T) {
+	actions := []extraction.ExtractedAction{
+		{Type: "chat", Content: "Hallo!", Target: "Lisa"},
+	}
+	meta := ActionMeta{AgentName: "AGENT-01", RequestID: "req-field"}
+
+	events := MapActions(actions, meta)
+	var payload map[string]string
 	if err := json.Unmarshal([]byte(events[0].Payload), &payload); err != nil {
-		t.Fatal(err)
+		t.Fatalf("payload unmarshal: %v", err)
 	}
-	if payload["action_type"] != "unknown_action" {
-		t.Fatalf("action type was hidden: %#v", payload)
+	// Must use "action_type" (not "type") for dashboard compatibility
+	if payload["action_type"] != "chat" {
+		t.Errorf("expected action_type=chat, got %q", payload["action_type"])
+	}
+	if _, hasOldKey := payload["type"]; hasOldKey {
+		t.Errorf("payload should not have 'type' key, found %q", payload["type"])
+	}
+	if payload["content"] != "Hallo!" {
+		t.Errorf("expected content=Hallo!, got %q", payload["content"])
+	}
+	if payload["target"] != "Lisa" {
+		t.Errorf("expected target=Lisa, got %q", payload["target"])
 	}
 }

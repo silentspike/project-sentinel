@@ -13,51 +13,34 @@ import (
 
 // ActionMeta holds contextual metadata for mapping actions to events.
 type ActionMeta struct {
-	AgentID   uint16 // server-authenticated numeric agent identity
+	AgentName string // e.g. "AGENT-01"
 	RequestID string // X-Request-ID or generated UUID
 	Tick      int64  // simulation tick from metadata, 0 if unknown
-}
-
-type agentActionReceivedPayload struct {
-	Type       string  `json:"type"`
-	AgentID    uint16  `json:"agent_id"`
-	ActionType string  `json:"action_type"`
-	TargetRoom *string `json:"target_room"`
-	Content    *string `json:"content"`
-	Source     string  `json:"source"`
 }
 
 // allActionsEventType is the unified event type for all LLM-generated agent actions.
 // The dashboard activity feed filters for this type; the specific action kind
 // (chat, move, emote, work, break, think) is stored in the payload's "action_type" field.
 const allActionsEventType = "agent_action_received"
-const maxShippedAgentID = 60
 
 // MapActions converts extracted actions into domain events ready for persistence.
 // Each action becomes one DomainEvent with a deterministic operation_id
 // ({RequestID}-{index}) for retry idempotency.
-func MapActions(actions []extraction.ExtractedAction, meta ActionMeta) ([]eventstore.DomainEvent, error) {
+func MapActions(actions []extraction.ExtractedAction, meta ActionMeta) []eventstore.DomainEvent {
 	if len(actions) == 0 {
-		return nil, nil
-	}
-	if meta.AgentID == 0 || meta.AgentID > maxShippedAgentID {
-		return nil, fmt.Errorf("agent action mapping requires an authenticated agent id")
+		return nil
 	}
 
 	now := time.Now().UnixMilli()
 	events := make([]eventstore.DomainEvent, 0, len(actions))
-	aggregateID := fmt.Sprintf("AGENT-%02d", meta.AgentID)
 
 	for i, action := range actions {
-		payload, err := buildPayload(action, meta.AgentID)
-		if err != nil {
-			return nil, fmt.Errorf("encode agent action %d: %w", i, err)
-		}
+		payload := buildPayload(action)
 
 		events = append(events, eventstore.DomainEvent{
 			EventID:          eventstore.GenerateUUID(),
 			EventType:        allActionsEventType,
-			AggregateID:      aggregateID,
+			AggregateID:      meta.AgentName,
 			Payload:          payload,
 			CorrelationID:    meta.RequestID,
 			OperationID:      fmt.Sprintf("%s-%d", meta.RequestID, i),
@@ -68,29 +51,31 @@ func MapActions(actions []extraction.ExtractedAction, meta ActionMeta) ([]events
 		})
 	}
 
-	return events, nil
+	return events
 }
 
-// buildPayload emits the exact sentinel-common DomainEventPayload wire shape.
-func buildPayload(action extraction.ExtractedAction, agentID uint16) (string, error) {
-	payload := agentActionReceivedPayload{
-		Type:       "AgentActionReceived",
-		AgentID:    agentID,
-		ActionType: action.Type,
-		TargetRoom: optionalString(action.Target),
-		Content:    optionalString(action.Content),
-		Source:     "external",
+// buildPayload creates a JSON payload from the extracted action fields.
+func buildPayload(action extraction.ExtractedAction) string {
+	m := map[string]string{
+		"action_type": action.Type,
 	}
-	b, err := json.Marshal(payload)
+	if action.Content != "" {
+		m["content"] = action.Content
+	}
+	if action.Target != "" {
+		m["target"] = action.Target
+	}
+	if action.Emotion != "" {
+		m["emotion"] = action.Emotion
+	}
+	if action.Intent != "" {
+		m["intent"] = action.Intent
+	}
+
+	b, err := json.Marshal(m)
 	if err != nil {
-		return "", err
+		// Fallback: never fail on serialization.
+		return fmt.Sprintf(`{"action_type":%q,"error":"marshal failed"}`, action.Type)
 	}
-	return string(b), nil
-}
-
-func optionalString(value string) *string {
-	if value == "" {
-		return nil
-	}
-	return &value
+	return string(b)
 }
