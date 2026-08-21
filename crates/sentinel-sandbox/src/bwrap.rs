@@ -29,11 +29,10 @@ const WORKBENCH_ENVIRONMENT: [(&str, &str); 4] = [
 /// Result of spawning a bwrap sandbox.
 ///
 /// `child` is the bwrap **supervisor** process (host/root netns by design,
-/// used for cgroup membership and SIGTERM). `child_pid` is the **sandboxed**
-/// process inside the agent's network namespace, reported by bwrap via
-/// `--info-fd`; this is the PID to verify isolation against (#75). `None` if
-/// bwrap did not report it (then netns verification is skipped, but the bwrap
-/// exit code remains the primary fail-closed signal).
+/// used for cgroup membership and SIGTERM). `child_pid` is bwrap's sandbox
+/// init process in the agent namespaces, reported by `--info-fd`. The command
+/// normally runs as its direct child; attested workbench startup resolves and
+/// verifies that runtime separately. `None` means bwrap did not report init.
 #[derive(Debug)]
 pub struct SpawnedSandbox {
     pub child: Child,
@@ -240,10 +239,9 @@ impl BwrapConfig {
     /// Spawns a bwrap sandbox process with the configured isolation.
     ///
     /// Returns a [`SpawnedSandbox`] holding the bwrap supervisor `Child` plus
-    /// the sandboxed child PID (from bwrap `--info-fd`). The caller manages the
-    /// child (cgroup membership uses the supervisor PID; netns isolation must
-    /// be verified against `child_pid`, since the supervisor stays in the root
-    /// netns by design — #75).
+    /// the sandbox init PID (from bwrap `--info-fd`). The caller manages the
+    /// process tree; the supervisor stays in the root netns, while init and its
+    /// command child live in the sandbox namespaces.
     pub fn spawn(&self, command: &[String]) -> Result<SpawnedSandbox> {
         let config = self.with_existing_host_binds()?;
         let mut args = config.to_args();
@@ -315,7 +313,7 @@ impl BwrapConfig {
         let child_pid = read_child_pid_from_info_fd(read_fd, INFO_FD_TIMEOUT_MS);
         if child_pid.is_none() {
             warn!(
-                "bwrap did not report a sandboxed child PID via --info-fd; \
+                "bwrap did not report its sandbox init PID via --info-fd; \
                  netns isolation verification will be skipped for this agent"
             );
         }
@@ -473,7 +471,7 @@ fn hostname_for_agent(name: &str) -> String {
     }
 }
 
-/// Reads the sandboxed child PID from bwrap's `--info-fd` pipe.
+/// Reads the sandbox-init Host PID from bwrap's `--info-fd` pipe.
 ///
 /// bwrap does NOT write the info JSON in one `write()`: bubblewrap 0.9.0 emits
 /// it across eight syscalls (one per field — verified with strace), so the
