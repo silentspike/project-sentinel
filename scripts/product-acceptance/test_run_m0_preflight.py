@@ -906,6 +906,19 @@ class PreflightTests(unittest.TestCase):
                     self.check(result, "systemd_units")["reason"], reason
                 )
 
+    def test_calendar_timer_accepts_last_success_before_current_activation(self) -> None:
+        fixture = Fixture()
+        timer = "sentinel-nightrun.timer"
+        service = preflight.TIMER_SERVICES[timer]
+        fixture.unit_facts[service]["ExecMainStartTimestampMonotonic"] = str(
+            int(fixture.unit_facts[timer]["ActiveEnterTimestampMonotonic"]) - 2
+        )
+        fixture.unit_facts[service]["ExecMainExitTimestampMonotonic"] = str(
+            int(fixture.unit_facts[timer]["ActiveEnterTimestampMonotonic"]) - 1
+        )
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(self.check(result, "systemd_units")["status"], "PASS")
+
     def test_missing_or_duplicate_required_unit_fails(self) -> None:
         wants = self.fixture.unit_facts[preflight.TARGET_UNIT]["Wants"].split()
         self.fixture.unit_facts[preflight.TARGET_UNIT]["Wants"] = " ".join(wants[:-1] + [wants[0]])
