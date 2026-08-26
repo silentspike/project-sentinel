@@ -1355,16 +1355,26 @@ class PreflightTests(unittest.TestCase):
                     reason,
                 )
 
-    def test_episode_frontier_must_equal_global_cut(self) -> None:
-        for frontier, reason in (
-            (None, "episode_projection_frontier_missing"),
-            (40, "episode_projection_frontier_mismatch"),
+    def test_episode_frontier_accepts_exact_subject_local_lag(self) -> None:
+        fixture = Fixture()
+        agent = fixture.http_payloads["episode_projection"]["agents"][0]  # type: ignore[index]
+        agent["frontier_source_row_id"] = 40
+        agent["lag_rows"] = 1
+        result = preflight.evaluate(fixture.inputs(), fixture.deps())
+        self.assertEqual(self.check(result, "identity_readiness")["status"], "PASS")
+
+    def test_episode_frontier_rejects_missing_future_or_inconsistent_lag(self) -> None:
+        for frontier, lag_rows, reason in (
+            (None, 0, "episode_projection_frontier_missing"),
+            (42, 0, "episode_projection_frontier_mismatch"),
+            (40, 0, "episode_projection_frontier_mismatch"),
+            (40, 2, "episode_projection_frontier_mismatch"),
         ):
-            with self.subTest(frontier=frontier):
+            with self.subTest(frontier=frontier, lag_rows=lag_rows):
                 fixture = Fixture()
-                fixture.http_payloads["episode_projection"]["agents"][0][  # type: ignore[index]
-                    "frontier_source_row_id"
-                ] = frontier
+                agent = fixture.http_payloads["episode_projection"]["agents"][0]  # type: ignore[index]
+                agent["frontier_source_row_id"] = frontier
+                agent["lag_rows"] = lag_rows
                 result = preflight.evaluate(fixture.inputs(), fixture.deps())
                 self.assertEqual(self.check(result, "identity_readiness")["reason"], reason)
 
