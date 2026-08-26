@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Align single-node M0 episode readiness with the durable subject-local
+  projection contract: each agent frontier may trail the global scan cursor
+  when no relevant event exists, while its reported lag must equal the exact
+  cursor delta and future, inconsistent, blocked, or missing frontiers still
+  fail closed.
+- Bound Go EventStore write-lock contention with a five-second SQLite busy
+  handler so NATS PubAck adoption can converge under the daemon's live writer
+  load instead of immediately abandoning each publication attempt.
 - Queue Platform Control Plane starts for inactive systemd dependencies with
   `--no-block`, preventing daemon `ExecStartPost` readiness from deadlocking on
   units ordered after `sentinel-daemon.service`.
