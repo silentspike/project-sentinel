@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Keep work assigned to an off-shift employee durably pending until that
+  employee's exact bwrap runtime is available. The Workbench dispatcher now
+  rejects this condition before reservation or runtime I/O and distinguishes
+  it from a genuinely ambiguous post-dispatch outcome; its response window
+  also covers a loaded adaptive ECS tick instead of falsely blocking the work.
 - Route Project Manager mutations in the canonical M0 company journey through
   its authenticated agent authority instead of the operator-only command
   surface; operator reads and the explicit customer/operator negative remain

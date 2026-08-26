@@ -37,8 +37,8 @@ use uuid::Uuid;
 use crate::delivery::{ConfiguredDeliveryCore, DeliveryStoreConfigV1};
 use crate::workbench::{
     dispatch_workbench, stage_verified_artifact_inputs, WorkbenchAuthoritySnapshot,
-    WorkbenchAuthoritySource, WorkbenchDispatchCommand, WorkbenchInvocationRecord,
-    WorkbenchInvocationState, WorkbenchProfile,
+    WorkbenchAuthoritySource, WorkbenchDispatchCommand, WorkbenchDispatchUnavailable,
+    WorkbenchInvocationRecord, WorkbenchInvocationState, WorkbenchProfile,
 };
 use delivery_runtime::{
     LimboDeliveryEffects, LimboDeliveryPublication, WorkflowDeliveryIntegration,
@@ -62,7 +62,7 @@ pub const MAX_WORKFLOW_BODY_BYTES: usize = 256 * 1024;
 const PRINCIPAL_SCHEMA_VERSION: u16 = 1;
 const PROFILE_GENERATION: u64 = 1;
 const RUNTIME_GENERATION: u64 = 1;
-const DISPATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const DISPATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RECONCILE_BATCH: usize = 32;
 const MAX_PRINCIPAL_BINDINGS_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTION_INTENT_STEPS: usize = 16;
@@ -1056,7 +1056,7 @@ impl WorkbenchExecutionAdapter {
         dispatch_workbench(command(response)).map_err(|_| WorkflowPortError::Unavailable)?;
         match receiver.recv_timeout(DISPATCH_RESPONSE_TIMEOUT) {
             Ok(Ok(update)) => Ok(update),
-            Ok(Err(_)) => Err(WorkflowPortError::UnknownOutcome),
+            Ok(Err(error)) => Err(map_workbench_dispatch_error(error)),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(WorkflowPortError::UnknownOutcome),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(WorkflowPortError::Unavailable),
         }
@@ -1097,6 +1097,14 @@ impl WorkbenchExecutionAdapter {
             .last()
             .filter(|record| record.state == WorkbenchInvocationState::Succeeded)
             .ok_or(WorkflowPortError::Rejected)
+    }
+}
+
+fn map_workbench_dispatch_error(error: anyhow::Error) -> WorkflowPortError {
+    if error.is::<WorkbenchDispatchUnavailable>() {
+        WorkflowPortError::Unavailable
+    } else {
+        WorkflowPortError::UnknownOutcome
     }
 }
 
@@ -2954,6 +2962,18 @@ mod tests {
             agent_id: Some(AgentId(6)),
             authority_generation: 1,
         }
+    }
+
+    #[test]
+    fn workbench_dispatch_error_preserves_only_proven_pre_dispatch_unavailability() {
+        assert_eq!(
+            map_workbench_dispatch_error(WorkbenchDispatchUnavailable.into()),
+            WorkflowPortError::Unavailable
+        );
+        assert_eq!(
+            map_workbench_dispatch_error(anyhow::anyhow!("post-dispatch failure")),
+            WorkflowPortError::UnknownOutcome
+        );
     }
 
     fn execution_step() -> sentinel_workflow::ExecutionStepV1 {

@@ -32,6 +32,19 @@ const MAX_PROFILE_TEST_SUITES: usize = 64;
 const LINUX_O_NOFOLLOW: i32 = 0o400000;
 const LINUX_O_CLOEXEC: i32 = 0o2000000;
 
+/// Signals that a command was rejected before the coordinator reserved an
+/// invocation or dispatched runtime I/O. Callers may retry this condition.
+#[derive(Debug)]
+pub(crate) struct WorkbenchDispatchUnavailable;
+
+impl std::fmt::Display for WorkbenchDispatchUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("workbench runtime is unavailable before dispatch")
+    }
+}
+
+impl std::error::Error for WorkbenchDispatchUnavailable {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkbenchProfile {
