@@ -1022,6 +1022,96 @@ fn handoffs_blockers_rooms_questions_and_actions_keep_project_authority() {
 }
 
 #[test]
+fn resolving_a_pre_activation_blocker_restores_explicit_planning_authority() {
+    let state = journey();
+    let project = command(
+        &state.store,
+        &state.pm,
+        800,
+        CompanyWorkflowCommandV1::PlanWorkGraph {
+            project_id: state.project_id.clone(),
+            expected_version: 1,
+            items: vec![work(
+                "work-a",
+                CompanyRoleV1::Developer,
+                &["rust"],
+                &[],
+                100,
+            )],
+        },
+        800,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    let project = command(
+        &state.store,
+        &state.pm,
+        801,
+        CompanyWorkflowCommandV1::RaiseBlocker {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: None,
+            cause_ref: "pre-activation-review".to_owned(),
+            owner: AgentId(2),
+        },
+        801,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    assert_eq!(project.lifecycle_state, ProjectLifecycleStateV1::Blocked);
+    let blocker_id = project.blockers[0].blocker_id.clone();
+    let project = command(
+        &state.store,
+        &state.pm,
+        802,
+        CompanyWorkflowCommandV1::EscalateBlocker {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            blocker_id: blocker_id.clone(),
+            escalation_target: AgentId(1),
+            reason_ref: "manager-decision-required".to_owned(),
+        },
+        802,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    let project = command(
+        &state.store,
+        &state.pm,
+        803,
+        CompanyWorkflowCommandV1::ResolveBlocker {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            blocker_id,
+            resolution_ref: "review-approved".to_owned(),
+        },
+        803,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    assert_eq!(project.lifecycle_state, ProjectLifecycleStateV1::Planning);
+    let project = command(
+        &state.store,
+        &state.pm,
+        804,
+        CompanyWorkflowCommandV1::ActivateProject {
+            project_id: state.project_id,
+            expected_version: project.version,
+            reason_ref: "governance-complete".to_owned(),
+        },
+        804,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    assert_eq!(project.lifecycle_state, ProjectLifecycleStateV1::Active);
+}
+
+#[test]
 fn every_project_mutation_rejects_unbound_or_spoofed_principals_before_state_change() {
     let state = journey();
     let before = state

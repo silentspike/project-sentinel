@@ -11,7 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its authenticated agent authority instead of the operator-only command
   surface; operator reads and the explicit customer/operator negative remain
   unchanged. The corrected semantic journey uses a new durable journey ID so
-  prior operation IDs cannot be mistaken for fresh acceptance evidence.
+  prior operation IDs cannot be mistaken for fresh acceptance evidence. A
+  pre-activation blocker now returns an untouched work graph to `planning`
+  after resolution, preserving the explicit manager activation gate.
 - Align single-node M0 episode readiness with the durable subject-local
   projection contract: each agent frontier may trail the global scan cursor
   when no relevant event exists, while its reported lag must equal the exact
