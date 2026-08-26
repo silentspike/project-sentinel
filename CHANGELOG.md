@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bound Go EventStore write-lock contention with a five-second SQLite busy
   handler so NATS PubAck adoption can converge under the daemon's live writer
   load instead of immediately abandoning each publication attempt.
+- Release an exact LLM request reservation after a transport-level connect
+  failure proves that no Gateway dispatch occurred; timeouts and all ambiguous
+  post-connect failures remain durable and fail closed.
+- Treat a successful calendar-triggered Nightrun outcome as historical evidence
+  across service reactivation while still requiring the periodic health-monitor
+  oneshot to complete after the current timer activation.
 - Queue Platform Control Plane starts for inactive systemd dependencies with
   `--no-block`, preventing daemon `ExecStartPost` readiness from deadlocking on
   units ordered after `sentinel-daemon.service`.

@@ -192,6 +192,11 @@ pub mod bridge {
             request_digest: &str,
             agent_id: &str,
         ) -> anyhow::Result<bool>;
+        fn release_undispatched_request(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+        ) -> anyhow::Result<bool>;
         fn enqueue_completion(
             &self,
             request_id: &str,
@@ -226,6 +231,14 @@ pub mod bridge {
             agent_id: &str,
         ) -> anyhow::Result<bool> {
             self.reserve_llm_request(request_id, request_digest, agent_id)
+        }
+
+        fn release_undispatched_request(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+        ) -> anyhow::Result<bool> {
+            self.release_undispatched_llm_request(request_id, request_digest)
         }
 
         fn enqueue_completion(
@@ -300,6 +313,28 @@ pub mod bridge {
         store
             .reserve_request(request_id, request_digest, agent_id)
             .map(Some)
+    }
+
+    fn release_connect_failed_request<S: CompletionStore>(
+        store: &S,
+        request_id: &str,
+        request_digest: &str,
+        error: &reqwest::Error,
+    ) -> bool {
+        if !error.is_connect() {
+            return false;
+        }
+        match store.release_undispatched_request(request_id, request_digest) {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!(request_id, "Undispatched LLM reservation was not released");
+                false
+            }
+            Err(release_error) => {
+                error!(request_id, error = %release_error, "Undispatched LLM reservation release failed closed");
+                false
+            }
+        }
     }
 
     fn agent_runtime_request(
@@ -1073,7 +1108,13 @@ pub mod bridge {
                             }
                             Err(e) => {
                                 let is_timeout = e.is_timeout();
-                                warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, "Gateway Request fehlgeschlagen");
+                                let reservation_released = release_connect_failed_request(
+                                    bridge_event_store.as_ref(),
+                                    &request_id,
+                                    &request_digest,
+                                    &e,
+                                );
+                                warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, reservation_released, "Gateway Request fehlgeschlagen");
                                 telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                 cb.lock().unwrap().record_failure();
                             }
@@ -1177,7 +1218,13 @@ pub mod bridge {
                             }
                             Err(e) => {
                                 let is_timeout = e.is_timeout();
-                                warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, "Gateway Request fehlgeschlagen");
+                                let reservation_released = release_connect_failed_request(
+                                    bridge_event_store.as_ref(),
+                                    &request_id,
+                                    &request_digest,
+                                    &e,
+                                );
+                                warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, reservation_released, "Gateway Request fehlgeschlagen");
                                 telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                 cb.lock().unwrap().record_failure();
                             }
@@ -1520,6 +1567,15 @@ pub mod bridge {
                     .reserve_llm_request(request_id, request_digest, agent_id)
             }
 
+            fn release_undispatched_request(
+                &self,
+                request_id: &str,
+                request_digest: &str,
+            ) -> anyhow::Result<bool> {
+                self.inner
+                    .release_undispatched_llm_request(request_id, request_digest)
+            }
+
             fn enqueue_completion(
                 &self,
                 request_id: &str,
@@ -1809,6 +1865,60 @@ pub mod bridge {
                 .unwrap()
                 .is_none());
             provider_task.abort();
+        }
+
+        #[tokio::test]
+        async fn connect_failure_releases_only_undispatched_reservation() {
+            let dir = tempfile::tempdir().unwrap();
+            let event_path = dir.path().join("events.db");
+            let state_path = dir.path().join("state.redb");
+            let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
+            let event_store = Arc::new(EventStore::open(event_path.to_str().unwrap()).unwrap());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let unavailable_address = listener.local_addr().unwrap();
+            drop(listener);
+            let config = LlmBridgeConfig {
+                gateway_url: format!("http://{unavailable_address}"),
+                credential: "test-credential".to_string(),
+                request_timeout: Duration::from_secs(1),
+                ..Default::default()
+            };
+            let (perception_tx, perception_rx) = mpsc::channel();
+            let (action_tx, _action_rx) = mpsc::channel();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let telemetry = Arc::new(BridgeTelemetry::default());
+            let bridge = tokio::spawn(run_llm_bridge_with_store(
+                config,
+                perception_rx,
+                action_tx,
+                Arc::clone(&telemetry),
+                state_store,
+                Arc::clone(&event_store),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
+                shutdown_rx,
+                Arc::new(RwLock::new(true)),
+            ));
+
+            perception_tx.send(recovery_test_perception()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while telemetry.calls_failed.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("connect failure was not observed");
+            assert!(event_store
+                .get_llm_completion("agent-runtime-07-55")
+                .unwrap()
+                .is_none());
+
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), bridge)
+                .await
+                .expect("bridge did not shut down")
+                .unwrap()
+                .unwrap();
         }
 
         #[tokio::test]
