@@ -39,7 +39,7 @@ class M0JourneyContractTests(unittest.TestCase):
     def test_plan_is_a_complete_v2_product_journey(self) -> None:
         journey.validate_plan(self.plan)
         self.assertEqual(self.plan["schema_version"], 2)
-        self.assertEqual(self.plan["journey_id"], "single-node-web-company-v3")
+        self.assertEqual(self.plan["journey_id"], "single-node-web-company-v4")
         self.assertEqual(self.plan["provider_mode"], "token_free")
         self.assertEqual(len(self.plan["steps"]), 28)
         self.assertEqual(

@@ -1999,6 +1999,7 @@ fn mutate_project(
                 escalation_target: None,
                 state: BlockerStateV1::Open,
                 blocker_kind: BlockerKindV1::Operational,
+                blocked_from_state: Some(project.lifecycle_state),
                 resolution_ref: None,
                 last_actor_id: principal.principal_id.clone(),
                 created_at_unix_ms: now_ms,
@@ -2084,6 +2085,7 @@ fn mutate_project(
                 reason_ref: resolution_ref.clone(),
                 occurred_at_unix_ms: now_ms,
             });
+            restore_project_lifecycle_after_last_blocker(&mut project);
             refresh_project_lifecycle(&mut project);
         }
         CompanyWorkflowCommandV1::RecordApproval {
@@ -2215,6 +2217,7 @@ fn mutate_project(
                     escalation_target: None,
                     state: BlockerStateV1::Open,
                     blocker_kind: BlockerKindV1::BudgetExhausted,
+                    blocked_from_state: Some(project.lifecycle_state),
                     resolution_ref: None,
                     last_actor_id: principal.principal_id.clone(),
                     created_at_unix_ms: now_ms,
@@ -3962,6 +3965,7 @@ fn resolve_budget_blockers_if_headroom(
         blocker.last_actor_id = principal.principal_id.clone();
         blocker.updated_at_unix_ms = now_ms;
     }
+    restore_project_lifecycle_after_last_blocker(project);
     refresh_project_lifecycle(project);
     Ok(())
 }
@@ -4077,6 +4081,25 @@ fn refresh_project_lifecycle(project: &mut ProjectV1) {
         project.lifecycle_state = ProjectLifecycleStateV1::Blocked;
     } else if project.lifecycle_state != ProjectLifecycleStateV1::Planning {
         project.lifecycle_state = ProjectLifecycleStateV1::Active;
+    }
+}
+
+fn restore_project_lifecycle_after_last_blocker(project: &mut ProjectV1) {
+    if project
+        .blockers
+        .iter()
+        .any(|blocker| blocker.state != BlockerStateV1::Resolved)
+    {
+        return;
+    }
+    if let Some(state) = project
+        .blockers
+        .iter()
+        .rev()
+        .filter_map(|blocker| blocker.blocked_from_state)
+        .find(|state| *state != ProjectLifecycleStateV1::Blocked)
+    {
+        project.lifecycle_state = state;
     }
 }
 
@@ -4682,6 +4705,7 @@ mod tests {
             escalation_target: None,
             state: BlockerStateV1::Open,
             blocker_kind: BlockerKindV1::Operational,
+            blocked_from_state: None,
             resolution_ref: None,
             last_actor_id: "agent-1".to_owned(),
             created_at_unix_ms: 1,
@@ -4708,6 +4732,7 @@ mod tests {
             escalation_target: None,
             state: BlockerStateV1::Resolved,
             blocker_kind: BlockerKindV1::Operational,
+            blocked_from_state: None,
             resolution_ref: Some("restored".to_owned()),
             last_actor_id: "agent-2".to_owned(),
             created_at_unix_ms: 2,
@@ -5078,6 +5103,7 @@ mod tests {
             escalation_target: None,
             state: BlockerStateV1::Open,
             blocker_kind: BlockerKindV1::Operational,
+            blocked_from_state: None,
             resolution_ref: None,
             last_actor_id: "developer-a".to_owned(),
             created_at_unix_ms: 3,
