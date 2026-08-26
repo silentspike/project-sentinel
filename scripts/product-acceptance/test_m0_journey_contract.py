@@ -85,6 +85,34 @@ class M0JourneyContractTests(unittest.TestCase):
             hashlib.sha256(qa_profile.read_bytes()).hexdigest(),
         )
 
+    def test_project_manager_mutations_use_its_agent_authority(self) -> None:
+        mutations = {
+            "plan_work_graph",
+            "create_project_room",
+            "raise_project_blocker",
+            "resolve_project_blocker",
+            "activate_project",
+            "assign_designer",
+        }
+        steps = {step["id"]: step for step in self.plan["steps"]}
+        for step_id in mutations:
+            self.assertEqual(steps[step_id]["credential_alias"], "project_manager")
+            self.assertEqual(steps[step_id]["path"], "/agent/workflow/commands")
+            self.assertEqual(steps[step_id]["route_role"], "agent")
+
+        self.assertEqual(
+            steps["customer_operator_boundary"]["path"],
+            "/operator/workflow/commands",
+        )
+        self.assertEqual(
+            steps["observe_design_done"]["path"],
+            "/operator/workflow/work-items",
+        )
+        self.assertEqual(
+            steps["observe_source_done"]["path"],
+            "/operator/workflow/work-items",
+        )
+
     def test_real_work_collaboration_and_delivery_intents_are_present(self) -> None:
         steps = {step["id"]: step for step in self.plan["steps"]}
         step_order = [step["id"] for step in self.plan["steps"]]

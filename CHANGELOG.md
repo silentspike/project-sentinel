@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Route Project Manager mutations in the canonical M0 company journey through
+  its authenticated agent authority instead of the operator-only command
+  surface; operator reads and the explicit customer/operator negative remain
+  unchanged.
 - Align single-node M0 episode readiness with the durable subject-local
   projection contract: each agent frontier may trail the global scan cursor
   when no relevant event exists, while its reported lag must equal the exact
