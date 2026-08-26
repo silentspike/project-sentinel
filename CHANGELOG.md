@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop the single-node daemon before its Gateway during activation rollback so
   in-flight LLM effects can finish or record a terminal outcome instead of
   becoming unresolved after the transport disappears.
+- Stop LLM admission on daemon shutdown, supervise every reserved provider
+  request, and require a bounded terminal drain before the daemon may report a
+  clean exit. Pending, unreserved calls are cancelled; reserved calls retain
+  the full request deadline inside the matching systemd stop budget.
 
 ### Changed
 - Issue #650 live-startup correction: tolerate only the attestation writer's transient zero-length regular file before consuming its nonce-bound payload, revalidate asynchronous service-health observations immediately before starting an inactive service, and prevent a full shift transition from starting after shutdown was requested. Invalid attestation file types/links/sizes remain fail closed, stale service-health observations use idempotent `systemctl start` instead of restarting an already recovered service, projection-lag restarts retain their separate authority, and the ECS shutdown path no longer begins new roster work after SIGTERM.
