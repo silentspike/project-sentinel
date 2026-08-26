@@ -20,7 +20,8 @@ pub mod bridge {
 
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
-    use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+    use tokio::sync::{watch, Mutex as AsyncMutex, Semaphore};
+    use tokio::task::JoinSet;
     use tracing::{debug, error, info, instrument, warn};
 
     use sentinel_common::{
@@ -43,6 +44,8 @@ pub mod bridge {
         pub min_ticks_between_calls: u64,
         /// HTTP Request Timeout
         pub request_timeout: Duration,
+        /// Maximum time to drain already reserved provider calls during shutdown.
+        pub shutdown_drain_timeout: Duration,
         /// Circuit Breaker: Failures bis Open
         pub circuit_breaker_threshold: u32,
         /// Circuit Breaker: Reset-Zeit nach Open
@@ -64,6 +67,7 @@ pub mod bridge {
                 max_concurrent: 8,
                 min_ticks_between_calls: 5,
                 request_timeout: Duration::from_secs(35),
+                shutdown_drain_timeout: Duration::from_secs(40),
                 circuit_breaker_threshold: 3,
                 circuit_breaker_reset: Duration::from_secs(30),
                 credential: String::new(),
@@ -271,6 +275,31 @@ pub mod bridge {
         fn has_operation(&self, operation_id: &str) -> anyhow::Result<bool> {
             self.has_event_operation_id(operation_id)
         }
+    }
+
+    pub fn stop_provider_admission(admission: &RwLock<bool>) {
+        let mut open = admission
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *open = false;
+    }
+
+    fn reserve_provider_request<S: CompletionStore>(
+        admission: &RwLock<bool>,
+        store: &S,
+        request_id: &str,
+        request_digest: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<bool>> {
+        let open = admission
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*open {
+            return Ok(None);
+        }
+        store
+            .reserve_request(request_id, request_digest, agent_id)
+            .map(Some)
     }
 
     fn agent_runtime_request(
@@ -605,6 +634,39 @@ pub mod bridge {
         llm_unavailable: Arc<AtomicBool>,
         llm_activity_ticks: SharedLlmActivityTicks,
     ) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let provider_admission = Arc::new(RwLock::new(true));
+        let result = run_llm_bridge_with_store(
+            config,
+            perception_rx,
+            action_tx,
+            telemetry,
+            state_store,
+            event_store,
+            llm_unavailable,
+            llm_activity_ticks,
+            shutdown_rx,
+            provider_admission,
+        )
+        .await;
+        drop(shutdown_tx);
+        if let Err(reason) = result {
+            error!(reason, "LLM Bridge shutdown failed closed");
+        }
+    }
+
+    pub async fn run_llm_bridge_with_shutdown(
+        config: LlmBridgeConfig,
+        perception_rx: mpsc::Receiver<Perception>,
+        action_tx: mpsc::Sender<AgentAction>,
+        telemetry: Arc<BridgeTelemetry>,
+        state_store: Arc<StateStore>,
+        event_store: Arc<EventStore>,
+        llm_unavailable: Arc<AtomicBool>,
+        llm_activity_ticks: SharedLlmActivityTicks,
+        shutdown_rx: watch::Receiver<bool>,
+        provider_admission: Arc<RwLock<bool>>,
+    ) -> std::result::Result<(), &'static str> {
         run_llm_bridge_with_store(
             config,
             perception_rx,
@@ -614,8 +676,10 @@ pub mod bridge {
             event_store,
             llm_unavailable,
             llm_activity_ticks,
+            shutdown_rx,
+            provider_admission,
         )
-        .await;
+        .await
     }
 
     async fn run_llm_bridge_with_store<S: CompletionStore + 'static>(
@@ -627,7 +691,9 @@ pub mod bridge {
         event_store: Arc<S>,
         llm_unavailable: Arc<AtomicBool>,
         llm_activity_ticks: SharedLlmActivityTicks,
-    ) {
+        mut shutdown_rx: watch::Receiver<bool>,
+        provider_admission: Arc<RwLock<bool>>,
+    ) -> std::result::Result<(), &'static str> {
         info!(
             max_concurrent = config.max_concurrent,
             min_ticks = config.min_ticks_between_calls,
@@ -643,7 +709,7 @@ pub mod bridge {
             Ok(c) => c,
             Err(e) => {
                 error!(error = %e, "HTTP Client erstellen fehlgeschlagen");
-                return;
+                return Ok(());
             }
         };
 
@@ -659,6 +725,8 @@ pub mod bridge {
         llm_unavailable.store(false, Ordering::Relaxed);
         let pending_retries = Arc::new(AsyncMutex::new(HashMap::<AgentId, Perception>::new()));
         let mut last_call_tick: HashMap<AgentId, u64> = HashMap::new();
+        let mut provider_tasks = JoinSet::new();
+        let mut provider_task_failed = false;
         // Debounce: Operator-Impulse (Gaia/Broadcast) nur beim ERSTEN Tick urgent,
         // danach 60 Ticks Cooldown. Verhindert Semaphore-Starvation bei 300-Tick TTL.
         let mut impulse_acked: HashMap<AgentId, u64> = HashMap::new();
@@ -713,7 +781,24 @@ pub mod bridge {
             })
             .expect("LLM Bridge Receiver Thread spawnen");
 
-        while let Some(first) = async_rx.recv().await {
+        loop {
+            let first = tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        stop_provider_admission(provider_admission.as_ref());
+                        break;
+                    }
+                    continue;
+                }
+                perception = async_rx.recv() => match perception {
+                    Some(perception) => perception,
+                    None => {
+                        stop_provider_admission(provider_admission.as_ref());
+                        break;
+                    }
+                },
+            };
             // Drain: Alle sofort verfuegbaren Perceptions lesen.
             // Pro Agent: neueste behalten, heard_text bevorzugen.
             let mut batch: HashMap<AgentId, Perception> = {
@@ -859,6 +944,7 @@ pub mod bridge {
                 let credential = config.credential.clone();
                 let usage_v2_enabled = config.usage_v2_enabled;
                 let request_completion_max_attempts = completion_max_attempts;
+                let task_provider_admission = Arc::clone(&provider_admission);
 
                 telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
 
@@ -867,40 +953,51 @@ pub mod bridge {
                     // Wartet auf Permit im eigenen Task — Drain-Loop blockiert NICHT,
                     // urgent Calls werden NIEMALS gedroppt.
                     let sem = llm_semaphore.clone();
-                    tokio::spawn(async move {
+                    let mut task_shutdown_rx = shutdown_rx.clone();
+                    provider_tasks.spawn(async move {
                         // Urgent Calls duerfen auf Semaphore und Gateway warten, aber nicht ewig.
                         let acquire_timeout = config.request_timeout;
-                        let permit = match tokio::time::timeout(
-                            acquire_timeout,
-                            sem.acquire_owned(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(permit)) => permit,
-                            Ok(Err(_)) => {
-                                warn!(agent = %agent_id, "URGENT Semaphore closed");
-                                queue_retry(&retry_queue, retry_perception.clone()).await;
+                        let permit = tokio::select! {
+                            biased;
+                            _ = task_shutdown_rx.changed() => {
+                                debug!(agent = %agent_id, "URGENT call cancelled before reservation during shutdown");
                                 return;
                             }
-                            Err(_) => {
-                                warn!(
-                                    agent = %agent_id,
-                                    timeout_ms = acquire_timeout.as_millis(),
-                                    "URGENT Semaphore timeout"
-                                );
-                                queue_retry(&retry_queue, retry_perception.clone()).await;
-                                return;
+                            result = tokio::time::timeout(acquire_timeout, sem.acquire_owned()) => {
+                                match result {
+                                    Ok(Ok(permit)) => permit,
+                                    Ok(Err(_)) => {
+                                        warn!(agent = %agent_id, "URGENT Semaphore closed");
+                                        queue_retry(&retry_queue, retry_perception.clone()).await;
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        warn!(
+                                            agent = %agent_id,
+                                            timeout_ms = acquire_timeout.as_millis(),
+                                            "URGENT Semaphore timeout"
+                                        );
+                                        queue_retry(&retry_queue, retry_perception.clone()).await;
+                                        return;
+                                    }
+                                }
                             }
                         };
                         let call_start = Instant::now();
-                        match bridge_event_store.reserve_request(
+                        match reserve_provider_request(
+                            task_provider_admission.as_ref(),
+                            bridge_event_store.as_ref(),
                             &request_id,
                             &request_digest,
                             &agent_id.to_string(),
                         ) {
-                            Ok(true) => {}
-                            Ok(false) => {
+                            Ok(Some(true)) => {}
+                            Ok(Some(false)) => {
                                 warn!(request_id = %request_id, "LLM provider request already reserved");
+                                return;
+                            }
+                            Ok(None) => {
+                                debug!(request_id = %request_id, "LLM call cancelled before reservation during shutdown");
                                 return;
                             }
                             Err(error) => {
@@ -991,16 +1088,22 @@ pub mod bridge {
                             continue;
                         }
                     };
-                    tokio::spawn(async move {
+                    provider_tasks.spawn(async move {
                         let call_start = Instant::now();
-                        match bridge_event_store.reserve_request(
+                        match reserve_provider_request(
+                            task_provider_admission.as_ref(),
+                            bridge_event_store.as_ref(),
                             &request_id,
                             &request_digest,
                             &agent_id.to_string(),
                         ) {
-                            Ok(true) => {}
-                            Ok(false) => {
+                            Ok(Some(true)) => {}
+                            Ok(Some(false)) => {
                                 warn!(request_id = %request_id, "LLM provider request already reserved");
+                                return;
+                            }
+                            Ok(None) => {
+                                debug!(request_id = %request_id, "LLM call cancelled before reservation during shutdown");
                                 return;
                             }
                             Err(error) => {
@@ -1082,13 +1185,44 @@ pub mod bridge {
                     });
                 }
             }
+            while let Some(result) = provider_tasks.try_join_next() {
+                if let Err(join_error) = result {
+                    provider_task_failed = true;
+                    error!(error = %join_error, "LLM provider task failed");
+                }
+            }
         }
 
+        let drain_result = tokio::time::timeout(config.shutdown_drain_timeout, async {
+            while let Some(result) = provider_tasks.join_next().await {
+                if let Err(join_error) = result {
+                    provider_task_failed = true;
+                    error!(error = %join_error, "LLM provider task failed during shutdown");
+                }
+            }
+        })
+        .await;
+        if drain_result.is_err() {
+            provider_tasks.abort_all();
+            while provider_tasks.join_next().await.is_some() {}
+            let _ = recovery_shutdown_tx.send(true);
+            let _ = recovery_task.await;
+            error!(
+                timeout_ms = config.shutdown_drain_timeout.as_millis(),
+                "LLM provider drain timed out"
+            );
+            return Err("llm_provider_drain_timeout");
+        }
         let _ = recovery_shutdown_tx.send(true);
         if let Err(error) = recovery_task.await {
             error!(error = %error, "LLM completion recovery task failed");
+            return Err("llm_recovery_task_failed");
+        }
+        if provider_task_failed {
+            return Err("llm_provider_task_failed");
         }
         info!("LLM Bridge beendet");
+        Ok(())
     }
 
     /// Fuegt Perception in Batch ein. Bevorzugt Versionen MIT heard_text.
@@ -1462,6 +1596,8 @@ pub mod bridge {
 
         async fn start_mock_agent_provider(
             provider_calls: Arc<std::sync::atomic::AtomicUsize>,
+            request_observed: Option<Arc<tokio::sync::Notify>>,
+            release_response: Option<Arc<tokio::sync::Notify>>,
         ) -> (String, tokio::task::JoinHandle<()>) {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1474,6 +1610,8 @@ pub mod bridge {
                         Err(_) => return,
                     };
                     let provider_calls = Arc::clone(&provider_calls);
+                    let request_observed = request_observed.clone();
+                    let release_response = release_response.clone();
                     tokio::spawn(async move {
                         let mut request = Vec::new();
                         let mut chunk = [0u8; 4096];
@@ -1503,6 +1641,12 @@ pub mod bridge {
                             line.to_ascii_lowercase().starts_with("x-request-digest: ")
                         }));
                         provider_calls.fetch_add(1, Ordering::SeqCst);
+                        if let Some(observed) = request_observed {
+                            observed.notify_one();
+                        }
+                        if let Some(release) = release_response {
+                            release.notified().await;
+                        }
                         let body = serde_json::json!({
                             "content": "move",
                             "actions": [{"type": "move", "target": "meeting-room"}],
@@ -1562,7 +1706,7 @@ pub mod bridge {
             let append_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let failure_observed = Arc::new(tokio::sync::Notify::new());
             let (gateway_url, provider_task) =
-                start_mock_agent_provider(Arc::clone(&provider_calls)).await;
+                start_mock_agent_provider(Arc::clone(&provider_calls), None, None).await;
             let config = LlmBridgeConfig {
                 gateway_url,
                 credential: "test-credential".to_string(),
@@ -1579,6 +1723,8 @@ pub mod bridge {
             });
             let (first_perception_tx, first_perception_rx) = mpsc::channel();
             let (action_tx, action_rx) = mpsc::channel();
+            let (first_shutdown_tx, first_shutdown_rx) = watch::channel(false);
+            let first_provider_admission = Arc::new(RwLock::new(true));
             let first_failure = failure_observed.notified();
             let first_bridge = tokio::spawn(run_llm_bridge_with_store(
                 config.clone(),
@@ -1589,6 +1735,8 @@ pub mod bridge {
                 Arc::clone(&first_store),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(Mutex::new(HashMap::new())),
+                first_shutdown_rx,
+                first_provider_admission,
             ));
             first_perception_tx
                 .send(recovery_test_perception())
@@ -1607,9 +1755,11 @@ pub mod bridge {
             // End the first bridge after the completed response is durable but before
             // the usage append succeeds, then construct a fresh store from the same DB.
             drop(first_perception_tx);
+            drop(first_shutdown_tx);
             tokio::time::timeout(Duration::from_secs(5), first_bridge)
                 .await
                 .expect("first bridge did not shut down")
+                .unwrap()
                 .unwrap();
             drop(first_store);
 
@@ -1621,6 +1771,8 @@ pub mod bridge {
             });
             let (second_perception_tx, second_perception_rx) = mpsc::channel();
             drop(second_perception_tx);
+            let (second_shutdown_tx, second_shutdown_rx) = watch::channel(false);
+            let second_provider_admission = Arc::new(RwLock::new(true));
             run_llm_bridge_with_store(
                 config,
                 second_perception_rx,
@@ -1630,8 +1782,12 @@ pub mod bridge {
                 Arc::clone(&second_store),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(Mutex::new(HashMap::new())),
+                second_shutdown_rx,
+                second_provider_admission,
             )
-            .await;
+            .await
+            .unwrap();
+            drop(second_shutdown_tx);
 
             let action = action_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert_eq!(action.agent_id, AgentId(7));
@@ -1652,6 +1808,154 @@ pub mod bridge {
                 .get_completion("agent-runtime-07-55")
                 .unwrap()
                 .is_none());
+            provider_task.abort();
+        }
+
+        #[tokio::test]
+        async fn shutdown_drains_reserved_provider_call_before_returning() {
+            let dir = tempfile::tempdir().unwrap();
+            let event_path = dir.path().join("events.db");
+            let state_path = dir.path().join("state.redb");
+            let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
+            let event_store = Arc::new(EventStore::open(event_path.to_str().unwrap()).unwrap());
+            let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let request_observed = Arc::new(tokio::sync::Notify::new());
+            let release_response = Arc::new(tokio::sync::Notify::new());
+            let (gateway_url, provider_task) = start_mock_agent_provider(
+                Arc::clone(&provider_calls),
+                Some(Arc::clone(&request_observed)),
+                Some(Arc::clone(&release_response)),
+            )
+            .await;
+            let config = LlmBridgeConfig {
+                gateway_url,
+                credential: "test-credential".to_string(),
+                max_concurrent: 1,
+                usage_v2_enabled: true,
+                completion_retry_interval: Duration::from_secs(3600),
+                shutdown_drain_timeout: Duration::from_secs(2),
+                ..Default::default()
+            };
+            let (perception_tx, perception_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let provider_admission = Arc::new(RwLock::new(true));
+            let telemetry = Arc::new(BridgeTelemetry::default());
+            let bridge = tokio::spawn(run_llm_bridge_with_store(
+                config,
+                perception_rx,
+                action_tx,
+                Arc::clone(&telemetry),
+                state_store,
+                Arc::clone(&event_store),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
+                shutdown_rx,
+                Arc::clone(&provider_admission),
+            ));
+
+            perception_tx.send(recovery_test_perception()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), request_observed.notified())
+                .await
+                .expect("provider request was not observed");
+
+            let mut queued_perception = recovery_test_perception();
+            queued_perception.agent_id = AgentId(8);
+            queued_perception.tick = Tick(56);
+            queued_perception.is_directly_addressed = true;
+            perception_tx.send(queued_perception).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while telemetry.calls_total.load(Ordering::SeqCst) != 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("urgent provider task did not reach semaphore admission");
+
+            stop_provider_admission(provider_admission.as_ref());
+            shutdown_tx.send(true).unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(!bridge.is_finished());
+            release_response.notify_one();
+
+            tokio::time::timeout(Duration::from_secs(2), bridge)
+                .await
+                .expect("bridge did not drain")
+                .unwrap()
+                .unwrap();
+            let action = action_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(action.agent_id, AgentId(7));
+            assert!(event_store
+                .get_llm_completion("agent-runtime-07-55")
+                .unwrap()
+                .is_none());
+            assert!(event_store
+                .get_llm_completion("agent-runtime-08-56")
+                .unwrap()
+                .is_none());
+            assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+            provider_task.abort();
+        }
+
+        #[tokio::test]
+        async fn shutdown_timeout_fails_closed_with_reserved_request() {
+            let dir = tempfile::tempdir().unwrap();
+            let event_path = dir.path().join("events.db");
+            let state_path = dir.path().join("state.redb");
+            let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
+            let event_store = Arc::new(EventStore::open(event_path.to_str().unwrap()).unwrap());
+            let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let request_observed = Arc::new(tokio::sync::Notify::new());
+            let release_response = Arc::new(tokio::sync::Notify::new());
+            let (gateway_url, provider_task) = start_mock_agent_provider(
+                Arc::clone(&provider_calls),
+                Some(Arc::clone(&request_observed)),
+                Some(release_response),
+            )
+            .await;
+            let config = LlmBridgeConfig {
+                gateway_url,
+                credential: "test-credential".to_string(),
+                shutdown_drain_timeout: Duration::from_millis(25),
+                ..Default::default()
+            };
+            let (perception_tx, perception_rx) = mpsc::channel();
+            let (action_tx, _action_rx) = mpsc::channel();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let provider_admission = Arc::new(RwLock::new(true));
+            let bridge = tokio::spawn(run_llm_bridge_with_store(
+                config,
+                perception_rx,
+                action_tx,
+                Arc::new(BridgeTelemetry::default()),
+                state_store,
+                Arc::clone(&event_store),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
+                shutdown_rx,
+                Arc::clone(&provider_admission),
+            ));
+
+            perception_tx.send(recovery_test_perception()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), request_observed.notified())
+                .await
+                .expect("provider request was not observed");
+            stop_provider_admission(provider_admission.as_ref());
+            shutdown_tx.send(true).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), bridge)
+                .await
+                .expect("bridge did not fail closed")
+                .unwrap();
+            assert_eq!(result, Err("llm_provider_drain_timeout"));
+            assert_eq!(
+                event_store
+                    .get_llm_completion("agent-runtime-07-55")
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "provider_in_flight"
+            );
+            assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
             provider_task.abort();
         }
 

@@ -19,7 +19,10 @@ ExecStartPost=/usr/bin/python3 /opt/sentinel/scripts/m0-readiness.py daemon --cr
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=180
-TimeoutStopSec=15
+# The daemon admits no new LLM work after SIGTERM, but an already reserved
+# provider request may use the configured 150-second request deadline. Keep
+# enough time for terminal persistence and the remaining supervised shutdown.
+TimeoutStopSec=180
 MemoryMax=2G
 CPUAffinity=0-3
 OOMScoreAdjust=-1000

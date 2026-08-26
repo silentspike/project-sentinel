@@ -3149,7 +3149,29 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
     // -- LLM Bridge starten (Perception → Cortex Gateway → Action) --
     #[cfg(feature = "llm")]
-    let _llm_bridge_handle = {
+    let (llm_bridge_shutdown_tx, llm_bridge_shutdown_rx) = tokio::sync::watch::channel(false);
+    #[cfg(feature = "llm")]
+    let llm_provider_admission = Arc::new(RwLock::new(true));
+    #[cfg(feature = "llm")]
+    let gateway_request_timeout_ms = std::env::var("SENTINEL_LLM_BRIDGE_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(config.traffic_control.gateway_request_timeout_ms);
+    #[cfg(feature = "llm")]
+    const MAX_LLM_BRIDGE_REQUEST_TIMEOUT_MS: u64 = 150_000;
+    #[cfg(feature = "llm")]
+    if gateway_request_timeout_ms > MAX_LLM_BRIDGE_REQUEST_TIMEOUT_MS {
+        return Err(anyhow!(
+            "LLM Bridge request timeout {gateway_request_timeout_ms}ms exceeds the 150000ms shutdown contract"
+        ));
+    }
+    #[cfg(feature = "llm")]
+    let llm_bridge_drain_timeout =
+        Duration::from_millis(gateway_request_timeout_ms) + Duration::from_secs(5);
+    #[cfg(feature = "llm")]
+    let llm_bridge_join_timeout = llm_bridge_drain_timeout + Duration::from_secs(5);
+    #[cfg(feature = "llm")]
+    let mut llm_bridge_handle = {
         let (guarded_perception_tx, guarded_perception_rx) = mpsc::sync_channel::<Perception>(128);
         let perception_admission = Arc::clone(&episode_projection_admission);
         tokio::task::spawn_blocking(move || {
@@ -3184,15 +3206,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 }
             }
         });
-        let gateway_request_timeout_ms = std::env::var("SENTINEL_LLM_BRIDGE_REQUEST_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(config.traffic_control.gateway_request_timeout_ms);
         let bridge_config = crate::llm_bridge::bridge::LlmBridgeConfig {
             gateway_url: std::env::var("CORTEX_GATEWAY_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".to_string()),
             max_concurrent: config.traffic_control.max_forward_concurrency.max(1),
             request_timeout: std::time::Duration::from_millis(gateway_request_timeout_ms),
+            shutdown_drain_timeout: llm_bridge_drain_timeout,
             credential: read_required_credential("SENTINEL_AGENT_RUNTIME_CREDENTIAL_FILE")?,
             usage_v2_enabled: std::env::var("SENTINEL_LLM_USAGE_V2_ENABLED")
                 .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
@@ -3205,9 +3224,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             gateway_url = %bridge_config.gateway_url,
             max_concurrent = bridge_config.max_concurrent,
             request_timeout_ms = gateway_request_timeout_ms,
+            shutdown_drain_timeout_ms = llm_bridge_drain_timeout.as_millis(),
             "LLM Bridge wird gestartet"
         );
-        tokio::spawn(crate::llm_bridge::bridge::run_llm_bridge(
+        tokio::spawn(crate::llm_bridge::bridge::run_llm_bridge_with_shutdown(
             bridge_config,
             guarded_perception_rx,
             guarded_action_tx,
@@ -3216,6 +3236,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             Arc::clone(&event_store), // #427: emit AgentLlmUsage per LLM call
             Arc::clone(&llm_circuit_open),
             Arc::clone(&llm_activity_ticks),
+            llm_bridge_shutdown_rx,
+            Arc::clone(&llm_provider_admission),
         ))
     };
 
@@ -3359,9 +3381,15 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- Graceful Shutdown --
     info!("Shutdown eingeleitet...");
     shutdown.store(true, Ordering::SeqCst);
+    #[cfg(feature = "llm")]
+    crate::llm_bridge::bridge::stop_provider_admission(llm_provider_admission.as_ref());
+    #[cfg(feature = "llm")]
+    llm_bridge_shutdown_tx
+        .send(true)
+        .map_err(|_| anyhow!("LLM Bridge shutdown channel closed before shutdown"))?;
     // The reconciler's bounded Workbench response wait is five seconds. Give
-    // an in-flight batch one extra second while keeping the existing ECS join
-    // inside systemd's 15-second stop budget.
+    // an in-flight batch one extra second. The LLM drain runs concurrently and
+    // retains its own request-deadline-based systemd budget.
     if !join_workflow_reconciler(workflow_reconcile_handle, Duration::from_secs(6)) {
         warn!("Company-Workflow-Reconciler konnte nicht sauber beendet werden");
     }
@@ -3395,6 +3423,17 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             break; // Daemon exits, --die-with-parent kills agents
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+
+    #[cfg(feature = "llm")]
+    match tokio::time::timeout(llm_bridge_join_timeout, &mut llm_bridge_handle).await {
+        Ok(Ok(Ok(()))) => info!("LLM Bridge provider tasks drained"),
+        Ok(Ok(Err(reason))) => return Err(anyhow!("LLM Bridge shutdown failed: {reason}")),
+        Ok(Err(error)) => return Err(anyhow!("LLM Bridge task failed: {error}")),
+        Err(_) => {
+            llm_bridge_handle.abort();
+            return Err(anyhow!("LLM Bridge shutdown join timed out"));
+        }
     }
 
     info!("Daemon heruntergefahren");
