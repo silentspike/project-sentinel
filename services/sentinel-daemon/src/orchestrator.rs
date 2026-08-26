@@ -740,6 +740,20 @@ fn process_workbench_dispatch(
             break;
         };
         let now_ms = now_ms_i64().max(0) as u64;
+        if let crate::workbench::WorkbenchDispatchCommand::Submit {
+            request, response, ..
+        } = &command
+        {
+            if !workbench_submit_runtime_available(runtimes.handle(request.agent_id)) {
+                if response
+                    .send(Err(crate::workbench::WorkbenchDispatchUnavailable.into()))
+                    .is_err()
+                {
+                    warn!("workbench requester disconnected before runtime-unavailable rejection");
+                }
+                continue;
+            }
+        }
         let mut runtime = DaemonWorkbenchRuntimeClient {
             runtimes,
             owner_registry,
@@ -882,6 +896,10 @@ fn process_workbench_dispatch(
             warn!("workbench requester disconnected before receiving its durable outcome");
         }
     }
+}
+
+fn workbench_submit_runtime_available(handle: Option<&NanoHandle>) -> bool {
+    handle.is_some_and(|handle| handle.runtime_key == RUNTIME_BWRAP_LANDLOCK)
 }
 
 fn workbench_invocation_uses_qa_profile(
@@ -13618,6 +13636,27 @@ mod tests {
         let (restored, resources) = daemon_registry.restore(snapshots[0].clone()).unwrap();
         assert_ne!(restored.instance_id, handle.instance_id);
         assert_eq!(resources.instance_id, Some(restored.instance_id));
+    }
+
+    #[test]
+    fn workbench_submit_requires_an_exact_bwrap_handle_before_reservation() {
+        let agent_id = AgentId(42);
+        let bwrap = NanoHandle::new(
+            RUNTIME_BWRAP_LANDLOCK,
+            "AGENT-42".to_string(),
+            Some(agent_id),
+            Some(1234),
+        );
+        let wasm = NanoHandle::new(
+            RUNTIME_WASM_WASMTIME,
+            "AGENT-42".to_string(),
+            Some(agent_id),
+            Some(1234),
+        );
+
+        assert!(!workbench_submit_runtime_available(None));
+        assert!(!workbench_submit_runtime_available(Some(&wasm)));
+        assert!(workbench_submit_runtime_available(Some(&bwrap)));
     }
 
     #[test]

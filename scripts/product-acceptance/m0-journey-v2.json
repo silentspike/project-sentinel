@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "journey_id": "single-node-web-company-v4",
+  "journey_id": "single-node-web-company-v5",
   "provider_mode": "token_free",
   "steps": [
     {
