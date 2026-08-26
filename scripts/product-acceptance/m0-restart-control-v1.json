@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "journey_plan_sha256": "b0fac640b87814a067a926d79f1cdde101422b45b26fdcb1b6ca0a8b0b4d03b0",
+  "journey_plan_sha256": "4c474f00d3697388e7bf338fa10afe0aaeb8205f9d7461f104811b72ccecc4c2",
   "checkpoint_services": {
     "after_customer_submit": "sentinel-daemon.service",
     "after_customer_clarification": "sentinel-daemon.service",
