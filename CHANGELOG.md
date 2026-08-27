@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Give each M0 restart-journey child a bounded process budget for replaying its
+  full HTTP/observe prefix while preserving the tighter per-request timeout
+  inside the journey runner (#650).
+
 - Preserve the persisted company-work plan deadline while independent QA waits
   for dispatch, while retaining the profile's relative Workbench wall-time as
   the execution limit once the sandboxed tool starts (#650).

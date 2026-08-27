@@ -1309,7 +1309,7 @@ class ControlTests(unittest.TestCase):
         with self.assertRaisesRegex(control.ControlError, "restart_timeout"):
             fixture.restart(runner)
 
-    def test_restart_uses_independent_systemd_job_budget(self) -> None:
+    def test_restart_uses_independent_systemd_and_journey_process_budgets(self) -> None:
         self.fixture.restart(self.runner)
 
         restart_timeouts = [
@@ -1328,14 +1328,100 @@ class ControlTests(unittest.TestCase):
             timeout == control.RESTART_COMMAND_TIMEOUT_SECONDS
             for timeout in restart_timeouts
         ))
-        self.assertTrue(all(
-            timeout == self.fixture.journey_args().timeout
-            for timeout in journey_timeouts
-        ))
+        expected_journey_timeouts = [
+            control.journey_command_timeout(
+                self.fixture.journey_contract,
+                self.fixture.journey_args(),
+                checkpoint,
+            )
+            for checkpoint in self.fixture.journey_contract.checkpoints
+        ]
+        expected_journey_timeouts.extend([
+            control.journey_command_timeout(
+                self.fixture.journey_contract, self.fixture.journey_args(), None
+            ),
+            control.journey_command_timeout(
+                self.fixture.journey_contract, self.fixture.journey_args(), None
+            ),
+        ])
+        self.assertEqual(journey_timeouts, expected_journey_timeouts)
         self.assertGreater(control.RESTART_COMMAND_TIMEOUT_SECONDS, 180.0)
         self.assertGreater(
             control.RESTART_COMMAND_TIMEOUT_SECONDS,
             self.fixture.journey_args().timeout,
+        )
+        self.assertTrue(all(
+            timeout > self.fixture.journey_args().timeout
+            for timeout in journey_timeouts
+        ))
+        self.assertTrue(all(
+            timeout <= control.MAX_JOURNEY_COMMAND_TIMEOUT_SECONDS
+            for timeout in journey_timeouts
+        ))
+
+    def test_journey_process_budget_covers_replayed_prefix_and_observe_bounds(self) -> None:
+        journey = self.fixture.journey_args()
+        contract = self.fixture.journey_contract
+        first_checkpoint = contract.checkpoints[0]
+        first_index = next(
+            index
+            for index, step in enumerate(contract.plan["steps"])
+            if step.get("checkpoint") == first_checkpoint
+        )
+        expected_prefix = sum(
+            step.get("observe", {}).get("max_elapsed_ms", journey.timeout * 1_000)
+            / 1_000
+            for step in contract.plan["steps"][:first_index + 1]
+        ) + control.JOURNEY_COMMAND_GRACE_SECONDS
+        self.assertEqual(
+            control.journey_command_timeout(contract, journey, first_checkpoint),
+            expected_prefix,
+        )
+        self.assertGreater(
+            control.journey_command_timeout(contract, journey, None),
+            expected_prefix,
+        )
+        oversized = copy.deepcopy(contract.plan)
+        oversized["steps"] = oversized["steps"] * 10_000
+        oversized_contract = control.JourneyContract(
+            contract.raw_sha256,
+            contract.module,
+            oversized,
+            contract.checkpoints,
+            contract.step_ids,
+        )
+        with self.assertRaisesRegex(
+            control.ControlError, "journey_command_budget_exceeded"
+        ):
+            control.journey_command_timeout(oversized_contract, journey, None)
+
+    def test_canonical_m0_plan_fits_the_bounded_journey_process_budget(self) -> None:
+        plan_path = HERE.parent / "m0-journey-v2.json"
+        raw = plan_path.read_bytes()
+        plan = json.loads(raw)
+        contract = control.JourneyContract(
+            control.digest_bytes(raw),
+            self.fixture.journey_contract.module,
+            plan,
+            tuple(
+                step["checkpoint"]
+                for step in plan["steps"]
+                if step.get("checkpoint") is not None
+            ),
+            tuple(step["id"] for step in plan["steps"]),
+        )
+        journey = control.JourneyArgs(
+            plan_path,
+            "http://127.0.0.1:8084",
+            (),
+            self.fixture.ledger,
+            self.fixture.evidence,
+            control.MAX_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(control.journey_command_timeout(contract, journey, None), 870.0)
+        self.assertLess(
+            control.journey_command_timeout(contract, journey, None),
+            control.MAX_JOURNEY_COMMAND_TIMEOUT_SECONDS,
         )
 
     def test_restart_readiness_retries_only_temporal_failures(self) -> None:
