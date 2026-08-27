@@ -32,6 +32,7 @@ use sentinel_workflow::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::delivery::{ConfiguredDeliveryCore, DeliveryStoreConfigV1};
@@ -1102,10 +1103,19 @@ impl WorkbenchExecutionAdapter {
 
 fn map_workbench_dispatch_error(error: anyhow::Error) -> WorkflowPortError {
     if error.is::<WorkbenchDispatchUnavailable>() {
-        WorkflowPortError::Unavailable
-    } else {
-        WorkflowPortError::UnknownOutcome
+        return WorkflowPortError::Unavailable;
     }
+    if let Some(runtime) = error.downcast_ref::<sentinel_common::nano_runtime::NanoExecError>() {
+        warn!(
+            code = ?runtime.code,
+            retryable = runtime.retryable,
+            "workbench dispatch returned a classified runtime failure"
+        );
+        if runtime.retryable {
+            return WorkflowPortError::Unavailable;
+        }
+    }
+    WorkflowPortError::UnknownOutcome
 }
 
 impl WorkExecutionPort for WorkbenchExecutionAdapter {
@@ -2969,6 +2979,28 @@ mod tests {
         assert_eq!(
             map_workbench_dispatch_error(WorkbenchDispatchUnavailable.into()),
             WorkflowPortError::Unavailable
+        );
+        assert_eq!(
+            map_workbench_dispatch_error(
+                sentinel_common::nano_runtime::NanoExecError::new(
+                    sentinel_common::nano_runtime::NanoExecErrorCode::ChannelDisconnected,
+                    true,
+                    "workbench runtime recycle remains pending",
+                )
+                .into(),
+            ),
+            WorkflowPortError::Unavailable
+        );
+        assert_eq!(
+            map_workbench_dispatch_error(
+                sentinel_common::nano_runtime::NanoExecError::new(
+                    sentinel_common::nano_runtime::NanoExecErrorCode::ProtocolViolation,
+                    false,
+                    "workbench output failed its protocol binding",
+                )
+                .into(),
+            ),
+            WorkflowPortError::UnknownOutcome
         );
         assert_eq!(
             map_workbench_dispatch_error(anyhow::anyhow!("post-dispatch failure")),
