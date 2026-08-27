@@ -38,6 +38,7 @@ use super::PrincipalAuthenticator;
 
 const DELIVERY_AUTHORITY_GENERATION: u64 = 1;
 const DELIVERY_EVENT_TOPIC: &str = "sentinel.delivery.events";
+const WEB_QA_PROGRAM: &str = "sentinel-web-qa";
 const WORK_ITEM_GATE_PROGRAM: &str = "sentinel-work-item-gate";
 
 type M0QaEvidenceComponents = (
@@ -64,6 +65,22 @@ fn work_item_gate_command_rule(paths: &[String]) -> Result<CommandRule, Workflow
     }
     Ok(CommandRule {
         program: WORK_ITEM_GATE_PROGRAM.to_string(),
+        required_arg_prefix: paths.to_vec(),
+        max_args,
+    })
+}
+
+fn web_qa_command_rule(paths: &[String]) -> Result<CommandRule, DeliveryError> {
+    let max_args = u16::try_from(paths.len()).map_err(|_| {
+        DeliveryError::Validation("QA input inventory exceeds the command policy".to_string())
+    })?;
+    if max_args == 0 || paths.len() > 64 {
+        return Err(DeliveryError::Validation(
+            "QA input inventory is empty or exceeds the command policy".to_string(),
+        ));
+    }
+    Ok(CommandRule {
+        program: WEB_QA_PROGRAM.to_string(),
         required_arg_prefix: paths.to_vec(),
         max_args,
     })
@@ -810,6 +827,11 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
             .ok_or_else(|| {
                 DeliveryError::Validation("QA workbench deadline overflow".to_string())
             })?;
+        let input_paths = inputs
+            .iter()
+            .map(|input| input.mount_path.clone())
+            .collect::<Vec<_>>();
+        let command_policy = vec![web_qa_command_rule(&input_paths)?];
         let mut workbench_request = WorkbenchRequest {
             schema_version: WORKBENCH_SCHEMA_VERSION,
             invocation_id: request.invocation.id.clone(),
@@ -828,7 +850,7 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
             capabilities: BTreeSet::from(["test.run_profile".to_string()]),
             output_artifact_kinds: BTreeSet::new(),
             inputs,
-            command_policy: Vec::new(),
+            command_policy,
             resource_limits: WorkbenchResourceLimits {
                 wall_time_ms: self.qa_profile.resource_ceilings.wall_time_ms,
                 cpu_time_ms: self.qa_profile.resource_ceilings.cpu_time_ms,
@@ -842,19 +864,11 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
             attempt: 1,
             tool: WorkbenchTool::RunTests {
                 suite_id: "web-qa-v1".to_string(),
-                program: "sentinel-web-qa".to_string(),
-                args: Vec::new(),
+                program: WEB_QA_PROGRAM.to_string(),
+                args: input_paths,
             },
             input_digest: String::new(),
         };
-        let input_paths = workbench_request
-            .inputs
-            .iter()
-            .map(|input| input.mount_path.clone())
-            .collect();
-        if let WorkbenchTool::RunTests { args, .. } = &mut workbench_request.tool {
-            *args = input_paths;
-        }
         workbench_request.input_digest = workbench_request
             .canonical_digest()
             .map_err(storage_error)?;
@@ -1905,6 +1919,20 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_qa_command_policy_is_bound_to_the_exact_input_inventory() {
+        let paths = vec!["design.md".to_string(), "src/index.html".to_string()];
+        let rule = web_qa_command_rule(&paths).unwrap();
+
+        assert!(rule.allows(WEB_QA_PROGRAM, &paths));
+        assert!(!rule.allows(WEB_QA_PROGRAM, &paths[..1]));
+        assert!(!rule.allows(WEB_QA_PROGRAM, &[paths[1].clone(), paths[0].clone()]));
+        let mut extended = paths.clone();
+        extended.push("foreign.txt".to_string());
+        assert!(!rule.allows(WEB_QA_PROGRAM, &extended));
+        assert!(web_qa_command_rule(&[]).is_err());
+    }
 
     #[test]
     fn company_governance_roles_without_delivery_authority_stay_out_of_delivery_inventory() {
