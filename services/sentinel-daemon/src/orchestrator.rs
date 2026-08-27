@@ -734,6 +734,9 @@ impl crate::workbench::WorkbenchRuntimeClient for DaemonWorkbenchRuntimeClient<'
 fn process_workbench_dispatch(
     service: &crate::workbench::WorkbenchService,
     runtimes: &mut DaemonNanoRuntimeRegistry,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
     owner_registry: &sentinel_common::OwnerRegistry,
     event_store: &EventStore,
     tick: u64,
@@ -741,6 +744,19 @@ fn process_workbench_dispatch(
     for _ in 0..MAX_WORKBENCH_COMMANDS_PER_TICK {
         let Ok(command) = service.receiver.try_recv() else {
             break;
+        };
+        let affected_agent_id = match &command {
+            crate::workbench::WorkbenchDispatchCommand::Submit { request, .. } => {
+                Some(request.agent_id)
+            }
+            crate::workbench::WorkbenchDispatchCommand::Poll { invocation_id, .. }
+            | crate::workbench::WorkbenchDispatchCommand::Recover { invocation_id, .. }
+            | crate::workbench::WorkbenchDispatchCommand::Cancel { invocation_id, .. } => service
+                .store
+                .load(invocation_id)
+                .ok()
+                .flatten()
+                .map(|record| record.agent_id),
         };
         let now_ms = now_ms_i64().max(0) as u64;
         if let crate::workbench::WorkbenchDispatchCommand::Submit {
@@ -892,6 +908,17 @@ fn process_workbench_dispatch(
             }
         };
         let result = result.and_then(|update| {
+            let agent_id = affected_agent_id
+                .ok_or_else(|| anyhow::anyhow!("workbench runtime owner is unavailable"))?;
+            let (handle, resources) = runtimes.observe(agent_id)?;
+            let (cgroup_id, pid) = synchronize_workbench_runtime_observation(
+                agent_id,
+                &handle,
+                &resources,
+                sandbox_handles,
+                security_runtime_state,
+            )?;
+            ebpf_collector.update_agent_pid(cgroup_id, pid);
             crate::workbench::publish_workbench_records(event_store, &update.records, tick)?;
             Ok(update)
         });
@@ -899,6 +926,58 @@ fn process_workbench_dispatch(
             warn!("workbench requester disconnected before receiving its durable outcome");
         }
     }
+}
+
+fn synchronize_workbench_runtime_observation(
+    agent_id: AgentId,
+    handle: &NanoHandle,
+    resources: &NanoRuntimeResources,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+) -> Result<(u64, u32)> {
+    anyhow::ensure!(
+        handle.agent_id == Some(agent_id)
+            && handle.runtime_key == RUNTIME_BWRAP_LANDLOCK
+            && resources.instance_id == Some(handle.instance_id),
+        "workbench runtime observation is not bound to its adapter owner"
+    );
+    let pid = resources
+        .pid
+        .ok_or_else(|| anyhow!("workbench runtime observation has no process"))?;
+    let cgroup_id = resources
+        .cgroup_id
+        .filter(|_| resources.cgroup_created)
+        .ok_or_else(|| anyhow!("workbench runtime observation has no cgroup"))?;
+    anyhow::ensure!(
+        resources.landlock_applied && resources.network_isolated,
+        "workbench runtime observation lost its isolation contract"
+    );
+
+    let sandbox = sandbox_handles
+        .get_mut(&agent_id)
+        .ok_or_else(|| anyhow!("workbench runtime sandbox observation is unavailable"))?;
+    let mut security = security_runtime_state
+        .write()
+        .map_err(|_| anyhow!("workbench security runtime state is poisoned"))?;
+    let snapshot = security
+        .get_mut(&agent_id.0)
+        .ok_or_else(|| anyhow!("workbench security runtime observation is unavailable"))?;
+    anyhow::ensure!(
+        snapshot.instance_id == Some(handle.instance_id)
+            && snapshot.runtime_key == handle.runtime_key
+            && sandbox.agent_name == snapshot.agent_name,
+        "workbench runtime observation conflicts with the retained owner"
+    );
+
+    sandbox.cgroup_created = resources.cgroup_created;
+    sandbox.cgroup_id = resources.cgroup_id;
+    sandbox.io_available = resources.io_available;
+    sandbox.bwrap_pid = Some(pid);
+    sandbox.landlock_applied = resources.landlock_applied;
+    sandbox.network_isolated = resources.network_isolated;
+    snapshot.runtime_pid = Some(pid);
+    snapshot.bwrap_pid = Some(pid);
+    Ok((cgroup_id, pid))
 }
 
 fn workbench_submit_runtime_available(handle: Option<&NanoHandle>) -> bool {
@@ -8571,6 +8650,9 @@ fn ecs_tick_loop(
             process_workbench_dispatch(
                 service,
                 &mut nano_runtimes,
+                &mut sandbox_handles,
+                &mut ebpf_collector,
+                &security_runtime_state,
                 owner_registry,
                 &event_store,
                 tick_count,
@@ -11968,6 +12050,120 @@ mod tests {
         assert!(
             workbench_profile_is_qa("foreign-profile", "web-authoring-v1", "web-qa-v1").is_err()
         );
+    }
+
+    fn workbench_recycle_observation_fixture() -> (
+        AgentId,
+        NanoHandle,
+        NanoRuntimeResources,
+        HashMap<AgentId, SandboxHandle>,
+        operator_api::SharedSecurityRuntimeState,
+    ) {
+        let agent_id = AgentId(55);
+        let old_pid = 10_055;
+        let new_pid = 20_055;
+        let handle = NanoHandle::new(
+            RUNTIME_BWRAP_LANDLOCK,
+            "AGENT-55".to_string(),
+            Some(agent_id),
+            Some(new_pid),
+        );
+        let resources = NanoRuntimeResources {
+            instance_id: Some(handle.instance_id),
+            pid: Some(new_pid),
+            child_pid: Some(new_pid + 1),
+            cgroup_created: true,
+            cgroup_id: Some(7_055),
+            io_available: true,
+            landlock_applied: true,
+            network_isolated: true,
+        };
+        let sandbox_handles = HashMap::from([(
+            agent_id,
+            SandboxHandle {
+                agent_name: "Laura Petersen".to_string(),
+                cgroup_created: true,
+                cgroup_id: Some(6_055),
+                io_available: false,
+                bwrap_pid: Some(old_pid),
+                landlock_applied: true,
+                network_isolated: true,
+            },
+        )]);
+        let security_runtime_state: operator_api::SharedSecurityRuntimeState = Default::default();
+        security_runtime_state.write().unwrap().insert(
+            agent_id.0,
+            operator_api::SecurityAgentRuntimeSnapshot {
+                agent_id: agent_id.0,
+                aggregate_id: "AGENT-55".to_string(),
+                agent_name: "Laura Petersen".to_string(),
+                runtime_key: RUNTIME_BWRAP_LANDLOCK.to_string(),
+                instance_id: Some(handle.instance_id),
+                runtime_pid: Some(old_pid),
+                bwrap_pid: Some(old_pid),
+                home_host_path: "/ram/agents/Laura Petersen".to_string(),
+                fs_mount: None,
+            },
+        );
+        (
+            agent_id,
+            handle,
+            resources,
+            sandbox_handles,
+            security_runtime_state,
+        )
+    }
+
+    #[test]
+    fn workbench_recycle_refreshes_runtime_observations_before_publication() {
+        let (agent_id, handle, resources, mut sandbox_handles, security_runtime_state) =
+            workbench_recycle_observation_fixture();
+
+        let observed = synchronize_workbench_runtime_observation(
+            agent_id,
+            &handle,
+            &resources,
+            &mut sandbox_handles,
+            &security_runtime_state,
+        )
+        .unwrap();
+
+        assert_eq!(observed, (7_055, 20_055));
+        let sandbox = &sandbox_handles[&agent_id];
+        assert_eq!(sandbox.cgroup_id, Some(7_055));
+        assert!(sandbox.cgroup_created);
+        assert!(sandbox.io_available);
+        assert_eq!(sandbox.bwrap_pid, Some(20_055));
+        assert!(sandbox.landlock_applied);
+        assert!(sandbox.network_isolated);
+        let security = security_runtime_state.read().unwrap();
+        assert_eq!(security[&agent_id.0].runtime_pid, Some(20_055));
+        assert_eq!(security[&agent_id.0].bwrap_pid, Some(20_055));
+    }
+
+    #[test]
+    fn workbench_recycle_observation_rejects_foreign_instance_without_mutation() {
+        let (agent_id, handle, mut resources, mut sandbox_handles, security_runtime_state) =
+            workbench_recycle_observation_fixture();
+        resources.instance_id = Some(uuid::Uuid::new_v4());
+
+        let error = synchronize_workbench_runtime_observation(
+            agent_id,
+            &handle,
+            &resources,
+            &mut sandbox_handles,
+            &security_runtime_state,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not bound to its adapter owner"));
+        let sandbox = &sandbox_handles[&agent_id];
+        assert_eq!(sandbox.cgroup_id, Some(6_055));
+        assert!(!sandbox.io_available);
+        assert_eq!(sandbox.bwrap_pid, Some(10_055));
+        let security = security_runtime_state.read().unwrap();
+        assert_eq!(security[&agent_id.0].runtime_pid, Some(10_055));
+        assert_eq!(security[&agent_id.0].bwrap_pid, Some(10_055));
     }
 
     #[test]
