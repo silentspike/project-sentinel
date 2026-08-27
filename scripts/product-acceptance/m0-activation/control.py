@@ -32,6 +32,9 @@ MAX_TIMEOUT_SECONDS = 30.0
 # Rollback must outlive that contract instead of reporting failure while systemd
 # is still completing a valid stop.
 ROLLBACK_COMMAND_TIMEOUT_SECONDS = 190.0
+# A restart includes the same bounded daemon drain as rollback. Keep this
+# systemd job budget separate from the tighter journey HTTP timeout.
+RESTART_COMMAND_TIMEOUT_SECONDS = 190.0
 MAX_ACTIVATION_DEADLINE_SECONDS = 900.0
 DEFAULT_ACTIVATION_DEADLINE_SECONDS = 300.0
 ACTIVATION_POLL_SECONDS = 1.0
@@ -1205,7 +1208,10 @@ def _restart_journey(
             expected_completed, previously_completed,
         )
         unit = mapping[checkpoint]
-        result = invoke(runner, (str(SYSTEMCTL), "restart", unit), journey.timeout)
+        result = invoke(
+            runner, (str(SYSTEMCTL), "restart", unit),
+            RESTART_COMMAND_TIMEOUT_SECONDS,
+        )
         if result.returncode != 0:
             fail("restart_failed")
         wait_service(runner, unit, journey.timeout)
