@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Keep durable company-workflow execution intents valid across one bounded
+  daemon restart without relaxing per-tool Workbench wall-time limits (#650).
+
 - Give the single-node M0 restart controller an independent 190-second
   systemd job budget so the daemon's canonical 180-second durable drain can
   complete without weakening the bounded HTTP journey timeout, and retry only
