@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request-specific command policy continues to bind exact input arguments.
 - Keep the work-item QA Workbench deadline stable across durable outbox retries
   so a completed gate can be replayed without changing its request digest.
+- Record the internal, credential-free delivery rejection reason in the daemon
+  journal while keeping the public company API error response redacted.
 
 - Validate completed Workbench artifacts against the same mutable per-agent
   backing used by the attested runtime. An active sentinel-fs home view no

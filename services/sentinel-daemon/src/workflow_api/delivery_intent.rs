@@ -193,7 +193,15 @@ pub(super) fn handle(
     };
     match result {
         Ok(response) => json(200, &response),
-        Err(error) => delivery_error(error),
+        Err(error) => {
+            tracing::warn!(
+                operation_id = %envelope.operation_id,
+                intent = ?envelope.intent,
+                error = %error,
+                "Delivery intent rejected"
+            );
+            delivery_error(error)
+        }
     }
 }
 
