@@ -28,6 +28,10 @@ CONTROL_LOCK = SAFE_ROOT / ".m0-activation-control.lock"
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_TIMEOUT_SECONDS = 30.0
+# The preflight validates its own per-probe timeout against a tighter bound.
+# Keep that budget separate from the outer process deadline so startup work
+# cannot consume the entire child lifetime before the result is serialized.
+MAX_PREFLIGHT_PROBE_TIMEOUT_SECONDS = 15.0
 # The daemon's canonical unit allows 180 seconds for its bounded durable drain.
 # Rollback must outlive that contract instead of reporting failure while systemd
 # is still completing a valid stop.
@@ -700,7 +704,8 @@ class PreflightArgs:
 
 
 def preflight_command(value: PreflightArgs, timeout: float | None = None) -> tuple[str, ...]:
-    effective_timeout = value.timeout if timeout is None else min(value.timeout, timeout)
+    process_timeout = value.timeout if timeout is None else min(value.timeout, timeout)
+    effective_timeout = min(process_timeout, MAX_PREFLIGHT_PROBE_TIMEOUT_SECONDS)
     if effective_timeout <= 0:
         fail("readiness_failed")
     return (
@@ -716,8 +721,8 @@ def preflight_command(value: PreflightArgs, timeout: float | None = None) -> tup
 def run_preflight_attempt(
     runner: Runner, value: PreflightArgs, timeout: float | None = None,
 ) -> tuple[str | None, bool]:
-    effective_timeout = value.timeout if timeout is None else min(value.timeout, timeout)
-    result = invoke(runner, preflight_command(value, effective_timeout), effective_timeout)
+    process_timeout = value.timeout if timeout is None else min(value.timeout, timeout)
+    result = invoke(runner, preflight_command(value, process_timeout), process_timeout)
     output = strict_json(result.stdout, "preflight")
     expected_keys = {
         "schema_version", "claim", "runtime_preflight_pass",

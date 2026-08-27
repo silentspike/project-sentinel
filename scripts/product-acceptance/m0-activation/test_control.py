@@ -854,6 +854,27 @@ class ControlTests(unittest.TestCase):
                 with self.assertRaisesRegex(control.ControlError, "readiness_failed"):
                     control.run_preflight_attempt(runner, self.fixture.preflight())
 
+    def test_preflight_probe_budget_is_separate_from_process_deadline(self) -> None:
+        original = self.fixture.preflight()
+        preflight = control.PreflightArgs(
+            original.manifest, original.contract, original.profile,
+            original.agents_dir, original.operator_credential_file,
+            original.expected_git_sha, original.expected_manifest_sha256,
+            control.MAX_TIMEOUT_SECONDS,
+        )
+        runner = FakeRunner(self.fixture)
+
+        digest, retryable = control.run_preflight_attempt(runner, preflight)
+
+        self.assertRegex(digest or "", r"^[0-9a-f]{64}$")
+        self.assertFalse(retryable)
+        call = runner.calls[-1]
+        self.assertEqual(
+            float(call[call.index("--timeout-seconds") + 1]),
+            control.MAX_PREFLIGHT_PROBE_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(runner.timeouts[-1], control.MAX_TIMEOUT_SECONDS)
+
     def test_no_block_target_job_can_complete_after_command_timeout(self) -> None:
         clock = FakeClock()
         self.runner.ready_after_rounds[control.TARGET] = 149
