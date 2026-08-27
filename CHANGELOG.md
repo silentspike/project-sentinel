@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Make the canonical M0 website journey produce and package a real HTML
   entrypoint with its checked script so the independent web QA profile can
   validate the promised product rather than an incomplete script artifact.
+- Refresh the daemon's security, sandbox, and eBPF observations from the
+  adapter-owned process after Workbench recycling so successful QA does not
+  leave its agent with a stale pre-recycle PID.
 
 - Validate completed Workbench artifacts against the same mutable per-agent
   backing used by the attested runtime. An active sentinel-fs home view no
