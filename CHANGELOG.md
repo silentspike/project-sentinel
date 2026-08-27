@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forcing them into the delivery authority inventory.
 - Bind independent QA execution to an exact, profile-approved command rule for
   the sealed candidate input inventory.
+- Make the canonical M0 website journey produce and package a real HTML
+  entrypoint with its checked script so the independent web QA profile can
+  validate the promised product rather than an incomplete script artifact.
 
 - Validate completed Workbench artifacts against the same mutable per-agent
   backing used by the attested runtime. An active sentinel-fs home view no
