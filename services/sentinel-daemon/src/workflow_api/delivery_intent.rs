@@ -213,7 +213,7 @@ fn context(
 ) -> CommandContextV1 {
     CommandContextV1 {
         principal,
-        idempotency_key: format!("{operation_id}:{stage}"),
+        idempotency_key: format!("{operation_id}.{stage}"),
         now_ms,
     }
 }
@@ -1367,6 +1367,10 @@ mod tests {
         assert_eq!(first.principal, retry.principal);
         assert_eq!(first.idempotency_key, retry.idempotency_key);
         assert_ne!(first.now_ms, retry.now_ms);
+        assert!(first
+            .idempotency_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')));
     }
 
     #[test]
