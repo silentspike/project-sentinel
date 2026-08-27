@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Separate the M0 preflight's 15-second per-probe budget from its 30-second
+  controller process deadline so restart recovery can serialize a valid
+  readiness result without passing an invalid timeout to the preflight.
+
 - Keep durable company-workflow execution intents valid across one bounded
   daemon restart without relaxing per-tool Workbench wall-time limits (#650).
 
