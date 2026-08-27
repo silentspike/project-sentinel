@@ -68,6 +68,9 @@ const MAX_RECONCILE_BATCH: usize = 32;
 const MAX_PRINCIPAL_BINDINGS_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTION_INTENT_STEPS: usize = 16;
 const EXECUTION_INTENT_OVERHEAD_MS: u64 = 30_000;
+// A durable intent can be accepted immediately before the daemon is restarted.
+// Keep restart recovery separate from the per-tool wall-time resource bound.
+const EXECUTION_RESTART_RECOVERY_ALLOWANCE_MS: u64 = 190_000;
 const LINUX_O_NOFOLLOW: i32 = 0o400000;
 const LINUX_O_CLOEXEC: i32 = 0o2000000;
 
@@ -484,17 +487,12 @@ impl CompanyAuthority {
             return Err(execution_authority_conflict());
         }
         let inputs = self.materialize_execution_inputs(&project, &spec.spec, agent_id)?;
-        let execution_ms = self
-            .workbench_profile
-            .resource_ceilings
-            .wall_time_ms
-            .checked_mul(intent.tools.len() as u64)
-            .and_then(|value| value.checked_add(EXECUTION_INTENT_OVERHEAD_MS))
-            .ok_or_else(execution_intent_invalid)?;
         let created_at_unix_ms = now_ms;
-        let deadline_unix_ms = now_ms
-            .checked_add(execution_ms)
-            .ok_or_else(execution_intent_invalid)?;
+        let deadline_unix_ms = execution_deadline_unix_ms(
+            now_ms,
+            self.workbench_profile.resource_ceilings.wall_time_ms,
+            intent.tools.len(),
+        )?;
         let plan = build_execution_plan(
             operation_id,
             &authority,
@@ -653,6 +651,21 @@ impl CompanyAuthority {
             profile_capabilities: self.workbench_profile.capabilities.clone(),
         })
     }
+}
+
+fn execution_deadline_unix_ms(
+    now_ms: u64,
+    tool_wall_time_ms: u64,
+    step_count: usize,
+) -> Result<u64, WorkflowError> {
+    let execution_ms = tool_wall_time_ms
+        .checked_mul(u64::try_from(step_count).map_err(|_| execution_intent_invalid())?)
+        .and_then(|value| value.checked_add(EXECUTION_INTENT_OVERHEAD_MS))
+        .and_then(|value| value.checked_add(EXECUTION_RESTART_RECOVERY_ALLOWANCE_MS))
+        .ok_or_else(execution_intent_invalid)?;
+    now_ms
+        .checked_add(execution_ms)
+        .ok_or_else(execution_intent_invalid)
 }
 
 fn build_execution_plan(
@@ -3447,6 +3460,14 @@ mod tests {
             ],
         };
 
+        let deadline_unix_ms = execution_deadline_unix_ms(
+            1_000,
+            profile.resource_ceilings.wall_time_ms,
+            intent.tools.len(),
+        )
+        .unwrap();
+        assert_eq!(deadline_unix_ms, 311_000);
+
         let plan = build_execution_plan(
             operation_id,
             &authority,
@@ -3455,7 +3476,7 @@ mod tests {
             &profile,
             &intent,
             1_000,
-            121_000,
+            deadline_unix_ms,
         )
         .unwrap();
         let replay = build_execution_plan(
@@ -3466,7 +3487,7 @@ mod tests {
             &profile,
             &intent,
             1_000,
-            121_000,
+            deadline_unix_ms,
         )
         .unwrap();
         assert_eq!(plan, replay);
@@ -3483,6 +3504,9 @@ mod tests {
         assert_eq!(plan.steps[2].artifacts[0].artifact_kind, "source_tree");
         assert!(execution_intent_matches_plan(&intent, &plan));
         plan.validate_at(2_000).unwrap();
+        plan.validate_at(1_000 + EXECUTION_RESTART_RECOVERY_ALLOWANCE_MS)
+            .unwrap();
+        assert!(plan.validate_at(deadline_unix_ms).is_err());
 
         let mut foreign = intent;
         foreign.tools[2] = ExecutionToolV1::PackageArtifact {
@@ -3500,7 +3524,7 @@ mod tests {
                 &profile,
                 &foreign,
                 1_000,
-                121_000,
+                deadline_unix_ms,
             )
             .unwrap_err()
             .code,
