@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backing used by the attested runtime. An active sentinel-fs home view no
   longer redirects the daemon's terminal manifest check to a FUSE path that
   does not own Workbench workspace or artifact state.
+- Bind the automatic independent work-item gate to an exact, digest-covered
+  command rule for the built-in QA helper and its staged input paths. Gate
+  execution no longer fails admission before the Workbench dispatch.
 - Recover completed Workbench invocations through the same bounded JSONL drain
   and terminal-replay path as polling. A non-terminal poll or recovery now
   retains the durable `Executing` record instead of exposing an empty update

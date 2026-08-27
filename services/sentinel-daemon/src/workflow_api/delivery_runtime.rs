@@ -4,8 +4,8 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use sentinel_common::{
-    AgentId, DomainEvent, DomainEventPayload, WorkbenchRequest, WorkbenchResourceLimits,
-    WorkbenchTool, WORKBENCH_RUNTIME_BWRAP, WORKBENCH_SCHEMA_VERSION,
+    AgentId, CommandRule, DomainEvent, DomainEventPayload, WorkbenchRequest,
+    WorkbenchResourceLimits, WorkbenchTool, WORKBENCH_RUNTIME_BWRAP, WORKBENCH_SCHEMA_VERSION,
 };
 use sentinel_limbo::EventStore;
 use sentinel_workflow::{
@@ -38,6 +38,7 @@ use super::PrincipalAuthenticator;
 
 const DELIVERY_AUTHORITY_GENERATION: u64 = 1;
 const DELIVERY_EVENT_TOPIC: &str = "sentinel.delivery.events";
+const WORK_ITEM_GATE_PROGRAM: &str = "sentinel-work-item-gate";
 
 type M0QaEvidenceComponents = (
     Vec<QaDatasetCaseV1>,
@@ -54,6 +55,18 @@ impl WorkflowWorkItemGate {
     pub(super) fn new(integration: WorkflowDeliveryIntegration) -> Self {
         Self { integration }
     }
+}
+
+fn work_item_gate_command_rule(paths: &[String]) -> Result<CommandRule, WorkflowPortError> {
+    let max_args = u16::try_from(paths.len()).map_err(|_| WorkflowPortError::Rejected)?;
+    if max_args == 0 || paths.len() > 64 {
+        return Err(WorkflowPortError::Rejected);
+    }
+    Ok(CommandRule {
+        program: WORK_ITEM_GATE_PROGRAM.to_string(),
+        required_arg_prefix: paths.to_vec(),
+        max_args,
+    })
 }
 
 struct WorkItemGateReceipt {
@@ -1448,19 +1461,20 @@ impl GateEvidencePort for WorkflowWorkItemGate {
             attempt: 1,
             tool: WorkbenchTool::RunTests {
                 suite_id: "web-work-item-qa-v1".to_string(),
-                program: "sentinel-work-item-gate".to_string(),
+                program: WORK_ITEM_GATE_PROGRAM.to_string(),
                 args: Vec::new(),
             },
             input_digest: String::new(),
         };
-        let paths = workbench
+        let paths: Vec<String> = workbench
             .inputs
             .iter()
             .map(|input| input.mount_path.clone())
             .collect();
         if let WorkbenchTool::RunTests { args, .. } = &mut workbench.tool {
-            *args = paths;
+            *args = paths.clone();
         }
+        workbench.command_policy = vec![work_item_gate_command_rule(&paths)?];
         workbench.input_digest = workbench
             .canonical_digest()
             .map_err(|_| WorkflowPortError::Rejected)?;
@@ -1861,6 +1875,20 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_item_gate_command_policy_binds_exact_helper_and_inputs() {
+        let paths = vec!["design.md".to_string(), "screens/home.txt".to_string()];
+        let rule = work_item_gate_command_rule(&paths).unwrap();
+
+        assert!(rule.allows(WORK_ITEM_GATE_PROGRAM, &paths));
+        assert!(!rule.allows("node", &paths));
+        assert!(!rule.allows(WORK_ITEM_GATE_PROGRAM, &paths[..1]));
+        let mut extended = paths.clone();
+        extended.push("foreign.txt".to_string());
+        assert!(!rule.allows(WORK_ITEM_GATE_PROGRAM, &extended));
+        assert!(work_item_gate_command_rule(&[]).is_err());
+    }
 
     fn digest(value: &str) -> ContentDigest {
         ContentDigest::of(&value).unwrap()
