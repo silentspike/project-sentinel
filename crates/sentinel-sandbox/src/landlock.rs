@@ -105,6 +105,10 @@ impl LandlockRuleset {
                 // required for bounded process-group resource accounting and
                 // cannot expose host process metadata.
                 PathBuf::from("/proc"),
+                // Completion receipts use kernel randomness only to make the
+                // private, create-new staging name unpredictable. The device
+                // remains read-only and is provided by bwrap's private /dev.
+                PathBuf::from("/dev/urandom"),
             ],
             write_paths: vec![
                 PathBuf::from(format!("/home/{name}")),
@@ -265,6 +269,7 @@ mod tests {
         assert!(rs.read_paths.contains(&PathBuf::from("/proc")));
         assert!(rs.read_paths.contains(&PathBuf::from("/lib")));
         assert!(rs.read_paths.contains(&PathBuf::from("/lib64")));
+        assert!(rs.read_paths.contains(&PathBuf::from("/dev/urandom")));
         assert!(rs.write_paths.contains(&PathBuf::from("/home/thomas")));
         assert!(rs.write_paths.contains(&PathBuf::from("/workspace")));
         assert!(rs.write_paths.contains(&PathBuf::from("/artifacts")));
