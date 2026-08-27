@@ -690,10 +690,7 @@ impl crate::workbench::WorkbenchRuntimeClient for DaemonWorkbenchRuntimeClient<'
             handle.runtime_key
         );
 
-        if matches!(
-            request.operation.as_str(),
-            "workbench_start" | "workbench_recover"
-        ) {
+        if request.operation == "workbench_start" {
             self.revalidate_world_authority(&world_guard)?;
             let resources = self.runtimes.adapter_owner.resources(&handle)?;
             anyhow::ensure!(
@@ -13660,7 +13657,7 @@ mod tests {
     }
 
     #[test]
-    fn workbench_start_attests_resources_but_terminal_poll_uses_exact_handle_only() {
+    fn workbench_start_attests_resources_but_terminal_replay_uses_exact_handle_only() {
         let agent_id = AgentId(42);
         let handle = NanoHandle::new(
             RUNTIME_BWRAP_LANDLOCK,
@@ -13710,7 +13707,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(exec_calls.load(Ordering::SeqCst), 2);
+        crate::workbench::WorkbenchRuntimeClient::exchange(
+            &mut client,
+            agent_id,
+            NanoExecRequest {
+                operation: "workbench_recover".to_string(),
+                input: "recover".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 3);
 
         client
             .runtimes
@@ -13727,7 +13734,8 @@ mod tests {
             },
         )
         .is_err());
-        assert_eq!(exec_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 3);
     }
 
     fn cluster_owner_registry_for_workbench_test() -> (
