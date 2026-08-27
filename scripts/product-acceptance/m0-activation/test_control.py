@@ -757,6 +757,19 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(clock.now, 149.0)
         self.assertGreater(clock.now, control.MAX_TIMEOUT_SECONDS)
 
+    def test_activation_retries_transient_systemd_exec_identity_race(self) -> None:
+        clock = FakeClock()
+        self.runner.preflight_failures_remaining = 1
+        self.runner.preflight_failure_reason = "running_executable_identity_mismatch"
+
+        result = self.fixture.activate(
+            self.runner, activation_deadline=10.0,
+            monotonic=clock.monotonic, sleeper=clock.sleep,
+        )
+
+        self.assertEqual(result["status"], "ACTIVE")
+        self.assertEqual(clock.sleeps, [1.0])
+
     def test_activation_deadline_rechecks_slow_readback_and_preflight(self) -> None:
         readback_clock = FakeClock()
         readback_runner = FakeRunner(self.fixture)
@@ -925,9 +938,9 @@ class ControlTests(unittest.TestCase):
             control.ROLLBACK_COMMAND_TIMEOUT_SECONDS,
             self.fixture.preflight().timeout,
         )
-        self.assertLessEqual(
+        self.assertGreater(
             control.ROLLBACK_COMMAND_TIMEOUT_SECONDS,
-            control.MAX_TIMEOUT_SECONDS,
+            180.0,
         )
 
     def test_running_oneshot_that_later_fails_never_reaches_preflight(self) -> None:
