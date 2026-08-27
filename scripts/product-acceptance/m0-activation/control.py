@@ -41,6 +41,12 @@ ROLLBACK_COMMAND_TIMEOUT_SECONDS = 190.0
 RESTART_COMMAND_TIMEOUT_SECONDS = 190.0
 RESTART_READINESS_DEADLINE_SECONDS = 300.0
 RESTART_READINESS_POLL_SECONDS = 1.0
+# A journey child replays every completed step before it reaches the next
+# checkpoint. Its process budget must therefore cover the bounded HTTP/observe
+# budget of the whole prefix, not just one request. The inner journey timeout
+# remains the per-request limit.
+JOURNEY_COMMAND_GRACE_SECONDS = 30.0
+MAX_JOURNEY_COMMAND_TIMEOUT_SECONDS = 900.0
 MAX_ACTIVATION_DEADLINE_SECONDS = 900.0
 DEFAULT_ACTIVATION_DEADLINE_SECONDS = 300.0
 ACTIVATION_POLL_SECONDS = 1.0
@@ -1130,6 +1136,28 @@ def journey_command(value: JourneyArgs, checkpoint: str | None) -> tuple[str, ..
     return tuple(argv)
 
 
+def journey_command_timeout(
+    contract: JourneyContract, value: JourneyArgs, checkpoint: str | None,
+) -> float:
+    request_budget = 0.0
+    checkpoint_found = checkpoint is None
+    for step in contract.plan["steps"]:
+        observe = step.get("observe")
+        if observe is None:
+            request_budget += value.timeout
+        else:
+            request_budget += observe["max_elapsed_ms"] / 1_000
+        if checkpoint is not None and step.get("checkpoint") == checkpoint:
+            checkpoint_found = True
+            break
+    if not checkpoint_found:
+        fail("journey_checkpoint_invalid")
+    process_budget = request_budget + JOURNEY_COMMAND_GRACE_SECONDS
+    if process_budget > MAX_JOURNEY_COMMAND_TIMEOUT_SECONDS:
+        fail("journey_command_budget_exceeded")
+    return max(value.timeout, process_budget)
+
+
 def validate_journey_state(
     contract: JourneyContract, journey: JourneyArgs, expected_result: str,
     checkpoint: str | None, expected_completed: tuple[str, ...],
@@ -1228,7 +1256,11 @@ def _restart_journey(
     records: list[dict[str, str]] = []
     previously_completed: tuple[str, ...] = ()
     for checkpoint in checkpoints:
-        result = invoke(runner, journey_command(journey, checkpoint), journey.timeout)
+        result = invoke(
+            runner,
+            journey_command(journey, checkpoint),
+            journey_command_timeout(contract, journey, checkpoint),
+        )
         if result.returncode != 0:
             fail("journey_checkpoint_failed")
         checkpoint_index = next(
@@ -1256,14 +1288,15 @@ def _restart_journey(
         records.append({"checkpoint": checkpoint, "unit": unit, "readiness_digest": readiness,
                         "ledger_digest": ledger_before, "evidence_digest": evidence_before})
         previously_completed = expected_completed
-    result = invoke(runner, journey_command(journey, None), journey.timeout)
+    final_command_timeout = journey_command_timeout(contract, journey, None)
+    result = invoke(runner, journey_command(journey, None), final_command_timeout)
     if result.returncode != 0:
         fail("journey_resume_failed")
     validate_journey_state(
         contract, journey, "complete", None, contract.step_ids,
         previously_completed,
     )
-    result = invoke(runner, journey_command(journey, None), journey.timeout)
+    result = invoke(runner, journey_command(journey, None), final_command_timeout)
     if result.returncode != 0:
         fail("journey_replay_failed")
     _, _, final = validate_journey_state(
