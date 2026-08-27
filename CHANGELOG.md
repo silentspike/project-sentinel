@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Validate completed Workbench artifacts against the same mutable per-agent
+  backing used by the attested runtime. An active sentinel-fs home view no
+  longer redirects the daemon's terminal manifest check to a FUSE path that
+  does not own Workbench workspace or artifact state.
 - Recover completed Workbench invocations through the same bounded JSONL drain
   and terminal-replay path as polling. A non-terminal poll or recovery now
   retains the durable `Executing` record instead of exposing an empty update
