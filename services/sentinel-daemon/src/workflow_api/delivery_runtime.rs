@@ -314,6 +314,17 @@ impl WorkflowDeliveryIntegration {
         tenant_id: &str,
         principal_id: &str,
     ) -> Result<PrincipalV1, DeliveryError> {
+        self.mapped_delivery_principal(tenant_id, principal_id)?
+            .ok_or_else(|| {
+                DeliveryError::AuthorityDenied("principal has no delivery authority".to_string())
+            })
+    }
+
+    fn mapped_delivery_principal(
+        &self,
+        tenant_id: &str,
+        principal_id: &str,
+    ) -> Result<Option<PrincipalV1>, DeliveryError> {
         let bound = self
             .principals
             .principal(principal_id)
@@ -323,16 +334,14 @@ impl WorkflowDeliveryIntegration {
             })?;
         let roles = delivery_roles(bound.principal.role);
         if roles.is_empty() {
-            return Err(DeliveryError::AuthorityDenied(
-                "principal has no delivery authority".to_string(),
-            ));
+            return Ok(None);
         }
-        Ok(PrincipalV1 {
+        Ok(Some(PrincipalV1 {
             tenant_id: tenant_id.to_string(),
             principal_id: bound.principal.principal_id,
             authority_generation: bound.principal.authority_generation,
             roles,
-        })
+        }))
     }
 
     fn expected_project_ref(
@@ -373,10 +382,12 @@ impl WorkflowDeliveryIntegration {
                 .iter()
                 .map(|participant| participant.principal_id.clone()),
         );
-        let mut principals = principal_ids
-            .into_iter()
-            .map(|principal_id| self.mapped_principal(tenant_id, &principal_id))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut principals = Vec::new();
+        for principal_id in principal_ids {
+            if let Some(principal) = self.mapped_delivery_principal(tenant_id, &principal_id)? {
+                principals.push(principal);
+            }
+        }
         principals.sort_by(|left, right| left.principal_id.cmp(&right.principal_id));
         if !principals
             .iter()
@@ -1894,6 +1905,21 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn company_governance_roles_without_delivery_authority_stay_out_of_delivery_inventory() {
+        for role in [
+            CompanyRoleV1::Sales,
+            CompanyRoleV1::ProjectManager,
+            CompanyRoleV1::TechnicalLead,
+        ] {
+            assert!(delivery_roles(role).is_empty());
+        }
+        assert_eq!(
+            delivery_roles(CompanyRoleV1::Developer),
+            BTreeSet::from([AuthorityRole::Developer])
+        );
+    }
 
     #[test]
     fn work_item_gate_command_policy_binds_exact_helper_and_inputs() {
