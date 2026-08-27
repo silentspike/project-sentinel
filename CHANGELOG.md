@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Give the single-node M0 restart controller an independent 190-second
+  systemd job budget so the daemon's canonical 180-second durable drain can
+  complete without weakening the bounded HTTP journey timeout.
+
 - Retry the bounded single-node activation preflight across systemd's narrow
   active-before-exec race, and give rollback enough time for the daemon's
   canonical 180-second durable shutdown contract.
