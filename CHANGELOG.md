@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Retry the bounded single-node activation preflight across systemd's narrow
+  active-before-exec race, and give rollback enough time for the daemon's
+  canonical 180-second durable shutdown contract.
 - Fixed the single-node M0 workbench Landlock policy so the two provisioned,
   profile-bound QA helpers and their Python launcher can execute while the
   request-specific command policy continues to bind exact input arguments.

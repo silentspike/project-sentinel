@@ -28,9 +28,10 @@ CONTROL_LOCK = SAFE_ROOT / ".m0-activation-control.lock"
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_TIMEOUT_SECONDS = 30.0
-# Canonical service units allow up to 15 seconds to stop. Rollback must not
-# inherit a shorter readiness-command timeout and abandon a valid shutdown.
-ROLLBACK_COMMAND_TIMEOUT_SECONDS = 20.0
+# The daemon's canonical unit allows 180 seconds for its bounded durable drain.
+# Rollback must outlive that contract instead of reporting failure while systemd
+# is still completing a valid stop.
+ROLLBACK_COMMAND_TIMEOUT_SECONDS = 190.0
 MAX_ACTIVATION_DEADLINE_SECONDS = 900.0
 DEFAULT_ACTIVATION_DEADLINE_SECONDS = 300.0
 ACTIVATION_POLL_SECONDS = 1.0
@@ -110,6 +111,10 @@ TEMPORAL_PREFLIGHT_REASONS = frozenset({
     "platform_unresolved",
     "publication_or_recovery_backlog",
     "read_model_projection_lag",
+    # systemd may expose ActiveState=active and MainPID in the narrow interval
+    # before the child has completed execve. The activation deadline keeps a
+    # persistent executable mismatch fail-closed.
+    "running_executable_identity_mismatch",
     "runtime_agent_not_ready",
     "runtime_count_mismatch",
     "runtime_drift",
