@@ -499,7 +499,7 @@ impl WorkflowStore {
         limit: usize,
     ) -> Result<Vec<PendingGateEvidenceV1>, WorkflowError> {
         self.validate_state_domain(
-            "SELECT COUNT(*) FROM workflow_gate_outbox WHERE state NOT IN ('pending','completed')",
+            "SELECT COUNT(*) FROM workflow_gate_outbox WHERE state NOT IN ('pending','completed','timed_out')",
         )?;
         self.read_pending(
             "SELECT request FROM workflow_gate_outbox WHERE state='pending' ORDER BY updated_at_ms, request_id LIMIT ?1",
@@ -760,6 +760,59 @@ impl WorkflowStore {
         request: &PendingGateEvidenceV1,
     ) -> Result<(WorkItemExecutionV1, bool), WorkflowError> {
         self.gate_work_item(request)
+    }
+
+    pub(crate) fn record_gate_timeout(
+        &self,
+        request: &PendingGateEvidenceV1,
+        authority: &RuntimeAuthoritySnapshotV1,
+        now_ms: u64,
+    ) -> Result<WorkItemExecutionV1, WorkflowError> {
+        authority.validate()?;
+        let mut connection = self.lock()?;
+        let transaction = immediate(&mut connection)?;
+        let mut work_item =
+            read_work_item_by_plan(&transaction, request.plan_id)?.ok_or_else(corrupt_store)?;
+        let completed = validate_gate_request(&transaction, &work_item, request)?;
+        if completed {
+            return Ok(work_item);
+        }
+        validate_monotonic_time(
+            now_ms,
+            request.created_at_unix_ms,
+            work_item.updated_at_unix_ms,
+        )?;
+        if now_ms < work_item.plan.deadline_unix_ms
+            || !work_item.plan.authority_matches(authority)
+            || request.authority_snapshot_digest != authority.canonical_digest()?
+        {
+            return Err(authority_conflict());
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE workflow_gate_outbox SET state='timed_out', updated_at_ms=?1 WHERE request_id=?2 AND state='pending'",
+                params![sql_u64(now_ms)?, request.request_id],
+            )
+            .map_err(map_sqlite_error)?;
+        require_one_row(updated)?;
+        let previous = work_item.state;
+        work_item.state = WorkItemState::Blocked;
+        work_item.blocker_code = Some("gate_timed_out".to_owned());
+        work_item.version = work_item.version.saturating_add(1);
+        work_item.updated_at_unix_ms = now_ms;
+        put_work_item(&transaction, &work_item)?;
+        append_audit(
+            &transaction,
+            &work_item,
+            "gate_timed_out",
+            Some(previous),
+            work_item.state,
+            &authority.canonical_digest()?,
+            &request.request_digest,
+            now_ms,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(work_item)
     }
 
     pub(crate) fn record_gate_evidence(
@@ -1354,6 +1407,18 @@ fn validate_gate_request(
             }
             Ok(true)
         }
+        ("timed_out", None) => {
+            let updated_at = stored_u64(row.updated_at_ms)?;
+            if updated_at < work_item.plan.deadline_unix_ms
+                || work_item.updated_at_unix_ms != updated_at
+                || work_item.state != WorkItemState::Blocked
+                || work_item.blocker_code.as_deref() != Some("gate_timed_out")
+                || work_item.gate_evidence.is_some()
+            {
+                return Err(corrupt_store());
+            }
+            Ok(true)
+        }
         _ => Err(corrupt_store()),
     }
 }
@@ -1543,7 +1608,30 @@ fn validate_stored_work_item(
             }
         }
         WorkItemState::Blocked => {
-            if value.terminal_execution_evidence.is_some()
+            if value.blocker_code.as_deref() == Some("gate_timed_out") {
+                if usize::from(value.next_step_ordinal) != final_ordinal
+                    || value.gate_evidence.is_some()
+                {
+                    return Err(corrupt_store());
+                }
+                let evidence = value
+                    .terminal_execution_evidence
+                    .as_ref()
+                    .ok_or_else(corrupt_store)?;
+                let step = &value.plan.steps[final_ordinal];
+                if evidence.schema_version != WORKFLOW_SCHEMA_VERSION
+                    || evidence.invocation_id != step.invocation_id
+                    || evidence.plan_digest != value.plan.request_digest
+                    || evidence.step_digest != step_digest(step)?
+                    || evidence.receipt_id.is_empty()
+                    || evidence.completed_at_unix_ms < value.plan.created_at_unix_ms
+                    || evidence.completed_at_unix_ms > step.deadline_unix_ms
+                    || evidence.completed_at_unix_ms > value.plan.deadline_unix_ms
+                {
+                    return Err(corrupt_store());
+                }
+                validate_sealed_descriptors(step, evidence).map_err(|_| corrupt_store())?;
+            } else if value.terminal_execution_evidence.is_some()
                 || value.gate_evidence.is_some()
                 || !matches!(
                     value.blocker_code.as_deref(),

@@ -1846,6 +1846,25 @@ impl GateEvidencePort for FutureGate {
 }
 
 #[derive(Clone)]
+struct TimeoutGate {
+    calls: Arc<AtomicUsize>,
+}
+
+impl GateEvidencePort for TimeoutGate {
+    fn readiness(&self) -> DependencyReadiness {
+        DependencyReadiness::Ready
+    }
+
+    fn gate_evidence(
+        &self,
+        _request: &PendingGateEvidenceV1,
+    ) -> Result<Box<dyn IndependentGateEvidence>, WorkflowPortError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(WorkflowPortError::TimedOut)
+    }
+}
+
+#[derive(Clone)]
 struct TimedGate {
     completed_at_unix_ms: u64,
     calls: Arc<AtomicUsize>,
@@ -1907,6 +1926,50 @@ fn future_gate_receipt_is_rejected_without_state_advance() {
 }
 
 #[test]
+fn expired_gate_timeout_is_durable_and_does_not_block_the_outbox() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("workflow.sqlite");
+    let gate_calls = Arc::new(AtomicUsize::new(0));
+    let core = WorkflowCore::new(
+        WorkflowStore::open(&database).unwrap(),
+        FakeOrganization {
+            snapshot: Arc::new(Mutex::new(authority())),
+        },
+        FakeExecution {
+            observations: Arc::new(Mutex::new(vec![WorkExecutionObservation::Succeeded].into())),
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        FakeCompletion {
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        TimeoutGate {
+            calls: Arc::clone(&gate_calls),
+        },
+    );
+    core.admit_plan(&package_only_plan(), NOW).unwrap();
+    let execution = core.store().pending_executions(1).unwrap().remove(0);
+    core.reconcile_execution(&execution, NOW + 1).unwrap();
+    let completion = core
+        .store()
+        .pending_completion_evidence(1)
+        .unwrap()
+        .remove(0);
+    core.reconcile_completion_evidence(&completion, NOW + 2)
+        .unwrap();
+    let gate = core.store().pending_gate_evidence(1).unwrap().remove(0);
+    let timed_out = core.reconcile_gate_evidence(&gate, NOW + 60_002).unwrap();
+    assert_eq!(timed_out.state, WorkItemState::Blocked);
+    assert_eq!(timed_out.blocker_code.as_deref(), Some("gate_timed_out"));
+    assert!(timed_out.gate_evidence.is_none());
+    assert!(core.store().pending_gate_evidence(1).unwrap().is_empty());
+    assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+
+    let replayed = core.reconcile_gate_evidence(&gate, NOW + 70_000).unwrap();
+    assert_eq!(replayed, timed_out);
+    assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn gate_deadline_rejects_late_receipt_but_allows_timely_receipt_read_later() {
     let directory = tempfile::tempdir().unwrap();
 
@@ -1945,15 +2008,17 @@ fn gate_deadline_rejects_late_receipt_but_allows_timely_receipt_read_later() {
         .pending_gate_evidence(1)
         .unwrap()
         .remove(0);
-    assert_eq!(
-        late_core
-            .reconcile_gate_evidence(&gate, NOW + 60_002)
-            .unwrap_err()
-            .code,
-        WorkflowErrorCode::AuthorityConflict
-    );
+    let timed_out = late_core
+        .reconcile_gate_evidence(&gate, NOW + 60_002)
+        .unwrap();
     assert_eq!(late_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(late_core.store().pending_gate_evidence(1).unwrap()[0], gate);
+    assert!(late_core
+        .store()
+        .pending_gate_evidence(1)
+        .unwrap()
+        .is_empty());
+    assert_eq!(timed_out.state, WorkItemState::Blocked);
+    assert_eq!(timed_out.blocker_code.as_deref(), Some("gate_timed_out"));
     assert_eq!(
         late_core
             .store()
@@ -1965,7 +2030,7 @@ fn gate_deadline_rejects_late_receipt_but_allows_timely_receipt_read_later() {
             .unwrap()
             .unwrap()
             .state,
-        WorkItemState::InReview
+        WorkItemState::Blocked
     );
 
     let timely_database = directory.path().join("timely.sqlite");

@@ -68,6 +68,7 @@ TIMER_SERVICES = {
     "sentinel-health-monitor.timer": "sentinel-health-monitor.service",
     "sentinel-nightrun.timer": "sentinel-nightrun.service",
 }
+ACTIVATION_ONESHOT_TIMERS = {"sentinel-health-monitor.timer"}
 M0_CONTRACT_PATH = Path("/opt/sentinel/config/product-acceptance/m0-contract.toml")
 M0_PROFILE_PATH = Path("/opt/sentinel/config/work-profiles/web-project-v1.toml")
 M0_WORKBENCH_PROFILE_PATH = Path(
@@ -1417,7 +1418,7 @@ def validate_systemd(
             "systemd_timer_outcome_missing",
             positive=True,
         )
-        if not timer_entered <= started <= exited:
+        if timer in ACTIVATION_ONESHOT_TIMERS and not timer_entered <= started <= exited:
             raise PreflightError("systemd_timer_outcome_stale")
         timer_outcomes.append(
             {
@@ -1729,14 +1730,19 @@ def validate_identity(roster: dict[int, dict[str, Any]], payloads: dict[str, dic
     if set(projection_agents) != set(roster):
         raise PreflightError("episode_roster_mismatch")
     for item in projection_agents.values():
-        if item.get("ready") is not True or item.get("lag_rows") != 0 or item.get("blockers") != []:
+        if item.get("ready") is not True or item.get("blockers") != []:
             raise PreflightError("episode_projection_blocked")
         frontier = require_int(
             item.get("frontier_source_row_id"),
             "episode_projection_frontier_missing",
             minimum=0,
         )
-        if frontier != global_frontier:
+        lag_rows = require_int(
+            item.get("lag_rows"),
+            "episode_projection_frontier_mismatch",
+            minimum=0,
+        )
+        if frontier > global_frontier or lag_rows != global_frontier - frontier:
             raise PreflightError("episode_projection_frontier_mismatch")
     return {
         "configured_agents": len(roster),

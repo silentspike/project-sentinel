@@ -32,13 +32,14 @@ use sentinel_workflow::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::delivery::{ConfiguredDeliveryCore, DeliveryStoreConfigV1};
 use crate::workbench::{
     dispatch_workbench, stage_verified_artifact_inputs, WorkbenchAuthoritySnapshot,
-    WorkbenchAuthoritySource, WorkbenchDispatchCommand, WorkbenchInvocationRecord,
-    WorkbenchInvocationState, WorkbenchProfile,
+    WorkbenchAuthoritySource, WorkbenchDispatchCommand, WorkbenchDispatchUnavailable,
+    WorkbenchInvocationRecord, WorkbenchInvocationState, WorkbenchProfile,
 };
 use delivery_runtime::{
     LimboDeliveryEffects, LimboDeliveryPublication, WorkflowDeliveryIntegration,
@@ -62,7 +63,7 @@ pub const MAX_WORKFLOW_BODY_BYTES: usize = 256 * 1024;
 const PRINCIPAL_SCHEMA_VERSION: u16 = 1;
 const PROFILE_GENERATION: u64 = 1;
 const RUNTIME_GENERATION: u64 = 1;
-const DISPATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const DISPATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RECONCILE_BATCH: usize = 32;
 const MAX_PRINCIPAL_BINDINGS_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTION_INTENT_STEPS: usize = 16;
@@ -1054,12 +1055,7 @@ impl WorkbenchExecutionAdapter {
     ) -> Result<crate::workbench::WorkbenchCoordinatorUpdate, WorkflowPortError> {
         let (response, receiver) = mpsc::sync_channel(1);
         dispatch_workbench(command(response)).map_err(|_| WorkflowPortError::Unavailable)?;
-        match receiver.recv_timeout(DISPATCH_RESPONSE_TIMEOUT) {
-            Ok(Ok(update)) => Ok(update),
-            Ok(Err(_)) => Err(WorkflowPortError::UnknownOutcome),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(WorkflowPortError::UnknownOutcome),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(WorkflowPortError::Unavailable),
-        }
+        map_workbench_dispatch_response(receiver.recv_timeout(DISPATCH_RESPONSE_TIMEOUT))
     }
 
     fn observation(
@@ -1097,6 +1093,38 @@ impl WorkbenchExecutionAdapter {
             .last()
             .filter(|record| record.state == WorkbenchInvocationState::Succeeded)
             .ok_or(WorkflowPortError::Rejected)
+    }
+}
+
+fn map_workbench_dispatch_error(error: anyhow::Error) -> WorkflowPortError {
+    if error.is::<WorkbenchDispatchUnavailable>() {
+        return WorkflowPortError::Unavailable;
+    }
+    if let Some(runtime) = error.downcast_ref::<sentinel_common::nano_runtime::NanoExecError>() {
+        warn!(
+            code = ?runtime.code,
+            retryable = runtime.retryable,
+            "workbench dispatch returned a classified runtime failure"
+        );
+        if runtime.retryable {
+            return WorkflowPortError::Unavailable;
+        }
+    }
+    WorkflowPortError::UnknownOutcome
+}
+
+fn map_workbench_dispatch_response<T>(
+    response: Result<anyhow::Result<T>, mpsc::RecvTimeoutError>,
+) -> Result<T, WorkflowPortError> {
+    match response {
+        Ok(Ok(update)) => Ok(update),
+        Ok(Err(error)) => Err(map_workbench_dispatch_error(error)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The durable, digest-bound invocation remains safe to submit or recover again.
+            warn!("workbench dispatch response remains pending for its stable invocation");
+            Err(WorkflowPortError::Unavailable)
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(WorkflowPortError::Unavailable),
     }
 }
 
@@ -2457,7 +2485,10 @@ impl WorkflowApi {
                     "company transition authority changed after execution",
                 ));
             }
-            let principal = if target == sentinel_workflow::CompanyWorkStateV1::Done {
+            let gate_owned_transition = target == sentinel_workflow::CompanyWorkStateV1::Done
+                || target == sentinel_workflow::CompanyWorkStateV1::Blocked
+                    && work.state == sentinel_workflow::CompanyWorkStateV1::InReview;
+            let principal = if gate_owned_transition {
                 independent_gate_principal(
                     &project.governance.participants,
                     assignment.agent_id,
@@ -2513,11 +2544,17 @@ impl WorkflowApi {
                 output_receipts: outputs,
                 gate_receipt,
                 phase_a_evidence_digest: execution.plan.request_digest.clone(),
-                reason_ref: match target {
-                    sentinel_workflow::CompanyWorkStateV1::Done => {
+                reason_ref: match (target, work.state) {
+                    (sentinel_workflow::CompanyWorkStateV1::Done, _) => {
                         "independent-quality-gate-evidence"
                     }
-                    sentinel_workflow::CompanyWorkStateV1::Blocked => "workbench-execution-blocked",
+                    (
+                        sentinel_workflow::CompanyWorkStateV1::Blocked,
+                        sentinel_workflow::CompanyWorkStateV1::InReview,
+                    ) => "independent-quality-gate-timeout",
+                    (sentinel_workflow::CompanyWorkStateV1::Blocked, _) => {
+                        "workbench-execution-blocked"
+                    }
                     _ => "sealed-workbench-evidence",
                 }
                 .to_owned(),
@@ -2664,7 +2701,8 @@ fn company_transition_target(
         (
             sentinel_workflow::WorkItemState::Blocked | sentinel_workflow::WorkItemState::Cancelled,
             sentinel_workflow::CompanyWorkStateV1::Assigned
-            | sentinel_workflow::CompanyWorkStateV1::InProgress,
+            | sentinel_workflow::CompanyWorkStateV1::InProgress
+            | sentinel_workflow::CompanyWorkStateV1::InReview,
         ) => Some(sentinel_workflow::CompanyWorkStateV1::Blocked),
         (
             sentinel_workflow::WorkItemState::Assigned | sentinel_workflow::WorkItemState::Claimed,
@@ -2954,6 +2992,48 @@ mod tests {
             agent_id: Some(AgentId(6)),
             authority_generation: 1,
         }
+    }
+
+    #[test]
+    fn workbench_dispatch_error_preserves_only_proven_pre_dispatch_unavailability() {
+        assert_eq!(
+            map_workbench_dispatch_error(WorkbenchDispatchUnavailable.into()),
+            WorkflowPortError::Unavailable
+        );
+        assert_eq!(
+            map_workbench_dispatch_error(
+                sentinel_common::nano_runtime::NanoExecError::new(
+                    sentinel_common::nano_runtime::NanoExecErrorCode::ChannelDisconnected,
+                    true,
+                    "workbench runtime recycle remains pending",
+                )
+                .into(),
+            ),
+            WorkflowPortError::Unavailable
+        );
+        assert_eq!(
+            map_workbench_dispatch_error(
+                sentinel_common::nano_runtime::NanoExecError::new(
+                    sentinel_common::nano_runtime::NanoExecErrorCode::ProtocolViolation,
+                    false,
+                    "workbench output failed its protocol binding",
+                )
+                .into(),
+            ),
+            WorkflowPortError::UnknownOutcome
+        );
+        assert_eq!(
+            map_workbench_dispatch_error(anyhow::anyhow!("post-dispatch failure")),
+            WorkflowPortError::UnknownOutcome
+        );
+        assert_eq!(
+            map_workbench_dispatch_response::<()>(Err(mpsc::RecvTimeoutError::Timeout)),
+            Err(WorkflowPortError::Unavailable)
+        );
+        assert_eq!(
+            map_workbench_dispatch_response::<()>(Err(mpsc::RecvTimeoutError::Disconnected)),
+            Err(WorkflowPortError::Unavailable)
+        );
     }
 
     fn execution_step() -> sentinel_workflow::ExecutionStepV1 {
@@ -3451,6 +3531,11 @@ mod tests {
         );
         assert_eq!(
             company_transition_target(WorkItemState::Blocked, CompanyWorkStateV1::InProgress)
+                .unwrap(),
+            Some(CompanyWorkStateV1::Blocked)
+        );
+        assert_eq!(
+            company_transition_target(WorkItemState::Blocked, CompanyWorkStateV1::InReview)
                 .unwrap(),
             Some(CompanyWorkStateV1::Blocked)
         );

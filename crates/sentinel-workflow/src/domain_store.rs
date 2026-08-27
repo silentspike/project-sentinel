@@ -683,7 +683,7 @@ impl WorkflowStore {
         let connection = self.connection.lock().map_err(|_| persistence())?;
         let mut statement = connection
             .prepare(
-                "SELECT sequence,event_id,tenant_id,project_id,event_type,operation_id,operation_digest,principal_id,principal_kind,principal_role,agent_id,customer_id,authority_generation,authority_digest,authority_binding_digest,payload,payload_digest,created_at_ms FROM company_events WHERE tenant_id=?1 AND project_id IS NOT NULL AND sequence>?2 ORDER BY sequence LIMIT ?3",
+                "SELECT sequence,event_id,tenant_id,project_id,event_type,operation_id,operation_digest,principal_id,principal_kind,principal_role,agent_id,customer_id,authority_generation,authority_digest,authority_binding_digest,payload,payload_digest,created_at_ms FROM company_events WHERE tenant_id=?1 AND event_type GLOB 'project_*' AND sequence>?2 ORDER BY sequence LIMIT ?3",
             )
             .map_err(WorkflowError::from)?;
         let rows = statement
@@ -1814,7 +1814,14 @@ fn mutate_project(
                     || matches!(
                         principal.role,
                         CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
-                    ));
+                    ))
+                || receipt.from_state == CompanyWorkStateV1::InReview
+                    && receipt.to_state == CompanyWorkStateV1::Blocked
+                    && matches!(
+                        principal.role,
+                        CompanyRoleV1::Qa | CompanyRoleV1::ReleaseManager
+                    )
+                    && !actor_is_assignee;
             if !legal {
                 return Err(transition());
             }
@@ -1999,6 +2006,7 @@ fn mutate_project(
                 escalation_target: None,
                 state: BlockerStateV1::Open,
                 blocker_kind: BlockerKindV1::Operational,
+                blocked_from_state: Some(project.lifecycle_state),
                 resolution_ref: None,
                 last_actor_id: principal.principal_id.clone(),
                 created_at_unix_ms: now_ms,
@@ -2084,6 +2092,7 @@ fn mutate_project(
                 reason_ref: resolution_ref.clone(),
                 occurred_at_unix_ms: now_ms,
             });
+            restore_project_lifecycle_after_last_blocker(&mut project);
             refresh_project_lifecycle(&mut project);
         }
         CompanyWorkflowCommandV1::RecordApproval {
@@ -2215,6 +2224,7 @@ fn mutate_project(
                     escalation_target: None,
                     state: BlockerStateV1::Open,
                     blocker_kind: BlockerKindV1::BudgetExhausted,
+                    blocked_from_state: Some(project.lifecycle_state),
                     resolution_ref: None,
                     last_actor_id: principal.principal_id.clone(),
                     created_at_unix_ms: now_ms,
@@ -3669,6 +3679,7 @@ fn validate_work_transition_history(
                 | ("Assigned", "Blocked")
                 | ("InProgress", "InReview")
                 | ("InProgress", "Blocked")
+                | ("InReview", "Blocked")
                 | ("InReview", "Done")
                 | ("Assigned", "Assigned")
                 | ("Blocked", "Assigned")
@@ -3709,7 +3720,7 @@ fn work_transition_actor_is_authorized(
                 })
         }
         ("Assigned", "InProgress") | ("InProgress", "InReview") => is_assignee,
-        ("InReview", "Done") => is_independent_qa,
+        ("InReview", "Done") | ("InReview", "Blocked") => is_independent_qa,
         ("Assigned", "Blocked") | ("InProgress", "Blocked") => is_assignee || is_manager,
         ("Assigned", "Assigned") | ("Blocked", "Assigned") => {
             active_assignment.is_some_and(|assignment| {
@@ -3962,6 +3973,7 @@ fn resolve_budget_blockers_if_headroom(
         blocker.last_actor_id = principal.principal_id.clone();
         blocker.updated_at_unix_ms = now_ms;
     }
+    restore_project_lifecycle_after_last_blocker(project);
     refresh_project_lifecycle(project);
     Ok(())
 }
@@ -4077,6 +4089,25 @@ fn refresh_project_lifecycle(project: &mut ProjectV1) {
         project.lifecycle_state = ProjectLifecycleStateV1::Blocked;
     } else if project.lifecycle_state != ProjectLifecycleStateV1::Planning {
         project.lifecycle_state = ProjectLifecycleStateV1::Active;
+    }
+}
+
+fn restore_project_lifecycle_after_last_blocker(project: &mut ProjectV1) {
+    if project
+        .blockers
+        .iter()
+        .any(|blocker| blocker.state != BlockerStateV1::Resolved)
+    {
+        return;
+    }
+    if let Some(state) = project
+        .blockers
+        .iter()
+        .rev()
+        .filter_map(|blocker| blocker.blocked_from_state)
+        .find(|state| *state != ProjectLifecycleStateV1::Blocked)
+    {
+        project.lifecycle_state = state;
     }
 }
 
@@ -4456,6 +4487,20 @@ mod tests {
     }
 
     #[test]
+    fn project_event_feed_excludes_agreement_payload_with_project_reference() {
+        let (_temp, _path, store, principal, project) = accepted_project_fixture();
+
+        let events = store
+            .company_project_events_since(&principal.tenant_id, 0, 100)
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "project_created");
+        assert_eq!(events[0].project_id, project.project_id);
+        assert_eq!(events[0].project, project);
+    }
+
+    #[test]
     fn backdated_request_and_project_commands_write_no_rows() {
         let (_temp, _path, store, customer, project) = accepted_project_fixture();
         let before = company_row_counts(&store);
@@ -4682,6 +4727,7 @@ mod tests {
             escalation_target: None,
             state: BlockerStateV1::Open,
             blocker_kind: BlockerKindV1::Operational,
+            blocked_from_state: None,
             resolution_ref: None,
             last_actor_id: "agent-1".to_owned(),
             created_at_unix_ms: 1,
@@ -4708,6 +4754,7 @@ mod tests {
             escalation_target: None,
             state: BlockerStateV1::Resolved,
             blocker_kind: BlockerKindV1::Operational,
+            blocked_from_state: None,
             resolution_ref: Some("restored".to_owned()),
             last_actor_id: "agent-2".to_owned(),
             created_at_unix_ms: 2,
@@ -5078,6 +5125,7 @@ mod tests {
             escalation_target: None,
             state: BlockerStateV1::Open,
             blocker_kind: BlockerKindV1::Operational,
+            blocked_from_state: None,
             resolution_ref: None,
             last_actor_id: "developer-a".to_owned(),
             created_at_unix_ms: 3,

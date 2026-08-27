@@ -193,7 +193,15 @@ pub(super) fn handle(
     };
     match result {
         Ok(response) => json(200, &response),
-        Err(error) => delivery_error(error),
+        Err(error) => {
+            tracing::warn!(
+                operation_id = %envelope.operation_id,
+                intent = ?envelope.intent,
+                error = %error,
+                "Delivery intent rejected"
+            );
+            delivery_error(error)
+        }
     }
 }
 
@@ -205,7 +213,7 @@ fn context(
 ) -> CommandContextV1 {
     CommandContextV1 {
         principal,
-        idempotency_key: format!("{operation_id}:{stage}"),
+        idempotency_key: format!("{operation_id}.{stage}"),
         now_ms,
     }
 }
@@ -1359,6 +1367,10 @@ mod tests {
         assert_eq!(first.principal, retry.principal);
         assert_eq!(first.idempotency_key, retry.idempotency_key);
         assert_ne!(first.now_ms, retry.now_ms);
+        assert!(first
+            .idempotency_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')));
     }
 
     #[test]

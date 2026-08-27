@@ -78,6 +78,13 @@ impl LandlockRuleset {
             // M0 web-authoring profile: syntax validation only; arguments are
             // separately constrained by the digest-bound command policy.
             PathBuf::from("/usr/bin/node"),
+            // M0 quality gates are fixed, provisioned Python entrypoints. The
+            // workbench profile and per-request command policy still bind the
+            // exact helper and its content-addressed input arguments.
+            PathBuf::from("/usr/bin/sentinel-web-qa"),
+            PathBuf::from("/usr/bin/sentinel-work-item-gate"),
+            PathBuf::from("/usr/bin/env"),
+            PathBuf::from("/usr/bin/python3"),
             PathBuf::from("/breakout-helper"),
             // Dynamically linked ELF binaries also need their loader executable.
             PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
@@ -105,6 +112,10 @@ impl LandlockRuleset {
                 // required for bounded process-group resource accounting and
                 // cannot expose host process metadata.
                 PathBuf::from("/proc"),
+                // Completion receipts use kernel randomness only to make the
+                // private, create-new staging name unpredictable. The device
+                // remains read-only and is provided by bwrap's private /dev.
+                PathBuf::from("/dev/urandom"),
             ],
             write_paths: vec![
                 PathBuf::from(format!("/home/{name}")),
@@ -265,6 +276,7 @@ mod tests {
         assert!(rs.read_paths.contains(&PathBuf::from("/proc")));
         assert!(rs.read_paths.contains(&PathBuf::from("/lib")));
         assert!(rs.read_paths.contains(&PathBuf::from("/lib64")));
+        assert!(rs.read_paths.contains(&PathBuf::from("/dev/urandom")));
         assert!(rs.write_paths.contains(&PathBuf::from("/home/thomas")));
         assert!(rs.write_paths.contains(&PathBuf::from("/workspace")));
         assert!(rs.write_paths.contains(&PathBuf::from("/artifacts")));
@@ -274,6 +286,14 @@ mod tests {
             .exec_paths
             .contains(&PathBuf::from("/usr/bin/agent-runtime")));
         assert!(rs.exec_paths.contains(&PathBuf::from("/usr/bin/node")));
+        assert!(rs
+            .exec_paths
+            .contains(&PathBuf::from("/usr/bin/sentinel-web-qa")));
+        assert!(rs
+            .exec_paths
+            .contains(&PathBuf::from("/usr/bin/sentinel-work-item-gate")));
+        assert!(rs.exec_paths.contains(&PathBuf::from("/usr/bin/env")));
+        assert!(rs.exec_paths.contains(&PathBuf::from("/usr/bin/python3")));
         assert!(rs.exec_paths.contains(&PathBuf::from("/breakout-helper")));
         assert!(rs
             .exec_paths

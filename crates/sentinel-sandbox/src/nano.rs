@@ -16,6 +16,7 @@ use sentinel_common::nano_runtime::{
 };
 use sentinel_common::{
     WorkbenchArtifactRef, WorkbenchMessage, WorkbenchOutcome, WorkbenchRequest, WorkbenchTool,
+    WORKBENCH_SCHEMA_VERSION,
 };
 use sentinel_fs::artifact::ArtifactPlane;
 use sentinel_fs::home_manifest::{self, HomeManifest, RestorePolicy};
@@ -1825,16 +1826,18 @@ impl BwrapNanoRuntime {
                     "workbench recovery digest conflicts with retained state",
                 ));
             }
-            if let Some(failure) = exchange.terminal_error.as_ref() {
-                return Err(failure.clone().into());
-            }
-            return workbench_exec_result(
-                handle,
-                true,
-                &invocation_id,
-                exchange_state_with_supervision(exchange, supervision),
-                exchange_messages_with_supervision(exchange, supervision),
-            );
+            let poll = serde_json::json!({
+                "kind": "poll",
+                "schema_version": WORKBENCH_SCHEMA_VERSION,
+                "invocation_id": invocation_id,
+            })
+            .to_string();
+            // A retained exchange may have completed after the original
+            // requester timed out. Recovery must import those child frames
+            // through the same bounded protocol and cleanup path as polling;
+            // returning only the supervision snapshot would strand the
+            // durable invocation in Executing despite an existing receipt.
+            return self.poll_workbench_exchange(handle, &poll);
         }
 
         let channel_available = self
@@ -3759,25 +3762,14 @@ mod tests {
             )
             .unwrap();
         assert!(accepted.output.contains("accepted"));
-        let replay = runtime
-            .exec(
-                &handle,
-                NanoExecRequest {
-                    operation: "workbench_recover".to_string(),
-                    input: recover,
-                },
-            )
-            .unwrap();
-        assert!(replay.output.contains("pending") || replay.output.contains("completed"));
-
         let terminal = (0..100)
             .find_map(|_| {
                 let result = runtime
                     .exec(
                         &handle,
                         NanoExecRequest {
-                            operation: "workbench_poll".to_string(),
-                            input: poll_frame(invocation_id),
+                            operation: "workbench_recover".to_string(),
+                            input: recover.clone(),
                         },
                     )
                     .unwrap();
@@ -3789,7 +3781,7 @@ mod tests {
                     None
                 }
             })
-            .expect("recovery receipt did not reach its retained terminal state");
+            .expect("recovery did not import its retained completion receipt");
         assert!(!runtime.processes.contains_key(&handle.workload_id));
         let terminal_replay = runtime
             .exec(

@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Fixed the single-node M0 workbench Landlock policy so the two provisioned,
+  profile-bound QA helpers and their Python launcher can execute while the
+  request-specific command policy continues to bind exact input arguments.
+- Keep the work-item QA Workbench deadline stable across durable outbox retries
+  so a completed gate can be replayed without changing its request digest.
+- Record the internal, credential-free delivery rejection reason in the daemon
+  journal while keeping the public company API error response redacted.
+- Encode delivery-stage idempotency keys as canonical store identifiers while
+  preserving their stable operation and stage binding across retries.
+- Keep current non-delivery governance roles in the company model without
+  forcing them into the delivery authority inventory.
+- Bind independent QA execution to an exact, profile-approved command rule for
+  the sealed candidate input inventory.
+- Make the canonical M0 website journey produce and package a real HTML
+  entrypoint with its checked script so the independent web QA profile can
+  validate the promised product rather than an incomplete script artifact.
+- Refresh the daemon's security, sandbox, and eBPF observations from the
+  adapter-owned process after Workbench recycling so successful QA does not
+  leave its agent with a stale pre-recycle PID.
+
+- Validate completed Workbench artifacts against the same mutable per-agent
+  backing used by the attested runtime. An active sentinel-fs home view no
+  longer redirects the daemon's terminal manifest check to a FUSE path that
+  does not own Workbench workspace or artifact state.
+- Bind the automatic independent work-item gate to an exact, digest-covered
+  command rule for the built-in QA helper and its staged input paths. Gate
+  execution no longer fails admission before the Workbench dispatch.
+- Terminalize expired independent gates as durable `gate_timed_out` work-item
+  blockers. A failed project remains auditable without leaving a pending
+  outbox row that degrades every later company workflow. The independent QA or
+  release authority also reconciles the company work item from review to its
+  matching blocked state without granting that transition to the implementer.
+- Recover completed Workbench invocations through the same bounded JSONL drain
+  and terminal-replay path as polling. A non-terminal poll or recovery now
+  retains the durable `Executing` record instead of exposing an empty update
+  that the company workflow could misclassify as an unknown outcome.
+- Keep a company-workflow execution pending when a stable Workbench invocation
+  is still awaiting its local dispatch response, recovery returns a typed
+  retryable runtime failure, or its exact NanoRuntime handle is temporarily
+  absent during supervised process recycling. Non-retryable and unclassified
+  post-dispatch failures remain durable unknown outcomes, while operator logs
+  expose only the public-safe runtime error code and retryability.
+- Keep the operator company-event feed restricted to validated project
+  snapshots. Agreement events may reference the newly created project for
+  lineage, but their agreement payload is not a project snapshot.
+- Permit read-only access to bwrap's private `/dev/urandom` in the Landlock
+  workbench profile so atomic completion receipts can create unpredictable
+  staging names after a successful tool effect. Terminal recovery now reads
+  that receipt through the retained instance-fenced handle without requiring
+  the already reaped child process or cgroup to remain live.
+- Keep work assigned to an off-shift employee durably pending until that
+  employee's exact bwrap runtime is available. The Workbench dispatcher now
+  rejects this condition before reservation or runtime I/O and distinguishes
+  it from a genuinely ambiguous post-dispatch outcome; its response window
+  also covers a loaded adaptive ECS tick instead of falsely blocking the work.
+- Route Project Manager mutations in the canonical M0 company journey through
+  its authenticated agent authority instead of the operator-only command
+  surface; operator reads and the explicit customer/operator negative remain
+  unchanged. The corrected semantic journey uses a new durable journey ID so
+  prior operation IDs cannot be mistaken for fresh acceptance evidence. A
+  pre-activation blocker now returns an untouched work graph to `planning`
+  after resolution, preserving the explicit manager activation gate.
+- Align single-node M0 episode readiness with the durable subject-local
+  projection contract: each agent frontier may trail the global scan cursor
+  when no relevant event exists, while its reported lag must equal the exact
+  cursor delta and future, inconsistent, blocked, or missing frontiers still
+  fail closed.
+- Bound Go EventStore write-lock contention with a five-second SQLite busy
+  handler so NATS PubAck adoption can converge under the daemon's live writer
+  load instead of immediately abandoning each publication attempt.
+- Release an exact LLM request reservation after a transport-level connect
+  failure proves that no Gateway dispatch occurred; timeouts and all ambiguous
+  post-connect failures remain durable and fail closed.
+- Treat a successful calendar-triggered Nightrun outcome as historical evidence
+  across service reactivation while still requiring the periodic health-monitor
+  oneshot to complete after the current timer activation.
 - Queue Platform Control Plane starts for inactive systemd dependencies with
   `--no-block`, preventing daemon `ExecStartPost` readiness from deadlocking on
   units ordered after `sentinel-daemon.service`.
@@ -23,6 +99,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop the single-node daemon before its Gateway during activation rollback so
   in-flight LLM effects can finish or record a terminal outcome instead of
   becoming unresolved after the transport disappears.
+- Stop LLM admission on daemon shutdown, supervise every reserved provider
+  request, and require a bounded terminal drain before the daemon may report a
+  clean exit. Pending, unreserved calls are cancelled; reserved calls retain
+  the full request deadline inside the matching systemd stop budget.
 
 ### Changed
 - Issue #650 live-startup correction: tolerate only the attestation writer's transient zero-length regular file before consuming its nonce-bound payload, revalidate asynchronous service-health observations immediately before starting an inactive service, and prevent a full shift transition from starting after shutdown was requested. Invalid attestation file types/links/sizes remain fail closed, stale service-health observations use idempotent `systemctl start` instead of restarting an already recovered service, projection-lag restarts retain their separate authority, and the ECS shutdown path no longer begins new roster work after SIGTERM.
