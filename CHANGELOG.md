@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Preserve the persisted company-work plan deadline while independent QA waits
+  for dispatch, while retaining the profile's relative Workbench wall-time as
+  the execution limit once the sandboxed tool starts (#650).
+
 - Separate the M0 preflight's 15-second per-probe budget from its 30-second
   controller process deadline so restart recovery can serialize a valid
   readiness result without passing an invalid timeout to the preflight.
