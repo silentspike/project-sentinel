@@ -87,18 +87,13 @@ fn web_qa_command_rule(paths: &[String]) -> Result<CommandRule, DeliveryError> {
 }
 
 fn work_item_gate_deadline(
-    created_at_unix_ms: u64,
-    wall_time_ms: u64,
     plan_deadline_unix_ms: u64,
     now_unix_ms: u64,
 ) -> Result<u64, WorkflowPortError> {
-    let deadline = created_at_unix_ms
-        .saturating_add(wall_time_ms)
-        .min(plan_deadline_unix_ms);
-    if deadline <= now_unix_ms {
+    if plan_deadline_unix_ms <= now_unix_ms {
         Err(WorkflowPortError::TimedOut)
     } else {
-        Ok(deadline)
+        Ok(plan_deadline_unix_ms)
     }
 }
 
@@ -1457,15 +1452,10 @@ impl GateEvidencePort for WorkflowWorkItemGate {
             return Err(WorkflowPortError::Rejected);
         }
         let now = now_ms();
-        // The invocation ID is stable across outbox retries, so every field in
-        // the canonical Workbench request must be stable too. Anchor the
-        // execution window to the persisted gate request, not this attempt.
-        let deadline = work_item_gate_deadline(
-            request.created_at_unix_ms,
-            self.integration.qa_profile.resource_ceilings.wall_time_ms,
-            work.plan.deadline_unix_ms,
-            now,
-        )?;
+        // Queue and reconciliation delay must not consume the tool's execution
+        // budget. The persisted plan deadline keeps the request digest stable;
+        // resource_limits.wall_time_ms independently bounds actual execution.
+        let deadline = work_item_gate_deadline(work.plan.deadline_unix_ms, now)?;
         let authority = GateWorkbenchAuthority {
             gate: self.clone(),
             request: request.clone(),
@@ -1965,19 +1955,26 @@ mod tests {
 
     #[test]
     fn work_item_gate_deadline_is_stable_across_retries() {
-        let first = work_item_gate_deadline(1_000, 30_000, 90_000, 2_000).unwrap();
-        let retry = work_item_gate_deadline(1_000, 30_000, 90_000, 20_000).unwrap();
+        let first = work_item_gate_deadline(90_000, 2_000).unwrap();
+        let retry = work_item_gate_deadline(90_000, 80_000).unwrap();
 
-        assert_eq!(first, 31_000);
+        assert_eq!(first, 90_000);
         assert_eq!(retry, first);
         assert_eq!(
-            work_item_gate_deadline(1_000, 30_000, 20_000, 2_000).unwrap(),
-            20_000
-        );
-        assert_eq!(
-            work_item_gate_deadline(1_000, 30_000, 90_000, first),
+            work_item_gate_deadline(90_000, 90_000),
             Err(WorkflowPortError::TimedOut)
         );
+        assert_eq!(
+            work_item_gate_deadline(90_000, 90_001),
+            Err(WorkflowPortError::TimedOut)
+        );
+    }
+
+    #[test]
+    fn work_item_gate_queue_delay_does_not_consume_execution_budget() {
+        // A created-at + 30s deadline would reject this queued retry at 40s.
+        // The runtime still enforces its 30s relative wall-time after dispatch.
+        assert_eq!(work_item_gate_deadline(120_000, 40_000).unwrap(), 120_000);
     }
 
     fn digest(value: &str) -> ContentDigest {
