@@ -1288,6 +1288,35 @@ class ControlTests(unittest.TestCase):
         with self.assertRaisesRegex(control.ControlError, "restart_timeout"):
             fixture.restart(runner)
 
+    def test_restart_uses_independent_systemd_job_budget(self) -> None:
+        self.fixture.restart(self.runner)
+
+        restart_timeouts = [
+            timeout
+            for call, timeout in zip(self.runner.calls, self.runner.timeouts)
+            if call[:2] == (str(control.SYSTEMCTL), "restart")
+        ]
+        journey_timeouts = [
+            timeout
+            for call, timeout in zip(self.runner.calls, self.runner.timeouts)
+            if call[:2] == (str(control.PYTHON), str(control.JOURNEY_PROGRAM))
+        ]
+        self.assertTrue(restart_timeouts)
+        self.assertTrue(journey_timeouts)
+        self.assertTrue(all(
+            timeout == control.RESTART_COMMAND_TIMEOUT_SECONDS
+            for timeout in restart_timeouts
+        ))
+        self.assertTrue(all(
+            timeout == self.fixture.journey_args().timeout
+            for timeout in journey_timeouts
+        ))
+        self.assertGreater(control.RESTART_COMMAND_TIMEOUT_SECONDS, 180.0)
+        self.assertGreater(
+            control.RESTART_COMMAND_TIMEOUT_SECONDS,
+            self.fixture.journey_args().timeout,
+        )
+
     def test_wait_service_binds_each_readback_and_terminal_result(self) -> None:
         unit = control.SERVICES[0]
         slow_clock = FakeClock()
