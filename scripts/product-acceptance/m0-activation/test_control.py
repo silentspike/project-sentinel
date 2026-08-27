@@ -1317,6 +1317,37 @@ class ControlTests(unittest.TestCase):
             self.fixture.journey_args().timeout,
         )
 
+    def test_restart_readiness_retries_only_temporal_failures(self) -> None:
+        clock = FakeClock()
+        self.runner.preflight_failures_remaining = 2
+        digest = control.wait_for_restart_readiness(
+            self.runner, self.fixture.preflight(), deadline_seconds=10.0,
+            monotonic=clock.monotonic, sleeper=clock.sleep,
+        )
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        self.assertEqual(clock.sleeps, [1.0, 1.0])
+
+        fatal_runner = FakeRunner(self.fixture)
+        fatal_runner.preflight_failures_remaining = 1
+        fatal_runner.preflight_failure_reason = "artifact_hash_mismatch"
+        with self.assertRaisesRegex(control.ControlError, "readiness_failed"):
+            control.wait_for_restart_readiness(
+                fatal_runner, self.fixture.preflight(), deadline_seconds=10.0,
+                monotonic=clock.monotonic, sleeper=clock.sleep,
+            )
+
+    def test_restart_readiness_temporal_failure_is_deadline_bounded(self) -> None:
+        clock = FakeClock()
+        self.runner.preflight_failures_remaining = 10
+        with self.assertRaisesRegex(
+            control.ControlError, "restart_readiness_timeout"
+        ):
+            control.wait_for_restart_readiness(
+                self.runner, self.fixture.preflight(), deadline_seconds=2.0,
+                monotonic=clock.monotonic, sleeper=clock.sleep,
+            )
+        self.assertEqual(clock.sleeps, [1.0, 1.0])
+
     def test_wait_service_binds_each_readback_and_terminal_result(self) -> None:
         unit = control.SERVICES[0]
         slow_clock = FakeClock()
