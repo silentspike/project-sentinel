@@ -4,8 +4,8 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use sentinel_common::{
-    AgentId, DomainEvent, DomainEventPayload, WorkbenchRequest, WorkbenchResourceLimits,
-    WorkbenchTool, WORKBENCH_RUNTIME_BWRAP, WORKBENCH_SCHEMA_VERSION,
+    AgentId, CommandRule, DomainEvent, DomainEventPayload, WorkbenchRequest,
+    WorkbenchResourceLimits, WorkbenchTool, WORKBENCH_RUNTIME_BWRAP, WORKBENCH_SCHEMA_VERSION,
 };
 use sentinel_limbo::EventStore;
 use sentinel_workflow::{
@@ -38,6 +38,8 @@ use super::PrincipalAuthenticator;
 
 const DELIVERY_AUTHORITY_GENERATION: u64 = 1;
 const DELIVERY_EVENT_TOPIC: &str = "sentinel.delivery.events";
+const WEB_QA_PROGRAM: &str = "sentinel-web-qa";
+const WORK_ITEM_GATE_PROGRAM: &str = "sentinel-work-item-gate";
 
 type M0QaEvidenceComponents = (
     Vec<QaDatasetCaseV1>,
@@ -53,6 +55,50 @@ pub(super) struct WorkflowWorkItemGate {
 impl WorkflowWorkItemGate {
     pub(super) fn new(integration: WorkflowDeliveryIntegration) -> Self {
         Self { integration }
+    }
+}
+
+fn work_item_gate_command_rule(paths: &[String]) -> Result<CommandRule, WorkflowPortError> {
+    let max_args = u16::try_from(paths.len()).map_err(|_| WorkflowPortError::Rejected)?;
+    if max_args == 0 || paths.len() > 64 {
+        return Err(WorkflowPortError::Rejected);
+    }
+    Ok(CommandRule {
+        program: WORK_ITEM_GATE_PROGRAM.to_string(),
+        required_arg_prefix: paths.to_vec(),
+        max_args,
+    })
+}
+
+fn web_qa_command_rule(paths: &[String]) -> Result<CommandRule, DeliveryError> {
+    let max_args = u16::try_from(paths.len()).map_err(|_| {
+        DeliveryError::Validation("QA input inventory exceeds the command policy".to_string())
+    })?;
+    if max_args == 0 || paths.len() > 64 {
+        return Err(DeliveryError::Validation(
+            "QA input inventory is empty or exceeds the command policy".to_string(),
+        ));
+    }
+    Ok(CommandRule {
+        program: WEB_QA_PROGRAM.to_string(),
+        required_arg_prefix: paths.to_vec(),
+        max_args,
+    })
+}
+
+fn work_item_gate_deadline(
+    created_at_unix_ms: u64,
+    wall_time_ms: u64,
+    plan_deadline_unix_ms: u64,
+    now_unix_ms: u64,
+) -> Result<u64, WorkflowPortError> {
+    let deadline = created_at_unix_ms
+        .saturating_add(wall_time_ms)
+        .min(plan_deadline_unix_ms);
+    if deadline <= now_unix_ms {
+        Err(WorkflowPortError::TimedOut)
+    } else {
+        Ok(deadline)
     }
 }
 
@@ -285,6 +331,17 @@ impl WorkflowDeliveryIntegration {
         tenant_id: &str,
         principal_id: &str,
     ) -> Result<PrincipalV1, DeliveryError> {
+        self.mapped_delivery_principal(tenant_id, principal_id)?
+            .ok_or_else(|| {
+                DeliveryError::AuthorityDenied("principal has no delivery authority".to_string())
+            })
+    }
+
+    fn mapped_delivery_principal(
+        &self,
+        tenant_id: &str,
+        principal_id: &str,
+    ) -> Result<Option<PrincipalV1>, DeliveryError> {
         let bound = self
             .principals
             .principal(principal_id)
@@ -294,16 +351,14 @@ impl WorkflowDeliveryIntegration {
             })?;
         let roles = delivery_roles(bound.principal.role);
         if roles.is_empty() {
-            return Err(DeliveryError::AuthorityDenied(
-                "principal has no delivery authority".to_string(),
-            ));
+            return Ok(None);
         }
-        Ok(PrincipalV1 {
+        Ok(Some(PrincipalV1 {
             tenant_id: tenant_id.to_string(),
             principal_id: bound.principal.principal_id,
             authority_generation: bound.principal.authority_generation,
             roles,
-        })
+        }))
     }
 
     fn expected_project_ref(
@@ -344,10 +399,12 @@ impl WorkflowDeliveryIntegration {
                 .iter()
                 .map(|participant| participant.principal_id.clone()),
         );
-        let mut principals = principal_ids
-            .into_iter()
-            .map(|principal_id| self.mapped_principal(tenant_id, &principal_id))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut principals = Vec::new();
+        for principal_id in principal_ids {
+            if let Some(principal) = self.mapped_delivery_principal(tenant_id, &principal_id)? {
+                principals.push(principal);
+            }
+        }
         principals.sort_by(|left, right| left.principal_id.cmp(&right.principal_id));
         if !principals
             .iter()
@@ -770,6 +827,11 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
             .ok_or_else(|| {
                 DeliveryError::Validation("QA workbench deadline overflow".to_string())
             })?;
+        let input_paths = inputs
+            .iter()
+            .map(|input| input.mount_path.clone())
+            .collect::<Vec<_>>();
+        let command_policy = vec![web_qa_command_rule(&input_paths)?];
         let mut workbench_request = WorkbenchRequest {
             schema_version: WORKBENCH_SCHEMA_VERSION,
             invocation_id: request.invocation.id.clone(),
@@ -788,7 +850,7 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
             capabilities: BTreeSet::from(["test.run_profile".to_string()]),
             output_artifact_kinds: BTreeSet::new(),
             inputs,
-            command_policy: Vec::new(),
+            command_policy,
             resource_limits: WorkbenchResourceLimits {
                 wall_time_ms: self.qa_profile.resource_ceilings.wall_time_ms,
                 cpu_time_ms: self.qa_profile.resource_ceilings.cpu_time_ms,
@@ -802,19 +864,11 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
             attempt: 1,
             tool: WorkbenchTool::RunTests {
                 suite_id: "web-qa-v1".to_string(),
-                program: "sentinel-web-qa".to_string(),
-                args: Vec::new(),
+                program: WEB_QA_PROGRAM.to_string(),
+                args: input_paths,
             },
             input_digest: String::new(),
         };
-        let input_paths = workbench_request
-            .inputs
-            .iter()
-            .map(|input| input.mount_path.clone())
-            .collect();
-        if let WorkbenchTool::RunTests { args, .. } = &mut workbench_request.tool {
-            *args = input_paths;
-        }
         workbench_request.input_digest = workbench_request
             .canonical_digest()
             .map_err(storage_error)?;
@@ -1403,12 +1457,15 @@ impl GateEvidencePort for WorkflowWorkItemGate {
             return Err(WorkflowPortError::Rejected);
         }
         let now = now_ms();
-        let deadline = now
-            .saturating_add(self.integration.qa_profile.resource_ceilings.wall_time_ms)
-            .min(work.plan.deadline_unix_ms);
-        if deadline <= now {
-            return Err(WorkflowPortError::TimedOut);
-        }
+        // The invocation ID is stable across outbox retries, so every field in
+        // the canonical Workbench request must be stable too. Anchor the
+        // execution window to the persisted gate request, not this attempt.
+        let deadline = work_item_gate_deadline(
+            request.created_at_unix_ms,
+            self.integration.qa_profile.resource_ceilings.wall_time_ms,
+            work.plan.deadline_unix_ms,
+            now,
+        )?;
         let authority = GateWorkbenchAuthority {
             gate: self.clone(),
             request: request.clone(),
@@ -1448,19 +1505,20 @@ impl GateEvidencePort for WorkflowWorkItemGate {
             attempt: 1,
             tool: WorkbenchTool::RunTests {
                 suite_id: "web-work-item-qa-v1".to_string(),
-                program: "sentinel-work-item-gate".to_string(),
+                program: WORK_ITEM_GATE_PROGRAM.to_string(),
                 args: Vec::new(),
             },
             input_digest: String::new(),
         };
-        let paths = workbench
+        let paths: Vec<String> = workbench
             .inputs
             .iter()
             .map(|input| input.mount_path.clone())
             .collect();
         if let WorkbenchTool::RunTests { args, .. } = &mut workbench.tool {
-            *args = paths;
+            *args = paths.clone();
         }
+        workbench.command_policy = vec![work_item_gate_command_rule(&paths)?];
         workbench.input_digest = workbench
             .canonical_digest()
             .map_err(|_| WorkflowPortError::Rejected)?;
@@ -1861,6 +1919,66 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_qa_command_policy_is_bound_to_the_exact_input_inventory() {
+        let paths = vec!["design.md".to_string(), "src/index.html".to_string()];
+        let rule = web_qa_command_rule(&paths).unwrap();
+
+        assert!(rule.allows(WEB_QA_PROGRAM, &paths));
+        assert!(!rule.allows(WEB_QA_PROGRAM, &paths[..1]));
+        assert!(!rule.allows(WEB_QA_PROGRAM, &[paths[1].clone(), paths[0].clone()]));
+        let mut extended = paths.clone();
+        extended.push("foreign.txt".to_string());
+        assert!(!rule.allows(WEB_QA_PROGRAM, &extended));
+        assert!(web_qa_command_rule(&[]).is_err());
+    }
+
+    #[test]
+    fn company_governance_roles_without_delivery_authority_stay_out_of_delivery_inventory() {
+        for role in [
+            CompanyRoleV1::Sales,
+            CompanyRoleV1::ProjectManager,
+            CompanyRoleV1::TechnicalLead,
+        ] {
+            assert!(delivery_roles(role).is_empty());
+        }
+        assert_eq!(
+            delivery_roles(CompanyRoleV1::Developer),
+            BTreeSet::from([AuthorityRole::Developer])
+        );
+    }
+
+    #[test]
+    fn work_item_gate_command_policy_binds_exact_helper_and_inputs() {
+        let paths = vec!["design.md".to_string(), "screens/home.txt".to_string()];
+        let rule = work_item_gate_command_rule(&paths).unwrap();
+
+        assert!(rule.allows(WORK_ITEM_GATE_PROGRAM, &paths));
+        assert!(!rule.allows("node", &paths));
+        assert!(!rule.allows(WORK_ITEM_GATE_PROGRAM, &paths[..1]));
+        let mut extended = paths.clone();
+        extended.push("foreign.txt".to_string());
+        assert!(!rule.allows(WORK_ITEM_GATE_PROGRAM, &extended));
+        assert!(work_item_gate_command_rule(&[]).is_err());
+    }
+
+    #[test]
+    fn work_item_gate_deadline_is_stable_across_retries() {
+        let first = work_item_gate_deadline(1_000, 30_000, 90_000, 2_000).unwrap();
+        let retry = work_item_gate_deadline(1_000, 30_000, 90_000, 20_000).unwrap();
+
+        assert_eq!(first, 31_000);
+        assert_eq!(retry, first);
+        assert_eq!(
+            work_item_gate_deadline(1_000, 30_000, 20_000, 2_000).unwrap(),
+            20_000
+        );
+        assert_eq!(
+            work_item_gate_deadline(1_000, 30_000, 90_000, first),
+            Err(WorkflowPortError::TimedOut)
+        );
+    }
 
     fn digest(value: &str) -> ContentDigest {
         ContentDigest::of(&value).unwrap()

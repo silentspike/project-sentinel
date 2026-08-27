@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -60,6 +61,50 @@ func TestOpenAndClose(t *testing.T) {
 	}
 	if pending != 0 {
 		t.Errorf("expected 0 pending outbox, got %d", pending)
+	}
+
+	var busyTimeout int
+	if err := store.db.QueryRow("PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		t.Fatalf("read busy_timeout: %v", err)
+	}
+	if busyTimeout != sqliteBusyTimeoutMillis {
+		t.Fatalf("busy_timeout=%d, want %d", busyTimeout, sqliteBusyTimeoutMillis)
+	}
+}
+
+func TestAppendWaitsForConcurrentWriter(t *testing.T) {
+	store, path := tempDB(t)
+
+	locker, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open lock holder: %v", err)
+	}
+	locker.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = locker.Close() })
+
+	tx, err := locker.Begin()
+	if err != nil {
+		t.Fatalf("begin lock holder: %v", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO events
+		(event_id, event_type, aggregate_id, payload, correlation_id,
+		 causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type)
+		VALUES ('lock-event', 'lock', 'lock', '{}', 'lock', '', 'lock-operation', 0, 1, 1, 'none')`); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("acquire writer lock: %v", err)
+	}
+
+	released := make(chan error, 1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		released <- tx.Rollback()
+	}()
+
+	if err := store.AppendWithOutbox(makeEvent("busy-timeout"), "events.agent"); err != nil {
+		t.Fatalf("append while a concurrent writer briefly holds the database: %v", err)
+	}
+	if err := <-released; err != nil && err != sql.ErrTxDone {
+		t.Fatalf("release writer lock: %v", err)
 	}
 }
 

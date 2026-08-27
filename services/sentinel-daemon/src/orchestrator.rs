@@ -683,17 +683,20 @@ impl crate::workbench::WorkbenchRuntimeClient for DaemonWorkbenchRuntimeClient<'
             .handles
             .get(&agent_id)
             .cloned()
-            .ok_or_else(|| anyhow!("NanoRuntime handle does not exist for {agent_id}"))?;
+            .ok_or_else(|| {
+                sentinel_common::nano_runtime::NanoExecError::new(
+                    sentinel_common::nano_runtime::NanoExecErrorCode::WorkloadUnavailable,
+                    true,
+                    "workbench runtime handle is temporarily unavailable",
+                )
+            })?;
         anyhow::ensure!(
             handle.runtime_key == RUNTIME_BWRAP_LANDLOCK,
             "workbench requires '{RUNTIME_BWRAP_LANDLOCK}', selected '{}'",
             handle.runtime_key
         );
 
-        if matches!(
-            request.operation.as_str(),
-            "workbench_start" | "workbench_recover"
-        ) {
+        if request.operation == "workbench_start" {
             self.revalidate_world_authority(&world_guard)?;
             let resources = self.runtimes.adapter_owner.resources(&handle)?;
             anyhow::ensure!(
@@ -731,6 +734,9 @@ impl crate::workbench::WorkbenchRuntimeClient for DaemonWorkbenchRuntimeClient<'
 fn process_workbench_dispatch(
     service: &crate::workbench::WorkbenchService,
     runtimes: &mut DaemonNanoRuntimeRegistry,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
     owner_registry: &sentinel_common::OwnerRegistry,
     event_store: &EventStore,
     tick: u64,
@@ -739,7 +745,34 @@ fn process_workbench_dispatch(
         let Ok(command) = service.receiver.try_recv() else {
             break;
         };
+        let affected_agent_id = match &command {
+            crate::workbench::WorkbenchDispatchCommand::Submit { request, .. } => {
+                Some(request.agent_id)
+            }
+            crate::workbench::WorkbenchDispatchCommand::Poll { invocation_id, .. }
+            | crate::workbench::WorkbenchDispatchCommand::Recover { invocation_id, .. }
+            | crate::workbench::WorkbenchDispatchCommand::Cancel { invocation_id, .. } => service
+                .store
+                .load(invocation_id)
+                .ok()
+                .flatten()
+                .map(|record| record.agent_id),
+        };
         let now_ms = now_ms_i64().max(0) as u64;
+        if let crate::workbench::WorkbenchDispatchCommand::Submit {
+            request, response, ..
+        } = &command
+        {
+            if !workbench_submit_runtime_available(runtimes.handle(request.agent_id)) {
+                if response
+                    .send(Err(crate::workbench::WorkbenchDispatchUnavailable.into()))
+                    .is_err()
+                {
+                    warn!("workbench requester disconnected before runtime-unavailable rejection");
+                }
+                continue;
+            }
+        }
         let mut runtime = DaemonWorkbenchRuntimeClient {
             runtimes,
             owner_registry,
@@ -875,6 +908,17 @@ fn process_workbench_dispatch(
             }
         };
         let result = result.and_then(|update| {
+            let agent_id = affected_agent_id
+                .ok_or_else(|| anyhow::anyhow!("workbench runtime owner is unavailable"))?;
+            let (handle, resources) = runtimes.observe(agent_id)?;
+            let (cgroup_id, pid) = synchronize_workbench_runtime_observation(
+                agent_id,
+                &handle,
+                &resources,
+                sandbox_handles,
+                security_runtime_state,
+            )?;
+            ebpf_collector.update_agent_pid(cgroup_id, pid);
             crate::workbench::publish_workbench_records(event_store, &update.records, tick)?;
             Ok(update)
         });
@@ -882,6 +926,62 @@ fn process_workbench_dispatch(
             warn!("workbench requester disconnected before receiving its durable outcome");
         }
     }
+}
+
+fn synchronize_workbench_runtime_observation(
+    agent_id: AgentId,
+    handle: &NanoHandle,
+    resources: &NanoRuntimeResources,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+) -> Result<(u64, u32)> {
+    anyhow::ensure!(
+        handle.agent_id == Some(agent_id)
+            && handle.runtime_key == RUNTIME_BWRAP_LANDLOCK
+            && resources.instance_id == Some(handle.instance_id),
+        "workbench runtime observation is not bound to its adapter owner"
+    );
+    let pid = resources
+        .pid
+        .ok_or_else(|| anyhow!("workbench runtime observation has no process"))?;
+    let cgroup_id = resources
+        .cgroup_id
+        .filter(|_| resources.cgroup_created)
+        .ok_or_else(|| anyhow!("workbench runtime observation has no cgroup"))?;
+    anyhow::ensure!(
+        resources.landlock_applied && resources.network_isolated,
+        "workbench runtime observation lost its isolation contract"
+    );
+
+    let sandbox = sandbox_handles
+        .get_mut(&agent_id)
+        .ok_or_else(|| anyhow!("workbench runtime sandbox observation is unavailable"))?;
+    let mut security = security_runtime_state
+        .write()
+        .map_err(|_| anyhow!("workbench security runtime state is poisoned"))?;
+    let snapshot = security
+        .get_mut(&agent_id.0)
+        .ok_or_else(|| anyhow!("workbench security runtime observation is unavailable"))?;
+    anyhow::ensure!(
+        snapshot.instance_id == Some(handle.instance_id)
+            && snapshot.runtime_key == handle.runtime_key
+            && sandbox.agent_name == snapshot.agent_name,
+        "workbench runtime observation conflicts with the retained owner"
+    );
+
+    sandbox.cgroup_created = resources.cgroup_created;
+    sandbox.cgroup_id = resources.cgroup_id;
+    sandbox.io_available = resources.io_available;
+    sandbox.bwrap_pid = Some(pid);
+    sandbox.landlock_applied = resources.landlock_applied;
+    sandbox.network_isolated = resources.network_isolated;
+    snapshot.runtime_pid = Some(pid);
+    snapshot.bwrap_pid = Some(pid);
+    Ok((cgroup_id, pid))
+}
+
+fn workbench_submit_runtime_available(handle: Option<&NanoHandle>) -> bool {
+    handle.is_some_and(|handle| handle.runtime_key == RUNTIME_BWRAP_LANDLOCK)
 }
 
 fn workbench_invocation_uses_qa_profile(
@@ -1318,6 +1418,14 @@ fn wait_for_fuse_mount(path: &std::path::Path, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     mountpoint_is_active(path)
+}
+
+fn workbench_artifact_root(agent_name: &str, _active_fs_mount: Option<&str>) -> std::path::PathBuf {
+    // Workbench roots deliberately remain on the mutable per-agent backing.
+    // sentinel-fs presents the normal home view but does not own these roots.
+    std::path::PathBuf::from("/ram/agents")
+        .join(agent_name)
+        .join("artifacts")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2502,15 +2610,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let workbench_artifact_roots: std::collections::HashMap<_, _> = all_agents
         .iter()
         .map(|agent| {
-            let raw_agent_id = agent.identity.id;
-            let agent_id = AgentId(raw_agent_id);
-            let host_root = match active_fs_mount.as_deref() {
-                Some(mount) => {
-                    std::path::PathBuf::from(mount).join(format!("AGENT-{raw_agent_id:02}"))
-                }
-                None => std::path::PathBuf::from("/ram/agents").join(&agent.identity.name),
-            };
-            (agent_id, host_root.join("artifacts"))
+            (
+                AgentId(agent.identity.id),
+                workbench_artifact_root(&agent.identity.name, active_fs_mount.as_deref()),
+            )
         })
         .collect();
     let workbench_data_dir = data_dir.join("company-workbench");
@@ -3149,7 +3252,29 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
     // -- LLM Bridge starten (Perception → Cortex Gateway → Action) --
     #[cfg(feature = "llm")]
-    let _llm_bridge_handle = {
+    let (llm_bridge_shutdown_tx, llm_bridge_shutdown_rx) = tokio::sync::watch::channel(false);
+    #[cfg(feature = "llm")]
+    let llm_provider_admission = Arc::new(RwLock::new(true));
+    #[cfg(feature = "llm")]
+    let gateway_request_timeout_ms = std::env::var("SENTINEL_LLM_BRIDGE_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(config.traffic_control.gateway_request_timeout_ms);
+    #[cfg(feature = "llm")]
+    const MAX_LLM_BRIDGE_REQUEST_TIMEOUT_MS: u64 = 150_000;
+    #[cfg(feature = "llm")]
+    if gateway_request_timeout_ms > MAX_LLM_BRIDGE_REQUEST_TIMEOUT_MS {
+        return Err(anyhow!(
+            "LLM Bridge request timeout {gateway_request_timeout_ms}ms exceeds the 150000ms shutdown contract"
+        ));
+    }
+    #[cfg(feature = "llm")]
+    let llm_bridge_drain_timeout =
+        Duration::from_millis(gateway_request_timeout_ms) + Duration::from_secs(5);
+    #[cfg(feature = "llm")]
+    let llm_bridge_join_timeout = llm_bridge_drain_timeout + Duration::from_secs(5);
+    #[cfg(feature = "llm")]
+    let mut llm_bridge_handle = {
         let (guarded_perception_tx, guarded_perception_rx) = mpsc::sync_channel::<Perception>(128);
         let perception_admission = Arc::clone(&episode_projection_admission);
         tokio::task::spawn_blocking(move || {
@@ -3184,15 +3309,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 }
             }
         });
-        let gateway_request_timeout_ms = std::env::var("SENTINEL_LLM_BRIDGE_REQUEST_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(config.traffic_control.gateway_request_timeout_ms);
         let bridge_config = crate::llm_bridge::bridge::LlmBridgeConfig {
             gateway_url: std::env::var("CORTEX_GATEWAY_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".to_string()),
             max_concurrent: config.traffic_control.max_forward_concurrency.max(1),
             request_timeout: std::time::Duration::from_millis(gateway_request_timeout_ms),
+            shutdown_drain_timeout: llm_bridge_drain_timeout,
             credential: read_required_credential("SENTINEL_AGENT_RUNTIME_CREDENTIAL_FILE")?,
             usage_v2_enabled: std::env::var("SENTINEL_LLM_USAGE_V2_ENABLED")
                 .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
@@ -3205,9 +3327,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             gateway_url = %bridge_config.gateway_url,
             max_concurrent = bridge_config.max_concurrent,
             request_timeout_ms = gateway_request_timeout_ms,
+            shutdown_drain_timeout_ms = llm_bridge_drain_timeout.as_millis(),
             "LLM Bridge wird gestartet"
         );
-        tokio::spawn(crate::llm_bridge::bridge::run_llm_bridge(
+        tokio::spawn(crate::llm_bridge::bridge::run_llm_bridge_with_shutdown(
             bridge_config,
             guarded_perception_rx,
             guarded_action_tx,
@@ -3216,6 +3339,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             Arc::clone(&event_store), // #427: emit AgentLlmUsage per LLM call
             Arc::clone(&llm_circuit_open),
             Arc::clone(&llm_activity_ticks),
+            llm_bridge_shutdown_rx,
+            Arc::clone(&llm_provider_admission),
         ))
     };
 
@@ -3359,9 +3484,15 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- Graceful Shutdown --
     info!("Shutdown eingeleitet...");
     shutdown.store(true, Ordering::SeqCst);
+    #[cfg(feature = "llm")]
+    crate::llm_bridge::bridge::stop_provider_admission(llm_provider_admission.as_ref());
+    #[cfg(feature = "llm")]
+    llm_bridge_shutdown_tx
+        .send(true)
+        .map_err(|_| anyhow!("LLM Bridge shutdown channel closed before shutdown"))?;
     // The reconciler's bounded Workbench response wait is five seconds. Give
-    // an in-flight batch one extra second while keeping the existing ECS join
-    // inside systemd's 15-second stop budget.
+    // an in-flight batch one extra second. The LLM drain runs concurrently and
+    // retains its own request-deadline-based systemd budget.
     if !join_workflow_reconciler(workflow_reconcile_handle, Duration::from_secs(6)) {
         warn!("Company-Workflow-Reconciler konnte nicht sauber beendet werden");
     }
@@ -3395,6 +3526,17 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             break; // Daemon exits, --die-with-parent kills agents
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+
+    #[cfg(feature = "llm")]
+    match tokio::time::timeout(llm_bridge_join_timeout, &mut llm_bridge_handle).await {
+        Ok(Ok(Ok(()))) => info!("LLM Bridge provider tasks drained"),
+        Ok(Ok(Err(reason))) => return Err(anyhow!("LLM Bridge shutdown failed: {reason}")),
+        Ok(Err(error)) => return Err(anyhow!("LLM Bridge task failed: {error}")),
+        Err(_) => {
+            llm_bridge_handle.abort();
+            return Err(anyhow!("LLM Bridge shutdown join timed out"));
+        }
     }
 
     info!("Daemon heruntergefahren");
@@ -8508,6 +8650,9 @@ fn ecs_tick_loop(
             process_workbench_dispatch(
                 service,
                 &mut nano_runtimes,
+                &mut sandbox_handles,
+                &mut ebpf_collector,
+                &security_runtime_state,
                 owner_registry,
                 &event_store,
                 tick_count,
@@ -11724,6 +11869,16 @@ fn ecs_tick_loop(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn workbench_artifact_validation_uses_mutable_backing_with_active_fuse() {
+        let expected = std::path::PathBuf::from("/ram/agents/Max Richter/artifacts");
+        assert_eq!(
+            workbench_artifact_root("Max Richter", Some("/opt/sentinel/fs")),
+            expected
+        );
+        assert_eq!(workbench_artifact_root("Max Richter", None), expected);
+    }
+
+    #[test]
     fn startup_runtime_spawn_retries_once_after_a_transient_failure() {
         let mut attempts = Vec::new();
         let mut backoffs = Vec::new();
@@ -11895,6 +12050,120 @@ mod tests {
         assert!(
             workbench_profile_is_qa("foreign-profile", "web-authoring-v1", "web-qa-v1").is_err()
         );
+    }
+
+    fn workbench_recycle_observation_fixture() -> (
+        AgentId,
+        NanoHandle,
+        NanoRuntimeResources,
+        HashMap<AgentId, SandboxHandle>,
+        operator_api::SharedSecurityRuntimeState,
+    ) {
+        let agent_id = AgentId(55);
+        let old_pid = 10_055;
+        let new_pid = 20_055;
+        let handle = NanoHandle::new(
+            RUNTIME_BWRAP_LANDLOCK,
+            "AGENT-55".to_string(),
+            Some(agent_id),
+            Some(new_pid),
+        );
+        let resources = NanoRuntimeResources {
+            instance_id: Some(handle.instance_id),
+            pid: Some(new_pid),
+            child_pid: Some(new_pid + 1),
+            cgroup_created: true,
+            cgroup_id: Some(7_055),
+            io_available: true,
+            landlock_applied: true,
+            network_isolated: true,
+        };
+        let sandbox_handles = HashMap::from([(
+            agent_id,
+            SandboxHandle {
+                agent_name: "Laura Petersen".to_string(),
+                cgroup_created: true,
+                cgroup_id: Some(6_055),
+                io_available: false,
+                bwrap_pid: Some(old_pid),
+                landlock_applied: true,
+                network_isolated: true,
+            },
+        )]);
+        let security_runtime_state: operator_api::SharedSecurityRuntimeState = Default::default();
+        security_runtime_state.write().unwrap().insert(
+            agent_id.0,
+            operator_api::SecurityAgentRuntimeSnapshot {
+                agent_id: agent_id.0,
+                aggregate_id: "AGENT-55".to_string(),
+                agent_name: "Laura Petersen".to_string(),
+                runtime_key: RUNTIME_BWRAP_LANDLOCK.to_string(),
+                instance_id: Some(handle.instance_id),
+                runtime_pid: Some(old_pid),
+                bwrap_pid: Some(old_pid),
+                home_host_path: "/ram/agents/Laura Petersen".to_string(),
+                fs_mount: None,
+            },
+        );
+        (
+            agent_id,
+            handle,
+            resources,
+            sandbox_handles,
+            security_runtime_state,
+        )
+    }
+
+    #[test]
+    fn workbench_recycle_refreshes_runtime_observations_before_publication() {
+        let (agent_id, handle, resources, mut sandbox_handles, security_runtime_state) =
+            workbench_recycle_observation_fixture();
+
+        let observed = synchronize_workbench_runtime_observation(
+            agent_id,
+            &handle,
+            &resources,
+            &mut sandbox_handles,
+            &security_runtime_state,
+        )
+        .unwrap();
+
+        assert_eq!(observed, (7_055, 20_055));
+        let sandbox = &sandbox_handles[&agent_id];
+        assert_eq!(sandbox.cgroup_id, Some(7_055));
+        assert!(sandbox.cgroup_created);
+        assert!(sandbox.io_available);
+        assert_eq!(sandbox.bwrap_pid, Some(20_055));
+        assert!(sandbox.landlock_applied);
+        assert!(sandbox.network_isolated);
+        let security = security_runtime_state.read().unwrap();
+        assert_eq!(security[&agent_id.0].runtime_pid, Some(20_055));
+        assert_eq!(security[&agent_id.0].bwrap_pid, Some(20_055));
+    }
+
+    #[test]
+    fn workbench_recycle_observation_rejects_foreign_instance_without_mutation() {
+        let (agent_id, handle, mut resources, mut sandbox_handles, security_runtime_state) =
+            workbench_recycle_observation_fixture();
+        resources.instance_id = Some(uuid::Uuid::new_v4());
+
+        let error = synchronize_workbench_runtime_observation(
+            agent_id,
+            &handle,
+            &resources,
+            &mut sandbox_handles,
+            &security_runtime_state,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not bound to its adapter owner"));
+        let sandbox = &sandbox_handles[&agent_id];
+        assert_eq!(sandbox.cgroup_id, Some(6_055));
+        assert!(!sandbox.io_available);
+        assert_eq!(sandbox.bwrap_pid, Some(10_055));
+        let security = security_runtime_state.read().unwrap();
+        assert_eq!(security[&agent_id.0].runtime_pid, Some(10_055));
+        assert_eq!(security[&agent_id.0].bwrap_pid, Some(10_055));
     }
 
     #[test]
@@ -13582,7 +13851,28 @@ mod tests {
     }
 
     #[test]
-    fn workbench_start_attests_resources_but_terminal_poll_uses_exact_handle_only() {
+    fn workbench_submit_requires_an_exact_bwrap_handle_before_reservation() {
+        let agent_id = AgentId(42);
+        let bwrap = NanoHandle::new(
+            RUNTIME_BWRAP_LANDLOCK,
+            "AGENT-42".to_string(),
+            Some(agent_id),
+            Some(1234),
+        );
+        let wasm = NanoHandle::new(
+            RUNTIME_WASM_WASMTIME,
+            "AGENT-42".to_string(),
+            Some(agent_id),
+            Some(1234),
+        );
+
+        assert!(!workbench_submit_runtime_available(None));
+        assert!(!workbench_submit_runtime_available(Some(&wasm)));
+        assert!(workbench_submit_runtime_available(Some(&bwrap)));
+    }
+
+    #[test]
+    fn workbench_start_attests_resources_but_terminal_replay_uses_exact_handle_only() {
         let agent_id = AgentId(42);
         let handle = NanoHandle::new(
             RUNTIME_BWRAP_LANDLOCK,
@@ -13632,7 +13922,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(exec_calls.load(Ordering::SeqCst), 2);
+        crate::workbench::WorkbenchRuntimeClient::exchange(
+            &mut client,
+            agent_id,
+            NanoExecRequest {
+                operation: "workbench_recover".to_string(),
+                input: "recover".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 3);
+
+        client.runtimes.handles.remove(&agent_id);
+        let unavailable = match crate::workbench::WorkbenchRuntimeClient::exchange(
+            &mut client,
+            agent_id,
+            NanoExecRequest {
+                operation: "workbench_recover".to_string(),
+                input: "recover".to_string(),
+            },
+        ) {
+            Ok(_) => panic!("missing live handle must fail before runtime I/O"),
+            Err(error) => error,
+        };
+        let unavailable = unavailable
+            .downcast_ref::<sentinel_common::nano_runtime::NanoExecError>()
+            .expect("missing live handle must remain a typed retryable runtime error");
+        assert_eq!(
+            unavailable.code,
+            sentinel_common::nano_runtime::NanoExecErrorCode::WorkloadUnavailable
+        );
+        assert!(unavailable.retryable);
+        assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 3);
+
+        client.runtimes.handles.insert(agent_id, handle.clone());
 
         client
             .runtimes
@@ -13649,7 +13974,8 @@ mod tests {
             },
         )
         .is_err());
-        assert_eq!(exec_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 3);
     }
 
     fn cluster_owner_registry_for_workbench_test() -> (

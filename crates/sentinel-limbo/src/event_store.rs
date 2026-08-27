@@ -1933,6 +1933,53 @@ impl EventStore {
         Ok(inserted == 1)
     }
 
+    /// Release an exact reservation only when the caller proved that no network
+    /// dispatch occurred. Ambiguous requests must remain `provider_in_flight`.
+    pub fn release_undispatched_llm_request(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
+        let (existing_digest, owner_scope, payload, status, attempt_count): (
+            String,
+            String,
+            String,
+            String,
+            i64,
+        ) = conn.query_row(
+            "SELECT request_digest, owner_scope, payload, status, attempt_count
+             FROM llm_completion_outbox WHERE request_id = ?1",
+            params![request_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        anyhow::ensure!(
+            existing_digest == request_digest,
+            "LLM completion digest conflict for {request_id}"
+        );
+        anyhow::ensure!(
+            payload.is_empty() && status == "provider_in_flight" && attempt_count == 0,
+            "LLM completion {request_id} is not an undispatched reservation"
+        );
+        let changed = conn.execute(
+            "DELETE FROM llm_completion_outbox
+             WHERE request_id = ?1 AND request_digest = ?2 AND owner_scope = ?3
+               AND payload = '' AND status = 'provider_in_flight' AND attempt_count = 0",
+            params![request_id, request_digest, owner_scope],
+        )?;
+        anyhow::ensure!(changed == 1, "LLM request reservation changed concurrently");
+        conn.commit()?;
+        Ok(true)
+    }
+
     fn llm_completion_scope(&self, request_id: &str) -> anyhow::Result<StateTransferScope> {
         let conn = self
             .conn
@@ -4171,6 +4218,43 @@ mod tests {
         assert!(!store
             .reserve_llm_request(request_id, digest, "AGENT-07")
             .unwrap());
+    }
+
+    #[test]
+    fn undispatched_llm_reservation_release_is_exact_and_replayable() {
+        let store = EventStore::open(":memory:").unwrap();
+        let request_id = "agent-runtime-07-undispatched";
+        let digest = "request-digest";
+
+        assert!(store
+            .reserve_llm_request(request_id, digest, "AGENT-07")
+            .unwrap());
+        assert!(store
+            .release_undispatched_llm_request(request_id, "different")
+            .is_err());
+        assert!(store.get_llm_completion(request_id).unwrap().is_some());
+        assert!(store
+            .release_undispatched_llm_request(request_id, digest)
+            .unwrap());
+        assert!(store.get_llm_completion(request_id).unwrap().is_none());
+        assert!(store
+            .reserve_llm_request(request_id, digest, "AGENT-07")
+            .unwrap());
+
+        store
+            .enqueue_llm_completion(request_id, digest, "{}")
+            .unwrap();
+        assert!(store
+            .release_undispatched_llm_request(request_id, digest)
+            .is_err());
+        assert_eq!(
+            store
+                .get_llm_completion(request_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending_usage"
+        );
     }
 
     #[test]

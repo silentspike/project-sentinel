@@ -89,6 +89,8 @@ CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status) WHERE status = '
 CREATE INDEX IF NOT EXISTS idx_outbox_event_id ON outbox(event_id)
 `
 
+const sqliteBusyTimeoutMillis = 5000
+
 const pragmas = `
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -110,6 +112,10 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(pragmas); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("eventstore pragmas: %w", err)
+	}
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA busy_timeout = %d", sqliteBusyTimeoutMillis)); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("eventstore busy timeout: %w", err)
 	}
 	if _, err := db.Exec(createEvents); err != nil {
 		_ = db.Close()

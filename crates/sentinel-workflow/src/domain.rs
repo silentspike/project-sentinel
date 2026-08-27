@@ -586,6 +586,8 @@ pub struct BlockerV1 {
     pub escalation_target: Option<AgentId>,
     pub state: BlockerStateV1,
     pub blocker_kind: BlockerKindV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_from_state: Option<ProjectLifecycleStateV1>,
     pub resolution_ref: Option<String>,
     pub last_actor_id: String,
     pub created_at_unix_ms: u64,

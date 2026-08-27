@@ -39,6 +39,7 @@ class M0JourneyContractTests(unittest.TestCase):
     def test_plan_is_a_complete_v2_product_journey(self) -> None:
         journey.validate_plan(self.plan)
         self.assertEqual(self.plan["schema_version"], 2)
+        self.assertEqual(self.plan["journey_id"], "single-node-web-company-v5")
         self.assertEqual(self.plan["provider_mode"], "token_free")
         self.assertEqual(len(self.plan["steps"]), 28)
         self.assertEqual(
@@ -85,6 +86,34 @@ class M0JourneyContractTests(unittest.TestCase):
             hashlib.sha256(qa_profile.read_bytes()).hexdigest(),
         )
 
+    def test_project_manager_mutations_use_its_agent_authority(self) -> None:
+        mutations = {
+            "plan_work_graph",
+            "create_project_room",
+            "raise_project_blocker",
+            "resolve_project_blocker",
+            "activate_project",
+            "assign_designer",
+        }
+        steps = {step["id"]: step for step in self.plan["steps"]}
+        for step_id in mutations:
+            self.assertEqual(steps[step_id]["credential_alias"], "project_manager")
+            self.assertEqual(steps[step_id]["path"], "/agent/workflow/commands")
+            self.assertEqual(steps[step_id]["route_role"], "agent")
+
+        self.assertEqual(
+            steps["customer_operator_boundary"]["path"],
+            "/operator/workflow/commands",
+        )
+        self.assertEqual(
+            steps["observe_design_done"]["path"],
+            "/operator/workflow/work-items",
+        )
+        self.assertEqual(
+            steps["observe_source_done"]["path"],
+            "/operator/workflow/work-items",
+        )
+
     def test_real_work_collaboration_and_delivery_intents_are_present(self) -> None:
         steps = {step["id"]: step for step in self.plan["steps"]}
         step_order = [step["id"] for step in self.plan["steps"]]
@@ -125,6 +154,11 @@ class M0JourneyContractTests(unittest.TestCase):
             steps["execute_source"]["body"]["intent"]["tools"][0],
             {"kind": "inspect_file", "path": "design.md", "max_bytes": 4096},
         )
+        source_tools = steps["execute_source"]["body"]["intent"]["tools"]
+        self.assertEqual(source_tools[1]["kind"], "write_file")
+        self.assertEqual(source_tools[1]["path"], "index.html")
+        self.assertIn("<title>Project Sentinel</title>", source_tools[1]["content"])
+        self.assertEqual(source_tools[-1]["paths"], ["index.html", "site.js"])
         self.assertEqual(
             steps["execute_design"]["body"]["intent"]["tools"][-1]["artifact_kind"],
             "design_specification",
