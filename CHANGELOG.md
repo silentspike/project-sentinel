@@ -7,11 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Keep a company-workflow execution pending when Workbench recovery returns a
-  typed retryable runtime failure or its exact NanoRuntime handle is temporarily
+- Keep a company-workflow execution pending when a stable Workbench invocation
+  is still awaiting its local dispatch response, recovery returns a typed
+  retryable runtime failure, or its exact NanoRuntime handle is temporarily
   absent during supervised process recycling. Non-retryable and unclassified
   post-dispatch failures remain durable unknown outcomes, while operator logs
   expose only the public-safe runtime error code and retryability.
+- Keep the operator company-event feed restricted to validated project
+  snapshots. Agreement events may reference the newly created project for
+  lineage, but their agreement payload is not a project snapshot.
 - Permit read-only access to bwrap's private `/dev/urandom` in the Landlock
   workbench profile so atomic completion receipts can create unpredictable
   staging names after a successful tool effect. Terminal recovery now reads

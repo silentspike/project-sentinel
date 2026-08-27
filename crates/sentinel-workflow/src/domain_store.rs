@@ -683,7 +683,7 @@ impl WorkflowStore {
         let connection = self.connection.lock().map_err(|_| persistence())?;
         let mut statement = connection
             .prepare(
-                "SELECT sequence,event_id,tenant_id,project_id,event_type,operation_id,operation_digest,principal_id,principal_kind,principal_role,agent_id,customer_id,authority_generation,authority_digest,authority_binding_digest,payload,payload_digest,created_at_ms FROM company_events WHERE tenant_id=?1 AND project_id IS NOT NULL AND sequence>?2 ORDER BY sequence LIMIT ?3",
+                "SELECT sequence,event_id,tenant_id,project_id,event_type,operation_id,operation_digest,principal_id,principal_kind,principal_role,agent_id,customer_id,authority_generation,authority_digest,authority_binding_digest,payload,payload_digest,created_at_ms FROM company_events WHERE tenant_id=?1 AND event_type GLOB 'project_*' AND sequence>?2 ORDER BY sequence LIMIT ?3",
             )
             .map_err(WorkflowError::from)?;
         let rows = statement
@@ -4476,6 +4476,20 @@ mod tests {
                 )
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn project_event_feed_excludes_agreement_payload_with_project_reference() {
+        let (_temp, _path, store, principal, project) = accepted_project_fixture();
+
+        let events = store
+            .company_project_events_since(&principal.tenant_id, 0, 100)
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "project_created");
+        assert_eq!(events[0].project_id, project.project_id);
+        assert_eq!(events[0].project, project);
     }
 
     #[test]

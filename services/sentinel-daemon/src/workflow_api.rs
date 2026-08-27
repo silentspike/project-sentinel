@@ -1055,12 +1055,7 @@ impl WorkbenchExecutionAdapter {
     ) -> Result<crate::workbench::WorkbenchCoordinatorUpdate, WorkflowPortError> {
         let (response, receiver) = mpsc::sync_channel(1);
         dispatch_workbench(command(response)).map_err(|_| WorkflowPortError::Unavailable)?;
-        match receiver.recv_timeout(DISPATCH_RESPONSE_TIMEOUT) {
-            Ok(Ok(update)) => Ok(update),
-            Ok(Err(error)) => Err(map_workbench_dispatch_error(error)),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(WorkflowPortError::UnknownOutcome),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(WorkflowPortError::Unavailable),
-        }
+        map_workbench_dispatch_response(receiver.recv_timeout(DISPATCH_RESPONSE_TIMEOUT))
     }
 
     fn observation(
@@ -1116,6 +1111,21 @@ fn map_workbench_dispatch_error(error: anyhow::Error) -> WorkflowPortError {
         }
     }
     WorkflowPortError::UnknownOutcome
+}
+
+fn map_workbench_dispatch_response<T>(
+    response: Result<anyhow::Result<T>, mpsc::RecvTimeoutError>,
+) -> Result<T, WorkflowPortError> {
+    match response {
+        Ok(Ok(update)) => Ok(update),
+        Ok(Err(error)) => Err(map_workbench_dispatch_error(error)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The durable, digest-bound invocation remains safe to submit or recover again.
+            warn!("workbench dispatch response remains pending for its stable invocation");
+            Err(WorkflowPortError::Unavailable)
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(WorkflowPortError::Unavailable),
+    }
 }
 
 impl WorkExecutionPort for WorkbenchExecutionAdapter {
@@ -3005,6 +3015,14 @@ mod tests {
         assert_eq!(
             map_workbench_dispatch_error(anyhow::anyhow!("post-dispatch failure")),
             WorkflowPortError::UnknownOutcome
+        );
+        assert_eq!(
+            map_workbench_dispatch_response::<()>(Err(mpsc::RecvTimeoutError::Timeout)),
+            Err(WorkflowPortError::Unavailable)
+        );
+        assert_eq!(
+            map_workbench_dispatch_response::<()>(Err(mpsc::RecvTimeoutError::Disconnected)),
+            Err(WorkflowPortError::Unavailable)
         );
     }
 
