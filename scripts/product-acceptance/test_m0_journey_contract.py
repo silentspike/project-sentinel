@@ -154,6 +154,11 @@ class M0JourneyContractTests(unittest.TestCase):
             steps["execute_source"]["body"]["intent"]["tools"][0],
             {"kind": "inspect_file", "path": "design.md", "max_bytes": 4096},
         )
+        source_tools = steps["execute_source"]["body"]["intent"]["tools"]
+        self.assertEqual(source_tools[1]["kind"], "write_file")
+        self.assertEqual(source_tools[1]["path"], "index.html")
+        self.assertIn("<title>Project Sentinel</title>", source_tools[1]["content"])
+        self.assertEqual(source_tools[-1]["paths"], ["index.html", "site.js"])
         self.assertEqual(
             steps["execute_design"]["body"]["intent"]["tools"][-1]["artifact_kind"],
             "design_specification",
