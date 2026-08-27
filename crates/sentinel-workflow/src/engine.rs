@@ -275,7 +275,22 @@ where
             request.created_at_unix_ms,
             now_ms,
         )?;
-        let receipt = self.gate.gate_evidence(request).map_err(map_gate_error)?;
+        let receipt = match self.gate.gate_evidence(request) {
+            Ok(receipt) => receipt,
+            Err(WorkflowPortError::TimedOut) if now_ms >= work_item.plan.deadline_unix_ms => {
+                let authority = self.authority_for_work_item(&work_item)?;
+                ensure_same_authority(&authority_before, &authority)?;
+                validate_pre_io_authority(
+                    &work_item,
+                    &authority,
+                    &request.authority_snapshot_digest,
+                    request.created_at_unix_ms,
+                    now_ms,
+                )?;
+                return self.store.record_gate_timeout(request, &authority, now_ms);
+            }
+            Err(error) => return Err(map_gate_error(error)),
+        };
         let authority = self.authority_for_work_item(&work_item)?;
         ensure_same_authority(&authority_before, &authority)?;
         validate_pre_io_authority(
@@ -294,9 +309,11 @@ where
             || !receipt.passed()
             || receipt.completed_at_unix_ms() < request.created_at_unix_ms
             || receipt.completed_at_unix_ms() > now_ms
-            || receipt.completed_at_unix_ms() > work_item.plan.deadline_unix_ms
         {
             return Err(authority_conflict());
+        }
+        if receipt.completed_at_unix_ms() > work_item.plan.deadline_unix_ms {
+            return self.store.record_gate_timeout(request, &authority, now_ms);
         }
         validate_identifier(receipt.receipt_id())?;
         let evidence = GateEvidenceReadbackV1::new(
