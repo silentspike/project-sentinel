@@ -1370,6 +1370,152 @@ fn dependency_contracts_gate_assignment_and_unlock_only_after_bound_output_and_q
 }
 
 #[test]
+fn independent_gate_authority_can_block_review_but_the_implementer_cannot() {
+    let state = journey();
+    let project = command(
+        &state.store,
+        &state.pm,
+        170,
+        CompanyWorkflowCommandV1::PlanWorkGraph {
+            project_id: state.project_id.clone(),
+            expected_version: 1,
+            items: vec![work(
+                "gate-timeout-work",
+                CompanyRoleV1::Developer,
+                &["rust"],
+                &[],
+                100,
+            )],
+        },
+        170,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    let project = command(
+        &state.store,
+        &state.pm,
+        171,
+        CompanyWorkflowCommandV1::ActivateProject {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            reason_ref: "approved-plan".to_owned(),
+        },
+        171,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    let project = command(
+        &state.store,
+        &state.pm,
+        172,
+        CompanyWorkflowCommandV1::AssignWork {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: WorkItemId::parse("gate-timeout-work").unwrap(),
+            agent_id: AgentId(2),
+            organization_generation: 1,
+            organization_digest: DIGEST.to_owned(),
+            reason_ref: "implementation-owner".to_owned(),
+        },
+        172,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    let project = command(
+        &state.store,
+        &state.developer,
+        173,
+        transition(
+            &state.project_id,
+            project.version,
+            "gate-timeout-work",
+            2,
+            1,
+            CompanyWorkStateV1::Assigned,
+            CompanyWorkStateV1::InProgress,
+            Vec::new(),
+            None,
+            173,
+        ),
+        173,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    let project = command(
+        &state.store,
+        &state.developer,
+        174,
+        transition(
+            &state.project_id,
+            project.version,
+            "gate-timeout-work",
+            3,
+            1,
+            CompanyWorkStateV1::InProgress,
+            CompanyWorkStateV1::InReview,
+            output_receipt(),
+            None,
+            174,
+        ),
+        174,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    let implementer_error = state
+        .store
+        .apply_company_command(
+            &state.developer,
+            Uuid::from_u128(175),
+            &transition(
+                &state.project_id,
+                project.version,
+                "gate-timeout-work",
+                4,
+                1,
+                CompanyWorkStateV1::InReview,
+                CompanyWorkStateV1::Blocked,
+                Vec::new(),
+                None,
+                175,
+            ),
+            175,
+        )
+        .unwrap_err();
+    assert_eq!(implementer_error.code, WorkflowErrorCode::InvalidTransition);
+
+    let project = command(
+        &state.store,
+        &state.qa,
+        176,
+        transition(
+            &state.project_id,
+            project.version,
+            "gate-timeout-work",
+            4,
+            1,
+            CompanyWorkStateV1::InReview,
+            CompanyWorkStateV1::Blocked,
+            Vec::new(),
+            None,
+            176,
+        ),
+        176,
+    );
+    let CompanyWorkflowResponseV1::Project(project) = project else {
+        panic!()
+    };
+    assert_eq!(
+        project.work_items[&WorkItemId::parse("gate-timeout-work").unwrap()].state,
+        CompanyWorkStateV1::Blocked
+    );
+}
+
+#[test]
 fn customer_rework_reopens_delivery_candidate_with_new_linked_work_and_exact_replay() {
     let state = journey();
     let project = command(

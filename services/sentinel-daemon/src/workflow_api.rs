@@ -2485,7 +2485,10 @@ impl WorkflowApi {
                     "company transition authority changed after execution",
                 ));
             }
-            let principal = if target == sentinel_workflow::CompanyWorkStateV1::Done {
+            let gate_owned_transition = target == sentinel_workflow::CompanyWorkStateV1::Done
+                || target == sentinel_workflow::CompanyWorkStateV1::Blocked
+                    && work.state == sentinel_workflow::CompanyWorkStateV1::InReview;
+            let principal = if gate_owned_transition {
                 independent_gate_principal(
                     &project.governance.participants,
                     assignment.agent_id,
@@ -2541,11 +2544,17 @@ impl WorkflowApi {
                 output_receipts: outputs,
                 gate_receipt,
                 phase_a_evidence_digest: execution.plan.request_digest.clone(),
-                reason_ref: match target {
-                    sentinel_workflow::CompanyWorkStateV1::Done => {
+                reason_ref: match (target, work.state) {
+                    (sentinel_workflow::CompanyWorkStateV1::Done, _) => {
                         "independent-quality-gate-evidence"
                     }
-                    sentinel_workflow::CompanyWorkStateV1::Blocked => "workbench-execution-blocked",
+                    (
+                        sentinel_workflow::CompanyWorkStateV1::Blocked,
+                        sentinel_workflow::CompanyWorkStateV1::InReview,
+                    ) => "independent-quality-gate-timeout",
+                    (sentinel_workflow::CompanyWorkStateV1::Blocked, _) => {
+                        "workbench-execution-blocked"
+                    }
                     _ => "sealed-workbench-evidence",
                 }
                 .to_owned(),
@@ -2692,7 +2701,8 @@ fn company_transition_target(
         (
             sentinel_workflow::WorkItemState::Blocked | sentinel_workflow::WorkItemState::Cancelled,
             sentinel_workflow::CompanyWorkStateV1::Assigned
-            | sentinel_workflow::CompanyWorkStateV1::InProgress,
+            | sentinel_workflow::CompanyWorkStateV1::InProgress
+            | sentinel_workflow::CompanyWorkStateV1::InReview,
         ) => Some(sentinel_workflow::CompanyWorkStateV1::Blocked),
         (
             sentinel_workflow::WorkItemState::Assigned | sentinel_workflow::WorkItemState::Claimed,
@@ -3521,6 +3531,11 @@ mod tests {
         );
         assert_eq!(
             company_transition_target(WorkItemState::Blocked, CompanyWorkStateV1::InProgress)
+                .unwrap(),
+            Some(CompanyWorkStateV1::Blocked)
+        );
+        assert_eq!(
+            company_transition_target(WorkItemState::Blocked, CompanyWorkStateV1::InReview)
                 .unwrap(),
             Some(CompanyWorkStateV1::Blocked)
         );
