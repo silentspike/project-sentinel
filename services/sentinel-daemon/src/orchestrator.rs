@@ -683,7 +683,13 @@ impl crate::workbench::WorkbenchRuntimeClient for DaemonWorkbenchRuntimeClient<'
             .handles
             .get(&agent_id)
             .cloned()
-            .ok_or_else(|| anyhow!("NanoRuntime handle does not exist for {agent_id}"))?;
+            .ok_or_else(|| {
+                sentinel_common::nano_runtime::NanoExecError::new(
+                    sentinel_common::nano_runtime::NanoExecErrorCode::WorkloadUnavailable,
+                    true,
+                    "workbench runtime handle is temporarily unavailable",
+                )
+            })?;
         anyhow::ensure!(
             handle.runtime_key == RUNTIME_BWRAP_LANDLOCK,
             "workbench requires '{RUNTIME_BWRAP_LANDLOCK}', selected '{}'",
@@ -13718,6 +13724,31 @@ mod tests {
         .unwrap();
         assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
         assert_eq!(exec_calls.load(Ordering::SeqCst), 3);
+
+        client.runtimes.handles.remove(&agent_id);
+        let unavailable = match crate::workbench::WorkbenchRuntimeClient::exchange(
+            &mut client,
+            agent_id,
+            NanoExecRequest {
+                operation: "workbench_recover".to_string(),
+                input: "recover".to_string(),
+            },
+        ) {
+            Ok(_) => panic!("missing live handle must fail before runtime I/O"),
+            Err(error) => error,
+        };
+        let unavailable = unavailable
+            .downcast_ref::<sentinel_common::nano_runtime::NanoExecError>()
+            .expect("missing live handle must remain a typed retryable runtime error");
+        assert_eq!(
+            unavailable.code,
+            sentinel_common::nano_runtime::NanoExecErrorCode::WorkloadUnavailable
+        );
+        assert!(unavailable.retryable);
+        assert_eq!(resource_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 3);
+
+        client.runtimes.handles.insert(agent_id, handle.clone());
 
         client
             .runtimes
