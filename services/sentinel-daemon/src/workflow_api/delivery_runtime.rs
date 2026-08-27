@@ -69,6 +69,22 @@ fn work_item_gate_command_rule(paths: &[String]) -> Result<CommandRule, Workflow
     })
 }
 
+fn work_item_gate_deadline(
+    created_at_unix_ms: u64,
+    wall_time_ms: u64,
+    plan_deadline_unix_ms: u64,
+    now_unix_ms: u64,
+) -> Result<u64, WorkflowPortError> {
+    let deadline = created_at_unix_ms
+        .saturating_add(wall_time_ms)
+        .min(plan_deadline_unix_ms);
+    if deadline <= now_unix_ms {
+        Err(WorkflowPortError::TimedOut)
+    } else {
+        Ok(deadline)
+    }
+}
+
 struct WorkItemGateReceipt {
     receipt_id: String,
     profile_id: String,
@@ -1416,12 +1432,15 @@ impl GateEvidencePort for WorkflowWorkItemGate {
             return Err(WorkflowPortError::Rejected);
         }
         let now = now_ms();
-        let deadline = now
-            .saturating_add(self.integration.qa_profile.resource_ceilings.wall_time_ms)
-            .min(work.plan.deadline_unix_ms);
-        if deadline <= now {
-            return Err(WorkflowPortError::TimedOut);
-        }
+        // The invocation ID is stable across outbox retries, so every field in
+        // the canonical Workbench request must be stable too. Anchor the
+        // execution window to the persisted gate request, not this attempt.
+        let deadline = work_item_gate_deadline(
+            request.created_at_unix_ms,
+            self.integration.qa_profile.resource_ceilings.wall_time_ms,
+            work.plan.deadline_unix_ms,
+            now,
+        )?;
         let authority = GateWorkbenchAuthority {
             gate: self.clone(),
             request: request.clone(),
@@ -1888,6 +1907,23 @@ mod tests {
         extended.push("foreign.txt".to_string());
         assert!(!rule.allows(WORK_ITEM_GATE_PROGRAM, &extended));
         assert!(work_item_gate_command_rule(&[]).is_err());
+    }
+
+    #[test]
+    fn work_item_gate_deadline_is_stable_across_retries() {
+        let first = work_item_gate_deadline(1_000, 30_000, 90_000, 2_000).unwrap();
+        let retry = work_item_gate_deadline(1_000, 30_000, 90_000, 20_000).unwrap();
+
+        assert_eq!(first, 31_000);
+        assert_eq!(retry, first);
+        assert_eq!(
+            work_item_gate_deadline(1_000, 30_000, 20_000, 2_000).unwrap(),
+            20_000
+        );
+        assert_eq!(
+            work_item_gate_deadline(1_000, 30_000, 90_000, first),
+            Err(WorkflowPortError::TimedOut)
+        );
     }
 
     fn digest(value: &str) -> ContentDigest {
