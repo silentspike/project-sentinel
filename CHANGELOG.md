@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Fixed the single-node M0 workbench Landlock policy so the two provisioned,
+  profile-bound QA helpers and their Python launcher can execute while the
+  request-specific command policy continues to bind exact input arguments.
+
 - Validate completed Workbench artifacts against the same mutable per-agent
   backing used by the attested runtime. An active sentinel-fs home view no
   longer redirects the daemon's terminal manifest check to a FUSE path that
