@@ -1814,7 +1814,14 @@ fn mutate_project(
                     || matches!(
                         principal.role,
                         CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
-                    ));
+                    ))
+                || receipt.from_state == CompanyWorkStateV1::InReview
+                    && receipt.to_state == CompanyWorkStateV1::Blocked
+                    && matches!(
+                        principal.role,
+                        CompanyRoleV1::Qa | CompanyRoleV1::ReleaseManager
+                    )
+                    && !actor_is_assignee;
             if !legal {
                 return Err(transition());
             }
@@ -3672,6 +3679,7 @@ fn validate_work_transition_history(
                 | ("Assigned", "Blocked")
                 | ("InProgress", "InReview")
                 | ("InProgress", "Blocked")
+                | ("InReview", "Blocked")
                 | ("InReview", "Done")
                 | ("Assigned", "Assigned")
                 | ("Blocked", "Assigned")
@@ -3712,7 +3720,7 @@ fn work_transition_actor_is_authorized(
                 })
         }
         ("Assigned", "InProgress") | ("InProgress", "InReview") => is_assignee,
-        ("InReview", "Done") => is_independent_qa,
+        ("InReview", "Done") | ("InReview", "Blocked") => is_independent_qa,
         ("Assigned", "Blocked") | ("InProgress", "Blocked") => is_assignee || is_manager,
         ("Assigned", "Assigned") | ("Blocked", "Assigned") => {
             active_assignment.is_some_and(|assignment| {

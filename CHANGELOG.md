@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   execution no longer fails admission before the Workbench dispatch.
 - Terminalize expired independent gates as durable `gate_timed_out` work-item
   blockers. A failed project remains auditable without leaving a pending
-  outbox row that degrades every later company workflow.
+  outbox row that degrades every later company workflow. The independent QA or
+  release authority also reconciles the company work item from review to its
+  matching blocked state without granting that transition to the implementer.
 - Recover completed Workbench invocations through the same bounded JSONL drain
   and terminal-replay path as polling. A non-terminal poll or recovery now
   retains the durable `Executing` record instead of exposing an empty update
