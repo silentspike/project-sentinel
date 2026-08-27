@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a completed gate can be replayed without changing its request digest.
 - Record the internal, credential-free delivery rejection reason in the daemon
   journal while keeping the public company API error response redacted.
+- Encode delivery-stage idempotency keys as canonical store identifiers while
+  preserving their stable operation and stage binding across retries.
 
 - Validate completed Workbench artifacts against the same mutable per-agent
   backing used by the attested runtime. An active sentinel-fs home view no
