@@ -2421,7 +2421,7 @@ impl<'a> WorkbenchCoordinator<'a> {
             &record.request_digest,
             WorkbenchRuntimeEnvelope::poll(&record.invocation_id)?,
             now_ms,
-            Vec::new(),
+            vec![record.clone()],
             false,
             authority,
         )
@@ -2459,7 +2459,7 @@ impl<'a> WorkbenchCoordinator<'a> {
             &record.request_digest,
             WorkbenchRuntimeEnvelope::recover(&record.invocation_id, &record.request_digest)?,
             now_ms,
-            Vec::new(),
+            vec![record.clone()],
             false,
             authority,
         )
@@ -4066,7 +4066,7 @@ mod tests {
         };
         let mut runtime = FakeRuntime {
             calls: 0,
-            responses: VecDeque::from([Ok(accepted), Ok(recovered)]),
+            responses: VecDeque::from([Ok(accepted.clone()), Ok(accepted), Ok(recovered)]),
         };
         let coordinator = WorkbenchCoordinator::new(&store, &profile, &profile_digest);
 
@@ -4085,8 +4085,8 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(runtime.calls, 1, "executing replay must not redispatch");
 
-        let completed = coordinator
-            .poll(
+        let pending = coordinator
+            .recover_executing(
                 &mut runtime,
                 &request.invocation_id,
                 &authority,
@@ -4094,6 +4094,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(runtime.calls, 2);
+        assert_eq!(pending.runtime_state.as_deref(), Some("accepted"));
+        assert_eq!(
+            pending.records.last().unwrap().state,
+            WorkbenchInvocationState::Executing
+        );
+
+        let completed = coordinator
+            .recover_executing(
+                &mut runtime,
+                &request.invocation_id,
+                &authority,
+                1_900_000_000_003,
+            )
+            .unwrap();
+        assert_eq!(runtime.calls, 3);
         assert_eq!(completed.runtime_state.as_deref(), Some("completed"));
         assert_eq!(
             completed.records.last().unwrap().state,
@@ -4109,7 +4124,7 @@ mod tests {
                 request.deadline_unix_ms + 1,
             )
             .unwrap();
-        assert_eq!(runtime.calls, 2, "terminal replay must not redispatch");
+        assert_eq!(runtime.calls, 3, "terminal replay must not redispatch");
         assert_eq!(terminal_replay.caller_result, Some(durable_result.clone()));
         assert!(!serde_json::to_string(&terminal_replay.records)
             .unwrap()
@@ -4130,7 +4145,7 @@ mod tests {
                 request.deadline_unix_ms + 2,
             )
             .unwrap();
-        assert_eq!(runtime.calls, 2, "restart replay must not redispatch");
+        assert_eq!(runtime.calls, 3, "restart replay must not redispatch");
         assert_eq!(restarted.caller_result, Some(durable_result));
     }
 

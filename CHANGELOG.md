@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Recover completed Workbench invocations through the same bounded JSONL drain
+  and terminal-replay path as polling. A non-terminal poll or recovery now
+  retains the durable `Executing` record instead of exposing an empty update
+  that the company workflow could misclassify as an unknown outcome.
 - Keep a company-workflow execution pending when a stable Workbench invocation
   is still awaiting its local dispatch response, recovery returns a typed
   retryable runtime failure, or its exact NanoRuntime handle is temporarily
