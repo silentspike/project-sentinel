@@ -1341,6 +1341,14 @@ fn wait_for_fuse_mount(path: &std::path::Path, timeout: Duration) -> bool {
     mountpoint_is_active(path)
 }
 
+fn workbench_artifact_root(agent_name: &str, _active_fs_mount: Option<&str>) -> std::path::PathBuf {
+    // Workbench roots deliberately remain on the mutable per-agent backing.
+    // sentinel-fs presents the normal home view but does not own these roots.
+    std::path::PathBuf::from("/ram/agents")
+        .join(agent_name)
+        .join("artifacts")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent_nano_runtime(
     agent_cfg: &AgentConfig,
@@ -2523,15 +2531,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let workbench_artifact_roots: std::collections::HashMap<_, _> = all_agents
         .iter()
         .map(|agent| {
-            let raw_agent_id = agent.identity.id;
-            let agent_id = AgentId(raw_agent_id);
-            let host_root = match active_fs_mount.as_deref() {
-                Some(mount) => {
-                    std::path::PathBuf::from(mount).join(format!("AGENT-{raw_agent_id:02}"))
-                }
-                None => std::path::PathBuf::from("/ram/agents").join(&agent.identity.name),
-            };
-            (agent_id, host_root.join("artifacts"))
+            (
+                AgentId(agent.identity.id),
+                workbench_artifact_root(&agent.identity.name, active_fs_mount.as_deref()),
+            )
         })
         .collect();
     let workbench_data_dir = data_dir.join("company-workbench");
@@ -11783,6 +11786,16 @@ fn ecs_tick_loop(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workbench_artifact_validation_uses_mutable_backing_with_active_fuse() {
+        let expected = std::path::PathBuf::from("/ram/agents/Max Richter/artifacts");
+        assert_eq!(
+            workbench_artifact_root("Max Richter", Some("/opt/sentinel/fs")),
+            expected
+        );
+        assert_eq!(workbench_artifact_root("Max Richter", None), expected);
+    }
+
     #[test]
     fn startup_runtime_spawn_retries_once_after_a_transient_failure() {
         let mut attempts = Vec::new();
