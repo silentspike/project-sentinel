@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Permit read-only access to bwrap's private `/dev/urandom` in the Landlock
   workbench profile so atomic completion receipts can create unpredictable
-  staging names after a successful tool effect.
+  staging names after a successful tool effect. Terminal recovery now reads
+  that receipt through the retained instance-fenced handle without requiring
+  the already reaped child process or cgroup to remain live.
 - Keep work assigned to an off-shift employee durably pending until that
   employee's exact bwrap runtime is available. The Workbench dispatcher now
   rejects this condition before reservation or runtime I/O and distinguishes
