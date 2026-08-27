@@ -35,6 +35,8 @@ ROLLBACK_COMMAND_TIMEOUT_SECONDS = 190.0
 # A restart includes the same bounded daemon drain as rollback. Keep this
 # systemd job budget separate from the tighter journey HTTP timeout.
 RESTART_COMMAND_TIMEOUT_SECONDS = 190.0
+RESTART_READINESS_DEADLINE_SECONDS = 300.0
+RESTART_READINESS_POLL_SECONDS = 1.0
 MAX_ACTIVATION_DEADLINE_SECONDS = 900.0
 DEFAULT_ACTIVATION_DEADLINE_SECONDS = 300.0
 ACTIVATION_POLL_SECONDS = 1.0
@@ -800,6 +802,32 @@ def run_preflight(runner: Runner, value: PreflightArgs) -> str:
     return result
 
 
+def wait_for_restart_readiness(
+    runner: Runner, value: PreflightArgs,
+    deadline_seconds: float = RESTART_READINESS_DEADLINE_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> str:
+    if not 0 < deadline_seconds <= MAX_ACTIVATION_DEADLINE_SECONDS:
+        fail("restart_readiness_deadline_invalid")
+    deadline = monotonic() + deadline_seconds
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            fail("restart_readiness_timeout")
+        readiness_digest, retryable = run_preflight_attempt(
+            runner, value, min(value.timeout, remaining)
+        )
+        if readiness_digest is not None:
+            return readiness_digest
+        if not retryable:
+            fail("readiness_failed")
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            fail("restart_readiness_timeout")
+        sleeper(min(RESTART_READINESS_POLL_SECONDS, remaining))
+
+
 def unit_terminal_failure(unit: str, values: dict[str, str]) -> bool:
     return (
         values["LoadState"] != "loaded"
@@ -1215,7 +1243,7 @@ def _restart_journey(
         if result.returncode != 0:
             fail("restart_failed")
         wait_service(runner, unit, journey.timeout)
-        readiness = run_preflight(runner, preflight)
+        readiness = wait_for_restart_readiness(runner, preflight)
         if digest_bytes(read_regular(journey.ledger, "journey_ledger")) != ledger_before:
             fail("ledger_changed_during_restart")
         if digest_bytes(read_regular(journey.evidence, "journey_evidence")) != evidence_before:
