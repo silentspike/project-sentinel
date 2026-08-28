@@ -2198,6 +2198,9 @@ fn join_workflow_reconciler(handle: std::thread::JoinHandle<()>, timeout: Durati
 }
 
 #[cfg(feature = "llm")]
+const ECS_ACTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(feature = "llm")]
 async fn drain_llm_actions_before_ecs_shutdown(
     mut bridge_handle: tokio::task::JoinHandle<std::result::Result<(), &'static str>>,
     mut action_forwarder_handle: tokio::task::JoinHandle<Result<()>>,
@@ -3562,7 +3565,11 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         &action_drain_tx,
         shutdown.as_ref(),
         llm_bridge_join_timeout,
-        Duration::from_secs(8),
+        // A stop can arrive while the synchronous ECS thread is below its
+        // schedule in episode projection or another bounded post-schedule
+        // phase. The barrier must cover that in-flight phase and the following
+        // Input-to-Persist schedule, not only the legacy ECS join window.
+        ECS_ACTION_DRAIN_TIMEOUT,
     )
     .await;
     shutdown.store(true, Ordering::SeqCst);
