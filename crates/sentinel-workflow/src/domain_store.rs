@@ -498,6 +498,27 @@ impl WorkflowStore {
         self.apply_company_command_inner(principal, operation_id, command, now_ms, false)
     }
 
+    /// Reports whether this authority namespace already owns the operation ID.
+    /// Callers use this only to preserve replay-before-freshness ordering; the
+    /// authoritative replay and request-digest checks remain inside
+    /// `apply_company_command_inner`.
+    pub fn has_company_operation(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        operation_id: Uuid,
+    ) -> Result<bool, WorkflowError> {
+        principal.validate()?;
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        let exists: i64 = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM company_operations WHERE authority_namespace=?1 AND operation_id=?2)",
+                params![principal.namespace(), operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(WorkflowError::from)?;
+        Ok(exists == 1)
+    }
+
     #[cfg(test)]
     pub(crate) fn apply_company_command_with_accept_failpoint(
         &self,
@@ -609,6 +630,53 @@ impl WorkflowStore {
             validate_project(project)?;
         }
         Ok(value)
+    }
+
+    /// Returns every durable project after validating the complete entity-row
+    /// binding. The M0 provider bridge uses this bounded read to resolve one
+    /// exact active assignment and cost reservation before external I/O.
+    pub fn company_projects(&self) -> Result<Vec<ProjectV1>, WorkflowError> {
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT tenant_id,entity_kind,entity_id,version,payload,payload_digest FROM company_entities WHERE entity_kind='project' ORDER BY tenant_id,entity_id",
+            )
+            .map_err(WorkflowError::from)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(WorkflowError::from)?;
+        rows.map(|row| {
+            let (tenant, kind, id, version, payload, payload_digest) =
+                row.map_err(WorkflowError::from)?;
+            if kind != "project"
+                || version <= 0
+                || !constant_time_eq(
+                    &bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?,
+                    &payload_digest,
+                )
+            {
+                return Err(corrupt());
+            }
+            let project: ProjectV1 = decode(&payload)?;
+            if project.tenant_id.0 != tenant
+                || project.project_id.0 != id
+                || project.version != stored_u64(version)?
+            {
+                return Err(corrupt());
+            }
+            validate_project(&project).map_err(|_| corrupt())?;
+            Ok(project)
+        })
+        .collect()
     }
 
     pub fn company_agreement(
@@ -2177,7 +2245,7 @@ fn mutate_project(
                     Ok::<_, WorkflowError>((current, budget))
                 })
                 .transpose()?;
-            if (*amount_micros == 0 && provider != "local")
+            if (*amount_micros == 0 && !is_token_free_provider(provider))
                 || total > project.cost_ceiling_micros
                 || provider_total > provider_ceiling
                 || work_total.is_some_and(|(current, budget)| {
@@ -2200,12 +2268,14 @@ fn mutate_project(
                 provider: provider.clone(),
                 reserved_micros: *amount_micros,
                 committed_micros: None,
+                usage_event_operation_id: None,
                 state: CostReservationStateV1::Active,
                 created_by: principal.principal_id.clone(),
                 created_at_unix_ms: now_ms,
                 updated_at_unix_ms: now_ms,
             });
-            if total == project.cost_ceiling_micros
+            if *amount_micros > 0
+                && total == project.cost_ceiling_micros
                 && !project.blockers.iter().any(|blocker| {
                     blocker.blocker_kind == BlockerKindV1::BudgetExhausted
                         && blocker.state != BlockerStateV1::Resolved
@@ -2237,12 +2307,24 @@ fn mutate_project(
         CompanyWorkflowCommandV1::CommitCost {
             reservation_id,
             actual_micros,
+            usage_event_operation_id,
             ..
         } => {
             require_role(
                 principal,
                 &[CompanyRoleV1::ProjectManager, CompanyRoleV1::TechnicalLead],
             )?;
+            if let Some(operation_id) = usage_event_operation_id {
+                validate_identifier(operation_id)?;
+                if !operation_id.starts_with("llm_usage_")
+                    || project.reservations.iter().any(|reservation| {
+                        reservation.reservation_id != *reservation_id
+                            && reservation.usage_event_operation_id.as_ref() == Some(operation_id)
+                    })
+                {
+                    return Err(invalid("provider usage operation is not unique"));
+                }
+            }
             let reservation = project
                 .reservations
                 .iter_mut()
@@ -2261,6 +2343,7 @@ fn mutate_project(
                 return Err(invalid("committed cost exceeds ceiling"));
             }
             reservation.committed_micros = Some(*actual_micros);
+            reservation.usage_event_operation_id = usage_event_operation_id.clone();
             reservation.state = CostReservationStateV1::Committed;
             reservation.updated_at_unix_ms = now_ms;
             project.reserved_cost_micros = project
@@ -3438,6 +3521,16 @@ fn validate_project_collections(project: &ProjectV1) -> Result<(), WorkflowError
         let creator = principal_participant(&reservation.created_by)?;
         validate_optional_work(project, reservation.work_item_id.as_ref())
             .map_err(|_| corrupt())?;
+        let usage_operation_valid =
+            reservation
+                .usage_event_operation_id
+                .as_deref()
+                .is_none_or(|operation_id| {
+                    reservation.state == CostReservationStateV1::Committed
+                        && operation_id.starts_with("llm_usage_")
+                        && validate_identifier(operation_id).is_ok()
+                        && ids.insert(("usage_operation", operation_id))
+                });
         if !matches!(
             creator.role,
             CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
@@ -3445,7 +3538,8 @@ fn validate_project_collections(project: &ProjectV1) -> Result<(), WorkflowError
             || reservation.updated_at_unix_ms < reservation.created_at_unix_ms
             || reservation.updated_at_unix_ms > project.updated_at_unix_ms
             || !ids.insert(("reservation", reservation.reservation_id.as_str()))
-            || (reservation.reserved_micros == 0 && reservation.provider != "local")
+            || !usage_operation_valid
+            || (reservation.reserved_micros == 0 && !is_token_free_provider(&reservation.provider))
             || (reservation.state == CostReservationStateV1::Active
                 && reservation.committed_micros.is_some())
             || (reservation.state == CostReservationStateV1::Committed
@@ -3943,6 +4037,12 @@ fn reservation_effective_amount(reservation: &CostReservationV1) -> u64 {
         CostReservationStateV1::Committed => reservation.committed_micros.unwrap_or(0),
         CostReservationStateV1::Released => 0,
     }
+}
+
+fn is_token_free_provider(provider: &str) -> bool {
+    // `local` is retained for previously persisted workflow snapshots. New
+    // Gateway-backed M0 projects use the canonical provider id `local-loop`.
+    matches!(provider, "local-loop" | "local")
 }
 
 fn resolve_budget_blockers_if_headroom(
@@ -4498,6 +4598,18 @@ mod tests {
         assert_eq!(events[0].event_type, "project_created");
         assert_eq!(events[0].project_id, project.project_id);
         assert_eq!(events[0].project, project);
+    }
+
+    #[test]
+    fn company_projects_validates_and_returns_durable_entity_rows() {
+        let (_temp, _path, store, principal, project) = accepted_project_fixture();
+        assert_eq!(store.company_projects().unwrap(), vec![project]);
+        assert!(store
+            .has_company_operation(&principal, Uuid::from_u128(10))
+            .unwrap());
+        assert!(!store
+            .has_company_operation(&principal, Uuid::from_u128(11))
+            .unwrap());
     }
 
     #[test]
@@ -5088,6 +5200,7 @@ mod tests {
             provider: "local".to_owned(),
             reserved_micros: 10,
             committed_micros: None,
+            usage_event_operation_id: None,
             state: CostReservationStateV1::Active,
             created_by: "pm-a".to_owned(),
             created_at_unix_ms: 3,
