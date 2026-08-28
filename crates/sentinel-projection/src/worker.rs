@@ -254,6 +254,15 @@ impl ProjectionWorker {
                     continue;
                 }
                 let DomainEventPayload::AgentLlmUsage {
+                    tenant_id,
+                    project_id,
+                    work_item_id,
+                    reservation_id,
+                    assignment_id,
+                    assignment_version,
+                    provider,
+                    requested_model,
+                    caller_role,
                     tier,
                     hierarchy_tier,
                     cost_source,
@@ -290,6 +299,28 @@ impl ProjectionWorker {
                         .is_none_or(|model| model.trim().is_empty())
                     {
                         anyhow::bail!("v2 agent_llm_usage is missing effective_model");
+                    }
+                    if event.schema_version >= 3 {
+                        if [
+                            tenant_id.as_deref(),
+                            project_id.as_deref(),
+                            work_item_id.as_deref(),
+                            reservation_id.as_deref(),
+                            assignment_id.as_deref(),
+                            provider.as_deref(),
+                            requested_model.as_deref(),
+                        ]
+                        .into_iter()
+                        .any(|value| value.is_none_or(|value| value.trim().is_empty()))
+                        {
+                            anyhow::bail!("v3 agent_llm_usage is missing project authority");
+                        }
+                        if assignment_version.is_none_or(|value| value == 0) {
+                            anyhow::bail!("v3 agent_llm_usage has invalid assignment_version");
+                        }
+                        if caller_role.as_deref() != Some("agent_runtime") {
+                            anyhow::bail!("v3 agent_llm_usage has invalid caller_role");
+                        }
                     }
                     txn.record_hierarchy_cost(
                         &LlmHierarchyCostUpdate {

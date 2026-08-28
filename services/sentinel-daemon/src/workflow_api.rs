@@ -1469,6 +1469,143 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn usd_to_micros(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 || value > (u64::MAX as f64 / 1_000_000.0) {
+        return None;
+    }
+    Some((value * 1_000_000.0).round() as u64)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderUsageBinding {
+    tenant_id: String,
+    project_id: String,
+    work_item_id: String,
+    reservation_id: String,
+    assignment_id: String,
+    assignment_version: u64,
+    agent_id: AgentId,
+    provider: String,
+}
+
+fn select_provider_usage_binding(
+    projects: &[sentinel_workflow::ProjectV1],
+    agent_id: AgentId,
+) -> Result<Option<ProviderUsageBinding>, &'static str> {
+    let mut selected = None;
+    for project in projects {
+        if project.lifecycle_state != sentinel_workflow::ProjectLifecycleStateV1::Active {
+            continue;
+        }
+        for (work_item_id, work_item) in &project.work_items {
+            if !matches!(
+                work_item.state,
+                sentinel_workflow::CompanyWorkStateV1::Assigned
+                    | sentinel_workflow::CompanyWorkStateV1::InProgress
+                    | sentinel_workflow::CompanyWorkStateV1::InReview
+            ) {
+                continue;
+            }
+            let mut active_assignments = work_item
+                .assignments
+                .iter()
+                .filter(|assignment| assignment.active);
+            let Some(assignment) = active_assignments.next() else {
+                return Err("provider work item has no active assignment");
+            };
+            if active_assignments.next().is_some() {
+                return Err("provider work item has ambiguous active assignments");
+            }
+            if assignment.agent_id != agent_id {
+                continue;
+            }
+            let mut active_reservations = project.reservations.iter().filter(|reservation| {
+                reservation.state == sentinel_workflow::CostReservationStateV1::Active
+                    && reservation.work_item_id.as_ref() == Some(work_item_id)
+            });
+            let Some(reservation) = active_reservations.next() else {
+                return Err("assigned provider work item has no active reservation");
+            };
+            if active_reservations.next().is_some() {
+                return Err("assigned provider work item has ambiguous active reservations");
+            }
+            let binding = ProviderUsageBinding {
+                tenant_id: project.tenant_id.0.clone(),
+                project_id: project.project_id.0.clone(),
+                work_item_id: work_item_id.0.clone(),
+                reservation_id: reservation.reservation_id.clone(),
+                assignment_id: assignment.assignment_id.clone(),
+                assignment_version: assignment.assignment_version,
+                agent_id,
+                provider: reservation.provider.clone(),
+            };
+            if selected.replace(binding).is_some() {
+                return Err("agent has ambiguous provider usage authority");
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn validate_provider_usage_event(
+    event: &DomainEvent,
+    usage_operation_id: &str,
+    expected: &ProviderUsageBinding,
+    expected_cost_micros: u64,
+) -> Result<(), &'static str> {
+    if event.event_type != "agent_llm_usage"
+        || event.schema_version < 3
+        || usage_operation_id != format!("llm_usage_{}", event.correlation_id)
+    {
+        return Err("provider usage event identity is invalid");
+    }
+    let payload: DomainEventPayload =
+        serde_json::from_str(&event.payload).map_err(|_| "provider usage payload is invalid")?;
+    let DomainEventPayload::AgentLlmUsage {
+        agent_id,
+        tenant_id,
+        project_id,
+        work_item_id,
+        reservation_id,
+        assignment_id,
+        assignment_version,
+        provider,
+        requested_model,
+        caller_role,
+        hierarchy_tier,
+        cost_source,
+        effective_model,
+        cost_usd,
+        ..
+    } = payload
+    else {
+        return Err("provider usage payload type is invalid");
+    };
+    if agent_id != expected.agent_id
+        || tenant_id.as_deref() != Some(expected.tenant_id.as_str())
+        || project_id.as_deref() != Some(expected.project_id.as_str())
+        || work_item_id.as_deref() != Some(expected.work_item_id.as_str())
+        || reservation_id.as_deref() != Some(expected.reservation_id.as_str())
+        || assignment_id.as_deref() != Some(expected.assignment_id.as_str())
+        || assignment_version != Some(expected.assignment_version)
+        || provider.as_deref() != Some(expected.provider.as_str())
+        || requested_model
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        || caller_role.as_deref() != Some("agent_runtime")
+        || hierarchy_tier.is_none()
+        || cost_source.is_none()
+        || effective_model
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        || event.aggregate_id != format!("AGENT-{:02}", agent_id.0)
+        || usd_to_micros(cost_usd) != Some(expected_cost_micros)
+    {
+        return Err("provider usage does not match the project reservation");
+    }
+    Ok(())
+}
+
 fn workflow_unavailable() -> WorkflowError {
     WorkflowError::new(
         WorkflowErrorCode::PersistenceFailure,
@@ -1855,6 +1992,20 @@ impl WorkflowApi {
         let Ok(_guard) = self.mutation_fence.read() else {
             return json_error(503, "workflow_busy", "workflow recovery is active", true);
         };
+        let operation_exists = match self
+            .store
+            .has_company_operation(&principal.principal, envelope.operation_id)
+        {
+            Ok(value) => value,
+            Err(error) => return workflow_error(error),
+        };
+        if !operation_exists {
+            if let Err(response) =
+                self.validate_provider_usage_binding(&principal.principal, &envelope.command)
+            {
+                return response;
+            }
+        }
         match self.core.apply_company_command(
             &principal.principal,
             envelope.operation_id,
@@ -1864,6 +2015,158 @@ impl WorkflowApi {
             Ok(value) => json(200, &value),
             Err(error) => workflow_error(error),
         }
+    }
+
+    fn validate_provider_usage_binding(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        command: &CompanyWorkflowCommandV1,
+    ) -> Result<(), WorkflowHttpResponse> {
+        let CompanyWorkflowCommandV1::CommitCost {
+            project_id,
+            expected_version,
+            reservation_id,
+            actual_micros,
+            usage_event_operation_id,
+            ..
+        } = command
+        else {
+            return Ok(());
+        };
+        let Some(usage_operation_id) = usage_event_operation_id.as_deref() else {
+            return Err(json_error(
+                409,
+                "evidence_required",
+                "provider cost requires a durable usage event",
+                false,
+            ));
+        };
+        if !usage_operation_id.starts_with("llm_usage_") {
+            return Err(json_error(
+                409,
+                "evidence_conflict",
+                "provider usage operation is invalid",
+                false,
+            ));
+        }
+        let event_store = self.event_store.as_ref().ok_or_else(|| {
+            json_error(
+                503,
+                "workflow_unavailable",
+                "provider usage authority is unavailable",
+                true,
+            )
+        })?;
+        let event = event_store
+            .event_by_operation_id(usage_operation_id)
+            .map_err(|_| {
+                json_error(
+                    503,
+                    "workflow_unavailable",
+                    "provider usage authority could not be read",
+                    true,
+                )
+            })?
+            .ok_or_else(|| {
+                json_error(
+                    409,
+                    "evidence_required",
+                    "provider usage event does not exist",
+                    false,
+                )
+            })?;
+        let project = self
+            .store
+            .company_project(&principal.tenant_id, project_id)
+            .map_err(workflow_error)?
+            .ok_or_else(|| json_error(404, "not_found", "workflow object was not found", false))?;
+        if project.version != *expected_version {
+            return Err(json_error(
+                409,
+                "evidence_conflict",
+                "provider usage was validated against a stale project version",
+                false,
+            ));
+        }
+        let reservation = project
+            .reservations
+            .iter()
+            .find(|value| value.reservation_id == *reservation_id)
+            .ok_or_else(|| json_error(404, "not_found", "workflow object was not found", false))?;
+        let Some(work_item_id) = reservation.work_item_id.as_ref() else {
+            return Err(json_error(
+                409,
+                "evidence_conflict",
+                "provider usage must be bound to a work item",
+                false,
+            ));
+        };
+        let work_item = project.work_items.get(work_item_id).ok_or_else(|| {
+            json_error(
+                409,
+                "evidence_conflict",
+                "work item no longer exists",
+                false,
+            )
+        })?;
+        let mut active_assignments = work_item
+            .assignments
+            .iter()
+            .filter(|assignment| assignment.active);
+        let assignment = active_assignments.next().ok_or_else(|| {
+            json_error(
+                409,
+                "evidence_conflict",
+                "provider work item has no active assignment",
+                false,
+            )
+        })?;
+        if active_assignments.next().is_some() {
+            return Err(json_error(
+                409,
+                "evidence_conflict",
+                "provider work item has ambiguous active assignments",
+                false,
+            ));
+        }
+        let expected = ProviderUsageBinding {
+            tenant_id: principal.tenant_id.0.clone(),
+            project_id: project_id.0.clone(),
+            work_item_id: work_item_id.0.clone(),
+            reservation_id: reservation_id.clone(),
+            assignment_id: assignment.assignment_id.clone(),
+            assignment_version: assignment.assignment_version,
+            agent_id: assignment.agent_id,
+            provider: reservation.provider.clone(),
+        };
+        validate_provider_usage_event(&event, usage_operation_id, &expected, *actual_micros)
+            .map_err(|message| json_error(409, "evidence_conflict", message, false))?;
+        if project.reservations.iter().any(|value| {
+            value.reservation_id != *reservation_id
+                && value.usage_event_operation_id.as_deref() == Some(usage_operation_id)
+        }) {
+            return Err(json_error(
+                409,
+                "evidence_conflict",
+                "provider usage does not match the project reservation",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    fn provider_usage_binding_for_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<ProviderUsageBinding>, &'static str> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let projects = self
+            .store
+            .company_projects()
+            .map_err(|_| "company provider authority could not be read")?;
+        select_provider_usage_binding(&projects, agent_id)
     }
 
     fn agent_command(&self, principal: &BoundPrincipal, body: &[u8]) -> WorkflowHttpResponse {
@@ -2646,6 +2949,30 @@ impl WorkflowApi {
     }
 }
 
+#[cfg(feature = "llm")]
+impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
+    fn resolve_provider_usage_authority(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<crate::llm_bridge::bridge::ProviderUsageAuthority>, &'static str> {
+        self.provider_usage_binding_for_agent(agent_id)
+            .map(|binding| {
+                binding.map(
+                    |binding| crate::llm_bridge::bridge::ProviderUsageAuthority {
+                        tenant_id: binding.tenant_id,
+                        project_id: binding.project_id,
+                        work_item_id: binding.work_item_id,
+                        reservation_id: binding.reservation_id,
+                        assignment_id: binding.assignment_id,
+                        assignment_version: binding.assignment_version,
+                        agent_id: binding.agent_id,
+                        provider: binding.provider,
+                    },
+                )
+            })
+    }
+}
+
 fn principal_unavailable() -> WorkflowError {
     WorkflowError::new(
         WorkflowErrorCode::AuthorityConflict,
@@ -3005,6 +3332,220 @@ mod tests {
             agent_id: Some(AgentId(6)),
             authority_generation: 1,
         }
+    }
+
+    fn provider_usage_event() -> DomainEvent {
+        let payload = DomainEventPayload::AgentLlmUsage {
+            agent_id: AgentId(6),
+            tenant_id: Some("tenant-m0".to_owned()),
+            project_id: Some("project-m0".to_owned()),
+            work_item_id: Some("build-site".to_owned()),
+            reservation_id: Some("reservation-m0".to_owned()),
+            assignment_id: Some("assignment-m0".to_owned()),
+            assignment_version: Some(1),
+            provider: Some("local-loop".to_owned()),
+            requested_model: Some("local-loop-v1".to_owned()),
+            caller_role: Some("agent_runtime".to_owned()),
+            tier: "mid".to_owned(),
+            hierarchy_tier: Some(sentinel_common::HierarchyTier::TIER_2),
+            cost_source: Some(sentinel_common::CostSource::ProviderReported),
+            effective_model: Some("local-loop-v1".to_owned()),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read: 0,
+            cache_creation: 0,
+            cost_usd: 0.0,
+        };
+        DomainEvent::new(
+            payload.event_type_str(),
+            "AGENT-06",
+            &payload.to_json(),
+            "request-m0",
+            1,
+        )
+        .with_operation_id("llm_usage_request-m0")
+        .with_schema_version(3)
+    }
+
+    fn provider_usage_binding() -> ProviderUsageBinding {
+        ProviderUsageBinding {
+            tenant_id: "tenant-m0".to_owned(),
+            project_id: "project-m0".to_owned(),
+            work_item_id: "build-site".to_owned(),
+            reservation_id: "reservation-m0".to_owned(),
+            assignment_id: "assignment-m0".to_owned(),
+            assignment_version: 1,
+            agent_id: AgentId(6),
+            provider: "local-loop".to_owned(),
+        }
+    }
+
+    fn project_with_provider_authority() -> sentinel_workflow::ProjectV1 {
+        let digest = "a".repeat(64);
+        let profile = sentinel_workflow::WorkProfileBindingV1 {
+            profile_id: "web-project-v1".to_owned(),
+            generation: 1,
+            digest: digest.clone(),
+        };
+        let work_item_id = WorkItemId::parse("build-site").unwrap();
+        let work_item = sentinel_workflow::CompanyWorkItemV1 {
+            spec: sentinel_workflow::CompanyWorkItemSpecV1 {
+                work_item_id: work_item_id.clone(),
+                title: "Build site".to_owned(),
+                objective: "Create the accepted site".to_owned(),
+                required_role: CompanyRoleV1::Developer,
+                required_specialties: BTreeSet::from(["frontend".to_owned()]),
+                dependency_ids: BTreeSet::new(),
+                owner: AgentId(6),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                quality_gate: sentinel_workflow::QualityGateBindingV1 {
+                    gate_id: "web-qa".to_owned(),
+                    generation: 1,
+                    digest: digest.clone(),
+                },
+                budget_micros: 100,
+                rework: None,
+            },
+            state: sentinel_workflow::CompanyWorkStateV1::Assigned,
+            version: 1,
+            assignments: vec![sentinel_workflow::AssignmentV1 {
+                assignment_id: "assignment-m0".to_owned(),
+                agent_id: AgentId(6),
+                role: CompanyRoleV1::Developer,
+                specialties: BTreeSet::from(["frontend".to_owned()]),
+                profile: profile.clone(),
+                organization_generation: 1,
+                organization_digest: digest.clone(),
+                assignment_version: 1,
+                delegated_by: None,
+                reason_ref: "project-plan".to_owned(),
+                active: true,
+                assigned_by: "pm-1".to_owned(),
+                created_at_unix_ms: 2,
+                ended_at_unix_ms: None,
+            }],
+            output_receipts: Vec::new(),
+            gate_receipt: None,
+            transition_history: Vec::new(),
+        };
+        sentinel_workflow::ProjectV1 {
+            schema_version: sentinel_workflow::COMPANY_DOMAIN_SCHEMA_VERSION,
+            tenant_id: TenantId::parse("tenant-m0").unwrap(),
+            project_id: ProjectId::parse("project-m0").unwrap(),
+            agreement_id: "agreement-m0".to_owned(),
+            agreement_digest: digest.clone(),
+            governance: sentinel_workflow::ProposalGovernanceV1 {
+                owner: AgentId(6),
+                participants: vec![sentinel_workflow::ParticipantBindingV1 {
+                    agent_id: AgentId(6),
+                    principal_id: "developer-6".to_owned(),
+                    role: CompanyRoleV1::Developer,
+                    specialties: BTreeSet::from(["frontend".to_owned()]),
+                    reports_to: None,
+                    profile: profile.clone(),
+                }],
+                project_profile: profile,
+            },
+            cost_ceiling_micros: 100,
+            provider_cost_ceilings_micros: std::collections::BTreeMap::from([(
+                "local-loop".to_owned(),
+                100,
+            )]),
+            lifecycle_state: sentinel_workflow::ProjectLifecycleStateV1::Active,
+            reserved_cost_micros: 0,
+            committed_cost_micros: 0,
+            work_items: std::collections::BTreeMap::from([(work_item_id.clone(), work_item)]),
+            decisions: Vec::new(),
+            handoffs: Vec::new(),
+            blockers: Vec::new(),
+            approvals: Vec::new(),
+            reservations: vec![sentinel_workflow::CostReservationV1 {
+                reservation_id: "reservation-m0".to_owned(),
+                work_item_id: Some(work_item_id),
+                provider: "local-loop".to_owned(),
+                reserved_micros: 0,
+                committed_micros: None,
+                usage_event_operation_id: None,
+                state: sentinel_workflow::CostReservationStateV1::Active,
+                created_by: "pm-1".to_owned(),
+                created_at_unix_ms: 3,
+                updated_at_unix_ms: 3,
+            }],
+            rooms: Vec::new(),
+            questions: Vec::new(),
+            actions: Vec::new(),
+            version: 3,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 3,
+        }
+    }
+
+    #[test]
+    fn provider_usage_authority_requires_one_exact_active_reservation() {
+        let project = project_with_provider_authority();
+        assert_eq!(
+            select_provider_usage_binding(std::slice::from_ref(&project), AgentId(6)).unwrap(),
+            Some(provider_usage_binding())
+        );
+        assert_eq!(
+            select_provider_usage_binding(std::slice::from_ref(&project), AgentId(7)).unwrap(),
+            None
+        );
+
+        let mut second = project;
+        second.project_id = ProjectId::parse("project-other").unwrap();
+        second.reservations[0].reservation_id = "reservation-other".to_owned();
+        assert!(select_provider_usage_binding(
+            &[project_with_provider_authority(), second],
+            AgentId(6),
+        )
+        .is_err());
+
+        let mut missing_reservation = project_with_provider_authority();
+        missing_reservation.reservations.clear();
+        assert_eq!(
+            select_provider_usage_binding(&[missing_reservation], AgentId(6)),
+            Err("assigned provider work item has no active reservation")
+        );
+    }
+
+    #[test]
+    fn provider_usage_event_is_exactly_bound_and_tampering_fails_closed() {
+        let event = provider_usage_event();
+        let binding = provider_usage_binding();
+        assert_eq!(
+            validate_provider_usage_event(&event, "llm_usage_request-m0", &binding, 0,),
+            Ok(())
+        );
+        let mut wrong_provider = binding.clone();
+        wrong_provider.provider = "anthropic-direct".to_owned();
+        assert!(
+            validate_provider_usage_event(&event, "llm_usage_request-m0", &wrong_provider, 0,)
+                .is_err()
+        );
+        assert!(
+            validate_provider_usage_event(&event, "llm_usage_request-m0", &binding, 1,).is_err()
+        );
+
+        let mut legacy = event.clone();
+        legacy.schema_version = 2;
+        assert!(
+            validate_provider_usage_event(&legacy, "llm_usage_request-m0", &binding, 0,).is_err()
+        );
+
+        let mut wrong_caller = event;
+        let DomainEventPayload::AgentLlmUsage { caller_role, .. } =
+            serde_json::from_str::<DomainEventPayload>(&wrong_caller.payload).unwrap()
+        else {
+            panic!("usage payload expected")
+        };
+        assert_eq!(caller_role.as_deref(), Some("agent_runtime"));
+        wrong_caller.payload = wrong_caller.payload.replace("agent_runtime", "operator");
+        assert!(
+            validate_provider_usage_event(&wrong_caller, "llm_usage_request-m0", &binding, 0,)
+                .is_err()
+        );
     }
 
     #[test]

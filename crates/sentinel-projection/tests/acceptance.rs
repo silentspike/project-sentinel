@@ -520,6 +520,15 @@ fn append_usage(
 ) {
     let payload = DomainEventPayload::AgentLlmUsage {
         agent_id: AgentId(agent),
+        tenant_id: None,
+        project_id: None,
+        work_item_id: None,
+        reservation_id: None,
+        assignment_id: None,
+        assignment_version: None,
+        provider: hierarchy_tier.map(|_| "test-provider".to_string()),
+        requested_model: hierarchy_tier.map(|_| "test-model".to_string()),
+        caller_role: hierarchy_tier.map(|_| "agent_runtime".to_string()),
         tier: tier.to_string(),
         hierarchy_tier,
         cost_source: hierarchy_tier.map(|_| CostSource::ProviderReported),
@@ -702,6 +711,52 @@ fn hierarchy_projection_rejects_mismatched_v2_payload_without_advancing_offset()
             .last_usage_event_id,
         0
     );
+}
+
+#[test]
+fn hierarchy_projection_rejects_v3_usage_without_provider_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let es_path = dir.path().join("hierarchy_invalid_v3_es.db");
+    let rm_path = dir.path().join("hierarchy_invalid_v3_rm.db");
+    let store = Arc::new(EventStore::open(es_path.to_str().unwrap()).unwrap());
+
+    let payload = DomainEventPayload::AgentLlmUsage {
+        agent_id: AgentId(8),
+        tenant_id: Some("tenant-m0".to_owned()),
+        project_id: Some("project-m0".to_owned()),
+        work_item_id: Some("build-site".to_owned()),
+        reservation_id: Some("reservation-m0".to_owned()),
+        assignment_id: Some("assignment-m0".to_owned()),
+        assignment_version: Some(1),
+        provider: None,
+        requested_model: Some("test-model".to_owned()),
+        caller_role: Some("agent_runtime".to_owned()),
+        tier: "mid".to_owned(),
+        hierarchy_tier: Some(HierarchyTier::TIER_2),
+        cost_source: Some(CostSource::ProviderReported),
+        effective_model: Some("test-model".to_owned()),
+        input_tokens: 10,
+        output_tokens: 2,
+        cache_read: 0,
+        cache_creation: 0,
+        cost_usd: 0.0,
+    };
+    let event = DomainEvent::new(
+        "agent_llm_usage",
+        "AGENT-08",
+        &payload.to_json(),
+        "req-invalid-v3",
+        1,
+    )
+    .with_operation_id("llm_usage_req-invalid-v3")
+    .with_schema_version(3);
+    store.append_event(&event).unwrap();
+
+    let worker =
+        ProjectionWorker::new(Arc::clone(&store), make_config(rm_path.to_str().unwrap())).unwrap();
+    let error = format!("{:#}", worker.catch_up_hierarchy().unwrap_err());
+    assert!(error.contains("missing project authority"), "{error}");
+    assert_eq!(store.get_offset(HIERARCHY_PROJECTION_NAME).unwrap(), None);
 }
 
 #[test]
