@@ -113,6 +113,18 @@ class M0JourneyContractTests(unittest.TestCase):
             steps["observe_source_done"]["path"],
             "/operator/workflow/work-items",
         )
+        self.assertEqual(
+            steps["observe_design_done"]["observe"]["max_attempts"], 20
+        )
+        self.assertEqual(
+            steps["observe_design_done"]["observe"]["max_elapsed_ms"], 30_000
+        )
+        self.assertEqual(
+            steps["observe_source_done"]["observe"]["max_attempts"], 300
+        )
+        self.assertEqual(
+            steps["observe_source_done"]["observe"]["max_elapsed_ms"], 300_000
+        )
 
     def test_real_work_collaboration_and_delivery_intents_are_present(self) -> None:
         steps = {step["id"]: step for step in self.plan["steps"]}
