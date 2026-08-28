@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remains authoritative while each earlier checkpoint validates only the
   operations that its bounded runner actually replayed (#650).
 
+- Allow an in-flight synchronous ECS post-schedule phase to finish before the
+  final LLM action persist barrier expires, with matching systemd and M0
+  controller stop budgets (#650).
+
 - Drain reserved LLM provider results through the projection admission
   forwarder and one acknowledged ECS persist tick before closing the daemon's
   action receiver during single-node shutdown (#650).
