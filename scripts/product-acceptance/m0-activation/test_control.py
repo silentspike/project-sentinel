@@ -94,6 +94,8 @@ class FakeRunner:
         self.rollback_failure: str | None = None
         self.readiness_failure = False
         self.restart_never_ready = False
+        self.restart_never_ready_unit: str | None = None
+        self.unclean_stop_unit: str | None = None
         self.nightrun_fails_after_start = False
         self.mutate_during_preflight: str | None = None
         self.journey_effects: dict[str, int] = {}
@@ -171,6 +173,15 @@ class FakeRunner:
                         )
                         self.readiness_failure = True
                     return control.Result(0)
+                if unit in control.SERVICES:
+                    if self.restart_never_ready:
+                        self.restart_never_ready_unit = unit
+                        self.states[unit].update(
+                            ActiveState="activating", SubState="start", Result="success"
+                        )
+                    else:
+                        self._ready(unit)
+                    return control.Result(0)
                 if unit != control.TARGET:
                     raise AssertionError(f"unexpected start unit: {unit}")
                 if self.auth_init_fails:
@@ -190,6 +201,10 @@ class FakeRunner:
                         )
                     else:
                         self._ready(unit)
+                if self.restart_never_ready_unit is not None:
+                    self.states[self.restart_never_ready_unit].update(
+                        ActiveState="activating", SubState="start", Result="success"
+                    )
                 if self.terminal_failure_unit is not None:
                     self.states[self.terminal_failure_unit].update(
                         ActiveState="failed", SubState="failed",
@@ -200,14 +215,10 @@ class FakeRunner:
                 unit = argv[2]
                 if self.rollback_failure == unit:
                     return control.Result(1)
-                self.states[unit].update(ActiveState="inactive", SubState="dead")
-                return control.Result(0)
-            if verb == "restart":
-                unit = argv[2]
-                if not self.restart_never_ready:
-                    self._ready(unit)
-                else:
-                    self.states[unit].update(ActiveState="activating", SubState="start")
+                result = "exit-code" if self.unclean_stop_unit == unit else "success"
+                self.states[unit].update(
+                    ActiveState="inactive", SubState="dead", Result=result
+                )
                 return control.Result(0)
         if argv[:2] == (str(control.PYTHON), str(control.PREFLIGHT_PROGRAM)):
             if self.mutate_during_preflight == "ledger":
@@ -890,6 +901,10 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(self.runner.timeouts[start_index], 0.15)
         with self.assertRaisesRegex(control.ControlError, "command_not_allowed"):
             control.validate_command((str(control.SYSTEMCTL), "start", control.TARGET))
+        with self.assertRaisesRegex(control.ControlError, "command_not_allowed"):
+            control.validate_command(
+                (str(control.SYSTEMCTL), "restart", control.SERVICES[0])
+            )
 
     def test_activation_never_ready_timer_stops_at_monotonic_deadline(self) -> None:
         clock = FakeClock()
@@ -1133,8 +1148,19 @@ class ControlTests(unittest.TestCase):
         result = self.fixture.restart(self.runner)
         self.assertEqual(result["status"], "COMPLETE")
         self.assertTrue(result["authoritative_replay_verified"])
-        restarts = [call[2] for call in self.runner.calls if call[1] == "restart"]
-        self.assertEqual(restarts, list(self.fixture.control_value["checkpoint_services"].values()))
+        expected_units = list(self.fixture.control_value["checkpoint_services"].values())
+        stopped = [call[2] for call in self.runner.calls if call[1] == "stop"]
+        started = [
+            call[2] for call in self.runner.calls
+            if call[1] == "start" and len(call) == 3
+        ]
+        topology_starts = [
+            call for call in self.runner.calls
+            if call == (str(control.SYSTEMCTL), "start", "--no-block", control.TARGET)
+        ]
+        self.assertEqual(stopped, expected_units)
+        self.assertEqual(started, expected_units)
+        self.assertEqual(len(topology_starts), len(expected_units))
         self.assertEqual(
             self.runner.journey_effects,
             {step["id"]: 1 for step in self.fixture.plan["steps"]},
@@ -1204,7 +1230,9 @@ class ControlTests(unittest.TestCase):
                 runner.journey_mutation = mutation
                 with self.assertRaises(control.ControlError):
                     fixture.restart(runner)
-                self.assertFalse(any(call[1] == "restart" for call in runner.calls))
+                self.assertFalse(any(
+                    call[1] in {"stop", "start", "restart"} for call in runner.calls
+                ))
 
     def test_final_empty_evidence_cannot_claim_authoritative_replay(self) -> None:
         self.runner.journey_mutation = "empty_evidence"
@@ -1319,8 +1347,8 @@ class ControlTests(unittest.TestCase):
                     fixture.restart(runner)
 
     def test_restart_failure_and_timeout_are_visible(self) -> None:
-        self.runner.fail_command = (str(control.SYSTEMCTL), "restart")
-        with self.assertRaisesRegex(control.ControlError, "restart_failed"):
+        self.runner.fail_command = (str(control.SYSTEMCTL), "stop")
+        with self.assertRaisesRegex(control.ControlError, "restart_stop_failed"):
             self.fixture.restart(self.runner)
         fixture = Fixture(self.root / "timeout")
         runner = FakeRunner(fixture)
@@ -1328,13 +1356,26 @@ class ControlTests(unittest.TestCase):
         with self.assertRaisesRegex(control.ControlError, "restart_timeout"):
             fixture.restart(runner)
 
+    def test_restart_rejects_unclean_old_invocation_before_start(self) -> None:
+        unit = next(iter(self.fixture.control_value["checkpoint_services"].values()))
+        self.runner.unclean_stop_unit = unit
+        with self.assertRaisesRegex(control.ControlError, "restart_stop_unclean"):
+            self.fixture.restart(self.runner)
+        self.assertFalse(any(
+            call[:3] == (str(control.SYSTEMCTL), "start", unit)
+            for call in self.runner.calls
+        ))
+
     def test_restart_uses_independent_systemd_and_journey_process_budgets(self) -> None:
         self.fixture.restart(self.runner)
 
         restart_timeouts = [
             timeout
             for call, timeout in zip(self.runner.calls, self.runner.timeouts)
-            if call[:2] == (str(control.SYSTEMCTL), "restart")
+            if call[:2] in {
+                (str(control.SYSTEMCTL), "stop"),
+                (str(control.SYSTEMCTL), "start"),
+            }
         ]
         journey_timeouts = [
             timeout
@@ -1364,7 +1405,7 @@ class ControlTests(unittest.TestCase):
             ),
         ])
         self.assertEqual(journey_timeouts, expected_journey_timeouts)
-        self.assertGreater(control.RESTART_COMMAND_TIMEOUT_SECONDS, 360.0)
+        self.assertGreater(control.RESTART_COMMAND_TIMEOUT_SECONDS, 180.0)
         self.assertGreater(
             control.RESTART_COMMAND_TIMEOUT_SECONDS,
             self.fixture.journey_args().timeout,
@@ -1512,7 +1553,9 @@ class ControlTests(unittest.TestCase):
         self.runner.fail_command = (str(control.PYTHON), str(control.JOURNEY_PROGRAM))
         with self.assertRaisesRegex(control.ControlError, "journey_checkpoint_failed"):
             self.fixture.restart(self.runner)
-        self.assertFalse(any(call[1] == "restart" for call in self.runner.calls))
+        self.assertFalse(any(
+            call[1] in {"stop", "start", "restart"} for call in self.runner.calls
+        ))
         self.assertFalse(any(
             call[:2] == (str(control.PYTHON), str(control.PREFLIGHT_PROGRAM))
             for call in self.runner.calls
