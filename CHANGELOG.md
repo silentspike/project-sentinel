@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Treat loopback HTTP 503 responses as bounded M0 readiness convergence while
+  keeping redirects, authorization failures, and other unexpected statuses
+  fail-closed during single-node activation (#650).
+
 - Install the exact validated M0 release manifest as rollback-protected host
   authority so a snapshot-based deployment cannot retain stale provenance
   while activating current binaries and configuration (#650).
