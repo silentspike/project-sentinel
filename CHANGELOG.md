@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Drain reserved LLM provider results through the projection admission
+  forwarder and one acknowledged ECS persist tick before closing the daemon's
+  action receiver during single-node shutdown (#650).
+
 - Treat loopback HTTP 503 responses as bounded M0 readiness convergence while
   keeping redirects, authorization failures, and other unexpected statuses
   fail-closed during single-node activation (#650).

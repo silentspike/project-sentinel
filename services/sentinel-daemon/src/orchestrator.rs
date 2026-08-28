@@ -2197,6 +2197,59 @@ fn join_workflow_reconciler(handle: std::thread::JoinHandle<()>, timeout: Durati
     handle.join().is_ok()
 }
 
+#[cfg(feature = "llm")]
+async fn drain_llm_actions_before_ecs_shutdown(
+    mut bridge_handle: tokio::task::JoinHandle<std::result::Result<(), &'static str>>,
+    mut action_forwarder_handle: tokio::task::JoinHandle<Result<()>>,
+    action_drain_tx: &mpsc::Sender<mpsc::SyncSender<()>>,
+    bridge_timeout: Duration,
+    action_timeout: Duration,
+) -> Result<()> {
+    match tokio::time::timeout(bridge_timeout, &mut bridge_handle).await {
+        Ok(Ok(Ok(()))) => info!("LLM Bridge provider tasks drained"),
+        Ok(Ok(Err(reason))) => return Err(anyhow!("LLM Bridge shutdown failed: {reason}")),
+        Ok(Err(error)) => return Err(anyhow!("LLM Bridge task failed: {error}")),
+        Err(_) => {
+            bridge_handle.abort();
+            return Err(anyhow!("LLM Bridge shutdown join timed out"));
+        }
+    }
+
+    match tokio::time::timeout(action_timeout, &mut action_forwarder_handle).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => return Err(error.context("LLM action forwarding failed")),
+        Ok(Err(error)) => return Err(anyhow!("LLM action forwarder failed: {error}")),
+        Err(_) => {
+            action_forwarder_handle.abort();
+            return Err(anyhow!("LLM action forwarder drain timed out"));
+        }
+    }
+
+    let (drained_tx, drained_rx) = mpsc::sync_channel(1);
+    action_drain_tx
+        .send(drained_tx)
+        .map_err(|_| anyhow!("ECS action-drain channel closed before shutdown"))?;
+    let drain_result = tokio::task::spawn_blocking(move || drained_rx.recv_timeout(action_timeout))
+        .await
+        .context("join ECS action-drain acknowledgement")?;
+    drain_result.map_err(|error| anyhow!("ECS action drain was not acknowledged: {error}"))?;
+    info!("LLM actions applied and persisted by ECS before shutdown");
+    Ok(())
+}
+
+fn collect_action_drain_requests(
+    action_drain_rx: &mpsc::Receiver<mpsc::SyncSender<()>>,
+    pending: &mut Vec<mpsc::SyncSender<()>>,
+) {
+    pending.extend(action_drain_rx.try_iter());
+}
+
+fn acknowledge_action_drain_requests(pending: &mut Vec<mpsc::SyncSender<()>>) {
+    for drained_tx in pending.drain(..) {
+        let _ = drained_tx.send(());
+    }
+}
+
 /// Startet den Daemon-Hauptloop.
 ///
 /// 1. Oeffnet EventStore + StateStore
@@ -2769,6 +2822,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
     // -- Channels fuer ECS <-> Async Bridge --
     let (action_tx, action_rx) = mpsc::channel();
+    let (action_drain_tx, action_drain_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
     let (operator_tx, operator_rx) = mpsc::channel::<OperatorCommand>();
     let (platform_tx, platform_rx) =
         mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>();
@@ -3173,6 +3227,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 ecs_state_store,
                 ecs_event_store,
                 action_rx,
+                action_drain_rx,
                 operator_rx,
                 platform_rx,
                 runtime_rx,
@@ -3274,7 +3329,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     #[cfg(feature = "llm")]
     let llm_bridge_join_timeout = llm_bridge_drain_timeout + Duration::from_secs(5);
     #[cfg(feature = "llm")]
-    let mut llm_bridge_handle = {
+    let (llm_bridge_handle, llm_action_forwarder_handle) = {
         let (guarded_perception_tx, guarded_perception_rx) = mpsc::sync_channel::<Perception>(128);
         let perception_admission = Arc::clone(&episode_projection_admission);
         tokio::task::spawn_blocking(move || {
@@ -3295,12 +3350,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             mpsc::channel::<sentinel_common::AgentAction>();
         let action_admission = Arc::clone(&episode_projection_admission);
         let admitted_action_tx = action_tx.clone();
-        tokio::task::spawn_blocking(move || {
+        let action_forwarder_handle = tokio::task::spawn_blocking(move || -> Result<()> {
             while let Ok(action) = guarded_action_rx.recv() {
                 if episode_projection_allows_agent(&action_admission, action.agent_id) {
-                    if admitted_action_tx.send(action).is_err() {
-                        break;
-                    }
+                    admitted_action_tx
+                        .send(action)
+                        .map_err(|_| anyhow!("ECS action receiver closed during LLM drain"))?;
                 } else {
                     sentinel_telemetry::MetricsRegistry::global()
                         .counter("sentinel_episode_projection_action_blocked_total")
@@ -3308,6 +3363,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                     warn!(agent_id = %action.agent_id, "Agent action blocked by episode projection readiness");
                 }
             }
+            Ok(())
         });
         let bridge_config = crate::llm_bridge::bridge::LlmBridgeConfig {
             gateway_url: std::env::var("CORTEX_GATEWAY_URL")
@@ -3331,7 +3387,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             shutdown_drain_timeout_ms = llm_bridge_drain_timeout.as_millis(),
             "LLM Bridge wird gestartet"
         );
-        tokio::spawn(crate::llm_bridge::bridge::run_llm_bridge_with_shutdown(
+        let bridge_handle = tokio::spawn(crate::llm_bridge::bridge::run_llm_bridge_with_shutdown(
             bridge_config,
             guarded_perception_rx,
             guarded_action_tx,
@@ -3342,7 +3398,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             Arc::clone(&llm_activity_ticks),
             llm_bridge_shutdown_rx,
             Arc::clone(&llm_provider_admission),
-        ))
+        ));
+        (bridge_handle, action_forwarder_handle)
     };
 
     // -- NATS Consumer fuer Judge-Alerts --
@@ -3484,23 +3541,31 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
     // -- Graceful Shutdown --
     info!("Shutdown eingeleitet...");
-    shutdown.store(true, Ordering::SeqCst);
     #[cfg(feature = "llm")]
     crate::llm_bridge::bridge::stop_provider_admission(llm_provider_admission.as_ref());
     #[cfg(feature = "llm")]
     llm_bridge_shutdown_tx
         .send(true)
         .map_err(|_| anyhow!("LLM Bridge shutdown channel closed before shutdown"))?;
-    // The reconciler's bounded Workbench response wait is five seconds. Give
-    // an in-flight batch one extra second. The LLM drain runs concurrently and
-    // retains its own request-deadline-based systemd budget.
-    if !join_workflow_reconciler(workflow_reconcile_handle, Duration::from_secs(6)) {
-        warn!("Company-Workflow-Reconciler konnte nicht sauber beendet werden");
-    }
     if let Some(handle) = operator_api_handle {
         handle.abort();
     }
-
+    #[cfg(feature = "llm")]
+    let llm_drain_result = drain_llm_actions_before_ecs_shutdown(
+        llm_bridge_handle,
+        llm_action_forwarder_handle,
+        &action_drain_tx,
+        llm_bridge_join_timeout,
+        Duration::from_secs(8),
+    )
+    .await;
+    shutdown.store(true, Ordering::SeqCst);
+    // The reconciler's bounded Workbench response wait is five seconds. Give
+    // an in-flight batch one extra second after the LLM-to-ECS handoff has
+    // reached the persisted tick barrier.
+    if !join_workflow_reconciler(workflow_reconcile_handle, Duration::from_secs(6)) {
+        warn!("Company-Workflow-Reconciler konnte nicht sauber beendet werden");
+    }
     // Action-Channel schliessen damit ECS-Thread aufwacht falls er blockt
     drop(action_tx);
     drop(operator_tx);
@@ -3530,15 +3595,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     }
 
     #[cfg(feature = "llm")]
-    match tokio::time::timeout(llm_bridge_join_timeout, &mut llm_bridge_handle).await {
-        Ok(Ok(Ok(()))) => info!("LLM Bridge provider tasks drained"),
-        Ok(Ok(Err(reason))) => return Err(anyhow!("LLM Bridge shutdown failed: {reason}")),
-        Ok(Err(error)) => return Err(anyhow!("LLM Bridge task failed: {error}")),
-        Err(_) => {
-            llm_bridge_handle.abort();
-            return Err(anyhow!("LLM Bridge shutdown join timed out"));
-        }
-    }
+    llm_drain_result?;
 
     info!("Daemon heruntergefahren");
 
@@ -7861,6 +7918,7 @@ fn ecs_tick_loop(
     state_store: Arc<StateStore>,
     event_store: Arc<EventStore>,
     action_rx: mpsc::Receiver<sentinel_common::AgentAction>,
+    action_drain_rx: mpsc::Receiver<mpsc::SyncSender<()>>,
     operator_rx: mpsc::Receiver<sentinel_common::OperatorCommand>,
     platform_rx: mpsc::Receiver<crate::platform_controlplane::PlatformControlCommand>,
     runtime_rx: mpsc::Receiver<RuntimeControlCommand>,
@@ -8582,6 +8640,7 @@ fn ecs_tick_loop(
     // disappeared. Keep every mutually exclusive operator command queued across
     // intermediate ticks; the tick-local closure fence alone is insufficient.
     let mut pressure_deferred_shift = false;
+    let mut pending_action_drains = Vec::<mpsc::SyncSender<()>>::new();
     #[cfg(test)]
     let mut test_tick_iterations = 0u64;
 
@@ -8739,7 +8798,12 @@ fn ecs_tick_loop(
 
         // ECS Schedule ausfuehren (alle 12 Systems in Reihenfolge)
         if world_background_allowed {
+            // Collect before Input runs and acknowledge only after Persist. A
+            // request arriving during this schedule is deliberately deferred
+            // to the next tick so its preceding action cannot miss Input.
+            collect_action_drain_requests(&action_drain_rx, &mut pending_action_drains);
             schedule.run(&mut world);
+            acknowledge_action_drain_requests(&mut pending_action_drains);
         }
 
         // Per-Phase-Dauern recorden (#381): 10x observe, ~25ns each — im Budget.
@@ -11957,6 +12021,74 @@ mod tests {
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
 
+    #[cfg(feature = "llm")]
+    #[tokio::test]
+    async fn llm_shutdown_waits_for_forwarding_and_ecs_persist_barrier() {
+        let (guarded_tx, guarded_rx) = mpsc::channel::<u8>();
+        let (ecs_tx, ecs_rx) = mpsc::channel::<u8>();
+        let action_forwarder = tokio::task::spawn_blocking(move || -> Result<()> {
+            while let Ok(value) = guarded_rx.recv() {
+                ecs_tx
+                    .send(value)
+                    .map_err(|_| anyhow!("test ECS receiver closed"))?;
+            }
+            Ok(())
+        });
+        let bridge = tokio::spawn(async move {
+            guarded_tx.send(7).expect("queue provider result");
+            Ok(())
+        });
+        let (drain_tx, drain_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
+        let persisted = Arc::new(AtomicBool::new(false));
+        let persisted_from_ecs = Arc::clone(&persisted);
+        let ecs = std::thread::spawn(move || {
+            let drained_tx = drain_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("receive ECS drain request");
+            assert_eq!(
+                ecs_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("receive forwarded action"),
+                7
+            );
+            persisted_from_ecs.store(true, Ordering::SeqCst);
+            drained_tx.send(()).expect("acknowledge persisted ECS tick");
+        });
+
+        drain_llm_actions_before_ecs_shutdown(
+            bridge,
+            action_forwarder,
+            &drain_tx,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        ecs.join().unwrap();
+        assert!(persisted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn ecs_action_drain_barrier_requires_a_following_schedule_boundary() {
+        let (drain_tx, drain_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
+        let mut pending = Vec::new();
+
+        // This models the pre-schedule collection point.
+        collect_action_drain_requests(&drain_rx, &mut pending);
+
+        // The shutdown request arrives while that schedule is already running.
+        let (drained_tx, drained_rx) = mpsc::sync_channel(1);
+        drain_tx.send(drained_tx).unwrap();
+        acknowledge_action_drain_requests(&mut pending);
+        assert_eq!(drained_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        // Only the next schedule boundary may observe and acknowledge it.
+        collect_action_drain_requests(&drain_rx, &mut pending);
+        acknowledge_action_drain_requests(&mut pending);
+        assert_eq!(drained_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+    }
+
     #[test]
     fn startup_cgroup_reconcile_preserves_owned_and_cleans_stale_entries() {
         let owned = HashSet::from(["active-agent".to_string()]);
@@ -14413,6 +14545,7 @@ mod tests {
             Arc::clone(&state_store),
             Arc::clone(&event_store),
             rx,
+            mpsc::channel::<mpsc::SyncSender<()>>().1,
             operator_rx,
             mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
             mpsc::channel::<RuntimeControlCommand>().1,
@@ -16449,6 +16582,7 @@ mod tests {
             Arc::clone(&state_store),
             Arc::clone(&event_store),
             rx,
+            mpsc::channel::<mpsc::SyncSender<()>>().1,
             operator_rx,
             mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
             mpsc::channel::<RuntimeControlCommand>().1,
@@ -17092,6 +17226,7 @@ mod tests {
             Arc::clone(&state_store),
             Arc::clone(&event_store),
             rx,
+            mpsc::channel::<mpsc::SyncSender<()>>().1,
             operator_rx,
             mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
             mpsc::channel::<RuntimeControlCommand>().1,
@@ -18549,6 +18684,7 @@ mod tests {
             state_store,
             event_store,
             rx,
+            mpsc::channel::<mpsc::SyncSender<()>>().1,
             operator_rx,
             mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
             mpsc::channel::<RuntimeControlCommand>().1,
@@ -18646,6 +18782,7 @@ mod tests {
                 state_store,
                 event_store,
                 rx,
+                mpsc::channel::<mpsc::SyncSender<()>>().1,
                 operator_rx,
                 mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
                 mpsc::channel::<RuntimeControlCommand>().1,
@@ -18760,6 +18897,7 @@ mod tests {
                 state_store,
                 event_store,
                 rx,
+                mpsc::channel::<mpsc::SyncSender<()>>().1,
                 operator_rx,
                 mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
                 mpsc::channel::<RuntimeControlCommand>().1,
@@ -18893,6 +19031,7 @@ mod tests {
                 state_store,
                 event_store,
                 action_rx,
+                mpsc::channel::<mpsc::SyncSender<()>>().1,
                 operator_rx,
                 mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
                 runtime_rx,
@@ -19036,6 +19175,7 @@ mod tests {
                 state_store,
                 event_store,
                 action_rx,
+                mpsc::channel::<mpsc::SyncSender<()>>().1,
                 operator_rx,
                 mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
                 runtime_rx,
@@ -19168,6 +19308,7 @@ mod tests {
                 state_store,
                 event_store,
                 rx,
+                mpsc::channel::<mpsc::SyncSender<()>>().1,
                 operator_rx,
                 mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
                 mpsc::channel::<RuntimeControlCommand>().1,
