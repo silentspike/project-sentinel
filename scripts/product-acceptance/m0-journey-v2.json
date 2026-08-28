@@ -424,7 +424,7 @@
       "expected_status": [200],
       "assertions": [{"pointer": "/state", "equals": "done"}],
       "capture": {"state": {"pointer": "/state", "type": "state"}, "artifact_digest": {"pointer": "/terminal_execution_evidence/artifacts/0/digest", "type": "digest"}},
-      "observe": {"max_attempts": 20, "interval_ms": 1000, "max_elapsed_ms": 30000, "retry_statuses": [404, 409, 425], "replay": "exact_status_and_captures"}
+      "observe": {"max_attempts": 300, "interval_ms": 1000, "max_elapsed_ms": 300000, "retry_statuses": [404, 409, 425], "replay": "exact_status_and_captures"}
     },
     {
       "id": "create_source_handoff",

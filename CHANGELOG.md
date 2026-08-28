@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Keep the token-free M0 source-work observation bounded but long enough for
+  restart-driven Workbench recovery and its independent gate, with a matching
+  bounded controller child-process ceiling (#650).
+
 - Give each M0 restart-journey child a bounded process budget for replaying its
   full HTTP/observe prefix while preserving the tighter per-request timeout
   inside the journey runner (#650).
