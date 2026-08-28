@@ -275,7 +275,8 @@ class FakeRunner:
                 "completed": {},
             }
         replayed: set[str] = set()
-        for step in self.fixture.plan["steps"]:
+        processed_count = 0
+        for index, step in enumerate(self.fixture.plan["steps"]):
             step_id = step["id"]
             if step_id in ledger["completed"]:
                 replayed.add(step_id)
@@ -316,11 +317,19 @@ class FakeRunner:
                 ledger["completed"][step_id] = record
                 ledger["chain_tip"] = record["record_digest"]
                 self.journey_effects[step_id] = 1
+            processed_count = index + 1
             if checkpoint is not None and step.get("checkpoint") == checkpoint:
                 break
         self.fixture.ledger.write_bytes(encoded(ledger))
+        evidence_ledger = (
+            module.evidence_ledger_prefix(
+                self.fixture.plan, ledger, processed_count
+            )
+            if checkpoint is not None
+            else ledger
+        )
         evidence = module.build_evidence(
-            self.fixture.plan, ledger,
+            self.fixture.plan, evidence_ledger,
             "checkpoint_reached" if checkpoint else "complete",
             checkpoint, replayed,
         )
@@ -1180,12 +1189,12 @@ class ControlTests(unittest.TestCase):
         )
 
     def test_restart_controller_resumes_an_existing_checkpoint_prefix(self) -> None:
-        first_checkpoint = next(
+        checkpoints = [
             step["checkpoint"]
             for step in self.fixture.plan["steps"]
             if step.get("checkpoint") is not None
-        )
-        self.runner._journey(first_checkpoint)
+        ]
+        self.runner._journey(checkpoints[2])
         evidence = json.loads(self.fixture.evidence.read_text())
         self.assertEqual(evidence["replay_verified_steps"], [])
 
@@ -1196,6 +1205,11 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(
             self.runner.journey_effects,
             {step["id"]: 1 for step in self.fixture.plan["steps"]},
+        )
+        stopped = [call[2] for call in self.runner.calls if call[1] == "stop"]
+        self.assertEqual(
+            stopped,
+            list(self.fixture.control_value["checkpoint_services"].values()),
         )
 
     def test_schema_v2_alias_credentials_are_forwarded_without_secret_disclosure(self) -> None:
