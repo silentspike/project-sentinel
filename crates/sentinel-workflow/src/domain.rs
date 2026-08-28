@@ -622,6 +622,9 @@ pub struct CostReservationV1 {
     pub provider: String,
     pub reserved_micros: u64,
     pub committed_micros: Option<u64>,
+    /// Durable Limbo usage-event operation bound to the committed provider cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_event_operation_id: Option<String>,
     pub state: CostReservationStateV1,
     pub created_by: String,
     pub created_at_unix_ms: u64,
@@ -866,6 +869,9 @@ pub enum CompanyWorkflowCommandV1 {
         expected_version: u64,
         reservation_id: String,
         actual_micros: u64,
+        /// `llm_usage_<request-id>` operation of the immutable provider-usage event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_event_operation_id: Option<String>,
     },
     ReleaseCost {
         project_id: ProjectId,
