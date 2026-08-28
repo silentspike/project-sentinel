@@ -2202,6 +2202,7 @@ async fn drain_llm_actions_before_ecs_shutdown(
     mut bridge_handle: tokio::task::JoinHandle<std::result::Result<(), &'static str>>,
     mut action_forwarder_handle: tokio::task::JoinHandle<Result<()>>,
     action_drain_tx: &mpsc::Sender<mpsc::SyncSender<()>>,
+    shutdown: &AtomicBool,
     bridge_timeout: Duration,
     action_timeout: Duration,
 ) -> Result<()> {
@@ -2229,6 +2230,10 @@ async fn drain_llm_actions_before_ecs_shutdown(
     action_drain_tx
         .send(drained_tx)
         .map_err(|_| anyhow!("ECS action-drain channel closed before shutdown"))?;
+    // Every provider result is now queued before this barrier. Wake the ECS
+    // shutdown path before another heavy post-schedule phase can delay the
+    // final schedule that applies and persists those results.
+    shutdown.store(true, Ordering::SeqCst);
     let drain_result = tokio::task::spawn_blocking(move || drained_rx.recv_timeout(action_timeout))
         .await
         .context("join ECS action-drain acknowledgement")?;
@@ -3555,6 +3560,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         llm_bridge_handle,
         llm_action_forwarder_handle,
         &action_drain_tx,
+        shutdown.as_ref(),
         llm_bridge_join_timeout,
         Duration::from_secs(8),
     )
@@ -8691,7 +8697,10 @@ fn ecs_tick_loop(
         let tick_start = Instant::now();
 
         if shutdown.load(Ordering::SeqCst) {
-            break;
+            collect_action_drain_requests(&action_drain_rx, &mut pending_action_drains);
+            if pending_action_drains.is_empty() {
+                break;
+            }
         }
         shift_snapshot_blocked_this_tick = false;
         #[cfg(test)]
@@ -9655,14 +9664,26 @@ fn ecs_tick_loop(
             }
         }
 
-        // A stop request can arrive after the tick-start check. Account for the
-        // already executed tick, but do not begin any later roster work.
+        // A stop can arrive after this tick's schedule. If its ordered action
+        // barrier has not run yet, skip roster/consolidation work and enter the
+        // next schedule immediately. Once the barrier is acknowledged, exit.
         if shutdown.load(Ordering::SeqCst) {
+            collect_action_drain_requests(&action_drain_rx, &mut pending_action_drains);
+            if pending_action_drains.is_empty() {
+                if world_background_allowed {
+                    tick_count += 1;
+                }
+                drop(owner_tick_barrier);
+                break;
+            }
             if world_background_allowed {
                 tick_count += 1;
             }
             drop(owner_tick_barrier);
-            break;
+            if !world_background_allowed {
+                std::thread::sleep(tick_rate.min(Duration::from_millis(50)));
+            }
+            continue;
         }
 
         // Shift-Erkennung (alle 60 Ticks = ~1 Minute bei 1s Tick-Rate)
@@ -12039,6 +12060,7 @@ mod tests {
             Ok(())
         });
         let (drain_tx, drain_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
+        let shutdown = AtomicBool::new(false);
         let persisted = Arc::new(AtomicBool::new(false));
         let persisted_from_ecs = Arc::clone(&persisted);
         let ecs = std::thread::spawn(move || {
@@ -12059,6 +12081,7 @@ mod tests {
             bridge,
             action_forwarder,
             &drain_tx,
+            &shutdown,
             Duration::from_secs(1),
             Duration::from_secs(1),
         )
@@ -12066,6 +12089,7 @@ mod tests {
         .unwrap();
 
         ecs.join().unwrap();
+        assert!(shutdown.load(Ordering::SeqCst));
         assert!(persisted.load(Ordering::SeqCst));
     }
 
