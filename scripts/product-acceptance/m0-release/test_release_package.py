@@ -237,6 +237,9 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "COMPLETE")
         self.assertEqual(receipt["artifact_count"], expected_count)
         self.assertEqual(receipt["changed_count"], expected_count)
+        installed_manifest = self.fixture.target / "opt/sentinel/release-manifest.json"
+        self.assertEqual(installed_manifest.read_bytes(), manifest_raw)
+        self.assertEqual(stat.S_IMODE(installed_manifest.stat().st_mode), 0o644)
 
     def test_retry_reuses_identical_immutable_package(self) -> None:
         first = self.fixture.build()
