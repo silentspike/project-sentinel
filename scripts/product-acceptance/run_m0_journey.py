@@ -1507,6 +1507,17 @@ def build_evidence(
     return evidence
 
 
+def evidence_ledger_prefix(
+    plan: dict[str, Any], ledger: dict[str, Any], record_count: int
+) -> dict[str, Any]:
+    if not 0 <= record_count <= len(ledger["completed"]):
+        raise JourneyError("evidence prefix length is invalid")
+    step_ids = [step["id"] for step in plan["steps"][:record_count]]
+    completed = {step_id: ledger["completed"][step_id] for step_id in step_ids}
+    chain_tip = ZERO_DIGEST if not step_ids else completed[step_ids[-1]]["record_digest"]
+    return {**ledger, "completed": completed, "chain_tip": chain_tip}
+
+
 def resolved_request(
     step: dict[str, Any],
     references: dict[str, Any],
@@ -1698,7 +1709,8 @@ def _run_journey_locked(
     stopped_at: str | None = None
     replay_verified_steps: set[str] = set()
 
-    for step in plan["steps"]:
+    processed_count = 0
+    for index, step in enumerate(plan["steps"]):
         step_id = step["id"]
         operation_id = stable_operation_id(journey_id, step_id, schema_version)
         body, encoded_query, request_digest = resolved_request(
@@ -1811,13 +1823,19 @@ def _run_journey_locked(
             )
 
         checkpoint = step.get("checkpoint")
+        processed_count = index + 1
         if checkpoint is not None and checkpoint == stop_after_checkpoint:
             stopped_at = checkpoint
             break
 
+    evidence_ledger = (
+        evidence_ledger_prefix(plan, ledger, processed_count)
+        if stopped_at is not None
+        else ledger
+    )
     evidence = build_evidence(
         plan,
-        ledger,
+        evidence_ledger,
         "checkpoint_reached" if stopped_at else "complete",
         stopped_at,
         replay_verified_steps,

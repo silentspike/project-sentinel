@@ -1200,8 +1200,11 @@ def validate_journey_state(
             or set(ledger["completed"]) != set(expected_completed)
         ):
             fail("journey_completed_prefix_mismatch")
+        evidence_ledger = module.evidence_ledger_prefix(
+            contract.plan, ledger, evidence_value["record_count"]
+        )
         expected_evidence = module.build_evidence(
-            contract.plan, ledger, expected_result, checkpoint,
+            contract.plan, evidence_ledger, expected_result, checkpoint,
             set(expected_replayed),
         )
         if evidence_value != expected_evidence:
@@ -1335,10 +1338,12 @@ def _restart_journey(
             index for index, step in enumerate(contract.plan["steps"])
             if step.get("checkpoint") == checkpoint
         )
-        expected_completed = contract.step_ids[:checkpoint_index + 1]
+        completed_count = max(len(replayed_before), checkpoint_index + 1)
+        expected_completed = contract.step_ids[:completed_count]
+        expected_replayed = replayed_before[:checkpoint_index + 1]
         ledger_before, evidence_before, _ = validate_journey_state(
             contract, journey, "checkpoint_reached", checkpoint,
-            expected_completed, replayed_before,
+            expected_completed, expected_replayed,
         )
         unit = mapping[checkpoint]
         restart_service_cleanly(

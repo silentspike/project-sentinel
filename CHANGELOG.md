@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Resume the M0 restart journey from a validated existing checkpoint prefix
   and expect exactly the operations replayed by that resumed runner process
-  instead of rejecting its canonical replay evidence (#650).
+  instead of rejecting its canonical replay evidence. A deep existing prefix
+  remains authoritative while each earlier checkpoint validates only the
+  operations that its bounded runner actually replayed (#650).
 
 - Drain reserved LLM provider results through the projection admission
   forwarder and one acknowledged ECS persist tick before closing the daemon's

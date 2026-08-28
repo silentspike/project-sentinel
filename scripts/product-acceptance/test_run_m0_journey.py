@@ -613,6 +613,25 @@ class JourneyRunnerTests(unittest.TestCase):
         self.assertEqual(evidence["target_origin"], self.base_url)
         self.assertEqual(evidence["record_chain_tip"], records["acceptance"]["record_digest"])
 
+    def test_completed_ledger_can_replay_an_earlier_checkpoint_canonically(self) -> None:
+        complete = self.run_plan()
+        self.assertEqual(complete["result"], "complete")
+        mutation_counts = self.state.effective_mutations.copy()
+
+        checkpoint = self.run_plan(checkpoint="after_customer_request")
+
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        self.assertEqual(checkpoint["result"], "checkpoint_reached")
+        self.assertEqual(checkpoint["stopped_at"], "after_customer_request")
+        self.assertEqual(checkpoint["record_count"], 2)
+        self.assertEqual(len(ledger["completed"]), len(complete["steps"]))
+        self.assertTrue(
+            runner.validate_evidence_binding(
+                self.evidence, ledger, canonical_plan()
+            )
+        )
+        self.assertEqual(self.state.effective_mutations, mutation_counts)
+
     def test_v1_ledger_shape_remains_byte_compatible(self) -> None:
         self.run_plan(checkpoint="after_customer_request")
         ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
