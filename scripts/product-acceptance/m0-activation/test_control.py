@@ -1140,6 +1140,25 @@ class ControlTests(unittest.TestCase):
             {step["id"]: 1 for step in self.fixture.plan["steps"]},
         )
 
+    def test_restart_controller_resumes_an_existing_checkpoint_prefix(self) -> None:
+        first_checkpoint = next(
+            step["checkpoint"]
+            for step in self.fixture.plan["steps"]
+            if step.get("checkpoint") is not None
+        )
+        self.runner._journey(first_checkpoint)
+        evidence = json.loads(self.fixture.evidence.read_text())
+        self.assertEqual(evidence["replay_verified_steps"], [])
+
+        result = self.fixture.restart(self.runner)
+
+        self.assertEqual(result["status"], "COMPLETE")
+        self.assertTrue(result["authoritative_replay_verified"])
+        self.assertEqual(
+            self.runner.journey_effects,
+            {step["id"]: 1 for step in self.fixture.plan["steps"]},
+        )
+
     def test_schema_v2_alias_credentials_are_forwarded_without_secret_disclosure(self) -> None:
         reference = "customer_primary:customer=M0_TEST_CUSTOMER_CREDENTIAL"
         argv = (
