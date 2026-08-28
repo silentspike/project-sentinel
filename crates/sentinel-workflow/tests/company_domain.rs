@@ -96,6 +96,7 @@ fn binding() -> ProposalBindingV1 {
         cost_ceiling_micros: 1_000,
         provider_cost_ceilings_micros: BTreeMap::from([
             ("local".to_owned(), 700),
+            ("local-loop".to_owned(), 700),
             ("review".to_owned(), 300),
         ]),
         governance: ProposalGovernanceV1 {
@@ -664,6 +665,7 @@ fn budget_reservation_and_commit_are_bounded_and_idempotent() {
             expected_version: project.version,
             reservation_id,
             actual_micros: 550,
+            usage_event_operation_id: Some("llm_usage_request-52".to_owned()),
         },
         52,
     );
@@ -671,6 +673,45 @@ fn budget_reservation_and_commit_are_bounded_and_idempotent() {
         panic!()
     };
     assert_eq!(committed.committed_cost_micros, 550);
+    assert_eq!(
+        committed.reservations[0]
+            .usage_event_operation_id
+            .as_deref(),
+        Some("llm_usage_request-52")
+    );
+
+    let second = command(
+        &state.store,
+        &state.pm,
+        53,
+        CompanyWorkflowCommandV1::ReserveCost {
+            project_id: state.project_id.clone(),
+            expected_version: committed.version,
+            work_item_id: None,
+            provider: "local".to_owned(),
+            amount_micros: 50,
+        },
+        53,
+    );
+    let CompanyWorkflowResponseV1::Project(second) = second else {
+        panic!()
+    };
+    let duplicate = state
+        .store
+        .apply_company_command(
+            &state.pm,
+            Uuid::from_u128(54),
+            &CompanyWorkflowCommandV1::CommitCost {
+                project_id: state.project_id.clone(),
+                expected_version: second.version,
+                reservation_id: second.reservations[1].reservation_id.clone(),
+                actual_micros: 50,
+                usage_event_operation_id: Some("llm_usage_request-52".to_owned()),
+            },
+            54,
+        )
+        .unwrap_err();
+    assert_eq!(duplicate.code, WorkflowErrorCode::InvalidInput);
 }
 
 #[test]
@@ -2340,7 +2381,7 @@ fn exact_budget_exhaustion_blocks_then_release_restores_active_and_zero_cost_loc
             project_id: state.project_id,
             expected_version: project.version,
             work_item_id: None,
-            provider: "local".to_owned(),
+            provider: "local-loop".to_owned(),
             amount_micros: 0,
         },
         146,
@@ -2349,4 +2390,21 @@ fn exact_budget_exhaustion_blocks_then_release_restores_active_and_zero_cost_loc
         panic!()
     };
     assert_eq!(project.reserved_cost_micros, 700);
+
+    let paid_zero = state
+        .store
+        .apply_company_command(
+            &state.pm,
+            Uuid::from_u128(147),
+            &CompanyWorkflowCommandV1::ReserveCost {
+                project_id: project.project_id.clone(),
+                expected_version: project.version,
+                work_item_id: None,
+                provider: "review".to_owned(),
+                amount_micros: 0,
+            },
+            147,
+        )
+        .unwrap_err();
+    assert_eq!(paid_zero.code, WorkflowErrorCode::InvalidInput);
 }

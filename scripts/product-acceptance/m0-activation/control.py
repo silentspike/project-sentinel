@@ -36,9 +36,10 @@ MAX_PREFLIGHT_PROBE_TIMEOUT_SECONDS = 15.0
 # Rollback must outlive that contract instead of reporting failure while systemd
 # is still completing a valid stop.
 ROLLBACK_COMMAND_TIMEOUT_SECONDS = 190.0
-# A restart includes the same bounded daemon drain as rollback. Keep this
-# systemd job budget separate from the tighter journey HTTP timeout.
-RESTART_COMMAND_TIMEOUT_SECONDS = 190.0
+# A restart can consume both the unit's bounded 180-second stop and start
+# phases. Keep that combined systemd job budget separate from the tighter
+# journey HTTP timeout and leave a small process-control grace period.
+RESTART_COMMAND_TIMEOUT_SECONDS = 370.0
 RESTART_READINESS_DEADLINE_SECONDS = 300.0
 RESTART_READINESS_POLL_SECONDS = 1.0
 # A journey child replays every completed step before it reaches the next

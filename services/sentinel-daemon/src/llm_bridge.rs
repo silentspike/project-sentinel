@@ -33,6 +33,26 @@ pub mod bridge {
 
     pub type SharedLlmActivityTicks = Arc<Mutex<HashMap<AgentId, u64>>>;
 
+    /// Durable company authority attached to exactly one provider effect.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ProviderUsageAuthority {
+        pub tenant_id: String,
+        pub project_id: String,
+        pub work_item_id: String,
+        pub reservation_id: String,
+        pub assignment_id: String,
+        pub assignment_version: u64,
+        pub agent_id: AgentId,
+        pub provider: String,
+    }
+
+    pub trait ProviderUsageAuthorityResolver: Send + Sync {
+        fn resolve_provider_usage_authority(
+            &self,
+            agent_id: AgentId,
+        ) -> Result<Option<ProviderUsageAuthority>, &'static str>;
+    }
+
     /// LLM Bridge Konfiguration.
     #[derive(Clone)]
     pub struct LlmBridgeConfig {
@@ -58,6 +78,9 @@ pub mod bridge {
         pub completion_retry_interval: Duration,
         /// Finite local usage-persistence attempts before fail-closed quarantine.
         pub completion_max_attempts: u32,
+        /// Optional productive company-workflow authority. Ambient agent calls
+        /// remain valid without a binding, but cannot be committed as project cost.
+        pub provider_usage_authority: Option<Arc<dyn ProviderUsageAuthorityResolver>>,
     }
 
     impl Default for LlmBridgeConfig {
@@ -74,6 +97,7 @@ pub mod bridge {
                 usage_v2_enabled: false,
                 completion_retry_interval: Duration::from_secs(1),
                 completion_max_attempts: 5,
+                provider_usage_authority: None,
             }
         }
     }
@@ -154,6 +178,8 @@ pub mod bridge {
         tokens_used: i32,
         #[serde(default)]
         request_id: String,
+        #[serde(default)]
+        provider: String,
         // #427: cache-aware breakdown + gateway-resolved tier + per-call cost. input_tokens
         // is the FOLDED input (fresh + cache); the fresh input for the event is recovered as
         // input_tokens - cache_read - cache_creation (matches the gateway per-agent counter).
@@ -353,10 +379,18 @@ pub mod bridge {
             .json(request)
     }
 
-    fn agent_runtime_request_id(perception: &Perception) -> String {
-        format!(
-            "agent-runtime-{:02}-{}",
-            perception.agent_id.0, perception.tick.0
+    fn agent_runtime_request_id(
+        perception: &Perception,
+        authority: Option<&ProviderUsageAuthority>,
+    ) -> String {
+        authority.map_or_else(
+            || {
+                format!(
+                    "agent-runtime-{:02}-{}",
+                    perception.agent_id.0, perception.tick.0
+                )
+            },
+            |binding| format!("company-provider-{}", binding.reservation_id),
         )
     }
 
@@ -372,12 +406,17 @@ pub mod bridge {
     fn build_usage_event(
         agent_id: AgentId,
         tick: u64,
+        requested_model: &str,
+        authority: Option<&ProviderUsageAuthority>,
         resp: &GatewayResponse,
         usage_v2_enabled: bool,
     ) -> Result<DomainEvent, String> {
         if usage_v2_enabled {
             if resp.effective_model.trim().is_empty() {
                 return Err("v2 response missing effective_model".to_string());
+            }
+            if resp.provider.trim().is_empty() {
+                return Err("v2 response missing provider".to_string());
             }
             if resp.tier.trim().is_empty() {
                 return Err("v2 response missing model tier".to_string());
@@ -392,6 +431,21 @@ pub mod bridge {
             .saturating_sub(resp.cache_creation);
         let payload = DomainEventPayload::AgentLlmUsage {
             agent_id,
+            tenant_id: authority.map(|value| value.tenant_id.clone()),
+            project_id: authority.map(|value| value.project_id.clone()),
+            work_item_id: authority.map(|value| value.work_item_id.clone()),
+            reservation_id: authority.map(|value| value.reservation_id.clone()),
+            assignment_id: authority.map(|value| value.assignment_id.clone()),
+            assignment_version: authority.map(|value| value.assignment_version),
+            provider: usage_v2_enabled.then(|| resp.provider.clone()),
+            requested_model: usage_v2_enabled.then(|| {
+                if requested_model.trim().is_empty() {
+                    "gateway-policy-default".to_string()
+                } else {
+                    requested_model.to_string()
+                }
+            }),
+            caller_role: usage_v2_enabled.then(|| "agent_runtime".to_string()),
             tier: resp.tier.clone(),
             hierarchy_tier: if usage_v2_enabled {
                 Some(
@@ -425,7 +479,7 @@ pub mod bridge {
             event = event.with_operation_id(&format!("llm_usage_{}", resp.request_id));
         }
         if usage_v2_enabled {
-            event = event.with_schema_version(2);
+            event = event.with_schema_version(if authority.is_some() { 3 } else { 2 });
         }
         Ok(event)
     }
@@ -544,24 +598,125 @@ pub mod bridge {
         }
     }
 
+    struct GatewayCompletionContext<'a> {
+        request_id: &'a str,
+        request_digest: &'a str,
+        agent_id: AgentId,
+        tick: u64,
+        requested_model: &'a str,
+        authority: Option<&'a ProviderUsageAuthority>,
+        authority_resolver: Option<&'a dyn ProviderUsageAuthorityResolver>,
+        gateway_response: &'a GatewayResponse,
+        usage_v2_enabled: bool,
+    }
+
+    fn validate_current_provider_usage_authority(
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
+        expected: Option<&ProviderUsageAuthority>,
+        agent_id: AgentId,
+    ) -> Result<(), String> {
+        match resolver {
+            Some(resolver) => {
+                let current = resolver
+                    .resolve_provider_usage_authority(agent_id)
+                    .map_err(|reason| format!("provider usage reauthorization failed: {reason}"))?;
+                if current.as_ref() != expected {
+                    return Err("provider usage authority changed during provider I/O".to_string());
+                }
+            }
+            None if expected.is_some() => {
+                return Err("provider usage authority resolver is unavailable".to_string());
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn validate_provider_usage_mode(
+        authority: Option<&ProviderUsageAuthority>,
+        usage_v2_enabled: bool,
+    ) -> Result<(), &'static str> {
+        if authority.is_some() && !usage_v2_enabled {
+            return Err("project provider usage requires schema-v3 accounting");
+        }
+        Ok(())
+    }
+
+    fn validate_pre_dispatch_provider_authority<S: CompletionStore>(
+        store: &S,
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
+        expected: Option<&ProviderUsageAuthority>,
+        agent_id: AgentId,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<(), String> {
+        if let Err(reason) = validate_current_provider_usage_authority(resolver, expected, agent_id)
+        {
+            return match store.release_undispatched_request(request_id, request_digest) {
+                Ok(true) => Err(reason),
+                Ok(false) => Err(format!(
+                    "{reason}; undispatched provider reservation was not released"
+                )),
+                Err(error) => Err(format!(
+                    "{reason}; undispatched provider reservation release failed: {error}"
+                )),
+            };
+        }
+        Ok(())
+    }
+
+    fn validate_gateway_completion_authority(
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
+        expected: Option<&ProviderUsageAuthority>,
+        gateway_response: &GatewayResponse,
+        agent_id: AgentId,
+    ) -> Result<(), String> {
+        if let Some(expected) = expected {
+            if gateway_response.provider != expected.provider {
+                return Err("gateway provider does not match the reserved provider".to_string());
+            }
+        }
+        validate_current_provider_usage_authority(resolver, expected, agent_id)
+    }
+
     fn store_gateway_completion<S: CompletionStore>(
         store: &S,
         action_tx: &mpsc::Sender<AgentAction>,
-        request_id: &str,
-        request_digest: &str,
-        agent_id: AgentId,
-        tick: u64,
-        gateway_resp: &GatewayResponse,
-        usage_v2_enabled: bool,
+        context: GatewayCompletionContext<'_>,
         max_attempts: u32,
     ) -> Result<(), String> {
+        let GatewayCompletionContext {
+            request_id,
+            request_digest,
+            agent_id,
+            tick,
+            requested_model,
+            authority,
+            authority_resolver,
+            gateway_response,
+            usage_v2_enabled,
+        } = context;
+        let gateway_resp = gateway_response;
         if gateway_resp.request_id != request_id {
             return Err(format!(
                 "gateway request_id mismatch: sent {request_id}, received {}",
                 gateway_resp.request_id
             ));
         }
-        let usage_event = build_usage_event(agent_id, tick, gateway_resp, usage_v2_enabled)?;
+        validate_gateway_completion_authority(
+            authority_resolver,
+            authority,
+            gateway_resp,
+            agent_id,
+        )?;
+        let usage_event = build_usage_event(
+            agent_id,
+            tick,
+            requested_model,
+            authority,
+            gateway_resp,
+            usage_v2_enabled,
+        )?;
         let is_synthesis = gateway_resp.tokens_used == 0;
         let actions = gateway_resp
             .actions
@@ -906,6 +1061,30 @@ pub mod bridge {
                     continue;
                 }
 
+                let usage_authority = match config.provider_usage_authority.as_ref() {
+                    Some(resolver) => match resolver.resolve_provider_usage_authority(agent_id) {
+                        Ok(value) => value,
+                        Err(reason) => {
+                            error!(agent = %agent_id, reason, "Provider usage authority resolution failed closed");
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                if usage_authority
+                    .as_ref()
+                    .is_some_and(|authority| authority.agent_id != agent_id)
+                {
+                    error!(agent = %agent_id, "Provider usage authority returned another agent");
+                    continue;
+                }
+                if let Err(reason) =
+                    validate_provider_usage_mode(usage_authority.as_ref(), config.usage_v2_enabled)
+                {
+                    error!(agent = %agent_id, reason, "Provider usage accounting is unavailable");
+                    continue;
+                }
+
                 last_call_tick.insert(agent_id, current_tick);
                 {
                     let mut ticks = llm_activity_ticks.lock().unwrap();
@@ -917,8 +1096,13 @@ pub mod bridge {
                     });
                 }
 
-                let request = build_gateway_request(&perception, &state_store);
-                let request_id = agent_runtime_request_id(&perception);
+                let request_id = agent_runtime_request_id(&perception, usage_authority.as_ref());
+                let request = build_gateway_request(
+                    &perception,
+                    &state_store,
+                    &request_id,
+                    usage_authority.as_ref(),
+                );
                 let request_digest = match gateway_request_digest(&request) {
                     Ok(digest) => digest,
                     Err(error) => {
@@ -980,6 +1164,9 @@ pub mod bridge {
                 let usage_v2_enabled = config.usage_v2_enabled;
                 let request_completion_max_attempts = completion_max_attempts;
                 let task_provider_admission = Arc::clone(&provider_admission);
+                let provider_usage_authority = usage_authority.clone();
+                let provider_usage_authority_resolver =
+                    config.provider_usage_authority.as_ref().map(Arc::clone);
 
                 telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
 
@@ -1040,6 +1227,17 @@ pub mod bridge {
                                 return;
                             }
                         }
+                        if let Err(error) = validate_pre_dispatch_provider_authority(
+                            bridge_event_store.as_ref(),
+                            provider_usage_authority_resolver.as_deref(),
+                            provider_usage_authority.as_ref(),
+                            agent_id,
+                            &request_id,
+                            &request_digest,
+                        ) {
+                            warn!(request_id = %request_id, error, "Provider request reauthorization failed before dispatch");
+                            return;
+                        }
                         match agent_runtime_request(
                             &client,
                             &url,
@@ -1062,12 +1260,18 @@ pub mod bridge {
                                             if let Err(e) = store_gateway_completion(
                                                 bridge_event_store.as_ref(),
                                                 &action_tx,
-                                                &request_id,
-                                                &request_digest,
-                                                agent_id,
-                                                current_tick,
-                                                &gateway_resp,
-                                                usage_v2_enabled,
+                                                GatewayCompletionContext {
+                                                    request_id: &request_id,
+                                                    request_digest: &request_digest,
+                                                    agent_id,
+                                                    tick: current_tick,
+                                                    requested_model: &request.model,
+                                                    authority: provider_usage_authority.as_ref(),
+                                                    authority_resolver: provider_usage_authority_resolver
+                                                        .as_deref(),
+                                                    gateway_response: &gateway_resp,
+                                                    usage_v2_enabled,
+                                                },
                                                 request_completion_max_attempts,
                                             ) {
                                                 warn!(agent = %agent_id, error = %e, "Completed gateway response rejected fail-closed");
@@ -1152,6 +1356,17 @@ pub mod bridge {
                                 return;
                             }
                         }
+                        if let Err(error) = validate_pre_dispatch_provider_authority(
+                            bridge_event_store.as_ref(),
+                            provider_usage_authority_resolver.as_deref(),
+                            provider_usage_authority.as_ref(),
+                            agent_id,
+                            &request_id,
+                            &request_digest,
+                        ) {
+                            warn!(request_id = %request_id, error, "Provider request reauthorization failed before dispatch");
+                            return;
+                        }
                         match agent_runtime_request(
                             &client,
                             &url,
@@ -1172,12 +1387,18 @@ pub mod bridge {
                                             if let Err(e) = store_gateway_completion(
                                                 bridge_event_store.as_ref(),
                                                 &action_tx,
-                                                &request_id,
-                                                &request_digest,
-                                                agent_id,
-                                                current_tick,
-                                                &gateway_resp,
-                                                usage_v2_enabled,
+                                                GatewayCompletionContext {
+                                                    request_id: &request_id,
+                                                    request_digest: &request_digest,
+                                                    agent_id,
+                                                    tick: current_tick,
+                                                    requested_model: &request.model,
+                                                    authority: provider_usage_authority.as_ref(),
+                                                    authority_resolver: provider_usage_authority_resolver
+                                                        .as_deref(),
+                                                    gateway_response: &gateway_resp,
+                                                    usage_v2_enabled,
+                                                },
                                                 request_completion_max_attempts,
                                             ) {
                                                 warn!(agent = %agent_id, error = %e, "Completed gateway response rejected fail-closed");
@@ -1313,7 +1534,12 @@ pub mod bridge {
     }
 
     /// Baut den Gateway-Request aus einer Perception + Evolution-Daten aus redb.
-    fn build_gateway_request(perception: &Perception, store: &StateStore) -> GatewayRequest {
+    fn build_gateway_request(
+        perception: &Perception,
+        store: &StateStore,
+        request_id: &str,
+        authority: Option<&ProviderUsageAuthority>,
+    ) -> GatewayRequest {
         let user_prompt = if perception.impulse_text.is_empty() {
             "Was machst du als naechstes? Reagiere natuerlich auf deine aktuelle Situation."
                 .to_string()
@@ -1348,10 +1574,19 @@ pub mod bridge {
         metadata.insert("impulse".to_string(), perception.impulse_text.clone());
         metadata.insert("perception".to_string(), formatted_perception);
         metadata.insert("tick".to_string(), perception.tick.0.to_string());
-        metadata.insert(
-            "request_id".to_string(),
-            agent_runtime_request_id(perception),
-        );
+        metadata.insert("request_id".to_string(), request_id.to_string());
+        if let Some(binding) = authority {
+            metadata.insert("tenant_id".to_string(), binding.tenant_id.clone());
+            metadata.insert("project_id".to_string(), binding.project_id.clone());
+            metadata.insert("work_item_id".to_string(), binding.work_item_id.clone());
+            metadata.insert("reservation_id".to_string(), binding.reservation_id.clone());
+            metadata.insert("assignment_id".to_string(), binding.assignment_id.clone());
+            metadata.insert("reserved_provider".to_string(), binding.provider.clone());
+            metadata.insert(
+                "assignment_version".to_string(),
+                binding.assignment_version.to_string(),
+            );
+        }
 
         // Traffic Control Metadata (Synthesis, Chat-Sequencing)
         metadata.insert("room_id".to_string(), perception.room_id.clone());
@@ -1556,6 +1791,60 @@ pub mod bridge {
             failure_observed: Arc<tokio::sync::Notify>,
         }
 
+        struct StaticProviderUsageAuthority {
+            authority: ProviderUsageAuthority,
+        }
+
+        impl ProviderUsageAuthorityResolver for StaticProviderUsageAuthority {
+            fn resolve_provider_usage_authority(
+                &self,
+                agent_id: AgentId,
+            ) -> Result<Option<ProviderUsageAuthority>, &'static str> {
+                Ok((self.authority.agent_id == agent_id).then(|| self.authority.clone()))
+            }
+        }
+
+        #[test]
+        fn pre_dispatch_authority_change_releases_the_undispatched_reservation() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = EventStore::open(dir.path().join("events.db").to_str().unwrap()).unwrap();
+            let expected = ProviderUsageAuthority {
+                tenant_id: "tenant-m0".to_owned(),
+                project_id: "project-m0".to_owned(),
+                work_item_id: "build-site".to_owned(),
+                reservation_id: "reservation-m0".to_owned(),
+                assignment_id: "assignment-m0".to_owned(),
+                assignment_version: 1,
+                agent_id: AgentId(7),
+                provider: "local-loop".to_owned(),
+            };
+            let stale_resolver = StaticProviderUsageAuthority {
+                authority: ProviderUsageAuthority {
+                    assignment_version: 2,
+                    ..expected.clone()
+                },
+            };
+            assert!(store
+                .reserve_request("company-provider-reservation-m0", "digest-m0", "AGENT-07")
+                .unwrap());
+
+            let error = validate_pre_dispatch_provider_authority(
+                &store,
+                Some(&stale_resolver),
+                Some(&expected),
+                AgentId(7),
+                "company-provider-reservation-m0",
+                "digest-m0",
+            )
+            .unwrap_err();
+
+            assert!(error.contains("authority changed"), "{error}");
+            assert!(store
+                .get_completion("company-provider-reservation-m0")
+                .unwrap()
+                .is_none());
+        }
+
         impl CompletionStore for FailFirstCompletionStore {
             fn reserve_request(
                 &self,
@@ -1708,6 +1997,7 @@ pub mod bridge {
                             "actions": [{"type": "move", "target": "meeting-room"}],
                             "tokens_used": 7,
                             "request_id": request_id,
+                            "provider": "local-loop",
                             "input_tokens": 5,
                             "output_tokens": 2,
                             "cache_read": 0,
@@ -1864,6 +2154,95 @@ pub mod bridge {
                 .get_completion("agent-runtime-07-55")
                 .unwrap()
                 .is_none());
+            provider_task.abort();
+        }
+
+        #[tokio::test]
+        async fn project_reservation_allows_one_provider_effect_across_new_perceptions() {
+            let dir = tempfile::tempdir().unwrap();
+            let event_path = dir.path().join("events.db");
+            let state_path = dir.path().join("state.redb");
+            let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
+            let event_store = Arc::new(EventStore::open(event_path.to_str().unwrap()).unwrap());
+            let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (gateway_url, provider_task) =
+                start_mock_agent_provider(Arc::clone(&provider_calls), None, None).await;
+            let config = LlmBridgeConfig {
+                gateway_url,
+                credential: "test-credential".to_owned(),
+                min_ticks_between_calls: 0,
+                usage_v2_enabled: true,
+                provider_usage_authority: Some(Arc::new(StaticProviderUsageAuthority {
+                    authority: ProviderUsageAuthority {
+                        tenant_id: "tenant-m0".to_owned(),
+                        project_id: "project-m0".to_owned(),
+                        work_item_id: "build-site".to_owned(),
+                        reservation_id: "reservation-m0".to_owned(),
+                        assignment_id: "assignment-m0".to_owned(),
+                        assignment_version: 1,
+                        agent_id: AgentId(7),
+                        provider: "local-loop".to_owned(),
+                    },
+                })),
+                ..Default::default()
+            };
+            let (perception_tx, perception_rx) = mpsc::channel();
+            let (action_tx, _action_rx) = mpsc::channel();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let activity_ticks = Arc::new(Mutex::new(HashMap::new()));
+            let bridge = tokio::spawn(run_llm_bridge_with_store(
+                config,
+                perception_rx,
+                action_tx,
+                Arc::new(BridgeTelemetry::default()),
+                state_store,
+                Arc::clone(&event_store),
+                Arc::new(AtomicBool::new(false)),
+                Arc::clone(&activity_ticks),
+                shutdown_rx,
+                Arc::new(RwLock::new(true)),
+            ));
+
+            perception_tx.send(recovery_test_perception()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !event_store
+                    .has_event_operation_id("llm_usage_company-provider-reservation-m0")
+                    .unwrap()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("project usage event was not persisted");
+
+            let mut second = recovery_test_perception();
+            second.tick = Tick(56);
+            second.impulse_text = "continue".to_owned();
+            perception_tx.send(second).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while activity_ticks.lock().unwrap().get(&AgentId(7)) != Some(&56) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("second perception was not evaluated");
+
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), bridge)
+                .await
+                .expect("bridge did not shut down")
+                .unwrap()
+                .unwrap();
+            assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+            let usage = event_store
+                .event_by_operation_id("llm_usage_company-provider-reservation-m0")
+                .unwrap()
+                .unwrap();
+            assert_eq!(usage.schema_version, 3);
+            assert!(usage.payload.contains("\"tenant_id\":\"tenant-m0\""));
+            assert!(usage
+                .payload
+                .contains("\"reservation_id\":\"reservation-m0\""));
             provider_task.abort();
         }
 
@@ -2093,7 +2472,7 @@ pub mod bridge {
                 has_operator_impulse: false,
             };
 
-            let request = build_gateway_request(&perception, &store);
+            let request = build_gateway_request(&perception, &store, "agent-runtime-07-55", None);
 
             assert_eq!(request.messages.len(), 1);
             assert_eq!(request.messages[0].role, "user");
@@ -2272,6 +2651,7 @@ pub mod bridge {
                 actions: vec![],
                 tokens_used: 1800,
                 request_id: "req-abc".to_string(),
+                provider: "anthropic-direct".to_string(),
                 input_tokens: 1300, // folded (fresh 1000 + cache 200 + 100)
                 output_tokens: 500,
                 cache_read: 200,
@@ -2282,7 +2662,8 @@ pub mod bridge {
                 cost_source: Some(CostSource::ProviderReported),
                 effective_model: "claude-sonnet-5".to_string(),
             };
-            let ev = build_usage_event(AgentId(8), 42, &resp, true).unwrap();
+            let ev =
+                build_usage_event(AgentId(8), 42, "claude-sonnet-5", None, &resp, true).unwrap();
             assert_eq!(ev.event_type, "agent_llm_usage");
             assert_eq!(ev.aggregate_id, "AGENT-08");
             assert_eq!(ev.correlation_id, "req-abc");
@@ -2297,7 +2678,94 @@ pub mod bridge {
             assert!(ev
                 .payload
                 .contains("\"effective_model\":\"claude-sonnet-5\""));
+            assert!(ev.payload.contains("\"provider\":\"anthropic-direct\""));
+            assert!(ev.payload.contains("\"caller_role\":\"agent_runtime\""));
             assert_eq!(ev.schema_version, 2);
+        }
+
+        #[test]
+        fn project_provider_usage_is_reservation_keyed_and_authority_bound() {
+            let perception = make_perception(8, "Bitte bearbeite das Projekt.", true);
+            let authority = ProviderUsageAuthority {
+                tenant_id: "tenant-m0".to_owned(),
+                project_id: "project-m0".to_owned(),
+                work_item_id: "build-site".to_owned(),
+                reservation_id: "reservation-m0".to_owned(),
+                assignment_id: "assignment-m0".to_owned(),
+                assignment_version: 2,
+                agent_id: AgentId(8),
+                provider: "local-loop".to_owned(),
+            };
+            assert_eq!(
+                agent_runtime_request_id(&perception, Some(&authority)),
+                "company-provider-reservation-m0"
+            );
+            assert_eq!(validate_provider_usage_mode(Some(&authority), true), Ok(()));
+            assert!(validate_provider_usage_mode(Some(&authority), false).is_err());
+            assert_eq!(validate_provider_usage_mode(None, false), Ok(()));
+            let mut response = GatewayResponse {
+                content: "done".to_owned(),
+                actions: Vec::new(),
+                tokens_used: 0,
+                request_id: "company-provider-reservation-m0".to_owned(),
+                provider: "local-loop".to_owned(),
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read: 0,
+                cache_creation: 0,
+                tier: "mid".to_owned(),
+                cost_usd: 0.0,
+                hierarchy_tier: Some(HierarchyTier::TIER_2),
+                cost_source: Some(CostSource::ProviderReported),
+                effective_model: "local-loop-tier2".to_owned(),
+            };
+            let event =
+                build_usage_event(AgentId(8), 42, "", Some(&authority), &response, true).unwrap();
+            assert_eq!(event.schema_version, 3);
+            assert!(event.payload.contains("\"tenant_id\":\"tenant-m0\""));
+            assert!(event.payload.contains("\"project_id\":\"project-m0\""));
+            assert!(event.payload.contains("\"work_item_id\":\"build-site\""));
+            assert!(event
+                .payload
+                .contains("\"reservation_id\":\"reservation-m0\""));
+            assert!(event
+                .payload
+                .contains("\"requested_model\":\"gateway-policy-default\""));
+
+            let resolver = StaticProviderUsageAuthority {
+                authority: authority.clone(),
+            };
+            assert_eq!(
+                validate_gateway_completion_authority(
+                    Some(&resolver),
+                    Some(&authority),
+                    &response,
+                    AgentId(8),
+                ),
+                Ok(())
+            );
+            response.provider = "anthropic-direct".to_owned();
+            assert!(validate_gateway_completion_authority(
+                Some(&resolver),
+                Some(&authority),
+                &response,
+                AgentId(8),
+            )
+            .is_err());
+            response.provider = "local-loop".to_owned();
+            let stale_resolver = StaticProviderUsageAuthority {
+                authority: ProviderUsageAuthority {
+                    assignment_version: authority.assignment_version + 1,
+                    ..authority.clone()
+                },
+            };
+            assert!(validate_gateway_completion_authority(
+                Some(&stale_resolver),
+                Some(&authority),
+                &response,
+                AgentId(8),
+            )
+            .is_err());
         }
 
         #[test]
@@ -2305,8 +2773,8 @@ pub mod bridge {
             let resp: GatewayResponse =
                 serde_json::from_str(r#"{"tier":"mid","cost_usd":0,"request_id":"missing-v2"}"#)
                     .unwrap();
-            assert!(build_usage_event(AgentId(1), 1, &resp, true).is_err());
-            assert!(build_usage_event(AgentId(1), 1, &resp, false).is_ok());
+            assert!(build_usage_event(AgentId(1), 1, "", None, &resp, true).is_err());
+            assert!(build_usage_event(AgentId(1), 1, "", None, &resp, false).is_ok());
         }
 
         #[test]
@@ -2320,7 +2788,9 @@ pub mod bridge {
             assert_eq!(response.hierarchy_tier, Some(HierarchyTier::TIER_2));
             assert_eq!(response.cost_source, Some(CostSource::ProviderReported));
             assert_eq!(response.effective_model, "claude-sonnet-5");
-            assert!(build_usage_event(AgentId(8), 42, &response, true).is_ok());
+            assert!(
+                build_usage_event(AgentId(8), 42, "claude-sonnet-5", None, &response, true).is_ok()
+            );
         }
     }
 }

@@ -481,6 +481,33 @@ pub enum DomainEventPayload {
     /// `reconstruct_inputs` ueberspringt es), beruehrt den STRICT/CORE-Hash nicht.
     AgentLlmUsage {
         agent_id: AgentId,
+        /// Tenant authority for a project-bound provider call. Missing on ambient/legacy calls.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant_id: Option<String>,
+        /// Project authority for a project-bound provider call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        /// Work item whose active assignment authorized the provider call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_item_id: Option<String>,
+        /// Exact active cost reservation used as the stable provider-effect key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reservation_id: Option<String>,
+        /// Exact assignment authority observed before provider I/O.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assignment_id: Option<String>,
+        /// Assignment generation observed before provider I/O.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assignment_version: Option<u64>,
+        /// Exact Gateway provider selected for the call. Missing on legacy events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        /// Model requested by the daemon before Gateway policy resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_model: Option<String>,
+        /// Authenticated internal caller role. Missing on legacy events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_role: Option<String>,
         /// Aufgeloester Model-Tier (low/mid/high) bzw. synthesis/apicp/intercept/unknown.
         tier: String,
         /// Gateway-resolved organization hierarchy class. Missing on v1 events.
@@ -567,6 +594,15 @@ mod tests {
         // type="AgentLlmUsage"; the cache breakdown survives the roundtrip.
         let usage = DomainEventPayload::AgentLlmUsage {
             agent_id: AgentId(8),
+            tenant_id: Some("tenant-m0".to_string()),
+            project_id: Some("project-m0".to_string()),
+            work_item_id: Some("build-site".to_string()),
+            reservation_id: Some("reservation-m0".to_string()),
+            assignment_id: Some("assignment-m0".to_string()),
+            assignment_version: Some(1),
+            provider: Some("anthropic-direct".to_string()),
+            requested_model: Some("claude-sonnet-5".to_string()),
+            caller_role: Some("agent_runtime".to_string()),
             tier: "high".to_string(),
             hierarchy_tier: Some(HierarchyTier::TIER_2),
             cost_source: Some(CostSource::ProviderReported),
@@ -585,6 +621,8 @@ mod tests {
         assert!(json.contains("\"hierarchy_tier\":2"));
         assert!(json.contains("\"cost_source\":\"provider_reported\""));
         assert!(json.contains("\"effective_model\":\"claude-sonnet-5\""));
+        assert!(json.contains("\"provider\":\"anthropic-direct\""));
+        assert!(json.contains("\"caller_role\":\"agent_runtime\""));
         let back: DomainEventPayload = serde_json::from_str(&json).expect("roundtrip");
         assert_eq!(back.to_json(), json);
     }
@@ -595,11 +633,29 @@ mod tests {
         let payload: DomainEventPayload = serde_json::from_str(json).expect("v1 usage parses");
         match payload {
             DomainEventPayload::AgentLlmUsage {
+                tenant_id,
+                project_id,
+                work_item_id,
+                reservation_id,
+                assignment_id,
+                assignment_version,
+                provider,
+                requested_model,
+                caller_role,
                 hierarchy_tier,
                 cost_source,
                 effective_model,
                 ..
             } => {
+                assert_eq!(tenant_id, None);
+                assert_eq!(project_id, None);
+                assert_eq!(work_item_id, None);
+                assert_eq!(reservation_id, None);
+                assert_eq!(assignment_id, None);
+                assert_eq!(assignment_version, None);
+                assert_eq!(provider, None);
+                assert_eq!(requested_model, None);
+                assert_eq!(caller_role, None);
                 assert_eq!(hierarchy_tier, None);
                 assert_eq!(cost_source, None);
                 assert_eq!(effective_model, None);

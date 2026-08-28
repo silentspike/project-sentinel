@@ -3318,6 +3318,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             credential: read_required_credential("SENTINEL_AGENT_RUNTIME_CREDENTIAL_FILE")?,
             usage_v2_enabled: std::env::var("SENTINEL_LLM_USAGE_V2_ENABLED")
                 .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            provider_usage_authority: Some(workflow_api.clone()),
             ..Default::default()
         };
         let bridge_telemetry =
