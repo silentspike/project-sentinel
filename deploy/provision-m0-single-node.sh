@@ -30,6 +30,7 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 CREATED_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 OWNER_PAIR_RE = re.compile(r"^(0|[1-9][0-9]{0,9}):(0|[1-9][0-9]{0,9})$")
 PRODUCTION_STAGE_PREFIX = Path("/work/tmp/project-sentinel")
+INSTALLED_MANIFEST = "/opt/sentinel/release-manifest.json"
 STOPPED_UNITS = {
     "nats-server.service",
     "sentinel-auth-init.service",
@@ -304,7 +305,7 @@ def source_snapshot(root: Path, source: str, kind: str) -> dict[str, Any]:
         os.close(fd)
 
 
-def read_manifest(path: Path) -> tuple[bytes, dict[str, Any]]:
+def read_manifest(path: Path) -> tuple[bytes, dict[str, Any], dict[str, Any]]:
     fd, info = open_absolute(path, owners={0, os.geteuid()})
     try:
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
@@ -317,11 +318,20 @@ def read_manifest(path: Path) -> tuple[bytes, dict[str, Any]]:
     value = strict_json(raw)
     if not isinstance(value, dict):
         fail("manifest_not_object")
-    return raw, value
+    return raw, value, {
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "size": len(raw),
+        "mtime_ns": info.st_mtime_ns,
+        "mode": stat.S_IMODE(info.st_mode),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
 
 
-def validate_manifest(args: argparse.Namespace) -> tuple[list[dict[str, Any]], str]:
-    raw, manifest = read_manifest(args.manifest)
+def validate_manifest(
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    raw, manifest, manifest_snapshot = read_manifest(args.manifest)
     actual_manifest_sha = hashlib.sha256(raw).hexdigest()
     if not DIGEST_RE.fullmatch(args.expected_manifest_sha256) or not hmac.compare_digest(actual_manifest_sha, args.expected_manifest_sha256):
         fail("manifest_authority_digest_mismatch")
@@ -362,7 +372,11 @@ def validate_manifest(args: argparse.Namespace) -> tuple[list[dict[str, Any]], s
         verified.append({**item, "snapshot": snap})
     if seen_paths != set(AUTHORITY):
         fail("manifest_required_artifact_missing")
-    return sorted(verified, key=lambda row: row["path"]), actual_manifest_sha
+    return (
+        sorted(verified, key=lambda row: row["path"]),
+        actual_manifest_sha,
+        manifest_snapshot,
+    )
 
 
 def parse_owner_pairs(values: list[str], reason: str) -> set[tuple[int, int]]:
@@ -868,9 +882,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         lock_fd, operation = prepare_stage(args)
         if args.inject_pre_mutation_error:
             raise RuntimeError(f"injected private detail at {args.stage_root}")
-        rows, manifest_sha = validate_manifest(args)
+        rows, manifest_sha, manifest_snapshot = validate_manifest(args)
+        manifest_row = {
+            "path": INSTALLED_MANIFEST,
+            "type": "config",
+            "sha256": manifest_sha,
+        }
+        install_rows = [*rows, manifest_row]
         validate_services(args)
-        plan_legacy_takeover(args, rows, uid, gid, allowed_owner_pairs)
+        plan_legacy_takeover(args, install_rows, uid, gid, allowed_owner_pairs)
 
         incoming = operation / "incoming"
         rollback = operation / "rollback"
@@ -890,11 +910,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if digest != row["sha256"] or size != row["snapshot"]["size"]:
                 fail("staged_artifact_mismatch")
             staged.append(staged_file)
+        staged_manifest = incoming / f"{len(rows):03d}"
+        manifest_digest, manifest_size = copy_and_hash(
+            args.manifest,
+            staged_manifest,
+            TARGET_MODES["config"],
+            uid,
+            gid,
+            expected_snapshot=manifest_snapshot,
+        )
+        if (
+            manifest_digest != manifest_sha
+            or manifest_size != manifest_snapshot["size"]
+        ):
+            fail("staged_manifest_mismatch")
+        staged.append(staged_manifest)
 
         # Recheck every target and service immediately before host mutation.
         validate_services(args)
         takeover_records = plan_legacy_takeover(
-            args, rows, uid, gid, allowed_owner_pairs
+            args, install_rows, uid, gid, allowed_owner_pairs
         )
         write_takeover_state(operation, takeover_records)
         if args.test_identity_mismatch and takeover_records:
@@ -910,11 +945,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 and len(takeover_applied) >= args.test_fail_takeover_after
             ):
                 fail("injected_takeover_failure")
-        validate_targets(args, rows, uid, gid)
+        validate_targets(args, install_rows, uid, gid)
         original_metadata = {record["path"]: record for record in takeover_records}
         applied = 0
+        mutation_applied = 0
         target_mutation_started = True
-        for index, row in enumerate(rows):
+        for index, row in enumerate(install_rows):
             target = target_path(args.target_root, row["path"])
             ensure_dir(target.parent, uid, gid, created_dirs)
             backup: Path | None = None
@@ -956,12 +992,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 os.fsync(parent_fd)
             finally:
                 os.close(parent_fd)
-            applied += 1
-            if args.fail_after is not None and applied >= args.fail_after:
+            mutation_applied += 1
+            if index < len(rows):
+                applied += 1
+            if args.fail_after is not None and mutation_applied >= args.fail_after:
                 fail("injected_install_failure")
 
-        validate_targets(args, rows, uid, gid)
-        for row in rows:
+        validate_targets(args, install_rows, uid, gid)
+        for row in install_rows:
             target = target_path(args.target_root, row["path"])
             if hash_file(target)[0] != row["sha256"]:
                 fail("installed_hash_mismatch")

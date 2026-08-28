@@ -126,6 +126,10 @@ class Fixture:
     def target_for(self, artifact: dict[str, str]) -> Path:
         return self.target / artifact["path"].lstrip("/")
 
+    @property
+    def installed_manifest(self) -> Path:
+        return self.target / "opt/sentinel/release-manifest.json"
+
     def artifact_for(self, destination: str) -> dict[str, str]:
         return next(row for row in self.artifacts if row["path"] == destination)
 
@@ -219,6 +223,11 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
             target = self.fixture.target_for(artifact)
             self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), artifact["sha256"])
             self.assertEqual(target.stat().st_mode & 0o777, MODES[artifact["type"]])
+        self.assertEqual(
+            self.fixture.installed_manifest.read_bytes(),
+            self.fixture.manifest_path.read_bytes(),
+        )
+        self.assertEqual(self.fixture.installed_manifest.stat().st_mode & 0o777, 0o644)
         receipt = json.loads((self.fixture.stage / "provision-receipt.json").read_text())
         self.assertEqual(receipt["manifest_sha256"], self.fixture.manifest_sha)
         self.assertNotIn("source", receipt)
@@ -234,6 +243,10 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
                           self.fixture.target_for(row).stat().st_mtime_ns)
             for row in self.fixture.artifacts
         }
+        manifest_before = (
+            self.fixture.installed_manifest.stat().st_ino,
+            self.fixture.installed_manifest.stat().st_mtime_ns,
+        )
         second = self.fixture.run()
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(json.loads(second.stdout)["changed_count"], 0)
@@ -247,6 +260,13 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
             for row in self.fixture.artifacts
         }
         self.assertEqual(before, after)
+        self.assertEqual(
+            manifest_before,
+            (
+                self.fixture.installed_manifest.stat().st_ino,
+                self.fixture.installed_manifest.stat().st_mtime_ns,
+            ),
+        )
 
     def test_symlinked_stage_lock_is_public_safe_and_has_no_target_effect(self) -> None:
         self.fixture.stage.mkdir(mode=0o700)
@@ -407,6 +427,37 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
         receipt = json.loads((self.fixture.stage / "provision-receipt.json").read_text())
         self.assertEqual(receipt["status"], "ROLLED_BACK")
         self.assertFalse(receipt["services_started"])
+
+    def test_failure_after_manifest_install_restores_previous_manifest(self) -> None:
+        self.fixture.installed_manifest.parent.mkdir(parents=True, exist_ok=True)
+        previous = b'{"legacy":true}\n'
+        self.fixture.installed_manifest.write_bytes(previous)
+        self.fixture.installed_manifest.chmod(0o644)
+
+        result = self.fixture.run("--fail-after", str(len(AUTHORITY) + 1))
+
+        self.assert_failed(result, "injected_install_failure")
+        self.assertEqual(self.fixture.installed_manifest.read_bytes(), previous)
+        self.assertEqual(self.fixture.installed_manifest.stat().st_mode & 0o777, 0o644)
+        receipt = json.loads((self.fixture.stage / "provision-receipt.json").read_text())
+        self.assertEqual(receipt["status"], "ROLLED_BACK")
+
+    def test_installed_manifest_symlink_and_hardlink_fail_before_install(self) -> None:
+        for attack in ("symlink", "hardlink"):
+            with self.subTest(attack=attack):
+                fixture = Fixture(self.case / "cases" / f"manifest-{attack}")
+                fixture.installed_manifest.parent.mkdir(parents=True, exist_ok=True)
+                if attack == "symlink":
+                    fixture.installed_manifest.symlink_to(fixture.manifest_path)
+                else:
+                    fixture.installed_manifest.write_bytes(b"legacy\n")
+                    fixture.installed_manifest.chmod(0o644)
+                    os.link(fixture.installed_manifest, fixture.base / "manifest-link")
+
+                self.assert_failed(fixture.run(), "target_file_authority_invalid")
+                self.assertFalse(
+                    fixture.target_for(fixture.artifacts[0]).exists()
+                )
 
     def test_legacy_modes_are_taken_over_only_for_manifest_files_and_canonical_dirs(self) -> None:
         daemon = self.fixture.write_legacy_target("/opt/sentinel/config/daemon.toml")

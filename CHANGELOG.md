@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Install the exact validated M0 release manifest as rollback-protected host
+  authority so a snapshot-based deployment cannot retain stale provenance
+  while activating current binaries and configuration (#650).
+
 - Keep the token-free M0 source-work observation bounded but long enough for
   restart-driven Workbench recovery and its independent gate, with a matching
   bounded controller child-process ceiling (#650).
