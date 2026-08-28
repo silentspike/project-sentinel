@@ -580,7 +580,9 @@ def validate_executables(systemctl: Path, python: Path, preflight: Path, journey
 def systemctl_show(runner: Runner, unit: str, timeout: float) -> dict[str, str]:
     if unit not in INSPECT_UNITS:
         fail("unit_not_allowed")
-    properties = ("LoadState", "ActiveState", "SubState", "Result")
+    properties = ("LoadState", "ActiveState", "SubState")
+    if unit != TARGET:
+        properties += ("Result",)
     result = invoke(runner, (
         str(SYSTEMCTL), "show", unit, f"--property={','.join(properties)}",
         "--no-pager",
@@ -841,7 +843,7 @@ def unit_terminal_failure(unit: str, values: dict[str, str]) -> bool:
     return (
         values["LoadState"] != "loaded"
         or values["ActiveState"] == "failed"
-        or values["Result"] != "success"
+        or (unit != TARGET and values["Result"] != "success")
     )
 
 
