@@ -674,7 +674,9 @@ fn budget_reservation_and_commit_are_bounded_and_idempotent() {
     };
     assert_eq!(committed.committed_cost_micros, 550);
     assert_eq!(
-        committed.reservations[0].usage_event_operation_id.as_deref(),
+        committed.reservations[0]
+            .usage_event_operation_id
+            .as_deref(),
         Some("llm_usage_request-52")
     );
 

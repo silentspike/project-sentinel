@@ -3521,15 +3521,16 @@ fn validate_project_collections(project: &ProjectV1) -> Result<(), WorkflowError
         let creator = principal_participant(&reservation.created_by)?;
         validate_optional_work(project, reservation.work_item_id.as_ref())
             .map_err(|_| corrupt())?;
-        let usage_operation_valid = reservation
-            .usage_event_operation_id
-            .as_deref()
-            .is_none_or(|operation_id| {
-                reservation.state == CostReservationStateV1::Committed
-                    && operation_id.starts_with("llm_usage_")
-                    && validate_identifier(operation_id).is_ok()
-                    && ids.insert(("usage_operation", operation_id))
-            });
+        let usage_operation_valid =
+            reservation
+                .usage_event_operation_id
+                .as_deref()
+                .is_none_or(|operation_id| {
+                    reservation.state == CostReservationStateV1::Committed
+                        && operation_id.starts_with("llm_usage_")
+                        && validate_identifier(operation_id).is_ok()
+                        && ids.insert(("usage_operation", operation_id))
+                });
         if !matches!(
             creator.role,
             CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
