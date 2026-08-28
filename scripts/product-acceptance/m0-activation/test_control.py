@@ -1418,7 +1418,7 @@ class ControlTests(unittest.TestCase):
             self.fixture.evidence,
             control.MAX_TIMEOUT_SECONDS,
         )
-        self.assertEqual(control.journey_command_timeout(contract, journey, None), 870.0)
+        self.assertEqual(control.journey_command_timeout(contract, journey, None), 1140.0)
         self.assertLess(
             control.journey_command_timeout(contract, journey, None),
             control.MAX_JOURNEY_COMMAND_TIMEOUT_SECONDS,

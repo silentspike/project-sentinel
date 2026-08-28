@@ -846,11 +846,11 @@ class JourneyRunnerTests(unittest.TestCase):
     def test_v2_observe_contract_rejects_unbounded_or_ambiguous_forms(self) -> None:
         mutations = (
             lambda contract: contract.update(max_attempts=0),
-            lambda contract: contract.update(max_attempts=21),
+            lambda contract: contract.update(max_attempts=301),
             lambda contract: contract.update(interval_ms=-1),
             lambda contract: contract.update(interval_ms=2_001),
             lambda contract: contract.update(max_elapsed_ms=49),
-            lambda contract: contract.update(max_elapsed_ms=30_001),
+            lambda contract: contract.update(max_elapsed_ms=300_001),
             lambda contract: contract.update(retry_statuses=[404, 404]),
             lambda contract: contract.update(retry_statuses=[500]),
             lambda contract: contract.update(replay="best_effort"),
