@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Make M0 restart acceptance stop and verify the old systemd invocation before
   starting its replacement, and prioritize the final ECS persist schedule so
-  provider actions cannot be hidden by a heavy shutdown tick (#650).
+  provider actions cannot be hidden by a heavy shutdown tick. Service and timer
+  results remain mandatory while target units use their supported state fields
+  instead of a nonexistent systemd `Result` property (#650).
 
 - Resume the M0 restart journey from a validated existing checkpoint prefix
   and expect exactly the operations replayed by that resumed runner process

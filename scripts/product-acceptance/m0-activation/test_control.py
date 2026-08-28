@@ -89,6 +89,7 @@ class FakeRunner:
                    "SubState": "dead", "Result": "success"}
             for unit in control.INSPECT_UNITS
         }
+        self.states[control.TARGET].pop("Result")
         self.fail_command: tuple[str, ...] | None = None
         self.partial_start_at: str | None = None
         self.rollback_failure: str | None = None
@@ -718,6 +719,18 @@ class ControlTests(unittest.TestCase):
                 with self.assertRaisesRegex(control.ControlError, "unit_not_stopped_cleanly"):
                     self.fixture.activate(runner)
                 self.assertFalse(any(call[1] == "daemon-reload" for call in runner.calls))
+
+    def test_target_readback_does_not_require_unsupported_result_property(self) -> None:
+        values = control.systemctl_show(self.runner, control.TARGET, 5.0)
+        self.assertEqual(
+            values,
+            {"LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead"},
+        )
+        self.assertFalse(control.unit_terminal_failure(control.TARGET, values))
+        self.assertEqual(
+            self.runner.calls[-1][3],
+            "--property=LoadState,ActiveState,SubState",
+        )
 
     def test_failed_nightrun_oneshot_is_not_reset_or_accepted(self) -> None:
         self.runner.states["sentinel-nightrun.service"]["Result"] = "failed"
