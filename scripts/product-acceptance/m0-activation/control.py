@@ -32,13 +32,13 @@ MAX_TIMEOUT_SECONDS = 30.0
 # Keep that budget separate from the outer process deadline so startup work
 # cannot consume the entire child lifetime before the result is serialized.
 MAX_PREFLIGHT_PROBE_TIMEOUT_SECONDS = 15.0
-# The daemon's canonical unit allows 180 seconds for its bounded durable drain.
+# The daemon's canonical unit allows 240 seconds for its bounded durable drain.
 # Rollback must outlive that contract instead of reporting failure while systemd
 # is still completing a valid stop.
-ROLLBACK_COMMAND_TIMEOUT_SECONDS = 190.0
+ROLLBACK_COMMAND_TIMEOUT_SECONDS = 250.0
 # Stop and start are separate systemd jobs so the controller can prove that the
 # old invocation exited cleanly before it starts the replacement invocation.
-RESTART_COMMAND_TIMEOUT_SECONDS = 190.0
+RESTART_COMMAND_TIMEOUT_SECONDS = 250.0
 RESTART_READINESS_DEADLINE_SECONDS = 300.0
 RESTART_READINESS_POLL_SECONDS = 1.0
 # A journey child replays every completed step before it reaches the next

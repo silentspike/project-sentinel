@@ -998,7 +998,7 @@ class ControlTests(unittest.TestCase):
         )
         self.assertGreater(
             control.ROLLBACK_COMMAND_TIMEOUT_SECONDS,
-            180.0,
+            240.0,
         )
 
     def test_running_oneshot_that_later_fails_never_reaches_preflight(self) -> None:
@@ -1432,7 +1432,7 @@ class ControlTests(unittest.TestCase):
             ),
         ])
         self.assertEqual(journey_timeouts, expected_journey_timeouts)
-        self.assertGreater(control.RESTART_COMMAND_TIMEOUT_SECONDS, 180.0)
+        self.assertGreater(control.RESTART_COMMAND_TIMEOUT_SECONDS, 240.0)
         self.assertGreater(
             control.RESTART_COMMAND_TIMEOUT_SECONDS,
             self.fixture.journey_args().timeout,
