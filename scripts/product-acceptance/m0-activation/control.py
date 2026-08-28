@@ -36,10 +36,9 @@ MAX_PREFLIGHT_PROBE_TIMEOUT_SECONDS = 15.0
 # Rollback must outlive that contract instead of reporting failure while systemd
 # is still completing a valid stop.
 ROLLBACK_COMMAND_TIMEOUT_SECONDS = 190.0
-# A restart can consume both the unit's bounded 180-second stop and start
-# phases. Keep that combined systemd job budget separate from the tighter
-# journey HTTP timeout and leave a small process-control grace period.
-RESTART_COMMAND_TIMEOUT_SECONDS = 370.0
+# Stop and start are separate systemd jobs so the controller can prove that the
+# old invocation exited cleanly before it starts the replacement invocation.
+RESTART_COMMAND_TIMEOUT_SECONDS = 190.0
 RESTART_READINESS_DEADLINE_SECONDS = 300.0
 RESTART_READINESS_POLL_SECONDS = 1.0
 # A journey child replays every completed step before it reaches the next
@@ -444,11 +443,11 @@ def validate_command(argv: tuple[str, ...]) -> None:
         and argv[3] in {TARGET, *ONESHOTS}
     ):
         return
+    if verb == "start" and len(argv) == 3 and argv[2] in SERVICES:
+        return
     if verb == "show" and len(argv) == 5 and argv[2] in INSPECT_UNITS:
         return
     if verb == "stop" and len(argv) == 3 and argv[2] in INSPECT_UNITS:
-        return
-    if verb == "restart" and len(argv) == 3 and argv[2] in SERVICES:
         return
     fail("command_not_allowed")
 
@@ -581,9 +580,7 @@ def validate_executables(systemctl: Path, python: Path, preflight: Path, journey
 def systemctl_show(runner: Runner, unit: str, timeout: float) -> dict[str, str]:
     if unit not in INSPECT_UNITS:
         fail("unit_not_allowed")
-    properties = ("LoadState", "ActiveState", "SubState")
-    if unit != TARGET:
-        properties += ("Result",)
+    properties = ("LoadState", "ActiveState", "SubState", "Result")
     result = invoke(runner, (
         str(SYSTEMCTL), "show", unit, f"--property={','.join(properties)}",
         "--no-pager",
@@ -844,7 +841,7 @@ def unit_terminal_failure(unit: str, values: dict[str, str]) -> bool:
     return (
         values["LoadState"] != "loaded"
         or values["ActiveState"] == "failed"
-        or (unit != TARGET and values.get("Result") != "success")
+        or values["Result"] != "success"
     )
 
 
@@ -1280,6 +1277,31 @@ def wait_service(
         sleeper(min(0.05, remaining))
 
 
+def restart_service_cleanly(
+    runner: Runner, unit: str, command_timeout: float, readiness_timeout: float,
+) -> None:
+    result = invoke(runner, (str(SYSTEMCTL), "stop", unit), command_timeout)
+    if result.returncode != 0:
+        fail("restart_stop_failed")
+    stopped = systemctl_show(runner, unit, command_timeout)
+    if (
+        stopped["LoadState"] != "loaded"
+        or stopped["ActiveState"] != "inactive"
+        or stopped["SubState"] != "dead"
+        or stopped["Result"] != "success"
+    ):
+        fail("restart_stop_unclean")
+    result = invoke(runner, (str(SYSTEMCTL), "start", unit), command_timeout)
+    if result.returncode != 0:
+        fail("restart_start_failed")
+    result = invoke(
+        runner, (str(SYSTEMCTL), "start", "--no-block", TARGET), command_timeout
+    )
+    if result.returncode != 0:
+        fail("restart_topology_start_failed")
+    wait_service(runner, unit, readiness_timeout)
+
+
 def _restart_journey(
     runner: Runner, journey: JourneyArgs, control_path: Path,
     expected_control_sha: str, preflight: PreflightArgs, output_path: Path,
@@ -1317,13 +1339,9 @@ def _restart_journey(
             expected_completed, replayed_before,
         )
         unit = mapping[checkpoint]
-        result = invoke(
-            runner, (str(SYSTEMCTL), "restart", unit),
-            RESTART_COMMAND_TIMEOUT_SECONDS,
+        restart_service_cleanly(
+            runner, unit, RESTART_COMMAND_TIMEOUT_SECONDS, journey.timeout
         )
-        if result.returncode != 0:
-            fail("restart_failed")
-        wait_service(runner, unit, journey.timeout)
         readiness = wait_for_restart_readiness(runner, preflight)
         if digest_bytes(read_regular(journey.ledger, "journey_ledger")) != ledger_before:
             fail("ledger_changed_during_restart")
