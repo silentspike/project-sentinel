@@ -816,6 +816,8 @@ def _read_http_response(
 ) -> bytes:
     response = connection.getresponse()
     if response.status != 200:
+        if response.status == 503:
+            raise PreflightError("http_readiness_failed")
         raise PreflightError("http_status")
     if response.headers.get_content_type() != "application/json":
         raise PreflightError("http_content_type")

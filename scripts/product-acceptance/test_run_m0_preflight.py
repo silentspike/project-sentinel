@@ -55,6 +55,12 @@ class TransportHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if self.path in {"/forbidden", "/unavailable"}:
+            self.send_response(403 if self.path == "/forbidden" else 503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path == "/wrong-content":
             self.write_response(b'{"status":"ok"}', "text/plain")
             return
@@ -1534,6 +1540,12 @@ shift_set = 0
                 )
                 with self.assertRaisesRegex(preflight.PreflightError, "http_status"):
                     preflight.default_http(f"{base}/redirect", SECRET, 1.0, 64)
+                with self.assertRaisesRegex(preflight.PreflightError, "http_status"):
+                    preflight.default_http(f"{base}/forbidden", None, 1.0, 64)
+                with self.assertRaisesRegex(
+                    preflight.PreflightError, "http_readiness_failed"
+                ):
+                    preflight.default_http(f"{base}/unavailable", None, 1.0, 64)
             finally:
                 if previous is None:
                     os.environ.pop("HTTP_PROXY", None)
@@ -1610,6 +1622,16 @@ shift_set = 0
                 with self.assertRaisesRegex(preflight.PreflightError, "http_status"):
                     preflight.default_https(
                         f"{preflight.DASHBOARD_ORIGIN}/redirect",
+                        2.0,
+                        1024,
+                        pem,
+                        peer_digest,
+                    )
+                with self.assertRaisesRegex(
+                    preflight.PreflightError, "http_readiness_failed"
+                ):
+                    preflight.default_https(
+                        f"{preflight.DASHBOARD_ORIGIN}/unavailable",
                         2.0,
                         1024,
                         pem,
