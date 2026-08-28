@@ -1216,6 +1216,49 @@ def validate_journey_state(
     return digest_bytes(ledger_raw), digest_bytes(evidence_raw), evidence_value
 
 
+def load_replay_prefix(
+    contract: JourneyContract, journey: JourneyArgs,
+) -> tuple[str, ...]:
+    """Return the validated prefix that the next Journey run must replay."""
+    if not journey.ledger.exists():
+        return ()
+    plan_raw, plan_value = load_json(journey.plan, "journey_plan")
+    ledger_raw, ledger_value = load_json(journey.ledger, "journey_ledger")
+    if (
+        digest_bytes(plan_raw) != contract.raw_sha256
+        or plan_value != contract.plan
+        or ledger_raw != canonical(ledger_value)
+    ):
+        fail("journey_state_noncanonical")
+    module = contract.module
+    original_load_json = module.load_json
+
+    def pinned_load_json(path: Path, _label: str) -> dict[str, Any]:
+        if path == journey.ledger and isinstance(ledger_value, dict):
+            return ledger_value
+        raise module.JourneyError("controller supplied an unknown state path")
+
+    try:
+        module.load_json = pinned_load_json
+        normalized_origin = module.validate_base_url(journey.base_url)
+        ledger = module.load_ledger(
+            journey.ledger, contract.plan["schema_version"],
+            module.digest(contract.plan), contract.plan["journey_id"],
+            normalized_origin,
+        )
+        module.validate_completed_prefix(
+            contract.plan, ledger["completed"], ledger["chain_tip"]
+        )
+    except Exception as exc:
+        raise ControlError("journey_state_invalid") from exc
+    finally:
+        module.load_json = original_load_json
+    return tuple(
+        step_id for step_id in contract.step_ids
+        if step_id in ledger["completed"]
+    )
+
+
 def wait_service(
     runner: Runner, unit: str, timeout: float,
     monotonic: Callable[[], float] = time.monotonic,
@@ -1255,8 +1298,8 @@ def _restart_journey(
         control_path, expected_control_sha, contract.raw_sha256, checkpoints
     )
     records: list[dict[str, str]] = []
-    previously_completed: tuple[str, ...] = ()
     for checkpoint in checkpoints:
+        replayed_before = load_replay_prefix(contract, journey)
         result = invoke(
             runner,
             journey_command(journey, checkpoint),
@@ -1271,7 +1314,7 @@ def _restart_journey(
         expected_completed = contract.step_ids[:checkpoint_index + 1]
         ledger_before, evidence_before, _ = validate_journey_state(
             contract, journey, "checkpoint_reached", checkpoint,
-            expected_completed, previously_completed,
+            expected_completed, replayed_before,
         )
         unit = mapping[checkpoint]
         result = invoke(
@@ -1288,14 +1331,14 @@ def _restart_journey(
             fail("evidence_changed_during_restart")
         records.append({"checkpoint": checkpoint, "unit": unit, "readiness_digest": readiness,
                         "ledger_digest": ledger_before, "evidence_digest": evidence_before})
-        previously_completed = expected_completed
     final_command_timeout = journey_command_timeout(contract, journey, None)
+    replayed_before = load_replay_prefix(contract, journey)
     result = invoke(runner, journey_command(journey, None), final_command_timeout)
     if result.returncode != 0:
         fail("journey_resume_failed")
     validate_journey_state(
         contract, journey, "complete", None, contract.step_ids,
-        previously_completed,
+        replayed_before,
     )
     result = invoke(runner, journey_command(journey, None), final_command_timeout)
     if result.returncode != 0:
