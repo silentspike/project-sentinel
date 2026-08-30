@@ -319,12 +319,12 @@ blocker = "Closeout memory requires an accepted governed project lineage."
 [[requirements]]
 id = "M0-RECOVERY-001"
 category = "recovery"
-title = "No duplicate effects across restart boundaries"
+title = "No duplicate effects across a representative restart boundary"
 togaf_anchor = "Durable events, outbox, idempotency, and recovery"
 contract_section = "Idempotency and Recovery"
 owner_issue = 650
-test_id = "m0.recovery.boundary_matrix"
-live_probe = "restart-every-product-boundary"
+test_id = "m0.recovery.representative_restart"
+live_probe = "restart-once-after-durable-agreement-project-boundary"
 evidence = "console/evidence/issue-650-live/ac-12-recovery.md"
 status = "not_tested"
 

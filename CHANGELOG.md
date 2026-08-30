@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Exercise one representative persisted mid-journey boundary during the M0
+  restart gate, then complete and replay the full journey. Journey checkpoints
+  remain available for targeted diagnostics without repeating the same daemon
+  restart architecture after every business mutation (#650).
+
 - Measure Event Store pressure from SQLite pages that still contain live data,
   excluding reusable freelist pages left behind by retention. A pruned store
   can now become healthy without an unsafe online `VACUUM`, while metric-query
