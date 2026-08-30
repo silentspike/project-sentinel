@@ -214,7 +214,7 @@ class M0JourneyContractTests(unittest.TestCase):
             ["prepare_candidate", "assign_qa", "execute_qa", "release", "accept", "closeout"],
         )
 
-    def test_restart_control_covers_every_checkpoint_and_pins_plan_bytes(self) -> None:
+    def test_restart_control_selects_one_representative_checkpoint(self) -> None:
         contract = activation.load_journey_contract(PLAN_PATH)
         control_raw = CONTROL_PATH.read_bytes()
         mapping = activation.load_control_plan(
@@ -223,8 +223,10 @@ class M0JourneyContractTests(unittest.TestCase):
             contract.raw_sha256,
             list(contract.checkpoints),
         )
-        self.assertEqual(set(mapping), set(contract.checkpoints))
-        self.assertEqual(set(mapping.values()), {"sentinel-daemon.service"})
+        self.assertEqual(
+            mapping,
+            {"after_agreement_project": "sentinel-daemon.service"},
+        )
 
     def test_release_and_provisioning_authorities_include_the_journey(self) -> None:
         generator = (REPO_ROOT / "deploy/generate-manifest.sh").read_text(
