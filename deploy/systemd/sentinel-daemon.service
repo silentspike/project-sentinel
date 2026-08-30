@@ -22,8 +22,9 @@ TimeoutStartSec=180
 # The daemon admits no new LLM work after SIGTERM, but an already reserved
 # provider request may use the configured 150-second request deadline. Keep
 # enough time for terminal persistence through the next ECS schedule and the
-# remaining supervised shutdown. The maximum path is 160s provider join + 30s
-# ECS action barrier + 6s workflow reconciliation + 8s ECS join.
+# remaining supervised shutdown. The maximum path is 160s provider join + 5s
+# action-forwarder drain + 45s ECS action barrier + 6s workflow reconciliation
+# + 8s ECS join = 224s.
 TimeoutStopSec=240
 MemoryMax=2G
 CPUAffinity=0-3
