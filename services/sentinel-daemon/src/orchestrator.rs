@@ -2198,7 +2198,9 @@ fn join_workflow_reconciler(handle: std::thread::JoinHandle<()>, timeout: Durati
 }
 
 #[cfg(feature = "llm")]
-const ECS_ACTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const LLM_ACTION_FORWARDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "llm")]
+const ECS_ACTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[cfg(feature = "llm")]
 async fn drain_llm_actions_before_ecs_shutdown(
@@ -2207,6 +2209,7 @@ async fn drain_llm_actions_before_ecs_shutdown(
     action_drain_tx: &mpsc::Sender<mpsc::SyncSender<()>>,
     shutdown: &AtomicBool,
     bridge_timeout: Duration,
+    action_forwarder_timeout: Duration,
     action_timeout: Duration,
 ) -> Result<()> {
     match tokio::time::timeout(bridge_timeout, &mut bridge_handle).await {
@@ -2219,7 +2222,7 @@ async fn drain_llm_actions_before_ecs_shutdown(
         }
     }
 
-    match tokio::time::timeout(action_timeout, &mut action_forwarder_handle).await {
+    match tokio::time::timeout(action_forwarder_timeout, &mut action_forwarder_handle).await {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(error))) => return Err(error.context("LLM action forwarding failed")),
         Ok(Err(error)) => return Err(anyhow!("LLM action forwarder failed: {error}")),
@@ -3565,10 +3568,15 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         &action_drain_tx,
         shutdown.as_ref(),
         llm_bridge_join_timeout,
+        // Once the provider bridge has closed, forwarding through the
+        // unbounded ECS channel is local and must not consume the budget
+        // reserved for an in-flight synchronous ECS post-schedule phase.
+        LLM_ACTION_FORWARDER_DRAIN_TIMEOUT,
         // A stop can arrive while the synchronous ECS thread is below its
         // schedule in episode projection or another bounded post-schedule
         // phase. The barrier must cover that in-flight phase and the following
-        // Input-to-Persist schedule, not only the legacy ECS join window.
+        // Input-to-Persist schedule. Keep the aggregate worst-case shutdown
+        // below systemd's 240-second stop deadline.
         ECS_ACTION_DRAIN_TIMEOUT,
     )
     .await;
@@ -12089,6 +12097,7 @@ mod tests {
             action_forwarder,
             &drain_tx,
             &shutdown,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),
         )
