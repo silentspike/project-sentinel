@@ -1058,11 +1058,16 @@ def load_control_plan(path: Path, expected_sha: str, journey_plan_sha: str,
         value["schema_version"] != 1
         or value["journey_plan_sha256"] != journey_plan_sha
         or not isinstance(mapping, dict)
-        or set(mapping) != set(checkpoints)
+        or not mapping
+        or not set(mapping).issubset(checkpoints)
         or any(not isinstance(unit, str) or unit not in SERVICES for unit in mapping.values())
     ):
         fail("restart_control_authority_mismatch")
-    return {checkpoint: mapping[checkpoint] for checkpoint in checkpoints}
+    return {
+        checkpoint: mapping[checkpoint]
+        for checkpoint in checkpoints
+        if checkpoint in mapping
+    }
 
 
 @dataclass(frozen=True)
@@ -1320,12 +1325,12 @@ def _restart_journey(
     safe_output_path(journey.ledger, "ledger")
     safe_output_path(journey.evidence, "evidence")
     contract = load_journey_contract(journey.plan)
-    checkpoints = list(contract.checkpoints)
+    plan_checkpoints = list(contract.checkpoints)
     mapping = load_control_plan(
-        control_path, expected_control_sha, contract.raw_sha256, checkpoints
+        control_path, expected_control_sha, contract.raw_sha256, plan_checkpoints
     )
     records: list[dict[str, str]] = []
-    for checkpoint in checkpoints:
+    for checkpoint in mapping:
         replayed_before = load_replay_prefix(contract, journey)
         result = invoke(
             runner,

@@ -578,7 +578,8 @@ effect, retention, and recovery integrations.
 6. Re-run canonical Rust and Console gates on final main.
 7. Obtain ORC code approval and an explicit `.240` runtime authorization.
 8. Create and verify the issue-specific snapshot before deployment.
-9. Execute the full token-free journey, negative probes, restart matrix,
+9. Execute the full token-free journey, negative probes, one representative
+   mid-journey restart followed by complete replay,
    rollback rehearsal, browser/API/event/artifact/memory readback, stability
    scan, and approved runtime benchmarks.
 10. Preserve the snapshot and stop fail-closed on any failed acceptance

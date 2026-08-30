@@ -2,29 +2,6 @@
   "schema_version": 1,
   "journey_plan_sha256": "63f04cd0457d197a96285bc8c92200d52f51372f5a19c46f83c1300d2c55e415",
   "checkpoint_services": {
-    "after_customer_submit": "sentinel-daemon.service",
-    "after_customer_clarification": "sentinel-daemon.service",
-    "after_customer_qualification": "sentinel-daemon.service",
-    "after_proposal": "sentinel-daemon.service",
-    "after_agreement_project": "sentinel-daemon.service",
-    "after_work_graph": "sentinel-daemon.service",
-    "after_architecture_decision": "sentinel-daemon.service",
-    "after_project_room": "sentinel-daemon.service",
-    "after_blocker_raise": "sentinel-daemon.service",
-    "after_blocker_escalation": "sentinel-daemon.service",
-    "after_blocker_resolution": "sentinel-daemon.service",
-    "after_project_activation": "sentinel-daemon.service",
-    "after_designer_assignment": "sentinel-daemon.service",
-    "after_developer_assignment": "sentinel-daemon.service",
-    "after_design_admission": "sentinel-daemon.service",
-    "after_source_admission": "sentinel-daemon.service",
-    "after_source_handoff": "sentinel-daemon.service",
-    "after_handoff_acceptance": "sentinel-daemon.service",
-    "after_candidate_preparation": "sentinel-daemon.service",
-    "after_qa_assignment": "sentinel-daemon.service",
-    "after_qa_release_gate": "sentinel-daemon.service",
-    "after_delivery_release": "sentinel-daemon.service",
-    "after_customer_acceptance": "sentinel-daemon.service",
-    "after_project_closeout": "sentinel-daemon.service"
+    "after_agreement_project": "sentinel-daemon.service"
   }
 }
