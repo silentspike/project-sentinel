@@ -2200,7 +2200,7 @@ fn join_workflow_reconciler(handle: std::thread::JoinHandle<()>, timeout: Durati
 #[cfg(feature = "llm")]
 const LLM_ACTION_FORWARDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "llm")]
-const ECS_ACTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(45);
+const ECS_ACTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[cfg(feature = "llm")]
 async fn drain_llm_actions_before_ecs_shutdown(

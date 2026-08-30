@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Allow the ordered ECS action-persist barrier up to 60 seconds to finish one
+  already-running durable episode commit during shutdown. The total worst-case
+  internal drain remains 239 seconds; the 260-second systemd ceiling and
+  270-second acceptance-controller timeout leave explicit orchestration margin
+  without delaying a normally completing shutdown (#650).
+
 - Exercise one representative persisted mid-journey boundary during the M0
   restart gate, then complete and replay the full journey. Journey checkpoints
   remain available for targeted diagnostics without repeating the same daemon
