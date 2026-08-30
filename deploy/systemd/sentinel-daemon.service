@@ -23,9 +23,10 @@ TimeoutStartSec=180
 # provider request may use the configured 150-second request deadline. Keep
 # enough time for terminal persistence through the next ECS schedule and the
 # remaining supervised shutdown. The maximum path is 160s provider join + 5s
-# action-forwarder drain + 45s ECS action barrier + 6s workflow reconciliation
-# + 8s ECS join = 224s.
-TimeoutStopSec=240
+# action-forwarder drain + 60s ECS action barrier + 6s workflow reconciliation
+# + 8s ECS join = 239s. The outer limit leaves 21 seconds for systemd and
+# scheduler overhead without extending a normally completing shutdown.
+TimeoutStopSec=260
 MemoryMax=2G
 CPUAffinity=0-3
 OOMScoreAdjust=-1000
