@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Quiesce the ECS loop at the first schedule boundary after SIGTERM and keep it
+  on Input-to-Persist schedules only until the provider-action drain barrier is
+  armed and acknowledged. Episode projection now also yields between durable
+  event commits, so a batch already in flight cannot consume the graceful-
+  shutdown budget and resumes from its exact committed cursor (#650).
+
 - Make M0 restart acceptance stop and verify the old systemd invocation before
   starting its replacement, and prioritize the final ECS persist schedule so
   provider actions cannot be hidden by a heavy shutdown tick. Service and timer

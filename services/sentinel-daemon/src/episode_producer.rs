@@ -583,6 +583,25 @@ impl EpisodeProducer {
         _current_tick: u64,
         _tick_rate_s: f64,
     ) -> usize {
+        self.tick_until_cancelled(event_store, || false)
+    }
+
+    /// Process one bounded batch while yielding at durable event boundaries.
+    ///
+    /// Cancellation never advances past the last event whose projection and
+    /// source frontier were committed. A later tick or restart can therefore
+    /// resume from the same authoritative cursor without duplicating effects.
+    pub(crate) fn tick_until_cancelled<F>(
+        &mut self,
+        event_store: &EventStore,
+        mut should_cancel: F,
+    ) -> usize
+    where
+        F: FnMut() -> bool,
+    {
+        if should_cancel() {
+            return 0;
+        }
         let events = match event_store.get_events_since_with_id(self.last_event_id, BATCH_LIMIT) {
             Ok(events) => events,
             Err(e) => {
@@ -606,8 +625,13 @@ impl EpisodeProducer {
 
         let mut total = 0;
         let mut agents_with_episodes = std::collections::HashSet::new();
+        let mut cancelled = false;
 
         for (source_row_id, event) in &events {
+            if should_cancel() {
+                cancelled = true;
+                break;
+            }
             effect_reference_tick = effect_reference_tick.max(event.tick);
             let request_digest = source_request_digest(event);
 
@@ -854,6 +878,15 @@ impl EpisodeProducer {
 
         if let Err(error) = self.refresh_admission_state() {
             warn!(%error, "Episode Producer: admission snapshot failed closed");
+        }
+
+        if cancelled {
+            info!(
+                episodes = total,
+                cursor = self.last_event_id,
+                "Episode Producer: shutdown paused batch at a durable event boundary"
+            );
+            return total;
         }
 
         if total > 0 {
@@ -2920,6 +2953,60 @@ mod tests {
             serde_json::to_vec(&rebuilt).unwrap()
         );
         assert_eq!(evidence, rebuilt_evidence);
+    }
+
+    #[test]
+    fn shutdown_cancellation_resumes_after_the_last_committed_event_without_duplicates() {
+        use std::cell::Cell;
+
+        let (hippocampus, dir) = temp_hippocampus();
+        let event_store = temp_event_store(&dir);
+        let mut producer =
+            EpisodeProducer::new(hippocampus, &[(1, "Thomas".to_string())], &event_store).unwrap();
+        for action in ["first", "second", "third"] {
+            append_payload(
+                &event_store,
+                &DomainEventPayload::BioActionPerformed {
+                    agent_id: AgentId(1),
+                    action: action.to_string(),
+                },
+                1,
+            );
+        }
+
+        let checks = Cell::new(0_u8);
+        assert_eq!(
+            producer.tick_until_cancelled(&event_store, || {
+                let current = checks.get();
+                checks.set(current.saturating_add(1));
+                current >= 2
+            }),
+            1
+        );
+        assert_eq!(producer.last_event_id, 1);
+        assert_eq!(
+            producer
+                .hippocampus()
+                .store()
+                .load_episodes("Thomas")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert_eq!(producer.tick(&event_store, 2, 1.0), 2);
+        assert_eq!(producer.last_event_id, 3);
+        let episodes = producer
+            .hippocampus()
+            .store()
+            .load_episodes("Thomas")
+            .unwrap();
+        assert_eq!(episodes.len(), 3);
+        let unique_ids = episodes
+            .iter()
+            .map(|episode| episode.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique_ids.len(), 3);
     }
 
     #[test]
