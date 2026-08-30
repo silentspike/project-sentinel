@@ -3265,6 +3265,38 @@ impl EventStore {
         &self.path
     }
 
+    /// Returns bytes occupied by live SQLite pages, excluding reusable freelist pages.
+    ///
+    /// Retention deletes rows without shrinking the database file. Using the file length
+    /// for pressure decisions would therefore keep reporting an already-pruned store as
+    /// oversized even though SQLite can reuse almost all of its allocated pages.
+    pub fn live_storage_bytes(&self) -> anyhow::Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("Lock poisoned: {error}"))?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let freelist_count: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        anyhow::ensure!(page_size > 0, "SQLite page size must be positive");
+        anyhow::ensure!(page_count >= 0, "SQLite page count must be non-negative");
+        anyhow::ensure!(
+            freelist_count >= 0,
+            "SQLite freelist count must be non-negative"
+        );
+        let page_size = u64::try_from(page_size)?;
+        let page_count = u64::try_from(page_count)?;
+        let freelist_count = u64::try_from(freelist_count)?;
+        let live_pages = page_count.checked_sub(freelist_count).ok_or_else(|| {
+            anyhow::anyhow!(
+                "SQLite freelist count {freelist_count} exceeds page count {page_count}"
+            )
+        })?;
+        live_pages
+            .checked_mul(page_size)
+            .ok_or_else(|| anyhow::anyhow!("SQLite live storage byte count overflow"))
+    }
+
     /// Setzt den Offset einer Projection (upsert, monoton steigend).
     ///
     /// Verhalten:
@@ -5953,5 +5985,41 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn platform_controlplane_live_storage_bytes_excludes_reusable_freelist_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = EventStore::open(directory.path().join("events.db").to_str().unwrap()).unwrap();
+        let (page_size, page_count, freelist_count) = {
+            let connection = store.conn.lock().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE pressure_fixture(payload BLOB NOT NULL);
+                     INSERT INTO pressure_fixture(payload) VALUES (zeroblob(8388608));
+                     DELETE FROM pressure_fixture;",
+                )
+                .unwrap();
+            (
+                connection
+                    .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                connection
+                    .query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                connection
+                    .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+            )
+        };
+
+        assert!(freelist_count > 0);
+        assert_eq!(
+            store.live_storage_bytes().unwrap(),
+            u64::try_from((page_count - freelist_count) * page_size).unwrap()
+        );
+        assert!(
+            store.live_storage_bytes().unwrap() < u64::try_from(page_count * page_size).unwrap()
+        );
     }
 }

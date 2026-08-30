@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Measure Event Store pressure from SQLite pages that still contain live data,
+  excluding reusable freelist pages left behind by retention. A pruned store
+  can now become healthy without an unsafe online `VACUUM`, while metric-query
+  failures retain the conservative physical-file fallback (#650).
+
 - Quiesce the ECS loop at the first schedule boundary after SIGTERM and keep it
   on Input-to-Persist schedules only until the provider-action drain barrier is
   armed and acknowledged. Episode projection now also yields between durable
