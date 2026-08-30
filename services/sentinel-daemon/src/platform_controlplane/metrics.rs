@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct PlatformMetrics {
     /// Namen gestallter Agents (aus eBPF Collector).
     pub stalled_agents: Vec<String>,
-    /// events.db Dateigroesse in Bytes.
+    /// Bytes occupied by live events.db pages (allocated freelist pages excluded).
     pub event_store_size_bytes: u64,
     /// max(event_id) - projection_offset.
     pub projection_lag: i64,
@@ -91,10 +91,13 @@ pub fn collect_with_cgroup_root(
             .collect();
     }
 
-    // 2. Event Store Dateigroesse
-    if let Ok(meta) = std::fs::metadata(events_db_path) {
-        metrics.event_store_size_bytes = meta.len();
-    }
+    // 2. Event Store live pages. Retention leaves reusable pages in the SQLite
+    // file, so the allocated file length is not a valid post-prune health check.
+    metrics.event_store_size_bytes = event_store.live_storage_bytes().unwrap_or_else(|_| {
+        std::fs::metadata(events_db_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    });
 
     // 3. Projection Lag
     let latest_id = event_store.get_latest_event_id().unwrap_or(0);
