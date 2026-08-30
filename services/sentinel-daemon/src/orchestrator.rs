@@ -2208,10 +2208,17 @@ async fn drain_llm_actions_before_ecs_shutdown(
     mut action_forwarder_handle: tokio::task::JoinHandle<Result<()>>,
     action_drain_tx: &mpsc::Sender<mpsc::SyncSender<()>>,
     shutdown: &AtomicBool,
+    action_drain_armed: &AtomicBool,
     bridge_timeout: Duration,
     action_forwarder_timeout: Duration,
     action_timeout: Duration,
 ) -> Result<()> {
+    // Quiesce the synchronous ECS thread as soon as shutdown starts. Until the
+    // ordered barrier is armed below, it keeps running only Input-to-Persist
+    // schedules so provider results can still arrive without entering another
+    // expensive post-schedule phase.
+    shutdown.store(true, Ordering::SeqCst);
+
     match tokio::time::timeout(bridge_timeout, &mut bridge_handle).await {
         Ok(Ok(Ok(()))) => info!("LLM Bridge provider tasks drained"),
         Ok(Ok(Err(reason))) => return Err(anyhow!("LLM Bridge shutdown failed: {reason}")),
@@ -2236,10 +2243,9 @@ async fn drain_llm_actions_before_ecs_shutdown(
     action_drain_tx
         .send(drained_tx)
         .map_err(|_| anyhow!("ECS action-drain channel closed before shutdown"))?;
-    // Every provider result is now queued before this barrier. Wake the ECS
-    // shutdown path before another heavy post-schedule phase can delay the
-    // final schedule that applies and persists those results.
-    shutdown.store(true, Ordering::SeqCst);
+    // Sending happens-before arming under SeqCst, so the ECS thread cannot
+    // mistake an armed but not-yet-visible request for a completed barrier.
+    action_drain_armed.store(true, Ordering::SeqCst);
     let drain_result = tokio::task::spawn_blocking(move || drained_rx.recv_timeout(action_timeout))
         .await
         .context("join ECS action-drain acknowledgement")?;
@@ -2253,6 +2259,36 @@ fn collect_action_drain_requests(
     pending: &mut Vec<mpsc::SyncSender<()>>,
 ) {
     pending.extend(action_drain_rx.try_iter());
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EcsShutdownProgress {
+    Running,
+    AwaitingDrain,
+    Drained,
+}
+
+fn ecs_shutdown_progress(
+    shutdown: &AtomicBool,
+    action_drain_armed: &AtomicBool,
+    action_drain_rx: &mpsc::Receiver<mpsc::SyncSender<()>>,
+    pending: &mut Vec<mpsc::SyncSender<()>>,
+) -> EcsShutdownProgress {
+    if !shutdown.load(Ordering::SeqCst) {
+        return EcsShutdownProgress::Running;
+    }
+    if !action_drain_armed.load(Ordering::SeqCst) {
+        return EcsShutdownProgress::AwaitingDrain;
+    }
+    // The sender queues the request before publishing `armed`. Collect only
+    // after the acquiring atomic load so an empty receive cannot race ahead of
+    // that publication and incorrectly declare the barrier complete.
+    collect_action_drain_requests(action_drain_rx, pending);
+    if pending.is_empty() {
+        EcsShutdownProgress::Drained
+    } else {
+        EcsShutdownProgress::AwaitingDrain
+    }
 }
 
 fn acknowledge_action_drain_requests(pending: &mut Vec<mpsc::SyncSender<()>>) {
@@ -3051,6 +3087,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- Shutdown Flag --
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_ecs = Arc::clone(&shutdown);
+    let action_drain_armed = Arc::new(AtomicBool::new(!cfg!(feature = "llm")));
+    let action_drain_armed_ecs = Arc::clone(&action_drain_armed);
 
     // -- Room Distance Map + Room Info Map (BFS-vorberechnet fuer Transit-Dauer + Capacity + Floor) --
     let rooms_toml_path = config.config_dir.join("rooms.toml");
@@ -3251,6 +3289,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 time_scale,
                 config.phase_timing_enabled,
                 shutdown_ecs,
+                action_drain_armed_ecs,
                 controlplane,
                 runtime_orch,
                 sandbox,
@@ -3567,16 +3606,16 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         llm_action_forwarder_handle,
         &action_drain_tx,
         shutdown.as_ref(),
+        action_drain_armed.as_ref(),
         llm_bridge_join_timeout,
         // Once the provider bridge has closed, forwarding through the
         // unbounded ECS channel is local and must not consume the budget
         // reserved for an in-flight synchronous ECS post-schedule phase.
         LLM_ACTION_FORWARDER_DRAIN_TIMEOUT,
-        // A stop can arrive while the synchronous ECS thread is below its
-        // schedule in episode projection or another bounded post-schedule
-        // phase. The barrier must cover that in-flight phase and the following
-        // Input-to-Persist schedule. Keep the aggregate worst-case shutdown
-        // below systemd's 240-second stop deadline.
+        // The ECS thread quiesces as soon as this drain starts, then runs only
+        // Input-to-Persist schedules until the armed barrier is acknowledged.
+        // Keep a bounded failure ceiling without budgeting for episode or
+        // snapshot work that shutdown is required to skip.
         ECS_ACTION_DRAIN_TIMEOUT,
     )
     .await;
@@ -7952,6 +7991,7 @@ fn ecs_tick_loop(
     time_scale: f32,
     phase_timing_enabled: bool,
     shutdown: Arc<AtomicBool>,
+    action_drain_armed: Arc<AtomicBool>,
     mut controlplane: ControlplaneKernel,
     mut runtime_orch: RuntimeOrchestrator,
     sandbox: SandboxEnforcer,
@@ -8711,11 +8751,14 @@ fn ecs_tick_loop(
     loop {
         let tick_start = Instant::now();
 
-        if shutdown.load(Ordering::SeqCst) {
-            collect_action_drain_requests(&action_drain_rx, &mut pending_action_drains);
-            if pending_action_drains.is_empty() {
-                break;
-            }
+        if ecs_shutdown_progress(
+            shutdown.as_ref(),
+            action_drain_armed.as_ref(),
+            &action_drain_rx,
+            &mut pending_action_drains,
+        ) == EcsShutdownProgress::Drained
+        {
+            break;
         }
         shift_snapshot_blocked_this_tick = false;
         #[cfg(test)]
@@ -8828,6 +8871,37 @@ fn ecs_tick_loop(
             collect_action_drain_requests(&action_drain_rx, &mut pending_action_drains);
             schedule.run(&mut world);
             acknowledge_action_drain_requests(&mut pending_action_drains);
+        }
+
+        // Do not enter synchronous episode projection, health analysis, or
+        // another post-schedule phase after shutdown has requested the ordered
+        // action barrier. A request that arrived during the schedule remains
+        // pending and receives exactly one following Input-to-Persist schedule;
+        // an already acknowledged request exits immediately.
+        match ecs_shutdown_progress(
+            shutdown.as_ref(),
+            action_drain_armed.as_ref(),
+            &action_drain_rx,
+            &mut pending_action_drains,
+        ) {
+            EcsShutdownProgress::Running => {}
+            EcsShutdownProgress::Drained => {
+                if world_background_allowed {
+                    tick_count += 1;
+                }
+                drop(owner_tick_barrier);
+                break;
+            }
+            EcsShutdownProgress::AwaitingDrain => {
+                if world_background_allowed {
+                    tick_count += 1;
+                }
+                drop(owner_tick_barrier);
+                if !world_background_allowed {
+                    std::thread::sleep(tick_rate.min(Duration::from_millis(50)));
+                }
+                continue;
+            }
         }
 
         // Per-Phase-Dauern recorden (#381): 10x observe, ~25ns each — im Budget.
@@ -9677,28 +9751,6 @@ fn ecs_tick_loop(
             if let Err(e) = controlplane.cycle(&mut world, tick_count) {
                 error!(error = %e, tick = tick_count, "Controlplane-Zyklus fehlgeschlagen");
             }
-        }
-
-        // A stop can arrive after this tick's schedule. If its ordered action
-        // barrier has not run yet, skip roster/consolidation work and enter the
-        // next schedule immediately. Once the barrier is acknowledged, exit.
-        if shutdown.load(Ordering::SeqCst) {
-            collect_action_drain_requests(&action_drain_rx, &mut pending_action_drains);
-            if pending_action_drains.is_empty() {
-                if world_background_allowed {
-                    tick_count += 1;
-                }
-                drop(owner_tick_barrier);
-                break;
-            }
-            if world_background_allowed {
-                tick_count += 1;
-            }
-            drop(owner_tick_barrier);
-            if !world_background_allowed {
-                std::thread::sleep(tick_rate.min(Duration::from_millis(50)));
-            }
-            continue;
         }
 
         // Shift-Erkennung (alle 60 Ticks = ~1 Minute bei 1s Tick-Rate)
@@ -11764,12 +11816,28 @@ fn ecs_tick_loop(
         }
 
         // Episode Producer (alle 30 Ticks = ~30s bei 1s Tick-Rate)
-        if unfenced_world_background_work_allowed(owner_registry, &restore_fence)
+        if !shutdown.load(Ordering::SeqCst)
+            && unfenced_world_background_work_allowed(owner_registry, &restore_fence)
             && episode_producer.should_run(tick_count)
         {
-            let tick_rate_s = tick_rate.as_secs_f64();
-            episode_producer.tick(&event_store_for_episodes, tick_count, tick_rate_s);
-            publish_episode_projection_health(&runtime_health, &episode_projection_admission);
+            episode_producer.tick_until_cancelled(&event_store_for_episodes, || {
+                shutdown.load(Ordering::SeqCst)
+            });
+            if !shutdown.load(Ordering::SeqCst) {
+                publish_episode_projection_health(&runtime_health, &episode_projection_admission);
+            }
+        }
+
+        // Shutdown may arrive while one episode event is being committed. The
+        // producer yields at the next durable cursor; re-check immediately so
+        // that the same tick cannot continue into a runtime snapshot,
+        // checkpoint, or adaptive sleep before the action-drain schedule.
+        if shutdown.load(Ordering::SeqCst) {
+            if world_background_allowed {
+                tick_count += 1;
+            }
+            drop(owner_tick_barrier);
+            continue;
         }
 
         // Periodischer Runtime-Snapshot (alle 600 Ticks = ~10 Minuten bei 1s Tick-Rate).
@@ -12076,6 +12144,7 @@ mod tests {
         });
         let (drain_tx, drain_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
         let shutdown = AtomicBool::new(false);
+        let action_drain_armed = AtomicBool::new(false);
         let persisted = Arc::new(AtomicBool::new(false));
         let persisted_from_ecs = Arc::clone(&persisted);
         let ecs = std::thread::spawn(move || {
@@ -12097,6 +12166,7 @@ mod tests {
             action_forwarder,
             &drain_tx,
             &shutdown,
+            &action_drain_armed,
             Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -12106,6 +12176,7 @@ mod tests {
 
         ecs.join().unwrap();
         assert!(shutdown.load(Ordering::SeqCst));
+        assert!(action_drain_armed.load(Ordering::SeqCst));
         assert!(persisted.load(Ordering::SeqCst));
     }
 
@@ -12113,6 +12184,8 @@ mod tests {
     fn ecs_action_drain_barrier_requires_a_following_schedule_boundary() {
         let (drain_tx, drain_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
         let mut pending = Vec::new();
+        let shutdown = AtomicBool::new(false);
+        let action_drain_armed = AtomicBool::new(false);
 
         // This models the pre-schedule collection point.
         collect_action_drain_requests(&drain_rx, &mut pending);
@@ -12123,9 +12196,33 @@ mod tests {
         acknowledge_action_drain_requests(&mut pending);
         assert_eq!(drained_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
 
-        // Only the next schedule boundary may observe and acknowledge it.
-        collect_action_drain_requests(&drain_rx, &mut pending);
+        // The immediate post-schedule boundary must detect shutdown before any
+        // expensive projection/snapshot phase and request one following tick.
+        shutdown.store(true, Ordering::SeqCst);
+        assert_eq!(
+            ecs_shutdown_progress(&shutdown, &action_drain_armed, &drain_rx, &mut pending,),
+            EcsShutdownProgress::AwaitingDrain,
+        );
+        assert!(pending.is_empty());
+        assert_eq!(drained_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        // Arming publishes the already-queued request. The next pre-schedule
+        // boundary collects it but must not acknowledge it before that
+        // schedule has applied and persisted the forwarded actions.
+        action_drain_armed.store(true, Ordering::SeqCst);
+        assert_eq!(
+            ecs_shutdown_progress(&shutdown, &action_drain_armed, &drain_rx, &mut pending,),
+            EcsShutdownProgress::AwaitingDrain,
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(drained_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        // Only the post-schedule boundary may acknowledge the request.
         acknowledge_action_drain_requests(&mut pending);
+        assert_eq!(
+            ecs_shutdown_progress(&shutdown, &action_drain_armed, &drain_rx, &mut pending,),
+            EcsShutdownProgress::Drained,
+        );
         assert_eq!(drained_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
     }
 
@@ -14602,6 +14699,7 @@ mod tests {
             if exercise_shift { 2.0 } else { 1.0 },
             true,
             shutdown,
+            Arc::new(AtomicBool::new(true)),
             test_controlplane(temp_root),
             RuntimeOrchestrator::new(8).with_event_store(Arc::clone(&event_store)),
             test_sandbox(),
@@ -16635,6 +16733,7 @@ mod tests {
             1.0,
             true,
             shutdown,
+            Arc::new(AtomicBool::new(true)),
             test_controlplane(&tmp),
             RuntimeOrchestrator::new(4).with_event_store(Arc::clone(&event_store)),
             test_sandbox(),
@@ -17279,6 +17378,7 @@ mod tests {
             1.0,
             true,
             shutdown,
+            Arc::new(AtomicBool::new(true)),
             test_controlplane(&tmp),
             RuntimeOrchestrator::new(4).with_event_store(Arc::clone(&event_store)),
             test_sandbox(),
@@ -18737,6 +18837,7 @@ mod tests {
             1.0, // time_scale
             true,
             shutdown,
+            Arc::new(AtomicBool::new(true)),
             controlplane,
             runtime_orch,
             test_sandbox(),
@@ -18835,6 +18936,7 @@ mod tests {
                 1.0, // time_scale
                 true,
                 shutdown,
+                Arc::new(AtomicBool::new(true)),
                 controlplane,
                 runtime_orch,
                 test_sandbox(),
@@ -18950,6 +19052,7 @@ mod tests {
                 1.0, // time_scale
                 true,
                 shutdown,
+                Arc::new(AtomicBool::new(true)),
                 controlplane,
                 runtime_orch,
                 test_sandbox(),
@@ -19084,6 +19187,7 @@ mod tests {
                 1.0,
                 true,
                 shutdown,
+                Arc::new(AtomicBool::new(true)),
                 test_controlplane(&tmp),
                 runtime_orch,
                 test_sandbox(),
@@ -19228,6 +19332,7 @@ mod tests {
                 1.0,
                 true,
                 shutdown,
+                Arc::new(AtomicBool::new(true)),
                 test_controlplane(&tmp),
                 runtime_orch,
                 test_sandbox(),
@@ -19361,6 +19466,7 @@ mod tests {
                 1.0,
                 true,
                 shutdown,
+                Arc::new(AtomicBool::new(true)),
                 controlplane,
                 runtime_orch,
                 test_sandbox(),
@@ -20177,6 +20283,31 @@ mod tests {
         assert!(source.contains(
             "attempt_shutdown_runtime_snapshot(\n        owner_registry,\n        &restore_fence,\n        shift_snapshot_fenced,"
         ));
+    }
+
+    #[test]
+    fn episode_shutdown_boundary_precedes_runtime_snapshot_and_tick_sleep() {
+        let source = include_str!("orchestrator.rs");
+        let episode = source
+            .find("episode_producer.tick_until_cancelled")
+            .expect("cooperative episode projection callsite");
+        let shutdown_boundary = source[episode..]
+            .find("if shutdown.load(Ordering::SeqCst)")
+            .map(|offset| episode + offset)
+            .expect("post-episode shutdown boundary");
+        let periodic_snapshot = source[shutdown_boundary..]
+            .find("attempt_periodic_runtime_snapshot(")
+            .map(|offset| shutdown_boundary + offset)
+            .expect("periodic runtime snapshot after shutdown boundary");
+        let adaptive_sleep = source[periodic_snapshot..]
+            .find("std::thread::sleep(effective_rate - tick_elapsed)")
+            .map(|offset| periodic_snapshot + offset)
+            .expect("adaptive tick sleep after periodic runtime snapshot");
+
+        assert!(episode < shutdown_boundary);
+        assert!(shutdown_boundary < periodic_snapshot);
+        assert!(periodic_snapshot < adaptive_sleep);
+        assert!(source[shutdown_boundary..periodic_snapshot].contains("continue;"));
     }
 
     #[test]
