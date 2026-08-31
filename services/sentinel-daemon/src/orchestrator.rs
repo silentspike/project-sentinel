@@ -3524,19 +3524,34 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                         );
 
                         // ADR-001: HTTP POST to Gateway Control Plane for model-swap
-                        let target_provider = extract_swap_provider(&alert.details);
+                        let Some(target_provider) = extract_swap_provider(&alert.details) else {
+                            warn!(
+                                agent_id = %alert.agent_id,
+                                alert_ref = "model_swap_provider_not_authoritative",
+                                "Model-Swap ohne expliziten Provider verworfen"
+                            );
+                            continue;
+                        };
                         let url = format!("{}/control/agent-provider", gateway_url);
                         let body = serde_json::json!({
                             "agent_id": alert.agent_id,
                             "provider": target_provider,
                         });
                         match http_client.post(&url).json(&body).send().await {
-                            Ok(resp) => {
+                            Ok(resp) if resp.status().is_success() => {
                                 info!(
                                     status = %resp.status(),
                                     agent_id = %alert.agent_id,
                                     provider = %target_provider,
                                     "Model-Swap an Gateway gesendet"
+                                );
+                            }
+                            Ok(resp) => {
+                                warn!(
+                                    status = %resp.status(),
+                                    agent_id = %alert.agent_id,
+                                    provider = %target_provider,
+                                    "Model-Swap vom Gateway abgelehnt"
                                 );
                             }
                             Err(e) => {
@@ -3662,22 +3677,25 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     Ok(())
 }
 
-/// Extrahiert den Ziel-Provider aus den Swap-Alert Details.
+/// Extract an explicit provider directive from a Judge swap alert.
 ///
-/// Falls die Details einen bekannten Provider-Namen enthalten, wird dieser zurueckgegeben.
-/// "claude-code" wird VOR "claude" geprueft (laengster Match zuerst).
-/// Fallback: "claude-code" (Subscription-basiert, kein API Key noetig).
+/// Natural-language alert details are evidence, not provider authority. Only one
+/// exact `provider=<catalog-id>` token may request a control-plane mutation; a
+/// missing, unknown, or ambiguous directive leaves the current provider intact.
 #[cfg(feature = "nats")]
-fn extract_swap_provider(details: &str) -> String {
-    let lower = details.to_lowercase();
-    // Laengste Matches zuerst pruefen ("claude-code" vor "claude")
-    for provider in ["claude-code", "claude", "ollama", "qwen3"] {
-        if lower.contains(provider) {
-            return provider.to_string();
-        }
+fn extract_swap_provider(details: &str) -> Option<String> {
+    let mut directives = details
+        .split_ascii_whitespace()
+        .filter_map(|token| token.strip_prefix("provider="));
+    let provider = directives.next()?;
+    if directives.next().is_some() {
+        return None;
     }
-    // Default: claude-code (Subscription-basiert, immer verfuegbar)
-    "claude-code".to_string()
+    matches!(
+        provider,
+        "codex-cli" | "claude-code" | "anthropic-direct" | "ollama" | "local-loop"
+    )
+    .then(|| provider.to_string())
 }
 
 fn collect_platform_metrics_snapshot(
@@ -20428,6 +20446,26 @@ mod tests {
         assert!(
             max_tick < 1_000_000_000,
             "legacy millisecond tick was retained: {max_tick}"
+        );
+    }
+
+    #[cfg(feature = "nats")]
+    #[test]
+    fn judge_swap_requires_one_explicit_catalog_provider() {
+        assert_eq!(
+            extract_swap_provider("quality remained low provider=codex-cli"),
+            Some("codex-cli".to_string())
+        );
+        assert_eq!(
+            extract_swap_provider("provider=local-loop deterministic recovery"),
+            Some("local-loop".to_string())
+        );
+        assert_eq!(extract_swap_provider("five low quality scores"), None);
+        assert_eq!(extract_swap_provider("try claude-code next"), None);
+        assert_eq!(extract_swap_provider("provider=unknown"), None);
+        assert_eq!(
+            extract_swap_provider("provider=codex-cli provider=local-loop"),
+            None
         );
     }
 }
