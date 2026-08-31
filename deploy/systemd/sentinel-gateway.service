@@ -17,10 +17,14 @@ RestartSec=5
 MemoryMax=2G
 OOMScoreAdjust=-900
 
-Environment=CORTEX_PRIMARY_PROVIDER=claude-code
+Environment=CORTEX_PRIMARY_PROVIDER=codex-cli
 Environment=CORTEX_PROXY_BIND=0.0.0.0
 Environment=CORTEX_CONTROL_BIND=127.0.0.1
 Environment=CLAUDE_CODE_BINARY=/usr/bin/claude
+Environment=CODEX_CLI_BINARY=/opt/sentinel/bin/codex
+Environment=CODEX_CLI_WORKDIR=/opt/sentinel/data/codex-provider
+Environment=CODEX_HOME=/home/ubuntu/.codex
+Environment=HOME=/home/ubuntu
 # Deliberately unset by default. Gate B must provide
 # CORTEX_MODEL_CATALOG_GATE_B_ATTESTATION=gate-b:<provider>:<semantic-catalog-digest>
 # in an authorized deployment drop-in before a provider without token-free
@@ -57,7 +61,7 @@ Group=ubuntu
 
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/sentinel/data
+ReadWritePaths=/opt/sentinel/data /home/ubuntu/.codex
 PrivateTmp=true
 
 [Install]

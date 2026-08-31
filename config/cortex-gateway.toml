@@ -13,19 +13,31 @@ type = "claude-code"
 binary = "claude"
 default_model = "claude-sonnet-5"
 allowed_models = ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001"]
-priority = 1
+priority = 2
 
 [providers.claude-code.hierarchy_models]
 tier_1 = "claude-opus-4-8"
 tier_2 = "claude-sonnet-5"
 tier_3 = "claude-haiku-4-5-20251001"
 
+[providers.codex-cli]
+type = "codex-cli"
+binary = "/opt/sentinel/bin/codex"
+default_model = "gpt-5.6-luna"
+allowed_models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+priority = 1
+
+[providers.codex-cli.hierarchy_models]
+tier_1 = "gpt-5.6-sol"
+tier_2 = "gpt-5.6-terra"
+tier_3 = "gpt-5.6-luna"
+
 [providers.anthropic-direct]
 type = "anthropic-direct"
 base_url = "https://api.anthropic.com"
 default_model = "claude-sonnet-5"
 allowed_models = ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001"]
-priority = 2
+priority = 3
 
 [providers.anthropic-direct.hierarchy_models]
 tier_1 = "claude-opus-4-8"
@@ -38,7 +50,7 @@ base_url = "http://localhost:11434"
 default_model = "qwen3:8b"
 allowed_models = ["qwen3:14b", "qwen3:8b", "qwen3:4b-instruct"]
 max_tokens = 4096
-priority = 3
+priority = 4
 
 [providers.ollama.hierarchy_models]
 tier_1 = "qwen3:14b"
@@ -49,7 +61,7 @@ tier_3 = "qwen3:4b-instruct"
 type = "local-loop"
 default_model = "local-loop-tier2"
 allowed_models = ["local-loop-tier1", "local-loop-tier2", "local-loop-tier3"]
-priority = 4
+priority = 5
 
 [providers.local-loop.hierarchy_models]
 tier_1 = "local-loop-tier1"
