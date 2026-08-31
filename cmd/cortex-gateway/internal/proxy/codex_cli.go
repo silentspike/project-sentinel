@@ -31,12 +31,17 @@ const (
 	codexCLIMaxPromptBytes    = 4 * 1024 * 1024
 	codexCLIMaxDiagnosticSize = 8 * 1024
 	maxConcurrentCodexCLI     = 1
+
+	codexCLIDisabledCodeModePrelude = "Code Mode is unavailable because code-mode host is disabled. " +
+		"Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`."
 )
 
 var codexCLIDisabledFeatures = []string{
 	"apps",
 	"auth_elicitation",
 	"browser_use",
+	"code_mode",
+	"code_mode_host",
 	"computer_use",
 	"goals",
 	"hooks",
@@ -82,6 +87,7 @@ type codexCLIStreamState struct {
 	threadStarted    bool
 	turnStarted      bool
 	turnCompleted    bool
+	codeModePrelude  bool
 	message          string
 	usage            codexCLIUsage
 	maxResponseBytes int
@@ -350,7 +356,15 @@ func (s *codexCLIStreamState) apply(event codexCLIEvent) error {
 }
 
 func (s *codexCLIStreamState) applyItem(eventType string, item *codexCLIItem) error {
-	if !s.turnStarted || item == nil {
+	if item == nil {
+		return fmt.Errorf("codex-cli emitted invalid item event")
+	}
+	if !s.turnStarted {
+		if eventType == "item.completed" && item.Type == "error" &&
+			item.Message == codexCLIDisabledCodeModePrelude && !s.codeModePrelude {
+			s.codeModePrelude = true
+			return nil
+		}
 		return fmt.Errorf("codex-cli emitted invalid item event")
 	}
 	switch item.Type {
