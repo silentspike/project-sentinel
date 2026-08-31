@@ -1170,8 +1170,7 @@ fn validate_workflow_lineage(
             || !ordinals.insert(node.node_ordinal)
             || node.generation == 0
             || node.digest == ContentDigest::zero()
-            || (node.kind == WorkflowLineageKindV1::Participant && node.participant_role.is_none())
-            || (node.kind != WorkflowLineageKindV1::Participant && node.participant_role.is_some())
+            || !workflow_role_allowed(node.kind, node.participant_role.as_ref())
             || !workflow_state_allowed(node.kind, node.state)
         {
             return Err(corrupt(
@@ -1281,12 +1280,48 @@ fn reachable_ordinals(start: u32, adjacency: &BTreeMap<u32, Vec<u32>>) -> BTreeS
     reached
 }
 
+fn workflow_role_allowed(kind: WorkflowLineageKindV1, role: Option<&AuthorityRole>) -> bool {
+    match (kind, role) {
+        (
+            WorkflowLineageKindV1::CustomerRequest | WorkflowLineageKindV1::Agreement,
+            Some(AuthorityRole::Customer),
+        ) => true,
+        (
+            WorkflowLineageKindV1::WorkItem,
+            Some(
+                AuthorityRole::Developer
+                | AuthorityRole::Qa
+                | AuthorityRole::ReleaseManager
+                | AuthorityRole::GaiaObserver,
+            ),
+        ) => true,
+        (
+            WorkflowLineageKindV1::Participant,
+            Some(
+                AuthorityRole::Customer
+                | AuthorityRole::Developer
+                | AuthorityRole::Qa
+                | AuthorityRole::ReleaseManager
+                | AuthorityRole::GaiaObserver,
+            ),
+        ) => true,
+        (
+            WorkflowLineageKindV1::Project
+            | WorkflowLineageKindV1::Decision
+            | WorkflowLineageKindV1::Handoff
+            | WorkflowLineageKindV1::Blocker,
+            None,
+        ) => true,
+        _ => false,
+    }
+}
+
 fn workflow_state_allowed(kind: WorkflowLineageKindV1, state: WorkflowLineageStateV1) -> bool {
     matches!(
         (kind, state),
         (
             WorkflowLineageKindV1::CustomerRequest,
-            WorkflowLineageStateV1::Requested
+            WorkflowLineageStateV1::Approved
         ) | (
             WorkflowLineageKindV1::Agreement,
             WorkflowLineageStateV1::Approved

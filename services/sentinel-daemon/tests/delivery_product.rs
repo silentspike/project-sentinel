@@ -209,6 +209,9 @@ enum WorkflowFault {
     Cycle,
     DuplicateRoot,
     IllegalState,
+    MissingRequiredRole,
+    IllegalWorkItemRole,
+    UnexpectedAdministrativeRole,
     StaleIntegration,
 }
 
@@ -278,13 +281,13 @@ impl DeliveryIntegrationPort for DeterministicIntegration {
         let kinds = [
             (
                 WorkflowLineageKindV1::CustomerRequest,
-                WorkflowLineageStateV1::Requested,
-                None,
+                WorkflowLineageStateV1::Approved,
+                Some(AuthorityRole::Customer),
             ),
             (
                 WorkflowLineageKindV1::Agreement,
                 WorkflowLineageStateV1::Approved,
-                None,
+                Some(AuthorityRole::Customer),
             ),
             (
                 WorkflowLineageKindV1::Project,
@@ -294,7 +297,7 @@ impl DeliveryIntegrationPort for DeterministicIntegration {
             (
                 WorkflowLineageKindV1::WorkItem,
                 WorkflowLineageStateV1::Completed,
-                None,
+                Some(AuthorityRole::Developer),
             ),
             (
                 WorkflowLineageKindV1::Participant,
@@ -387,6 +390,15 @@ impl DeliveryIntegrationPort for DeterministicIntegration {
             }
             WorkflowFault::IllegalState => {
                 snapshot.nodes[1].state = WorkflowLineageStateV1::Requested;
+            }
+            WorkflowFault::MissingRequiredRole => {
+                snapshot.nodes[0].participant_role = None;
+            }
+            WorkflowFault::IllegalWorkItemRole => {
+                snapshot.nodes[3].participant_role = Some(AuthorityRole::Customer);
+            }
+            WorkflowFault::UnexpectedAdministrativeRole => {
+                snapshot.nodes[2].participant_role = Some(AuthorityRole::Developer);
             }
         }
         snapshot.seal()
@@ -933,6 +945,28 @@ fn production_shape_persists_publishes_and_returns_only_authorized_redacted_line
         ] {
             assert!(stages.contains(&stage));
         }
+        for (stage, expected_role) in [
+            (
+                DeliveryLineageStageV1::CustomerRequest,
+                AuthorityRole::Customer,
+            ),
+            (DeliveryLineageStageV1::Agreement, AuthorityRole::Customer),
+            (DeliveryLineageStageV1::WorkItem, AuthorityRole::Developer),
+            (
+                DeliveryLineageStageV1::Participant,
+                AuthorityRole::Developer,
+            ),
+        ] {
+            assert_eq!(
+                lineage
+                    .nodes
+                    .iter()
+                    .find(|node| node.stage == stage)
+                    .expect("role-bearing workflow node")
+                    .actor_role,
+                expected_role
+            );
+        }
         let low_entropy_hash = ContentDigest::of_domain(
             "public-delivery-project",
             DELIVERY_SCHEMA_V1,
@@ -1107,6 +1141,51 @@ fn workflow_lineage_rejects_incomplete_disconnected_duplicate_cyclic_or_illegal_
             &CommandContextV1 {
                 principal: auditor,
                 idempotency_key: "read-topology-fault".to_string(),
+                now_ms: 101,
+            },
+            "tenant-a",
+            "project-private-1",
+        );
+        assert!(matches!(result, Err(DeliveryError::CorruptStore(_))));
+    }
+}
+
+#[test]
+fn workflow_lineage_rejects_missing_illegal_or_unexpected_actor_roles() {
+    for fault in [
+        WorkflowFault::MissingRequiredRole,
+        WorkflowFault::IllegalWorkItemRole,
+        WorkflowFault::UnexpectedAdministrativeRole,
+    ] {
+        let temp = TempDir::new().expect("tempdir");
+        let developer = principal("developer-private", AuthorityRole::Developer);
+        let auditor = principal("auditor-private", AuthorityRole::Auditor);
+        let product = ConfiguredDeliveryCore::open(
+            &config(&temp),
+            DeterministicIntegration {
+                principals: vec![developer.clone(), auditor.clone()],
+                execution_ready: true,
+                workflow_fault: fault,
+                lineage_phase: Arc::default(),
+            },
+            DeterministicEffects,
+            DeterministicPublisher::default(),
+        )
+        .expect("configured product");
+        product
+            .register_candidate(
+                &CommandContextV1 {
+                    principal: developer,
+                    idempotency_key: "register-role-fault".to_string(),
+                    now_ms: 100,
+                },
+                candidate(),
+            )
+            .expect("candidate commit");
+        let result = product.read_public_lineage(
+            &CommandContextV1 {
+                principal: auditor,
+                idempotency_key: "read-role-fault".to_string(),
                 now_ms: 101,
             },
             "tenant-a",
