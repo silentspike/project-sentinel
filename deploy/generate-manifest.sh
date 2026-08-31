@@ -66,6 +66,7 @@ ARTIFACT_DEFS=(
   "deploy/scripts/web-qa-v1.py|/usr/bin/sentinel-web-qa|script"
   "deploy/scripts/work-item-gate-v1.py|/usr/bin/sentinel-work-item-gate|script"
   "deploy/scripts/install-native-claude.sh|/opt/sentinel/scripts/install-native-claude.sh|script"
+  "deploy/scripts/install-native-codex.sh|/opt/sentinel/scripts/install-native-codex.sh|script"
   "deploy/scripts/init-hugepages.sh|/opt/sentinel/scripts/init-hugepages.sh|script"
   "deploy/scripts/init-sysctl.sh|/opt/sentinel/scripts/init-sysctl.sh|script"
   "deploy/scripts/init-tmpfs.sh|/opt/sentinel/scripts/init-tmpfs.sh|script"

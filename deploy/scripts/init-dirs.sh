@@ -4,6 +4,7 @@
 set -euo pipefail
 
 SENTINEL_USER="${SENTINEL_USER:-ubuntu}"
+SENTINEL_HOME="${SENTINEL_HOME:-/home/${SENTINEL_USER}}"
 
 echo "[init-dirs] Creating Sentinel directory structure..."
 
@@ -14,7 +15,8 @@ install -d -o "${SENTINEL_USER}" -g "${SENTINEL_USER}" -m 0750 \
   /opt/sentinel/data /opt/sentinel/logs
 install -d -o root -g root -m 0700 /opt/sentinel/data/company-delivery
 install -d -o "${SENTINEL_USER}" -g "${SENTINEL_USER}" -m 0700 \
-  /opt/sentinel/data/gaia-console /opt/sentinel/data/gaia-console/sessions
+	/opt/sentinel/data/gaia-console /opt/sentinel/data/gaia-console/sessions \
+	/opt/sentinel/data/codex-provider "${SENTINEL_HOME}/.codex"
 
 # RAM-backed directories (created here, mounted by init-tmpfs.sh)
 mkdir -p /ram/sentinel/{ecs,sessions,zenoh,bench}

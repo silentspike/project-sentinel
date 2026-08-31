@@ -74,6 +74,7 @@ func main() {
 	if err := catalog.RequireProviders(map[string]string{
 		"anthropic-direct":          "anthropic-direct",
 		"claude-code":               "claude-code",
+		proxy.CodexCLIProviderName:  proxy.CodexCLIProviderName,
 		"ollama":                    "ollama",
 		proxy.LocalLoopProviderName: "local-loop",
 	}); err != nil {
@@ -115,6 +116,17 @@ func main() {
 	}, logger), forwardQueue)
 	registry.Register("claude-code", claudeCodeProvider)
 	logger.Info("registered provider", "name", "claude-code", "model", claudeCodeCatalog.DefaultModel)
+
+	// Primary subscription-backed provider: pinned Codex CLI using ChatGPT auth.
+	codexCatalog, _ := catalog.Entry(proxy.CodexCLIProviderName)
+	codexProvider := proxy.NewQueuedProvider(proxy.NewCodexCLIProvider(proxy.ProviderConfig{
+		Name:    proxy.CodexCLIProviderName,
+		Type:    proxy.CodexCLIProviderName,
+		BaseURL: envOrDefault("CODEX_CLI_BINARY", codexCatalog.Binary), // binary path
+		Model:   codexCatalog.DefaultModel,
+	}, logger), forwardQueue)
+	registry.Register(proxy.CodexCLIProviderName, codexProvider)
+	logger.Info("registered provider", "name", proxy.CodexCLIProviderName, "model", codexCatalog.DefaultModel)
 
 	ollamaCatalog, _ := catalog.Entry("ollama")
 	registry.Register("ollama", proxy.NewQueuedProvider(proxy.NewOllamaProvider(proxy.ProviderConfig{
@@ -722,6 +734,15 @@ func handleReady(catalog *proxy.ProviderCatalog, cfg *control.Config, registry *
 				_ = json.NewEncoder(w).Encode(response)
 				return
 			}
+			if readiness, ok := provider.(proxy.ProviderReadinessChecker); ok {
+				if err := readiness.ReadinessCheck(r.Context()); err != nil {
+					response["ready"] = false
+					response["model_inventory_status"] = "provider_unavailable"
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(response)
+					return
+				}
+			}
 			if primary == proxy.LocalLoopProviderName {
 				response["model_inventory_status"] = "token_free_local"
 			} else {
@@ -864,7 +885,7 @@ func defaultPrimaryProvider() string {
 	if os.Getenv("ANTHROPIC_API_KEY") != "" {
 		return "anthropic-direct"
 	}
-	return "claude-code"
+	return proxy.CodexCLIProviderName
 }
 
 func applyTrafficRuntimeConfig(

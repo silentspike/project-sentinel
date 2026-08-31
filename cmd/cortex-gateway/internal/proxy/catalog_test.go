@@ -58,6 +58,9 @@ func TestProviderCatalogRealConfigAndTierMatrix(t *testing.T) {
 		{"anthropic-direct", 2, "claude-sonnet-5"},
 		{"anthropic-direct", 3, "claude-haiku-4-5-20251001"},
 		{"claude-code", 1, "claude-opus-4-8"},
+		{CodexCLIProviderName, 1, "gpt-5.6-sol"},
+		{CodexCLIProviderName, 2, "gpt-5.6-terra"},
+		{CodexCLIProviderName, 3, "gpt-5.6-luna"},
 		{"ollama", 2, "qwen3:8b"},
 		{LocalLoopProviderName, 3, "local-loop-tier3"},
 	}
@@ -73,7 +76,7 @@ func TestProviderCatalogRealConfigAndTierMatrix(t *testing.T) {
 	if _, err := catalog.Resolve("unknown", 1, ""); err == nil {
 		t.Fatal("unknown provider accepted")
 	}
-	if catalog.Digest() != "10ed8408bd69c9b10acda44f4cebc889680435945b08a5c3ef2cf068a58680aa" {
+	if catalog.Digest() != "50eb02d1dec87cdeee8dda8252862128d45f488e780323477ae824b4f96a6647" {
 		t.Fatalf("semantic digest drifted: %s", catalog.Digest())
 	}
 	entry, _ := catalog.Entry("ollama")
@@ -85,6 +88,7 @@ func TestProviderCatalogRealConfigAndTierMatrix(t *testing.T) {
 	required := map[string]string{
 		"anthropic-direct":    "anthropic-direct",
 		"claude-code":         "claude-code",
+		CodexCLIProviderName:  CodexCLIProviderName,
 		"ollama":              "ollama",
 		LocalLoopProviderName: "local-loop",
 	}
@@ -128,6 +132,16 @@ func TestProviderActivationRequiresExactGateBAttestationWithoutInventory(t *test
 		catalog.ExpectedGateBAttestation("claude-code"),
 	); err != nil {
 		t.Fatalf("exact Gate B attestation rejected: %v", err)
+	}
+	if err := catalog.ValidateProviderActivation(CodexCLIProviderName, false, ""); err == nil {
+		t.Fatal("codex-cli activated without Gate B attestation")
+	}
+	if err := catalog.ValidateProviderActivation(
+		CodexCLIProviderName,
+		false,
+		catalog.ExpectedGateBAttestation(CodexCLIProviderName),
+	); err != nil {
+		t.Fatalf("codex-cli exact Gate B attestation rejected: %v", err)
 	}
 	if err := catalog.ValidateProviderActivation(LocalLoopProviderName, false, ""); err != nil {
 		t.Fatalf("token-free local-loop blocked: %v", err)

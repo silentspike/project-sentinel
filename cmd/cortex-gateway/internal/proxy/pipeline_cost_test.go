@@ -70,6 +70,9 @@ func TestResolveTier(t *testing.T) {
 		"claude-haiku-4-5":     "low",
 		"claude-sonnet-4-6":    "mid",
 		"claude-opus-4-8":      "high",
+		"gpt-5.6-luna":         "low",
+		"gpt-5.6-terra":        "mid",
+		"gpt-5.6-sol":          "high",
 		"":                     "unknown",
 		"some-other-model-xyz": "unknown",
 	}

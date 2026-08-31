@@ -40,6 +40,46 @@ func TestSonnetFiveAnnouncedPriceSchedule(t *testing.T) {
 	}
 }
 
+func TestResolveCodexCLICostUsesOpenAIRateCardEquivalent(t *testing.T) {
+	result := resolveResponseCostAt(PipelineResponse{
+		Provider: CodexCLIProviderName, EffectiveModel: "gpt-5.6-luna",
+		InputTokens: 100_000, OutputTokens: 100_000,
+		CacheRead: 20_000, CacheCreation: 10_000,
+	}, time.Date(2026, time.August, 31, 0, 0, 0, 0, time.UTC))
+	want := 0.1369 // 70k fresh + 20k cached + 10k cache-write + 100k output.
+	if math.Abs(result.USD-want) > 1e-12 || result.Source != CostSourceUsagePriceTable {
+		t.Fatalf("result=%+v want_usd=%.10f", result, want)
+	}
+}
+
+func TestResolveCodexCLICostFailsClosedForUnknownModel(t *testing.T) {
+	result := resolveResponseCostAt(PipelineResponse{
+		Provider: CodexCLIProviderName, EffectiveModel: "gpt-future", InputTokens: 1_000_000,
+	}, time.Now())
+	if result.USD != 0 || result.Source != CostSourcePricingUnknown {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestResolveCodexCLICostAppliesLongContextRatesAboveBoundary(t *testing.T) {
+	below := resolveResponseCostAt(PipelineResponse{
+		Provider: CodexCLIProviderName, EffectiveModel: "gpt-5.6-terra",
+		InputTokens: 272_000, OutputTokens: 100_000,
+	}, time.Now())
+	if math.Abs(below.USD-1.744) > 1e-12 {
+		t.Fatalf("boundary cost=%f want=1.744", below.USD)
+	}
+
+	above := resolveResponseCostAt(PipelineResponse{
+		Provider: CodexCLIProviderName, EffectiveModel: "gpt-5.6-terra",
+		InputTokens: 272_001, OutputTokens: 100_000,
+	}, time.Now())
+	want := float64(272_001)*4/1_000_000 + float64(100_000)*18/1_000_000
+	if math.Abs(above.USD-want) > 1e-12 {
+		t.Fatalf("long-context cost=%f want=%f", above.USD, want)
+	}
+}
+
 func TestResolveResponseCostFailsClosedForInvalidOrUnknownPricing(t *testing.T) {
 	invalid := math.Inf(1)
 	result := resolveResponseCostAt(PipelineResponse{
