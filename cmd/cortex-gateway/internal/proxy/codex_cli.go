@@ -20,6 +20,7 @@ import (
 
 const (
 	defaultCodexCLIBinary  = "codex"
+	pinnedCodexCLIVersion  = "0.151.0"
 	defaultCodexCLIModel   = "gpt-5.6-luna"
 	defaultCodexCLIWorkdir = "/opt/sentinel/data/codex-provider"
 	defaultCodexCLIHome    = "/home/ubuntu/.codex"
@@ -419,11 +420,12 @@ func (s *codexCLIStreamState) response() (*LLMResponse, error) {
 func (p *CodexCLIProvider) HealthCheck(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, codexCLIHealthTimeout)
 	defer cancel()
-	if _, err := p.runHealthCommand(ctx, "--version"); err != nil {
+	version, err := p.runHealthCommand(ctx, "--version")
+	if err != nil || strings.TrimSpace(version) != "codex-cli "+pinnedCodexCLIVersion {
 		return fmt.Errorf("codex-cli version check failed")
 	}
 	output, err := p.runHealthCommand(ctx, "login", "status")
-	if err != nil || !strings.Contains(output, "Logged in using ChatGPT") {
+	if err != nil || strings.TrimSpace(output) != "Logged in using ChatGPT" {
 		return fmt.Errorf("codex-cli ChatGPT authentication unavailable")
 	}
 	return nil

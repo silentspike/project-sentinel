@@ -246,6 +246,42 @@ esac
 	}
 }
 
+func TestCodexCLIReadinessRejectsWrongVersionAndMisleadingLoginText(t *testing.T) {
+	workdir := t.TempDir()
+	if err := os.Chmod(workdir, 0o700); err != nil { //nolint:gosec // test models the private production workdir
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_CLI_WORKDIR", workdir)
+
+	for name, script := range map[string]string{
+		"wrong version": `#!/bin/sh
+case "$1" in
+  --version) printf 'codex-cli 0.150.0\n' ;;
+  login) printf 'Logged in using ChatGPT\n' ;;
+  *) exit 64 ;;
+esac
+`,
+		"misleading login": `#!/bin/sh
+case "$1" in
+  --version) printf 'codex-cli 0.151.0\n' ;;
+  login) printf 'Not Logged in using ChatGPT\n' ;;
+  *) exit 64 ;;
+esac
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			scriptPath := filepath.Join(t.TempDir(), "codex")
+			if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil { //nolint:gosec // executable test fixture
+				t.Fatal(err)
+			}
+			provider := NewCodexCLIProvider(ProviderConfig{Name: CodexCLIProviderName, BaseURL: scriptPath}, nil)
+			if err := provider.ReadinessCheck(context.Background()); err == nil {
+				t.Fatal("invalid runtime readiness accepted")
+			}
+		})
+	}
+}
+
 func TestCodexCLIProviderSanitizesAuthenticationFailure(t *testing.T) {
 	workdir := t.TempDir()
 	if err := os.Chmod(workdir, 0o700); err != nil { //nolint:gosec // test models the private production workdir
