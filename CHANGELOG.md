@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Accept only the pinned Codex CLI's exact fail-closed disabled-code-mode
+  prelude before a turn, while rejecting every other pre-turn error or tool
+  item, explicitly disabling both code-mode feature switches, and collecting
+  bounded subprocess diagnostics before classifying failures (#650).
+
 - Accept the productive customer, agreement, and work-item actor roles and emit
   nonzero workflow ordinals in the server-redacted delivery lineage while
   rejecting invalid role/class pairs (#650).
