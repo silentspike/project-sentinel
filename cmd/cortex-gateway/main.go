@@ -169,12 +169,10 @@ func main() {
 	}
 	controlConfig := control.NewConfig(primaryProvider)
 	controlConfig.SetAgentRuntimePolicyValidator(catalog.ValidatePolicy)
-	controlConfig.SetProviderValidator(func(provider string) error {
-		if _, ok := catalog.Entry(provider); !ok {
-			return fmt.Errorf("provider %q is not in the immutable startup catalog", provider)
-		}
-		return nil
-	})
+	// Runtime control-plane changes must satisfy the same activation contract as
+	// request dispatch. Catalog membership alone is not enough for providers that
+	// require an explicit Gate B attestation.
+	controlConfig.SetProviderValidator(validateProviderActivation)
 	applyTrafficControlDefaults(controlConfig, logger)
 	applyHardeningDefaults(controlConfig, logger)
 
