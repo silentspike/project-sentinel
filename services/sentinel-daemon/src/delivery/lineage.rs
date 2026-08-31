@@ -1281,39 +1281,36 @@ fn reachable_ordinals(start: u32, adjacency: &BTreeMap<u32, Vec<u32>>) -> BTreeS
 }
 
 fn workflow_role_allowed(kind: WorkflowLineageKindV1, role: Option<&AuthorityRole>) -> bool {
-    match (kind, role) {
+    matches!(
+        (kind, role),
         (
             WorkflowLineageKindV1::CustomerRequest | WorkflowLineageKindV1::Agreement,
-            Some(AuthorityRole::Customer),
-        ) => true,
-        (
+            Some(AuthorityRole::Customer)
+        ) | (
             WorkflowLineageKindV1::WorkItem,
             Some(
                 AuthorityRole::Developer
-                | AuthorityRole::Qa
-                | AuthorityRole::ReleaseManager
-                | AuthorityRole::GaiaObserver,
-            ),
-        ) => true,
-        (
+                    | AuthorityRole::Qa
+                    | AuthorityRole::ReleaseManager
+                    | AuthorityRole::GaiaObserver
+            )
+        ) | (
             WorkflowLineageKindV1::Participant,
             Some(
                 AuthorityRole::Customer
-                | AuthorityRole::Developer
-                | AuthorityRole::Qa
-                | AuthorityRole::ReleaseManager
-                | AuthorityRole::GaiaObserver,
-            ),
-        ) => true,
-        (
+                    | AuthorityRole::Developer
+                    | AuthorityRole::Qa
+                    | AuthorityRole::ReleaseManager
+                    | AuthorityRole::GaiaObserver
+            )
+        ) | (
             WorkflowLineageKindV1::Project
-            | WorkflowLineageKindV1::Decision
-            | WorkflowLineageKindV1::Handoff
-            | WorkflowLineageKindV1::Blocker,
-            None,
-        ) => true,
-        _ => false,
-    }
+                | WorkflowLineageKindV1::Decision
+                | WorkflowLineageKindV1::Handoff
+                | WorkflowLineageKindV1::Blocker,
+            None
+        )
+    )
 }
 
 fn workflow_state_allowed(kind: WorkflowLineageKindV1, state: WorkflowLineageStateV1) -> bool {
