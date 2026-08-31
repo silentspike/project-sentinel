@@ -462,7 +462,11 @@ impl WorkflowDeliveryIntegration {
         value: &T,
     ) -> Result<u32, DeliveryError> {
         let ordinal = u32::try_from(nodes.len())
-            .map_err(|_| DeliveryError::Validation("workflow lineage is too large".to_string()))?;
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| {
+                DeliveryError::Validation("workflow lineage is too large".to_string())
+            })?;
         nodes.push(WorkflowLineageNodeV1 {
             node_ordinal: ordinal,
             kind,
@@ -1909,6 +1913,40 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_lineage_nodes_use_nonzero_contiguous_ordinals() {
+        let mut nodes = Vec::new();
+        let request = WorkflowDeliveryIntegration::push_node(
+            &mut nodes,
+            WorkflowLineageKindV1::CustomerRequest,
+            WorkflowLineageStateV1::Approved,
+            1,
+            Some(AuthorityRole::Customer),
+            "workflow-request",
+            &"request",
+        )
+        .expect("request node");
+        let agreement = WorkflowDeliveryIntegration::push_node(
+            &mut nodes,
+            WorkflowLineageKindV1::Agreement,
+            WorkflowLineageStateV1::Approved,
+            1,
+            Some(AuthorityRole::Customer),
+            "workflow-agreement",
+            &"agreement",
+        )
+        .expect("agreement node");
+
+        assert_eq!((request, agreement), (1, 2));
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.node_ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
 
     #[test]
     fn web_qa_command_policy_is_bound_to_the_exact_input_inventory() {
