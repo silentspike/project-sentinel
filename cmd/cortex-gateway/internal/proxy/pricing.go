@@ -61,6 +61,35 @@ func modelPriceAt(model string, at time.Time) (modelPrice, bool) {
 	}, true
 }
 
+// openAIModelPrice returns the public OpenAI API rate-card equivalent for the
+// Codex models. A ChatGPT-plan invocation does not expose a per-request billed
+// amount, so callers must retain CostSourceUsagePriceTable rather than treating
+// this estimate as provider-reported spend. The public model pages also state
+// that requests above 272K input tokens use 2x input and 1.5x output rates for
+// the complete request. Sources, accessed 2026-08-31:
+// https://developers.openai.com/api/docs/models/gpt-5.6-sol
+// https://developers.openai.com/api/docs/models/gpt-5.6-terra
+// https://developers.openai.com/api/docs/models/gpt-5.6-luna
+func openAIModelPrice(model string) (modelPrice, bool) {
+	var input, output, cacheRead float64
+	switch model {
+	case "gpt-5.6-sol":
+		input, output, cacheRead = 4, 20, 0.4
+	case "gpt-5.6-terra":
+		input, output, cacheRead = 2, 12, 0.2
+	case "gpt-5.6-luna":
+		input, output, cacheRead = 0.2, 1.2, 0.02
+	default:
+		return modelPrice{}, false
+	}
+	return modelPrice{
+		inputPerMTok:        input,
+		outputPerMTok:       output,
+		cacheReadPerMTok:    cacheRead,
+		cacheWrite5mPerMTok: input * 1.25,
+	}, true
+}
+
 func resolveResponseCostAt(resp PipelineResponse, at time.Time) CostResult {
 	if resp.ReportedCostUSD != nil {
 		if !math.IsNaN(*resp.ReportedCostUSD) && !math.IsInf(*resp.ReportedCostUSD, 0) && *resp.ReportedCostUSD >= 0 {
@@ -86,6 +115,24 @@ func resolveResponseCostAt(resp PipelineResponse, at time.Time) CostResult {
 		freshInput := nonNegative(resp.InputTokens - resp.CacheRead - resp.CacheCreation)
 		usd := (float64(freshInput)*price.inputPerMTok +
 			float64(nonNegative(resp.OutputTokens))*price.outputPerMTok +
+			float64(nonNegative(resp.CacheRead))*price.cacheReadPerMTok +
+			float64(nonNegative(resp.CacheCreation))*price.cacheWrite5mPerMTok) / 1_000_000
+		return CostResult{USD: usd, Source: CostSourceUsagePriceTable}
+	case CodexCLIProviderName:
+		price, ok := openAIModelPrice(resp.EffectiveModel)
+		if !ok {
+			return CostResult{Source: CostSourcePricingUnknown}
+		}
+		outputMultiplier := 1.0
+		if resp.InputTokens > 272_000 {
+			price.inputPerMTok *= 2
+			price.cacheReadPerMTok *= 2
+			price.cacheWrite5mPerMTok *= 2
+			outputMultiplier = 1.5
+		}
+		freshInput := nonNegative(resp.InputTokens - resp.CacheRead - resp.CacheCreation)
+		usd := (float64(freshInput)*price.inputPerMTok +
+			float64(nonNegative(resp.OutputTokens))*price.outputPerMTok*outputMultiplier +
 			float64(nonNegative(resp.CacheRead))*price.cacheReadPerMTok +
 			float64(nonNegative(resp.CacheCreation))*price.cacheWrite5mPerMTok) / 1_000_000
 		return CostResult{USD: usd, Source: CostSourceUsagePriceTable}

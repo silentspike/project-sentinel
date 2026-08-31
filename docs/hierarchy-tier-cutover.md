@@ -12,13 +12,17 @@ target. Gate C and a current Gate B reservation are prerequisites.
   `hierarchy_models` mappings. Reassigning a hierarchy tier therefore changes
   the semantic digest and rejects every attestation pinned to the previous
   digest.
-- The current Gate C candidate pins are:
+- The original #395 Gate C acceptance pins are historical evidence and must
+  not be reused after any catalog change:
   - Git blob OID: `4a575661a99182eabeb67edd34dd277fb9485e32`
   - file SHA-256: `1138e60eaee2fb022394de46c3b49e8c43c509f3d69645c65357f2c82d7a78da`
   - `cortex-catalog-v1` semantic digest:
     `10ed8408bd69c9b10acda44f4cebc889680435945b08a5c3ef2cf068a58680aa`
   - 60-agent matrix SHA-256:
     `a297f22b7c9c32fee18a9f450f12cf52ccef97bd2fcb68e68401b35ea76f6cb5`
+- Every later release records a fresh catalog Git blob, file SHA-256 and
+  semantic digest. The attestation must use that release's semantic digest;
+  matching a historical pin never authorizes activation.
 - Gate B names one isolated target, owner, exclusive time window, mutation
   scope, rollback owner, and the exactly-one-daemon invariant.
 - The production reference and any target reserved by another issue remain out
@@ -102,13 +106,18 @@ improvise a migration.
      a model unless the current Gate B mutation scope explicitly allows it.
    - `local-loop` is the only provider without inventory that is intrinsically
      token-free; `/ready` reports `model_inventory_status=token_free_local`.
-   - A provider without a token-free inventory contract, including `claude-code`,
+   - A provider without a token-free inventory contract, including `claude-code`
+     and `codex-cli`,
      remains blocked both in `/ready` and immediately before provider execution.
      Gate B must materialize the exact public attestation
      `gate-b:<provider-id>:<cortex-catalog-v1 semantic digest>` as
      `CORTEX_MODEL_CATALOG_GATE_B_ATTESTATION`. A stale catalog digest or different
      provider keeps activation fail-closed. This attestation does not authorize a
      real provider call or any spend.
+   - `codex-cli` additionally requires the pinned local executable and a
+     successful token-free `codex login status` readback under the service
+     account. Binary presence, ChatGPT authentication and Gate B are all
+     necessary; none substitutes for the others.
 7. Verify that `/internal/agent-runtime` accepts only the Agent LLM bridge role,
    `/internal/llm` accepts only the Platform Analyzer, Evolution, and Judge
    roles, and public `/v1/*` claims are non-authoritative. Evidence must contain

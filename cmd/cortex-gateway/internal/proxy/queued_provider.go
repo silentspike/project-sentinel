@@ -20,13 +20,29 @@ func NewQueuedProvider(wrapped Provider, queue *forwardqueue.Manager) Provider {
 		wrapped: wrapped,
 		queue:   queue,
 	}
-	if _, ok := wrapped.(ModelInventoryProvider); ok {
+	_, inventoryCapable := wrapped.(ModelInventoryProvider)
+	_, readinessCapable := wrapped.(ProviderReadinessChecker)
+	switch {
+	case inventoryCapable && readinessCapable:
+		return &queuedInventoryReadinessProvider{queuedProvider: queued}
+	case inventoryCapable:
 		return &queuedInventoryProvider{queuedProvider: queued}
+	case readinessCapable:
+		return &queuedReadinessProvider{queuedProvider: queued}
+	default:
+		return queued
 	}
-	return queued
 }
 
 type queuedInventoryProvider struct {
+	*queuedProvider
+}
+
+type queuedReadinessProvider struct {
+	*queuedProvider
+}
+
+type queuedInventoryReadinessProvider struct {
 	*queuedProvider
 }
 
@@ -50,4 +66,19 @@ func (p *queuedProvider) HealthCheck(ctx context.Context) error {
 func (p *queuedInventoryProvider) ModelInventory(ctx context.Context) ([]string, error) {
 	inventory := p.wrapped.(ModelInventoryProvider) // constructor preserves this invariant
 	return inventory.ModelInventory(ctx)
+}
+
+func (p *queuedReadinessProvider) ReadinessCheck(ctx context.Context) error {
+	checker := p.wrapped.(ProviderReadinessChecker) // constructor preserves this invariant
+	return checker.ReadinessCheck(ctx)
+}
+
+func (p *queuedInventoryReadinessProvider) ModelInventory(ctx context.Context) ([]string, error) {
+	inventory := p.wrapped.(ModelInventoryProvider) // constructor preserves this invariant
+	return inventory.ModelInventory(ctx)
+}
+
+func (p *queuedInventoryReadinessProvider) ReadinessCheck(ctx context.Context) error {
+	checker := p.wrapped.(ProviderReadinessChecker) // constructor preserves this invariant
+	return checker.ReadinessCheck(ctx)
 }
