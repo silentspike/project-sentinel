@@ -58,12 +58,12 @@ func (p *inventoryTestProvider) ModelInventory(context.Context) ([]string, error
 	return append([]string(nil), p.models...), p.err
 }
 
-func TestDefaultPrimaryProviderFallsBackToClaudeCodeWithoutAPIKey(t *testing.T) {
+func TestDefaultPrimaryProviderFallsBackToCodexCLIWithoutAPIKey(t *testing.T) {
 	t.Setenv("CORTEX_PRIMARY_PROVIDER", "")
 	t.Setenv("ANTHROPIC_API_KEY", "")
 
-	if got := defaultPrimaryProvider(); got != "claude-code" {
-		t.Fatalf("defaultPrimaryProvider() = %q, want %q", got, "claude-code")
+	if got := defaultPrimaryProvider(); got != proxy.CodexCLIProviderName {
+		t.Fatalf("defaultPrimaryProvider() = %q, want %q", got, proxy.CodexCLIProviderName)
 	}
 }
 
@@ -102,13 +102,63 @@ func TestReadyValidatesActiveProviderInventoryWithoutExposingModels(t *testing.T
 		t.Fatalf("unexpected readiness response: %#v", response)
 	}
 	providerIDs, ok := response["catalog_provider_ids"].([]any)
-	if !ok || len(providerIDs) != 4 {
+	if !ok || len(providerIDs) != 5 {
 		t.Fatalf("catalog provider IDs missing: %#v", response)
 	}
 	for _, model := range []string{"qwen3:14b", "qwen3:8b", "qwen3:4b-instruct"} {
 		if responseBody := recorder.Body.String(); strings.Contains(responseBody, model) {
 			t.Fatalf("readiness response exposed provider inventory model %q: %s", model, responseBody)
 		}
+	}
+}
+
+type readinessTestProvider struct {
+	name string
+	err  error
+}
+
+func (p *readinessTestProvider) Name() string { return p.name }
+func (p *readinessTestProvider) Send(context.Context, *proxy.LLMRequest) (*proxy.LLMResponse, error) {
+	return nil, nil
+}
+func (p *readinessTestProvider) HealthCheck(context.Context) error { return p.err }
+func (p *readinessTestProvider) ReadinessCheck(context.Context) error {
+	return p.err
+}
+
+func TestReadyRequiresCodexCLILocalReadinessAfterGateB(t *testing.T) {
+	catalog, err := proxy.LoadProviderCatalog(filepath.Join("..", "..", "config", "cortex-gateway.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := control.NewConfig(proxy.CodexCLIProviderName)
+	registry := proxy.NewRegistry()
+	provider := &readinessTestProvider{name: proxy.CodexCLIProviderName, err: context.DeadlineExceeded}
+	registry.Register(proxy.CodexCLIProviderName, provider)
+
+	recorder := httptest.NewRecorder()
+	handleReady(
+		catalog,
+		cfg,
+		registry,
+		catalog.ExpectedGateBAttestation(proxy.CodexCLIProviderName),
+	).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if recorder.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(recorder.Body.String(), `"model_inventory_status":"provider_unavailable"`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	provider.err = nil
+	recorder = httptest.NewRecorder()
+	handleReady(
+		catalog,
+		cfg,
+		registry,
+		catalog.ExpectedGateBAttestation(proxy.CodexCLIProviderName),
+	).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if recorder.Code != http.StatusOK ||
+		!strings.Contains(recorder.Body.String(), `"model_inventory_status":"gate_b_attested"`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 

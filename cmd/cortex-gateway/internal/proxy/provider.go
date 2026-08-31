@@ -16,6 +16,7 @@ const (
 	RequestFormatAnthropic RequestFormat = "anthropic"
 
 	LocalLoopProviderName = "local-loop"
+	CodexCLIProviderName  = "codex-cli"
 )
 
 // LLMRequest represents a request to an LLM provider.
@@ -108,10 +109,17 @@ type ProviderStatusReporter interface {
 	CurrentProviderError() error
 }
 
+// ProviderReadinessChecker is an optional token-free readiness check for
+// providers whose local executable or authentication state must be validated
+// before the provider is allowed to receive work.
+type ProviderReadinessChecker interface {
+	ReadinessCheck(ctx context.Context) error
+}
+
 // ProviderConfig holds configuration for a provider.
 type ProviderConfig struct {
 	Name      string `toml:"name"`
-	Type      string `toml:"type"` // "claude", "anthropic-direct", "ollama", "claude-code", or "local-loop"
+	Type      string `toml:"type"` // "claude", "anthropic-direct", "ollama", "claude-code", "codex-cli", or "local-loop"
 	BaseURL   string `toml:"base_url"`
 	APIKey    string `toml:"api_key"` //nolint:gosec // field name, not a credential
 	Model     string `toml:"model"`
@@ -198,6 +206,8 @@ func NewProviderFromConfig(cfg ProviderConfig) (Provider, error) {
 		return NewOllamaProvider(cfg), nil
 	case "claude-code":
 		return NewClaudeCodeProvider(cfg, nil), nil
+	case CodexCLIProviderName:
+		return NewCodexCLIProvider(cfg, nil), nil
 	case LocalLoopProviderName:
 		return NewLocalLoopProvider(LocalLoopConfig{Name: cfg.Name, Model: cfg.Model})
 	default:

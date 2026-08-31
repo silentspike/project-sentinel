@@ -16,7 +16,30 @@
 
 - `pkg/sentinel-go/eventstore` and `pkg/sentinel-go/judge`.
 - `modernc.org/sqlite`, `prometheus/client_golang`, and `BurntSushi/toml`.
-- External provider credentials are supplied through environment variables; no provider call is required for unit tests.
+- External provider credentials are supplied through protected files or the provider's native authentication store; no provider call is required for unit tests.
+
+## Codex CLI provider
+
+`codex-cli` is the default single-node subscription-backed provider. The
+gateway executes the pinned native Codex CLI in ephemeral, read-only mode with
+user configuration, rules, tools, web search, plugins, memories, delegation,
+and inherited shell environment disabled. It passes the prompt on standard
+input, accepts only a completed natural-language message plus terminal usage,
+and rejects every tool event fail-closed.
+
+Install the already downloaded official release with
+`deploy/scripts/install-native-codex.sh`. Authenticate directly on the target
+host as the `ubuntu` service user:
+
+```bash
+sudo -u ubuntu env HOME=/home/ubuntu CODEX_HOME=/home/ubuntu/.codex /opt/sentinel/bin/codex login --device-auth
+```
+
+Authentication material must never be copied from a workstation. The gateway
+requires the exact Gate B catalog attestation and a token-free local binary and
+login-status check before readiness succeeds. Codex JSONL usage is priced with
+the public OpenAI rate-card equivalent and marked `usage_price_table`; it is not
+misrepresented as the marginal charge of a ChatGPT-plan invocation.
 
 ## Verify
 

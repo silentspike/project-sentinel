@@ -37,6 +37,22 @@ type inventoryMockProvider struct {
 	models []string
 }
 
+type readinessMockProvider struct {
+	*mockProvider
+	err error
+}
+
+func (p *readinessMockProvider) ReadinessCheck(context.Context) error { return p.err }
+
+type inventoryReadinessMockProvider struct {
+	*readinessMockProvider
+	models []string
+}
+
+func (p *inventoryReadinessMockProvider) ModelInventory(context.Context) ([]string, error) {
+	return append([]string(nil), p.models...), nil
+}
+
 func (p *inventoryMockProvider) ModelInventory(context.Context) ([]string, error) {
 	return append([]string(nil), p.models...), nil
 }
@@ -64,6 +80,34 @@ func TestQueuedProviderPreservesOnlySupportedInventoryCapability(t *testing.T) {
 	models, err := inventory.ModelInventory(context.Background())
 	if err != nil || !reflect.DeepEqual(models, []string{"model-a"}) {
 		t.Fatalf("inventory = %#v, err = %v", models, err)
+	}
+}
+
+func TestQueuedProviderPreservesOnlySupportedReadinessCapability(t *testing.T) {
+	queue := forwardqueue.NewManager(1)
+	plain := NewQueuedProvider(&mockProvider{name: "plain"}, queue)
+	if _, ok := plain.(ProviderReadinessChecker); ok {
+		t.Fatal("queued provider invented an unsupported readiness capability")
+	}
+
+	wantErr := errors.New("not ready")
+	ready := NewQueuedProvider(&readinessMockProvider{
+		mockProvider: &mockProvider{name: "ready"}, err: wantErr,
+	}, queue)
+	checker, ok := ready.(ProviderReadinessChecker)
+	if !ok || !errors.Is(checker.ReadinessCheck(context.Background()), wantErr) {
+		t.Fatal("queued provider dropped a supported readiness capability")
+	}
+
+	both := NewQueuedProvider(&inventoryReadinessMockProvider{
+		readinessMockProvider: &readinessMockProvider{mockProvider: &mockProvider{name: "both"}},
+		models:                []string{"model-a"},
+	}, queue)
+	if _, ok := both.(ProviderReadinessChecker); !ok {
+		t.Fatal("queued provider dropped readiness from a dual-capability provider")
+	}
+	if _, ok := both.(ModelInventoryProvider); !ok {
+		t.Fatal("queued provider dropped inventory from a dual-capability provider")
 	}
 }
 

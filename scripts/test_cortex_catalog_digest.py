@@ -77,7 +77,7 @@ class CatalogDigestTests(unittest.TestCase):
         document = tomllib.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(
             hashlib.sha256(normalize(document)).hexdigest(),
-            "10ed8408bd69c9b10acda44f4cebc889680435945b08a5c3ef2cf068a58680aa",
+            "50eb02d1dec87cdeee8dda8252862128d45f488e780323477ae824b4f96a6647",
         )
 
     def test_incomplete_hierarchy_map_fails_closed(self) -> None:

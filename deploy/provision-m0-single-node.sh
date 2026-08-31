@@ -136,6 +136,7 @@ def artifact_authority() -> dict[str, tuple[str, str]]:
         "/usr/bin/sentinel-web-qa": ("deploy/scripts/web-qa-v1.py", "script"),
         "/usr/bin/sentinel-work-item-gate": ("deploy/scripts/work-item-gate-v1.py", "script"),
         "/opt/sentinel/scripts/install-native-claude.sh": ("deploy/scripts/install-native-claude.sh", "script"),
+        "/opt/sentinel/scripts/install-native-codex.sh": ("deploy/scripts/install-native-codex.sh", "script"),
         "/opt/sentinel/scripts/init-hugepages.sh": ("deploy/scripts/init-hugepages.sh", "script"),
         "/opt/sentinel/scripts/init-sysctl.sh": ("deploy/scripts/init-sysctl.sh", "script"),
         "/opt/sentinel/scripts/init-tmpfs.sh": ("deploy/scripts/init-tmpfs.sh", "script"),

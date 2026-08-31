@@ -1564,9 +1564,15 @@ func resolveTier(effectiveModel string) string {
 		return "unknown"
 	case strings.Contains(m, "haiku"):
 		return "low"
+	case strings.Contains(m, "luna"):
+		return "low"
 	case strings.Contains(m, "sonnet"):
 		return "mid"
+	case strings.Contains(m, "terra"):
+		return "mid"
 	case strings.Contains(m, "opus"):
+		return "high"
+	case strings.Contains(m, "sol"):
 		return "high"
 	default:
 		return "unknown"
