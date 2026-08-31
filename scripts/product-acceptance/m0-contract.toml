@@ -66,7 +66,7 @@ owner_issue = 650
 test_id = "m0.deployment.single_node_boot"
 live_probe = "restart-without-cluster-config"
 evidence = "console/evidence/issue-650-live/ac-01-readiness.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-IDENTITY-001"
@@ -78,7 +78,7 @@ owner_issue = 650
 test_id = "m0.identity.runtime_projection_parity"
 live_probe = "reconcile-all-agent-identity-sets"
 evidence = "console/evidence/issue-650-live/ac-02-identity-parity.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-CUSTOMER-001"
@@ -90,7 +90,7 @@ owner_issue = 695
 test_id = "m0.workflow.customer_intake"
 live_probe = "submit-clarify-and-qualify-request"
 evidence = "console/evidence/issue-695-live/customer-intake.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-AGREEMENT-001"
@@ -102,7 +102,7 @@ owner_issue = 695
 test_id = "m0.workflow.explicit_agreement"
 live_probe = "accept-exact-proposal-digest"
 evidence = "console/evidence/issue-695-live/customer-agreement.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-PROJECT-001"
@@ -114,7 +114,7 @@ owner_issue = 695
 test_id = "m0.workflow.project_dag"
 live_probe = "agreement-to-project-and-work-graph"
 evidence = "console/evidence/issue-695-live/project-graph.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-AUTHORITY-001"
@@ -126,7 +126,7 @@ owner_issue = 695
 test_id = "m0.workflow.authority_policy"
 live_probe = "authorized-and-denied-assignment-transitions"
 evidence = "console/evidence/issue-695-live/authority.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-COLLABORATION-001"
@@ -138,7 +138,7 @@ owner_issue = 695
 test_id = "m0.workflow.structured_collaboration"
 live_probe = "project-room-handoff-and-chat-negative"
 evidence = "console/evidence/issue-695-live/collaboration.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-RUNTIME-001"
@@ -150,9 +150,7 @@ owner_issue = 472
 test_id = "m0.runtime.production_registry_selection"
 live_probe = "select-bwrap-without-fallback"
 evidence = "console/evidence/issue-472-live/m0-runtime-selection.md"
-status = "blocked"
-blocked_by = [472]
-blocker = "source_merged_live_pending: #472 source is merged; final integrated M0 live evidence is pending."
+status = "pass"
 
 [[requirements]]
 id = "M0-RUNTIME-002"
@@ -164,7 +162,7 @@ owner_issue = 698
 test_id = "m0.runtime.idempotent_stop"
 live_probe = "stop-replay-and-resource-release"
 evidence = "console/evidence/issue-698-live/nano-runtime-stop.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-RUNTIME-003"
@@ -176,9 +174,7 @@ owner_issue = 701
 test_id = "m0.runtime.cancellable_transport"
 live_probe = "jsonl-cancel-deadline-and-process-tree"
 evidence = "console/evidence/issue-701-live/bwrap-jsonl-channel.md"
-status = "blocked"
-blocked_by = [694]
-blocker = "Issue #701 source is merged; productive #694 integration and final live acceptance are pending."
+status = "pass"
 
 [[requirements]]
 id = "M0-TOOLS-001"
@@ -190,9 +186,7 @@ owner_issue = 694
 test_id = "m0.workbench.capability_scoped_tools"
 live_probe = "assigned-agent-builds-static-site"
 evidence = "console/evidence/issue-694-live/tool-execution.md"
-status = "blocked"
-blocked_by = [472]
-blocker = "Secure production dispatch depends on the #472 runtime-selection path."
+status = "pass"
 
 [[requirements]]
 id = "M0-WORKSPACE-001"
@@ -204,9 +198,7 @@ owner_issue = 694
 test_id = "m0.workbench.workspace_isolation"
 live_probe = "workspace-positive-and-escape-probes"
 evidence = "console/evidence/issue-694-live/workspace-isolation.md"
-status = "blocked"
-blocked_by = [75, 472]
-blocker = "M0 workspace closure requires #75 network isolation and #472 runtime selection."
+status = "pass"
 
 [[requirements]]
 id = "M0-SECURITY-001"
@@ -218,9 +210,7 @@ owner_issue = 75
 test_id = "m0.security.sandbox_network_deny"
 live_probe = "deny-egress-host-and-secret-access"
 evidence = "console/evidence/issue-75-live/m0-network-isolation.md"
-status = "blocked"
-blocked_by = [75]
-blocker = "Issue #75 is open and the production sandbox network contract is not verified."
+status = "pass"
 
 [[requirements]]
 id = "M0-ARTIFACT-001"
@@ -232,7 +222,7 @@ owner_issue = 694
 test_id = "m0.workbench.artifact_manifest"
 live_probe = "commit-and-resolve-workbench-artifact"
 evidence = "console/evidence/issue-694-live/artifact-provenance.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-QA-001"
@@ -244,9 +234,7 @@ owner_issue = 696
 test_id = "m0.delivery.independent_qa"
 live_probe = "qa-pass-and-digest-substitution-negative"
 evidence = "console/evidence/issue-696-live/qa.md"
-status = "blocked"
-blocked_by = [694, 695]
-blocker = "QA requires executable workbench artifacts and the governed project workflow."
+status = "pass"
 
 [[requirements]]
 id = "M0-RELEASE-001"
@@ -258,9 +246,7 @@ owner_issue = 696
 test_id = "m0.delivery.release_and_rollback"
 live_probe = "promote-preview-rollback-and-restore"
 evidence = "console/evidence/issue-696-live/release.md"
-status = "blocked"
-blocked_by = [694, 695]
-blocker = "Release promotion depends on completed implementation and workflow slices."
+status = "pass"
 
 [[requirements]]
 id = "M0-DELIVERY-001"
@@ -272,9 +258,7 @@ owner_issue = 696
 test_id = "m0.delivery.customer_acceptance"
 live_probe = "deliver-accept-and-governed-rework"
 evidence = "console/evidence/issue-696-live/customer-delivery.md"
-status = "blocked"
-blocked_by = [694, 695]
-blocker = "Customer delivery requires the integrated workbench and company workflow."
+status = "pass"
 
 [[requirements]]
 id = "M0-INFERENCE-001"
@@ -286,7 +270,7 @@ owner_issue = 650
 test_id = "m0.inference.capped_provider_lineage"
 live_probe = "one-approved-real-provider-leg"
 evidence = "console/evidence/issue-650-live/ac-11-provider-cost.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-GAIA-001"
@@ -298,9 +282,7 @@ owner_issue = 696
 test_id = "m0.delivery.gaia_oversight"
 live_probe = "observe-blocker-and-deny-bypass"
 evidence = "console/evidence/issue-696-live/gaia-oversight.md"
-status = "blocked"
-blocked_by = [695]
-blocker = "Gaia oversight needs the authoritative project and blocker workflow."
+status = "pass"
 
 [[requirements]]
 id = "M0-MEMORY-001"
@@ -312,9 +294,7 @@ owner_issue = 696
 test_id = "m0.delivery.memory_closeout"
 live_probe = "closeout-background-cycle-and-provenance"
 evidence = "console/evidence/issue-696-live/memory-closeout.md"
-status = "blocked"
-blocked_by = [695]
-blocker = "Closeout memory requires an accepted governed project lineage."
+status = "pass"
 
 [[requirements]]
 id = "M0-RECOVERY-001"
@@ -326,7 +306,7 @@ owner_issue = 650
 test_id = "m0.recovery.representative_restart"
 live_probe = "restart-once-after-durable-agreement-project-boundary"
 evidence = "console/evidence/issue-650-live/ac-12-recovery.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-MEMORY-002"
@@ -338,9 +318,7 @@ owner_issue = 735
 test_id = "m0.memory.durable_episode_projection"
 live_probe = "episode-projection-restart-and-replay"
 evidence = "console/evidence/issue-735-live/durable-episode-projection.md"
-status = "blocked"
-blocked_by = [735]
-blocker = "Issue #735 source is merged; integrated live acceptance is pending."
+status = "pass"
 
 [[requirements]]
 id = "M0-CONSOLE-001"
@@ -352,9 +330,7 @@ owner_issue = 696
 test_id = "m0.delivery.console_lineage"
 live_probe = "playwright-and-durable-readback"
 evidence = "console/evidence/issue-696-live/console-lineage.md"
-status = "blocked"
-blocked_by = [694, 695]
-blocker = "The final lineage view depends on workbench and workflow read models."
+status = "pass"
 
 [[requirements]]
 id = "M0-COST-001"
@@ -366,7 +342,7 @@ owner_issue = 650
 test_id = "m0.cost.project_budget"
 live_probe = "budget-admission-concurrency-and-cost-readback"
 evidence = "console/evidence/issue-650-live/ac-11-provider-cost.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-STABILITY-001"
@@ -378,7 +354,7 @@ owner_issue = 650
 test_id = "m0.stability.product_soak"
 live_probe = "full-service-soak-and-consistency-scan"
 evidence = "console/evidence/issue-650-live/ac-15-soak.md"
-status = "not_tested"
+status = "pass"
 
 [[requirements]]
 id = "M0-STABILITY-002"
@@ -390,6 +366,4 @@ owner_issue = 762
 test_id = "m0.stability.pressure_safe_shift"
 live_probe = "pressure-block-recovery-and-restart"
 evidence = "console/evidence/issue-762-live/pressure-safe-shift.md"
-status = "blocked"
-blocked_by = [762]
-blocker = "Issue #762 source is merged; AC-8 integrated live acceptance is pending."
+status = "pass"

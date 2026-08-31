@@ -120,3 +120,19 @@ removed after the negative readback; cleanup was verified.
 
 No final-delta service restart, cluster access, deployment, or provider call
 occurred.
+
+## Final M0 integration completion
+
+The earlier AC-6 deferral above is superseded by the final integrated M0
+deployment on revision `6c90ae73742ab678daa9868f5d07a4a68643d163`.
+
+- Production daemon selection uses the merged #472 registry contract.
+- All 26 scheduled workloads had healthy instance-bound runtime handles,
+  tracked processes, cgroups, and sandbox handles.
+- The representative daemon restart reaped the old process trees, restored 26
+  workloads without stale handles or orphans, and retained `NRestarts=0`.
+- The pressure-shift acceptance removed and replaced exactly 17 workloads,
+  ended with 26 healthy workloads, and produced no stale runtime entry,
+  projection drift, repair, or respawn failure.
+
+Final integrated result: PASS.

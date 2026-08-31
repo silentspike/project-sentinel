@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 import tempfile
+import tomllib
 import unittest
 
 import check_contract
@@ -28,6 +29,14 @@ class ContractValidatorTests(unittest.TestCase):
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(SOURCE_ROOT / relative, destination)
+        matrix = tomllib.loads((SOURCE_ROOT / MATRIX_REL).read_text(encoding="utf-8"))
+        for requirement in matrix["requirements"]:
+            relative = Path(requirement["evidence"])
+            source = SOURCE_ROOT / relative
+            if source.exists():
+                destination = self.root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -175,16 +184,24 @@ class ContractValidatorTests(unittest.TestCase):
         self.assert_error(self.validate(), "#999 is not in delivery_issues")
 
     def test_unknown_status_is_rejected(self) -> None:
-        self.replace(MATRIX_REL, 'status = "not_tested"', 'status = "done"')
+        self.replace(MATRIX_REL, 'status = "pass"', 'status = "done"')
         self.assert_error(self.validate(), "unknown status 'done'")
 
     def test_pass_requires_existing_evidence(self) -> None:
-        self.replace(MATRIX_REL, 'status = "not_tested"', 'status = "pass"')
+        self.replace(
+            MATRIX_REL,
+            'evidence = "console/evidence/issue-650-live/ac-01-readiness.md"',
+            'evidence = "console/evidence/issue-650-live/missing.md"',
+        )
         self.assert_error(self.validate(), "pass requires a non-empty evidence file")
 
     def test_pass_accepts_nonempty_evidence_without_not_tested_marker(self) -> None:
-        self.replace(MATRIX_REL, 'status = "not_tested"', 'status = "pass"')
-        evidence = self.root / "console/evidence/issue-650-live/ac-01-readiness.md"
+        self.replace(
+            MATRIX_REL,
+            'evidence = "console/evidence/issue-650-live/ac-01-readiness.md"',
+            'evidence = "console/evidence/issue-650-live/test-pass.md"',
+        )
+        evidence = self.root / "console/evidence/issue-650-live/test-pass.md"
         evidence.parent.mkdir(parents=True, exist_ok=True)
         evidence.write_text("Contract validator evidence: PASS\n", encoding="utf-8")
         self.assertEqual(self.validate(), [])
@@ -192,8 +209,8 @@ class ContractValidatorTests(unittest.TestCase):
     def test_blocked_requirement_needs_reason(self) -> None:
         self.replace(
             MATRIX_REL,
-            'blocker = "source_merged_live_pending: #472 source is merged; final integrated M0 live evidence is pending."\n',
-            "",
+            'status = "pass"',
+            'status = "blocked"\nblocked_by = [650]',
         )
         self.assert_error(self.validate(), "blocked requirements need a reason")
 
@@ -222,27 +239,15 @@ class ContractValidatorTests(unittest.TestCase):
         )
 
     def test_issue_701_cannot_pass_without_verified_evidence(self) -> None:
-        self.replace(
-            MATRIX_REL,
-            'evidence = "console/evidence/issue-701-live/bwrap-jsonl-channel.md"\nstatus = "blocked"',
-            'evidence = "console/evidence/issue-701-live/bwrap-jsonl-channel.md"\nstatus = "pass"',
-        )
+        (self.root / "console/evidence/issue-701-live/bwrap-jsonl-channel.md").unlink()
         self.assert_error(self.validate(), "pass requires a non-empty evidence file")
 
     def test_issue_735_source_only_row_cannot_pass_without_live_evidence(self) -> None:
-        self.replace(
-            MATRIX_REL,
-            'evidence = "console/evidence/issue-735-live/durable-episode-projection.md"\nstatus = "blocked"',
-            'evidence = "console/evidence/issue-735-live/durable-episode-projection.md"\nstatus = "pass"',
-        )
+        (self.root / "console/evidence/issue-735-live/durable-episode-projection.md").unlink()
         self.assert_error(self.validate(), "pass requires a non-empty evidence file")
 
     def test_issue_762_source_only_row_cannot_pass_without_live_evidence(self) -> None:
-        self.replace(
-            MATRIX_REL,
-            'evidence = "console/evidence/issue-762-live/pressure-safe-shift.md"\nstatus = "blocked"',
-            'evidence = "console/evidence/issue-762-live/pressure-safe-shift.md"\nstatus = "pass"',
-        )
+        (self.root / "console/evidence/issue-762-live/pressure-safe-shift.md").unlink()
         self.assert_error(self.validate(), "pass requires a non-empty evidence file")
 
     def test_unknown_contract_heading_is_rejected(self) -> None:
