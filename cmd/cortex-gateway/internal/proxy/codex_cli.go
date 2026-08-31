@@ -184,27 +184,17 @@ func (p *CodexCLIProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespo
 	if err != nil {
 		return nil, fmt.Errorf("codex-cli stdout pipe: %w", err)
 	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("codex-cli stderr pipe: %w", err)
-	}
+	diagnostics := &cappedBuffer{limit: codexCLIMaxDiagnosticSize}
+	cmd.Stderr = diagnostics
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("codex-cli start: %w", err)
 	}
-
-	diagnostics := &cappedBuffer{limit: codexCLIMaxDiagnosticSize}
-	stderrDone := make(chan struct{})
-	go func() {
-		defer close(stderrDone)
-		_, _ = io.Copy(diagnostics, stderr)
-	}()
 
 	response, parseErr := p.parseOutputStream(stdout, responseByteLimit(req.MaxTokens))
 	if parseErr != nil {
 		cancelRun()
 	}
 	waitErr := cmd.Wait()
-	<-stderrDone
 
 	if parseErr != nil {
 		if waitErr != nil {
