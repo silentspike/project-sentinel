@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Accept the productive customer, agreement, and work-item actor roles in the
+  server-redacted delivery lineage while rejecting invalid role/class pairs (#650).
+
 - Allow the ordered ECS action-persist barrier up to 60 seconds to finish one
   already-running durable episode commit during shutdown. The total worst-case
   internal drain remains 239 seconds; the 260-second systemd ceiling and
