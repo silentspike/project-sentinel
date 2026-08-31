@@ -15,6 +15,7 @@ import (
 func TestCodexCLIProviderParsesCompletedInference(t *testing.T) {
 	stream := strings.Join([]string{
 		`{"type":"thread.started","thread_id":"thread-1"}`,
+		fmt.Sprintf(`{"type":"item.completed","item":{"id":"item-0","type":"error","message":%q}}`, codexCLIDisabledCodeModePrelude),
 		`{"type":"turn.started"}`,
 		`{"type":"item.started","item":{"id":"reason-1","type":"reasoning","text":"summary"}}`,
 		`{"type":"item.completed","item":{"id":"reason-1","type":"reasoning","text":"summary"}}`,
@@ -33,6 +34,33 @@ func TestCodexCLIProviderParsesCompletedInference(t *testing.T) {
 	if response.InputTokens != 100 || response.CacheRead != 20 || response.CacheCreation != 10 ||
 		response.OutputTokens != 5 || response.TokensUsed != 105 {
 		t.Fatalf("usage=%+v", response)
+	}
+}
+
+func TestCodexCLIProviderRejectsUnexpectedOrDuplicatePreTurnItems(t *testing.T) {
+	tests := map[string]string{
+		"unexpected error": strings.Join([]string{
+			`{"type":"thread.started","thread_id":"thread-1"}`,
+			`{"type":"item.completed","item":{"id":"item-0","type":"error","message":"unexpected"}}`,
+		}, "\n"),
+		"duplicate disabled-code-mode prelude": strings.Join([]string{
+			`{"type":"thread.started","thread_id":"thread-1"}`,
+			fmt.Sprintf(`{"type":"item.completed","item":{"id":"item-0","type":"error","message":%q}}`, codexCLIDisabledCodeModePrelude),
+			fmt.Sprintf(`{"type":"item.completed","item":{"id":"item-1","type":"error","message":%q}}`, codexCLIDisabledCodeModePrelude),
+		}, "\n"),
+		"tool before turn": strings.Join([]string{
+			`{"type":"thread.started","thread_id":"thread-1"}`,
+			`{"type":"item.started","item":{"id":"item-0","type":"command_execution"}}`,
+		}, "\n"),
+	}
+
+	for name, stream := range tests {
+		t.Run(name, func(t *testing.T) {
+			provider := NewCodexCLIProvider(ProviderConfig{Name: CodexCLIProviderName}, nil)
+			if _, err := provider.parseOutputStream(strings.NewReader(stream), 1024); err == nil {
+				t.Fatal("invalid pre-turn stream accepted")
+			}
+		})
 	}
 }
 
@@ -152,7 +180,8 @@ esac
 	args := strings.Fields(readTestFile(t, argsPath))
 	for _, required := range []string{
 		"exec", "--json", "--ephemeral", "--strict-config", "--ignore-user-config", "--ignore-rules",
-		"--skip-git-repo-check", "read-only", "gpt-5.6-luna", "shell_tool", "multi_agent", "-",
+		"--skip-git-repo-check", "read-only", "gpt-5.6-luna", "code_mode", "code_mode_host",
+		"shell_tool", "multi_agent", "-",
 	} {
 		if !slices.Contains(args, required) {
 			t.Fatalf("missing argument %q in %#v", required, args)
