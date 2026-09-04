@@ -61,6 +61,8 @@ const EVENT_SCHEMA_VERSION: i64 = 2;
 const EVENT_V2_MIGRATION: &str =
     include_str!("../migrations/event-store/0001-event-envelope-v2.sql");
 const EVENT_V2_MIGRATION_NAME: &str = "event-envelope-v2";
+const EVENT_V2_SCHEMA_FINGERPRINT: &str =
+    "d7e51ea21faf194fa85b894534f816cfb6b5ca530be5d73cfabeac3ae22c88b4";
 
 const CREATE_EVENT_SCHEMA_MIGRATIONS: &str = "
 CREATE TABLE IF NOT EXISTS event_schema_migrations (
@@ -473,6 +475,13 @@ pub(crate) fn verify_event_contract_schema(
         name == EVENT_V2_MIGRATION_NAME && digest == expected_digest,
         "event schema migration checksum mismatch for version {EVENT_SCHEMA_VERSION}"
     );
+    let schema_fingerprint = event_contract_schema_fingerprint(conn)?;
+    anyhow::ensure!(
+        schema_fingerprint == EVENT_V2_SCHEMA_FINGERPRINT,
+        "event contract schema object fingerprint mismatch: expected {}, found {}",
+        EVENT_V2_SCHEMA_FINGERPRINT,
+        schema_fingerprint
+    );
     for table in [
         "event_truth_metadata",
         "event_stream_heads_v2",
@@ -602,6 +611,41 @@ pub(crate) fn verify_event_contract_schema(
         event_truth_generation,
         next_global_position,
     })
+}
+
+fn event_contract_schema_fingerprint(conn: &rusqlite::Connection) -> anyhow::Result<String> {
+    let mut statement = conn.prepare(
+        "SELECT type, name, tbl_name, COALESCE(sql, '')
+         FROM sqlite_schema
+         WHERE tbl_name IN (
+             'event_schema_migrations',
+             'event_truth_metadata',
+             'event_stream_heads_v2',
+             'events_v2',
+             'event_operations_v2',
+             'delivery_intents_v2',
+             'local_effect_reservations_v2'
+         )
+         ORDER BY type, name, tbl_name",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok([
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ])
+    })?;
+    let mut canonical = Vec::new();
+    for row in rows {
+        for value in row? {
+            canonical.extend_from_slice(value.len().to_string().as_bytes());
+            canonical.push(b':');
+            canonical.extend_from_slice(value.as_bytes());
+            canonical.push(b'\n');
+        }
+    }
+    Ok(sentinel_common::sha256_hex(&canonical))
 }
 
 fn validate_caller(
@@ -1778,6 +1822,25 @@ mod tests {
             .unwrap();
         drop(store);
         assert!(EventStore::open_compatible(path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn compatible_writer_rejects_tampered_schema_shape_with_matching_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shape-tampered.db");
+        drop(EventStore::open(path.to_str().unwrap()).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DROP INDEX idx_events_v2_type_position", [])
+            .unwrap();
+        drop(conn);
+
+        let error = match EventStore::open_compatible(path.to_str().unwrap()) {
+            Ok(_) => panic!("compatible writer accepted a tampered schema shape"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("schema object fingerprint mismatch"));
     }
 
     #[test]
