@@ -1737,10 +1737,10 @@ fn mutate_project(
                 || work.state != CompanyWorkStateV1::Ready
                 || work.spec.owner != *agent_id
                 || participant.role != work.spec.required_role
-                || !work
+                || work
                     .spec
                     .required_specialties
-                    .is_subset(&participant.specialties)
+                    .is_disjoint(&participant.specialties)
             {
                 return Err(unauthorized());
             }
@@ -1809,10 +1809,10 @@ fn mutate_project(
                     CompanyWorkStateV1::Assigned | CompanyWorkStateV1::Blocked
                 )
                 || participant.role != work.spec.required_role
-                || !work
+                || work
                     .spec
                     .required_specialties
-                    .is_subset(&participant.specialties)
+                    .is_disjoint(&participant.specialties)
                 || *organization_generation == 0
             {
                 return Err(unauthorized());
@@ -1872,10 +1872,10 @@ fn mutate_project(
                 .get_mut(work_item_id)
                 .ok_or_else(not_found)?;
             if participant.role != work.spec.required_role
-                || !work
+                || work
                     .spec
                     .required_specialties
-                    .is_subset(&participant.specialties)
+                    .is_disjoint(&participant.specialties)
                 || !is_direct_report(&project.governance, *delegate, actor_id)
                 || !matches!(
                     work.state,
@@ -6011,10 +6011,10 @@ fn validate_project_collections(project: &ProjectV1) -> Result<(), WorkflowError
                 || bound.specialties != assignment.specialties
                 || bound.profile != assignment.profile
                 || assignment.role != work.spec.required_role
-                || !work
+                || work
                     .spec
                     .required_specialties
-                    .is_subset(&assignment.specialties)
+                    .is_disjoint(&assignment.specialties)
             {
                 return Err(corrupt());
             }

@@ -739,6 +739,51 @@ pub struct ProjectV1 {
     pub updated_at_unix_ms: u64,
 }
 
+pub fn execution_capability_coverage_is_admitted(
+    project: &ProjectV1,
+    work: &CompanyWorkItemV1,
+    assignment: &AssignmentV1,
+) -> Result<bool, WorkflowError> {
+    if work
+        .spec
+        .required_specialties
+        .is_subset(&assignment.specialties)
+    {
+        return Ok(true);
+    }
+
+    let assignment_digest = assignment.canonical_digest()?;
+    Ok(project.collaboration_admissions.iter().any(|decision| {
+        matches!(
+            decision.state,
+            CollaborationAdmissionStateV1::Admitted
+                | CollaborationAdmissionStateV1::Active
+                | CollaborationAdmissionStateV1::Completed
+        ) && decision.validate(project.updated_at_unix_ms).is_ok()
+            && decision.input.tenant_id == project.tenant_id
+            && decision.input.project_id == project.project_id
+            && decision.input.work_item_id == work.spec.work_item_id
+            && decision.input.owner == assignment.agent_id
+            && decision.input.organization_generation == assignment.organization_generation
+            && decision.input.organization_digest == assignment.organization_digest
+            && decision.input.assignment_id == assignment.assignment_id
+            && decision.input.assignment_version == assignment.assignment_version
+            && decision.input.assignment_digest == assignment_digest
+            && decision.input.behavior_policy_generation
+                == project.governance.project_profile.generation
+            && decision.input.behavior_policy_digest == project.governance.project_profile.digest
+            && decision.input.required_capabilities == work.spec.required_specialties
+            && decision.selected_agents.contains(&assignment.agent_id)
+            && work.spec.required_specialties.is_subset(
+                &decision
+                    .selected_participants
+                    .iter()
+                    .flat_map(|participant| participant.capabilities.iter().cloned())
+                    .collect(),
+            )
+    }))
+}
+
 pub fn collaboration_policy_uncertainty(
     project: &ProjectV1,
     work_item_id: &WorkItemId,

@@ -941,6 +941,123 @@ fn assignment_is_profile_bound_and_self_qa_is_rejected() {
 }
 
 #[test]
+fn capability_gap_requires_a_bound_collaboration_before_execution() {
+    let state = journey();
+    let work_item_id = WorkItemId::parse("capability-gap").unwrap();
+    let rejected_work_item_id = WorkItemId::parse("foreign-capability").unwrap();
+    let mut project = project_command(
+        &state.store,
+        &state.pm,
+        43,
+        CompanyWorkflowCommandV1::PlanWorkGraph {
+            project_id: state.project_id.clone(),
+            expected_version: 1,
+            items: vec![
+                work(
+                    &work_item_id.0,
+                    CompanyRoleV1::Developer,
+                    &["qa", "rust"],
+                    &[],
+                    100,
+                ),
+                work(
+                    &rejected_work_item_id.0,
+                    CompanyRoleV1::Developer,
+                    &["python"],
+                    &[],
+                    100,
+                ),
+            ],
+        },
+        43,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        44,
+        CompanyWorkflowCommandV1::ActivateProject {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            reason_ref: "capability plan approved".to_owned(),
+        },
+        44,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        45,
+        CompanyWorkflowCommandV1::AssignWork {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: work_item_id.clone(),
+            agent_id: AgentId(2),
+            organization_generation: 1,
+            organization_digest: DIGEST.to_owned(),
+            reason_ref: "developer owns the bounded capability gap".to_owned(),
+        },
+        45,
+    );
+    let work_item = &project.work_items[&work_item_id];
+    let assignment = work_item.assignments.last().unwrap();
+    assert!(
+        !sentinel_workflow::execution_capability_coverage_is_admitted(
+            &project, work_item, assignment,
+        )
+        .unwrap()
+    );
+
+    let input = collaboration_admission_input(&project, &work_item_id, &state.store, 46);
+    assert!(input.directed_handoff_required);
+    let candidates = collaboration_admission_candidates(&project, &work_item_id, &state.store);
+    project = project_command(
+        &state.store,
+        &state.pm,
+        46,
+        CompanyWorkflowCommandV1::AdmitCollaboration {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            source_request_digest: DIGEST.to_owned(),
+            input,
+            candidates,
+            reliability: Vec::new(),
+            expected_benefit_ref: "qa closes the owner capability gap".to_owned(),
+        },
+        46,
+    );
+    let work_item = &project.work_items[&work_item_id];
+    let assignment = work_item.assignments.last().unwrap();
+    assert_eq!(
+        project.collaboration_admissions[0].mode,
+        CollaborationAdmissionModeV1::DirectedHandoff
+    );
+    assert!(
+        sentinel_workflow::execution_capability_coverage_is_admitted(
+            &project, work_item, assignment,
+        )
+        .unwrap()
+    );
+
+    let rejected = state
+        .store
+        .apply_company_command(
+            &state.pm,
+            Uuid::from_u128(47),
+            &CompanyWorkflowCommandV1::AssignWork {
+                project_id: state.project_id,
+                expected_version: project.version,
+                work_item_id: rejected_work_item_id,
+                agent_id: AgentId(2),
+                organization_generation: 1,
+                organization_digest: DIGEST.to_owned(),
+                reason_ref: "unrelated capability must fail".to_owned(),
+            },
+            47,
+        )
+        .unwrap_err();
+    assert_eq!(rejected.code, WorkflowErrorCode::AuthorityConflict);
+}
+
+#[test]
 fn budget_reservation_and_commit_are_bounded_and_idempotent() {
     let state = journey();
     let project = command(

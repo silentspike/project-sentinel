@@ -342,6 +342,10 @@ impl CompanyAuthority {
             .principals
             .principal(&participant.principal_id)
             .ok_or(WorkflowPortError::AuthorityConflict)?;
+        let capability_coverage = sentinel_workflow::execution_capability_coverage_is_admitted(
+            &project, work, assignment,
+        )
+        .map_err(map_authority_store_error)?;
         if assignment.agent_id != agent_id
             || participant.role != assignment.role
             || principal.principal.agent_id != Some(agent_id)
@@ -351,6 +355,7 @@ impl CompanyAuthority {
             || assignment.profile.digest != self.workbench_profile_digest
             || assignment.profile.generation != PROFILE_GENERATION
             || project.governance.project_profile.profile_id != "web-project-v1"
+            || !capability_coverage
             || (require_serving_state
                 && !matches!(
                     work.state,
