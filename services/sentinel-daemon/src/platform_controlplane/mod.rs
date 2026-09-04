@@ -955,14 +955,14 @@ mod tests {
             ..PlatformControlplaneConfig::default()
         });
         cp.write_rate_baselines
-            .insert("Test Agent".to_string(), 1_000.0);
+            .insert("Test Agent".to_string(), 100_000.0);
 
         let dir = tempfile::tempdir().unwrap();
         let db =
             sentinel_limbo::EventStore::open(dir.path().join("write-anomaly.db").to_str().unwrap())
                 .unwrap();
         let metrics = PlatformMetrics {
-            agent_write_rates: vec![("Test Agent".to_string(), 12_000.0)],
+            agent_write_rates: vec![("Test Agent".to_string(), 1_200_000.0)],
             ..Default::default()
         };
         let agent_name_to_id =
