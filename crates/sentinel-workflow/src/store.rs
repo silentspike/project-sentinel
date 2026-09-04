@@ -1656,7 +1656,7 @@ fn validate_stored_work_item(
     Ok(())
 }
 
-fn read_work_item(
+pub(crate) fn read_work_item(
     connection: &Connection,
     tenant_id: &crate::TenantId,
     project_id: &crate::ProjectId,
@@ -1684,7 +1684,7 @@ fn read_work_item(
         .transpose()
 }
 
-fn read_work_item_by_invocation(
+pub(crate) fn read_work_item_by_invocation(
     connection: &Connection,
     invocation_id: Uuid,
 ) -> Result<Option<WorkItemExecutionV1>, WorkflowError> {

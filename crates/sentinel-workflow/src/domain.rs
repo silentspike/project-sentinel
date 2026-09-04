@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::collaboration::*;
 use crate::digest::canonical_sha256;
 use crate::model::{validate_digest, validate_identifier};
 use crate::{AgentId, ProjectId, TenantId, WorkItemId, WorkflowError, WorkflowErrorCode};
@@ -543,6 +544,12 @@ pub struct DecisionV1 {
     pub created_at_unix_ms: u64,
 }
 
+impl DecisionV1 {
+    pub fn canonical_digest(&self) -> Result<String, WorkflowError> {
+        canonical_sha256("sentinel.workflow.project-decision.v1", self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HandoffStateV1 {
@@ -707,6 +714,19 @@ pub struct ProjectV1 {
     pub rooms: Vec<ProjectRoomV1>,
     pub questions: Vec<ProjectQuestionV1>,
     pub actions: Vec<ProjectActionV1>,
+    /// Missing means a pre-#739 project whose legacy handoffs remain read-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_schema_version: Option<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collaboration_sessions: Vec<CollaborationSessionV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handoff_packets: Vec<HandoffPacketV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dissent_records: Vec<DissentRecordV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_evidence: Vec<DecisionEvidenceLinkV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collaboration_publications: Vec<CollaborationPublicationV1>,
     pub version: u64,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
@@ -911,6 +931,149 @@ pub enum CompanyWorkflowCommandV1 {
         action_id: String,
         resolution_ref: String,
     },
+    CreateCollaborationSession {
+        project_id: ProjectId,
+        expected_version: u64,
+        work_item_id: Option<WorkItemId>,
+        authority: CollaborationAuthorityFenceV1,
+        subject_ref: String,
+        input_digest: String,
+        mode: CollaborationModeV1,
+        budget: CollaborationBudgetV1,
+        participants: Vec<CollaborationParticipantV1>,
+    },
+    RecordIndependentClaim {
+        project_id: ProjectId,
+        expected_version: u64,
+        session_id: String,
+        expected_transition_sequence: u64,
+        authority: CollaborationAuthorityFenceV1,
+        conclusion_ref: String,
+        evidence: Vec<EvidenceReferenceV1>,
+        assumptions: Vec<String>,
+        uncertainty: UncertaintyClassV1,
+        confidence_basis: String,
+        capability_snapshot_digest: String,
+        input_digest: String,
+    },
+    OpenClaimExposureBarrier {
+        project_id: ProjectId,
+        expected_version: u64,
+        session_id: String,
+        expected_transition_sequence: u64,
+        authority: CollaborationAuthorityFenceV1,
+        reason_ref: String,
+    },
+    OfferHandoffPacket {
+        project_id: ProjectId,
+        expected_version: u64,
+        session_id: String,
+        expected_transition_sequence: u64,
+        authority: CollaborationAuthorityFenceV1,
+        work_item_id: WorkItemId,
+        consumer: AgentId,
+        objective_ref: String,
+        authority_scope_ref: String,
+        authority_scope_digest: String,
+        input_digests: BTreeSet<String>,
+        artifact_digests: BTreeSet<String>,
+        evidence: Vec<EvidenceReferenceV1>,
+        assumptions: Vec<String>,
+        unresolved_questions: Vec<String>,
+        uncertainty: UncertaintyClassV1,
+        acceptance_checks: Vec<String>,
+        required_capabilities: BTreeSet<String>,
+        privacy_classes: BTreeSet<String>,
+    },
+    RequestHandoffClarification {
+        project_id: ProjectId,
+        expected_version: u64,
+        session_id: String,
+        expected_transition_sequence: u64,
+        authority: CollaborationAuthorityFenceV1,
+        packet_id: String,
+        packet_digest: String,
+        gap_class: HandoffGapClassV1,
+        question_ref: String,
+        basis_digest: String,
+    },
+    AnswerHandoffClarification {
+        project_id: ProjectId,
+        expected_version: u64,
+        session_id: String,
+        expected_transition_sequence: u64,
+        authority: CollaborationAuthorityFenceV1,
+        packet_id: String,
+        packet_digest: String,
+        clarification_id: String,
+        question_generation: u16,
+        answer_ref: String,
+        new_information_digest: String,
+    },
+    AcceptHandoffPacket {
+        project_id: ProjectId,
+        expected_version: u64,
+        session_id: String,
+        expected_transition_sequence: u64,
+        authority: CollaborationAuthorityFenceV1,
+        packet_id: String,
+        packet_digest: String,
+        capability_snapshot_digest: String,
+        reason_ref: String,
+    },
+    RejectHandoffPacket {
+        project_id: ProjectId,
+        expected_version: u64,
+        session_id: String,
+        expected_transition_sequence: u64,
+        authority: CollaborationAuthorityFenceV1,
+        packet_id: String,
+        packet_digest: String,
+        reason_ref: String,
+    },
+    ConsumeHandoffPacket {
+        project_id: ProjectId,
+        expected_version: u64,
+        session_id: String,
+        expected_transition_sequence: u64,
+        authority: CollaborationAuthorityFenceV1,
+        packet_id: String,
+        packet_digest: String,
+        kind: HandoffConsumptionKindV1,
+        subject_id: String,
+        subject_digest: String,
+    },
+    RecordDissent {
+        project_id: ProjectId,
+        expected_version: u64,
+        session_id: String,
+        expected_transition_sequence: u64,
+        authority: CollaborationAuthorityFenceV1,
+        decision_id: String,
+        claim_id: Option<String>,
+        rationale_ref: String,
+        evidence: Vec<EvidenceReferenceV1>,
+        residual_risk_ref: String,
+    },
+    LinkDecisionEvidence {
+        project_id: ProjectId,
+        expected_version: u64,
+        session_id: String,
+        expected_transition_sequence: u64,
+        authority: CollaborationAuthorityFenceV1,
+        decision_id: String,
+        claim_ids: BTreeSet<String>,
+        dissent_ids: BTreeSet<String>,
+    },
+    TransitionCollaborationSession {
+        project_id: ProjectId,
+        expected_version: u64,
+        session_id: String,
+        expected_transition_sequence: u64,
+        authority: CollaborationAuthorityFenceV1,
+        target: CollaborationSessionStateV1,
+        reason_ref: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -951,7 +1114,7 @@ pub enum CompanyWorkflowResponseV1 {
         agreement: Box<AgreementV1>,
         project: Box<ProjectV1>,
     },
-    Project(ProjectV1),
+    Project(Box<ProjectV1>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

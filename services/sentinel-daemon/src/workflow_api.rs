@@ -9,7 +9,7 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -19,16 +19,17 @@ use sentinel_common::{
     WorkbenchTool, WORKBENCH_RUNTIME_BWRAP, WORKBENCH_SCHEMA_VERSION,
 };
 use sentinel_workflow::{
+    collaboration_event_schema_registry, filtered_collaboration_view, is_collaboration_command_v1,
     sealed_output_bundle_digest, ArtifactExpectationV1, ArtifactInputV1,
-    AuthenticatedCompanyPrincipalV1, CommandRuleV1, CompanyPrincipalKindV1, CompanyRoleV1,
-    CompanyWorkflowCommandV1, CompletionEvidencePort, DependencyReadiness, ExecutionPlanV1,
-    ExecutionReconcileState, ExecutionResourceBoundsV1, ExecutionStepV1, ExecutionToolV1,
-    GateEvidencePort, GateExpectationV1, OutputExpectationV1, PendingCompletionEvidenceV1,
-    PendingExecutionV1, PrincipalAuthorityV1, ProjectId, RuntimeAuthoritySnapshotV1,
-    SealedArtifactEvidenceV1, SealedOutputEvidenceV1, TenantId, TerminalExecutionEvidence,
-    UnavailableGateEvidencePort, WorkExecutionObservation, WorkExecutionPort, WorkItemId,
-    WorkflowCore, WorkflowError, WorkflowErrorCode, WorkflowPortError, WorkflowStore,
-    EXECUTION_PLAN_SCHEMA_VERSION, WORKFLOW_SCHEMA_VERSION,
+    AuthenticatedCompanyPrincipalV1, CollaborationPublicationV1, CommandRuleV1,
+    CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkflowCommandV1, CompletionEvidencePort,
+    DependencyReadiness, ExecutionPlanV1, ExecutionReconcileState, ExecutionResourceBoundsV1,
+    ExecutionStepV1, ExecutionToolV1, GateEvidencePort, GateExpectationV1, OutputExpectationV1,
+    PendingCompletionEvidenceV1, PendingExecutionV1, PrincipalAuthorityV1, ProjectId,
+    RuntimeAuthoritySnapshotV1, SealedArtifactEvidenceV1, SealedOutputEvidenceV1, TenantId,
+    TerminalExecutionEvidence, UnavailableGateEvidencePort, WorkExecutionObservation,
+    WorkExecutionPort, WorkItemId, WorkflowCore, WorkflowError, WorkflowErrorCode,
+    WorkflowPortError, WorkflowStore, EXECUTION_PLAN_SCHEMA_VERSION, WORKFLOW_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -58,6 +59,7 @@ pub const DELIVERY_COMMAND_PATH: &str = "/company/delivery/commands";
 pub const DELIVERY_INTENT_PATH: &str = "/company/delivery/intents";
 pub const DELIVERY_LINEAGE_PATH: &str = "/company/delivery/lineage";
 pub const WORKFLOW_READINESS_PATH: &str = "/company/workflow/readiness";
+pub const COLLABORATION_VIEW_PATH: &str = "/company/workflow/collaboration";
 pub const MAX_WORKFLOW_BODY_BYTES: usize = 256 * 1024;
 
 const PRINCIPAL_SCHEMA_VERSION: u16 = 1;
@@ -1750,6 +1752,7 @@ pub struct WorkflowHealthSnapshot {
     pub pending_gate: usize,
     pub delivery_ready: bool,
     pub delivery_publication_pending: usize,
+    pub collaboration_publication_pending: usize,
     pub last_error: Option<String>,
 }
 
@@ -1769,6 +1772,7 @@ pub struct WorkflowApi {
     mutation_fence: RwLock<()>,
     enabled: bool,
     scan_succeeded: AtomicBool,
+    collaboration_publication_pending: AtomicUsize,
     last_error: Mutex<Option<String>>,
     company_sync_cursor: Mutex<Option<(TenantId, ProjectId, WorkItemId)>>,
 }
@@ -1873,6 +1877,7 @@ impl WorkflowApi {
             mutation_fence: RwLock::new(()),
             enabled: true,
             scan_succeeded: AtomicBool::new(false),
+            collaboration_publication_pending: AtomicUsize::new(usize::MAX),
             last_error: Mutex::new(None),
             company_sync_cursor: Mutex::new(None),
         })
@@ -1902,6 +1907,7 @@ impl WorkflowApi {
             mutation_fence: RwLock::new(()),
             enabled: false,
             scan_succeeded: AtomicBool::new(false),
+            collaboration_publication_pending: AtomicUsize::new(0),
             last_error: Mutex::new(None),
             company_sync_cursor: Mutex::new(None),
         })
@@ -1953,6 +1959,7 @@ impl WorkflowApi {
             ("POST", DELIVERY_COMMAND_PATH) => self.delivery_command(&principal, body),
             ("POST", DELIVERY_INTENT_PATH) => delivery_intent::handle(self, &principal, body),
             ("GET", DELIVERY_LINEAGE_PATH) => self.delivery_lineage(&principal, path),
+            ("GET", COLLABORATION_VIEW_PATH) => self.collaboration_view(&principal, path),
             ("GET", WORKFLOW_READINESS_PATH) => json(200, &self.health()),
             _ => json_error(
                 405,
@@ -2012,11 +2019,116 @@ impl WorkflowApi {
             &envelope.command,
             now_unix_ms(),
         ) {
-            Ok(value) => json(200, &value),
+            Ok(value) => {
+                if is_collaboration_command_v1(&envelope.command) {
+                    if let Err(error) = self.publish_collaboration_backlog() {
+                        if let Ok(mut last_error) = self.last_error.lock() {
+                            *last_error = Some(error);
+                        }
+                        return json_error(
+                            503,
+                            "collaboration_publication_pending",
+                            "collaboration state is durable but canonical publication is pending",
+                            true,
+                        );
+                    }
+                }
+                json(200, &value)
+            }
             Err(error) => workflow_error(error),
         }
     }
 
+    fn collaboration_view(&self, principal: &BoundPrincipal, path: &str) -> WorkflowHttpResponse {
+        if principal.principal.kind == CompanyPrincipalKindV1::Customer {
+            return json_error(
+                403,
+                "authority_conflict",
+                "operator or participating agent authority is required",
+                false,
+            );
+        }
+        let (Some(project_value), Some(session_id)) = (
+            query_parameter(path, "project_id"),
+            query_parameter(path, "session_id"),
+        ) else {
+            return json_error(
+                400,
+                "invalid_input",
+                "project_id and session_id are required",
+                false,
+            );
+        };
+        let project_id = match ProjectId::parse(project_value) {
+            Ok(value) => value,
+            Err(error) => return workflow_error(error),
+        };
+        match self
+            .store
+            .company_project(&principal.principal.tenant_id, &project_id)
+        {
+            Ok(Some(project)) => {
+                match filtered_collaboration_view(&project, &principal.principal, session_id) {
+                    Ok(value) => json(200, &value),
+                    Err(error) => workflow_error(error),
+                }
+            }
+            Ok(None) => json_error(404, "not_found", "workflow object was not found", false),
+            Err(error) => workflow_error(error),
+        }
+    }
+
+    fn publish_collaboration_backlog(&self) -> Result<(), String> {
+        let event_store = self
+            .event_store
+            .as_ref()
+            .ok_or_else(|| "collaboration event store is unavailable".to_owned())?;
+        let registry = collaboration_event_schema_registry()
+            .map_err(|error| format!("collaboration schema registry is invalid: {error}"))?;
+        let publications = self
+            .store
+            .collaboration_publications()
+            .map_err(|error| format!("collaboration publication ledger is unavailable: {error}"))?;
+        publish_collaboration_publications(
+            event_store,
+            &registry,
+            &publications,
+            &self.collaboration_publication_pending,
+        )
+        .map(|_| ())
+    }
+}
+
+fn publish_collaboration_publications(
+    event_store: &sentinel_limbo::EventStore,
+    registry: &sentinel_common::EventSchemaRegistry,
+    publications: &[CollaborationPublicationV1],
+    pending: &AtomicUsize,
+) -> Result<Vec<sentinel_common::AppendDispositionV2>, String> {
+    pending.store(publications.len(), Ordering::Release);
+    let mut dispositions = Vec::with_capacity(publications.len());
+    for (index, publication) in publications.iter().enumerate() {
+        let authority_scope_digest = publication
+            .proposal
+            .causal_context
+            .authority_scope_digest()
+            .map_err(|error| format!("collaboration authority is invalid: {error}"))?;
+        let caller = sentinel_limbo::AuthenticatedEventCallerV1 {
+            service_id: "sentinel-daemon-workflow".to_owned(),
+            producer: publication.proposal.producer.clone(),
+            authority_scope_digest,
+        };
+        let outcome = event_store
+            .append_gateway(registry)
+            .append(&caller, &publication.proposal)
+            .map_err(|error| format!("collaboration publication failed: {error}"))?;
+        dispositions.push(outcome.disposition);
+        pending.store(publications.len() - index - 1, Ordering::Release);
+    }
+    Ok(dispositions)
+}
+
+impl WorkflowApi {
     fn validate_provider_usage_binding(
         &self,
         principal: &AuthenticatedCompanyPrincipalV1,
@@ -2689,6 +2801,8 @@ impl WorkflowApi {
     }
 
     fn reconcile_batch(&self, should_stop: &impl Fn() -> bool) -> Result<(), WorkflowError> {
+        self.publish_collaboration_backlog()
+            .map_err(|_| workflow_unavailable())?;
         for pending in self.store.pending_executions(MAX_RECONCILE_BATCH)? {
             if should_stop() {
                 return Ok(());
@@ -2911,6 +3025,9 @@ impl WorkflowApi {
             .delivery
             .as_ref()
             .and_then(|delivery| delivery.pending_publication_count().ok());
+        let collaboration_publication_pending = self
+            .collaboration_publication_pending
+            .load(Ordering::Acquire);
         let dependencies_ready = self.core.dependencies_ready() && delivery_ready;
         let ready = self.enabled
             && dependencies_ready
@@ -2920,6 +3037,7 @@ impl WorkflowApi {
             && pending_completion.is_ok()
             && pending_gate.is_ok()
             && delivery_publication_pending == Some(0)
+            && collaboration_publication_pending == 0
             && canonical_event_cursor.is_ok();
         WorkflowHealthSnapshot {
             enabled: self.enabled,
@@ -2945,6 +3063,7 @@ impl WorkflowApi {
             delivery_ready,
             delivery_publication_pending: delivery_publication_pending
                 .unwrap_or(MAX_RECONCILE_BATCH),
+            collaboration_publication_pending,
             last_error,
         }
     }
@@ -3152,6 +3271,7 @@ fn is_workflow_path(path: &str) -> bool {
             | DELIVERY_COMMAND_PATH
             | DELIVERY_INTENT_PATH
             | DELIVERY_LINEAGE_PATH
+            | COLLABORATION_VIEW_PATH
             | WORKFLOW_READINESS_PATH
     )
 }
@@ -3335,6 +3455,183 @@ mod tests {
         }
     }
 
+    fn collaboration_publication() -> CollaborationPublicationV1 {
+        let authority_digest = "a".repeat(64);
+        let tenant_id = TenantId::parse("tenant-collaboration").unwrap();
+        let project_id = ProjectId::parse("project-collaboration").unwrap();
+        let work_item_id = WorkItemId::parse("work-collaboration").unwrap();
+        let mut session = sentinel_workflow::CollaborationSessionV1 {
+            schema_version: sentinel_workflow::COLLABORATION_SCHEMA_VERSION,
+            session_id: "collaboration-session".to_owned(),
+            tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
+            work_item_id: Some(work_item_id.clone()),
+            organization_generation: 1,
+            organization_digest: authority_digest.clone(),
+            policy_version: 1,
+            policy_digest: authority_digest.clone(),
+            subject_ref: "publish one collaboration transition".to_owned(),
+            input_digest: authority_digest.clone(),
+            mode: sentinel_workflow::CollaborationModeV1::IndependentReview,
+            budget: sentinel_workflow::CollaborationBudgetV1 {
+                max_participants: 2,
+                max_claims: 2,
+                max_handoffs: 1,
+                max_clarification_rounds: 1,
+                max_transitions: 8,
+                deadline_unix_ms: 100,
+            },
+            participants: vec![
+                sentinel_workflow::CollaborationParticipantV1 {
+                    agent_id: AgentId(1),
+                    permanent_role: CompanyRoleV1::ProjectManager,
+                    mandate: sentinel_workflow::BehaviorMandateV1::Synthesize,
+                    capability_snapshot_digest: authority_digest.clone(),
+                    capabilities: BTreeSet::from(["coordination".to_owned()]),
+                    privacy_classes: BTreeSet::from(["project-internal".to_owned()]),
+                },
+                sentinel_workflow::CollaborationParticipantV1 {
+                    agent_id: AgentId(2),
+                    permanent_role: CompanyRoleV1::Developer,
+                    mandate: sentinel_workflow::BehaviorMandateV1::Implement,
+                    capability_snapshot_digest: authority_digest.clone(),
+                    capabilities: BTreeSet::from(["rust".to_owned()]),
+                    privacy_classes: BTreeSet::from(["project-internal".to_owned()]),
+                },
+            ],
+            state: sentinel_workflow::CollaborationSessionStateV1::Planned,
+            transition_sequence: 1,
+            publication_revision: 1,
+            binding_digest: String::new(),
+            claims: Vec::new(),
+            transition_history: Vec::new(),
+            created_by: AgentId(1),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+        session.binding_digest = session.expected_binding_digest().unwrap();
+        let payload_value = sentinel_workflow::CollaborationEventPayloadV1 {
+            schema_version: sentinel_workflow::COLLABORATION_SCHEMA_VERSION,
+            tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
+            session_id: session.session_id.clone(),
+            transition_sequence: 1,
+            command_digest: authority_digest.clone(),
+            record: sentinel_workflow::CollaborationEventRecordV1::Session(session.clone()),
+        };
+        let payload = sentinel_common::canonical_json(&payload_value).unwrap();
+        let payload_digest = sentinel_common::sha256_hex(&payload);
+        let operation_id = Uuid::from_u128(739);
+        let proposal = sentinel_common::AppendProposalV2 {
+            proposal_version: sentinel_common::EVENT_PROPOSAL_VERSION_V2,
+            requested_event_id: None,
+            event_type: sentinel_workflow::COLLABORATION_EVENT_TYPE.to_owned(),
+            schema_version: sentinel_workflow::COLLABORATION_EVENT_SCHEMA_VERSION,
+            payload_codec: sentinel_common::EventPayloadCodec::Json,
+            payload_digest: payload_digest.clone(),
+            payload,
+            causal_context: sentinel_common::CausalContextV1 {
+                schema_version: sentinel_common::CAUSAL_CONTEXT_VERSION_V1,
+                tenant: sentinel_common::AuthorityRefV1 {
+                    kind: sentinel_common::AuthorityKindV1::Tenant,
+                    id: tenant_id.0.clone(),
+                    authority_generation: 1,
+                    authority_digest: authority_digest.clone(),
+                },
+                company: sentinel_common::AuthorityRefV1 {
+                    kind: sentinel_common::AuthorityKindV1::Company,
+                    id: "virtual-company".to_owned(),
+                    authority_generation: 1,
+                    authority_digest: authority_digest.clone(),
+                },
+                project: sentinel_common::AuthorityRefV1 {
+                    kind: sentinel_common::AuthorityKindV1::Project,
+                    id: project_id.0.clone(),
+                    authority_generation: 1,
+                    authority_digest: authority_digest.clone(),
+                },
+                workflow: Some(sentinel_common::AuthorityRefV1 {
+                    kind: sentinel_common::AuthorityKindV1::Workflow,
+                    id: session.session_id.clone(),
+                    authority_generation: 1,
+                    authority_digest: session.binding_digest,
+                }),
+                work_item: Some(sentinel_common::AuthorityRefV1 {
+                    kind: sentinel_common::AuthorityKindV1::WorkItem,
+                    id: work_item_id.0,
+                    authority_generation: 1,
+                    authority_digest: authority_digest.clone(),
+                }),
+                request_id: operation_id.to_string(),
+                request_digest: authority_digest.clone(),
+                correlation_id: session.session_id.clone(),
+                causation_event_id: None,
+                operation_id: operation_id.to_string(),
+                attempt: 1,
+                source_generation: 1,
+                source_digest: payload_digest.clone(),
+                invocation_id: None,
+                agent_id: Some("agent-1".to_owned()),
+                tick: None,
+                artifact_id: None,
+                artifact_digest: None,
+                qa_run_id: None,
+                release_id: None,
+                delivery_id: None,
+                diagnostic_trace_id: None,
+                diagnostic_span_id: None,
+            },
+            producer: sentinel_workflow::COLLABORATION_EVENT_PRODUCER.to_owned(),
+            owner_term: None,
+            tick: None,
+            requested_durability: sentinel_common::EventDurability::Authoritative,
+            expected_stream_revision: sentinel_common::ExpectedStreamRevision::NoStream,
+            delivery_intents: vec![sentinel_common::DeliveryIntentV1 {
+                intent_id: format!("collaboration-delivery-{operation_id}"),
+                topic: sentinel_workflow::COLLABORATION_DELIVERY_TOPIC.to_owned(),
+                payload_digest,
+            }],
+            effect_reservations: Vec::new(),
+        };
+        CollaborationPublicationV1 {
+            operation_id,
+            session_id: session.session_id,
+            transition_sequence: 1,
+            proposal,
+        }
+    }
+
+    #[test]
+    fn collaboration_publication_replays_without_a_second_event() {
+        let events = sentinel_limbo::EventStore::open(":memory:").unwrap();
+        let registry = collaboration_event_schema_registry().unwrap();
+        let publication = collaboration_publication();
+        let pending = AtomicUsize::new(usize::MAX);
+
+        let first = publish_collaboration_publications(
+            &events,
+            &registry,
+            std::slice::from_ref(&publication),
+            &pending,
+        )
+        .unwrap();
+        assert_eq!(first, [sentinel_common::AppendDispositionV2::Appended]);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+
+        let replay = publish_collaboration_publications(
+            &events,
+            &registry,
+            std::slice::from_ref(&publication),
+            &pending,
+        )
+        .unwrap();
+        assert_eq!(
+            replay,
+            [sentinel_common::AppendDispositionV2::ReplayOfPriorOperation]
+        );
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+    }
+
     fn provider_usage_event() -> DomainEvent {
         let payload = DomainEventPayload::AgentLlmUsage {
             agent_id: AgentId(6),
@@ -3476,6 +3773,12 @@ mod tests {
             rooms: Vec::new(),
             questions: Vec::new(),
             actions: Vec::new(),
+            collaboration_schema_version: Some(sentinel_workflow::COLLABORATION_SCHEMA_VERSION),
+            collaboration_sessions: Vec::new(),
+            handoff_packets: Vec::new(),
+            dissent_records: Vec::new(),
+            decision_evidence: Vec::new(),
+            collaboration_publications: Vec::new(),
             version: 3,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 3,
