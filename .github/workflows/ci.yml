@@ -429,14 +429,21 @@ jobs:
 
       - name: Install flatc
         run: |
-          curl -LO https://github.com/google/flatbuffers/releases/latest/download/Linux.flatbuffers.binary.clang++-17.zip
-          unzip Linux.flatbuffers.binary.clang++-17.zip -d /usr/local/bin/ || true
-          chmod +x /usr/local/bin/flatc || true
+          archive="$RUNNER_TEMP/Linux.flatc.binary.clang++-18.zip"
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            'https://github.com/google/flatbuffers/releases/download/v25.12.19-2026-02-06-03fffb2/Linux.flatc.binary.clang%2B%2B-18.zip'
+          echo '2cd7f7fcee4ca898d045054aa3e83406b2619f4f652b8c2bc2d444d5402a4c77  '"$archive" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/flatc-bin"
+          unzip -q "$archive" -d "$RUNNER_TEMP/flatc-bin"
+          chmod 0755 "$RUNNER_TEMP/flatc-bin/flatc"
+          echo "$RUNNER_TEMP/flatc-bin" >> "$GITHUB_PATH"
 
       - name: Validate schemas
         run: |
+          mkdir -p "$RUNNER_TEMP/flatc-output"
           for f in schemas/*.fbs; do
-            flatc --no-gen-all -o /tmp "$f" || exit 1
+            flatc --cpp --no-includes -o "$RUNNER_TEMP/flatc-output" "$f"
           done
 
   # ──────────────────────────────────────────────
