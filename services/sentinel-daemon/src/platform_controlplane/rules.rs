@@ -7,6 +7,9 @@ use sentinel_common::AgentId;
 use super::metrics::PlatformMetrics;
 use crate::config::PlatformControlplaneConfig;
 
+// Sparse low-volume samples make ratios against a near-zero EWMA non-actionable.
+const WRITE_ANOMALY_RELATIVE_FLOOR_BYTES_PER_SEC: f64 = 1_000_000.0;
+
 /// Auszufuehrende Aktion einer Regel.
 #[derive(Debug, Clone)]
 pub struct PlatformAction {
@@ -161,6 +164,9 @@ pub fn evaluate_rules(
 
     // Regel 5: Write-Rate Anomalie
     for (agent_name, rate) in &metrics.agent_write_rates {
+        if suspended_agents.contains(agent_name) {
+            continue;
+        }
         let Some(assessment) =
             assess_write_anomaly(*rate, write_rate_baselines.get(agent_name).copied(), config)
         else {
@@ -237,7 +243,10 @@ pub fn assess_write_anomaly(
         rate_bytes_per_sec > config.write_anomaly_threshold_bytes_per_sec as f64;
     let baseline_triggered = baseline_bytes_per_sec
         .filter(|baseline| *baseline > 0.0)
-        .map(|baseline| rate_bytes_per_sec > baseline * config.write_anomaly_baseline_multiplier)
+        .map(|baseline| {
+            rate_bytes_per_sec >= WRITE_ANOMALY_RELATIVE_FLOOR_BYTES_PER_SEC
+                && rate_bytes_per_sec > baseline * config.write_anomaly_baseline_multiplier
+        })
         .unwrap_or(false);
 
     if absolute_triggered || baseline_triggered {
@@ -522,14 +531,24 @@ mod tests {
     }
 
     #[test]
-    fn test_write_anomaly_assessment_triggers_on_baseline_multiplier() {
+    fn test_write_anomaly_assessment_rejects_low_rate_baseline_noise() {
         let config = PlatformControlplaneConfig {
             write_anomaly_threshold_bytes_per_sec: 50_000_000,
             write_anomaly_baseline_multiplier: 10.0,
             ..test_config()
         };
-        let assessment = assess_write_anomaly(12_000.0, Some(1_000.0), &config)
-            .expect("baseline should trigger");
+        assert_eq!(assess_write_anomaly(12_000.0, Some(1_000.0), &config), None);
+    }
+
+    #[test]
+    fn test_write_anomaly_assessment_triggers_on_meaningful_baseline_burst() {
+        let config = PlatformControlplaneConfig {
+            write_anomaly_threshold_bytes_per_sec: 50_000_000,
+            write_anomaly_baseline_multiplier: 10.0,
+            ..test_config()
+        };
+        let assessment = assess_write_anomaly(1_200_000.0, Some(100_000.0), &config)
+            .expect("meaningful baseline burst should trigger");
         assert!(assessment.baseline_triggered);
         assert!(!assessment.absolute_triggered);
     }
@@ -597,10 +616,10 @@ mod tests {
             ..test_config()
         };
         let metrics = PlatformMetrics {
-            agent_write_rates: vec![("Test Agent".to_string(), 12_000.0)],
+            agent_write_rates: vec![("Test Agent".to_string(), 1_200_000.0)],
             ..Default::default()
         };
-        let baselines = HashMap::from([("Test Agent".to_string(), 1_000.0)]);
+        let baselines = HashMap::from([("Test Agent".to_string(), 100_000.0)]);
         let agent_name_to_id = HashMap::from([("Test Agent".to_string(), AgentId(9))]);
         let actions = evaluate_rules(
             &metrics,
@@ -614,6 +633,28 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].action_label, "sigstop");
         assert!(actions[0].description.contains("Baseline"));
+    }
+
+    #[test]
+    fn test_write_anomaly_rule_skips_already_suspended_agent() {
+        let metrics = PlatformMetrics {
+            agent_write_rates: vec![("Test Agent".to_string(), 10_000_000.0)],
+            ..Default::default()
+        };
+        let agent_name_to_id = HashMap::from([("Test Agent".to_string(), AgentId(7))]);
+        let suspended = HashSet::from(["Test Agent".to_string()]);
+
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+            &agent_name_to_id,
+            &suspended,
+        );
+
+        assert!(actions.is_empty());
     }
 
     #[test]
