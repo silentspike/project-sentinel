@@ -70,7 +70,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     );
 
     let event_store = Arc::new(
-        EventStore::open(&cli.event_store)
+        EventStore::open_compatible(&cli.event_store)
             .with_context(|| format!("Failed to open EventStore: {}", cli.event_store))?,
     );
 

@@ -541,7 +541,10 @@ mod tests {
             tick,
         );
         event.timestamp_ms = tick * 1000;
-        store.append_event(&event).unwrap();
+        store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+            .append_event(&event)
+            .unwrap();
     }
 
     #[test]

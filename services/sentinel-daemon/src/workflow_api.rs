@@ -2661,6 +2661,7 @@ impl WorkflowApi {
             ));
         }
         event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonWorkflow)
             .append_event(&event)
             .map_err(|error| crate::delivery::DeliveryError::Storage(error.to_string()))?;
         Ok(())

@@ -2,8 +2,10 @@ package eventstore
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +23,44 @@ func tempDB(t *testing.T) (*Store, string) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store, path
+}
+
+func migrateEventContractForTest(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open migration fixture: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	migration, err := os.ReadFile(filepath.Join(
+		"..", "..", "..", "crates", "sentinel-limbo", "migrations", "event-store",
+		"0001-event-envelope-v2.sql",
+	))
+	if err != nil {
+		t.Fatalf("read canonical event migration: %v", err)
+	}
+	if _, err := db.Exec(`
+CREATE TABLE IF NOT EXISTS event_schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    sha256 TEXT NOT NULL,
+    applied_at_ms INTEGER NOT NULL
+)`); err != nil {
+		t.Fatalf("create migration ledger: %v", err)
+	}
+	if _, err := db.Exec(string(migration)); err != nil {
+		t.Fatalf("apply canonical event migration: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO event_schema_migrations(version, name, sha256, applied_at_ms)
+		 VALUES (?, ?, ?, ?)`,
+		eventContractSchemaVersion,
+		eventContractMigrationName,
+		eventContractMigrationSHA,
+		time.Now().UnixMilli(),
+	); err != nil {
+		t.Fatalf("record canonical event migration: %v", err)
+	}
 }
 
 func makeEvent(opID string) DomainEvent {
@@ -72,6 +112,166 @@ func TestOpenAndClose(t *testing.T) {
 	}
 }
 
+func TestOpenCompatibleVerifiesRustMigrationAndDisablesLegacyAppend(t *testing.T) {
+	legacy, path := tempDB(t)
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy schema authority: %v", err)
+	}
+	migrateEventContractForTest(t, path)
+
+	store, err := OpenCompatible(path)
+	if err != nil {
+		t.Fatalf("OpenCompatible(%q): %v", path, err)
+	}
+	defer func() { _ = store.Close() }()
+	status, err := store.EventContractSchemaStatus()
+	if err != nil {
+		t.Fatalf("EventContractSchemaStatus: %v", err)
+	}
+	if status.SchemaVersion != eventContractSchemaVersion ||
+		status.MigrationSHA256 != eventContractMigrationSHA ||
+		status.EventTruthGeneration != 1 || status.NextGlobalPosition != 1 {
+		t.Fatalf("unexpected schema status: %+v", status)
+	}
+	if err := store.appendWithOutbox(makeEvent("forbidden"), "events.agent"); !errors.Is(err, ErrLegacyAppendDisabled) {
+		t.Fatalf("AppendWithOutbox error = %v, want %v", err, ErrLegacyAppendDisabled)
+	}
+}
+
+func TestOpenLegacyCompatibleAllowsOnlyTheBoundProducer(t *testing.T) {
+	legacy, path := tempDB(t)
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy schema authority: %v", err)
+	}
+	migrateEventContractForTest(t, path)
+
+	store, err := OpenLegacyCompatible(path, LegacyProducerCortexAudit)
+	if err != nil {
+		t.Fatalf("OpenLegacyCompatible(%q): %v", path, err)
+	}
+	defer func() { _ = store.Close() }()
+	if err := store.LegacyAppendGateway(LegacyProducerCortexAudit).
+		AppendWithOutbox(makeEvent("cortex-compatible"), "events.audit"); err != nil {
+		t.Fatalf("authorized compatibility append: %v", err)
+	}
+	if err := store.LegacyAppendGateway(LegacyProducerBenchmark).
+		AppendWithOutbox(makeEvent("wrong-producer"), "events.audit"); err == nil {
+		t.Fatal("store accepted a legacy producer other than its bound producer")
+	}
+}
+
+func TestOpenCompatibleRejectsTamperedMigrationDigest(t *testing.T) {
+	legacy, path := tempDB(t)
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy schema authority: %v", err)
+	}
+	migrateEventContractForTest(t, path)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open tamper fixture: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE event_schema_migrations SET sha256 = ? WHERE version = ?`, strings.Repeat("0", 64), eventContractSchemaVersion); err != nil {
+		t.Fatalf("tamper migration digest: %v", err)
+	}
+	_ = db.Close()
+	if _, err := OpenCompatible(path); err == nil {
+		t.Fatal("OpenCompatible accepted a tampered migration digest")
+	}
+}
+
+func TestOpenCompatibleDoesNotCreateMissingStore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.db")
+	if _, err := OpenCompatible(path); err == nil {
+		t.Fatal("OpenCompatible created or accepted a missing store")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing compatible store was materialized: %v", err)
+	}
+}
+
+func TestOpenCompatibleRejectsCallerControlledSQLiteURI(t *testing.T) {
+	if _, err := OpenCompatible("file::memory:?cache=shared&_pragma=journal_mode(WAL)"); err == nil {
+		t.Fatal("OpenCompatible accepted a caller-controlled SQLite URI")
+	}
+}
+
+func TestOpenCompatibleRejectsPartialV2Schema(t *testing.T) {
+	legacy, path := tempDB(t)
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy schema authority: %v", err)
+	}
+	migrateEventContractForTest(t, path)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open partial schema fixture: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE events_v2 DROP COLUMN producer`); err != nil {
+		_ = db.Close()
+		t.Fatalf("remove required V2 column: %v", err)
+	}
+	_ = db.Close()
+	if _, err := OpenCompatible(path); err == nil {
+		t.Fatal("OpenCompatible accepted a partial V2 schema")
+	}
+}
+
+func TestOpenCompatibleRejectsTamperedSchemaShapeWithMatchingColumns(t *testing.T) {
+	legacy, path := tempDB(t)
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy schema authority: %v", err)
+	}
+	migrateEventContractForTest(t, path)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open schema-shape fixture: %v", err)
+	}
+	if _, err := db.Exec(`DROP INDEX idx_events_v2_type_position`); err != nil {
+		_ = db.Close()
+		t.Fatalf("tamper V2 schema shape: %v", err)
+	}
+	_ = db.Close()
+	if _, err := OpenCompatible(path); err == nil {
+		t.Fatal("OpenCompatible accepted a tampered schema with matching columns")
+	}
+}
+
+func TestOpenCompatibleDoesNotChangePersistentJournalMode(t *testing.T) {
+	legacy, path := tempDB(t)
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy schema authority: %v", err)
+	}
+	migrateEventContractForTest(t, path)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open journal mode fixture: %v", err)
+	}
+	var mode string
+	if err := db.QueryRow(`PRAGMA journal_mode = DELETE`).Scan(&mode); err != nil {
+		_ = db.Close()
+		t.Fatalf("set journal mode: %v", err)
+	}
+	if !strings.EqualFold(mode, "delete") {
+		_ = db.Close()
+		t.Fatalf("journal mode=%q, want delete", mode)
+	}
+	_ = db.Close()
+
+	if _, err := OpenCompatible(path); err == nil {
+		t.Fatal("OpenCompatible accepted a non-WAL store")
+	}
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("reopen journal mode fixture: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+		t.Fatalf("read journal mode: %v", err)
+	}
+	if !strings.EqualFold(mode, "delete") {
+		t.Fatalf("compatible open changed journal mode to %q", mode)
+	}
+}
+
 func TestAppendWaitsForConcurrentWriter(t *testing.T) {
 	store, path := tempDB(t)
 
@@ -100,7 +300,7 @@ func TestAppendWaitsForConcurrentWriter(t *testing.T) {
 		released <- tx.Rollback()
 	}()
 
-	if err := store.AppendWithOutbox(makeEvent("busy-timeout"), "events.agent"); err != nil {
+	if err := store.appendWithOutbox(makeEvent("busy-timeout"), "events.agent"); err != nil {
 		t.Fatalf("append while a concurrent writer briefly holds the database: %v", err)
 	}
 	if err := <-released; err != nil && err != sql.ErrTxDone {
@@ -193,7 +393,7 @@ func TestAppendWithOutbox(t *testing.T) {
 	store, _ := tempDB(t)
 
 	event := makeEvent("op-roundtrip-001")
-	if err := store.AppendWithOutbox(event, "sentinel/cortex/events/AGENT-01"); err != nil {
+	if err := store.appendWithOutbox(event, "sentinel/cortex/events/AGENT-01"); err != nil {
 		t.Fatalf("AppendWithOutbox: %v", err)
 	}
 
@@ -232,13 +432,13 @@ func TestIdempotency(t *testing.T) {
 	store, _ := tempDB(t)
 
 	event1 := makeEvent("op-idempotent-001")
-	if err := store.AppendWithOutbox(event1, "test/topic"); err != nil {
+	if err := store.appendWithOutbox(event1, "test/topic"); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
 
 	// Second append with same operation_id but different event_id
 	event2 := makeEvent("op-idempotent-001")
-	if err := store.AppendWithOutbox(event2, "test/topic"); err != nil {
+	if err := store.appendWithOutbox(event2, "test/topic"); err != nil {
 		t.Fatalf("second append: %v", err)
 	}
 
@@ -277,7 +477,7 @@ func TestConcurrentWrites(t *testing.T) {
 				SchemaVersion:    1,
 				CompensationType: "none",
 			}
-			if err := store.AppendWithOutbox(event, "test/concurrent"); err != nil {
+			if err := store.appendWithOutbox(event, "test/concurrent"); err != nil {
 				errs <- err
 			}
 		}(i)
@@ -299,7 +499,7 @@ func TestConcurrentWrites(t *testing.T) {
 func TestOutboxPublishedCASBindsPendingRowEventAndOperation(t *testing.T) {
 	store, _ := tempDB(t)
 	event := makeEvent("op-cas-001")
-	if err := store.AppendWithOutbox(event, "test/topic"); err != nil {
+	if err := store.appendWithOutbox(event, "test/topic"); err != nil {
 		t.Fatalf("AppendWithOutbox: %v", err)
 	}
 	entries, err := store.GetOutboxBatch(10)
@@ -341,7 +541,7 @@ func TestOutboxPublishedCASBindsPendingRowEventAndOperation(t *testing.T) {
 func TestOutboxRetryAndFailureCASRemainExact(t *testing.T) {
 	store, _ := tempDB(t)
 	event := makeEvent("op-failure-cas-001")
-	if err := store.AppendWithOutbox(event, "test/topic"); err != nil {
+	if err := store.appendWithOutbox(event, "test/topic"); err != nil {
 		t.Fatalf("AppendWithOutbox: %v", err)
 	}
 	entries, err := store.GetOutboxBatch(1)

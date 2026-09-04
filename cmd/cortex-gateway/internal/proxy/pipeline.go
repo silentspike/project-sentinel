@@ -1416,7 +1416,7 @@ func (ph *PipelineHandler) persistActionRejection(action extraction.ExtractedAct
 		CompensationType: "none",
 	}
 	topic := fmt.Sprintf("sentinel/cortex/audit/%s", aggregateID)
-	if err := ph.eventStore.AppendWithOutbox(evt, topic); err != nil {
+	if err := ph.eventStore.LegacyAppendGateway(eventstore.LegacyProducerCortexAudit).AppendWithOutbox(evt, topic); err != nil {
 		ph.logger.Warn("event store rejection audit write failed",
 			"error", err,
 			"request_id", requestID,

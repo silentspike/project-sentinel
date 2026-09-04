@@ -24,6 +24,7 @@ toml = { workspace = true }
 uuid = { workspace = true }
 bincode = { workspace = true }
 sha2 = { workspace = true }
+unicode-normalization = { workspace = true }
 # Model-checker for the owner-fence publish ordering (#496); only compiled with the
 # `loom-test` feature, so default builds and CI do not pull it.
 loom = { version = "0.7", optional = true }

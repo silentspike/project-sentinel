@@ -6,6 +6,7 @@ toolchain go1.26.6
 
 require (
 	github.com/nats-io/nats.go v1.48.0
+	golang.org/x/text v0.41.0
 	modernc.org/sqlite v1.45.0
 )
 

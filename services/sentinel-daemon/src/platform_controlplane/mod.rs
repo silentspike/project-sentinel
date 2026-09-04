@@ -630,6 +630,7 @@ pub(crate) fn persist_platform_analysis_event(
     );
     let topic = format!("sentinel/events/platform_analysis/{target}");
     event_store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::PlatformControlPlane)
         .append_with_outbox(&event, &topic)
         .context("persist platform_analysis")?;
     Ok(())
@@ -709,7 +710,9 @@ fn emit_platform_event(
         tick,
     );
     let topic = format!("sentinel/events/platform_intervention/{}", action.target);
-    event_store.append_with_outbox(&event, &topic)?;
+    event_store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::PlatformControlPlane)
+        .append_with_outbox(&event, &topic)?;
     Ok(())
 }
 

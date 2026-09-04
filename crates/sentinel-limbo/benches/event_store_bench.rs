@@ -44,7 +44,12 @@ fn bench_append_event(c: &mut Criterion) {
     c.bench_function("append_event", |b| {
         b.iter(|| {
             let event = make_event(i);
-            black_box(store.append_event(&event).unwrap());
+            black_box(
+                store
+                    .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::BenchmarkHarness)
+                    .append_event(&event)
+                    .unwrap(),
+            );
             i += 1;
         });
     });
@@ -61,6 +66,7 @@ fn bench_append_with_outbox(c: &mut Criterion) {
             let event = make_event(i);
             black_box(
                 store
+                    .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::BenchmarkHarness)
                     .append_with_outbox(&event, "sentinel/events/bench")
                     .unwrap(),
             );
@@ -139,7 +145,14 @@ fn bench_issue276_persist_26_events_individual_tx(c: &mut Criterion) {
             for agent in 1..=ISSUE276_ACTIVE_AGENTS {
                 let event = make_issue276_event(tick, agent);
                 let topic = issue276_topic(&event);
-                black_box(store.append_with_outbox(&event, &topic).unwrap());
+                black_box(
+                    store
+                        .legacy_append_gateway(
+                            sentinel_limbo::LegacyEventProducer::BenchmarkHarness,
+                        )
+                        .append_with_outbox(&event, &topic)
+                        .unwrap(),
+                );
             }
             tick += 1;
         });
@@ -161,7 +174,14 @@ fn bench_issue276_persist_26_events_individual_tx_prebuilt(c: &mut Criterion) {
             for batch in &batches {
                 let start = Instant::now();
                 for (event, topic) in batch {
-                    black_box(store.append_with_outbox(event, topic).unwrap());
+                    black_box(
+                        store
+                            .legacy_append_gateway(
+                                sentinel_limbo::LegacyEventProducer::BenchmarkHarness,
+                            )
+                            .append_with_outbox(event, topic)
+                            .unwrap(),
+                    );
                 }
                 total += start.elapsed();
             }
@@ -187,6 +207,7 @@ fn bench_issue276_persist_26_events_batch_tx(c: &mut Criterion) {
 
             black_box(
                 store
+                    .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::BenchmarkHarness)
                     .append_with_outbox_batch(
                         entries.iter().map(|(event, topic)| (event, topic.as_str())),
                     )
@@ -213,6 +234,9 @@ fn bench_issue276_persist_26_events_batch_tx_prebuilt(c: &mut Criterion) {
                 let start = Instant::now();
                 black_box(
                     store
+                        .legacy_append_gateway(
+                            sentinel_limbo::LegacyEventProducer::BenchmarkHarness,
+                        )
                         .append_with_outbox_batch(
                             batch.iter().map(|(event, topic)| (event, topic.as_str())),
                         )
@@ -233,7 +257,10 @@ fn bench_get_events_since(c: &mut Criterion) {
     // 1000 Events vorbereiten
     for i in 0..1000u64 {
         let event = make_event(i);
-        store.append_event(&event).unwrap();
+        store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::BenchmarkHarness)
+            .append_event(&event)
+            .unwrap();
     }
 
     let mut group = c.benchmark_group("get_events_since");
@@ -255,7 +282,10 @@ fn bench_get_events_by_aggregate(c: &mut Criterion) {
     // 1000 Events verteilt auf 15 Agents
     for i in 0..1000u64 {
         let event = make_event(i);
-        store.append_event(&event).unwrap();
+        store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::BenchmarkHarness)
+            .append_event(&event)
+            .unwrap();
     }
 
     c.bench_function("get_events_by_aggregate", |b| {
@@ -311,6 +341,7 @@ fn bench_poll_outbox(c: &mut Criterion) {
     for i in 0..500u64 {
         let event = make_event(i);
         store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::BenchmarkHarness)
             .append_with_outbox(&event, "sentinel/events/bench")
             .unwrap();
     }
@@ -330,7 +361,10 @@ fn bench_get_all_events(c: &mut Criterion) {
     // 1000 Events fuer Rebuild-Szenario
     for i in 0..1000u64 {
         let event = make_event(i);
-        store.append_event(&event).unwrap();
+        store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::BenchmarkHarness)
+            .append_event(&event)
+            .unwrap();
     }
 
     c.bench_function("get_all_events_1000", |b| {
@@ -347,7 +381,10 @@ fn bench_event_count(c: &mut Criterion) {
 
     for i in 0..1000u64 {
         let event = make_event(i);
-        store.append_event(&event).unwrap();
+        store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::BenchmarkHarness)
+            .append_event(&event)
+            .unwrap();
     }
 
     c.bench_function("event_count", |b| {
@@ -379,7 +416,14 @@ fn bench_single_tick_15_agents(c: &mut Criterion) {
                     &format!("corr-tick-{tick}"),
                     tick * 100,
                 );
-                black_box(store.append_event(&event).unwrap());
+                black_box(
+                    store
+                        .legacy_append_gateway(
+                            sentinel_limbo::LegacyEventProducer::BenchmarkHarness,
+                        )
+                        .append_event(&event)
+                        .unwrap(),
+                );
             }
             tick += 1;
         });
@@ -404,7 +448,14 @@ fn bench_100_ticks_15_agents_throughput(c: &mut Criterion) {
                         &format!("corr-tp-{tick}"),
                         tick * 100,
                     );
-                    black_box(store.append_event(&event).unwrap());
+                    black_box(
+                        store
+                            .legacy_append_gateway(
+                                sentinel_limbo::LegacyEventProducer::BenchmarkHarness,
+                            )
+                            .append_event(&event)
+                            .unwrap(),
+                    );
                 }
             }
         });
@@ -441,6 +492,9 @@ fn bench_mixed_workload_tick(c: &mut Criterion) {
                 );
                 black_box(
                     store
+                        .legacy_append_gateway(
+                            sentinel_limbo::LegacyEventProducer::BenchmarkHarness,
+                        )
                         .append_with_outbox(&event, &format!("sentinel/events/AGENT-{agent:02}"))
                         .unwrap(),
                 );
@@ -488,7 +542,10 @@ fn bench_read_scaling(c: &mut Criterion) {
 
         for i in 0..event_count {
             let event = make_event(i);
-            store.append_event(&event).unwrap();
+            store
+                .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::BenchmarkHarness)
+                .append_event(&event)
+                .unwrap();
         }
 
         group.bench_with_input(

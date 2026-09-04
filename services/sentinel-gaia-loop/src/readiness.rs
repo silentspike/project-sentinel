@@ -466,6 +466,7 @@ mod tests {
         let cfg = cfg(&dir);
         let event_store = EventStore::open(cfg.events_db.to_str().unwrap()).unwrap();
         event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::GaiaReadiness)
             .append_with_outbox(
                 &platform_event(Some(ESCALATE_TO_OPERATOR), "manual"),
                 "sentinel/events/platform_analysis/system",
@@ -489,6 +490,7 @@ mod tests {
         let cfg = cfg(&dir);
         let event_store = EventStore::open(cfg.events_db.to_str().unwrap()).unwrap();
         event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::GaiaReadiness)
             .append_with_outbox(
                 &platform_event(Some("force_profile"), "manual"),
                 "sentinel/events/platform_analysis/system",
@@ -508,6 +510,7 @@ mod tests {
         let cfg = cfg(&dir);
         let event_store = EventStore::open(cfg.events_db.to_str().unwrap()).unwrap();
         event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::GaiaReadiness)
             .append_with_outbox(
                 &platform_event(Some(ESCALATE_TO_OPERATOR), "manual"),
                 "sentinel/events/platform_analysis/system",
@@ -530,15 +533,18 @@ mod tests {
         let cfg = cfg(&dir);
         let event_store = EventStore::open(cfg.events_db.to_str().unwrap()).unwrap();
         event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::GaiaReadiness)
             .append_with_outbox(&platform_event(None, "manual"), "sentinel/events/one")
             .unwrap();
         event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::GaiaReadiness)
             .append_with_outbox(
                 &platform_event(Some(ESCALATE_TO_OPERATOR), "manual"),
                 "sentinel/events/platform_analysis/system",
             )
             .unwrap();
         event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::GaiaReadiness)
             .append_with_outbox(&platform_event(None, "manual"), "sentinel/events/two")
             .unwrap();
         let latest = event_store.get_latest_event_id().unwrap();

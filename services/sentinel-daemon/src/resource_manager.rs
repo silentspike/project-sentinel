@@ -234,7 +234,9 @@ fn emit_profile_event(
         "sentinel/events/resource_profile_changed/AGENT-{:02}",
         agent_id.0
     );
-    event_store.append_with_outbox(&event, &topic)?;
+    event_store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::ResourceManager)
+        .append_with_outbox(&event, &topic)?;
     Ok(())
 }
 

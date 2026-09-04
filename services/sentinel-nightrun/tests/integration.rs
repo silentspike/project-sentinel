@@ -439,10 +439,14 @@ fn ac18_2_idempotent_events() {
         .with_operation_id("idempotent-op-1");
 
     // Erstes Append
-    es.append_with_outbox(&event, "test").unwrap();
+    es.legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+        .append_with_outbox(&event, "test")
+        .unwrap();
 
     // Zweites Append mit gleicher operation_id — muss ignoriert werden
-    let result = es.append_with_outbox(&event, "test");
+    let result = es
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+        .append_with_outbox(&event, "test");
     // Sollte NICHT fehlschlagen (idempotent = silent skip)
     // EventStore nutzt UNIQUE auf operation_id
     assert!(result.is_ok() || result.is_err());

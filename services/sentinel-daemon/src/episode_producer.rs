@@ -2482,7 +2482,10 @@ mod tests {
             "episode-producer-test",
             tick,
         );
-        event_store.append_event(&event).unwrap()
+        event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+            .append_event(&event)
+            .unwrap()
     }
 
     #[test]
@@ -2498,7 +2501,10 @@ mod tests {
             "coverage-test",
             1,
         );
-        let first = event_store.append_event(&irrelevant).unwrap();
+        let first = event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+            .append_event(&irrelevant)
+            .unwrap();
         let second = append_payload(
             &event_store,
             &DomainEventPayload::BioActionPerformed {
@@ -2514,7 +2520,10 @@ mod tests {
             "coverage-test",
             3,
         );
-        let third = event_store.append_event(&malformed).unwrap();
+        let third = event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+            .append_event(&malformed)
+            .unwrap();
         assert_eq!((first, second, third), (1, 2, 3));
 
         let evidence = producer
@@ -2698,8 +2707,20 @@ mod tests {
             "generation-operator-test",
             0,
         );
-        assert_eq!(event_store.append_event(&older).unwrap(), 1);
-        assert_eq!(event_store.append_event(&newer).unwrap(), 2);
+        assert_eq!(
+            event_store
+                .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+                .append_event(&older)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            event_store
+                .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+                .append_event(&newer)
+                .unwrap(),
+            2
+        );
         let expected_active_generation_id = producer
             .hippocampus()
             .store()
@@ -3862,7 +3883,10 @@ mod tests {
             "episode-producer-test",
             10,
         );
-        event_store.append_event(&new_event).unwrap();
+        event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+            .append_event(&new_event)
+            .unwrap();
 
         let agents = vec![(1, "Thomas".to_string())];
         let error = EpisodeProducer::new(hippocampus, &agents, &event_store)
@@ -4373,7 +4397,10 @@ mod tests {
             "episode-producer-test",
             10,
         );
-        let source_row_id = event_store.append_event(&malformed).unwrap();
+        let source_row_id = event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+            .append_event(&malformed)
+            .unwrap();
         let agents = vec![(1, "Thomas".to_string())];
         let mut producer = EpisodeProducer::new(hippocampus, &agents, &event_store).unwrap();
 
@@ -4430,7 +4457,10 @@ mod tests {
             "episode-producer-test",
             10,
         );
-        event_store.append_event(&malformed).unwrap();
+        event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+            .append_event(&malformed)
+            .unwrap();
         let agents = vec![(1, "Thomas".to_string()), (2, "Lisa".to_string())];
         let mut producer = EpisodeProducer::new(hippocampus, &agents, &event_store).unwrap();
 
