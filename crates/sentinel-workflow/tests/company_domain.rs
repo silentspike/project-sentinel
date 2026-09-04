@@ -1,17 +1,31 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use sentinel_workflow::{
+    authorize_collaboration_gateway_result, collaboration_policy_ambiguity,
+    collaboration_policy_reversibility, collaboration_policy_role_name,
+    collaboration_policy_separation_requirements, collaboration_policy_task_risk,
+    collaboration_policy_uncertainty, compile_collaboration_gateway_request,
     filtered_collaboration_view, AgentId, AuthenticatedCompanyPrincipalV1, BehaviorMandateV1,
-    BlockerKindV1, BlockerStateV1, ClaimExposureStateV1, CollaborationAuthorityFenceV1,
-    CollaborationBudgetV1, CollaborationModeV1, CollaborationParticipantV1,
-    CollaborationSessionStateV1, CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkItemSpecV1,
-    CompanyWorkStateV1, CompanyWorkflowCommandV1, CompanyWorkflowResponseV1,
-    CostReservationStateV1, EvidenceReferenceV1, HandoffConsumptionKindV1, HandoffGapClassV1,
-    HandoffPacketStateV1, ParticipantBindingV1, ProjectId, ProjectLifecycleStateV1,
-    ProposalBindingV1, ProposalGovernanceV1, QualityGateBindingV1, QualityGateReceiptBindingV1,
-    TenantId, UncertaintyClassV1, WorkInputContractV1, WorkItemId, WorkOutputContractV1,
-    WorkOutputReceiptV1, WorkProfileBindingV1, WorkTransitionReceiptV1, WorkflowErrorCode,
-    WorkflowStore, COMPANY_DOMAIN_SCHEMA_VERSION,
+    BlockerKindV1, BlockerStateV1, BlockerV1, ClaimExposureStateV1, CollaborationAdmissionBudgetV1,
+    CollaborationAdmissionFenceV1, CollaborationAdmissionInputV1, CollaborationAdmissionModeV1,
+    CollaborationAdmissionStateV1, CollaborationAuthorityFenceV1, CollaborationBudgetV1,
+    CollaborationCandidateV1, CollaborationModeV1, CollaborationParticipantV1,
+    CollaborationProgressDispositionV1, CollaborationProgressV1, CollaborationSessionStateV1,
+    CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkItemSpecV1, CompanyWorkStateV1,
+    CompanyWorkflowCommandV1, CompanyWorkflowResponseV1, CostReservationStateV1,
+    EvidenceReferenceV1, HandoffConsumptionKindV1, HandoffGapClassV1, HandoffPacketStateV1,
+    ParticipantBindingV1, ProjectId, ProjectLifecycleStateV1, ProjectQuestionV1, ProposalBindingV1,
+    ProposalGovernanceV1, QualityGateBindingV1, QualityGateReceiptBindingV1,
+    ReliabilityObservationV1, ReversibilityV1, TaskRiskV1, TenantId, UncertaintyClassV1,
+    WorkInputContractV1, WorkItemId, WorkOutputContractV1, WorkOutputReceiptV1,
+    WorkProfileBindingV1, WorkTransitionReceiptV1, WorkflowErrorCode, WorkflowStore,
+    COLLABORATION_ADMISSION_SCHEMA_VERSION, COLLABORATION_POLICY_MAX_PARTICIPANTS,
+    COLLABORATION_POLICY_MAX_ROUNDS, COLLABORATION_POLICY_MAX_STALLED_UPDATES,
+    COLLABORATION_POLICY_MAX_TOKENS, COLLABORATION_POLICY_MINIMUM_NOVELTY_MICROS,
+    COLLABORATION_POLICY_QUALITY_TOLERANCE_MICROS, COLLABORATION_POLICY_WINDOW_MS,
+    COMPANY_DOMAIN_SCHEMA_VERSION,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -395,6 +409,282 @@ fn collaboration_participant(
         capabilities: BTreeSet::from([capability.to_owned()]),
         privacy_classes: BTreeSet::from(["project-internal".to_owned()]),
     }
+}
+
+fn collaboration_participants_from_admission(
+    admission: &sentinel_workflow::CollaborationAdmissionDecisionV1,
+) -> Vec<CollaborationParticipantV1> {
+    admission
+        .selected_participants
+        .iter()
+        .map(|participant| CollaborationParticipantV1 {
+            agent_id: participant.agent_id,
+            permanent_role: participant.permanent_role,
+            mandate: participant.mandate,
+            capability_snapshot_digest: participant.candidate_snapshot_digest.clone(),
+            capabilities: participant.capabilities.clone(),
+            privacy_classes: participant.privacy_classes.clone(),
+        })
+        .collect()
+}
+
+fn collaboration_capability_snapshot(
+    project: &sentinel_workflow::ProjectV1,
+    session_id: &str,
+    agent_id: AgentId,
+) -> String {
+    project
+        .collaboration_sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .and_then(|session| {
+            session
+                .participants
+                .iter()
+                .find(|participant| participant.agent_id == agent_id)
+        })
+        .map(|participant| participant.capability_snapshot_digest.clone())
+        .unwrap()
+}
+
+fn collaboration_admission_input(
+    project: &sentinel_workflow::ProjectV1,
+    work_item_id: &WorkItemId,
+    store: &WorkflowStore,
+    now_ms: u64,
+) -> CollaborationAdmissionInputV1 {
+    let work_item = &project.work_items[work_item_id];
+    let assignment = work_item
+        .assignments
+        .iter()
+        .find(|assignment| assignment.active)
+        .unwrap();
+    let remaining_cost_budget_micros = project
+        .cost_ceiling_micros
+        .checked_sub(project.reserved_cost_micros)
+        .and_then(|value| value.checked_sub(project.committed_cost_micros))
+        .and_then(|value| {
+            value.checked_sub(
+                store
+                    .collaboration_capacity_snapshot(&project.tenant_id, &project.project_id)
+                    .unwrap()
+                    .project_reserved_cost_micros,
+            )
+        })
+        .unwrap();
+    let task_risk = collaboration_policy_task_risk(work_item.spec.required_role);
+    let reversibility = collaboration_policy_reversibility(work_item.spec.required_role);
+    let ambiguity = collaboration_policy_ambiguity(work_item.spec.required_role);
+    let uncertainty = collaboration_policy_uncertainty(project, work_item_id);
+    let evidence_conflict = false;
+    let mut required_handoff_agents = Vec::new();
+    for dependency_id in &work_item.spec.dependency_ids {
+        let dependency_assignment = project.work_items[dependency_id]
+            .assignments
+            .iter()
+            .find(|candidate| candidate.active)
+            .unwrap();
+        if dependency_assignment.agent_id != assignment.agent_id
+            && !required_handoff_agents.contains(&dependency_assignment.agent_id)
+        {
+            required_handoff_agents.push(dependency_assignment.agent_id);
+        }
+    }
+    required_handoff_agents.sort_unstable_by_key(|agent_id| agent_id.0);
+    let capability_topology = project
+        .governance
+        .participants
+        .iter()
+        .map(|participant| (participant.agent_id, participant.specialties.clone()))
+        .collect::<Vec<_>>();
+    let (directed_handoff_required, specialist_panel_required) =
+        sentinel_workflow::collaboration_policy_team_shape(
+            assignment.agent_id,
+            &work_item.spec.required_specialties,
+            &capability_topology,
+            &required_handoff_agents,
+        )
+        .unwrap();
+    let separation_requirements = collaboration_policy_separation_requirements(
+        work_item.spec.required_role,
+        task_risk,
+        ambiguity,
+        uncertainty,
+        evidence_conflict,
+    );
+    CollaborationAdmissionInputV1 {
+        schema_version: COLLABORATION_ADMISSION_SCHEMA_VERSION,
+        tenant_id: project.tenant_id.clone(),
+        project_id: project.project_id.clone(),
+        work_item_id: work_item_id.clone(),
+        owner: assignment.agent_id,
+        task_family: project.governance.project_profile.profile_id.clone(),
+        input_class: collaboration_policy_role_name(work_item.spec.required_role).to_owned(),
+        task_risk,
+        reversibility,
+        ambiguity,
+        required_capabilities: work_item.spec.required_specialties.clone(),
+        uncertainty,
+        evidence_conflict,
+        directed_handoff_required,
+        required_handoff_agents,
+        specialist_panel_required,
+        separation_requirements,
+        privacy_class: "project-internal".to_owned(),
+        authority_conflict: false,
+        privacy_conflict: false,
+        human_approval_required: reversibility == ReversibilityV1::Irreversible,
+        remaining_cost_budget_micros,
+        remaining_time_budget_ms: COLLABORATION_POLICY_WINDOW_MS,
+        organization_generation: assignment.organization_generation,
+        organization_digest: assignment.organization_digest.clone(),
+        assignment_id: assignment.assignment_id.clone(),
+        assignment_version: assignment.assignment_version,
+        assignment_digest: assignment.canonical_digest().unwrap(),
+        behavior_policy_generation: project.governance.project_profile.generation,
+        behavior_policy_digest: project.governance.project_profile.digest.clone(),
+        learned_reliability_enabled: false,
+        collaboration_generation: project.collaboration_generation,
+        quality_tolerance_micros: COLLABORATION_POLICY_QUALITY_TOLERANCE_MICROS,
+        permitted_packet_classes: BTreeSet::from([
+            "decision".to_owned(),
+            "evidence".to_owned(),
+            "finding".to_owned(),
+            "handoff".to_owned(),
+        ]),
+        budget: CollaborationAdmissionBudgetV1 {
+            max_participants: u16::try_from(
+                project
+                    .governance
+                    .participants
+                    .len()
+                    .min(usize::from(COLLABORATION_POLICY_MAX_PARTICIPANTS)),
+            )
+            .unwrap(),
+            max_rounds: COLLABORATION_POLICY_MAX_ROUNDS,
+            max_tokens: COLLABORATION_POLICY_MAX_TOKENS,
+            max_cost_micros: work_item
+                .spec
+                .budget_micros
+                .min(remaining_cost_budget_micros),
+            deadline_unix_ms: now_ms + COLLABORATION_POLICY_WINDOW_MS,
+            minimum_novelty_micros: COLLABORATION_POLICY_MINIMUM_NOVELTY_MICROS,
+            max_stalled_updates: COLLABORATION_POLICY_MAX_STALLED_UPDATES,
+        },
+    }
+}
+
+fn collaboration_admission_candidates(
+    project: &sentinel_workflow::ProjectV1,
+    work_item_id: &WorkItemId,
+    store: &WorkflowStore,
+) -> Vec<CollaborationCandidateV1> {
+    let capacity = store
+        .collaboration_capacity_snapshot(&project.tenant_id, &project.project_id)
+        .unwrap();
+    let work_item = &project.work_items[work_item_id];
+    let assignment = work_item
+        .assignments
+        .iter()
+        .find(|assignment| assignment.active)
+        .unwrap();
+    project
+        .governance
+        .participants
+        .iter()
+        .map(|participant| CollaborationCandidateV1 {
+            agent_id: participant.agent_id,
+            permanent_role: participant.role,
+            mandate: sentinel_workflow::collaboration_policy_mandate(participant.role),
+            active: true,
+            authority_scope_digest: assignment.canonical_digest().unwrap(),
+            organization_generation: assignment.organization_generation,
+            organization_digest: assignment.organization_digest.clone(),
+            assignment_load: capacity
+                .assignment_load
+                .get(&participant.agent_id.0)
+                .copied()
+                .unwrap_or(0),
+            assignment_limit: 8,
+            capabilities: participant.specialties.clone(),
+            privacy_classes: BTreeSet::from(["project-internal".to_owned()]),
+            runtime_available: true,
+            tools_available: true,
+            model_family: format!("model-{}", participant.agent_id.0),
+            prompt_digest: participant.profile.digest.clone(),
+            tool_set_digest: format!("{:064x}", 100 + participant.agent_id.0),
+            data_provenance_digest: format!("{:064x}", 200 + participant.agent_id.0),
+            prior_claim_correlation_digest: None,
+            queue_delay_ms: 0,
+            estimated_cost_micros: 0,
+        })
+        .collect()
+}
+
+fn collaboration_admission_fence(
+    project: &sentinel_workflow::ProjectV1,
+    work_item_id: &WorkItemId,
+) -> CollaborationAdmissionFenceV1 {
+    let assignment = project.work_items[work_item_id]
+        .assignments
+        .iter()
+        .find(|assignment| assignment.active)
+        .unwrap();
+    CollaborationAdmissionFenceV1 {
+        organization_generation: assignment.organization_generation,
+        organization_digest: assignment.organization_digest.clone(),
+        assignment_id: assignment.assignment_id.clone(),
+        assignment_version: assignment.assignment_version,
+        assignment_digest: assignment.canonical_digest().unwrap(),
+        behavior_policy_generation: project.governance.project_profile.generation,
+        behavior_policy_digest: project.governance.project_profile.digest.clone(),
+        collaboration_generation: project.collaboration_generation,
+    }
+}
+
+fn admit_independent_review(
+    state: &Journey,
+    project: &sentinel_workflow::ProjectV1,
+    work_item_id: &WorkItemId,
+    operation: u128,
+    now_ms: u64,
+) -> sentinel_workflow::ProjectV1 {
+    let owner = project.work_items[work_item_id]
+        .assignments
+        .iter()
+        .find(|assignment| assignment.active)
+        .unwrap()
+        .agent_id;
+    let project = project_command(
+        &state.store,
+        &state.pm,
+        operation.checked_sub(1).unwrap(),
+        CompanyWorkflowCommandV1::RecordQuestion {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: Some(work_item_id.clone()),
+            owner,
+            question_ref: "independent evidence is required before completion".to_owned(),
+        },
+        now_ms,
+    );
+    let input = collaboration_admission_input(&project, work_item_id, &state.store, now_ms);
+    project_command(
+        &state.store,
+        &state.pm,
+        operation,
+        CompanyWorkflowCommandV1::AdmitCollaboration {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            source_request_digest: DIGEST.to_owned(),
+            input,
+            candidates: collaboration_admission_candidates(&project, work_item_id, &state.store),
+            reliability: project.collaboration_reliability.clone(),
+            expected_benefit_ref: "independent implementation review reduces defect risk"
+                .to_owned(),
+        },
+        now_ms,
+    )
 }
 
 fn evidence(reference: &str) -> Vec<EvidenceReferenceV1> {
@@ -2520,6 +2810,9 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
         },
         302,
     );
+    project = admit_independent_review(&state, &project, &work_item_id, 3302, 303);
+    let admission = project.collaboration_admissions[0].clone();
+    let admission_contract_digest = admission.expected_session_contract_digest().unwrap();
 
     let authority = collaboration_authority(&project, &work_item_id);
     let unscoped = state.store.apply_company_command(
@@ -2529,6 +2822,9 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             work_item_id: None,
+            admission_id: admission.admission_id.clone(),
+            admission_contract_digest: admission_contract_digest.clone(),
+            collaboration_generation: project.collaboration_generation,
             authority: authority.clone(),
             subject_ref: "unscoped collaboration must fail".to_owned(),
             input_digest: DIGEST.to_owned(),
@@ -2572,6 +2868,9 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             work_item_id: Some(work_item_id.clone()),
+            admission_id: admission.admission_id.clone(),
+            admission_contract_digest: admission_contract_digest.clone(),
+            collaboration_generation: project.collaboration_generation,
             authority: stale_policy,
             subject_ref: "stale policy must fail".to_owned(),
             input_digest: DIGEST.to_owned(),
@@ -2606,24 +2905,26 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
         WorkflowErrorCode::AuthorityConflict
     );
 
-    project = project_command(
-        &state.store,
+    let substituted_roster = state.store.apply_company_command(
         &state.pm,
-        303,
-        CompanyWorkflowCommandV1::CreateCollaborationSession {
+        Uuid::from_u128(6303),
+        &CompanyWorkflowCommandV1::CreateCollaborationSession {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             work_item_id: Some(work_item_id.clone()),
+            admission_id: admission.admission_id.clone(),
+            admission_contract_digest: admission_contract_digest.clone(),
+            collaboration_generation: project.collaboration_generation,
             authority: authority.clone(),
-            subject_ref: "produce and independently review the artifact".to_owned(),
+            subject_ref: "caller-selected roster must fail".to_owned(),
             input_digest: DIGEST.to_owned(),
             mode: CollaborationModeV1::IndependentReview,
             budget: CollaborationBudgetV1 {
-                max_participants: 3,
-                max_claims: 3,
-                max_handoffs: 3,
+                max_participants: u16::try_from(admission.selected_agents.len()).unwrap(),
+                max_claims: u16::try_from(admission.selected_agents.len()).unwrap(),
+                max_handoffs: 1,
                 max_clarification_rounds: 1,
-                max_transitions: 40,
+                max_transitions: 39,
                 deadline_unix_ms: 10_000,
             },
             participants: vec![
@@ -2641,6 +2942,38 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
                 ),
                 collaboration_participant(3, CompanyRoleV1::Qa, BehaviorMandateV1::Challenge, "qa"),
             ],
+        },
+        303,
+    );
+    assert_eq!(
+        substituted_roster.unwrap_err().code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+
+    project = project_command(
+        &state.store,
+        &state.pm,
+        303,
+        CompanyWorkflowCommandV1::CreateCollaborationSession {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: Some(work_item_id.clone()),
+            admission_id: admission.admission_id.clone(),
+            admission_contract_digest,
+            collaboration_generation: project.collaboration_generation,
+            authority: authority.clone(),
+            subject_ref: "produce and independently review the artifact".to_owned(),
+            input_digest: DIGEST.to_owned(),
+            mode: CollaborationModeV1::IndependentReview,
+            budget: CollaborationBudgetV1 {
+                max_participants: u16::try_from(admission.selected_agents.len()).unwrap(),
+                max_claims: u16::try_from(admission.selected_agents.len()).unwrap(),
+                max_handoffs: 3,
+                max_clarification_rounds: 1,
+                max_transitions: 39,
+                deadline_unix_ms: 10_000,
+            },
+            participants: collaboration_participants_from_admission(&admission),
         },
         303,
     );
@@ -2691,23 +3024,32 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
         304,
     );
 
-    let pm_claim = CompanyWorkflowCommandV1::RecordIndependentClaim {
+    let developer_claim = CompanyWorkflowCommandV1::RecordIndependentClaim {
         project_id: state.project_id.clone(),
         expected_version: project.version,
         session_id: session_id.clone(),
         expected_transition_sequence: 2,
         authority: authority.clone(),
-        conclusion_ref: "the plan is bounded".to_owned(),
-        evidence: evidence("plan evidence"),
-        assumptions: vec!["authority remains stable".to_owned()],
+        conclusion_ref: "the implementation is feasible".to_owned(),
+        evidence: evidence("implementation evidence"),
+        assumptions: vec!["toolchain remains pinned".to_owned()],
         uncertainty: UncertaintyClassV1::Low,
-        confidence_basis: "verified project contract".to_owned(),
-        capability_snapshot_digest: DIGEST.to_owned(),
+        confidence_basis: "source and contract inspection".to_owned(),
+        capability_snapshot_digest: collaboration_capability_snapshot(
+            &project,
+            &session_id,
+            AgentId(2),
+        ),
         input_digest: DIGEST.to_owned(),
     };
     let first = state
         .store
-        .apply_company_command(&state.pm, Uuid::from_u128(305), &pm_claim, 305)
+        .apply_company_command(
+            &state.developer,
+            Uuid::from_u128(305),
+            &developer_claim,
+            305,
+        )
         .unwrap();
     assert!(!first.replayed);
     let CompanyWorkflowResponseV1::Project(first_project) = first.response else {
@@ -2716,31 +3058,16 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
     project = *first_project;
     let replay = state
         .store
-        .apply_company_command(&state.pm, Uuid::from_u128(305), &pm_claim, 306)
+        .apply_company_command(
+            &state.developer,
+            Uuid::from_u128(305),
+            &developer_claim,
+            306,
+        )
         .unwrap();
     assert!(replay.replayed);
-    assert_eq!(project.collaboration_publications.len(), 3);
+    assert_eq!(project.collaboration_publications.len(), 4);
 
-    project = project_command(
-        &state.store,
-        &state.developer,
-        306,
-        CompanyWorkflowCommandV1::RecordIndependentClaim {
-            project_id: state.project_id.clone(),
-            expected_version: project.version,
-            session_id: session_id.clone(),
-            expected_transition_sequence: 3,
-            authority: authority.clone(),
-            conclusion_ref: "the implementation is feasible".to_owned(),
-            evidence: evidence("implementation evidence"),
-            assumptions: vec!["toolchain remains pinned".to_owned()],
-            uncertainty: UncertaintyClassV1::Material,
-            confidence_basis: "source and contract inspection".to_owned(),
-            capability_snapshot_digest: OTHER_DIGEST.to_owned(),
-            input_digest: DIGEST.to_owned(),
-        },
-        307,
-    );
     project = project_command(
         &state.store,
         &state.qa,
@@ -2749,14 +3076,18 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 4,
+            expected_transition_sequence: 3,
             authority: authority.clone(),
             conclusion_ref: "independent verification is required".to_owned(),
             evidence: evidence("quality evidence"),
             assumptions: Vec::new(),
             uncertainty: UncertaintyClassV1::Blocking,
             confidence_basis: "independent negative testing".to_owned(),
-            capability_snapshot_digest: DIGEST.to_owned(),
+            capability_snapshot_digest: collaboration_capability_snapshot(
+                &project,
+                &session_id,
+                AgentId(3),
+            ),
             input_digest: DIGEST.to_owned(),
         },
         308,
@@ -2776,7 +3107,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
                 project_id: state.project_id.clone(),
                 expected_version: project.version,
                 session_id: session_id.clone(),
-                expected_transition_sequence: 5,
+                expected_transition_sequence: 4,
                 authority: stale_authority,
                 reason_ref: "must not expose".to_owned(),
             },
@@ -2801,7 +3132,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 5,
+            expected_transition_sequence: 4,
             authority: authority.clone(),
             reason_ref: "all independent claims are durable".to_owned(),
         },
@@ -2816,7 +3147,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
         project_id: state.project_id.clone(),
         expected_version: project.version,
         session_id: session_id.clone(),
-        expected_transition_sequence: 6,
+        expected_transition_sequence: 5,
         authority: authority.clone(),
         work_item_id: work_item_id.clone(),
         consumer: AgentId(3),
@@ -2873,7 +3204,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 7,
+            expected_transition_sequence: 6,
             authority: authority.clone(),
             packet_id: packet_id.clone(),
             packet_digest: packet_digest.clone(),
@@ -2894,7 +3225,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 8,
+            expected_transition_sequence: 7,
             authority: authority.clone(),
             packet_id: packet_id.clone(),
             packet_digest: packet_digest.clone(),
@@ -2913,11 +3244,15 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 9,
+            expected_transition_sequence: 8,
             authority: authority.clone(),
             packet_id: packet_id.clone(),
             packet_digest: packet_digest.clone(),
-            capability_snapshot_digest: DIGEST.to_owned(),
+            capability_snapshot_digest: collaboration_capability_snapshot(
+                &project,
+                &session_id,
+                AgentId(3),
+            ),
             reason_ref: "evidence is sufficient".to_owned(),
         },
         314,
@@ -2937,7 +3272,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
                 project_id: state.project_id.clone(),
                 expected_version: project.version,
                 session_id: session_id.clone(),
-                expected_transition_sequence: 10,
+                expected_transition_sequence: 9,
                 authority: authority.clone(),
                 packet_id: packet_id.clone(),
                 packet_digest: packet_digest.clone(),
@@ -2965,7 +3300,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 10,
+            expected_transition_sequence: 9,
             authority: authority.clone(),
             packet_id: packet_id.clone(),
             packet_digest: packet_digest.clone(),
@@ -2988,7 +3323,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 11,
+            expected_transition_sequence: 10,
             authority: authority.clone(),
             work_item_id: work_item_id.clone(),
             consumer: AgentId(3),
@@ -3016,7 +3351,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 12,
+            expected_transition_sequence: 11,
             authority: authority.clone(),
             packet_id: novelty_packet.packet_id.clone(),
             packet_digest: novelty_packet.packet_digest.clone(),
@@ -3038,7 +3373,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
                 project_id: state.project_id.clone(),
                 expected_version: project.version,
                 session_id: session_id.clone(),
-                expected_transition_sequence: 13,
+                expected_transition_sequence: 12,
                 authority: authority.clone(),
                 packet_id: novelty_packet.packet_id.clone(),
                 packet_digest: novelty_packet.packet_digest.clone(),
@@ -3059,7 +3394,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 13,
+            expected_transition_sequence: 12,
             authority: authority.clone(),
             packet_id: novelty_packet.packet_id,
             packet_digest: novelty_packet.packet_digest,
@@ -3083,7 +3418,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 14,
+            expected_transition_sequence: 13,
             authority: authority.clone(),
             target: CollaborationSessionStateV1::Deciding,
             reason_ref: "evaluate exposed evidence".to_owned(),
@@ -3127,7 +3462,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
                 project_id: state.project_id.clone(),
                 expected_version: project.version,
                 session_id: session_id.clone(),
-                expected_transition_sequence: 15,
+                expected_transition_sequence: 14,
                 authority: authority.clone(),
                 decision_id: other_decision_id.clone(),
                 claim_id: None,
@@ -3162,7 +3497,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 15,
+            expected_transition_sequence: 14,
             authority: authority.clone(),
             decision_id: decision_id.clone(),
             claim_id: Some(qa_claim_id),
@@ -3183,7 +3518,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
                 project_id: state.project_id.clone(),
                 expected_version: project.version,
                 session_id: session_id.clone(),
-                expected_transition_sequence: 16,
+                expected_transition_sequence: 15,
                 authority: authority.clone(),
                 decision_id: other_decision_id,
                 claim_ids: claim_ids.clone(),
@@ -3211,7 +3546,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 16,
+            expected_transition_sequence: 15,
             authority: authority.clone(),
             decision_id,
             claim_ids,
@@ -3227,7 +3562,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             project_id: state.project_id.clone(),
             expected_version: project.version,
             session_id: session_id.clone(),
-            expected_transition_sequence: 17,
+            expected_transition_sequence: 16,
             authority,
             target: CollaborationSessionStateV1::Completed,
             reason_ref: "authorized decision is evidence-linked".to_owned(),
@@ -3237,14 +3572,1384 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
 
     let session = &project.collaboration_sessions[0];
     assert_eq!(session.state, CollaborationSessionStateV1::Completed);
-    assert_eq!(session.transition_sequence, 18);
-    assert_eq!(session.publication_revision, 18);
+    assert_eq!(session.transition_sequence, 17);
+    assert_eq!(session.publication_revision, 17);
     assert_eq!(project.collaboration_publications.len(), 18);
-    for (index, publication) in project.collaboration_publications.iter().enumerate() {
+    let session_publications = project
+        .collaboration_publications
+        .iter()
+        .filter(|publication| publication.proposal.causal_context.correlation_id == session_id)
+        .collect::<Vec<_>>();
+    assert_eq!(session_publications.len(), 17);
+    for (index, publication) in session_publications.iter().enumerate() {
         assert_eq!(publication.transition_sequence, (index + 1) as u64);
-        assert_eq!(
-            publication.proposal.causal_context.correlation_id,
-            session_id
+    }
+}
+
+#[test]
+fn collaboration_uncertainty_uses_only_relevant_durable_questions_and_blockers() {
+    let state = journey();
+    let mut project = state
+        .store
+        .company_project(&TenantId::parse("tenant-a").unwrap(), &state.project_id)
+        .unwrap()
+        .unwrap();
+    let target = WorkItemId::parse("target-work").unwrap();
+    let unrelated = WorkItemId::parse("unrelated-work").unwrap();
+
+    assert_eq!(
+        collaboration_policy_uncertainty(&project, &target),
+        UncertaintyClassV1::Low
+    );
+    project.questions.push(ProjectQuestionV1 {
+        question_id: "question-target".to_owned(),
+        work_item_id: Some(target.clone()),
+        owner: AgentId(2),
+        question_ref: "question-ref".to_owned(),
+        resolution_ref: None,
+        created_by: "pm-a".to_owned(),
+        resolved_by: None,
+        created_at_unix_ms: 1,
+        updated_at_unix_ms: 1,
+    });
+    assert_eq!(
+        collaboration_policy_uncertainty(&project, &target),
+        UncertaintyClassV1::Material
+    );
+    project.questions[0].resolution_ref = Some("answer-ref".to_owned());
+    project.blockers.push(BlockerV1 {
+        blocker_id: "blocker-unrelated".to_owned(),
+        work_item_id: Some(unrelated),
+        cause_ref: "unrelated-cause".to_owned(),
+        owner: AgentId(2),
+        escalation_target: Some(AgentId(1)),
+        state: BlockerStateV1::Escalated,
+        blocker_kind: BlockerKindV1::Operational,
+        blocked_from_state: None,
+        resolution_ref: None,
+        last_actor_id: "pm-a".to_owned(),
+        created_at_unix_ms: 1,
+        updated_at_unix_ms: 1,
+        transition_history: Vec::new(),
+    });
+    assert_eq!(
+        collaboration_policy_uncertainty(&project, &target),
+        UncertaintyClassV1::Low
+    );
+    project.blockers.push(BlockerV1 {
+        blocker_id: "blocker-global".to_owned(),
+        work_item_id: None,
+        cause_ref: "global-cause".to_owned(),
+        owner: AgentId(2),
+        escalation_target: Some(AgentId(1)),
+        state: BlockerStateV1::Open,
+        blocker_kind: BlockerKindV1::Operational,
+        blocked_from_state: None,
+        resolution_ref: None,
+        last_actor_id: "pm-a".to_owned(),
+        created_at_unix_ms: 1,
+        updated_at_unix_ms: 1,
+        transition_history: Vec::new(),
+    });
+    assert_eq!(
+        collaboration_policy_uncertainty(&project, &target),
+        UncertaintyClassV1::Material
+    );
+    project.blockers[1].state = BlockerStateV1::Escalated;
+    assert_eq!(
+        collaboration_policy_uncertainty(&project, &target),
+        UncertaintyClassV1::Blocking
+    );
+    project.blockers[1].state = BlockerStateV1::Resolved;
+    assert_eq!(
+        collaboration_policy_uncertainty(&project, &target),
+        UncertaintyClassV1::Low
+    );
+}
+
+#[test]
+fn collaboration_admission_is_solo_first_durable_fenced_and_exactly_replayable() {
+    let state = journey();
+    let work_item_id = WorkItemId::parse("admission-work").unwrap();
+    let mut project = project_command(
+        &state.store,
+        &state.pm,
+        500,
+        CompanyWorkflowCommandV1::PlanWorkGraph {
+            project_id: state.project_id.clone(),
+            expected_version: 1,
+            items: vec![work(
+                &work_item_id.0,
+                CompanyRoleV1::Developer,
+                &["rust"],
+                &[],
+                100,
+            )],
+        },
+        500,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        501,
+        CompanyWorkflowCommandV1::ActivateProject {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            reason_ref: "admission plan approved".to_owned(),
+        },
+        501,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        502,
+        CompanyWorkflowCommandV1::AssignWork {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: work_item_id.clone(),
+            agent_id: AgentId(2),
+            organization_generation: 1,
+            organization_digest: DIGEST.to_owned(),
+            reason_ref: "single accountable owner".to_owned(),
+        },
+        502,
+    );
+
+    let admission_input = collaboration_admission_input(&project, &work_item_id, &state.store, 503);
+    let candidates = collaboration_admission_candidates(&project, &work_item_id, &state.store);
+    let mut forged_uncertainty = admission_input.clone();
+    forged_uncertainty.uncertainty = UncertaintyClassV1::Material;
+    forged_uncertainty.separation_requirements = collaboration_policy_separation_requirements(
+        CompanyRoleV1::Developer,
+        forged_uncertainty.task_risk,
+        forged_uncertainty.ambiguity,
+        forged_uncertainty.uncertainty,
+        forged_uncertainty.evidence_conflict,
+    );
+    let error = state
+        .store
+        .apply_company_command(
+            &state.pm,
+            Uuid::from_u128(499),
+            &CompanyWorkflowCommandV1::AdmitCollaboration {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                source_request_digest: DIGEST.to_owned(),
+                input: forged_uncertainty,
+                candidates: candidates.clone(),
+                reliability: Vec::new(),
+                expected_benefit_ref: "caller cannot override derived uncertainty".to_owned(),
+            },
+            503,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, WorkflowErrorCode::AuthorityConflict);
+    assert_eq!(
+        state
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .unwrap(),
+        Some(project.clone())
+    );
+    let mut strengthened_risk = admission_input.clone();
+    strengthened_risk.task_risk = TaskRiskV1::High;
+    strengthened_risk.separation_requirements = collaboration_policy_separation_requirements(
+        CompanyRoleV1::Developer,
+        strengthened_risk.task_risk,
+        strengthened_risk.ambiguity,
+        strengthened_risk.uncertainty,
+        strengthened_risk.evidence_conflict,
+    );
+    let mut injected_conflict = admission_input.clone();
+    injected_conflict.evidence_conflict = true;
+    injected_conflict.separation_requirements = collaboration_policy_separation_requirements(
+        CompanyRoleV1::Developer,
+        injected_conflict.task_risk,
+        injected_conflict.ambiguity,
+        injected_conflict.uncertainty,
+        injected_conflict.evidence_conflict,
+    );
+    let mut narrowed_budget = admission_input.clone();
+    narrowed_budget.remaining_cost_budget_micros -= 1;
+    let mut forced_human = admission_input.clone();
+    forced_human.human_approval_required = true;
+    for (operation, input) in [
+        (4_991, strengthened_risk),
+        (4_992, injected_conflict),
+        (4_993, narrowed_budget),
+        (4_994, forced_human),
+    ] {
+        let error = state
+            .store
+            .apply_company_command(
+                &state.pm,
+                Uuid::from_u128(operation),
+                &CompanyWorkflowCommandV1::AdmitCollaboration {
+                    project_id: state.project_id.clone(),
+                    expected_version: project.version,
+                    source_request_digest: DIGEST.to_owned(),
+                    input,
+                    candidates: candidates.clone(),
+                    reliability: Vec::new(),
+                    expected_benefit_ref: "caller cannot alter derived admission policy".to_owned(),
+                },
+                503,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, WorkflowErrorCode::AuthorityConflict);
+    }
+    let mut forged_candidates = candidates.clone();
+    forged_candidates[0].mandate = BehaviorMandateV1::Verify;
+    let error = state
+        .store
+        .apply_company_command(
+            &state.pm,
+            Uuid::from_u128(4_995),
+            &CompanyWorkflowCommandV1::AdmitCollaboration {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                source_request_digest: DIGEST.to_owned(),
+                input: admission_input.clone(),
+                candidates: forged_candidates,
+                reliability: Vec::new(),
+                expected_benefit_ref: "caller cannot alter the role mandate".to_owned(),
+            },
+            503,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, WorkflowErrorCode::AuthorityConflict);
+    assert_eq!(
+        state
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .unwrap(),
+        Some(project.clone())
+    );
+    let operation_id = Uuid::from_u128(503);
+    let admission_command = CompanyWorkflowCommandV1::AdmitCollaboration {
+        project_id: state.project_id.clone(),
+        expected_version: project.version,
+        source_request_digest: OTHER_DIGEST.to_owned(),
+        input: admission_input.clone(),
+        candidates: candidates.clone(),
+        reliability: Vec::new(),
+        expected_benefit_ref: "solo baseline avoids coordination overhead".to_owned(),
+    };
+    let admitted = state
+        .store
+        .apply_company_command(&state.pm, operation_id, &admission_command, 503)
+        .unwrap();
+    let admitted_response = admitted.response.clone();
+    let CompanyWorkflowResponseV1::Project(admitted_project) = admitted.response else {
+        panic!("expected project response")
+    };
+    project = *admitted_project;
+    assert_eq!(project.collaboration_generation, 2);
+    assert_eq!(project.collaboration_admissions.len(), 1);
+    let decision = &project.collaboration_admissions[0];
+    assert_eq!(decision.mode, CollaborationAdmissionModeV1::Solo);
+    assert_eq!(decision.state, CollaborationAdmissionStateV1::Admitted);
+    assert_eq!(decision.selected_agents, vec![AgentId(2)]);
+    assert_eq!(decision.publication_revision, 1);
+    assert_eq!(decision.request_bindings.len(), 1);
+    assert_eq!(project.collaboration_publications.len(), 1);
+    assert_eq!(
+        state
+            .store
+            .collaboration_capacity_snapshot(&project.tenant_id, &project.project_id)
+            .unwrap()
+            .reserved_load
+            .get(&2),
+        Some(&1)
+    );
+
+    let replay = state
+        .store
+        .apply_company_command(&state.pm, operation_id, &admission_command, 9_000)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(
+        replay.response,
+        CompanyWorkflowResponseV1::Project(Box::new(project.clone()))
+    );
+
+    let before_rejection = project.clone();
+    let mut incomplete_candidates = candidates;
+    incomplete_candidates.pop();
+    let omitted_candidate = state
+        .store
+        .apply_company_command(
+            &state.pm,
+            Uuid::from_u128(504),
+            &CompanyWorkflowCommandV1::AdmitCollaboration {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                source_request_digest: DIGEST.to_owned(),
+                input: collaboration_admission_input(&project, &work_item_id, &state.store, 504),
+                candidates: incomplete_candidates,
+                reliability: Vec::new(),
+                expected_benefit_ref: "caller-selected roster must fail".to_owned(),
+            },
+            504,
+        )
+        .unwrap_err();
+    assert_eq!(omitted_candidate.code, WorkflowErrorCode::AuthorityConflict);
+    assert_eq!(
+        state
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .unwrap(),
+        Some(before_rejection)
+    );
+
+    let decision = project.collaboration_admissions[0].clone();
+    let stale_progress = state
+        .store
+        .apply_company_command(
+            &state.developer,
+            Uuid::from_u128(505),
+            &CompanyWorkflowCommandV1::ProgressCollaborationAdmission {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                source_request_digest: DIGEST.to_owned(),
+                admission_id: decision.admission_id.clone(),
+                fence: CollaborationAdmissionFenceV1 {
+                    organization_generation: decision.input.organization_generation,
+                    organization_digest: decision.input.organization_digest.clone(),
+                    assignment_id: decision.input.assignment_id.clone(),
+                    assignment_version: decision.input.assignment_version,
+                    assignment_digest: decision.input.assignment_digest.clone(),
+                    behavior_policy_generation: decision.input.behavior_policy_generation,
+                    behavior_policy_digest: decision.input.behavior_policy_digest.clone(),
+                    collaboration_generation: decision.input.collaboration_generation,
+                },
+                progress: CollaborationProgressV1 {
+                    expected_transition_sequence: decision.transition_sequence,
+                    rounds_delta: 1,
+                    tokens_delta: 10,
+                    cost_delta_micros: 0,
+                    novelty_micros: 1_000_000,
+                    novelty_digest: DIGEST.to_owned(),
+                    milestone_digest: None,
+                    work_digest: None,
+                    disposition: CollaborationProgressDispositionV1::Continue,
+                    reason_ref: "stale collaboration generation".to_owned(),
+                },
+            },
+            505,
+        )
+        .unwrap_err();
+    assert_eq!(stale_progress.code, WorkflowErrorCode::AuthorityConflict);
+
+    let assignment = project.work_items[&work_item_id]
+        .assignments
+        .iter()
+        .find(|assignment| assignment.active)
+        .unwrap();
+    project = project_command(
+        &state.store,
+        &state.developer,
+        506,
+        CompanyWorkflowCommandV1::ProgressCollaborationAdmission {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            source_request_digest: DIGEST.to_owned(),
+            admission_id: decision.admission_id,
+            fence: CollaborationAdmissionFenceV1 {
+                organization_generation: assignment.organization_generation,
+                organization_digest: assignment.organization_digest.clone(),
+                assignment_id: assignment.assignment_id.clone(),
+                assignment_version: assignment.assignment_version,
+                assignment_digest: assignment.canonical_digest().unwrap(),
+                behavior_policy_generation: project.governance.project_profile.generation,
+                behavior_policy_digest: project.governance.project_profile.digest.clone(),
+                collaboration_generation: project.collaboration_generation,
+            },
+            progress: CollaborationProgressV1 {
+                expected_transition_sequence: decision.transition_sequence,
+                rounds_delta: 1,
+                tokens_delta: 10,
+                cost_delta_micros: 0,
+                novelty_micros: 1_000_000,
+                novelty_digest: OTHER_DIGEST.to_owned(),
+                milestone_digest: Some(DIGEST.to_owned()),
+                work_digest: Some(OTHER_DIGEST.to_owned()),
+                disposition: CollaborationProgressDispositionV1::Complete,
+                reason_ref: "bounded solo task completed".to_owned(),
+            },
+        },
+        506,
+    );
+    let decision = &project.collaboration_admissions[0];
+    assert_eq!(decision.state, CollaborationAdmissionStateV1::Completed);
+    assert_eq!(decision.publication_revision, 2);
+    assert!(decision.reservations.iter().all(|value| value.released));
+    assert_eq!(project.collaboration_publications.len(), 2);
+    assert!(state
+        .store
+        .collaboration_capacity_snapshot(&project.tenant_id, &project.project_id)
+        .unwrap()
+        .reserved_load
+        .is_empty());
+    assert_eq!(
+        state
+            .store
+            .company_operation_response(&state.pm, operation_id)
+            .unwrap(),
+        Some(admitted_response)
+    );
+}
+
+#[test]
+fn concurrent_admissions_commit_once_and_active_followup_cannot_double_reserve() {
+    let state = journey();
+    let work_item_id = WorkItemId::parse("concurrent-admission-work").unwrap();
+    let mut project = project_command(
+        &state.store,
+        &state.pm,
+        600,
+        CompanyWorkflowCommandV1::PlanWorkGraph {
+            project_id: state.project_id.clone(),
+            expected_version: 1,
+            items: vec![work(
+                &work_item_id.0,
+                CompanyRoleV1::Developer,
+                &["rust"],
+                &[],
+                1_000,
+            )],
+        },
+        600,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        601,
+        CompanyWorkflowCommandV1::ActivateProject {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            reason_ref: "concurrent admission plan approved".to_owned(),
+        },
+        601,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        602,
+        CompanyWorkflowCommandV1::AssignWork {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: work_item_id.clone(),
+            agent_id: AgentId(2),
+            organization_generation: 1,
+            organization_digest: DIGEST.to_owned(),
+            reason_ref: "one accountable admission owner".to_owned(),
+        },
+        602,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        7_602,
+        CompanyWorkflowCommandV1::RecordQuestion {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: Some(work_item_id.clone()),
+            owner: AgentId(2),
+            question_ref: "concurrent admission requires independent evidence".to_owned(),
+        },
+        603,
+    );
+    let input = collaboration_admission_input(&project, &work_item_id, &state.store, 603);
+    let mut candidates = collaboration_admission_candidates(&project, &work_item_id, &state.store);
+    for candidate in &mut candidates {
+        candidate.estimated_cost_micros = if matches!(candidate.agent_id.0, 2 | 3) {
+            400
+        } else {
+            0
+        };
+    }
+    let command = CompanyWorkflowCommandV1::AdmitCollaboration {
+        project_id: state.project_id.clone(),
+        expected_version: project.version,
+        source_request_digest: DIGEST.to_owned(),
+        input,
+        candidates,
+        reliability: Vec::new(),
+        expected_benefit_ref: "reserve the smallest eligible team once".to_owned(),
+    };
+    let pm = state.pm.clone();
+    let project_id = state.project_id.clone();
+    let tenant_id = pm.tenant_id.clone();
+    let store = Arc::new(state.store);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = Vec::new();
+    for operation in [603_u128, 604] {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        let pm = pm.clone();
+        let command = command.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            store.apply_company_command(&pm, Uuid::from_u128(operation), &command, 603)
+        }));
+    }
+    barrier.wait();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+
+    let project = store
+        .company_project(&tenant_id, &project_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(project.collaboration_admissions.len(), 1);
+    assert_eq!(project.collaboration_publications.len(), 1);
+    assert_eq!(project.collaboration_generation, 2);
+    assert_eq!(
+        project.collaboration_admissions[0].mode,
+        CollaborationAdmissionModeV1::ParallelIndependentReview
+    );
+    assert_eq!(
+        project.collaboration_admissions[0].selected_agents,
+        vec![AgentId(2), AgentId(3)]
+    );
+    let capacity = store
+        .collaboration_capacity_snapshot(&tenant_id, &project_id)
+        .unwrap();
+    assert_eq!(capacity.reserved_load.get(&2), Some(&1));
+    assert_eq!(capacity.reserved_load.get(&3), Some(&1));
+    assert_eq!(capacity.project_reserved_cost_micros, 1_000);
+    let current = store
+        .company_project(&tenant_id, &project_id)
+        .unwrap()
+        .unwrap();
+    let second = store
+        .apply_company_command(
+            &pm,
+            Uuid::from_u128(605),
+            &CompanyWorkflowCommandV1::AdmitCollaboration {
+                project_id,
+                expected_version: current.version,
+                source_request_digest: OTHER_DIGEST.to_owned(),
+                input: collaboration_admission_input(&current, &work_item_id, &store, 605),
+                candidates: collaboration_admission_candidates(&current, &work_item_id, &store),
+                reliability: Vec::new(),
+                expected_benefit_ref: "the reserved cost ceiling cannot be consumed twice"
+                    .to_owned(),
+            },
+            605,
+        )
+        .unwrap_err();
+    assert_eq!(second.code, WorkflowErrorCode::InvalidInput);
+    let capacity_after_fallback = store
+        .collaboration_capacity_snapshot(&tenant_id, &current.project_id)
+        .unwrap();
+    assert_eq!(capacity_after_fallback.project_reserved_cost_micros, 1_000);
+    assert_eq!(capacity_after_fallback.reserved_load.get(&2), Some(&1));
+    assert_eq!(capacity_after_fallback.reserved_load.get(&3), Some(&1));
+    assert_eq!(
+        store
+            .company_project(&tenant_id, &current.project_id)
+            .unwrap()
+            .unwrap(),
+        current
+    );
+}
+
+#[test]
+fn unrelated_admission_does_not_revoke_an_exact_bound_session() {
+    let state = journey();
+    let first_work = WorkItemId::parse("admission-work-a").unwrap();
+    let second_work = WorkItemId::parse("admission-work-b").unwrap();
+    let mut project = project_command(
+        &state.store,
+        &state.pm,
+        650,
+        CompanyWorkflowCommandV1::PlanWorkGraph {
+            project_id: state.project_id.clone(),
+            expected_version: 1,
+            items: vec![
+                work(&first_work.0, CompanyRoleV1::Developer, &["rust"], &[], 100),
+                work(
+                    &second_work.0,
+                    CompanyRoleV1::Developer,
+                    &["rust"],
+                    &[],
+                    100,
+                ),
+            ],
+        },
+        650,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        651,
+        CompanyWorkflowCommandV1::ActivateProject {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            reason_ref: "independent admission scopes approved".to_owned(),
+        },
+        651,
+    );
+    for (operation, work_item) in [(652, &first_work), (653, &second_work)] {
+        project = project_command(
+            &state.store,
+            &state.pm,
+            operation,
+            CompanyWorkflowCommandV1::AssignWork {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                work_item_id: work_item.clone(),
+                agent_id: AgentId(2),
+                organization_generation: 1,
+                organization_digest: DIGEST.to_owned(),
+                reason_ref: "one accountable owner per work item".to_owned(),
+            },
+            operation as u64,
         );
     }
+
+    project = admit_independent_review(&state, &project, &first_work, 7_654, 654);
+    let first_admission = project.collaboration_admissions[0].clone();
+    let first_generation = project.collaboration_generation;
+    assert!(first_admission.selected_agents.contains(&AgentId(3)));
+    let unauthorized_terminal = state
+        .store
+        .apply_company_command(
+            &state.qa,
+            Uuid::from_u128(7_654),
+            &CompanyWorkflowCommandV1::ProgressCollaborationAdmission {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                source_request_digest: DIGEST.to_owned(),
+                admission_id: first_admission.admission_id.clone(),
+                fence: CollaborationAdmissionFenceV1 {
+                    organization_generation: first_admission.input.organization_generation,
+                    organization_digest: first_admission.input.organization_digest.clone(),
+                    assignment_id: first_admission.input.assignment_id.clone(),
+                    assignment_version: first_admission.input.assignment_version,
+                    assignment_digest: first_admission.input.assignment_digest.clone(),
+                    behavior_policy_generation: first_admission.input.behavior_policy_generation,
+                    behavior_policy_digest: first_admission.input.behavior_policy_digest.clone(),
+                    collaboration_generation: project.collaboration_generation,
+                },
+                progress: CollaborationProgressV1 {
+                    expected_transition_sequence: first_admission.transition_sequence,
+                    rounds_delta: 1,
+                    tokens_delta: 0,
+                    cost_delta_micros: 0,
+                    novelty_micros: 1_000_000,
+                    novelty_digest: OTHER_DIGEST.to_owned(),
+                    milestone_digest: Some(DIGEST.to_owned()),
+                    work_digest: Some(OTHER_DIGEST.to_owned()),
+                    disposition: CollaborationProgressDispositionV1::Complete,
+                    reason_ref: "reviewer cannot complete the owner's admission".to_owned(),
+                },
+            },
+            654,
+        )
+        .unwrap_err();
+    assert_eq!(
+        unauthorized_terminal.code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+    assert_eq!(
+        state
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .unwrap(),
+        Some(project.clone())
+    );
+    let second_input = collaboration_admission_input(&project, &second_work, &state.store, 655);
+    project = project_command(
+        &state.store,
+        &state.pm,
+        655,
+        CompanyWorkflowCommandV1::AdmitCollaboration {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            source_request_digest: OTHER_DIGEST.to_owned(),
+            input: second_input,
+            candidates: collaboration_admission_candidates(&project, &second_work, &state.store),
+            reliability: project.collaboration_reliability.clone(),
+            expected_benefit_ref: "second work item remains solo".to_owned(),
+        },
+        655,
+    );
+    assert!(project.collaboration_generation > first_generation);
+    let authority = collaboration_authority(&project, &first_work);
+    project = project_command(
+        &state.store,
+        &state.pm,
+        656,
+        CompanyWorkflowCommandV1::CreateCollaborationSession {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: Some(first_work.clone()),
+            admission_id: first_admission.admission_id.clone(),
+            admission_contract_digest: first_admission.expected_session_contract_digest().unwrap(),
+            collaboration_generation: first_generation,
+            authority: authority.clone(),
+            subject_ref: "session remains scoped to its own admission".to_owned(),
+            input_digest: DIGEST.to_owned(),
+            mode: CollaborationModeV1::IndependentReview,
+            budget: CollaborationBudgetV1 {
+                max_participants: u16::try_from(first_admission.selected_agents.len()).unwrap(),
+                max_claims: u16::try_from(first_admission.selected_agents.len()).unwrap(),
+                max_handoffs: 1,
+                max_clarification_rounds: 1,
+                max_transitions: 12,
+                deadline_unix_ms: 10_000,
+            },
+            participants: collaboration_participants_from_admission(&first_admission),
+        },
+        656,
+    );
+    let session_id = project.collaboration_sessions[0].session_id.clone();
+    let retained_admission = project
+        .collaboration_admissions
+        .iter()
+        .find(|candidate| candidate.admission_id == first_admission.admission_id)
+        .unwrap();
+    let retained_session = project
+        .collaboration_sessions
+        .iter()
+        .find(|candidate| candidate.session_id == session_id)
+        .unwrap();
+    let retained_assignment = project.work_items[&first_work]
+        .assignments
+        .iter()
+        .find(|candidate| candidate.active)
+        .unwrap();
+    retained_admission.validate(657).unwrap();
+    assert_eq!(retained_assignment.assignment_id, authority.assignment_id);
+    assert_eq!(
+        retained_assignment.assignment_version,
+        authority.assignment_version
+    );
+    assert_eq!(
+        retained_assignment.canonical_digest().unwrap(),
+        authority.assignment_digest
+    );
+    assert_eq!(
+        retained_session.organization_generation,
+        authority.organization_generation
+    );
+    assert_eq!(
+        retained_session.organization_digest,
+        authority.organization_digest
+    );
+    assert_eq!(retained_session.assignment_id, authority.assignment_id);
+    assert_eq!(
+        retained_session.assignment_version,
+        authority.assignment_version
+    );
+    assert_eq!(
+        retained_session.assignment_digest,
+        authority.assignment_digest
+    );
+    assert_eq!(retained_session.policy_version, authority.policy_version);
+    assert_eq!(retained_session.policy_digest, authority.policy_digest);
+    assert_eq!(
+        retained_session.collaboration_generation,
+        Some(first_generation)
+    );
+    assert_eq!(
+        retained_admission.input.collaboration_generation + 1,
+        first_generation
+    );
+    assert_eq!(
+        retained_admission
+            .expected_session_contract_digest()
+            .unwrap(),
+        retained_session.admission_contract_digest.clone().unwrap()
+    );
+    assert_eq!(
+        retained_session.participants,
+        collaboration_participants_from_admission(retained_admission)
+    );
+    assert_eq!(retained_session.admission_routes, retained_admission.routes);
+
+    project = project_command(
+        &state.store,
+        &state.pm,
+        657,
+        CompanyWorkflowCommandV1::TransitionCollaborationSession {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 1,
+            authority,
+            target: CollaborationSessionStateV1::CollectingIndependentClaims,
+            reason_ref: "unrelated admission cannot revoke this session".to_owned(),
+        },
+        657,
+    );
+    assert_eq!(
+        project.collaboration_sessions[0].state,
+        CollaborationSessionStateV1::CollectingIndependentClaims
+    );
+    assert_eq!(
+        project.collaboration_sessions[0].collaboration_generation,
+        Some(first_generation)
+    );
+
+    let dispatched =
+        compile_collaboration_gateway_request(&project, &session_id, AgentId(2), 657).unwrap();
+    authorize_collaboration_gateway_result(&project, &dispatched, 657).unwrap();
+    let deadline = project.collaboration_sessions[0].budget.deadline_unix_ms;
+    assert_eq!(
+        compile_collaboration_gateway_request(&project, &session_id, AgentId(2), deadline)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+    assert_eq!(
+        authorize_collaboration_gateway_result(&project, &dispatched, deadline)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+    for stale_project in [
+        {
+            let mut value = project.clone();
+            value.work_items.get_mut(&first_work).unwrap().assignments[0]
+                .organization_generation += 1;
+            value
+        },
+        {
+            let mut value = project.clone();
+            value.work_items.get_mut(&first_work).unwrap().assignments[0].assignment_version += 1;
+            value
+        },
+        {
+            let mut value = project.clone();
+            value.governance.project_profile.generation += 1;
+            value
+        },
+        {
+            let mut value = project.clone();
+            let admission = value
+                .collaboration_admissions
+                .iter_mut()
+                .find(|candidate| candidate.admission_id == first_admission.admission_id)
+                .unwrap();
+            admission.input.collaboration_generation += 1;
+            admission.refresh_digest().unwrap();
+            value
+        },
+    ] {
+        assert_eq!(
+            compile_collaboration_gateway_request(&stale_project, &session_id, AgentId(2), 657)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::AuthorityConflict
+        );
+        assert_eq!(
+            authorize_collaboration_gateway_result(&stale_project, &dispatched, 657)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::AuthorityConflict
+        );
+    }
+    let mut transitioned = project.clone();
+    transitioned.collaboration_sessions[0].transition_sequence += 1;
+    transitioned.collaboration_sessions[0].publication_revision += 1;
+    transitioned.collaboration_sessions[0].updated_at_unix_ms += 1;
+    assert_eq!(
+        authorize_collaboration_gateway_result(&transitioned, &dispatched, 658)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+
+    let active_admission = project
+        .collaboration_admissions
+        .iter()
+        .find(|candidate| candidate.admission_id == first_admission.admission_id)
+        .unwrap()
+        .clone();
+    let active_assignment = project.work_items[&first_work]
+        .assignments
+        .iter()
+        .find(|candidate| candidate.active)
+        .unwrap();
+    project = project_command(
+        &state.store,
+        &state.pm,
+        658,
+        CompanyWorkflowCommandV1::ProgressCollaborationAdmission {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            source_request_digest: OTHER_DIGEST.to_owned(),
+            admission_id: active_admission.admission_id.clone(),
+            fence: CollaborationAdmissionFenceV1 {
+                organization_generation: active_assignment.organization_generation,
+                organization_digest: active_assignment.organization_digest.clone(),
+                assignment_id: active_assignment.assignment_id.clone(),
+                assignment_version: active_assignment.assignment_version,
+                assignment_digest: active_assignment.canonical_digest().unwrap(),
+                behavior_policy_generation: project.governance.project_profile.generation,
+                behavior_policy_digest: project.governance.project_profile.digest.clone(),
+                collaboration_generation: project.collaboration_generation,
+            },
+            progress: CollaborationProgressV1 {
+                expected_transition_sequence: active_admission.transition_sequence,
+                rounds_delta: 1,
+                tokens_delta: 0,
+                cost_delta_micros: 0,
+                novelty_micros: 1_000_000,
+                novelty_digest: DIGEST.to_owned(),
+                milestone_digest: Some(OTHER_DIGEST.to_owned()),
+                work_digest: None,
+                disposition: CollaborationProgressDispositionV1::Cancel,
+                reason_ref: "replace the work-scoped admission atomically".to_owned(),
+            },
+        },
+        658,
+    );
+    assert!(project
+        .collaboration_admissions
+        .iter()
+        .find(|candidate| candidate.admission_id == first_admission.admission_id)
+        .unwrap()
+        .reservations
+        .iter()
+        .all(|reservation| reservation.released));
+
+    let next_input = collaboration_admission_input(&project, &first_work, &state.store, 659);
+    project = project_command(
+        &state.store,
+        &state.pm,
+        659,
+        CompanyWorkflowCommandV1::AdmitCollaboration {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            source_request_digest: DIGEST.to_owned(),
+            input: next_input,
+            candidates: collaboration_admission_candidates(&project, &first_work, &state.store),
+            reliability: project.collaboration_reliability.clone(),
+            expected_benefit_ref: "new evidence requires a fresh work-scoped decision".to_owned(),
+        },
+        659,
+    );
+    let current_fence = collaboration_admission_fence(&project, &first_work);
+    let before_stale_progress = project.clone();
+    let error = state
+        .store
+        .apply_company_command(
+            &state.developer,
+            Uuid::from_u128(660),
+            &CompanyWorkflowCommandV1::ProgressCollaborationAdmission {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                source_request_digest: OTHER_DIGEST.to_owned(),
+                admission_id: first_admission.admission_id,
+                fence: current_fence,
+                progress: CollaborationProgressV1 {
+                    expected_transition_sequence: first_admission.transition_sequence,
+                    rounds_delta: 1,
+                    tokens_delta: 0,
+                    cost_delta_micros: 0,
+                    novelty_micros: 1_000_000,
+                    novelty_digest: DIGEST.to_owned(),
+                    milestone_digest: None,
+                    work_digest: None,
+                    disposition: CollaborationProgressDispositionV1::Continue,
+                    reason_ref: "superseded work decision cannot progress".to_owned(),
+                },
+            },
+            660,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, WorkflowErrorCode::AuthorityConflict);
+    assert_eq!(
+        state
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .unwrap(),
+        Some(before_stale_progress)
+    );
+}
+
+#[test]
+fn reliability_requires_attributed_claim_accepted_output_and_independent_gate() {
+    let state = journey();
+    let work_item_id = WorkItemId::parse("verified-reliability-work").unwrap();
+    let mut project = project_command(
+        &state.store,
+        &state.pm,
+        700,
+        CompanyWorkflowCommandV1::PlanWorkGraph {
+            project_id: state.project_id.clone(),
+            expected_version: 1,
+            items: vec![work(
+                &work_item_id.0,
+                CompanyRoleV1::Developer,
+                &["rust"],
+                &[],
+                100,
+            )],
+        },
+        700,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        701,
+        CompanyWorkflowCommandV1::ActivateProject {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            reason_ref: "reliability evidence plan approved".to_owned(),
+        },
+        701,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        702,
+        CompanyWorkflowCommandV1::AssignWork {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: work_item_id.clone(),
+            agent_id: AgentId(2),
+            organization_generation: 1,
+            organization_digest: DIGEST.to_owned(),
+            reason_ref: "reliability attribution owner".to_owned(),
+        },
+        702,
+    );
+    project = admit_independent_review(&state, &project, &work_item_id, 7702, 703);
+    let admission = project.collaboration_admissions[0].clone();
+    let authority = collaboration_authority(&project, &work_item_id);
+    let mut widened_budget = CollaborationBudgetV1 {
+        max_participants: 3,
+        max_claims: 3,
+        max_handoffs: 1,
+        max_clarification_rounds: 1,
+        max_transitions: 12,
+        deadline_unix_ms: 10_000,
+    };
+    let participants = collaboration_participants_from_admission(&admission);
+    let participant_count = u16::try_from(participants.len()).unwrap();
+    let mut altered_participants = participants.clone();
+    altered_participants[0].capability_snapshot_digest = OTHER_DIGEST.to_owned();
+    for (operation, budget, candidate_participants) in [
+        (7_720, widened_budget.clone(), altered_participants),
+        {
+            widened_budget.max_participants = 4;
+            widened_budget.max_claims = 4;
+            (7_721, widened_budget.clone(), participants.clone())
+        },
+        {
+            widened_budget.max_participants = 3;
+            widened_budget.max_claims = 4;
+            (7_722, widened_budget.clone(), participants.clone())
+        },
+        {
+            widened_budget.max_claims = 3;
+            widened_budget.max_handoffs = 5;
+            (7_723, widened_budget.clone(), participants.clone())
+        },
+        {
+            widened_budget.max_handoffs = 1;
+            widened_budget.max_transitions = 41;
+            (7_724, widened_budget.clone(), participants.clone())
+        },
+        {
+            widened_budget.max_transitions = 12;
+            widened_budget.deadline_unix_ms = admission.input.budget.deadline_unix_ms + 1;
+            (7_725, widened_budget.clone(), participants.clone())
+        },
+    ] {
+        let rejected = state
+            .store
+            .apply_company_command(
+                &state.pm,
+                Uuid::from_u128(operation),
+                &CompanyWorkflowCommandV1::CreateCollaborationSession {
+                    project_id: state.project_id.clone(),
+                    expected_version: project.version,
+                    work_item_id: Some(work_item_id.clone()),
+                    admission_id: admission.admission_id.clone(),
+                    admission_contract_digest: admission
+                        .expected_session_contract_digest()
+                        .unwrap(),
+                    collaboration_generation: project.collaboration_generation,
+                    authority: authority.clone(),
+                    subject_ref: "reject a widened admission session".to_owned(),
+                    input_digest: DIGEST.to_owned(),
+                    mode: CollaborationModeV1::IndependentReview,
+                    budget,
+                    participants: candidate_participants,
+                },
+                703,
+            )
+            .unwrap_err();
+        assert_eq!(rejected.code, WorkflowErrorCode::AuthorityConflict);
+    }
+    project = project_command(
+        &state.store,
+        &state.pm,
+        703,
+        CompanyWorkflowCommandV1::CreateCollaborationSession {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: Some(work_item_id.clone()),
+            admission_id: admission.admission_id.clone(),
+            admission_contract_digest: admission.expected_session_contract_digest().unwrap(),
+            collaboration_generation: project.collaboration_generation,
+            authority: authority.clone(),
+            subject_ref: "bind one implementation claim to accepted work".to_owned(),
+            input_digest: DIGEST.to_owned(),
+            mode: CollaborationModeV1::IndependentReview,
+            budget: CollaborationBudgetV1 {
+                max_participants: participant_count,
+                max_claims: participant_count,
+                max_handoffs: 1,
+                max_clarification_rounds: 1,
+                max_transitions: 12,
+                deadline_unix_ms: 10_000,
+            },
+            participants,
+        },
+        703,
+    );
+    let session_id = project.collaboration_sessions[0].session_id.clone();
+    project = project_command(
+        &state.store,
+        &state.pm,
+        704,
+        CompanyWorkflowCommandV1::TransitionCollaborationSession {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 1,
+            authority: authority.clone(),
+            target: CollaborationSessionStateV1::CollectingIndependentClaims,
+            reason_ref: "collect the attributed claim privately".to_owned(),
+        },
+        704,
+    );
+    project = project_command(
+        &state.store,
+        &state.developer,
+        705,
+        CompanyWorkflowCommandV1::RecordIndependentClaim {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 2,
+            authority,
+            conclusion_ref: "the implementation satisfies the accepted contract".to_owned(),
+            evidence: evidence("accepted implementation evidence"),
+            assumptions: vec!["the independent gate remains authoritative".to_owned()],
+            uncertainty: UncertaintyClassV1::Low,
+            confidence_basis: "content-addressed output and independent gate".to_owned(),
+            capability_snapshot_digest: collaboration_capability_snapshot(
+                &project,
+                &session_id,
+                AgentId(2),
+            ),
+            input_digest: DIGEST.to_owned(),
+        },
+        705,
+    );
+    let claim_id = project.collaboration_sessions[0].claims[0].claim_id.clone();
+    project = project_command(
+        &state.store,
+        &state.developer,
+        706,
+        transition(
+            &state.project_id,
+            project.version,
+            &work_item_id.0,
+            2,
+            1,
+            CompanyWorkStateV1::Assigned,
+            CompanyWorkStateV1::InProgress,
+            Vec::new(),
+            None,
+            706,
+        ),
+        706,
+    );
+    project = project_command(
+        &state.store,
+        &state.developer,
+        707,
+        transition(
+            &state.project_id,
+            project.version,
+            &work_item_id.0,
+            3,
+            1,
+            CompanyWorkStateV1::InProgress,
+            CompanyWorkStateV1::InReview,
+            output_receipt(),
+            None,
+            707,
+        ),
+        707,
+    );
+
+    let mut observation = ReliabilityObservationV1 {
+        observation_id: "reliability-observation-1".to_owned(),
+        agent_id: AgentId(2),
+        capability: "rust".to_owned(),
+        task_family: "project-web-v1".to_owned(),
+        input_class: "developer".to_owned(),
+        claim_id,
+        accepted_outcome_digest: OTHER_DIGEST.to_owned(),
+        independent_verification_digest: DIGEST.to_owned(),
+        verifier_principal_id: state.qa.principal_id.clone(),
+        verifier_authority_digest: state.qa.authority_digest.clone(),
+        accepted: true,
+        calibration_bucket: 80,
+        evidence_quality_micros: 900_000,
+        policy_generation: project.governance.project_profile.generation,
+        observation_digest: String::new(),
+        recorded_at_unix_ms: 709,
+    };
+    observation.observation_digest = observation.expected_digest().unwrap();
+    let before_unverified = project.clone();
+    let unverified = state
+        .store
+        .apply_company_command(
+            &state.qa,
+            Uuid::from_u128(708),
+            &CompanyWorkflowCommandV1::RecordCollaborationReliability {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                work_item_id: work_item_id.clone(),
+                fence: collaboration_admission_fence(&project, &work_item_id),
+                observation: observation.clone(),
+            },
+            709,
+        )
+        .unwrap_err();
+    assert_eq!(unverified.code, WorkflowErrorCode::AuthorityConflict);
+    assert_eq!(
+        state
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .unwrap(),
+        Some(before_unverified)
+    );
+
+    project = project_command(
+        &state.store,
+        &state.qa,
+        709,
+        transition(
+            &state.project_id,
+            project.version,
+            &work_item_id.0,
+            4,
+            1,
+            CompanyWorkStateV1::InReview,
+            CompanyWorkStateV1::Done,
+            output_receipt(),
+            Some(QualityGateReceiptBindingV1 {
+                gate_id: "web-work-item-qa-v1".to_owned(),
+                generation: 1,
+                gate_digest: DIGEST.to_owned(),
+                subject_digest: OTHER_DIGEST.to_owned(),
+                passed: true,
+            }),
+            709,
+        ),
+        709,
+    );
+    assert!(state
+        .store
+        .collaboration_capacity_snapshot(&project.tenant_id, &project.project_id)
+        .unwrap()
+        .assignment_load
+        .is_empty());
+    assert_eq!(
+        project.work_items[&work_item_id]
+            .assignments
+            .iter()
+            .filter(|assignment| assignment.active)
+            .count(),
+        1
+    );
+    let self_report = state
+        .store
+        .apply_company_command(
+            &state.developer,
+            Uuid::from_u128(710),
+            &CompanyWorkflowCommandV1::RecordCollaborationReliability {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                work_item_id: work_item_id.clone(),
+                fence: collaboration_admission_fence(&project, &work_item_id),
+                observation: observation.clone(),
+            },
+            710,
+        )
+        .unwrap_err();
+    assert_eq!(self_report.code, WorkflowErrorCode::AuthorityConflict);
+
+    for (operation, mut invalid_observation) in [
+        {
+            let mut value = observation.clone();
+            value.task_family = "foreign-task-family".to_owned();
+            value.recorded_at_unix_ms = 711;
+            (711_u128, value)
+        },
+        {
+            let mut value = observation.clone();
+            value.input_class = "qa".to_owned();
+            value.recorded_at_unix_ms = 711;
+            (712_u128, value)
+        },
+        {
+            let mut value = observation.clone();
+            value.recorded_at_unix_ms = 710;
+            (713_u128, value)
+        },
+    ] {
+        invalid_observation.observation_digest = invalid_observation.expected_digest().unwrap();
+        let error = state
+            .store
+            .apply_company_command(
+                &state.qa,
+                Uuid::from_u128(operation),
+                &CompanyWorkflowCommandV1::RecordCollaborationReliability {
+                    project_id: state.project_id.clone(),
+                    expected_version: project.version,
+                    work_item_id: work_item_id.clone(),
+                    fence: collaboration_admission_fence(&project, &work_item_id),
+                    observation: invalid_observation,
+                },
+                711,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, WorkflowErrorCode::AuthorityConflict);
+    }
+
+    observation.recorded_at_unix_ms = 711;
+    observation.observation_digest = observation.expected_digest().unwrap();
+    let project = project_command(
+        &state.store,
+        &state.qa,
+        714,
+        CompanyWorkflowCommandV1::RecordCollaborationReliability {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: work_item_id.clone(),
+            fence: collaboration_admission_fence(&project, &work_item_id),
+            observation: observation.clone(),
+        },
+        711,
+    );
+    assert_eq!(project.collaboration_reliability, vec![observation]);
+    assert_eq!(project.collaboration_generation, 3);
 }

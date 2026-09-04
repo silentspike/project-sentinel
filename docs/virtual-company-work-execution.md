@@ -225,6 +225,13 @@ including its exact ID, version, and canonical digest, together with the
 organization generation and project-profile policy digest before state can
 advance. Reassignment freezes the prior session for audit; work continues in a
 new session bound to the new assignment rather than inheriting stale authority.
+Before a new session can start, a separate admission decision binds its exact
+work item, selected capability snapshots, sparse routes, resource limits, and
+admission contract digest. Only a newer admission for that same work item
+revokes the session; an unrelated work item cannot interrupt it. Session limits
+may narrow but never widen the admitted participant, message, transition, or
+deadline bounds. Historical version-1 sessions remain readable for audit but
+cannot authorize new collaboration effects.
 
 An employee keeps one permanent company role, such as Developer, QA, or
 Technical Lead. A collaboration session gives that employee a separate
@@ -291,10 +298,27 @@ authority, payload digest, and operation replay, then atomically adopts the
 corresponding delivery intent. A crash between workflow commit and Event Store
 adoption therefore converges by replay without producing a second event.
 
+Collaboration is admitted separately from the session protocol. `Solo` is the
+default for routine reversible work. The daemon derives eligible employees,
+task risk, reversibility, ambiguity, uncertainty, separation, privacy, packet
+and budget policy, dependency-owner handoffs, load, runtime/tool availability,
+and authority fences from server-owned state; the caller can submit neither a
+roster nor a weaker policy classification or accounting counter. The workflow
+store atomically chooses and reserves the smallest capability-complete team
+within the accepted tolerance.
+Only verified task-specific evidence may influence routing, and learned
+weighting remains disabled until calibrated policy evidence activates it. The
+full selection, correlation, reservation, retry, routing, and termination
+contract is defined in [Collaboration Admission](collaboration-admission.md).
+
 Team leads are accountable for graph health, assignment, blockers, and
 completion evidence. Project Management is accountable for agreement
 alignment and cross-team dependencies. Gaia may surface deadlocks and
 recommend escalation but cannot resolve them outside the authority model.
+An admitted participant may report bounded progress, a blocker, or an
+escalation need. Only the exact work owner or governed Project Management or
+Technical Lead authority may complete or cancel the collaboration admission;
+being invited into a temporary team never grants authority over the work item.
 
 ## Agent Workbench Contract
 

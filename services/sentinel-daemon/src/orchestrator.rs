@@ -3153,6 +3153,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             data_dir,
             &config.config_dir,
             workflow_agent_capabilities,
+            Arc::clone(&runtime_health),
             event_store.as_ref().clone(),
             workbench_artifact_roots,
         )

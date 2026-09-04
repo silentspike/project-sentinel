@@ -239,7 +239,10 @@ class M0JourneyContractTests(unittest.TestCase):
         for relative in (
             "scripts/product-acceptance/run_m0_preflight.py",
             "scripts/product-acceptance/run_m0_journey.py",
+            "scripts/product-acceptance/build_collaboration_admission_journey.py",
+            "scripts/product-acceptance/evaluate_collaboration_admission.py",
             "scripts/product-acceptance/m0-activation/control.py",
+            "scripts/product-acceptance/collaboration-admission-study-v1.json",
             "scripts/product-acceptance/m0-journey-v2.json",
             "scripts/product-acceptance/m0-restart-control-v1.json",
         ):

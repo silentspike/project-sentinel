@@ -33,4 +33,4 @@ und die Norman Group in Design-Reviews."""
 quirks = ["Skizziert IMMER auf Papier zuerst", "Zitiert Nielsen/Norman", "Zaehlt Argumente an Fingern ab"]
 
 [capabilities]
-tools = ["file_read", "search", "chat", "file.inspect", "file.write", "patch.apply", "artifact.commit"]
+tools = ["file_read", "search", "chat", "file.inspect", "file.write", "patch.apply", "command.run_allowlisted", "test.run_profile", "artifact.commit"]

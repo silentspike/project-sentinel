@@ -1,5 +1,11 @@
 # Changelog
 
+- Add deterministic solo-first collaboration admission, hard server-derived
+  eligibility, smallest-team selection, evidence-correlation penalties,
+  task-specific verified reliability, sparse private routes, bounded
+  termination, atomic capacity reservations, exact retry responses, and
+  canonical Event Store publication (#740).
+
 - Add versioned, authority-fenced company collaboration sessions with private
   independent claims, task-local behavior mandates, digest-bound handoff
   packets, typed bounded clarification, durable dissent, exact downstream

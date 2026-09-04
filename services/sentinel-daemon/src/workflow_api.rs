@@ -19,18 +19,30 @@ use sentinel_common::{
     WorkbenchTool, WORKBENCH_RUNTIME_BWRAP, WORKBENCH_SCHEMA_VERSION,
 };
 use sentinel_workflow::{
-    collaboration_event_schema_registry, filtered_collaboration_view, is_collaboration_command_v1,
-    sealed_output_bundle_digest, ArtifactExpectationV1, ArtifactInputV1,
-    AuthenticatedCompanyPrincipalV1, CollaborationPublicationV1, CommandRuleV1,
-    CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkflowCommandV1, CompletionEvidencePort,
-    DependencyReadiness, ExecutionPlanV1, ExecutionReconcileState, ExecutionResourceBoundsV1,
-    ExecutionStepV1, ExecutionToolV1, GateEvidencePort, GateExpectationV1, OutputExpectationV1,
-    PendingCompletionEvidenceV1, PendingExecutionV1, PrincipalAuthorityV1, ProjectId,
+    collaboration_event_schema_registry, collaboration_policy_ambiguity,
+    collaboration_policy_reversibility, collaboration_policy_role_name,
+    collaboration_policy_separation_requirements, collaboration_policy_task_risk,
+    collaboration_policy_team_shape, collaboration_policy_uncertainty, filtered_collaboration_view,
+    is_collaboration_command_v1, sealed_output_bundle_digest, ArtifactExpectationV1,
+    ArtifactInputV1, AuthenticatedCompanyPrincipalV1, CollaborationAdmissionBudgetV1,
+    CollaborationAdmissionFenceV1, CollaborationAdmissionInputV1, CollaborationCandidateV1,
+    CollaborationProgressDispositionV1, CollaborationProgressV1, CollaborationPublicationV1,
+    CommandRuleV1, CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkflowCommandV1,
+    CompanyWorkflowResponseV1, CompletionEvidencePort, DependencyReadiness, ExecutionPlanV1,
+    ExecutionReconcileState, ExecutionResourceBoundsV1, ExecutionStepV1, ExecutionToolV1,
+    GateEvidencePort, GateExpectationV1, OutputExpectationV1, PendingCompletionEvidenceV1,
+    PendingExecutionV1, PrincipalAuthorityV1, ProjectId, ReversibilityV1,
     RuntimeAuthoritySnapshotV1, SealedArtifactEvidenceV1, SealedOutputEvidenceV1, TenantId,
     TerminalExecutionEvidence, UnavailableGateEvidencePort, WorkExecutionObservation,
     WorkExecutionPort, WorkItemId, WorkflowCore, WorkflowError, WorkflowErrorCode,
-    WorkflowPortError, WorkflowStore, EXECUTION_PLAN_SCHEMA_VERSION, WORKFLOW_SCHEMA_VERSION,
+    WorkflowPortError, WorkflowStore, COLLABORATION_ADMISSION_SCHEMA_VERSION,
+    COLLABORATION_POLICY_MAX_PARTICIPANTS, COLLABORATION_POLICY_MAX_ROUNDS,
+    COLLABORATION_POLICY_MAX_STALLED_UPDATES, COLLABORATION_POLICY_MAX_TOKENS,
+    COLLABORATION_POLICY_MINIMUM_NOVELTY_MICROS, COLLABORATION_POLICY_QUALITY_TOLERANCE_MICROS,
+    COLLABORATION_POLICY_WINDOW_MS, EXECUTION_PLAN_SCHEMA_VERSION, WORKFLOW_SCHEMA_VERSION,
 };
+#[cfg(test)]
+use sentinel_workflow::{AmbiguityClassV1, TaskRiskV1, UncertaintyClassV1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -60,6 +72,7 @@ pub const DELIVERY_INTENT_PATH: &str = "/company/delivery/intents";
 pub const DELIVERY_LINEAGE_PATH: &str = "/company/delivery/lineage";
 pub const WORKFLOW_READINESS_PATH: &str = "/company/workflow/readiness";
 pub const COLLABORATION_VIEW_PATH: &str = "/company/workflow/collaboration";
+pub const COLLABORATION_ADMISSION_PATH: &str = "/company/workflow/collaboration/admissions";
 pub const MAX_WORKFLOW_BODY_BYTES: usize = 256 * 1024;
 
 const PRINCIPAL_SCHEMA_VERSION: u16 = 1;
@@ -69,6 +82,7 @@ const DISPATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RECONCILE_BATCH: usize = 32;
 const MAX_PRINCIPAL_BINDINGS_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTION_INTENT_STEPS: usize = 16;
+const MAX_COLLABORATION_ASSIGNMENT_LOAD: u16 = COLLABORATION_POLICY_MAX_PARTICIPANTS;
 const EXECUTION_INTENT_OVERHEAD_MS: u64 = 30_000;
 // A durable intent can be accepted immediately before the daemon is restarted.
 // Keep restart recovery separate from the per-tool wall-time resource bound.
@@ -266,7 +280,9 @@ struct CompanyAuthority {
     principals: Arc<PrincipalAuthenticator>,
     workbench_profile: WorkbenchProfile,
     workbench_profile_digest: String,
+    qa_profile_capabilities: BTreeSet<String>,
     agent_capabilities: Arc<HashMap<AgentId, BTreeSet<String>>>,
+    runtime_health: crate::runtime_health::SharedRuntimeHealthState,
     artifact_roots: Arc<HashMap<AgentId, PathBuf>>,
 }
 
@@ -632,11 +648,15 @@ impl CompanyAuthority {
             })
             .ok_or_else(|| anyhow::anyhow!("workbench principal authority changed"))?;
         let role = principal.principal.role;
-        let role_capabilities = role_capabilities(role, &self.workbench_profile);
+        let role_capabilities = role_capabilities(
+            role,
+            &self.workbench_profile.capabilities,
+            &self.qa_profile_capabilities,
+        );
         Ok(WorkbenchAuthoritySnapshot {
             agent_id,
             caller_id: runtime.principal.principal_id,
-            caller_role: role_name(role).to_owned(),
+            caller_role: collaboration_policy_role_name(role).to_owned(),
             project_id: project_id.0.clone(),
             work_item_id: work_item_id.0.clone(),
             assignment_version: runtime.assignment_version,
@@ -961,26 +981,603 @@ fn execution_intent_matches_plan(intent: &ExecutionIntentV1, plan: &ExecutionPla
             .all(|(tool, step)| tool == &step.tool)
 }
 
-fn role_capabilities(role: CompanyRoleV1, profile: &WorkbenchProfile) -> BTreeSet<String> {
-    if matches!(role, CompanyRoleV1::Designer | CompanyRoleV1::Developer) {
-        profile.capabilities.clone()
-    } else {
-        BTreeSet::new()
+fn role_capabilities(
+    role: CompanyRoleV1,
+    authoring_capabilities: &BTreeSet<String>,
+    qa_capabilities: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    match role {
+        CompanyRoleV1::Designer | CompanyRoleV1::Developer => authoring_capabilities.clone(),
+        CompanyRoleV1::Qa => qa_capabilities.clone(),
+        CompanyRoleV1::Customer
+        | CompanyRoleV1::Sales
+        | CompanyRoleV1::ProjectManager
+        | CompanyRoleV1::TechnicalLead
+        | CompanyRoleV1::ReleaseManager
+        | CompanyRoleV1::Gaia => BTreeSet::new(),
     }
 }
 
-fn role_name(role: CompanyRoleV1) -> &'static str {
-    match role {
-        CompanyRoleV1::Customer => "customer",
-        CompanyRoleV1::Sales => "sales",
-        CompanyRoleV1::ProjectManager => "project_manager",
-        CompanyRoleV1::TechnicalLead => "technical_lead",
-        CompanyRoleV1::Designer => "designer",
-        CompanyRoleV1::Developer => "developer",
-        CompanyRoleV1::Qa => "qa",
-        CompanyRoleV1::ReleaseManager => "release_manager",
-        CompanyRoleV1::Gaia => "gaia",
+fn derive_collaboration_admission_command(
+    authority: &CompanyAuthority,
+    project: &sentinel_workflow::ProjectV1,
+    request: CollaborationAdmissionRequest,
+    source_request_digest: String,
+) -> Result<CompanyWorkflowCommandV1, WorkflowError> {
+    match request {
+        CollaborationAdmissionRequest::Admit {
+            project_id,
+            work_item_id,
+            expected_version,
+            expected_benefit_ref,
+        } => {
+            if project.project_id != project_id || project.version != expected_version {
+                return Err(collaboration_authority_conflict());
+            }
+            let work = project
+                .work_items
+                .get(&work_item_id)
+                .ok_or_else(collaboration_authority_conflict)?;
+            let assignment = work
+                .assignments
+                .iter()
+                .find(|assignment| assignment.active)
+                .ok_or_else(collaboration_authority_conflict)?;
+            let capacity = authority
+                .store
+                .collaboration_capacity_snapshot(&project.tenant_id, &project.project_id)?;
+            let now_ms = now_unix_ms();
+            let remaining_cost_budget_micros = project
+                .cost_ceiling_micros
+                .checked_sub(project.reserved_cost_micros)
+                .and_then(|value| value.checked_sub(project.committed_cost_micros))
+                .and_then(|value| value.checked_sub(capacity.project_reserved_cost_micros))
+                .ok_or_else(collaboration_authority_conflict)?;
+            let remaining_time_budget_ms = COLLABORATION_POLICY_WINDOW_MS;
+            let deadline_unix_ms = now_ms
+                .checked_add(remaining_time_budget_ms)
+                .ok_or_else(collaboration_authority_conflict)?;
+            let task_risk = collaboration_policy_task_risk(work.spec.required_role);
+            let reversibility = collaboration_policy_reversibility(work.spec.required_role);
+            let ambiguity = collaboration_policy_ambiguity(work.spec.required_role);
+            let uncertainty = collaboration_policy_uncertainty(project, &work_item_id);
+            let evidence_conflict = project.dissent_records.iter().any(|dissent| {
+                project.collaboration_sessions.iter().any(|session| {
+                    session.session_id == dissent.session_id
+                        && session.work_item_id.as_ref() == Some(&work_item_id)
+                })
+            });
+            let mut required_handoff_agents = Vec::new();
+            for dependency_id in &work.spec.dependency_ids {
+                let dependency = project
+                    .work_items
+                    .get(dependency_id)
+                    .ok_or_else(collaboration_authority_conflict)?;
+                let mut active_assignments = dependency
+                    .assignments
+                    .iter()
+                    .filter(|candidate| candidate.active);
+                let dependency_assignment = active_assignments
+                    .next()
+                    .ok_or_else(collaboration_authority_conflict)?;
+                if active_assignments.next().is_some() {
+                    return Err(collaboration_authority_conflict());
+                }
+                if dependency_assignment.agent_id != assignment.agent_id
+                    && !required_handoff_agents.contains(&dependency_assignment.agent_id)
+                {
+                    required_handoff_agents.push(dependency_assignment.agent_id);
+                }
+            }
+            required_handoff_agents.sort_unstable_by_key(|agent_id| agent_id.0);
+            let capability_topology = project
+                .governance
+                .participants
+                .iter()
+                .map(|participant| (participant.agent_id, participant.specialties.clone()))
+                .collect::<Vec<_>>();
+            let (directed_handoff_required, specialist_panel_required) =
+                collaboration_policy_team_shape(
+                    assignment.agent_id,
+                    &work.spec.required_specialties,
+                    &capability_topology,
+                    &required_handoff_agents,
+                )?;
+            let separation_requirements = collaboration_policy_separation_requirements(
+                work.spec.required_role,
+                task_risk,
+                ambiguity,
+                uncertainty,
+                evidence_conflict,
+            );
+            let max_participants = u16::try_from(
+                project
+                    .governance
+                    .participants
+                    .len()
+                    .min(usize::from(MAX_COLLABORATION_ASSIGNMENT_LOAD)),
+            )
+            .map_err(|_| collaboration_invalid())?;
+            let budget = CollaborationAdmissionBudgetV1 {
+                max_participants,
+                max_rounds: COLLABORATION_POLICY_MAX_ROUNDS,
+                max_tokens: COLLABORATION_POLICY_MAX_TOKENS,
+                max_cost_micros: work.spec.budget_micros.min(remaining_cost_budget_micros),
+                deadline_unix_ms,
+                minimum_novelty_micros: COLLABORATION_POLICY_MINIMUM_NOVELTY_MICROS,
+                max_stalled_updates: COLLABORATION_POLICY_MAX_STALLED_UPDATES,
+            };
+            let assignment_digest = assignment.canonical_digest()?;
+            let data_provenance_digest = collaboration_input_provenance_digest(project, work)?;
+            let runtime_health = authority
+                .runtime_health
+                .read()
+                .map_err(|_| workflow_unavailable())?
+                .clone();
+            let candidates = project
+                .governance
+                .participants
+                .iter()
+                .map(|participant| {
+                    let bound_principal = authority
+                        .principals
+                        .principal(&participant.principal_id)
+                        .filter(|bound| {
+                            bound.principal.tenant_id == project.tenant_id
+                                && bound.principal.agent_id == Some(participant.agent_id)
+                                && bound.principal.role == participant.role
+                        });
+                    let runtime_capabilities = authority
+                        .agent_capabilities
+                        .get(&participant.agent_id)
+                        .cloned();
+                    let runtime_available = runtime_health
+                        .agents
+                        .iter()
+                        .find(|agent| agent.agent_id == participant.agent_id.0)
+                        .map(crate::runtime_health::classify_runtime_agent)
+                        == Some(crate::runtime_health::RuntimeAgentHealthClass::Healthy);
+                    let active = bound_principal.is_some()
+                        && runtime_capabilities.is_some()
+                        && runtime_available;
+                    let required_tools = role_capabilities(
+                        participant.role,
+                        &authority.workbench_profile.capabilities,
+                        &authority.qa_profile_capabilities,
+                    );
+                    let tools_available = runtime_capabilities
+                        .as_ref()
+                        .is_some_and(|available| required_tools.is_subset(available));
+                    let tool_material =
+                        serde_json::to_vec(&runtime_capabilities.clone().unwrap_or_default())
+                            .map_err(|_| collaboration_invalid())?;
+                    Ok(CollaborationCandidateV1 {
+                        agent_id: participant.agent_id,
+                        permanent_role: participant.role,
+                        mandate: sentinel_workflow::collaboration_policy_mandate(participant.role),
+                        active,
+                        authority_scope_digest: assignment_digest.clone(),
+                        organization_generation: assignment.organization_generation,
+                        organization_digest: assignment.organization_digest.clone(),
+                        assignment_load: capacity
+                            .assignment_load
+                            .get(&participant.agent_id.0)
+                            .copied()
+                            .unwrap_or(0),
+                        assignment_limit: MAX_COLLABORATION_ASSIGNMENT_LOAD,
+                        capabilities: participant.specialties.clone(),
+                        privacy_classes: BTreeSet::from(["project-internal".to_owned()]),
+                        runtime_available,
+                        tools_available,
+                        model_family: "model-unresolved".to_owned(),
+                        prompt_digest: participant.profile.digest.clone(),
+                        tool_set_digest: domain_digest(
+                            "sentinel.workflow.collaboration-tool-set.v1",
+                            &[&tool_material],
+                        ),
+                        data_provenance_digest: data_provenance_digest.clone(),
+                        prior_claim_correlation_digest: None,
+                        queue_delay_ms: u64::from(
+                            capacity
+                                .assignment_load
+                                .get(&participant.agent_id.0)
+                                .copied()
+                                .unwrap_or(0),
+                        )
+                        .saturating_mul(1_000),
+                        estimated_cost_micros: 0,
+                    })
+                })
+                .collect::<Result<Vec<_>, WorkflowError>>()?;
+            let input = CollaborationAdmissionInputV1 {
+                schema_version: COLLABORATION_ADMISSION_SCHEMA_VERSION,
+                tenant_id: project.tenant_id.clone(),
+                project_id: project.project_id.clone(),
+                work_item_id,
+                owner: assignment.agent_id,
+                task_family: project.governance.project_profile.profile_id.clone(),
+                input_class: collaboration_policy_role_name(work.spec.required_role).to_owned(),
+                task_risk,
+                reversibility,
+                ambiguity,
+                required_capabilities: work.spec.required_specialties.clone(),
+                uncertainty,
+                evidence_conflict,
+                directed_handoff_required,
+                required_handoff_agents,
+                specialist_panel_required,
+                separation_requirements,
+                privacy_class: "project-internal".to_owned(),
+                authority_conflict: false,
+                privacy_conflict: false,
+                human_approval_required: reversibility == ReversibilityV1::Irreversible,
+                remaining_cost_budget_micros,
+                remaining_time_budget_ms,
+                organization_generation: assignment.organization_generation,
+                organization_digest: assignment.organization_digest.clone(),
+                assignment_id: assignment.assignment_id.clone(),
+                assignment_version: assignment.assignment_version,
+                assignment_digest,
+                behavior_policy_generation: project.governance.project_profile.generation,
+                behavior_policy_digest: project.governance.project_profile.digest.clone(),
+                learned_reliability_enabled: false,
+                collaboration_generation: project.collaboration_generation,
+                quality_tolerance_micros: COLLABORATION_POLICY_QUALITY_TOLERANCE_MICROS,
+                permitted_packet_classes: BTreeSet::from([
+                    "decision".to_owned(),
+                    "evidence".to_owned(),
+                    "finding".to_owned(),
+                    "handoff".to_owned(),
+                ]),
+                budget,
+            };
+            Ok(CompanyWorkflowCommandV1::AdmitCollaboration {
+                project_id,
+                expected_version,
+                source_request_digest,
+                input,
+                candidates,
+                reliability: project.collaboration_reliability.clone(),
+                expected_benefit_ref,
+            })
+        }
+        CollaborationAdmissionRequest::Progress {
+            project_id,
+            expected_version,
+            admission_id,
+            progress,
+        } => {
+            if project.project_id != project_id || project.version != expected_version {
+                return Err(collaboration_authority_conflict());
+            }
+            let decision = project
+                .collaboration_admissions
+                .iter()
+                .find(|decision| decision.admission_id == admission_id)
+                .ok_or_else(collaboration_authority_conflict)?;
+            let work = project
+                .work_items
+                .get(&decision.input.work_item_id)
+                .ok_or_else(collaboration_authority_conflict)?;
+            let assignment = work
+                .assignments
+                .iter()
+                .find(|assignment| assignment.active)
+                .ok_or_else(collaboration_authority_conflict)?;
+            Ok(CompanyWorkflowCommandV1::ProgressCollaborationAdmission {
+                project_id,
+                expected_version,
+                source_request_digest,
+                admission_id,
+                fence: CollaborationAdmissionFenceV1 {
+                    organization_generation: assignment.organization_generation,
+                    organization_digest: assignment.organization_digest.clone(),
+                    assignment_id: assignment.assignment_id.clone(),
+                    assignment_version: assignment.assignment_version,
+                    assignment_digest: assignment.canonical_digest()?,
+                    behavior_policy_generation: project.governance.project_profile.generation,
+                    behavior_policy_digest: project.governance.project_profile.digest.clone(),
+                    collaboration_generation: project.collaboration_generation,
+                },
+                progress: CollaborationProgressV1 {
+                    expected_transition_sequence: progress.expected_transition_sequence,
+                    rounds_delta: 1,
+                    tokens_delta: 0,
+                    cost_delta_micros: 0,
+                    novelty_micros: progress.novelty_micros,
+                    novelty_digest: progress.novelty_digest,
+                    milestone_digest: progress.milestone_digest,
+                    work_digest: progress.work_digest,
+                    disposition: progress.disposition,
+                    reason_ref: progress.reason_ref,
+                },
+            })
+        }
     }
+}
+
+fn collaboration_input_provenance_digest(
+    project: &sentinel_workflow::ProjectV1,
+    work: &sentinel_workflow::CompanyWorkItemV1,
+) -> Result<String, WorkflowError> {
+    let mut input_receipts = Vec::with_capacity(work.spec.inputs.len());
+    for input in &work.spec.inputs {
+        let producer = project
+            .work_items
+            .get(&input.producer_work_item_id)
+            .ok_or_else(collaboration_authority_conflict)?;
+        let receipt = producer
+            .output_receipts
+            .iter()
+            .find(|receipt| {
+                receipt.name == input.producer_output_name
+                    && receipt.contract_generation == input.expected_contract_generation
+                    && receipt.contract_digest == input.expected_contract_digest
+            })
+            .ok_or_else(collaboration_authority_conflict)?;
+        input_receipts.push((input, receipt));
+    }
+    let material = serde_json::to_vec(&(
+        project.agreement_digest.as_str(),
+        &work.spec.work_item_id,
+        work.spec.objective.as_str(),
+        &input_receipts,
+    ))
+    .map_err(|_| collaboration_invalid())?;
+    Ok(domain_digest(
+        "sentinel.workflow.collaboration-data-provenance.v1",
+        &[&material],
+    ))
+}
+
+fn collaboration_invalid() -> WorkflowError {
+    WorkflowError::new(
+        WorkflowErrorCode::InvalidInput,
+        false,
+        "collaboration admission is invalid",
+    )
+}
+
+fn collaboration_authority_conflict() -> WorkflowError {
+    WorkflowError::new(
+        WorkflowErrorCode::AuthorityConflict,
+        false,
+        "collaboration admission authority is stale",
+    )
+}
+
+fn collaboration_participant_admission_view(
+    decision: &sentinel_workflow::CollaborationAdmissionDecisionV1,
+    agent_id: AgentId,
+) -> CollaborationAdmissionParticipantView {
+    let routes = decision
+        .routes
+        .iter()
+        .filter(|route| route.from == agent_id || route.to == agent_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut visible_agents = routes
+        .iter()
+        .flat_map(|route| [route.from, route.to])
+        .chain(std::iter::once(agent_id))
+        .collect::<Vec<_>>();
+    visible_agents.sort_by_key(|candidate| candidate.0);
+    visible_agents.dedup_by_key(|candidate| candidate.0);
+    CollaborationAdmissionParticipantView {
+        schema_version: decision.schema_version,
+        admission_id: decision.admission_id.clone(),
+        project_id: decision.input.project_id.clone(),
+        work_item_id: decision.input.work_item_id.clone(),
+        mode: decision.mode,
+        visible_agents: visible_agents.into_iter().collect(),
+        routes,
+        reasons: decision.reasons.clone(),
+        expected_benefit_ref: decision.expected_benefit_ref.clone(),
+        state: decision.state,
+        transition_sequence: decision.transition_sequence,
+        publication_revision: decision.publication_revision,
+        decision_digest: decision.decision_digest.clone(),
+        deadline_unix_ms: decision.input.budget.deadline_unix_ms,
+        updated_at_unix_ms: decision.updated_at_unix_ms,
+    }
+}
+
+fn governed_project_participant<'a>(
+    project: &'a sentinel_workflow::ProjectV1,
+    principal: &AuthenticatedCompanyPrincipalV1,
+) -> Option<&'a sentinel_workflow::ParticipantBindingV1> {
+    project.governance.participants.iter().find(|participant| {
+        Some(participant.agent_id) == principal.agent_id
+            && participant.principal_id == principal.principal_id
+            && participant.role == principal.role
+    })
+}
+
+fn may_read_full_project(
+    project: &sentinel_workflow::ProjectV1,
+    principal: &AuthenticatedCompanyPrincipalV1,
+) -> bool {
+    principal.kind == CompanyPrincipalKindV1::Operator
+        || governed_project_participant(project, principal).is_some_and(|participant| {
+            matches!(
+                participant.role,
+                CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+            )
+        })
+}
+
+fn company_command_response(
+    outcome: &sentinel_workflow::CompanyCommandOutcomeV1,
+    principal: &AuthenticatedCompanyPrincipalV1,
+) -> WorkflowHttpResponse {
+    let project = match &outcome.response {
+        CompanyWorkflowResponseV1::Project(project) => Some(project.as_ref()),
+        CompanyWorkflowResponseV1::AgreementProject { project, .. } => Some(project.as_ref()),
+        CompanyWorkflowResponseV1::CustomerRequest(_) | CompanyWorkflowResponseV1::Proposal(_) => {
+            None
+        }
+    };
+    if project.is_none_or(|project| may_read_full_project(project, principal)) {
+        return json(200, outcome);
+    }
+    let mut public = match serde_json::to_value(outcome) {
+        Ok(value) => value,
+        Err(_) => {
+            return json_error(
+                503,
+                "workflow_corrupt",
+                "workflow response could not be encoded",
+                false,
+            )
+        }
+    };
+    let project_value = match &outcome.response {
+        CompanyWorkflowResponseV1::Project(_) => public.pointer_mut("/response/value"),
+        CompanyWorkflowResponseV1::AgreementProject { .. } => {
+            public.pointer_mut("/response/value/project")
+        }
+        CompanyWorkflowResponseV1::CustomerRequest(_) | CompanyWorkflowResponseV1::Proposal(_) => {
+            None
+        }
+    };
+    let Some(serde_json::Value::Object(project)) = project_value else {
+        return json_error(
+            503,
+            "workflow_corrupt",
+            "workflow project response is invalid",
+            false,
+        );
+    };
+    for field in [
+        "collaboration_sessions",
+        "handoff_packets",
+        "dissent_records",
+        "decision_evidence",
+        "collaboration_publications",
+        "collaboration_generation",
+        "collaboration_admissions",
+        "collaboration_reliability",
+    ] {
+        project.remove(field);
+    }
+    json(200, &public)
+}
+
+fn collaboration_admission_response(
+    authority_project: &sentinel_workflow::ProjectV1,
+    response: &CompanyWorkflowResponseV1,
+    principal: &AuthenticatedCompanyPrincipalV1,
+    operation_id: Uuid,
+    request_digest: &str,
+) -> WorkflowHttpResponse {
+    let CompanyWorkflowResponseV1::Project(response_project) = response else {
+        return json_error(
+            503,
+            "workflow_corrupt",
+            "collaboration operation response is invalid",
+            false,
+        );
+    };
+    if response_project.project_id != authority_project.project_id
+        || response_project.tenant_id != authority_project.tenant_id
+    {
+        return json_error(
+            503,
+            "workflow_corrupt",
+            "collaboration operation response is invalid",
+            false,
+        );
+    }
+    let Some(decision) = response_project
+        .collaboration_admissions
+        .iter()
+        .find(|decision| {
+            decision.request_bindings.iter().any(|binding| {
+                binding.operation_id == operation_id && binding.request_digest == request_digest
+            })
+        })
+    else {
+        return json_error(
+            503,
+            "workflow_corrupt",
+            "collaboration operation response is missing its request binding",
+            false,
+        );
+    };
+    let governed_participant = governed_project_participant(authority_project, principal);
+    if governed_participant.is_some_and(|participant| {
+        matches!(
+            participant.role,
+            CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+        )
+    }) {
+        return json(200, decision);
+    }
+    let Some(agent_id) = governed_participant.map(|participant| participant.agent_id) else {
+        return json_error(
+            403,
+            "authority_conflict",
+            "collaboration admission is not visible to this principal",
+            false,
+        );
+    };
+    if !decision.selected_agents.contains(&agent_id) {
+        return json_error(
+            403,
+            "authority_conflict",
+            "collaboration admission is not visible to this principal",
+            false,
+        );
+    }
+    json(
+        200,
+        &collaboration_participant_admission_view(decision, agent_id),
+    )
+}
+
+fn collaboration_mutation_receipt(
+    command: &CompanyWorkflowCommandV1,
+    outcome: &sentinel_workflow::CompanyCommandOutcomeV1,
+) -> Result<CollaborationMutationReceipt, WorkflowError> {
+    let CompanyWorkflowResponseV1::Project(project) = &outcome.response else {
+        return Err(workflow_unavailable());
+    };
+    let session_id = match command {
+        CompanyWorkflowCommandV1::CreateCollaborationSession { admission_id, .. } => {
+            let mut sessions = project
+                .collaboration_sessions
+                .iter()
+                .filter(|session| session.admission_id.as_deref() == Some(admission_id.as_str()));
+            let session_id = sessions
+                .next()
+                .map(|session| session.session_id.clone())
+                .ok_or_else(workflow_unavailable)?;
+            if sessions.next().is_some() {
+                return Err(workflow_unavailable());
+            }
+            session_id
+        }
+        CompanyWorkflowCommandV1::RecordIndependentClaim { session_id, .. }
+        | CompanyWorkflowCommandV1::OpenClaimExposureBarrier { session_id, .. }
+        | CompanyWorkflowCommandV1::OfferHandoffPacket { session_id, .. }
+        | CompanyWorkflowCommandV1::RequestHandoffClarification { session_id, .. }
+        | CompanyWorkflowCommandV1::AnswerHandoffClarification { session_id, .. }
+        | CompanyWorkflowCommandV1::AcceptHandoffPacket { session_id, .. }
+        | CompanyWorkflowCommandV1::RejectHandoffPacket { session_id, .. }
+        | CompanyWorkflowCommandV1::ConsumeHandoffPacket { session_id, .. }
+        | CompanyWorkflowCommandV1::RecordDissent { session_id, .. }
+        | CompanyWorkflowCommandV1::LinkDecisionEvidence { session_id, .. }
+        | CompanyWorkflowCommandV1::TransitionCollaborationSession { session_id, .. } => {
+            session_id.clone()
+        }
+        _ => return Err(workflow_unavailable()),
+    };
+    Ok(CollaborationMutationReceipt {
+        replayed: outcome.replayed,
+        project_id: project.project_id.clone(),
+        project_version: project.version,
+        session_id,
+    })
 }
 
 #[derive(Clone)]
@@ -1028,7 +1625,7 @@ impl WorkbenchExecutionAdapter {
             work_item_id: work.work_item_id.0,
             workspace_id: pending.step.workspace_id.clone(),
             caller_id: authority.principal.principal_id,
-            caller_role: role_name(caller.principal.role).to_owned(),
+            caller_role: collaboration_policy_role_name(caller.principal.role).to_owned(),
             assignment_version: authority.assignment_version,
             credential_generation: authority.principal.principal_generation,
             policy_digest: authority.policy_digest,
@@ -1623,6 +2220,71 @@ struct CompanyCommandEnvelope {
     command: CompanyWorkflowCommandV1,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationAdmissionEnvelope {
+    operation_id: Uuid,
+    command: CollaborationAdmissionRequest,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationAdmissionParticipantView {
+    schema_version: u16,
+    admission_id: String,
+    project_id: ProjectId,
+    work_item_id: WorkItemId,
+    mode: sentinel_workflow::CollaborationAdmissionModeV1,
+    visible_agents: Vec<AgentId>,
+    routes: Vec<sentinel_workflow::CollaborationRouteV1>,
+    reasons: Vec<String>,
+    expected_benefit_ref: String,
+    state: sentinel_workflow::CollaborationAdmissionStateV1,
+    transition_sequence: u64,
+    publication_revision: u64,
+    decision_digest: String,
+    deadline_unix_ms: u64,
+    updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationMutationReceipt {
+    replayed: bool,
+    project_id: ProjectId,
+    project_version: u64,
+    session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+enum CollaborationAdmissionRequest {
+    Admit {
+        project_id: ProjectId,
+        work_item_id: WorkItemId,
+        expected_version: u64,
+        expected_benefit_ref: String,
+    },
+    Progress {
+        project_id: ProjectId,
+        expected_version: u64,
+        admission_id: String,
+        progress: CollaborationProgressRequestV1,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationProgressRequestV1 {
+    expected_transition_sequence: u64,
+    novelty_micros: u32,
+    novelty_digest: String,
+    milestone_digest: Option<String>,
+    work_digest: Option<String>,
+    disposition: CollaborationProgressDispositionV1,
+    reason_ref: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionPlanEnvelope {
@@ -1795,6 +2457,7 @@ impl WorkflowApi {
         data_dir: &Path,
         config_dir: &Path,
         agent_capabilities: HashMap<AgentId, BTreeSet<String>>,
+        runtime_health: crate::runtime_health::SharedRuntimeHealthState,
         event_store: sentinel_limbo::EventStore,
         workbench_artifact_roots: HashMap<AgentId, PathBuf>,
     ) -> Result<Self, WorkflowError> {
@@ -1818,13 +2481,18 @@ impl WorkflowApi {
         let (profile, profile_digest) =
             WorkbenchProfile::load(config_dir.join("workbench-profiles/web-authoring-v1.toml"))
                 .map_err(|_| workflow_unavailable())?;
+        let (qa_profile, qa_profile_digest) =
+            WorkbenchProfile::load(config_dir.join("workbench-profiles/web-qa-v1.toml"))
+                .map_err(|_| workflow_unavailable())?;
         let agent_capabilities = Arc::new(agent_capabilities);
         let authority = Arc::new(CompanyAuthority {
             store: Arc::clone(&store),
             principals: Arc::clone(&principals),
             workbench_profile: profile,
             workbench_profile_digest: profile_digest,
+            qa_profile_capabilities: qa_profile.capabilities.clone(),
             agent_capabilities: Arc::clone(&agent_capabilities),
+            runtime_health,
             artifact_roots: Arc::new(workbench_artifact_roots.clone()),
         });
         let workbench = Arc::new(WorkbenchExecutionAdapter {
@@ -1834,9 +2502,6 @@ impl WorkflowApi {
         let organization: Arc<dyn sentinel_workflow::OrganizationRuntimePort> = authority.clone();
         let execution: Arc<dyn WorkExecutionPort> = workbench.clone();
         let completion: Arc<dyn CompletionEvidencePort> = workbench;
-        let (qa_profile, qa_profile_digest) =
-            WorkbenchProfile::load(config_dir.join("workbench-profiles/web-qa-v1.toml"))
-                .map_err(|_| workflow_unavailable())?;
         let delivery_integration = WorkflowDeliveryIntegration::new(
             Arc::clone(&store),
             Arc::clone(&principals),
@@ -1959,7 +2624,13 @@ impl WorkflowApi {
             ("POST", DELIVERY_COMMAND_PATH) => self.delivery_command(&principal, body),
             ("POST", DELIVERY_INTENT_PATH) => delivery_intent::handle(self, &principal, body),
             ("GET", DELIVERY_LINEAGE_PATH) => self.delivery_lineage(&principal, path),
+            ("POST", COLLABORATION_ADMISSION_PATH) => {
+                self.collaboration_admission(&principal, body)
+            }
             ("GET", COLLABORATION_VIEW_PATH) => self.collaboration_view(&principal, path),
+            ("GET", COLLABORATION_ADMISSION_PATH) => {
+                self.collaboration_admission_view(&principal, path)
+            }
             ("GET", WORKFLOW_READINESS_PATH) => json(200, &self.health()),
             _ => json_error(
                 405,
@@ -2033,7 +2704,16 @@ impl WorkflowApi {
                         );
                     }
                 }
-                json(200, &value)
+                if is_collaboration_command_v1(&envelope.command)
+                    && principal.principal.kind == CompanyPrincipalKindV1::Agent
+                {
+                    match collaboration_mutation_receipt(&envelope.command, &value) {
+                        Ok(receipt) => json(200, &receipt),
+                        Err(error) => workflow_error(error),
+                    }
+                } else {
+                    company_command_response(&value, &principal.principal)
+                }
             }
             Err(error) => workflow_error(error),
         }
@@ -2076,6 +2756,275 @@ impl WorkflowApi {
             Ok(None) => json_error(404, "not_found", "workflow object was not found", false),
             Err(error) => workflow_error(error),
         }
+    }
+
+    fn collaboration_admission(
+        &self,
+        principal: &BoundPrincipal,
+        body: &[u8],
+    ) -> WorkflowHttpResponse {
+        if principal.principal.kind != CompanyPrincipalKindV1::Agent {
+            return json_error(
+                403,
+                "authority_conflict",
+                "agent authority is required",
+                false,
+            );
+        }
+        let envelope: CollaborationAdmissionEnvelope = match decode_body(body) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let Ok(request_bytes) = serde_json::to_vec(&envelope.command) else {
+            return json_error(
+                400,
+                "invalid_input",
+                "collaboration request is invalid",
+                false,
+            );
+        };
+        let request_digest = domain_digest(
+            "sentinel.workflow.collaboration-admission-request.v1",
+            &[&request_bytes],
+        );
+        let (project_id, expected_version, requested_admission_id) = match &envelope.command {
+            CollaborationAdmissionRequest::Admit {
+                project_id,
+                expected_version,
+                ..
+            } => (project_id, *expected_version, None),
+            CollaborationAdmissionRequest::Progress {
+                project_id,
+                expected_version,
+                admission_id,
+                ..
+            } => (project_id, *expected_version, Some(admission_id.as_str())),
+        };
+        let Ok(_guard) = self.mutation_fence.read() else {
+            return json_error(503, "workflow_busy", "workflow recovery is active", true);
+        };
+        match self
+            .store
+            .has_company_operation(&principal.principal, envelope.operation_id)
+        {
+            Ok(true) => {
+                return self.replay_collaboration_admission(
+                    principal,
+                    project_id,
+                    requested_admission_id,
+                    envelope.operation_id,
+                    &request_digest,
+                )
+            }
+            Ok(false) => {}
+            Err(error) => return workflow_error(error),
+        }
+        let Some(authority) = self.authority.as_ref() else {
+            return json_error(
+                503,
+                "workflow_unavailable",
+                "workflow authority is unavailable",
+                true,
+            );
+        };
+        let project = match self
+            .store
+            .company_project(&principal.principal.tenant_id, project_id)
+        {
+            Ok(Some(project)) => project,
+            Ok(None) => {
+                return json_error(404, "not_found", "workflow object was not found", false)
+            }
+            Err(error) => return workflow_error(error),
+        };
+        if project.version != expected_version {
+            return json_error(
+                409,
+                "version_conflict",
+                "collaboration project version is stale",
+                false,
+            );
+        }
+        let command = match derive_collaboration_admission_command(
+            authority,
+            &project,
+            envelope.command,
+            request_digest.clone(),
+        ) {
+            Ok(command) => command,
+            Err(error) => return workflow_error(error),
+        };
+        match self.core.apply_company_command(
+            &principal.principal,
+            envelope.operation_id,
+            &command,
+            now_unix_ms(),
+        ) {
+            Ok(value) => {
+                if let Err(error) = self.publish_collaboration_backlog() {
+                    if let Ok(mut last_error) = self.last_error.lock() {
+                        *last_error = Some(error);
+                    }
+                    return json_error(
+                        503,
+                        "collaboration_publication_pending",
+                        "collaboration state is durable but canonical publication is pending",
+                        true,
+                    );
+                }
+                collaboration_admission_response(
+                    &project,
+                    &value.response,
+                    &principal.principal,
+                    envelope.operation_id,
+                    &request_digest,
+                )
+            }
+            Err(error) => workflow_error(error),
+        }
+    }
+
+    fn replay_collaboration_admission(
+        &self,
+        principal: &BoundPrincipal,
+        project_id: &ProjectId,
+        requested_admission_id: Option<&str>,
+        operation_id: Uuid,
+        request_digest: &str,
+    ) -> WorkflowHttpResponse {
+        let project = match self
+            .store
+            .company_project(&principal.principal.tenant_id, project_id)
+        {
+            Ok(Some(project)) => project,
+            Ok(None) => {
+                return json_error(404, "not_found", "workflow object was not found", false)
+            }
+            Err(error) => return workflow_error(error),
+        };
+        let matched = project.collaboration_admissions.iter().any(|decision| {
+            requested_admission_id.is_none_or(|value| value == decision.admission_id)
+                && decision.request_bindings.iter().any(|binding| {
+                    binding.operation_id == operation_id && binding.request_digest == request_digest
+                })
+        });
+        if !matched {
+            return json_error(
+                409,
+                "idempotency_conflict",
+                "operation id is bound to another collaboration request",
+                false,
+            );
+        }
+        if let Err(error) = self.publish_collaboration_backlog() {
+            if let Ok(mut last_error) = self.last_error.lock() {
+                *last_error = Some(error);
+            }
+            return json_error(
+                503,
+                "collaboration_publication_pending",
+                "collaboration state is durable but canonical publication is pending",
+                true,
+            );
+        }
+        match self
+            .store
+            .company_operation_response(&principal.principal, operation_id)
+        {
+            Ok(Some(response)) => collaboration_admission_response(
+                &project,
+                &response,
+                &principal.principal,
+                operation_id,
+                request_digest,
+            ),
+            Ok(None) => json_error(
+                503,
+                "workflow_corrupt",
+                "collaboration operation response is missing",
+                false,
+            ),
+            Err(error) => workflow_error(error),
+        }
+    }
+
+    fn collaboration_admission_view(
+        &self,
+        principal: &BoundPrincipal,
+        path: &str,
+    ) -> WorkflowHttpResponse {
+        if principal.principal.kind == CompanyPrincipalKindV1::Customer {
+            return json_error(
+                403,
+                "authority_conflict",
+                "operator or admitted participant authority is required",
+                false,
+            );
+        }
+        let (Some(project_value), Some(admission_id)) = (
+            query_parameter(path, "project_id"),
+            query_parameter(path, "admission_id"),
+        ) else {
+            return json_error(
+                400,
+                "invalid_input",
+                "project_id and admission_id are required",
+                false,
+            );
+        };
+        let project_id = match ProjectId::parse(project_value) {
+            Ok(value) => value,
+            Err(error) => return workflow_error(error),
+        };
+        let project = match self
+            .store
+            .company_project(&principal.principal.tenant_id, &project_id)
+        {
+            Ok(Some(project)) => project,
+            Ok(None) => {
+                return json_error(404, "not_found", "workflow object was not found", false)
+            }
+            Err(error) => return workflow_error(error),
+        };
+        let Some(decision) = project
+            .collaboration_admissions
+            .iter()
+            .find(|decision| decision.admission_id == admission_id)
+        else {
+            return json_error(404, "not_found", "workflow object was not found", false);
+        };
+        if principal.principal.kind == CompanyPrincipalKindV1::Operator {
+            return json(200, decision);
+        }
+        let governed_participant = governed_project_participant(&project, &principal.principal);
+        if governed_participant.is_some_and(|participant| {
+            matches!(
+                participant.role,
+                CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+            )
+        }) {
+            return json(200, decision);
+        }
+        let Some(agent_id) = governed_participant.map(|participant| participant.agent_id) else {
+            return json_error(
+                403,
+                "authority_conflict",
+                "collaboration admission is not visible to this principal",
+                false,
+            );
+        };
+        if !decision.selected_agents.contains(&agent_id) {
+            return json_error(
+                403,
+                "authority_conflict",
+                "collaboration admission is not visible to this principal",
+                false,
+            );
+        }
+        json(
+            200,
+            &collaboration_participant_admission_view(decision, agent_id),
+        )
     }
 
     fn publish_collaboration_backlog(&self) -> Result<(), String> {
@@ -2421,7 +3370,15 @@ impl WorkflowApi {
             .store
             .company_project(&principal.principal.tenant_id, &project_id)
         {
-            Ok(Some(value)) => json(200, &value),
+            Ok(Some(value)) if may_read_full_project(&value, &principal.principal) => {
+                json(200, &value)
+            }
+            Ok(Some(_)) => json_error(
+                403,
+                "authority_conflict",
+                "operator or governed project leadership authority is required",
+                false,
+            ),
             Ok(None) => json_error(404, "not_found", "project was not found", false),
             Err(error) => workflow_error(error),
         }
@@ -2471,7 +3428,15 @@ impl WorkflowApi {
             .store
             .company_project_projection(&principal.principal.tenant_id, &project_id)
         {
-            Ok(Some(value)) => json(200, &value),
+            Ok(Some(value)) if may_read_full_project(&value.project, &principal.principal) => {
+                json(200, &value)
+            }
+            Ok(Some(_)) => json_error(
+                403,
+                "authority_conflict",
+                "operator or governed project leadership authority is required",
+                false,
+            ),
             Ok(None) => json_error(404, "not_found", "project projection was not found", false),
             Err(error) => workflow_error(error),
         }
@@ -2496,13 +3461,39 @@ impl WorkflowApi {
             None => 100,
             _ => return json_error(400, "invalid_input", "limit is invalid", false),
         };
-        match self
-            .store
-            .company_project_events_since(&principal.principal.tenant_id, after, limit)
-        {
-            Ok(value) => json(200, &value),
-            Err(error) => workflow_error(error),
+        let events = match self.store.company_project_events_since(
+            &principal.principal.tenant_id,
+            after,
+            limit,
+        ) {
+            Ok(value) => value,
+            Err(error) => return workflow_error(error),
+        };
+        if principal.principal.kind == CompanyPrincipalKindV1::Operator {
+            return json(200, &events);
         }
+        let mut authorized = Vec::new();
+        for event in events {
+            let current = match self
+                .store
+                .company_project(&principal.principal.tenant_id, &event.project_id)
+            {
+                Ok(Some(project)) => project,
+                Ok(None) => {
+                    return json_error(
+                        503,
+                        "workflow_corrupt",
+                        "event references a missing project",
+                        false,
+                    )
+                }
+                Err(error) => return workflow_error(error),
+            };
+            if may_read_full_project(&current, &principal.principal) {
+                authorized.push(event);
+            }
+        }
+        json(200, &authorized)
     }
 
     fn delivery_command(&self, principal: &BoundPrincipal, body: &[u8]) -> WorkflowHttpResponse {
@@ -3272,6 +4263,7 @@ fn is_workflow_path(path: &str) -> bool {
             | DELIVERY_INTENT_PATH
             | DELIVERY_LINEAGE_PATH
             | COLLABORATION_VIEW_PATH
+            | COLLABORATION_ADMISSION_PATH
             | WORKFLOW_READINESS_PATH
     )
 }
@@ -3376,6 +4368,9 @@ fn is_internal_company_command(command: &CompanyWorkflowCommandV1) -> bool {
         command,
         CompanyWorkflowCommandV1::ApplyWorkTransition { .. }
             | CompanyWorkflowCommandV1::CreateGovernedRework { .. }
+            | CompanyWorkflowCommandV1::AdmitCollaboration { .. }
+            | CompanyWorkflowCommandV1::ProgressCollaborationAdmission { .. }
+            | CompanyWorkflowCommandV1::RecordCollaborationReliability { .. }
     )
 }
 
@@ -3466,6 +4461,10 @@ mod tests {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             work_item_id: Some(work_item_id.clone()),
+            admission_id: None,
+            admission_contract_digest: None,
+            collaboration_generation: None,
+            admission_routes: Vec::new(),
             organization_generation: 1,
             organization_digest: authority_digest.clone(),
             assignment_id: "assignment-collaboration".to_owned(),
@@ -3782,6 +4781,9 @@ mod tests {
             dissent_records: Vec::new(),
             decision_evidence: Vec::new(),
             collaboration_publications: Vec::new(),
+            collaboration_generation: 1,
+            collaboration_admissions: Vec::new(),
+            collaboration_reliability: Vec::new(),
             version: 3,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 3,
@@ -3814,6 +4816,50 @@ mod tests {
         assert_eq!(
             select_provider_usage_binding(&[missing_reservation], AgentId(6)),
             Err("assigned provider work item has no active reservation")
+        );
+    }
+
+    #[test]
+    fn full_project_read_requires_operator_or_exact_governed_leadership() {
+        let mut project = project_with_provider_authority();
+        let principals =
+            PrincipalAuthenticator::new(vec![("d".repeat(32), principal_binding("developer-6"))])
+                .unwrap();
+        let developer = principals.principal("developer-6").unwrap().principal;
+        assert!(!may_read_full_project(&project, &developer));
+
+        let mut lead = developer.clone();
+        lead.role = CompanyRoleV1::TechnicalLead;
+        project.governance.participants[0].role = CompanyRoleV1::TechnicalLead;
+        assert!(may_read_full_project(&project, &lead));
+
+        lead.principal_id = "foreign-lead".to_owned();
+        assert!(!may_read_full_project(&project, &lead));
+
+        let mut operator = developer.clone();
+        operator.kind = CompanyPrincipalKindV1::Operator;
+        operator.role = CompanyRoleV1::Gaia;
+        operator.agent_id = None;
+        assert!(may_read_full_project(&project, &operator));
+
+        project.collaboration_generation = 2;
+        let outcome = sentinel_workflow::CompanyCommandOutcomeV1 {
+            replayed: false,
+            response: CompanyWorkflowResponseV1::Project(Box::new(project.clone())),
+        };
+        let redacted = company_command_response(&outcome, &developer);
+        assert_eq!(redacted.status, 200);
+        let redacted: serde_json::Value = serde_json::from_slice(&redacted.body).unwrap();
+        assert!(redacted
+            .pointer("/response/value/collaboration_generation")
+            .is_none());
+
+        let full = company_command_response(&outcome, &operator);
+        assert_eq!(full.status, 200);
+        let full: serde_json::Value = serde_json::from_slice(&full.body).unwrap();
+        assert_eq!(
+            full.pointer("/response/value/collaboration_generation"),
+            Some(&serde_json::json!(2))
         );
     }
 
@@ -4076,6 +5122,332 @@ mod tests {
 
         assert!(is_internal_company_command(&transition));
         assert!(is_internal_company_command(&rework));
+
+        let reliability = CompanyWorkflowCommandV1::RecordCollaborationReliability {
+            project_id: ProjectId::parse("project-m0").unwrap(),
+            expected_version: 1,
+            work_item_id: WorkItemId::parse("work-m0").unwrap(),
+            fence: CollaborationAdmissionFenceV1 {
+                organization_generation: 1,
+                organization_digest: "a".repeat(64),
+                assignment_id: "assignment-m0".to_owned(),
+                assignment_version: 1,
+                assignment_digest: "b".repeat(64),
+                behavior_policy_generation: 1,
+                behavior_policy_digest: "c".repeat(64),
+                collaboration_generation: 1,
+            },
+            observation: sentinel_workflow::ReliabilityObservationV1 {
+                observation_id: "observation-m0".to_owned(),
+                agent_id: AgentId(6),
+                capability: "frontend".to_owned(),
+                task_family: "web-development".to_owned(),
+                input_class: "static-site".to_owned(),
+                claim_id: "claim-m0".to_owned(),
+                accepted_outcome_digest: "d".repeat(64),
+                independent_verification_digest: "e".repeat(64),
+                verifier_principal_id: "qa-7".to_owned(),
+                verifier_authority_digest: "f".repeat(64),
+                accepted: true,
+                calibration_bucket: 50,
+                evidence_quality_micros: 500_000,
+                policy_generation: 1,
+                observation_digest: "1".repeat(64),
+                recorded_at_unix_ms: 1,
+            },
+        };
+        assert!(is_internal_company_command(&reliability));
+    }
+
+    fn admission_request(
+        project: &sentinel_workflow::ProjectV1,
+        _deadline_unix_ms: u64,
+    ) -> CollaborationAdmissionRequest {
+        CollaborationAdmissionRequest::Admit {
+            project_id: project.project_id.clone(),
+            work_item_id: WorkItemId::parse("build-site").unwrap(),
+            expected_version: project.version,
+            expected_benefit_ref: "solo owner covers the accepted task".to_owned(),
+        }
+    }
+
+    #[test]
+    fn public_admission_schema_cannot_inject_roster_or_authority() {
+        let project = project_with_provider_authority();
+        let envelope = CollaborationAdmissionEnvelope {
+            operation_id: Uuid::from_u128(740),
+            command: admission_request(&project, now_unix_ms().saturating_add(10_000)),
+        };
+        let mut value = serde_json::to_value(envelope).unwrap();
+        let command = value
+            .get_mut("command")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        assert!(!command.contains_key("candidates"));
+        assert!(!command.contains_key("organization_generation"));
+        assert!(!command.contains_key("assignment_digest"));
+        assert!(!command.contains_key("collaboration_generation"));
+        assert!(!command.contains_key("task_risk"));
+        assert!(!command.contains_key("separation_requirements"));
+        assert!(!command.contains_key("budget"));
+        command.insert("candidates".to_owned(), serde_json::json!([]));
+        assert!(serde_json::from_value::<CollaborationAdmissionEnvelope>(value).is_err());
+
+        let mut value = serde_json::to_value(CollaborationAdmissionEnvelope {
+            operation_id: Uuid::from_u128(741),
+            command: admission_request(&project, now_unix_ms().saturating_add(10_000)),
+        })
+        .unwrap();
+        value["command"]["task_risk"] = serde_json::json!("low");
+        assert!(serde_json::from_value::<CollaborationAdmissionEnvelope>(value).is_err());
+
+        let progress = CollaborationAdmissionEnvelope {
+            operation_id: Uuid::from_u128(742),
+            command: CollaborationAdmissionRequest::Progress {
+                project_id: project.project_id.clone(),
+                expected_version: project.version,
+                admission_id: "admission-m0".to_owned(),
+                progress: CollaborationProgressRequestV1 {
+                    expected_transition_sequence: 1,
+                    novelty_micros: 500_000,
+                    novelty_digest: "d".repeat(64),
+                    milestone_digest: Some("e".repeat(64)),
+                    work_digest: None,
+                    disposition: CollaborationProgressDispositionV1::Continue,
+                    reason_ref: "bounded progress".to_owned(),
+                },
+            },
+        };
+        let mut value = serde_json::to_value(progress).unwrap();
+        let progress = value["command"]["progress"].as_object_mut().unwrap();
+        assert!(!progress.contains_key("rounds_delta"));
+        assert!(!progress.contains_key("tokens_delta"));
+        assert!(!progress.contains_key("cost_delta_micros"));
+        progress.insert("tokens_delta".to_owned(), serde_json::json!(0));
+        assert!(serde_json::from_value::<CollaborationAdmissionEnvelope>(value).is_err());
+    }
+
+    #[test]
+    fn admission_tool_requirements_follow_the_candidate_role() {
+        let authoring = BTreeSet::from([
+            "file.inspect".to_owned(),
+            "file.write".to_owned(),
+            "patch.apply".to_owned(),
+        ]);
+        let qa = BTreeSet::from(["file.inspect".to_owned(), "test.run_profile".to_owned()]);
+
+        assert_eq!(
+            role_capabilities(CompanyRoleV1::Developer, &authoring, &qa),
+            authoring
+        );
+        assert_eq!(role_capabilities(CompanyRoleV1::Qa, &authoring, &qa), qa);
+        assert!(role_capabilities(CompanyRoleV1::ReleaseManager, &authoring, &qa).is_empty());
+
+        let qa_without_test_runner = BTreeSet::from(["file.inspect".to_owned()]);
+        assert!(!role_capabilities(CompanyRoleV1::Qa, &authoring, &qa)
+            .is_subset(&qa_without_test_runner));
+    }
+
+    #[test]
+    fn admission_derives_roster_load_and_fences_from_server_authority() {
+        let project = project_with_provider_authority();
+        let work = project.work_items.values().next().unwrap();
+        let expected_data_provenance =
+            collaboration_input_provenance_digest(&project, work).unwrap();
+        let principals = Arc::new(
+            PrincipalAuthenticator::new(vec![("d".repeat(32), principal_binding("developer-6"))])
+                .unwrap(),
+        );
+        let profile = WorkbenchProfile {
+            schema_version: 1,
+            id: "web-authoring-v1".to_owned(),
+            runtime_key: WORKBENCH_RUNTIME_BWRAP.to_owned(),
+            network: "deny".to_owned(),
+            environment: std::collections::BTreeMap::new(),
+            capabilities: BTreeSet::from(["frontend".to_owned()]),
+            output_artifact_kinds: BTreeSet::from(["source_tree".to_owned()]),
+            resource_ceilings: WorkbenchResourceLimits {
+                wall_time_ms: 30_000,
+                cpu_time_ms: 10_000,
+                memory_bytes: 134_217_728,
+                process_count: 16,
+                file_bytes: 8_388_608,
+                stdout_bytes: 65_536,
+                stderr_bytes: 65_536,
+            },
+            command_rules: Vec::new(),
+            test_suites: Vec::new(),
+        };
+        let authority = CompanyAuthority {
+            store: Arc::new(WorkflowStore::open(":memory:").unwrap()),
+            principals,
+            workbench_profile: profile,
+            workbench_profile_digest: "a".repeat(64),
+            qa_profile_capabilities: BTreeSet::from([
+                "file.inspect".to_owned(),
+                "test.run_profile".to_owned(),
+            ]),
+            agent_capabilities: Arc::new(HashMap::from([(
+                AgentId(6),
+                BTreeSet::from(["frontend".to_owned()]),
+            )])),
+            runtime_health: Arc::new(RwLock::new(crate::runtime_health::RuntimeHealthSnapshot {
+                agents: vec![crate::runtime_health::RuntimeHealthAgentSnapshot {
+                    agent_id: 6,
+                    runtime_present: true,
+                    projection_present: true,
+                    security_runtime_present: true,
+                    adapter_handle_present: true,
+                    adapter_instance_matches: true,
+                    runtime_resources_healthy: true,
+                    adapter_health_state: Some(
+                        sentinel_common::nano_runtime::NanoHealthState::Healthy,
+                    ),
+                    logical_status: Some(sentinel_runtime::AgentStatus::Active),
+                    ..crate::runtime_health::RuntimeHealthAgentSnapshot::default()
+                }],
+                ..crate::runtime_health::RuntimeHealthSnapshot::default()
+            })),
+            artifact_roots: Arc::new(HashMap::new()),
+        };
+        let command = derive_collaboration_admission_command(
+            &authority,
+            &project,
+            admission_request(&project, now_unix_ms().saturating_add(10_000)),
+            "9".repeat(64),
+        )
+        .unwrap();
+        let CompanyWorkflowCommandV1::AdmitCollaboration {
+            input,
+            candidates,
+            reliability,
+            expected_benefit_ref,
+            ..
+        } = command
+        else {
+            panic!("expected admission command")
+        };
+        assert_eq!(input.owner, AgentId(6));
+        assert_eq!(input.task_family, "web-project-v1");
+        assert_eq!(input.input_class, "developer");
+        assert_eq!(input.task_risk, TaskRiskV1::Low);
+        assert_eq!(input.reversibility, ReversibilityV1::Reversible);
+        assert_eq!(input.ambiguity, AmbiguityClassV1::Low);
+        assert_eq!(input.uncertainty, UncertaintyClassV1::Low);
+        assert!(!input.evidence_conflict);
+        assert!(!input.directed_handoff_required);
+        assert!(input.required_handoff_agents.is_empty());
+        assert!(!input.specialist_panel_required);
+        assert!(input.separation_requirements.is_empty());
+        assert_eq!(
+            input.required_capabilities,
+            BTreeSet::from(["frontend".to_owned()])
+        );
+        assert_eq!(input.assignment_id, "assignment-m0");
+        assert_eq!(input.assignment_version, 1);
+        assert_eq!(input.organization_generation, 1);
+        assert_eq!(input.collaboration_generation, 1);
+        assert_eq!(input.quality_tolerance_micros, 100_000);
+        assert_eq!(input.budget.max_participants, 1);
+        assert_eq!(input.budget.max_rounds, 4);
+        assert_eq!(input.budget.max_tokens, 32_000);
+        assert_eq!(input.budget.max_cost_micros, 100);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].agent_id, AgentId(6));
+        assert_eq!(candidates[0].assignment_load, 0);
+        assert!(candidates[0].runtime_available);
+        assert!(candidates[0].tools_available);
+        assert_eq!(
+            candidates[0].data_provenance_digest,
+            expected_data_provenance
+        );
+        assert!(reliability.is_empty());
+
+        authority.runtime_health.write().unwrap().agents.clear();
+        let unavailable = derive_collaboration_admission_command(
+            &authority,
+            &project,
+            admission_request(&project, now_unix_ms().saturating_add(10_000)),
+            "9".repeat(64),
+        )
+        .unwrap();
+        let CompanyWorkflowCommandV1::AdmitCollaboration {
+            candidates: unavailable_candidates,
+            ..
+        } = unavailable
+        else {
+            panic!("expected admission command")
+        };
+        assert!(!unavailable_candidates[0].active);
+        assert!(!unavailable_candidates[0].runtime_available);
+
+        let poisoned_health = Arc::clone(&authority.runtime_health);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned_health.write().unwrap();
+            panic!("poison collaboration runtime-health fixture");
+        })
+        .join()
+        .is_err());
+        let poisoned = derive_collaboration_admission_command(
+            &authority,
+            &project,
+            admission_request(&project, now_unix_ms().saturating_add(10_000)),
+            "9".repeat(64),
+        )
+        .unwrap_err();
+        assert_eq!(poisoned.code, WorkflowErrorCode::PersistenceFailure);
+
+        let mut decision = sentinel_workflow::admit_collaboration(
+            "admission-m0".to_owned(),
+            input,
+            &candidates,
+            &reliability,
+            &std::collections::BTreeMap::new(),
+            expected_benefit_ref,
+            now_unix_ms(),
+        )
+        .unwrap();
+        let view = serde_json::to_value(collaboration_participant_admission_view(
+            &decision,
+            AgentId(6),
+        ))
+        .unwrap();
+        assert!(view.get("eligible_agents").is_none());
+        assert!(view.get("rejected_candidates").is_none());
+        assert!(view.get("reservations").is_none());
+        assert!(view.get("input").is_none());
+        assert_eq!(view["visible_agents"], serde_json::json!([6]));
+
+        let operation_id = Uuid::from_u128(740);
+        let request_digest = "9".repeat(64);
+        decision
+            .request_bindings
+            .push(sentinel_workflow::CollaborationRequestBindingV1 {
+                operation_id,
+                request_digest: request_digest.clone(),
+            });
+        decision.refresh_digest().unwrap();
+        let mut response_project = project.clone();
+        response_project.collaboration_admissions.push(decision);
+        let principal = authority
+            .principals
+            .principal("developer-6")
+            .unwrap()
+            .principal;
+        let response = collaboration_admission_response(
+            &project,
+            &CompanyWorkflowResponseV1::Project(Box::new(response_project)),
+            &principal,
+            operation_id,
+            &request_digest,
+        );
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(body.get("eligible_agents").is_none());
+        assert!(body.get("rejected_candidates").is_none());
+        assert!(body.get("reservations").is_none());
+        assert!(body.get("input").is_none());
+        assert_eq!(body["visible_agents"], serde_json::json!([6]));
     }
 
     #[test]
