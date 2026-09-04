@@ -1,0 +1,33 @@
+{
+  "confidence_basis_points": 9500,
+  "maximum_authority_privacy_regressions": 0,
+  "minimum_paired_trials": 20,
+  "paired_adoption_rule": "discordant_wilson_lower_gt_half",
+  "policy_generation": 1,
+  "resource_adoption_rule": "candidate_mean_lte_solo_mean_times_participant_limit",
+  "scenarios": [
+    {
+      "candidate_mode": "directed_handoff",
+      "de_risk_dimension": "capability_coverage",
+      "max_candidate_participants": 2,
+      "scenario_id": "directed-capability-gap-v1",
+      "task_class": "web-project-v1"
+    },
+    {
+      "candidate_mode": "parallel_independent_review",
+      "de_risk_dimension": "independent_verification",
+      "max_candidate_participants": 2,
+      "scenario_id": "independent-review-v1",
+      "task_class": "web-project-v1"
+    },
+    {
+      "candidate_mode": "specialist_panel",
+      "de_risk_dimension": "cross-specialty-integration",
+      "max_candidate_participants": 3,
+      "scenario_id": "specialist-integration-v1",
+      "task_class": "web-project-v1"
+    }
+  ],
+  "schema_version": 1,
+  "study_id": "single-node-collaboration-admission-v1"
+}

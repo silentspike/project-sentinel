@@ -144,6 +144,8 @@ def artifact_authority() -> dict[str, tuple[str, str]]:
         "/opt/sentinel/scripts/m0-readiness.py": ("scripts/product-acceptance/m0-readiness/readiness.py", "script"),
         "/opt/sentinel/scripts/product-acceptance/run_m0_preflight.py": ("scripts/product-acceptance/run_m0_preflight.py", "script"),
         "/opt/sentinel/scripts/product-acceptance/run_m0_journey.py": ("scripts/product-acceptance/run_m0_journey.py", "script"),
+        "/opt/sentinel/scripts/product-acceptance/build_collaboration_admission_journey.py": ("scripts/product-acceptance/build_collaboration_admission_journey.py", "script"),
+        "/opt/sentinel/scripts/product-acceptance/evaluate_collaboration_admission.py": ("scripts/product-acceptance/evaluate_collaboration_admission.py", "script"),
         "/opt/sentinel/scripts/product-acceptance/m0-activation/control.py": ("scripts/product-acceptance/m0-activation/control.py", "script"),
         "/opt/sentinel/share/runtime-base.env": ("deploy/runtime-base.env", "config"),
         "/etc/apt/preferences.d/sentinel-runtime": ("deploy/apt/sentinel-runtime.pref", "config"),
@@ -153,6 +155,7 @@ def artifact_authority() -> dict[str, tuple[str, str]]:
         "/opt/sentinel/config/work-profiles/web-project-v1.toml": ("config/work-profiles/web-project-v1.toml", "config"),
         "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml": ("config/workbench-profiles/web-authoring-v1.toml", "config"),
         "/opt/sentinel/config/product-acceptance/m0-contract.toml": ("scripts/product-acceptance/m0-contract.toml", "config"),
+        "/opt/sentinel/config/product-acceptance/collaboration-admission-study-v1.json": ("scripts/product-acceptance/collaboration-admission-study-v1.json", "config"),
         "/opt/sentinel/config/product-acceptance/m0-journey-v2.json": ("scripts/product-acceptance/m0-journey-v2.json", "config"),
         "/opt/sentinel/config/product-acceptance/m0-restart-control-v1.json": ("scripts/product-acceptance/m0-restart-control-v1.json", "config"),
     }

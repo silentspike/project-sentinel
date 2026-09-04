@@ -72,7 +72,10 @@ ARTIFACT_DEFS=(
   "deploy/scripts/init-tmpfs.sh|/opt/sentinel/scripts/init-tmpfs.sh|script"
   "scripts/product-acceptance/run_m0_preflight.py|/opt/sentinel/scripts/product-acceptance/run_m0_preflight.py|script"
   "scripts/product-acceptance/run_m0_journey.py|/opt/sentinel/scripts/product-acceptance/run_m0_journey.py|script"
+  "scripts/product-acceptance/build_collaboration_admission_journey.py|/opt/sentinel/scripts/product-acceptance/build_collaboration_admission_journey.py|script"
+  "scripts/product-acceptance/evaluate_collaboration_admission.py|/opt/sentinel/scripts/product-acceptance/evaluate_collaboration_admission.py|script"
   "scripts/product-acceptance/m0-activation/control.py|/opt/sentinel/scripts/product-acceptance/m0-activation/control.py|script"
+  "scripts/product-acceptance/collaboration-admission-study-v1.json|/opt/sentinel/config/product-acceptance/collaboration-admission-study-v1.json|config"
   "scripts/product-acceptance/m0-journey-v2.json|/opt/sentinel/config/product-acceptance/m0-journey-v2.json|config"
   "scripts/product-acceptance/m0-restart-control-v1.json|/opt/sentinel/config/product-acceptance/m0-restart-control-v1.json|config"
   # Host runtime-base contract
