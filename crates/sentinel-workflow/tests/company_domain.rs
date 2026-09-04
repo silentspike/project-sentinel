@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sentinel_workflow::{
-    AgentId, AuthenticatedCompanyPrincipalV1, BlockerKindV1, BlockerStateV1,
-    CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkItemSpecV1, CompanyWorkStateV1,
-    CompanyWorkflowCommandV1, CompanyWorkflowResponseV1, CostReservationStateV1,
-    ParticipantBindingV1, ProjectId, ProjectLifecycleStateV1, ProposalBindingV1,
-    ProposalGovernanceV1, QualityGateBindingV1, QualityGateReceiptBindingV1, TenantId,
-    WorkInputContractV1, WorkItemId, WorkOutputContractV1, WorkOutputReceiptV1,
-    WorkProfileBindingV1, WorkTransitionReceiptV1, WorkflowErrorCode, WorkflowStore,
-    COMPANY_DOMAIN_SCHEMA_VERSION,
+    filtered_collaboration_view, AgentId, AuthenticatedCompanyPrincipalV1, BehaviorMandateV1,
+    BlockerKindV1, BlockerStateV1, ClaimExposureStateV1, CollaborationAuthorityFenceV1,
+    CollaborationBudgetV1, CollaborationModeV1, CollaborationParticipantV1,
+    CollaborationSessionStateV1, CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkItemSpecV1,
+    CompanyWorkStateV1, CompanyWorkflowCommandV1, CompanyWorkflowResponseV1,
+    CostReservationStateV1, EvidenceReferenceV1, HandoffConsumptionKindV1, HandoffGapClassV1,
+    HandoffPacketStateV1, ParticipantBindingV1, ProjectId, ProjectLifecycleStateV1,
+    ProposalBindingV1, ProposalGovernanceV1, QualityGateBindingV1, QualityGateReceiptBindingV1,
+    TenantId, UncertaintyClassV1, WorkInputContractV1, WorkItemId, WorkOutputContractV1,
+    WorkOutputReceiptV1, WorkProfileBindingV1, WorkTransitionReceiptV1, WorkflowErrorCode,
+    WorkflowStore, COMPANY_DOMAIN_SCHEMA_VERSION,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -337,6 +340,67 @@ fn output_receipt() -> Vec<WorkOutputReceiptV1> {
         contract_generation: 1,
         contract_digest: DIGEST.to_owned(),
         content_digest: OTHER_DIGEST.to_owned(),
+    }]
+}
+
+fn project_command(
+    store: &WorkflowStore,
+    actor: &AuthenticatedCompanyPrincipalV1,
+    id: u128,
+    command_value: CompanyWorkflowCommandV1,
+    now: u64,
+) -> sentinel_workflow::ProjectV1 {
+    let CompanyWorkflowResponseV1::Project(project) = command(store, actor, id, command_value, now)
+    else {
+        panic!("expected project response")
+    };
+    *project
+}
+
+fn collaboration_authority(
+    project: &sentinel_workflow::ProjectV1,
+    work_item_id: &WorkItemId,
+) -> CollaborationAuthorityFenceV1 {
+    let assignment = project.work_items[work_item_id]
+        .assignments
+        .iter()
+        .find(|assignment| assignment.active)
+        .unwrap();
+    CollaborationAuthorityFenceV1 {
+        organization_generation: 1,
+        organization_digest: DIGEST.to_owned(),
+        assignment_id: assignment.assignment_id.clone(),
+        assignment_version: assignment.assignment_version,
+        assignment_digest: assignment.canonical_digest().unwrap(),
+        policy_version: 1,
+        policy_digest: DIGEST.to_owned(),
+    }
+}
+
+fn collaboration_participant(
+    agent_id: u16,
+    role: CompanyRoleV1,
+    mandate: BehaviorMandateV1,
+    capability: &str,
+) -> CollaborationParticipantV1 {
+    CollaborationParticipantV1 {
+        agent_id: AgentId(agent_id),
+        permanent_role: role,
+        mandate,
+        capability_snapshot_digest: match agent_id {
+            1 | 3 => DIGEST,
+            _ => OTHER_DIGEST,
+        }
+        .to_owned(),
+        capabilities: BTreeSet::from([capability.to_owned()]),
+        privacy_classes: BTreeSet::from(["project-internal".to_owned()]),
+    }
+}
+
+fn evidence(reference: &str) -> Vec<EvidenceReferenceV1> {
+    vec![EvidenceReferenceV1 {
+        reference: reference.to_owned(),
+        digest: DIGEST.to_owned(),
     }]
 }
 
@@ -2407,4 +2471,780 @@ fn exact_budget_exhaustion_blocks_then_release_restores_active_and_zero_cost_loc
         )
         .unwrap_err();
     assert_eq!(paid_zero.code, WorkflowErrorCode::InvalidInput);
+}
+
+#[test]
+fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
+    let state = journey();
+    let work_item_id = WorkItemId::parse("collaboration-work").unwrap();
+    let mut project = project_command(
+        &state.store,
+        &state.pm,
+        300,
+        CompanyWorkflowCommandV1::PlanWorkGraph {
+            project_id: state.project_id.clone(),
+            expected_version: 1,
+            items: vec![work(
+                &work_item_id.0,
+                CompanyRoleV1::Developer,
+                &["rust"],
+                &[],
+                100,
+            )],
+        },
+        300,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        301,
+        CompanyWorkflowCommandV1::ActivateProject {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            reason_ref: "approved collaboration plan".to_owned(),
+        },
+        301,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        302,
+        CompanyWorkflowCommandV1::AssignWork {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: work_item_id.clone(),
+            agent_id: AgentId(2),
+            organization_generation: 1,
+            organization_digest: DIGEST.to_owned(),
+            reason_ref: "bounded implementation owner".to_owned(),
+        },
+        302,
+    );
+
+    let authority = collaboration_authority(&project, &work_item_id);
+    let unscoped = state.store.apply_company_command(
+        &state.pm,
+        Uuid::from_u128(3303),
+        &CompanyWorkflowCommandV1::CreateCollaborationSession {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: None,
+            authority: authority.clone(),
+            subject_ref: "unscoped collaboration must fail".to_owned(),
+            input_digest: DIGEST.to_owned(),
+            mode: CollaborationModeV1::IndependentReview,
+            budget: CollaborationBudgetV1 {
+                max_participants: 2,
+                max_claims: 2,
+                max_handoffs: 1,
+                max_clarification_rounds: 1,
+                max_transitions: 8,
+                deadline_unix_ms: 10_000,
+            },
+            participants: vec![
+                collaboration_participant(
+                    1,
+                    CompanyRoleV1::ProjectManager,
+                    BehaviorMandateV1::Synthesize,
+                    "coordination",
+                ),
+                collaboration_participant(
+                    2,
+                    CompanyRoleV1::Developer,
+                    BehaviorMandateV1::Implement,
+                    "rust",
+                ),
+            ],
+        },
+        303,
+    );
+    assert_eq!(
+        unscoped.unwrap_err().code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+
+    let mut stale_policy = authority.clone();
+    stale_policy.policy_digest = OTHER_DIGEST.to_owned();
+    let stale = state.store.apply_company_command(
+        &state.pm,
+        Uuid::from_u128(4303),
+        &CompanyWorkflowCommandV1::CreateCollaborationSession {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: Some(work_item_id.clone()),
+            authority: stale_policy,
+            subject_ref: "stale policy must fail".to_owned(),
+            input_digest: DIGEST.to_owned(),
+            mode: CollaborationModeV1::IndependentReview,
+            budget: CollaborationBudgetV1 {
+                max_participants: 2,
+                max_claims: 2,
+                max_handoffs: 1,
+                max_clarification_rounds: 1,
+                max_transitions: 8,
+                deadline_unix_ms: 10_000,
+            },
+            participants: vec![
+                collaboration_participant(
+                    1,
+                    CompanyRoleV1::ProjectManager,
+                    BehaviorMandateV1::Synthesize,
+                    "coordination",
+                ),
+                collaboration_participant(
+                    2,
+                    CompanyRoleV1::Developer,
+                    BehaviorMandateV1::Implement,
+                    "rust",
+                ),
+            ],
+        },
+        303,
+    );
+    assert_eq!(
+        stale.unwrap_err().code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+
+    project = project_command(
+        &state.store,
+        &state.pm,
+        303,
+        CompanyWorkflowCommandV1::CreateCollaborationSession {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: Some(work_item_id.clone()),
+            authority: authority.clone(),
+            subject_ref: "produce and independently review the artifact".to_owned(),
+            input_digest: DIGEST.to_owned(),
+            mode: CollaborationModeV1::IndependentReview,
+            budget: CollaborationBudgetV1 {
+                max_participants: 3,
+                max_claims: 3,
+                max_handoffs: 3,
+                max_clarification_rounds: 1,
+                max_transitions: 40,
+                deadline_unix_ms: 10_000,
+            },
+            participants: vec![
+                collaboration_participant(
+                    1,
+                    CompanyRoleV1::ProjectManager,
+                    BehaviorMandateV1::Synthesize,
+                    "coordination",
+                ),
+                collaboration_participant(
+                    2,
+                    CompanyRoleV1::Developer,
+                    BehaviorMandateV1::Implement,
+                    "rust",
+                ),
+                collaboration_participant(3, CompanyRoleV1::Qa, BehaviorMandateV1::Challenge, "qa"),
+            ],
+        },
+        303,
+    );
+    let session_id = project.collaboration_sessions[0].session_id.clone();
+    let mut stale_assignment = authority.clone();
+    stale_assignment.assignment_version += 1;
+    let stale_assignment_error = state
+        .store
+        .apply_company_command(
+            &state.pm,
+            Uuid::from_u128(5304),
+            &CompanyWorkflowCommandV1::TransitionCollaborationSession {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                session_id: session_id.clone(),
+                expected_transition_sequence: 1,
+                authority: stale_assignment,
+                target: CollaborationSessionStateV1::CollectingIndependentClaims,
+                reason_ref: "stale assignment must fail".to_owned(),
+            },
+            304,
+        )
+        .unwrap_err();
+    assert_eq!(
+        stale_assignment_error.code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+    assert_eq!(
+        state
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .unwrap(),
+        Some(project.clone())
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        304,
+        CompanyWorkflowCommandV1::TransitionCollaborationSession {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 1,
+            authority: authority.clone(),
+            target: CollaborationSessionStateV1::CollectingIndependentClaims,
+            reason_ref: "collect claims independently".to_owned(),
+        },
+        304,
+    );
+
+    let pm_claim = CompanyWorkflowCommandV1::RecordIndependentClaim {
+        project_id: state.project_id.clone(),
+        expected_version: project.version,
+        session_id: session_id.clone(),
+        expected_transition_sequence: 2,
+        authority: authority.clone(),
+        conclusion_ref: "the plan is bounded".to_owned(),
+        evidence: evidence("plan evidence"),
+        assumptions: vec!["authority remains stable".to_owned()],
+        uncertainty: UncertaintyClassV1::Low,
+        confidence_basis: "verified project contract".to_owned(),
+        capability_snapshot_digest: DIGEST.to_owned(),
+        input_digest: DIGEST.to_owned(),
+    };
+    let first = state
+        .store
+        .apply_company_command(&state.pm, Uuid::from_u128(305), &pm_claim, 305)
+        .unwrap();
+    assert!(!first.replayed);
+    let CompanyWorkflowResponseV1::Project(first_project) = first.response else {
+        panic!("expected project response")
+    };
+    project = *first_project;
+    let replay = state
+        .store
+        .apply_company_command(&state.pm, Uuid::from_u128(305), &pm_claim, 306)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(project.collaboration_publications.len(), 3);
+
+    project = project_command(
+        &state.store,
+        &state.developer,
+        306,
+        CompanyWorkflowCommandV1::RecordIndependentClaim {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 3,
+            authority: authority.clone(),
+            conclusion_ref: "the implementation is feasible".to_owned(),
+            evidence: evidence("implementation evidence"),
+            assumptions: vec!["toolchain remains pinned".to_owned()],
+            uncertainty: UncertaintyClassV1::Material,
+            confidence_basis: "source and contract inspection".to_owned(),
+            capability_snapshot_digest: OTHER_DIGEST.to_owned(),
+            input_digest: DIGEST.to_owned(),
+        },
+        307,
+    );
+    project = project_command(
+        &state.store,
+        &state.qa,
+        307,
+        CompanyWorkflowCommandV1::RecordIndependentClaim {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 4,
+            authority: authority.clone(),
+            conclusion_ref: "independent verification is required".to_owned(),
+            evidence: evidence("quality evidence"),
+            assumptions: Vec::new(),
+            uncertainty: UncertaintyClassV1::Blocking,
+            confidence_basis: "independent negative testing".to_owned(),
+            capability_snapshot_digest: DIGEST.to_owned(),
+            input_digest: DIGEST.to_owned(),
+        },
+        308,
+    );
+    let private = filtered_collaboration_view(&project, &state.developer, &session_id).unwrap();
+    assert_eq!(private.session.claims.len(), 1);
+    assert_eq!(private.session.claims[0].contributor, AgentId(2));
+
+    let mut stale_authority = authority.clone();
+    stale_authority.policy_version += 1;
+    let stale_error = state
+        .store
+        .apply_company_command(
+            &state.pm,
+            Uuid::from_u128(308),
+            &CompanyWorkflowCommandV1::OpenClaimExposureBarrier {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                session_id: session_id.clone(),
+                expected_transition_sequence: 5,
+                authority: stale_authority,
+                reason_ref: "must not expose".to_owned(),
+            },
+            309,
+        )
+        .unwrap_err();
+    assert_eq!(stale_error.code, WorkflowErrorCode::AuthorityConflict);
+    assert_eq!(
+        state
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .unwrap()
+            .unwrap(),
+        project
+    );
+
+    project = project_command(
+        &state.store,
+        &state.pm,
+        309,
+        CompanyWorkflowCommandV1::OpenClaimExposureBarrier {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 5,
+            authority: authority.clone(),
+            reason_ref: "all independent claims are durable".to_owned(),
+        },
+        310,
+    );
+    assert!(project.collaboration_sessions[0]
+        .claims
+        .iter()
+        .all(|claim| claim.exposure_state == ClaimExposureStateV1::Exposed));
+
+    let offer_handoff = CompanyWorkflowCommandV1::OfferHandoffPacket {
+        project_id: state.project_id.clone(),
+        expected_version: project.version,
+        session_id: session_id.clone(),
+        expected_transition_sequence: 6,
+        authority: authority.clone(),
+        work_item_id: work_item_id.clone(),
+        consumer: AgentId(3),
+        objective_ref: "independently verify the implementation".to_owned(),
+        authority_scope_ref: authority.assignment_id.clone(),
+        authority_scope_digest: authority.assignment_digest.clone(),
+        input_digests: BTreeSet::from([DIGEST.to_owned()]),
+        artifact_digests: BTreeSet::from([OTHER_DIGEST.to_owned()]),
+        evidence: evidence("handoff evidence"),
+        assumptions: vec!["artifact is immutable".to_owned()],
+        unresolved_questions: vec!["is the failure path bounded".to_owned()],
+        uncertainty: UncertaintyClassV1::Material,
+        acceptance_checks: vec!["reproduce the negative path".to_owned()],
+        required_capabilities: BTreeSet::from(["qa".to_owned()]),
+        privacy_classes: BTreeSet::from(["project-internal".to_owned()]),
+    };
+    let mut wrong_authority_scope = offer_handoff.clone();
+    let CompanyWorkflowCommandV1::OfferHandoffPacket {
+        authority_scope_digest,
+        ..
+    } = &mut wrong_authority_scope
+    else {
+        unreachable!()
+    };
+    *authority_scope_digest = DIGEST.to_owned();
+    let wrong_authority_error = state
+        .store
+        .apply_company_command(
+            &state.developer,
+            Uuid::from_u128(5310),
+            &wrong_authority_scope,
+            311,
+        )
+        .unwrap_err();
+    assert_eq!(
+        wrong_authority_error.code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+    assert_eq!(
+        state
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .unwrap(),
+        Some(project.clone())
+    );
+    project = project_command(&state.store, &state.developer, 310, offer_handoff, 311);
+    let packet_id = project.handoff_packets[0].packet_id.clone();
+    let packet_digest = project.handoff_packets[0].packet_digest.clone();
+    project = project_command(
+        &state.store,
+        &state.qa,
+        311,
+        CompanyWorkflowCommandV1::RequestHandoffClarification {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 7,
+            authority: authority.clone(),
+            packet_id: packet_id.clone(),
+            packet_digest: packet_digest.clone(),
+            gap_class: HandoffGapClassV1::DataGap,
+            question_ref: "provide the negative result".to_owned(),
+            basis_digest: DIGEST.to_owned(),
+        },
+        312,
+    );
+    let clarification_id = project.handoff_packets[0].clarifications[0]
+        .clarification_id
+        .clone();
+    project = project_command(
+        &state.store,
+        &state.developer,
+        312,
+        CompanyWorkflowCommandV1::AnswerHandoffClarification {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 8,
+            authority: authority.clone(),
+            packet_id: packet_id.clone(),
+            packet_digest: packet_digest.clone(),
+            clarification_id,
+            question_generation: 1,
+            answer_ref: "negative result is attached".to_owned(),
+            new_information_digest: OTHER_DIGEST.to_owned(),
+        },
+        313,
+    );
+    project = project_command(
+        &state.store,
+        &state.qa,
+        313,
+        CompanyWorkflowCommandV1::AcceptHandoffPacket {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 9,
+            authority: authority.clone(),
+            packet_id: packet_id.clone(),
+            packet_digest: packet_digest.clone(),
+            capability_snapshot_digest: DIGEST.to_owned(),
+            reason_ref: "evidence is sufficient".to_owned(),
+        },
+        314,
+    );
+    let qa_claim = project.collaboration_sessions[0]
+        .claims
+        .iter()
+        .find(|claim| claim.contributor == AgentId(3))
+        .unwrap()
+        .clone();
+    let wrong_consumption = state
+        .store
+        .apply_company_command(
+            &state.qa,
+            Uuid::from_u128(400),
+            &CompanyWorkflowCommandV1::ConsumeHandoffPacket {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                session_id: session_id.clone(),
+                expected_transition_sequence: 10,
+                authority: authority.clone(),
+                packet_id: packet_id.clone(),
+                packet_digest: packet_digest.clone(),
+                kind: HandoffConsumptionKindV1::IndependentClaim,
+                subject_id: qa_claim.claim_id.clone(),
+                subject_digest: DIGEST.to_owned(),
+            },
+            315,
+        )
+        .unwrap_err();
+    assert_eq!(wrong_consumption.code, WorkflowErrorCode::InvalidTransition);
+    assert_eq!(
+        state
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .unwrap()
+            .unwrap(),
+        project
+    );
+    project = project_command(
+        &state.store,
+        &state.qa,
+        314,
+        CompanyWorkflowCommandV1::ConsumeHandoffPacket {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 10,
+            authority: authority.clone(),
+            packet_id: packet_id.clone(),
+            packet_digest: packet_digest.clone(),
+            kind: HandoffConsumptionKindV1::IndependentClaim,
+            subject_id: qa_claim.claim_id,
+            subject_digest: qa_claim.claim_digest,
+        },
+        315,
+    );
+    assert_eq!(
+        project.handoff_packets[0].state,
+        HandoffPacketStateV1::Consumed
+    );
+
+    project = project_command(
+        &state.store,
+        &state.developer,
+        401,
+        CompanyWorkflowCommandV1::OfferHandoffPacket {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 11,
+            authority: authority.clone(),
+            work_item_id: work_item_id.clone(),
+            consumer: AgentId(3),
+            objective_ref: "verify clarification novelty".to_owned(),
+            authority_scope_ref: authority.assignment_id.clone(),
+            authority_scope_digest: authority.assignment_digest.clone(),
+            input_digests: BTreeSet::from([DIGEST.to_owned()]),
+            artifact_digests: BTreeSet::new(),
+            evidence: evidence("novelty evidence"),
+            assumptions: Vec::new(),
+            unresolved_questions: vec!["does the answer add information".to_owned()],
+            uncertainty: UncertaintyClassV1::Material,
+            acceptance_checks: vec!["reject repeated information".to_owned()],
+            required_capabilities: BTreeSet::from(["qa".to_owned()]),
+            privacy_classes: BTreeSet::from(["project-internal".to_owned()]),
+        },
+        316,
+    );
+    let novelty_packet = project.handoff_packets[1].clone();
+    project = project_command(
+        &state.store,
+        &state.qa,
+        402,
+        CompanyWorkflowCommandV1::RequestHandoffClarification {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 12,
+            authority: authority.clone(),
+            packet_id: novelty_packet.packet_id.clone(),
+            packet_digest: novelty_packet.packet_digest.clone(),
+            gap_class: HandoffGapClassV1::ReferentialDrift,
+            question_ref: "provide a current reference".to_owned(),
+            basis_digest: DIGEST.to_owned(),
+        },
+        317,
+    );
+    let novelty_clarification = project.handoff_packets[1].clarifications[0]
+        .clarification_id
+        .clone();
+    let unknown_clarification = state
+        .store
+        .apply_company_command(
+            &state.developer,
+            Uuid::from_u128(404),
+            &CompanyWorkflowCommandV1::AnswerHandoffClarification {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                session_id: session_id.clone(),
+                expected_transition_sequence: 13,
+                authority: authority.clone(),
+                packet_id: novelty_packet.packet_id.clone(),
+                packet_digest: novelty_packet.packet_digest.clone(),
+                clarification_id: "unknown-clarification".to_owned(),
+                question_generation: 1,
+                answer_ref: "repeated evidence".to_owned(),
+                new_information_digest: DIGEST.to_owned(),
+            },
+            318,
+        )
+        .unwrap_err();
+    assert_eq!(unknown_clarification.code, WorkflowErrorCode::NotFound);
+    project = project_command(
+        &state.store,
+        &state.developer,
+        403,
+        CompanyWorkflowCommandV1::AnswerHandoffClarification {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 13,
+            authority: authority.clone(),
+            packet_id: novelty_packet.packet_id,
+            packet_digest: novelty_packet.packet_digest,
+            clarification_id: novelty_clarification,
+            question_generation: 1,
+            answer_ref: "repeated evidence".to_owned(),
+            new_information_digest: DIGEST.to_owned(),
+        },
+        318,
+    );
+    assert_eq!(
+        project.handoff_packets[1].state,
+        HandoffPacketStateV1::Escalated
+    );
+
+    project = project_command(
+        &state.store,
+        &state.pm,
+        315,
+        CompanyWorkflowCommandV1::TransitionCollaborationSession {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 14,
+            authority: authority.clone(),
+            target: CollaborationSessionStateV1::Deciding,
+            reason_ref: "evaluate exposed evidence".to_owned(),
+        },
+        319,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        316,
+        CompanyWorkflowCommandV1::RecordDecision {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: Some(work_item_id.clone()),
+            choice_ref: "accept implementation".to_owned(),
+            rationale_ref: "independent claims and handoff evidence agree".to_owned(),
+        },
+        320,
+    );
+    let decision_id = project.decisions.last().unwrap().decision_id.clone();
+    project = project_command(
+        &state.store,
+        &state.pm,
+        320,
+        CompanyWorkflowCommandV1::RecordDecision {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: None,
+            choice_ref: "retain alternative".to_owned(),
+            rationale_ref: "prove collaboration evidence cannot cross work scope".to_owned(),
+        },
+        321,
+    );
+    let other_decision_id = project.decisions.last().unwrap().decision_id.clone();
+    let cross_work_dissent = state
+        .store
+        .apply_company_command(
+            &state.qa,
+            Uuid::from_u128(4321),
+            &CompanyWorkflowCommandV1::RecordDissent {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                session_id: session_id.clone(),
+                expected_transition_sequence: 15,
+                authority: authority.clone(),
+                decision_id: other_decision_id.clone(),
+                claim_id: None,
+                rationale_ref: "cross-work dissent must fail".to_owned(),
+                evidence: evidence("cross-work evidence"),
+                residual_risk_ref: "unrelated project decision".to_owned(),
+            },
+            321,
+        )
+        .unwrap_err();
+    assert_eq!(
+        cross_work_dissent.code,
+        WorkflowErrorCode::InvalidTransition
+    );
+    let claim_ids = project.collaboration_sessions[0]
+        .claims
+        .iter()
+        .map(|claim| claim.claim_id.clone())
+        .collect::<BTreeSet<_>>();
+    let qa_claim_id = project.collaboration_sessions[0]
+        .claims
+        .iter()
+        .find(|claim| claim.contributor == AgentId(3))
+        .unwrap()
+        .claim_id
+        .clone();
+    project = project_command(
+        &state.store,
+        &state.qa,
+        317,
+        CompanyWorkflowCommandV1::RecordDissent {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 15,
+            authority: authority.clone(),
+            decision_id: decision_id.clone(),
+            claim_id: Some(qa_claim_id),
+            rationale_ref: "retain the bounded residual risk".to_owned(),
+            evidence: evidence("residual risk evidence"),
+            residual_risk_ref: "monitor the negative path".to_owned(),
+        },
+        322,
+    );
+    let dissent_id = project.dissent_records[0].dissent_id.clone();
+    let before_wrong_decision_link = project.clone();
+    let wrong_decision_link = state
+        .store
+        .apply_company_command(
+            &state.pm,
+            Uuid::from_u128(321),
+            &CompanyWorkflowCommandV1::LinkDecisionEvidence {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                session_id: session_id.clone(),
+                expected_transition_sequence: 16,
+                authority: authority.clone(),
+                decision_id: other_decision_id,
+                claim_ids: claim_ids.clone(),
+                dissent_ids: BTreeSet::from([dissent_id.clone()]),
+            },
+            323,
+        )
+        .unwrap_err();
+    assert_eq!(
+        wrong_decision_link.code,
+        WorkflowErrorCode::InvalidTransition
+    );
+    assert_eq!(
+        state
+            .store
+            .company_project(&state.pm.tenant_id, &state.project_id)
+            .unwrap(),
+        Some(before_wrong_decision_link)
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        318,
+        CompanyWorkflowCommandV1::LinkDecisionEvidence {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 16,
+            authority: authority.clone(),
+            decision_id,
+            claim_ids,
+            dissent_ids: BTreeSet::from([dissent_id]),
+        },
+        324,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        319,
+        CompanyWorkflowCommandV1::TransitionCollaborationSession {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            session_id: session_id.clone(),
+            expected_transition_sequence: 17,
+            authority,
+            target: CollaborationSessionStateV1::Completed,
+            reason_ref: "authorized decision is evidence-linked".to_owned(),
+        },
+        325,
+    );
+
+    let session = &project.collaboration_sessions[0];
+    assert_eq!(session.state, CollaborationSessionStateV1::Completed);
+    assert_eq!(session.transition_sequence, 18);
+    assert_eq!(session.publication_revision, 18);
+    assert_eq!(project.collaboration_publications.len(), 18);
+    for (index, publication) in project.collaboration_publications.iter().enumerate() {
+        assert_eq!(publication.transition_sequence, (index + 1) as u64);
+        assert_eq!(
+            publication.proposal.causal_context.correlation_id,
+            session_id
+        );
+    }
 }
