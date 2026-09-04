@@ -779,7 +779,10 @@ pub struct ReadModelTransaction<'a> {
 impl<'a> ReadModelTransaction<'a> {
     /// Startet die SQLite-Transaktion.
     pub fn begin(&self) -> anyhow::Result<()> {
-        self.guard.execute_batch("BEGIN")?;
+        // Reserve writer authority before the first batch read. Otherwise a
+        // concurrent short writer can invalidate the WAL read snapshot and
+        // make the later write-upgrade fail immediately with SQLITE_BUSY.
+        self.guard.execute_batch("BEGIN IMMEDIATE")?;
         Ok(())
     }
 
@@ -1603,6 +1606,72 @@ mod tests {
 
         // Idempotent: nochmal initialisieren aendert nichts
         store.initialize_rooms(&["empfang", "kueche"]).unwrap();
+    }
+
+    #[test]
+    fn test_batch_reserves_writer_before_read_snapshot() {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-writer-reservation.db");
+        let store = ReadModelStore::open(path.to_str().unwrap()).unwrap();
+        store.initialize_rooms(&["empfang"]).unwrap();
+
+        let txn = store.begin_transaction().unwrap();
+        txn.begin().unwrap();
+        assert_eq!(txn.get_room_active_chaos("empfang").unwrap(), None);
+
+        let (writer_attempting_tx, writer_attempting_rx) = channel();
+        let (writer_acquired_tx, writer_acquired_rx) = channel();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || -> Result<(), String> {
+            let conn = Connection::open(writer_path).map_err(|error| error.to_string())?;
+            conn.busy_timeout(Duration::from_secs(2))
+                .map_err(|error| error.to_string())?;
+            writer_attempting_tx
+                .send(())
+                .map_err(|error| error.to_string())?;
+            conn.execute_batch("BEGIN IMMEDIATE")
+                .map_err(|error| error.to_string())?;
+            writer_acquired_tx
+                .send(())
+                .map_err(|error| error.to_string())?;
+            conn.execute(
+                "UPDATE room_live_view SET noise_db = 41.0 WHERE room_id = 'empfang'",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+            conn.execute_batch("COMMIT")
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+
+        writer_attempting_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        match writer_acquired_rx.recv_timeout(Duration::from_millis(250)) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) => {
+                txn.rollback().unwrap();
+                writer.join().unwrap().unwrap();
+                panic!("competing writer acquired authority during the projection batch");
+            }
+            Err(RecvTimeoutError::Disconnected) => panic!("competing writer disconnected"),
+        }
+
+        txn.update_room_physics("empfang", 21.0, 450.0, 35.0, false, 1, 1)
+            .unwrap();
+        txn.commit().unwrap();
+
+        writer_acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        writer.join().unwrap().unwrap();
+        drop(txn);
+        assert_eq!(
+            store.get_room("empfang").unwrap().unwrap().noise_db,
+            Some(41.0)
+        );
     }
 
     #[test]
