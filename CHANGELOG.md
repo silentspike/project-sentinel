@@ -1,5 +1,11 @@
 # Changelog
 
+- Add versioned, authority-fenced company collaboration sessions with private
+  independent claims, task-local behavior mandates, digest-bound handoff
+  packets, typed bounded clarification, durable dissent, exact downstream
+  consumption evidence, filtered reads, and replay-safe publication through
+  the canonical Event Store append and outbox boundary (#739).
+
 - Add the store-sealed EventEnvelopeV2 append boundary, checksummed single-owner
   migration, strict compatibility readers, cross-language inference authority
   schemas, and deterministic control vectors for the single-node M1 path.
