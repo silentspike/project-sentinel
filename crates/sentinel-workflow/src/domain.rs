@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::admission::*;
 use crate::collaboration::*;
 use crate::digest::canonical_sha256;
 use crate::model::{validate_digest, validate_identifier};
@@ -727,9 +728,37 @@ pub struct ProjectV1 {
     pub decision_evidence: Vec<DecisionEvidenceLinkV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collaboration_publications: Vec<CollaborationPublicationV1>,
+    #[serde(default = "default_collaboration_generation")]
+    pub collaboration_generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collaboration_admissions: Vec<CollaborationAdmissionDecisionV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collaboration_reliability: Vec<ReliabilityObservationV1>,
     pub version: u64,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+}
+
+pub fn collaboration_policy_uncertainty(
+    project: &ProjectV1,
+    work_item_id: &WorkItemId,
+) -> UncertaintyClassV1 {
+    let applies_to_work = |candidate: Option<&WorkItemId>| {
+        candidate.is_none_or(|candidate| candidate == work_item_id)
+    };
+    if project.blockers.iter().any(|blocker| {
+        applies_to_work(blocker.work_item_id.as_ref()) && blocker.state == BlockerStateV1::Escalated
+    }) {
+        return UncertaintyClassV1::Blocking;
+    }
+    if project.blockers.iter().any(|blocker| {
+        applies_to_work(blocker.work_item_id.as_ref()) && blocker.state == BlockerStateV1::Open
+    }) || project.questions.iter().any(|question| {
+        applies_to_work(question.work_item_id.as_ref()) && question.resolution_ref.is_none()
+    }) {
+        return UncertaintyClassV1::Material;
+    }
+    UncertaintyClassV1::Low
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -935,6 +964,9 @@ pub enum CompanyWorkflowCommandV1 {
         project_id: ProjectId,
         expected_version: u64,
         work_item_id: Option<WorkItemId>,
+        admission_id: String,
+        admission_contract_digest: String,
+        collaboration_generation: u64,
         authority: CollaborationAuthorityFenceV1,
         subject_ref: String,
         input_digest: String,
@@ -1074,6 +1106,34 @@ pub enum CompanyWorkflowCommandV1 {
         target: CollaborationSessionStateV1,
         reason_ref: String,
     },
+    AdmitCollaboration {
+        project_id: ProjectId,
+        expected_version: u64,
+        source_request_digest: String,
+        input: CollaborationAdmissionInputV1,
+        candidates: Vec<CollaborationCandidateV1>,
+        reliability: Vec<ReliabilityObservationV1>,
+        expected_benefit_ref: String,
+    },
+    ProgressCollaborationAdmission {
+        project_id: ProjectId,
+        expected_version: u64,
+        source_request_digest: String,
+        admission_id: String,
+        fence: CollaborationAdmissionFenceV1,
+        progress: CollaborationProgressV1,
+    },
+    RecordCollaborationReliability {
+        project_id: ProjectId,
+        expected_version: u64,
+        work_item_id: WorkItemId,
+        fence: CollaborationAdmissionFenceV1,
+        observation: ReliabilityObservationV1,
+    },
+}
+
+const fn default_collaboration_generation() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
