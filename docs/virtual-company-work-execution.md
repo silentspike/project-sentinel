@@ -213,18 +213,88 @@ The orchestrator is event-driven. It reacts to durable state changes and bounded
 
 ## Collaboration Contract
 
-Rooms provide human-like communication context, but authoritative collaboration uses typed records:
+Rooms provide human-like communication context, but conversation is not company
+authority. Authoritative collaboration is a bounded, versioned session tied to
+one tenant, project, exact work item, organization generation, sealed project
+policy,
+subject, input digest, participant set, and transition sequence. Each material
+step is submitted through an authenticated company-workflow command and is
+published through the canonical Event Store append and outbox boundary.
+Session creation and every later mutation recheck the active work assignment,
+including its exact ID, version, and canonical digest, together with the
+organization generation and project-profile policy digest before state can
+advance. Reassignment freezes the prior session for audit; work continues in a
+new session bound to the new assignment rather than inheriting stale authority.
 
-- `ProjectDecision`: choice, alternatives, rationale, decider, affected work, evidence.
-- `ActionItem`: owner, required output, due policy, source decision.
-- `Question`: asker, target role, blocking flag, answer reference.
-- `Handoff`: producer, consumer, input/output artifact digests, acceptance status.
-- `Blocker`: cause, impact, owner, escalation target, resolution.
-- `Acknowledgement`: actor, referenced record, accepted/rejected status.
+An employee keeps one permanent company role, such as Developer, QA, or
+Technical Lead. A collaboration session gives that employee a separate
+task-local behavior mandate:
 
-Chat messages may carry links to these records. A parser or provider may propose a typed command, but normal authentication, schema, aggregate-version, and authority checks remain mandatory.
+- `Discover` finds bounded facts and explicit unknowns.
+- `Implement` produces an artifact against an accepted decision and checks.
+- `Verify` returns an independent evidence-backed pass, fail, or blocker.
+- `Challenge` searches for counterexamples and unresolved risks.
+- `Synthesize` compares claims without inventing consensus.
+- `Decide` prepares an authorized choice with residual risk.
+- `Escalate` sends the smallest sufficient packet to the required authority.
 
-Team leads are accountable for graph health, assignment, blockers, and completion evidence. Project Management is accountable for agreement alignment and cross-team dependencies. Gaia may surface deadlocks and recommend escalation but cannot resolve them outside the authority model.
+The Gateway input combines the permanent role with this mandate, its required
+inputs, evidence shape, visibility rules, forbidden actions, and stop
+condition. A model response may propose a typed command, but cannot persist a
+claim, expose peers, acknowledge a handoff, make a decision, or complete work.
+
+When independent judgment matters, participants first commit immutable
+`IndependentClaim` records without seeing peer conclusions. Each claim binds
+its contributor, mandate, evidence, assumptions, uncertainty, confidence
+basis, capability snapshot, and input digest. Only an authorized exposure
+barrier reveals committed claims, and only when the source privacy classes are
+a subset of the reader's classes. This prevents a senior or early answer from
+silently anchoring the rest of the team while still preserving need-to-know
+boundaries when evidence is compared afterward.
+
+Work moves between employees as a digest-bound `HandoffPacket`, not as an
+unbounded transcript. The packet names the objective, authority scope, inputs,
+artifacts, evidence, assumptions, unresolved questions, uncertainty,
+acceptance checks, required capabilities, privacy classes, and relevant
+generations. Its authority scope is the exact assignment ID and canonical
+assignment digest sealed by the session, not sender-supplied descriptive text.
+The receiver may accept, reject, escalate, or request one of four typed
+clarifications:
+
+- `DataGap`: required information is absent.
+- `SignalCorruption`: supplied evidence cannot be trusted as received.
+- `ReferentialDrift`: an identifier, generation, or digest no longer names the
+  expected subject.
+- `CapabilityGap`: the receiver lacks a required capability or permitted data
+  class.
+
+Clarification rounds are bounded. Repeating a basis or supplying no new
+information escalates instead of creating an endless conversation. Acceptance
+does not mean consumption: `Consumed` is valid only when the exact packet is
+bound to a real downstream independent claim, Workbench invocation, review, or
+project decision digest.
+
+`DissentRecord` preserves evidence and residual risk even after an authorized
+`ProjectDecision`. A dissent record is bound to that exact decision; it cannot
+be rebound to make another decision appear contested or supported. Claims and
+dissent can support a decision, but neither creates decision authority.
+Filtered reads expose only the participant's tenant, project, directed
+handoffs, privacy classes, and the claims permitted by the exposure barrier;
+operator reads remain tenant and project scoped. The Gateway prompt compiler
+uses the same exposure and privacy-class subset rule, so a digest hidden by the
+read API cannot leak through model context.
+
+The local workflow database is command and recovery materialization. Its
+immutable publication proposals are replayable intents, not a second event
+truth. The canonical V2 Event Store validates stream revision, causation,
+authority, payload digest, and operation replay, then atomically adopts the
+corresponding delivery intent. A crash between workflow commit and Event Store
+adoption therefore converges by replay without producing a second event.
+
+Team leads are accountable for graph health, assignment, blockers, and
+completion evidence. Project Management is accountable for agreement
+alignment and cross-team dependencies. Gaia may surface deadlocks and
+recommend escalation but cannot resolve them outside the authority model.
 
 ## Agent Workbench Contract
 
