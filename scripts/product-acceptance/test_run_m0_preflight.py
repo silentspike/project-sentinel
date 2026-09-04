@@ -1201,6 +1201,25 @@ class PreflightTests(unittest.TestCase):
                 os.getpid(), Path("/usr/bin/true"), preflight.MAX_ARTIFACT_BYTES
             )
 
+    def test_proc_directory_identity_ignores_only_volatile_metadata(self) -> None:
+        baseline = os.stat("/proc")
+        changed_volatile = list(baseline)
+        changed_volatile[3] += 1
+        changed_volatile[6] += 4096
+        changed_volatile[8] += 1
+        changed_volatile[9] += 1
+        self.assertEqual(
+            preflight._proc_directory_identity(baseline),
+            preflight._proc_directory_identity(os.stat_result(changed_volatile)),
+        )
+
+        changed_inode = list(baseline)
+        changed_inode[1] += 1
+        self.assertNotEqual(
+            preflight._proc_directory_identity(baseline),
+            preflight._proc_directory_identity(os.stat_result(changed_inode)),
+        )
+
     def test_http_malformed_and_duplicate_json_fail(self) -> None:
         url = "http://127.0.0.1:8080/health"
         for body in (b"not-json", b'{"status":"ok","status":"ok"}'):
