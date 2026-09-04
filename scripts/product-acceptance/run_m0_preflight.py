@@ -521,6 +521,16 @@ def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]
     )
 
 
+def _proc_directory_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_uid,
+        value.st_gid,
+    )
+
+
 def _validate_directory_metadata(value: os.stat_result) -> None:
     mode = stat.S_IMODE(value.st_mode)
     if not stat.S_ISDIR(value.st_mode) or mode & (
@@ -580,6 +590,61 @@ def _pinned_directory(path: Path) -> Iterator[int]:
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
+
+
+@contextmanager
+def _pinned_process_directory(pid: int) -> Iterator[int]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    proc_fd = -1
+    process_fd = -1
+    verify_proc_fd = -1
+    try:
+        proc_fd = os.open("/proc", flags)
+        proc_before = os.fstat(proc_fd)
+        _validate_directory_metadata(proc_before)
+        process_fd = os.open(str(pid), flags, dir_fd=proc_fd)
+        process_before = os.fstat(process_fd)
+        _validate_directory_metadata(process_before)
+        yield process_fd
+        proc_after = os.fstat(proc_fd)
+        process_after = os.fstat(process_fd)
+        _validate_directory_metadata(proc_after)
+        _validate_directory_metadata(process_after)
+        if (
+            _proc_directory_identity(proc_before)
+            != _proc_directory_identity(proc_after)
+            or _proc_directory_identity(process_before)
+            != _proc_directory_identity(process_after)
+        ):
+            raise PreflightError("unsafe_path_component")
+        verify_proc_fd = os.open("/proc", flags)
+        verify_proc = os.fstat(verify_proc_fd)
+        _validate_directory_metadata(verify_proc)
+        if _proc_directory_identity(proc_before) != _proc_directory_identity(
+            verify_proc
+        ):
+            raise PreflightError("unsafe_path_component")
+        verify_process_fd = os.open(str(pid), flags, dir_fd=verify_proc_fd)
+        try:
+            verify_process = os.fstat(verify_process_fd)
+            _validate_directory_metadata(verify_process)
+            if _proc_directory_identity(process_before) != _proc_directory_identity(
+                verify_process
+            ):
+                raise PreflightError("unsafe_path_component")
+        finally:
+            os.close(verify_process_fd)
+    except PreflightError:
+        raise
+    except OSError as exc:
+        raise PreflightError("unsafe_path_component") from exc
+    finally:
+        if verify_proc_fd >= 0:
+            os.close(verify_proc_fd)
+        if process_fd >= 0:
+            os.close(process_fd)
+        if proc_fd >= 0:
+            os.close(proc_fd)
 
 
 def _validate_regular_metadata(value: os.stat_result, *, owner_only: bool) -> None:
@@ -700,7 +765,7 @@ def default_hash_running_executable(
         ) as (installed_fd, installed_size):
             installed = os.fstat(installed_fd)
             installed_digest, _ = _hash_descriptor(installed_fd, installed_size, limit)
-            with _pinned_directory(Path("/proc") / str(pid)) as process_fd:
+            with _pinned_process_directory(pid) as process_fd:
                 executable_fd = os.open(
                     "exe", os.O_RDONLY | os.O_CLOEXEC, dir_fd=process_fd
                 )
