@@ -3,6 +3,7 @@
 //! This crate owns plans and work-item state. The Workbench, organization, and
 //! independent gate implementations remain behind narrow authority ports.
 
+mod admission;
 mod collaboration;
 mod digest;
 mod domain;
@@ -13,6 +14,7 @@ mod model;
 mod port;
 mod store;
 
+pub use admission::*;
 pub use collaboration::*;
 pub use domain::*;
 pub use engine::WorkflowCore;

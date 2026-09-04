@@ -76,6 +76,9 @@ M0_WORKBENCH_PROFILE_PATH = Path(
 )
 M0_QA_PROFILE_PATH = Path("/opt/sentinel/config/workbench-profiles/web-qa-v1.toml")
 M0_JOURNEY_PATH = Path("/opt/sentinel/config/product-acceptance/m0-journey-v2.json")
+COLLABORATION_STUDY_PATH = Path(
+    "/opt/sentinel/config/product-acceptance/collaboration-admission-study-v1.json"
+)
 M0_RESTART_CONTROL_PATH = Path(
     "/opt/sentinel/config/product-acceptance/m0-restart-control-v1.json"
 )
@@ -347,6 +350,10 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
         "script",
     ),
     str(M0_CONTRACT_PATH): ("scripts/product-acceptance/m0-contract.toml", "config"),
+    str(COLLABORATION_STUDY_PATH): (
+        "scripts/product-acceptance/collaboration-admission-study-v1.json",
+        "config",
+    ),
     str(M0_JOURNEY_PATH): ("scripts/product-acceptance/m0-journey-v2.json", "config"),
     str(M0_RESTART_CONTROL_PATH): (
         "scripts/product-acceptance/m0-restart-control-v1.json",
@@ -358,6 +365,14 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
     ),
     "/opt/sentinel/scripts/product-acceptance/run_m0_journey.py": (
         "scripts/product-acceptance/run_m0_journey.py",
+        "script",
+    ),
+    "/opt/sentinel/scripts/product-acceptance/build_collaboration_admission_journey.py": (
+        "scripts/product-acceptance/build_collaboration_admission_journey.py",
+        "script",
+    ),
+    "/opt/sentinel/scripts/product-acceptance/evaluate_collaboration_admission.py": (
+        "scripts/product-acceptance/evaluate_collaboration_admission.py",
         "script",
     ),
     "/opt/sentinel/scripts/product-acceptance/m0-activation/control.py": (
