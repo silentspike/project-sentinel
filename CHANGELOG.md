@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Retry the bounded Event Store and projection read-only snapshot when live
+  append progress invalidates a cut, while accepting only an exact stable cut
+  and failing closed after the fixed attempt limit (#740).
+
 - Allow a responsible work owner with partial task capability to be assigned
   while keeping execution fail-closed until an exact, authority-fenced
   collaboration admission covers the remaining capabilities (#740).

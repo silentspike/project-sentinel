@@ -1469,12 +1469,31 @@ class PreflightTests(unittest.TestCase):
                 result = preflight.evaluate(fixture.inputs(), fixture.deps())
                 self.assertEqual(self.check(result, "identity_readiness")["reason"], reason)
 
-    def test_event_cut_progress_between_projection_reads_fails(self) -> None:
+    def test_event_cut_progress_between_projection_reads_retries(self) -> None:
         before = copy.deepcopy(self.fixture.event_store)
         after = copy.deepcopy(before)
         for key in ("latest_event_id", "projection_offset", "hierarchy_offset"):
             after[key] = 42
         self.fixture.event_store_reads = [before, after]
+        result = self.run_fixture()
+        self.assertTrue(result["runtime_preflight_pass"])
+        event_reads = [
+            argv
+            for argv in self.fixture.commands
+            if len(argv) > 4 and Path(argv[3]) == EVENT_DB
+        ]
+        self.assertEqual(len(event_reads), 4)
+
+    def test_event_cut_that_never_stabilizes_fails(self) -> None:
+        reads = []
+        for attempt in range(preflight.STORE_SNAPSHOT_ATTEMPTS):
+            before = copy.deepcopy(self.fixture.event_store)
+            after = copy.deepcopy(before)
+            for key in ("latest_event_id", "projection_offset", "hierarchy_offset"):
+                before[key] = 41 + attempt
+                after[key] = 42 + attempt
+            reads.extend((before, after))
+        self.fixture.event_store_reads = reads
         result = self.run_fixture()
         self.assertEqual(
             self.check(result, "store_projection_backlog")["reason"],
