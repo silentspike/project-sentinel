@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Reserve the SQLite projection writer before a batch reads its WAL snapshot,
+  so short runtime reconciliation writes wait instead of crashing a full
+  projection rebuild with `SQLITE_BUSY` (#740).
+
 - Accept only the pinned Codex CLI's exact fail-closed disabled-code-mode
   prelude before a turn, while rejecting every other pre-turn error or tool
   item, explicitly disabling both code-mode feature switches, and collecting
