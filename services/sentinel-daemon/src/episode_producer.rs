@@ -1900,7 +1900,18 @@ impl EpisodeProducer {
             .hippocampus
             .store()
             .list_episode_projection_quarantine()?;
-        let global_blockers = quarantines
+        let generation_blockers = self
+            .hippocampus
+            .store()
+            .load_episode_projection_generation_readiness_blocks()?;
+        let frontiers = self
+            .hippocampus
+            .store()
+            .list_episode_projection_frontiers_for_admission()?
+            .into_iter()
+            .map(|frontier| (frontier.subject, frontier))
+            .collect::<HashMap<_, _>>();
+        let global_blockers: Vec<EpisodeProjectionBlockerDiagnostic> = quarantines
             .iter()
             .filter(|record| {
                 !matches!(
@@ -1921,22 +1932,19 @@ impl EpisodeProducer {
             let subject = EpisodeProjectionSubject::Agent {
                 agent_id: AgentId(agent_id),
             };
-            let readiness = self
-                .hippocampus
-                .store()
-                .load_episode_projection_readiness(subject)?;
+            let frontier = frontiers.get(&subject);
             let blockers = quarantines
                 .iter()
                 .filter(|record| record.affected_subject == Some(subject))
                 .map(blocker_diagnostic)
                 .collect::<Vec<_>>();
-            let frontier_source_row_id = readiness
-                .frontier
-                .as_ref()
-                .map(|frontier| frontier.last_source_row_id);
+            let frontier_source_row_id = frontier.map(|frontier| frontier.last_source_row_id);
             agents.push(EpisodeProjectionAgentDiagnostic {
                 agent_id,
-                ready: readiness.is_ready(),
+                ready: frontier.is_some()
+                    && generation_blockers.is_empty()
+                    && global_blockers.is_empty()
+                    && blockers.is_empty(),
                 frontier_source_row_id,
                 lag_rows: frontier_source_row_id
                     .map(|frontier| control.last_source_row_id.saturating_sub(frontier)),
