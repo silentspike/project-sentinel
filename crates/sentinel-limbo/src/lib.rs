@@ -8,11 +8,16 @@
 //! support in its Rust binding. Same tables, same pragmas, sync API wrapped
 //! with tokio::task::spawn_blocking for async compatibility.
 
+pub mod event_gateway;
 pub mod event_store;
 #[cfg(kani)]
 mod kani;
 pub mod outbox_publisher;
 
+pub use event_gateway::{
+    AuthenticatedEventCallerV1, EventAppendError, EventAppendGateway, EventContractSchemaStatus,
+    LegacyEventAppendGateway, LegacyEventProducer,
+};
 pub use event_store::{
     runtime_config_apply_digest, EventStore, LlmCompletionEntry, MonotonicityError, OutboxEntry,
     OutboxTransport, RuntimeConfigApplyDecision, RuntimeConfigApplyPhase,

@@ -165,7 +165,10 @@ fn ac_08_01_events_append_only() {
     let store = EventStore::open(path.to_str().unwrap()).unwrap();
 
     let event = test_event("agent_action_received", "AGENT-01");
-    store.append_event(&event).unwrap();
+    store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+        .append_event(&event)
+        .unwrap();
 
     // EventStore API bietet kein update/delete — Event bleibt unveraendert
     let events = store.get_events_since(0, 10).unwrap();
@@ -185,6 +188,7 @@ fn ac_08_02_event_outbox_atomic() {
 
     let event = test_event("transit_started", "AGENT-02");
     store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
         .append_with_outbox(&event, "sentinel/events/AGENT-02")
         .unwrap();
 
@@ -205,12 +209,14 @@ fn ac_08_03_operation_id_idempotent() {
 
     let event1 = test_event("agent_action_received", "AGENT-01").with_operation_id("op-retry-abc");
     store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
         .append_with_outbox(&event1, "sentinel/events/AGENT-01")
         .unwrap();
 
     // Retry: gleiche operation_id, anderer event_id
     let event2 = test_event("agent_action_received", "AGENT-01").with_operation_id("op-retry-abc");
     store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
         .append_with_outbox(&event2, "sentinel/events/AGENT-01")
         .unwrap();
 
@@ -260,7 +266,10 @@ fn ac_08_05_rebuild_reproducible() {
             "corr-rebuild",
             i * 100,
         );
-        store.append_event(&event).unwrap();
+        store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+            .append_event(&event)
+            .unwrap();
     }
 
     assert_eq!(store.event_count().unwrap(), 10);
@@ -308,7 +317,10 @@ fn ac_08_06_snapshots_table() {
     for i in 0..3 {
         let event = test_event("bio_action_performed", "AGENT-01")
             .with_operation_id(&format!("op-snap-{i}"));
-        store.append_event(&event).unwrap();
+        store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+            .append_event(&event)
+            .unwrap();
     }
 
     // Snapshot speichern
@@ -341,11 +353,17 @@ fn ac_08_07_compensation_type() {
 
     // Default compensation_type
     let event1 = test_event("transit_started", "AGENT-01");
-    store.append_event(&event1).unwrap();
+    store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+        .append_event(&event1)
+        .unwrap();
 
     // Expliziter compensation_type
     let event2 = test_event("transit_started", "AGENT-02").with_compensation_type("rollback");
-    store.append_event(&event2).unwrap();
+    store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+        .append_event(&event2)
+        .unwrap();
 
     let events = store.get_events_since(0, 10).unwrap();
     assert_eq!(events.len(), 2);
@@ -396,6 +414,7 @@ async fn ac_57_06_e2e_outbox_publish_flow() {
     // 1. Agent-Action als Event mit Outbox persistieren
     let event = test_event("agent_action_received", "AGENT-05");
     let row_id = store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
         .append_with_outbox(&event, "sentinel/agent/AGENT-05/action")
         .unwrap();
     assert!(row_id > 0, "event should be persisted");

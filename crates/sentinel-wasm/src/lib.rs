@@ -2,7 +2,7 @@
 //!
 //! Provides sandboxed tool execution with capability-based access control.
 //! Native handlers for FileRead/FileWrite enforce filesystem restrictions.
-//! WASM Component Model plugins execute via wasmtime 46.0.2 (enable with `--features wasm`).
+//! WASM Component Model plugins execute via wasmtime 46.0.3 (enable with `--features wasm`).
 
 pub mod registry;
 pub mod runner;

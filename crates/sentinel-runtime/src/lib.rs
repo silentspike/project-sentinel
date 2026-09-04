@@ -639,7 +639,10 @@ impl RuntimeOrchestrator {
             .with_operation_id(&op_id);
 
         let topic = format!("sentinel/runtime/events/{}", aggregate_id);
-        if let Err(e) = store.append_with_outbox(&event, &topic) {
+        if let Err(e) = store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::RuntimeAgent)
+            .append_with_outbox(&event, &topic)
+        {
             tracing::warn!(
                 error = %e,
                 event_type,

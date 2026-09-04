@@ -1,5 +1,9 @@
 # Changelog
 
+- Add the store-sealed EventEnvelopeV2 append boundary, checksummed single-owner
+  migration, strict compatibility readers, cross-language inference authority
+  schemas, and deterministic control vectors for the single-node M1 path.
+
 - Issue #650 M0 correction: model-swap alerts no longer infer a provider from free text or fall back to Claude. Only one explicit catalog provider directive can request a swap, and the Gateway now applies the same inventory/Gate-B activation contract to runtime provider changes as to request dispatch.
 
 All notable changes to this project will be documented in this file.

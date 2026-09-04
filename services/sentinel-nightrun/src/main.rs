@@ -154,8 +154,8 @@ fn run(cli: Cli) -> Result<CommandOutcome> {
     let settings = config.nightrun;
 
     if let Some(run_id) = cli.replay_run_id.as_deref() {
-        let event_store =
-            EventStore::open(&settings.event_store_db).context("Failed to open EventStore")?;
+        let event_store = EventStore::open_compatible(&settings.event_store_db)
+            .context("Failed to open EventStore")?;
         let replay = ReplayEngine::new(&event_store);
         let expected_hash = match cli.expected_hash {
             Some(hash) => hash,
@@ -221,8 +221,8 @@ fn run(cli: Cli) -> Result<CommandOutcome> {
         }
     };
 
-    let event_store =
-        EventStore::open(&settings.event_store_db).context("Failed to open EventStore")?;
+    let event_store = EventStore::open_compatible(&settings.event_store_db)
+        .context("Failed to open EventStore")?;
 
     let job_queue = JobQueue::open(&settings.job_queue_path).context("Failed to open JobQueue")?;
 

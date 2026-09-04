@@ -1188,7 +1188,9 @@ fn append_nightrun_event(
         run_id,
         tick_count,
     );
-    event_store.append_with_outbox(&event, "nightrun")?;
+    event_store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
+        .append_with_outbox(&event, "nightrun")?;
     if let Some(chain) = hash_chain {
         chain.extend(&event);
     }
@@ -1333,7 +1335,10 @@ fn enforce_agent_netns_isolation(
             .to_string();
             let event =
                 DomainEvent::new("AgentIsolationFailed", &aggregate, &payload, &aggregate, 0);
-            let event_error = event_store.append_event(&event).err();
+            let event_error = event_store
+                .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
+                .append_event(&event)
+                .err();
             if let Some(e) = &event_error {
                 warn!(agent = %agent_name, error = %e, "AgentIsolationFailed-Event speichern fehlgeschlagen");
             }
@@ -3509,7 +3514,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                     0, // kein Simulations-Tick im async Context
                 );
 
-                if let Err(e) = es.append_event(&event) {
+                if let Err(e) = es
+                    .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
+                    .append_event(&event)
+                {
                     warn!(error = %e, agent = %alert.agent_id, "Judge Alert DomainEvent speichern fehlgeschlagen");
                 }
 
@@ -4204,7 +4212,10 @@ fn emit_runtime_repair_blocked_event(
         &format!("runtime-reconcile-{}", agent_id.0),
         tick_count,
     );
-    if let Err(error) = event_store.append_event(&event) {
+    if let Err(error) = event_store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
+        .append_event(&event)
+    {
         warn!(
             agent_id = %agent_id,
             error = %error,
@@ -4241,6 +4252,7 @@ fn emit_runtime_projection_despawn_event(
     )
     .with_operation_id(&op_id);
     event_store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
         .append_event(&event)
         .with_context(|| format!("Projection-only Despawn-Event persistieren fuer {aggregate_id}"))
 }
@@ -4304,7 +4316,9 @@ fn emit_runtime_projection_spawn_event(
         tick_count,
     )
     .with_operation_id(&op_id);
-    event_store.append_event(&event)
+    event_store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
+        .append_event(&event)
 }
 
 fn upsert_agent_projection_seed(
@@ -6240,6 +6254,7 @@ fn commit_world_restore_stores(
         compensation_type: "none".to_string(),
     };
     event_store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
         .append_with_outbox(&restore_event, "sentinel.events")
         .context("SnapshotRestored Event schreiben fehlgeschlagen")?;
 
@@ -7925,7 +7940,10 @@ fn run_provision_worker(
                     0,
                 )
                 .with_operation_id(&operation_id);
-                event_store.append_event(&event).map(|_| ())
+                event_store
+                    .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
+                    .append_event(&event)
+                    .map(|_| ())
             },
         ) {
             Ok(duration_ms) => {
@@ -11755,7 +11773,12 @@ fn ecs_tick_loop(
                         .get_resource::<sentinel_ecs::LimboEventStore>()
                         .map(|e| Arc::clone(&e.0))
                     {
-                        if let Err(e) = es.append_event(&event) {
+                        if let Err(e) = es
+                            .legacy_append_gateway(
+                                sentinel_limbo::LegacyEventProducer::DaemonOrchestrator,
+                            )
+                            .append_event(&event)
+                        {
                             warn!(error = %e, "MigrationCompleted-Event konnte nicht persistiert werden");
                         }
                     }
@@ -13168,23 +13191,41 @@ mod tests {
         };
 
         let a = mk("A", 1);
-        event_store.append_event(&a).unwrap();
+        event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
+            .append_event(&a)
+            .unwrap();
         let b = mk("B", 2);
-        event_store.append_event(&b).unwrap();
+        event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
+            .append_event(&b)
+            .unwrap();
         // old future C,D (ids 3,4) — discarded by the restore below
         let c = mk("C", 3);
-        event_store.append_event(&c).unwrap();
+        event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
+            .append_event(&c)
+            .unwrap();
         let d = mk("D", 4);
-        event_store.append_event(&d).unwrap();
+        event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
+            .append_event(&d)
+            .unwrap();
 
         event_store.increment_restore_generation().unwrap();
         event_store.push_dead_range(2, 4).unwrap(); // (2,4] dead -> ids 3,4
 
         // live continuation E,F (ids 5,6)
         let e = mk("E", 3);
-        event_store.append_event(&e).unwrap();
+        event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
+            .append_event(&e)
+            .unwrap();
         let f = mk("F", 4);
-        event_store.append_event(&f).unwrap();
+        event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
+            .append_event(&f)
+            .unwrap();
 
         // ground-truth forward hash over the LIVE timeline A,B,E,F (C,D never applied)
         let mut truth = NightrunHashChain::new(run_id, run_id);
@@ -16076,6 +16117,7 @@ mod tests {
             )
             .unwrap();
         conflict_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOrchestrator)
             .append_event(
                 &DomainEvent::new(
                     "unrelated",

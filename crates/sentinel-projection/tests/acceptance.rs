@@ -39,7 +39,10 @@ fn append_event(store: &EventStore, tick: u64, payload: &DomainEventPayload) {
         tick,
     );
     event.timestamp_ms = tick * 1000;
-    store.append_event(&event).unwrap();
+    store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+        .append_event(&event)
+        .unwrap();
 }
 
 /// Seed einer realistischen Event-Sequenz: spawn -> action -> transit -> complete.
@@ -335,7 +338,10 @@ fn unknown_event_type_is_skipped_gracefully() {
         "corr-test",
         2,
     );
-    store.append_event(&unknown).unwrap();
+    store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+        .append_event(&unknown)
+        .unwrap();
 
     // Weiteres bekanntes Event
     append_event(
@@ -551,7 +557,10 @@ fn append_usage(
         event = event.with_schema_version(2);
     }
     event.timestamp_ms = tick * 1000;
-    store.append_event(&event).unwrap();
+    store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+        .append_event(&event)
+        .unwrap();
 }
 
 #[test]
@@ -691,7 +700,10 @@ fn hierarchy_projection_rejects_mismatched_v2_payload_without_advancing_offset()
     )
     .with_schema_version(2);
     event.operation_id = "llm_usage_req-invalid-v2".to_string();
-    store.append_event(&event).unwrap();
+    store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+        .append_event(&event)
+        .unwrap();
 
     let worker =
         ProjectionWorker::new(Arc::clone(&store), make_config(rm_path.to_str().unwrap())).unwrap();
@@ -750,7 +762,10 @@ fn hierarchy_projection_rejects_v3_usage_without_provider_authority() {
     )
     .with_operation_id("llm_usage_req-invalid-v3")
     .with_schema_version(3);
-    store.append_event(&event).unwrap();
+    store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+        .append_event(&event)
+        .unwrap();
 
     let worker =
         ProjectionWorker::new(Arc::clone(&store), make_config(rm_path.to_str().unwrap())).unwrap();
