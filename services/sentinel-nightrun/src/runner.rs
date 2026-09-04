@@ -483,6 +483,7 @@ impl NightrunRunner {
             0,
         );
         self.event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::NightRun)
             .append_with_outbox(&event, "nightrun")
             .context("Failed to emit NightRunStarted")?;
         Ok(event)
@@ -525,6 +526,7 @@ impl NightrunRunner {
             0,
         );
         self.event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::NightRun)
             .append_with_outbox(&event, "nightrun")
             .context("Failed to emit NightRunCompleted")?;
         Ok(())
@@ -553,6 +555,7 @@ impl NightrunRunner {
             0,
         );
         self.event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::NightRun)
             .append_with_outbox(&event, "nightrun")
             .context("Failed to emit AgentConsolidated")?;
         Ok(event)
@@ -578,6 +581,7 @@ impl NightrunRunner {
             0,
         );
         self.event_store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::NightRun)
             .append_with_outbox(&event, "nightrun")
             .context("Failed to emit AgentConsolidationFailed")?;
         Ok(event)

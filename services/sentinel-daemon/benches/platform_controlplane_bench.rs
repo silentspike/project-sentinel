@@ -45,7 +45,10 @@ fn seed_event_store(store: &EventStore, count: usize, projection_lag: i64) {
             "bench-corr",
             idx as u64,
         );
-        store.append_event(&event).expect("bench event appended");
+        store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::BenchmarkHarness)
+            .append_event(&event)
+            .expect("bench event appended");
     }
     let latest_id = store.get_latest_event_id().expect("latest event id");
     let projection_offset = (latest_id - projection_lag).max(0);

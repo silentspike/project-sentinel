@@ -83,19 +83,14 @@ func main() {
 		"batch_size", cfg.EventStore.BatchSize,
 	)
 
-	// Open event store (read-only consumer)
-	store, err := eventstore.Open(cfg.EventStore.Path)
+	// Open the Rust-migrated store without acquiring schema authority. The
+	// bridge may update delivery state but cannot append legacy events.
+	store, err := eventstore.OpenCompatible(cfg.EventStore.Path)
 	if err != nil {
 		logger.Error("failed to open event store", "error", err)
 		os.Exit(1)
 	}
 	defer func() { _ = store.Close() }()
-
-	// Ensure outbox migration (adds retry_count, last_error columns if missing)
-	if err := store.EnsureOutboxMigration(); err != nil {
-		logger.Error("failed to migrate outbox schema", "error", err)
-		os.Exit(1)
-	}
 
 	// Connect to NATS
 	nc, err := messaging.Connect(messaging.ConnectOpts{

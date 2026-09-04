@@ -575,9 +575,9 @@ struct RuntimeConfigApplyV2Row {
 /// in tokio::task::spawn_blocking wrappen.
 #[derive(Clone)]
 pub struct EventStore {
-    conn: Arc<Mutex<Connection>>,
+    pub(crate) conn: Arc<Mutex<Connection>>,
     path: PathBuf,
-    owner_registry: &'static OwnerRegistry,
+    pub(crate) owner_registry: &'static OwnerRegistry,
 }
 
 impl EventStore {
@@ -585,6 +585,37 @@ impl EventStore {
     #[instrument(level = "debug", fields(path = %path))]
     pub fn open(path: &str) -> anyhow::Result<Self> {
         Self::open_with_owner_registry(path, OwnerRegistry::global())
+    }
+
+    /// Opens an existing event store without becoming a schema authority.
+    ///
+    /// Runtime processes other than the canonical migration executor use this
+    /// path. It refuses a missing, partial, or checksum-mismatched schema before
+    /// exposing a writable handle.
+    pub fn open_compatible(path: &str) -> anyhow::Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Self::configure_compatible_event_store_connection(&conn)?;
+        crate::event_gateway::verify_event_contract_schema(&conn)?;
+        for table in ["events", "outbox"] {
+            let exists = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                params![table],
+                |row| row.get::<_, bool>(0),
+            )?;
+            anyhow::ensure!(
+                exists,
+                "required legacy compatibility table {table} is missing"
+            );
+        }
+        info!("EventStore opened with verified schema at {path}");
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path: PathBuf::from(path),
+            owner_registry: OwnerRegistry::global(),
+        })
     }
 
     /// Dependency-injected owner authority for cluster contract tests. Production
@@ -596,14 +627,7 @@ impl EventStore {
     ) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
 
-        // Performance Pragmas
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA mmap_size = 268435456;
-             PRAGMA page_size = 8192;
-             PRAGMA busy_timeout = 5000;",
-        )?;
+        Self::configure_authority_event_store_connection(&conn)?;
 
         // Schema erstellen
         conn.execute_batch(CREATE_EVENTS)?;
@@ -629,6 +653,8 @@ impl EventStore {
         conn.execute_batch(CREATE_RUNTIME_CONFIG_RECOVERY)?;
         conn.execute_batch(CREATE_RUNTIME_CONFIG_APPLY_RECOVERY)?;
         Self::ensure_runtime_config_apply_migrations(&conn)?;
+        crate::event_gateway::apply_event_contract_migrations(&conn)?;
+        crate::event_gateway::verify_event_contract_schema(&conn)?;
         conn.execute_batch(
             "DROP TRIGGER IF EXISTS protect_runtime_config_apply_snapshots;
              CREATE TRIGGER protect_runtime_config_apply_snapshots
@@ -665,6 +691,47 @@ impl EventStore {
             path: PathBuf::from(path),
             owner_registry,
         })
+    }
+
+    fn configure_authority_event_store_connection(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = FULL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA mmap_size = 268435456;
+             PRAGMA page_size = 8192;
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        Self::verify_event_store_connection(conn)
+    }
+
+    fn configure_compatible_event_store_connection(conn: &Connection) -> anyhow::Result<()> {
+        // These settings are connection-local. In particular, do not assign
+        // journal_mode or page_size: compatible participants verify the
+        // daemon-owned database contract without mutating persistent state.
+        conn.execute_batch(
+            "PRAGMA synchronous = FULL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA mmap_size = 268435456;
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        Self::verify_event_store_connection(conn)
+    }
+
+    fn verify_event_store_connection(conn: &Connection) -> anyhow::Result<()> {
+        let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+        let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        let database_path: String = conn.query_row("PRAGMA database_list", [], |row| row.get(2))?;
+        let valid_journal_mode = journal_mode.eq_ignore_ascii_case("wal")
+            || (database_path.is_empty() && journal_mode.eq_ignore_ascii_case("memory"));
+        anyhow::ensure!(
+            valid_journal_mode,
+            "WAL mode is required for a file-backed event store"
+        );
+        anyhow::ensure!(synchronous == 2, "SQLite synchronous=FULL is required");
+        anyhow::ensure!(foreign_keys == 1, "SQLite foreign keys must be enabled");
+        Ok(())
     }
 
     fn ensure_outbox_migrations(conn: &Connection) -> anyhow::Result<()> {
@@ -1116,7 +1183,7 @@ impl EventStore {
     // term immediately before COMMIT; dropping the wrapper rolls the transaction back.
 
     /// Append-only: Fuegt ein Event ein. Gibt die interne Row-ID zurueck.
-    pub fn append_event(&self, event: &DomainEvent) -> anyhow::Result<i64> {
+    pub(crate) fn append_event(&self, event: &DomainEvent) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
         let conn = self.begin_fenced_write(
             &self
@@ -2428,7 +2495,11 @@ impl EventStore {
     ///
     /// Nutzt operation_id als Idempotenz-Key (UNIQUE INDEX).
     /// Bei Duplikat (gleiche operation_id) wird kein neuer Eintrag erstellt.
-    pub fn append_with_outbox(&self, event: &DomainEvent, topic: &str) -> anyhow::Result<i64> {
+    pub(crate) fn append_with_outbox(
+        &self,
+        event: &DomainEvent,
+        topic: &str,
+    ) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
         let conn = self.begin_fenced_write(
             &self
@@ -2489,7 +2560,7 @@ impl EventStore {
     ///
     /// Nutzt dieselbe operation_id-Idempotenz wie `append_with_outbox`.
     /// Duplikate werden ignoriert und erzeugen keinen Outbox-Eintrag.
-    pub fn append_with_outbox_batch<'a, I>(&self, entries: I) -> anyhow::Result<usize>
+    pub(crate) fn append_with_outbox_batch<'a, I>(&self, entries: I) -> anyhow::Result<usize>
     where
         I: IntoIterator<Item = (&'a DomainEvent, &'a str)>,
     {

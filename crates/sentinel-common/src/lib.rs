@@ -11,10 +11,12 @@ pub mod block_map;
 pub mod block_ref;
 pub mod cluster;
 pub mod components;
+pub mod event_contract;
 pub mod events;
 pub mod feature_flags;
 pub mod fencing;
 pub mod generated;
+pub mod inference_contract;
 pub mod membership;
 pub mod migration;
 pub mod nano_runtime;
@@ -34,6 +36,7 @@ pub use cluster::{
     ClusterConfig, ClusterRole, ControlPeer, NodeId, NodeIdentity, NodeLifecycleState,
     PendingBareNode,
 };
+pub use event_contract::*;
 pub use events::{CostSource, DomainEvent, DomainEventPayload};
 pub use fencing::{
     owner_tick_barrier, validate_owner_snapshot_pair, ActivationState, FencedStore,
@@ -43,6 +46,7 @@ pub use fencing::{
     OwnerSnapshotInstallOutcome, OwnerTerm, OwnerTermSnapshot, OwnerWriteGuard, StaleEpochError,
     OWNER_SNAPSHOT_SCHEMA_VERSION, TRACK_A_COORDINATOR_GENERATION,
 };
+pub use inference_contract::*;
 pub use membership::{
     Heartbeat, IngestOutcome, MembershipConfig, MembershipState, MembershipView, NodeMembership,
 };

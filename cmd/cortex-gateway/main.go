@@ -180,7 +180,7 @@ func main() {
 	var evStore *eventstore.Store
 	if esPath := os.Getenv("SENTINEL_CORTEX_EVENT_STORE_PATH"); esPath != "" {
 		var err error
-		evStore, err = eventstore.Open(esPath)
+		evStore, err = eventstore.OpenLegacyCompatible(esPath, eventstore.LegacyProducerCortexAudit)
 		if err != nil {
 			logger.Error("failed to open event store", "path", esPath, "error", err)
 			os.Exit(1)
