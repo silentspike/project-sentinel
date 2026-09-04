@@ -507,7 +507,11 @@ def validate_assertions(
     for assertion in assertions:
         if not isinstance(assertion, dict) or "pointer" not in assertion:
             raise JourneyError(f"step {step_id} has an invalid {field} assertion")
-        if set(assertion) not in ({"pointer", "present"}, {"pointer", "equals"}):
+        if set(assertion) not in (
+            {"pointer", "present"},
+            {"pointer", "equals"},
+            {"pointer", "one_of"},
+        ):
             raise JourneyError(f"step {step_id} {field} assertion shape is invalid")
         pointer = validate_pointer(
             assertion["pointer"],
@@ -534,6 +538,27 @@ def validate_assertions(
                 raise JourneyError(
                     f"step {step_id} {field} equals is not public-safe"
                 )
+        if "one_of" in assertion:
+            choices = assertion["one_of"]
+            if (
+                not isinstance(choices, list)
+                or not choices
+                or len(choices) != len({canonical_json(choice) for choice in choices})
+            ):
+                raise JourneyError(f"step {step_id} {field} one_of is invalid")
+            for choice in choices:
+                validate_template(
+                    choice,
+                    available_references,
+                    f"step {step_id} {field}",
+                )
+                validate_public_structure(
+                    choice, f"step {step_id} {field} one_of"
+                )
+                if not public_safe(choice):
+                    raise JourneyError(
+                        f"step {step_id} {field} one_of is not public-safe"
+                    )
 
 
 def validate_observe_contract(value: object, step_id: str) -> None:
@@ -559,7 +584,8 @@ def validate_observe_contract(value: object, step_id: str) -> None:
         or not isinstance(elapsed, int)
         or isinstance(elapsed, bool)
         or not 50 <= elapsed <= MAX_OBSERVE_ELAPSED_MS
-        or value["replay"] != "exact_status_and_captures"
+        or value["replay"]
+        not in {"exact_status_and_captures", "monotone_status_and_captures"}
         or not isinstance(retry_statuses, list)
         or len(retry_statuses) != len(set(retry_statuses))
         or any(
@@ -812,12 +838,23 @@ def validate_plan(plan: dict[str, Any]) -> None:
                 raise JourneyError(
                     "schema v2 positive commands require initial_assertions and replay_assertions"
                 )
+        elif (
+            schema_version == SCHEMA_VERSION_V2
+            and kind == "observe"
+            and raw_step["observe"]["replay"] == "monotone_status_and_captures"
+        ):
+            if not raw_step.get("initial_assertions") or not raw_step.get(
+                "replay_assertions"
+            ):
+                raise JourneyError(
+                    "monotone observe steps require initial_assertions and replay_assertions"
+                )
         elif schema_version == SCHEMA_VERSION_V2 and (
             raw_step.get("initial_assertions") is not None
             or raw_step.get("replay_assertions") is not None
         ):
             raise JourneyError(
-                "initial_assertions and replay_assertions are valid only for positive commands"
+                "initial_assertions and replay_assertions require a positive command or monotone observe"
             )
 
         available_references.update(f"{step_id}.{name}" for name in capture)
@@ -1476,6 +1513,33 @@ def evaluate_assertions(
             expected = resolve_template(assertion["equals"], references, operation_id)
             if actual != expected:
                 raise JourneyError("response assertion did not match")
+        if "one_of" in assertion:
+            expected = [
+                resolve_template(choice, references, operation_id)
+                for choice in assertion["one_of"]
+            ]
+            if actual not in expected:
+                raise JourneyError("response assertion did not match")
+
+
+def replay_captures_match(
+    step: dict[str, Any], current: dict[str, Any], recorded: dict[str, Any]
+) -> bool:
+    if step.get("kind", "positive") != "observe" or step.get("observe", {}).get(
+        "replay"
+    ) != "monotone_status_and_captures":
+        return current == recorded
+    if set(current) != set(recorded):
+        return False
+    specifications = step.get("capture", {})
+    for name, prior in recorded.items():
+        value = current[name]
+        if specifications[name]["type"] == "integer":
+            if value < prior:
+                return False
+        elif value != prior:
+            return False
+    return True
 
 
 def build_evidence(
@@ -1597,6 +1661,8 @@ def replay_contract_for_step(step: dict[str, Any], schema_version: int) -> str:
     if schema_version == SCHEMA_VERSION:
         return "server_response_verified"
     if step.get("kind", "positive") == "observe":
+        if step["observe"]["replay"] == "monotone_status_and_captures":
+            return "monotone_observe_v2"
         return "bounded_observe_v2"
     if step.get("kind", "positive") == "positive":
         return "idempotent_command_v2"
@@ -1730,12 +1796,16 @@ def _run_journey_locked(
                 or existing.get("query") != encoded_query
             ):
                 raise JourneyError(f"resume conflict for completed step {step_id}")
-            replay_assertions = (
-                step.get("assertions", [])
-                if schema_version == SCHEMA_VERSION
-                or step.get("kind", "positive") != "positive"
-                else step.get("assertions", []) + step["replay_assertions"]
-            )
+            if schema_version == SCHEMA_VERSION:
+                replay_assertions = step.get("assertions", [])
+            elif step.get("kind", "positive") in {"positive", "observe"} and step.get(
+                "replay_assertions"
+            ):
+                replay_assertions = (
+                    step.get("assertions", []) + step["replay_assertions"]
+                )
+            else:
+                replay_assertions = step.get("assertions", [])
             status, captures, _attempt_count = observe_step(
                 base_url,
                 step,
@@ -1749,7 +1819,9 @@ def _run_journey_locked(
                 schema_version,
                 replay_assertions,
             )
-            if status != existing["status"] or captures != existing["captures"]:
+            if status != existing["status"] or not replay_captures_match(
+                step, captures, existing["captures"]
+            ):
                 raise JourneyError(
                     f"authoritative replay changed the outcome for step {step_id}"
                 )
@@ -1759,12 +1831,16 @@ def _run_journey_locked(
                 build_evidence(plan, ledger, "in_progress", None, replay_verified_steps),
             )
         else:
-            initial_assertions = (
-                step.get("assertions", [])
-                if schema_version == SCHEMA_VERSION
-                or step.get("kind", "positive") != "positive"
-                else step.get("assertions", []) + step["initial_assertions"]
-            )
+            if schema_version == SCHEMA_VERSION:
+                initial_assertions = step.get("assertions", [])
+            elif step.get("kind", "positive") in {"positive", "observe"} and step.get(
+                "initial_assertions"
+            ):
+                initial_assertions = (
+                    step.get("assertions", []) + step["initial_assertions"]
+                )
+            else:
+                initial_assertions = step.get("assertions", [])
             status, captures, attempt_count = observe_step(
                 base_url,
                 step,
