@@ -32,7 +32,7 @@ class EventAppendBoundaryTest(unittest.TestCase):
         rust = root / "services/example/main.rs"
         rust.parent.mkdir(parents=True)
         rust.write_text(
-            "store.legacy_append_gateway(LegacyEventProducer::TestHarness)\n"
+            "store.legacy_append_gateway(LegacyEventProducer::DaemonWorkflow)\n"
             "    .append_event(&event);\n",
             encoding="utf-8",
         )
@@ -43,7 +43,60 @@ class EventAppendBoundaryTest(unittest.TestCase):
             "AppendWithOutbox(event, topic)\n",
             encoding="utf-8",
         )
-        self.assertEqual(MODULE.check(root), [])
+        self.assertEqual(
+            MODULE.check(
+                root,
+                rust_inventory={(Path("services/example/main.rs"), "DaemonWorkflow"): 1},
+                go_inventory={
+                    (
+                        Path("cmd/example/main.go"),
+                        "LegacyProducerCortexAudit",
+                    ): 1
+                },
+            ),
+            [],
+        )
+
+    def test_rejects_unregistered_or_extra_legacy_writer(self):
+        root = self.fixture()
+        rust = root / "services/example/main.rs"
+        rust.parent.mkdir(parents=True)
+        rust.write_text(
+            "store.legacy_append_gateway(LegacyEventProducer::TestHarness)\n"
+            "    .append_event(&event);\n",
+            encoding="utf-8",
+        )
+        errors = MODULE.check(root, rust_inventory={}, go_inventory={})
+        self.assertTrue(
+            any(
+                "producer=TestHarness: expected 0, found 1" in error
+                for error in errors
+            )
+        )
+
+    def test_rejects_raw_write_hidden_behind_classified_constructor(self):
+        root = self.fixture()
+        rust = root / "services/example/main.rs"
+        rust.parent.mkdir(parents=True)
+        rust.write_text(
+            "let gateway = store.legacy_append_gateway("
+            "LegacyEventProducer::DaemonWorkflow);\n"
+            "gateway.append_event(&event);\n",
+            encoding="utf-8",
+        )
+        go = root / "cmd/example/main.go"
+        go.parent.mkdir(parents=True)
+        go.write_text(
+            "gateway := store.LegacyAppendGateway("
+            "eventstore.LegacyProducerCortexAudit)\n"
+            "gateway.AppendWithOutbox(event, topic)\n",
+            encoding="utf-8",
+        )
+        errors = MODULE.check(root, rust_inventory={}, go_inventory={})
+        self.assertTrue(any("unclassified Rust append_event" in error for error in errors))
+        self.assertTrue(
+            any("unclassified Go AppendWithOutbox" in error for error in errors)
+        )
 
     def test_rejects_public_and_unclassified_writers(self):
         root = self.fixture()
@@ -52,7 +105,7 @@ class EventAppendBoundaryTest(unittest.TestCase):
         rust = root / "services/example/main.rs"
         rust.parent.mkdir(parents=True)
         rust.write_text("store.append_event(&event);\n", encoding="utf-8")
-        errors = MODULE.check(root)
+        errors = MODULE.check(root, rust_inventory={}, go_inventory={})
         self.assertTrue(any("raw Rust writer append_event is public" in error for error in errors))
         self.assertTrue(any("unclassified Rust append_event" in error for error in errors))
 
@@ -66,7 +119,7 @@ class EventAppendBoundaryTest(unittest.TestCase):
         rogue.write_text('sql!("INSERT INTO events (event_id) VALUES (?)");\n', encoding="utf-8")
         rust_owner = root / "services/example/main.rs"
         rust_owner.write_text('let store = EventStore::open("events.db");\n', encoding="utf-8")
-        errors = MODULE.check(root)
+        errors = MODULE.check(root, rust_inventory={}, go_inventory={})
         self.assertTrue(any("may not own event DDL" in error for error in errors))
         self.assertTrue(any("raw events-table insert" in error for error in errors))
 
@@ -80,7 +133,9 @@ class EventAppendBoundaryTest(unittest.TestCase):
             "}\n",
             encoding="utf-8",
         )
-        self.assertEqual(MODULE.check(root), [])
+        self.assertEqual(
+            MODULE.check(root, rust_inventory={}, go_inventory={}), []
+        )
 
 
 if __name__ == "__main__":

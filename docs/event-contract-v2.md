@@ -44,8 +44,11 @@ name and checksum, verifies every required table and truth-metadata row, and
 verifies every required V2 column before exposing the handle. It uses
 connection-local `synchronous=FULL` and foreign keys, and requires the daemon-set
 `journal_mode=WAL` on readback without changing persistent SQLite settings. A
-missing path, partial schema, caller-controlled SQLite URI, or non-WAL store is
-rejected without creating or repairing a database. Cortex receives
+missing path, partial schema, schema-object fingerprint mismatch,
+caller-controlled SQLite URI, or non-WAL store is rejected without creating or
+repairing a database. The fingerprint is derived from the exact schema objects
+created by the sole Rust migration authority; compatible readers verify that
+owner-produced shape instead of maintaining an independent DDL variant. Cortex receives
 only the named `CortexAudit` V1 compatibility capability; the NATS bridge does
 not receive an event-append capability. Startup fails
 closed when the daemon has not installed the exact schema.
@@ -102,8 +105,11 @@ result remain non-authorizing.
 
 The raw V1 methods are crate-private. Every remaining compatibility callsite
 must select one named `LegacyEventProducer`; the repository boundary checker
-rejects an unclassified call or a second production DDL owner. This inventory
-does not promote V1 rows to authority:
+freezes the exact production path, producer, and callsite count. It rejects an
+unclassified, added, removed, relabeled, or test-only production writer and a
+second production DDL owner. A compatibility producer must be bound in the same
+direct gateway/write expression; proximity to an approved constructor grants no
+authority. This inventory does not promote V1 rows to authority:
 
 | Producer | Existing information | V2 target class |
 |---|---|---|

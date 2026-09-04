@@ -5,6 +5,7 @@ package eventstore
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -88,6 +89,7 @@ const (
 	eventContractSchemaVersion = 2
 	eventContractMigrationName = "event-envelope-v2"
 	eventContractMigrationSHA  = "472b60a6cd218422b946f03e01e50d3566b563759899a027c02c047519097e86"
+	eventContractSchemaSHA     = "d7e51ea21faf194fa85b894534f816cfb6b5ca530be5d73cfabeac3ae22c88b4"
 )
 
 var requiredEventContractColumns = map[string][]string{
@@ -323,6 +325,17 @@ func compatibleReadWriteDSN(path string) (string, error) {
 }
 
 func verifyEventContractSchema(db *sql.DB) error {
+	fingerprint, err := eventContractSchemaFingerprint(db)
+	if err != nil {
+		return err
+	}
+	if fingerprint != eventContractSchemaSHA {
+		return fmt.Errorf(
+			"eventstore event contract schema object fingerprint mismatch: expected %s, found %s",
+			eventContractSchemaSHA,
+			fingerprint,
+		)
+	}
 	for table, requiredColumns := range requiredEventContractColumns {
 		actual := make(map[string]struct{})
 		rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
@@ -353,6 +366,43 @@ func verifyEventContractSchema(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+func eventContractSchemaFingerprint(db *sql.DB) (string, error) {
+	rows, err := db.Query(`
+		SELECT type, name, tbl_name, COALESCE(sql, '')
+		FROM sqlite_schema
+		WHERE tbl_name IN (
+			'event_schema_migrations',
+			'event_truth_metadata',
+			'event_stream_heads_v2',
+			'events_v2',
+			'event_operations_v2',
+			'delivery_intents_v2',
+			'local_effect_reservations_v2'
+		)
+		ORDER BY type, name, tbl_name`)
+	if err != nil {
+		return "", fmt.Errorf("eventstore query event contract schema objects: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	hash := sha256.New()
+	for rows.Next() {
+		var objectType, name, table, statement string
+		if err := rows.Scan(&objectType, &name, &table, &statement); err != nil {
+			return "", fmt.Errorf("eventstore read event contract schema object: %w", err)
+		}
+		for _, value := range []string{objectType, name, table, statement} {
+			_, _ = fmt.Fprintf(hash, "%d:", len(value))
+			_, _ = hash.Write([]byte(value))
+			_, _ = hash.Write([]byte{'\n'})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("eventstore read event contract schema objects: %w", err)
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // EventContractSchemaStatus verifies the immutable migration identity and

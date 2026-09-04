@@ -39,12 +39,13 @@ func migrateEventContractForTest(t *testing.T, path string) {
 	if err != nil {
 		t.Fatalf("read canonical event migration: %v", err)
 	}
-	if _, err := db.Exec(`CREATE TABLE event_schema_migrations (
-		version INTEGER PRIMARY KEY,
-		name TEXT NOT NULL UNIQUE,
-		sha256 TEXT NOT NULL,
-		applied_at_ms INTEGER NOT NULL
-	)`); err != nil {
+	if _, err := db.Exec(`
+CREATE TABLE IF NOT EXISTS event_schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    sha256 TEXT NOT NULL,
+    applied_at_ms INTEGER NOT NULL
+)`); err != nil {
 		t.Fatalf("create migration ledger: %v", err)
 	}
 	if _, err := db.Exec(string(migration)); err != nil {
@@ -211,6 +212,26 @@ func TestOpenCompatibleRejectsPartialV2Schema(t *testing.T) {
 	_ = db.Close()
 	if _, err := OpenCompatible(path); err == nil {
 		t.Fatal("OpenCompatible accepted a partial V2 schema")
+	}
+}
+
+func TestOpenCompatibleRejectsTamperedSchemaShapeWithMatchingColumns(t *testing.T) {
+	legacy, path := tempDB(t)
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy schema authority: %v", err)
+	}
+	migrateEventContractForTest(t, path)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open schema-shape fixture: %v", err)
+	}
+	if _, err := db.Exec(`DROP INDEX idx_events_v2_type_position`); err != nil {
+		_ = db.Close()
+		t.Fatalf("tamper V2 schema shape: %v", err)
+	}
+	_ = db.Close()
+	if _, err := OpenCompatible(path); err == nil {
+		t.Fatal("OpenCompatible accepted a tampered schema with matching columns")
 	}
 }
 
