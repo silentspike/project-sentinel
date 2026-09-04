@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Allow a responsible work owner with partial task capability to be assigned
+  while keeping execution fail-closed until an exact, authority-fenced
+  collaboration admission covers the remaining capabilities (#740).
+
 - Require a meaningful write rate before a relative Platform Control Plane
   baseline burst can suspend an agent, while preserving the absolute safety
   threshold and suppressing duplicate actions for already suspended agents
