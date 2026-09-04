@@ -2732,6 +2732,17 @@ fn apply_collaboration_mutation(
         budget.validate(now_ms)?;
         validate_optional_work(project, work_item_id.as_ref())?;
         validate_collaboration_work_authority(project, work_item_id.as_ref(), authority)?;
+        let (assignment_agent, assignment_id, assignment_version, assignment_digest) = {
+            let work_item_id = work_item_id.as_ref().ok_or_else(unauthorized)?;
+            let work = project.work_items.get(work_item_id).ok_or_else(not_found)?;
+            let assignment = current_assignment(work).ok_or_else(unauthorized)?;
+            (
+                assignment.agent_id,
+                assignment.assignment_id.clone(),
+                assignment.assignment_version,
+                assignment.canonical_digest()?,
+            )
+        };
         ensure_collection_capacity(project.collaboration_sessions.len())?;
         if participants.len() < 2 || participants.len() > usize::from(budget.max_participants) {
             return Err(invalid("collaboration participant budget is invalid"));
@@ -2752,6 +2763,9 @@ fn apply_collaboration_mutation(
         if !member_ids.contains(&actor.0) {
             return Err(unauthorized());
         }
+        if !member_ids.contains(&assignment_agent.0) {
+            return Err(unauthorized());
+        }
         let session_id = stable_domain_id("collaboration", &principal.tenant_id, operation_id)?;
         let mut session = CollaborationSessionV1 {
             schema_version: COLLABORATION_SCHEMA_VERSION,
@@ -2761,6 +2775,9 @@ fn apply_collaboration_mutation(
             work_item_id: work_item_id.clone(),
             organization_generation: authority.organization_generation,
             organization_digest: authority.organization_digest.clone(),
+            assignment_id,
+            assignment_version,
+            assignment_digest,
             policy_version: authority.policy_version,
             policy_digest: authority.policy_digest.clone(),
             subject_ref: subject_ref.clone(),
@@ -2902,6 +2919,11 @@ fn apply_collaboration_mutation(
                 return Err(unauthorized());
             }
             let session = &project.collaboration_sessions[session_index];
+            if *authority_scope_ref != session.assignment_id
+                || *authority_scope_digest != session.assignment_digest
+            {
+                return Err(unauthorized());
+            }
             if session.state != CollaborationSessionStateV1::ExchangingEvidence
                 || session.work_item_id.as_ref() != Some(work_item_id)
                 || session.participant(*consumer).is_err()
@@ -3124,6 +3146,11 @@ fn apply_collaboration_mutation(
             let packet_index = collaboration_packet_index(project, session_id, packet_id)?;
             let packet = &project.handoff_packets[packet_index];
             require_packet_actor(packet, actor, false, packet_digest)?;
+            if packet.authority_scope_ref != session.assignment_id
+                || packet.authority_scope_digest != session.assignment_digest
+            {
+                return Err(unauthorized());
+            }
             if session.state != CollaborationSessionStateV1::ExchangingEvidence
                 || packet.state != HandoffPacketStateV1::Offered
                 || packet
@@ -3459,7 +3486,10 @@ fn validate_collaboration_work_authority(
     let work_item_id = work_item_id.ok_or_else(unauthorized)?;
     let work = project.work_items.get(work_item_id).ok_or_else(not_found)?;
     let assignment = current_assignment(work).ok_or_else(unauthorized)?;
-    if assignment.organization_generation != authority.organization_generation
+    if assignment.assignment_id != authority.assignment_id
+        || assignment.assignment_version != authority.assignment_version
+        || assignment.canonical_digest()? != authority.assignment_digest
+        || assignment.organization_generation != authority.organization_generation
         || assignment.organization_digest != authority.organization_digest
     {
         return Err(unauthorized());
@@ -4479,6 +4509,8 @@ fn validate_project_collaboration(project: &ProjectV1) -> Result<(), WorkflowErr
         if session.work_item_id.as_ref() != Some(&packet.work_item_id)
             || session.participant(packet.producer).is_err()
             || session.participant(packet.consumer).is_err()
+            || packet.authority_scope_ref != session.assignment_id
+            || packet.authority_scope_digest != session.assignment_digest
             || packet.organization_generation != session.organization_generation
             || packet.organization_digest != session.organization_digest
             || packet.policy_version != session.policy_version
@@ -6080,6 +6112,9 @@ mod tests {
                     authority: CollaborationAuthorityFenceV1 {
                         organization_generation: 1,
                         organization_digest: DIGEST.to_owned(),
+                        assignment_id: "assignment-a".to_owned(),
+                        assignment_version: 1,
+                        assignment_digest: DIGEST.to_owned(),
                         policy_version: 1,
                         policy_digest: DIGEST.to_owned(),
                     },

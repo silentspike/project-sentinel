@@ -221,8 +221,10 @@ subject, input digest, participant set, and transition sequence. Each material
 step is submitted through an authenticated company-workflow command and is
 published through the canonical Event Store append and outbox boundary.
 Session creation and every later mutation recheck the active work assignment,
-organization generation, and project-profile policy digest before state can
-advance.
+including its exact ID, version, and canonical digest, together with the
+organization generation and project-profile policy digest before state can
+advance. Reassignment freezes the prior session for audit; work continues in a
+new session bound to the new assignment rather than inheriting stale authority.
 
 An employee keeps one permanent company role, such as Developer, QA, or
 Technical Lead. A collaboration session gives that employee a separate
@@ -254,8 +256,10 @@ Work moves between employees as a digest-bound `HandoffPacket`, not as an
 unbounded transcript. The packet names the objective, authority scope, inputs,
 artifacts, evidence, assumptions, unresolved questions, uncertainty,
 acceptance checks, required capabilities, privacy classes, and relevant
-generations. The receiver may accept, reject, escalate, or request one of four
-typed clarifications:
+generations. Its authority scope is the exact assignment ID and canonical
+assignment digest sealed by the session, not sender-supplied descriptive text.
+The receiver may accept, reject, escalate, or request one of four typed
+clarifications:
 
 - `DataGap`: required information is absent.
 - `SignalCorruption`: supplied evidence cannot be trusted as received.

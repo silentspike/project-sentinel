@@ -247,22 +247,33 @@ impl CollaborationParticipantV1 {
 pub struct CollaborationAuthorityFenceV1 {
     pub organization_generation: u64,
     pub organization_digest: String,
+    pub assignment_id: String,
+    pub assignment_version: u64,
+    pub assignment_digest: String,
     pub policy_version: u64,
     pub policy_digest: String,
 }
 
 impl CollaborationAuthorityFenceV1 {
     pub(crate) fn validate(&self) -> Result<(), WorkflowError> {
-        if self.organization_generation == 0 || self.policy_version == 0 {
+        if self.organization_generation == 0
+            || self.assignment_version == 0
+            || self.policy_version == 0
+        {
             return Err(invalid("collaboration authority fence is invalid"));
         }
         validate_digest(&self.organization_digest)?;
+        validate_identifier(&self.assignment_id)?;
+        validate_digest(&self.assignment_digest)?;
         validate_digest(&self.policy_digest)
     }
 
     pub(crate) fn matches(&self, session: &CollaborationSessionV1) -> bool {
         self.organization_generation == session.organization_generation
             && self.organization_digest == session.organization_digest
+            && self.assignment_id == session.assignment_id
+            && self.assignment_version == session.assignment_version
+            && self.assignment_digest == session.assignment_digest
             && self.policy_version == session.policy_version
             && self.policy_digest == session.policy_digest
     }
@@ -749,6 +760,9 @@ pub struct CollaborationSessionV1 {
     pub work_item_id: Option<WorkItemId>,
     pub organization_generation: u64,
     pub organization_digest: String,
+    pub assignment_id: String,
+    pub assignment_version: u64,
+    pub assignment_digest: String,
     pub policy_version: u64,
     pub policy_digest: String,
     pub subject_ref: String,
@@ -778,6 +792,9 @@ impl CollaborationSessionV1 {
             work_item_id: &'a Option<WorkItemId>,
             organization_generation: u64,
             organization_digest: &'a str,
+            assignment_id: &'a str,
+            assignment_version: u64,
+            assignment_digest: &'a str,
             policy_version: u64,
             policy_digest: &'a str,
             subject_ref: &'a str,
@@ -798,6 +815,9 @@ impl CollaborationSessionV1 {
                 work_item_id: &self.work_item_id,
                 organization_generation: self.organization_generation,
                 organization_digest: &self.organization_digest,
+                assignment_id: &self.assignment_id,
+                assignment_version: self.assignment_version,
+                assignment_digest: &self.assignment_digest,
                 policy_version: self.policy_version,
                 policy_digest: &self.policy_digest,
                 subject_ref: &self.subject_ref,
@@ -821,9 +841,16 @@ impl CollaborationSessionV1 {
             .ok_or_else(unauthorized)
     }
 
+    fn exposure_barrier_opened(&self) -> bool {
+        self.transition_history
+            .iter()
+            .any(|transition| transition.to == CollaborationSessionStateV1::ExchangingEvidence)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), WorkflowError> {
         if self.schema_version != COLLABORATION_SCHEMA_VERSION
             || self.organization_generation == 0
+            || self.assignment_version == 0
             || self.policy_version == 0
             || self.transition_sequence == 0
             || self.publication_revision > self.transition_sequence
@@ -846,6 +873,8 @@ impl CollaborationSessionV1 {
             work_item_id.validate()?;
         }
         validate_digest(&self.organization_digest)?;
+        validate_identifier(&self.assignment_id)?;
+        validate_digest(&self.assignment_digest)?;
         validate_digest(&self.policy_digest)?;
         validate_text(&self.subject_ref)?;
         validate_digest(&self.input_digest)?;
@@ -864,15 +893,16 @@ impl CollaborationSessionV1 {
         if !members.contains(&self.created_by.0) {
             return Err(invalid("collaboration creator is not a participant"));
         }
-        let exposed = matches!(
-            self.state,
-            CollaborationSessionStateV1::ExchangingEvidence
-                | CollaborationSessionStateV1::Deciding
-                | CollaborationSessionStateV1::Completed
-                | CollaborationSessionStateV1::Blocked
-                | CollaborationSessionStateV1::Escalated
-                | CollaborationSessionStateV1::Cancelled
-        );
+        validate_session_history(self)?;
+        let barrier_opened = self.exposure_barrier_opened();
+        if barrier_opened && self.claims.len() != self.participants.len() {
+            return Err(invalid("claim exposure barrier is incomplete"));
+        }
+        let required_exposure = if barrier_opened {
+            ClaimExposureStateV1::Exposed
+        } else {
+            ClaimExposureStateV1::Private
+        };
         let mut claims = BTreeSet::new();
         let mut contributors = BTreeSet::new();
         for claim in &self.claims {
@@ -884,12 +914,11 @@ impl CollaborationSessionV1 {
                 || claim.input_digest != self.input_digest
                 || !claims.insert(&claim.claim_id)
                 || !contributors.insert(claim.contributor.0)
-                || exposed != (claim.exposure_state == ClaimExposureStateV1::Exposed)
+                || claim.exposure_state != required_exposure
             {
                 return Err(invalid("independent claim binding is invalid"));
             }
         }
-        validate_session_history(self)?;
         Ok(())
     }
 }
@@ -1118,6 +1147,7 @@ pub fn filtered_collaboration_view(
         .iter()
         .find(|session| session.session_id == session_id)
         .ok_or_else(|| invalid("collaboration session was not found"))?;
+    source.validate()?;
     let actor = match principal.kind {
         CompanyPrincipalKindV1::Operator => None,
         CompanyPrincipalKindV1::Agent => {
@@ -1130,17 +1160,13 @@ pub fn filtered_collaboration_view(
         }
         CompanyPrincipalKindV1::Customer => return Err(unauthorized()),
     };
-    let peers_exposed = !matches!(
-        source.state,
-        CollaborationSessionStateV1::Planned
-            | CollaborationSessionStateV1::CollectingIndependentClaims
-    );
+    let peers_exposed = source.exposure_barrier_opened();
     let mut session = source.clone();
     if let Some(agent_id) = actor {
         let observer = source.participant(agent_id)?;
         session.claims.retain(|claim| {
             claim.contributor == agent_id
-                || (peers_exposed
+                || (claim.exposure_state == ClaimExposureStateV1::Exposed
                     && source
                         .participant(claim.contributor)
                         .is_ok_and(|contributor| {
@@ -1250,17 +1276,12 @@ pub fn compile_collaboration_gateway_request(
     session.validate()?;
     let participant = session.participant(agent_id)?;
     let contract = participant.mandate.contract();
-    let may_read_peers = !matches!(
-        session.state,
-        CollaborationSessionStateV1::Planned
-            | CollaborationSessionStateV1::CollectingIndependentClaims
-    );
     let visible_claim_digests = session
         .claims
         .iter()
         .filter(|claim| {
             claim.contributor == agent_id
-                || (may_read_peers
+                || (claim.exposure_state == ClaimExposureStateV1::Exposed
                     && session
                         .participant(claim.contributor)
                         .is_ok_and(|contributor| {
@@ -1357,6 +1378,9 @@ mod tests {
             work_item_id: Some(WorkItemId::parse("work-a").unwrap()),
             organization_generation: 7,
             organization_digest: DIGEST.to_owned(),
+            assignment_id: "assignment-a".to_owned(),
+            assignment_version: 1,
+            assignment_digest: DIGEST.to_owned(),
             policy_version: 3,
             policy_digest: DIGEST.to_owned(),
             subject_ref: "review the bounded implementation".to_owned(),
@@ -1566,6 +1590,43 @@ mod tests {
             gateway_request.visible_claim_digests[0],
             project.collaboration_sessions[0].claims[1].claim_digest
         );
+    }
+
+    #[test]
+    fn terminal_before_barrier_preserves_private_claims_and_rejects_mixed_exposure() {
+        let mut session = session(BehaviorMandateV1::Challenge);
+        session.state = CollaborationSessionStateV1::Cancelled;
+        session.transition_sequence = 3;
+        session.updated_at_unix_ms = 3;
+        session.transition_history = vec![
+            CollaborationTransitionV1 {
+                sequence: 2,
+                from: CollaborationSessionStateV1::Planned,
+                to: CollaborationSessionStateV1::CollectingIndependentClaims,
+                actor: AgentId(1),
+                reason_ref: "begin independent review".to_owned(),
+                occurred_at_unix_ms: 2,
+            },
+            CollaborationTransitionV1 {
+                sequence: 3,
+                from: CollaborationSessionStateV1::CollectingIndependentClaims,
+                to: CollaborationSessionStateV1::Cancelled,
+                actor: AgentId(1),
+                reason_ref: "stop before exposure".to_owned(),
+                occurred_at_unix_ms: 3,
+            },
+        ];
+        session.claims = vec![claim(&session, 1), claim(&session, 2)];
+        session.validate().unwrap();
+        let request = compile_collaboration_gateway_request(&session, AgentId(1)).unwrap();
+        assert_eq!(request.visible_claim_digests.len(), 1);
+        assert_eq!(
+            request.visible_claim_digests[0],
+            session.claims[0].claim_digest
+        );
+
+        session.claims[1].exposure_state = ClaimExposureStateV1::Exposed;
+        assert!(session.validate().is_err());
     }
 
     #[test]
