@@ -1,5 +1,7 @@
 # Changelog
 
+- Issue #740 M0 acceptance: collaboration projection observations now distinguish exact initial assertions from monotone replay assertions. A resumed token-free journey keeps its historical version/generation captures while accepting only forward state progression and non-decreasing counters, so durable replay cannot mistake a later `completed` admission for drift from its earlier `admitted` checkpoint.
+
 - Add deterministic solo-first collaboration admission, hard server-derived
   eligibility, smallest-team selection, evidence-correlation penalties,
   task-specific verified reliability, sparse private routes, bounded

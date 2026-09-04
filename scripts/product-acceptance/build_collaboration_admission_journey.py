@@ -14,7 +14,7 @@ import run_m0_journey as journey
 
 
 BASE_JOURNEY_ID = "single-node-web-company-v5"
-COLLABORATION_JOURNEY_ID = "single-node-collaboration-admission-v1"
+COLLABORATION_JOURNEY_ID = "single-node-collaboration-admission-v2"
 ORGANIZATION_DIGEST = "8573b066e5b7205e3af66a58352c4c698387b6f17e657f7f57f6daa9edadb1c6"
 DESIGN_CONTRACT_DIGEST = "4a6aac2362da98d08ad589ba5e36a12eda339a3c0f61f73f30af2a6d714dbd93"
 SOURCE_CONTRACT_DIGEST = "7af74cf0681ccef86e9b28d2caac337e5f08448435d9eb139ade1590a67ab702"
@@ -79,10 +79,21 @@ def _observe_project(
         "route_role": "operator",
         "query": {"project_id": _ref(project_id_ref)},
         "expected_status": [200],
-        "assertions": [
+        "assertions": [],
+        "initial_assertions": [
             {
                 "pointer": f"/collaboration_admissions/{admission_index}/state",
                 "equals": expected_state,
+            }
+        ],
+        "replay_assertions": [
+            {
+                "pointer": f"/collaboration_admissions/{admission_index}/state",
+                "one_of": (
+                    ["admitted", "completed"]
+                    if expected_state == "admitted"
+                    else ["completed"]
+                ),
             }
         ],
         "capture": {
@@ -96,7 +107,7 @@ def _observe_project(
             "interval_ms": 50,
             "max_attempts": 5,
             "max_elapsed_ms": 5_000,
-            "replay": "exact_status_and_captures",
+            "replay": "monotone_status_and_captures",
             "retry_statuses": [404, 409, 425, 429],
         },
     }
