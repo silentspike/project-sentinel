@@ -114,14 +114,18 @@ pub fn initialize_episode_projection_bootstrap(
     tick_duration_millis: u64,
 ) -> anyhow::Result<EpisodeProjectionBootstrapReceipt> {
     let existing = hippocampus.store().load_episode_projection_control()?;
-    let legacy_episode_bucket_count = hippocampus
-        .store()
-        .list_agents_with_episodes()?
-        .into_iter()
-        .try_fold(0_usize, |count, agent_name| {
-            let has_episodes = !hippocampus.store().load_episodes(&agent_name)?.is_empty();
-            Ok::<_, anyhow::Error>(count + usize::from(has_episodes))
-        })?;
+    let legacy_episode_bucket_count = if existing.is_some() {
+        hippocampus.store().list_agents_with_episodes()?.len()
+    } else {
+        hippocampus
+            .store()
+            .list_agents_with_episodes()?
+            .into_iter()
+            .try_fold(0_usize, |count, agent_name| {
+                let has_episodes = !hippocampus.store().load_episodes(&agent_name)?.is_empty();
+                Ok::<_, anyhow::Error>(count + usize::from(has_episodes))
+            })?
+    };
 
     let status = if existing.is_some() {
         EpisodeProjectionBootstrapStatus::AlreadyInitialized

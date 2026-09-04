@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
+use std::cell::Cell;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::episode::Episode;
@@ -43,6 +45,11 @@ const KEY_SEPARATOR: char = '\u{1f}';
 
 #[cfg(test)]
 static EPISODE_PROJECTION_FAULT_STAGE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static GENERATION_SNAPSHOT_CAPTURES: Cell<usize> = const { Cell::new(0) };
+}
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
@@ -641,8 +648,9 @@ impl HippocampusStore {
             );
         }
 
+        let projection_already_initialized = self.load_episode_projection_control()?.is_some();
         let write_txn = self.db.begin_write()?;
-        let has_existing_episode_data = {
+        let has_existing_episode_data = !projection_already_initialized && {
             let episodes = write_txn.open_table(EPISODES)?;
             let mut has_data = false;
             for entry in episodes.iter()? {
@@ -1631,6 +1639,22 @@ impl HippocampusStore {
         &self,
         projection_control: &EpisodeProjectionControl,
     ) -> anyhow::Result<()> {
+        {
+            let read_txn = self.db.begin_read()?;
+            let generations = read_txn.open_table(EPISODE_PROJECTION_GENERATIONS)?;
+            if let Some(control) = table_json_value::<EpisodeProjectionGenerationControl>(
+                &generations,
+                EPISODE_PROJECTION_GENERATION_CONTROL_KEY,
+            )? {
+                validate_generation_control_and_records(&generations, &control)?;
+                return Ok(());
+            }
+            anyhow::ensure!(
+                generations.iter()?.next().is_none(),
+                "orphaned episode projection generation records"
+            );
+        }
+
         let mut snapshot = capture_generation_snapshot_from(&self.db)?;
         let source_cut = episode_projection_source_cut_coverage(
             projection_control.start_policy.source_row_id(),
@@ -2435,7 +2459,10 @@ fn load_projection_readiness_from<D: ReadableDatabase>(
     })
 }
 
-fn table_json_value<T>(table: &redb::Table<'_, &str, &[u8]>, key: &str) -> anyhow::Result<Option<T>>
+fn table_json_value<T>(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> anyhow::Result<Option<T>>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -3073,6 +3100,9 @@ fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
 fn capture_generation_snapshot_from<D: ReadableDatabase>(
     db: &D,
 ) -> anyhow::Result<EpisodeProjectionGenerationSnapshot> {
+    #[cfg(test)]
+    GENERATION_SNAPSHOT_CAPTURES.with(|count| count.set(count.get() + 1));
+
     let read_txn = db.begin_read()?;
     let state = read_txn.open_table(EPISODE_PROJECTION_STATE)?;
     let receipts = read_txn.open_table(EPISODE_SOURCE_RECEIPTS)?;
@@ -3323,7 +3353,7 @@ fn ensure_no_open_generation_transition(
 }
 
 fn validate_generation_control_and_records(
-    generations: &redb::Table<'_, &str, &[u8]>,
+    generations: &impl ReadableTable<&'static str, &'static [u8]>,
     control: &EpisodeProjectionGenerationControl,
 ) -> anyhow::Result<()> {
     validate_generation_id(&control.active_generation_id)?;
@@ -4155,6 +4185,31 @@ mod tests {
             source_cut_digest: "cd".repeat(32),
             authorization_digest: "ab".repeat(32),
         }
+    }
+
+    #[test]
+    fn existing_episode_projection_skips_generation_snapshot_rebuild() {
+        let _guard = PROJECTION_TEST_LOCK.lock().unwrap();
+        let (store, _dir) = temp_store();
+        let agent = projection_agent();
+
+        GENERATION_SNAPSHOT_CAPTURES.with(|count| count.set(0));
+        store
+            .initialize_episode_projection(
+                &EpisodeProjectionStartPolicy::Beginning,
+                std::slice::from_ref(&agent),
+            )
+            .unwrap();
+        assert_eq!(GENERATION_SNAPSHOT_CAPTURES.with(Cell::get), 1);
+
+        GENERATION_SNAPSHOT_CAPTURES.with(|count| count.set(0));
+        store
+            .initialize_episode_projection(
+                &EpisodeProjectionStartPolicy::Beginning,
+                std::slice::from_ref(&agent),
+            )
+            .unwrap();
+        assert_eq!(GENERATION_SNAPSHOT_CAPTURES.with(Cell::get), 0);
     }
 
     fn overwrite_projection_control(store: &HippocampusStore, control: &EpisodeProjectionControl) {
