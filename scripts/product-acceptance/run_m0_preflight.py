@@ -34,6 +34,8 @@ MAX_COMMAND_BYTES = 512 * 1024
 MAX_HTTP_BYTES = 1024 * 1024
 MAX_TIMEOUT_SECONDS = 15.0
 MAX_AGENTS = 60
+LLM_COMPLETION_IN_FLIGHT_GRACE_MS = 120_000
+LLM_COMPLETION_FUTURE_SKEW_MS = 5_000
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -386,7 +388,21 @@ CANONICAL_RELEASE_ARTIFACTS.update(
         for name in CANONICAL_AGENT_FILES
     }
 )
-EVENT_STORE_SQL = """
+LLM_COMPLETION_BACKLOG_SQL = f"""
+SELECT COUNT(*) FROM llm_completion_outbox
+WHERE status IN ('pending_usage', 'ready_for_action', 'failed', 'action_claimed')
+   OR (
+        status = 'provider_in_flight'
+        AND (
+             created_at <= CAST(strftime('%s', 'now') AS INTEGER) * 1000
+                           - {LLM_COMPLETION_IN_FLIGHT_GRACE_MS}
+             OR created_at > CAST(strftime('%s', 'now') AS INTEGER) * 1000
+                           + {LLM_COMPLETION_FUTURE_SKEW_MS}
+        )
+   )
+""".strip()
+
+EVENT_STORE_SQL = f"""
 SELECT
   COALESCE((SELECT MAX(id) FROM events), 0) AS latest_event_id,
   (SELECT COUNT(*) FROM outbox
@@ -394,7 +410,7 @@ SELECT
   (SELECT COUNT(*) FROM outbox o
      LEFT JOIN events e ON e.event_id = o.event_id
      WHERE e.event_id IS NULL) AS orphan_outbox,
-  (SELECT COUNT(*) FROM llm_completion_outbox) AS unresolved_llm,
+  ({LLM_COMPLETION_BACKLOG_SQL}) AS unresolved_llm,
   (SELECT COUNT(*) FROM runtime_config_recovery) AS runtime_recovery,
   (SELECT COUNT(*) FROM runtime_config_apply_recovery) AS config_apply_recovery,
   (SELECT last_event_id FROM projection_offsets
