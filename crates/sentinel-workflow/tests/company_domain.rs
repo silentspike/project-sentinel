@@ -357,10 +357,21 @@ fn project_command(
     *project
 }
 
-fn collaboration_authority() -> CollaborationAuthorityFenceV1 {
+fn collaboration_authority(
+    project: &sentinel_workflow::ProjectV1,
+    work_item_id: &WorkItemId,
+) -> CollaborationAuthorityFenceV1 {
+    let assignment = project.work_items[work_item_id]
+        .assignments
+        .iter()
+        .find(|assignment| assignment.active)
+        .unwrap();
     CollaborationAuthorityFenceV1 {
         organization_generation: 1,
         organization_digest: DIGEST.to_owned(),
+        assignment_id: assignment.assignment_id.clone(),
+        assignment_version: assignment.assignment_version,
+        assignment_digest: assignment.canonical_digest().unwrap(),
         policy_version: 1,
         policy_digest: DIGEST.to_owned(),
     }
@@ -2510,7 +2521,7 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
         302,
     );
 
-    let authority = collaboration_authority();
+    let authority = collaboration_authority(&project, &work_item_id);
     let unscoped = state.store.apply_company_command(
         &state.pm,
         Uuid::from_u128(3303),
@@ -2634,6 +2645,36 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
         303,
     );
     let session_id = project.collaboration_sessions[0].session_id.clone();
+    let mut stale_assignment = authority.clone();
+    stale_assignment.assignment_version += 1;
+    let stale_assignment_error = state
+        .store
+        .apply_company_command(
+            &state.pm,
+            Uuid::from_u128(5304),
+            &CompanyWorkflowCommandV1::TransitionCollaborationSession {
+                project_id: state.project_id.clone(),
+                expected_version: project.version,
+                session_id: session_id.clone(),
+                expected_transition_sequence: 1,
+                authority: stale_assignment,
+                target: CollaborationSessionStateV1::CollectingIndependentClaims,
+                reason_ref: "stale assignment must fail".to_owned(),
+            },
+            304,
+        )
+        .unwrap_err();
+    assert_eq!(
+        stale_assignment_error.code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+    assert_eq!(
+        state
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .unwrap(),
+        Some(project.clone())
+    );
     project = project_command(
         &state.store,
         &state.pm,
@@ -2771,33 +2812,57 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
         .iter()
         .all(|claim| claim.exposure_state == ClaimExposureStateV1::Exposed));
 
-    project = project_command(
-        &state.store,
-        &state.developer,
-        310,
-        CompanyWorkflowCommandV1::OfferHandoffPacket {
-            project_id: state.project_id.clone(),
-            expected_version: project.version,
-            session_id: session_id.clone(),
-            expected_transition_sequence: 6,
-            authority: authority.clone(),
-            work_item_id: work_item_id.clone(),
-            consumer: AgentId(3),
-            objective_ref: "independently verify the implementation".to_owned(),
-            authority_scope_ref: "work-item collaboration-work".to_owned(),
-            authority_scope_digest: DIGEST.to_owned(),
-            input_digests: BTreeSet::from([DIGEST.to_owned()]),
-            artifact_digests: BTreeSet::from([OTHER_DIGEST.to_owned()]),
-            evidence: evidence("handoff evidence"),
-            assumptions: vec!["artifact is immutable".to_owned()],
-            unresolved_questions: vec!["is the failure path bounded".to_owned()],
-            uncertainty: UncertaintyClassV1::Material,
-            acceptance_checks: vec!["reproduce the negative path".to_owned()],
-            required_capabilities: BTreeSet::from(["qa".to_owned()]),
-            privacy_classes: BTreeSet::from(["project-internal".to_owned()]),
-        },
-        311,
+    let offer_handoff = CompanyWorkflowCommandV1::OfferHandoffPacket {
+        project_id: state.project_id.clone(),
+        expected_version: project.version,
+        session_id: session_id.clone(),
+        expected_transition_sequence: 6,
+        authority: authority.clone(),
+        work_item_id: work_item_id.clone(),
+        consumer: AgentId(3),
+        objective_ref: "independently verify the implementation".to_owned(),
+        authority_scope_ref: authority.assignment_id.clone(),
+        authority_scope_digest: authority.assignment_digest.clone(),
+        input_digests: BTreeSet::from([DIGEST.to_owned()]),
+        artifact_digests: BTreeSet::from([OTHER_DIGEST.to_owned()]),
+        evidence: evidence("handoff evidence"),
+        assumptions: vec!["artifact is immutable".to_owned()],
+        unresolved_questions: vec!["is the failure path bounded".to_owned()],
+        uncertainty: UncertaintyClassV1::Material,
+        acceptance_checks: vec!["reproduce the negative path".to_owned()],
+        required_capabilities: BTreeSet::from(["qa".to_owned()]),
+        privacy_classes: BTreeSet::from(["project-internal".to_owned()]),
+    };
+    let mut wrong_authority_scope = offer_handoff.clone();
+    let CompanyWorkflowCommandV1::OfferHandoffPacket {
+        authority_scope_digest,
+        ..
+    } = &mut wrong_authority_scope
+    else {
+        unreachable!()
+    };
+    *authority_scope_digest = DIGEST.to_owned();
+    let wrong_authority_error = state
+        .store
+        .apply_company_command(
+            &state.developer,
+            Uuid::from_u128(5310),
+            &wrong_authority_scope,
+            311,
+        )
+        .unwrap_err();
+    assert_eq!(
+        wrong_authority_error.code,
+        WorkflowErrorCode::AuthorityConflict
     );
+    assert_eq!(
+        state
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .unwrap(),
+        Some(project.clone())
+    );
+    project = project_command(&state.store, &state.developer, 310, offer_handoff, 311);
     let packet_id = project.handoff_packets[0].packet_id.clone();
     let packet_digest = project.handoff_packets[0].packet_digest.clone();
     project = project_command(
@@ -2928,8 +2993,8 @@ fn collaboration_journey_is_durable_fenced_bounded_and_replayable() {
             work_item_id: work_item_id.clone(),
             consumer: AgentId(3),
             objective_ref: "verify clarification novelty".to_owned(),
-            authority_scope_ref: "work-item collaboration-work".to_owned(),
-            authority_scope_digest: DIGEST.to_owned(),
+            authority_scope_ref: authority.assignment_id.clone(),
+            authority_scope_digest: authority.assignment_digest.clone(),
             input_digests: BTreeSet::from([DIGEST.to_owned()]),
             artifact_digests: BTreeSet::new(),
             evidence: evidence("novelty evidence"),
