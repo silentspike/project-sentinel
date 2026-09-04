@@ -34,6 +34,7 @@ MAX_COMMAND_BYTES = 512 * 1024
 MAX_HTTP_BYTES = 1024 * 1024
 MAX_TIMEOUT_SECONDS = 15.0
 MAX_AGENTS = 60
+STORE_SNAPSHOT_ATTEMPTS = 8
 LLM_COMPLETION_IN_FLIGHT_GRACE_MS = 120_000
 LLM_COMPLETION_FUTURE_SKEW_MS = 5_000
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1973,24 +1974,25 @@ def parse_projection_snapshot(data: bytes) -> tuple[dict[str, int], list[dict[st
 def capture_store_snapshot(
     inputs: Inputs, deps: Dependencies
 ) -> tuple[dict[str, int], dict[str, int], Any]:
-    event_before = read_event_cut(inputs, deps)
-    projection, projection_identity = parse_projection_snapshot(
-        deps.command(
-            [
-                "/usr/bin/sqlite3",
-                "-readonly",
-                "-json",
-                str(inputs.projection_store),
-                PROJECTION_SNAPSHOT_SQL,
-            ],
-            inputs.timeout_seconds,
-            MAX_COMMAND_BYTES,
+    for _ in range(STORE_SNAPSHOT_ATTEMPTS):
+        event_before = read_event_cut(inputs, deps)
+        projection, projection_identity = parse_projection_snapshot(
+            deps.command(
+                [
+                    "/usr/bin/sqlite3",
+                    "-readonly",
+                    "-json",
+                    str(inputs.projection_store),
+                    PROJECTION_SNAPSHOT_SQL,
+                ],
+                inputs.timeout_seconds,
+                MAX_COMMAND_BYTES,
+            )
         )
-    )
-    event_after = read_event_cut(inputs, deps)
-    if event_before != event_after:
-        raise PreflightError("event_cut_changed")
-    return event_before, projection, projection_identity
+        event_after = read_event_cut(inputs, deps)
+        if event_before == event_after:
+            return event_before, projection, projection_identity
+    raise PreflightError("event_cut_changed")
 
 
 def validate_stores(
