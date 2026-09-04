@@ -832,6 +832,61 @@ class JourneyRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.JourneyError, "observe bounds exhausted"):
             self.run_plan_v2()
 
+    def test_v2_monotone_observe_replays_progressed_projection(self) -> None:
+        plan = canonical_plan_v2()
+        observe = plan["steps"][4]
+        observe["assertions"] = []
+        observe["initial_assertions"] = [
+            {"pointer": "/state", "equals": "ready"}
+        ]
+        observe["replay_assertions"] = [
+            {"pointer": "/state", "one_of": ["ready", "completed"]}
+        ]
+        observe["capture"] = {
+            "generation": {"pointer": "/generation", "type": "integer"}
+        }
+        observe["observe"]["replay"] = "monotone_status_and_captures"
+
+        completed = self.run_plan_v2(plan)
+        records = {item["id"]: item for item in completed["steps"]}
+        self.assertEqual(records["observe_project"]["captures"]["generation"], 1)
+        self.assertEqual(
+            records["observe_project"]["replay_contract"], "monotone_observe_v2"
+        )
+
+        self.state.response_overrides["/operator/observe"] = {
+            "state": "completed",
+            "generation": 2,
+        }
+        replayed = self.run_plan_v2(plan)
+        records = {item["id"]: item for item in replayed["steps"]}
+        self.assertEqual(records["observe_project"]["captures"]["generation"], 1)
+
+        self.state.response_overrides["/operator/observe"] = {
+            "state": "completed",
+            "generation": 0,
+        }
+        with self.assertRaisesRegex(
+            runner.JourneyError, "authoritative replay changed the outcome"
+        ):
+            self.run_plan_v2(plan)
+
+    def test_v2_monotone_observe_contract_is_explicit_and_fail_closed(self) -> None:
+        plan = canonical_plan_v2()
+        observe = plan["steps"][4]
+        observe["observe"]["replay"] = "monotone_status_and_captures"
+        with self.assertRaisesRegex(runner.JourneyError, "initial_assertions"):
+            runner.validate_plan(plan)
+
+        observe["initial_assertions"] = [
+            {"pointer": "/state", "equals": "ready"}
+        ]
+        observe["replay_assertions"] = [
+            {"pointer": "/state", "one_of": []}
+        ]
+        with self.assertRaisesRegex(runner.JourneyError, "one_of is invalid"):
+            runner.validate_plan(plan)
+
     def test_v2_observe_503_is_immediate_and_attempt_bounds_fail_closed(self) -> None:
         self.state.response_sequences["/operator/observe"] = [
             (503, {"code": "adapter_unavailable"}),

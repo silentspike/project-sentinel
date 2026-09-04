@@ -174,6 +174,27 @@ class CollaborationAdmissionJourneyTests(unittest.TestCase):
             {"$ref": "observe_directed_handoff_completed.project_version"},
         )
 
+    def test_mutable_admission_observations_replay_monotonically(self) -> None:
+        for prefix in (
+            "independent_review",
+            "solo",
+            "directed_handoff",
+            "specialist_panel",
+        ):
+            admitted = self.steps[f"observe_{prefix}_admitted"]
+            self.assertEqual(
+                admitted["observe"]["replay"],
+                "monotone_status_and_captures",
+            )
+            self.assertEqual(
+                admitted["replay_assertions"][0]["one_of"],
+                ["admitted", "completed"],
+            )
+            completed = self.steps[f"observe_{prefix}_completed"]
+            self.assertEqual(
+                completed["replay_assertions"][0]["one_of"], ["completed"]
+            )
+
     def test_m0_designer_and_qa_match_their_pinned_tool_profiles(self) -> None:
         authoring = tomllib.loads(
             (REPO_ROOT / "config/workbench-profiles/web-authoring-v1.toml").read_text(
