@@ -29,7 +29,7 @@ func BenchmarkAppendWithOutbox(b *testing.B) {
 			SchemaVersion:    1,
 			CompensationType: "none",
 		}
-		if err := store.AppendWithOutbox(event, "sentinel/cortex/events/test"); err != nil {
+		if err := store.appendWithOutbox(event, "sentinel/cortex/events/test"); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -58,7 +58,7 @@ func BenchmarkAppendWithOutbox_15Agents(b *testing.B) {
 				Tick:          int64(tick),
 				SchemaVersion: 1,
 			}
-			if err := store.AppendWithOutbox(event, fmt.Sprintf("sentinel/cortex/events/AGENT-%02d", agent)); err != nil {
+			if err := store.appendWithOutbox(event, fmt.Sprintf("sentinel/cortex/events/AGENT-%02d", agent)); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -86,7 +86,7 @@ func BenchmarkIdempotentRetry(b *testing.B) {
 		Tick:          1,
 		SchemaVersion: 1,
 	}
-	if err := store.AppendWithOutbox(event, "test/topic"); err != nil {
+	if err := store.appendWithOutbox(event, "test/topic"); err != nil {
 		b.Fatal(err)
 	}
 
@@ -103,7 +103,7 @@ func BenchmarkIdempotentRetry(b *testing.B) {
 			Tick:          1,
 			SchemaVersion: 1,
 		}
-		if err := store.AppendWithOutbox(retry, "test/topic"); err != nil {
+		if err := store.appendWithOutbox(retry, "test/topic"); err != nil {
 			b.Fatal(err)
 		}
 	}

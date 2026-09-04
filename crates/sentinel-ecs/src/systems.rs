@@ -2309,7 +2309,9 @@ pub fn persist_system(
 
         if !persist_workspace.is_empty() {
             let event_count = persist_workspace.len();
-            let batch_result = es.0.append_with_outbox_batch(persist_workspace.entries());
+            let batch_result =
+                es.0.legacy_append_gateway(sentinel_limbo::LegacyEventProducer::EcsTickBatch)
+                    .append_with_outbox_batch(persist_workspace.entries());
 
             if let Err(err) = batch_result {
                 warn!(

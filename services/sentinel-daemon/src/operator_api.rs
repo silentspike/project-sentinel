@@ -3674,6 +3674,7 @@ fn persist_landlock_block_event(
     let topic = format!("sentinel/events/security_exec_blocked/{agent_name}");
     state
         .event_store
+        .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonOperatorApi)
         .append_with_outbox(&event, &topic)
         .map_err(|_| {
             ApiError::ServiceUnavailable("Security-Exec-Event konnte nicht persistiert werden")

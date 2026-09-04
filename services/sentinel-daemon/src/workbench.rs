@@ -687,7 +687,11 @@ pub fn publish_workbench_records(
 ) -> anyhow::Result<Vec<i64>> {
     records
         .iter()
-        .map(|record| event_store.append_event(&record.safe_event(tick)?))
+        .map(|record| {
+            event_store
+                .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonWorkbench)
+                .append_event(&record.safe_event(tick)?)
+        })
         .collect()
 }
 

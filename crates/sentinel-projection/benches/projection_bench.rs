@@ -82,7 +82,10 @@ fn seed_events(store: &EventStore, count: u64) {
             i * 100,
         );
         event.timestamp_ms = i * 1000;
-        store.append_event(&event).unwrap();
+        store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::BenchmarkHarness)
+            .append_event(&event)
+            .unwrap();
     }
 }
 

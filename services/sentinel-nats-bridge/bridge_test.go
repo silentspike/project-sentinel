@@ -327,7 +327,7 @@ func TestGetEventsSince(t *testing.T) {
 
 	// Insert 3 events
 	for i := 0; i < 3; i++ {
-		err := store.AppendWithOutbox(eventstore.DomainEvent{
+		err := store.LegacyAppendGateway(eventstore.LegacyProducerTestHarness).AppendWithOutbox(eventstore.DomainEvent{
 			EventID:       eventstore.GenerateUUID(),
 			EventType:     "agent_chat",
 			AggregateID:   "AGENT-01",

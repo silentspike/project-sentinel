@@ -1844,8 +1844,12 @@ fn ensure_or_append_event(
         return same_event(&existing, expected);
     }
     match topic {
-        Some(topic) => store.append_with_outbox(expected, topic),
-        None => store.append_event(expected),
+        Some(topic) => store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonWorkflow)
+            .append_with_outbox(expected, topic),
+        None => store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonWorkflow)
+            .append_event(expected),
     }
     .map_err(storage_error)?;
     let existing = store

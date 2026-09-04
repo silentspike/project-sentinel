@@ -41,6 +41,8 @@ jobs:
             rust:
               - 'crates/**'
               - 'services/**'
+              - 'schemas/event/**'
+              - 'schemas/inference/**'
               - 'Cargo.toml'
               - '**/Cargo.toml'
               - 'Cargo.lock'
@@ -54,6 +56,8 @@ jobs:
               - 'services/sentinel-judge/**'
               - 'services/sentinel-nats-bridge/**'
               - 'pkg/**'
+              - 'schemas/event/**'
+              - 'schemas/inference/**'
               - 'go.work'
               - 'go.work.sum'
             console:
@@ -96,6 +100,11 @@ jobs:
 
       - name: Fenced-writer enforcement (#496)
         run: python3 scripts/check-fenced-writers.py
+
+      - name: Canonical event append boundary (#732)
+        run: |
+          python3 scripts/check-event-append-boundary.py
+          python3 -m unittest discover -s scripts/tests -p 'test_check_event_append_boundary.py'
 
       - name: Dependency patch registry enforcement (#634)
         run: |
@@ -332,7 +341,7 @@ jobs:
         run: cargo test -p sentinel-ebpf --features ebpf || ${{ vars.RUNNER_MODE == 'hosted' && 'echo "::warning::eBPF tests failed (kernel headers may be missing)"' || 'exit 1' }}
 
   # ──────────────────────────────────────────────
-  # Go - only when cmd/ changed
+  # Go - when any shipped Go module or shared schema changes
   # ──────────────────────────────────────────────
   go:
     needs: changes
@@ -344,19 +353,20 @@ jobs:
       - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
         with:
           go-version-file: cmd/cortex-gateway/go.mod
-          cache-dependency-path: cmd/cortex-gateway/go.sum
+          cache-dependency-path: |
+            cmd/cortex-gateway/go.sum
+            pkg/sentinel-go/go.sum
+            services/sentinel-judge/go.sum
+            services/sentinel-nats-bridge/go.sum
 
       - name: Build
-        working-directory: cmd/cortex-gateway
-        run: go build ./...
+        run: go build ./cmd/cortex-gateway/... ./pkg/sentinel-go/... ./services/sentinel-judge/... ./services/sentinel-nats-bridge/...
 
       - name: Vet
-        working-directory: cmd/cortex-gateway
-        run: go vet ./...
+        run: go vet ./cmd/cortex-gateway/... ./pkg/sentinel-go/... ./services/sentinel-judge/... ./services/sentinel-nats-bridge/...
 
       - name: Tests
-        working-directory: cmd/cortex-gateway
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 ./cmd/cortex-gateway/... ./pkg/sentinel-go/... ./services/sentinel-judge/... ./services/sentinel-nats-bridge/...
 
       - name: Lint
         uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
