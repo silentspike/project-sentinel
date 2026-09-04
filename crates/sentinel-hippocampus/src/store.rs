@@ -49,6 +49,7 @@ static EPISODE_PROJECTION_FAULT_STAGE: AtomicU8 = AtomicU8::new(0);
 #[cfg(test)]
 thread_local! {
     static GENERATION_SNAPSHOT_CAPTURES: Cell<usize> = const { Cell::new(0) };
+    static GENERATION_RECORD_DEEP_VALIDATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -439,6 +440,18 @@ struct EpisodeProjectionGenerationSnapshot {
 struct EpisodeProjectionGenerationControl {
     active_generation_id: String,
     activation_epoch: u64,
+    #[serde(default)]
+    record_seals: Vec<EpisodeProjectionGenerationRecordSeal>,
+    #[serde(default)]
+    seal_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct EpisodeProjectionGenerationRecordSeal {
+    generation_id: String,
+    phase: EpisodeProjectionGenerationPhase,
+    candidate_digest: String,
+    encoded_record_digest: String,
 }
 
 #[derive(Debug)]
@@ -975,6 +988,13 @@ impl HippocampusStore {
         list_projection_frontiers_from(&self.db)
     }
 
+    /// Load and validate every frontier used by runtime admission in one read.
+    pub fn list_episode_projection_frontiers_for_admission(
+        &self,
+    ) -> anyhow::Result<Vec<EpisodeProjectionFrontier>> {
+        list_projection_frontiers_for_admission_from(&self.db)
+    }
+
     /// Load the permanent idempotency receipt for one agent/source event.
     pub fn load_episode_source_receipt(
         &self,
@@ -1464,6 +1484,7 @@ impl HippocampusStore {
             snapshot,
         };
         insert_json(&mut generations, &key, &record)?;
+        seal_generation_control(&mut generations, control)?;
         drop(generations);
         drop(quarantine);
         drop(archive);
@@ -1520,6 +1541,7 @@ impl HippocampusStore {
             "episode projection generation discard candidate CAS conflict"
         );
         generations.remove(key.as_str())?;
+        seal_generation_control(&mut generations, control)?;
         drop(generations);
         write_txn.commit()?;
         self.load_episode_projection_generation_status()
@@ -1579,6 +1601,7 @@ impl HippocampusStore {
         );
         record.phase = EpisodeProjectionGenerationPhase::Validated;
         insert_json(&mut generations, &key, &record)?;
+        seal_generation_control(&mut generations, control)?;
         drop(generations);
         drop(archive);
         write_txn.commit()?;
@@ -1635,24 +1658,62 @@ impl HippocampusStore {
         load_generation_status_from(&self.db)
     }
 
+    /// Validate the compact generation seal and report only open transitions.
+    /// Full generation material remains available through the operator status
+    /// path, but runtime admission must not deserialize it once per agent.
+    pub fn load_episode_projection_generation_readiness_blocks(
+        &self,
+    ) -> anyhow::Result<Vec<EpisodeProjectionReadinessBlock>> {
+        let read_txn = self.db.begin_read()?;
+        let generations = read_txn.open_table(EPISODE_PROJECTION_GENERATIONS)?;
+        generation_readiness_blocks(&generations)
+    }
+
     fn ensure_episode_projection_generation(
         &self,
         projection_control: &EpisodeProjectionControl,
     ) -> anyhow::Result<()> {
-        {
+        let needs_seal_migration = {
             let read_txn = self.db.begin_read()?;
             let generations = read_txn.open_table(EPISODE_PROJECTION_GENERATIONS)?;
             if let Some(control) = table_json_value::<EpisodeProjectionGenerationControl>(
                 &generations,
                 EPISODE_PROJECTION_GENERATION_CONTROL_KEY,
             )? {
-                validate_generation_control_and_records(&generations, &control)?;
-                return Ok(());
+                if !control.record_seals.is_empty() || control.seal_digest.is_some() {
+                    anyhow::ensure!(
+                        !control.record_seals.is_empty() && control.seal_digest.is_some(),
+                        "episode projection generation control seal is incomplete"
+                    );
+                    generation_readiness_blocks_from_seal(&generations, &control)?;
+                    return Ok(());
+                }
+                true
+            } else {
+                anyhow::ensure!(
+                    generations.iter()?.next().is_none(),
+                    "orphaned episode projection generation records"
+                );
+                false
             }
-            anyhow::ensure!(
-                generations.iter()?.next().is_none(),
-                "orphaned episode projection generation records"
-            );
+        };
+
+        if needs_seal_migration {
+            let write_txn = self.db.begin_write()?;
+            let mut generations = write_txn.open_table(EPISODE_PROJECTION_GENERATIONS)?;
+            let control = load_generation_control(&generations)?;
+            if !control.record_seals.is_empty() || control.seal_digest.is_some() {
+                anyhow::ensure!(
+                    !control.record_seals.is_empty() && control.seal_digest.is_some(),
+                    "episode projection generation control seal is incomplete"
+                );
+                generation_readiness_blocks_from_seal(&generations, &control)?;
+            } else {
+                seal_generation_control(&mut generations, control)?;
+            }
+            drop(generations);
+            write_txn.commit()?;
+            return Ok(());
         }
 
         let mut snapshot = capture_generation_snapshot_from(&self.db)?;
@@ -1685,7 +1746,15 @@ impl HippocampusStore {
             &generations,
             EPISODE_PROJECTION_GENERATION_CONTROL_KEY,
         )? {
-            validate_generation_control_and_records(&generations, &control)?;
+            if !control.record_seals.is_empty() || control.seal_digest.is_some() {
+                anyhow::ensure!(
+                    !control.record_seals.is_empty() && control.seal_digest.is_some(),
+                    "episode projection generation control seal is incomplete"
+                );
+                generation_readiness_blocks_from_seal(&generations, &control)?;
+            } else {
+                seal_generation_control(&mut generations, control)?;
+            }
             drop(generations);
             write_txn.commit()?;
             return Ok(());
@@ -1707,12 +1776,13 @@ impl HippocampusStore {
             &generation_record_key(&generation_id),
             &record,
         )?;
-        insert_json(
+        seal_generation_control(
             &mut generations,
-            EPISODE_PROJECTION_GENERATION_CONTROL_KEY,
-            &EpisodeProjectionGenerationControl {
+            EpisodeProjectionGenerationControl {
                 active_generation_id: generation_id,
                 activation_epoch: 0,
+                record_seals: Vec::new(),
+                seal_digest: None,
             },
         )?;
         drop(generations);
@@ -1825,11 +1895,7 @@ impl HippocampusStore {
         insert_json(&mut generations, &target_key, &target)?;
         generation_control.active_generation_id = generation_id.to_string();
         generation_control.activation_epoch = generation_control.activation_epoch.saturating_add(1);
-        insert_json(
-            &mut generations,
-            EPISODE_PROJECTION_GENERATION_CONTROL_KEY,
-            &generation_control,
-        )?;
+        seal_generation_control(&mut generations, generation_control)?;
 
         drop(generations);
         drop(quarantine);
@@ -2286,6 +2352,49 @@ fn list_projection_frontiers_from<D: ReadableDatabase>(
         if key.value().starts_with(&prefix) {
             frontiers.push(serde_json::from_slice(value.value())?);
         }
+    }
+    frontiers.sort_by_key(|frontier| frontier.subject.storage_key());
+    Ok(frontiers)
+}
+
+fn list_projection_frontiers_for_admission_from<D: ReadableDatabase>(
+    db: &D,
+) -> anyhow::Result<Vec<EpisodeProjectionFrontier>> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(EPISODE_PROJECTION_STATE)?;
+    let control: EpisodeProjectionControl = table
+        .get(EPISODE_PROJECTION_CONTROL_KEY)?
+        .map(|value| serde_json::from_slice(value.value()))
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("episode projection is uninitialized"))?;
+    validate_projection_control(&control)?;
+    let cutover = table
+        .get(EPISODE_PROJECTION_CUTOVER_KEY)?
+        .map(|value| serde_json::from_slice(value.value()))
+        .transpose()?;
+    validate_persisted_cutover_value(&control, cutover)?;
+
+    let prefix = format!("frontier{KEY_SEPARATOR}");
+    let mut frontiers = Vec::new();
+    for entry in table.iter()? {
+        let (key, value) = entry?;
+        if matches!(
+            key.value(),
+            EPISODE_PROJECTION_CONTROL_KEY | EPISODE_PROJECTION_CUTOVER_KEY
+        ) {
+            continue;
+        }
+        anyhow::ensure!(
+            key.value().starts_with(&prefix),
+            "unknown episode projection state key"
+        );
+        let frontier: EpisodeProjectionFrontier = serde_json::from_slice(value.value())?;
+        anyhow::ensure!(
+            key.value() == projection_frontier_key(frontier.subject),
+            "episode projection frontier key/value subject mismatch"
+        );
+        validate_projection_frontier(&frontier, frontier.subject, &control)?;
+        frontiers.push(frontier);
     }
     frontiers.sort_by_key(|frontier| frontier.subject.storage_key());
     Ok(frontiers)
@@ -3352,18 +3461,22 @@ fn ensure_no_open_generation_transition(
     Ok(())
 }
 
-fn validate_generation_control_and_records(
+fn validated_generation_record_seals(
     generations: &impl ReadableTable<&'static str, &'static [u8]>,
     control: &EpisodeProjectionGenerationControl,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<EpisodeProjectionGenerationRecordSeal>> {
     validate_generation_id(&control.active_generation_id)?;
     let mut active_count = 0_usize;
+    let mut open_transition_count = 0_usize;
+    let mut seals = Vec::new();
     for entry in generations.iter()? {
         let (key, value) = entry?;
         if key.value() == EPISODE_PROJECTION_GENERATION_CONTROL_KEY {
             continue;
         }
         let record: EpisodeProjectionGenerationRecord = serde_json::from_slice(value.value())?;
+        #[cfg(test)]
+        GENERATION_RECORD_DEEP_VALIDATIONS.with(|count| count.set(count.get() + 1));
         validate_generation_descriptor(&record.descriptor)?;
         validate_generation_snapshot(
             &record.descriptor,
@@ -3391,12 +3504,166 @@ fn validate_generation_control_and_records(
                 "episode projection active generation/control mismatch"
             );
         }
+        if matches!(
+            record.phase,
+            EpisodeProjectionGenerationPhase::Building
+                | EpisodeProjectionGenerationPhase::Validated
+        ) {
+            open_transition_count += 1;
+        }
+        seals.push(EpisodeProjectionGenerationRecordSeal {
+            generation_id: record.descriptor.generation_id,
+            phase: record.phase,
+            candidate_digest: record.candidate_digest,
+            encoded_record_digest: projection_sha256(
+                b"sentinel-episode-projection-generation-record-v1",
+                value.value(),
+            ),
+        });
     }
     anyhow::ensure!(
         active_count == 1,
         "episode projection must have exactly one active generation"
     );
-    Ok(())
+    anyhow::ensure!(
+        open_transition_count <= 1,
+        "episode projection has multiple open generation transitions"
+    );
+    seals.sort_by(|left, right| left.generation_id.cmp(&right.generation_id));
+    Ok(seals)
+}
+
+fn generation_control_seal_digest(
+    control: &EpisodeProjectionGenerationControl,
+    record_seals: &[EpisodeProjectionGenerationRecordSeal],
+) -> anyhow::Result<String> {
+    let material = serde_json::to_vec(&(
+        1_u16,
+        control.active_generation_id.as_str(),
+        control.activation_epoch,
+        record_seals,
+    ))?;
+    Ok(projection_sha256(
+        b"sentinel-episode-projection-generation-control-v1",
+        &material,
+    ))
+}
+
+fn seal_generation_control(
+    generations: &mut redb::Table<'_, &str, &[u8]>,
+    mut control: EpisodeProjectionGenerationControl,
+) -> anyhow::Result<EpisodeProjectionGenerationControl> {
+    control.record_seals = validated_generation_record_seals(generations, &control)?;
+    control.seal_digest = Some(generation_control_seal_digest(
+        &control,
+        &control.record_seals,
+    )?);
+    insert_json(
+        generations,
+        EPISODE_PROJECTION_GENERATION_CONTROL_KEY,
+        &control,
+    )?;
+    Ok(control)
+}
+
+fn generation_readiness_blocks_from_seal<T>(
+    generations: &T,
+    control: &EpisodeProjectionGenerationControl,
+) -> anyhow::Result<Vec<EpisodeProjectionReadinessBlock>>
+where
+    T: ReadableTable<&'static str, &'static [u8]>,
+{
+    validate_generation_id(&control.active_generation_id)?;
+    anyhow::ensure!(
+        !control.record_seals.is_empty() && control.seal_digest.is_some(),
+        "episode projection generation control is not sealed"
+    );
+    let expected_control_digest = generation_control_seal_digest(control, &control.record_seals)?;
+    let seal_digest = control
+        .seal_digest
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("episode projection generation control seal is missing"))?;
+    anyhow::ensure!(
+        constant_time_bytes_eq(expected_control_digest.as_bytes(), seal_digest.as_bytes(),),
+        "episode projection generation control seal mismatch"
+    );
+
+    let mut previous_generation_id: Option<&str> = None;
+    let mut active_count = 0_usize;
+    let mut open_transition_count = 0_usize;
+    let mut expected_keys = HashSet::new();
+    let mut blockers = Vec::new();
+    for seal in &control.record_seals {
+        validate_generation_id(&seal.generation_id)?;
+        anyhow::ensure!(
+            previous_generation_id.is_none_or(|previous| previous < seal.generation_id.as_str()),
+            "episode projection generation seals must be unique and sorted"
+        );
+        previous_generation_id = Some(&seal.generation_id);
+        anyhow::ensure!(
+            is_lower_sha256_hex(&seal.candidate_digest)
+                && is_lower_sha256_hex(&seal.encoded_record_digest),
+            "episode projection generation record seal is invalid"
+        );
+        let key = generation_record_key(&seal.generation_id);
+        anyhow::ensure!(
+            expected_keys.insert(key.clone()),
+            "duplicate episode projection generation seal"
+        );
+        let value = generations
+            .get(key.as_str())?
+            .ok_or_else(|| anyhow::anyhow!("sealed episode projection generation is missing"))?;
+        let encoded_digest = projection_sha256(
+            b"sentinel-episode-projection-generation-record-v1",
+            value.value(),
+        );
+        anyhow::ensure!(
+            constant_time_bytes_eq(
+                encoded_digest.as_bytes(),
+                seal.encoded_record_digest.as_bytes(),
+            ),
+            "episode projection generation encoded record seal mismatch"
+        );
+        match seal.phase {
+            EpisodeProjectionGenerationPhase::Active => {
+                active_count += 1;
+                anyhow::ensure!(
+                    seal.generation_id == control.active_generation_id,
+                    "episode projection active generation/control seal mismatch"
+                );
+            }
+            phase @ (EpisodeProjectionGenerationPhase::Building
+            | EpisodeProjectionGenerationPhase::Validated) => {
+                open_transition_count += 1;
+                blockers.push(EpisodeProjectionReadinessBlock::GenerationTransition {
+                    generation_id: seal.generation_id.clone(),
+                    phase,
+                });
+            }
+            EpisodeProjectionGenerationPhase::Retained => {}
+        }
+    }
+    anyhow::ensure!(
+        active_count == 1,
+        "episode projection generation seal must have exactly one active generation"
+    );
+    anyhow::ensure!(
+        open_transition_count <= 1,
+        "episode projection generation seal has multiple open transitions"
+    );
+
+    let mut observed_keys = HashSet::new();
+    for entry in generations.iter()? {
+        let (key, _) = entry?;
+        if key.value() != EPISODE_PROJECTION_GENERATION_CONTROL_KEY {
+            observed_keys.insert(key.value().to_string());
+        }
+    }
+    anyhow::ensure!(
+        observed_keys == expected_keys,
+        "episode projection generation seal inventory mismatch"
+    );
+    Ok(blockers)
 }
 
 fn load_generation_status_from<D: ReadableDatabase>(
@@ -3481,6 +3748,13 @@ where
         .transpose()?
         .ok_or_else(|| anyhow::anyhow!("episode projection generation control is missing"))?;
     validate_generation_id(&control.active_generation_id)?;
+    if !control.record_seals.is_empty() || control.seal_digest.is_some() {
+        anyhow::ensure!(
+            !control.record_seals.is_empty() && control.seal_digest.is_some(),
+            "episode projection generation control seal is incomplete"
+        );
+        return generation_readiness_blocks_from_seal(generations, &control);
+    }
     let mut active_count = 0_usize;
     let mut blockers = Vec::new();
     for entry in generations.iter()? {
@@ -4194,6 +4468,7 @@ mod tests {
         let agent = projection_agent();
 
         GENERATION_SNAPSHOT_CAPTURES.with(|count| count.set(0));
+        GENERATION_RECORD_DEEP_VALIDATIONS.with(|count| count.set(0));
         store
             .initialize_episode_projection(
                 &EpisodeProjectionStartPolicy::Beginning,
@@ -4201,8 +4476,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(GENERATION_SNAPSHOT_CAPTURES.with(Cell::get), 1);
+        assert_eq!(GENERATION_RECORD_DEEP_VALIDATIONS.with(Cell::get), 1);
 
         GENERATION_SNAPSHOT_CAPTURES.with(|count| count.set(0));
+        GENERATION_RECORD_DEEP_VALIDATIONS.with(|count| count.set(0));
         store
             .initialize_episode_projection(
                 &EpisodeProjectionStartPolicy::Beginning,
@@ -4210,6 +4487,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(GENERATION_SNAPSHOT_CAPTURES.with(Cell::get), 0);
+        assert_eq!(GENERATION_RECORD_DEEP_VALIDATIONS.with(Cell::get), 0);
+    }
+
+    #[test]
+    fn legacy_generation_control_is_sealed_once_then_uses_bounded_validation() {
+        let _guard = PROJECTION_TEST_LOCK.lock().unwrap();
+        let (store, _dir) = temp_store();
+        let agent = projection_agent();
+        store
+            .initialize_episode_projection(
+                &EpisodeProjectionStartPolicy::Beginning,
+                std::slice::from_ref(&agent),
+            )
+            .unwrap();
+
+        let write_txn = store.db.begin_write().unwrap();
+        {
+            let mut generations = write_txn
+                .open_table(EPISODE_PROJECTION_GENERATIONS)
+                .unwrap();
+            let mut control = load_generation_control(&generations).unwrap();
+            control.record_seals.clear();
+            control.seal_digest = None;
+            insert_json(
+                &mut generations,
+                EPISODE_PROJECTION_GENERATION_CONTROL_KEY,
+                &control,
+            )
+            .unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        GENERATION_RECORD_DEEP_VALIDATIONS.with(|count| count.set(0));
+        store
+            .initialize_episode_projection(
+                &EpisodeProjectionStartPolicy::Beginning,
+                std::slice::from_ref(&agent),
+            )
+            .unwrap();
+        assert_eq!(GENERATION_RECORD_DEEP_VALIDATIONS.with(Cell::get), 1);
+
+        GENERATION_RECORD_DEEP_VALIDATIONS.with(|count| count.set(0));
+        store
+            .initialize_episode_projection(
+                &EpisodeProjectionStartPolicy::Beginning,
+                std::slice::from_ref(&agent),
+            )
+            .unwrap();
+        assert_eq!(GENERATION_RECORD_DEEP_VALIDATIONS.with(Cell::get), 0);
     }
 
     fn overwrite_projection_control(store: &HippocampusStore, control: &EpisodeProjectionControl) {
