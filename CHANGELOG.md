@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Require a meaningful write rate before a relative Platform Control Plane
+  baseline burst can suspend an agent, while preserving the absolute safety
+  threshold and suppressing duplicate actions for already suspended agents
+  (#740).
+
 - Reserve the SQLite projection writer before a batch reads its WAL snapshot,
   so short runtime reconciliation writes wait instead of crashing a full
   projection rebuild with `SQLITE_BUSY` (#740).
