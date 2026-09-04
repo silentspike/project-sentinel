@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -1315,6 +1316,58 @@ class PreflightTests(unittest.TestCase):
             self.check(result, "store_projection_backlog")["reason"],
             "publication_or_recovery_backlog",
         )
+
+    def test_llm_backlog_allows_only_recent_provider_execution(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute(
+            """
+            CREATE TABLE llm_completion_outbox (
+                request_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        now_ms = int(time.time() * 1000)
+
+        def backlog() -> int:
+            return connection.execute(
+                f"SELECT ({preflight.LLM_COMPLETION_BACKLOG_SQL})"
+            ).fetchone()[0]
+
+        connection.execute(
+            "INSERT INTO llm_completion_outbox VALUES (?, ?, ?)",
+            ("active", "provider_in_flight", now_ms),
+        )
+        self.assertEqual(backlog(), 0)
+
+        connection.execute(
+            "INSERT INTO llm_completion_outbox VALUES (?, ?, ?)",
+            (
+                "stale",
+                "provider_in_flight",
+                now_ms - preflight.LLM_COMPLETION_IN_FLIGHT_GRACE_MS - 1_000,
+            ),
+        )
+        self.assertEqual(backlog(), 1)
+
+        connection.execute(
+            "INSERT INTO llm_completion_outbox VALUES (?, ?, ?)",
+            (
+                "future",
+                "provider_in_flight",
+                now_ms + preflight.LLM_COMPLETION_FUTURE_SKEW_MS + 60_000,
+            ),
+        )
+        self.assertEqual(backlog(), 2)
+
+        for status in ("pending_usage", "ready_for_action", "failed", "action_claimed"):
+            connection.execute(
+                "INSERT INTO llm_completion_outbox VALUES (?, ?, ?)",
+                (status, status, now_ms),
+            )
+        self.assertEqual(backlog(), 6)
 
     def test_missing_event_store_projection_offsets_are_temporal_but_malformed_fail(self) -> None:
         for key in ("projection_offset", "hierarchy_offset"):
