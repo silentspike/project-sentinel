@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Recognize the exact collaboration-admission snapshot event emitted by the
+  workflow writer during projection reads, event reads, and projection rebuilds.
+  Keep unknown event types rejected and verify admission, completion, and
+  reliability snapshots across database reopening (#740).
+
 - Retry the bounded Event Store and projection read-only snapshot when live
   append progress invalidates a cut, while accepting only an exact stable cut
   and failing closed after the fixed attempt limit (#740).
