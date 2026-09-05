@@ -39,7 +39,8 @@ response mode disables synthesis and learned-response substitution. Existing
 deterministic personality, quality, and fourth-wall checks reject concerns
 without making an additional hidden provider call. An operator-rewritten
 response is not accepted as the model's proposal. The requested output-token
-ceiling cannot be raised by a larger global default.
+ceiling cannot be raised by a larger global default; this does not imply that
+every provider transport supports a hard generation-token ceiling.
 
 The model returns only a strict JSON object with `schema_version: 1` and a
 bounded `tools` list. It supplies the actual proposed file contents and relative
@@ -67,6 +68,51 @@ valid substitute for ChatGPT subscription call/token/time limits or be populated
 with an invented marginal USD price. The activation stays off until that provider
 contract and the target-runtime readiness are verified. Test fixtures use the
 existing `local-loop` exemption, not a production OAuth exemption.
+
+### Codex OAuth transport limits
+
+The pinned Codex CLI `0.151.0` remains an inference-only subprocess. It uses its
+native ChatGPT login and endpoint selection; the Gateway does not extract or
+copy its credentials. An explicit `sentinel_chatgpt` provider entry disables
+HTTP and stream retries and WebSocket fallback. The separate
+`unbounded_connection_retries` feature is also disabled. Overriding these fields
+on the built-in `openai` entry would not work: the pinned CLI retains its built-in
+provider entry instead of merging that configured replacement. Shell snapshots
+are disabled along with tools and delegation because this process only returns
+a proposal; actual tools belong to the Workbench sandbox.
+
+These settings address hidden transport redispatch, not durable admission. The
+existing request/outbox authority still owns whether an attempt may start, and
+an ambiguous result must not authorize another call. A local conformance test
+runs the actual pinned binary against a loopback-only fake Responses endpoint,
+with an empty private home and no credentials. It verifies one inference request
+for HTTP 500, stream disconnection, and successful completion, no advertised
+tools, and preservation of successful response text and usage. It is not
+ChatGPT authentication or live-product acceptance evidence.
+
+`MaxTokens` is only a prompt request plus a conservative local response-byte
+guard in this adapter. The pinned CLI's Responses request has no
+`max_output_tokens` field. Terminal token counts measure reported usage; they
+do not enforce a pre-consumption ceiling. A local deadline cancels the CLI but
+does not prove that the remote service stopped generation immediately. Do not
+report a timeout or missing terminal usage as zero consumption. Hard token-cap
+acceptance therefore remains unverified; enabling this bridge requires an
+explicitly approved provider-appropriate contract, not a fake local-provider
+exemption or invented USD price.
+
+The source contract is pinned to OpenAI Codex commit
+`78c290807ce710180111df227df3b7a4fe845452`:
+[provider selection and retry settings](https://github.com/openai/codex/blob/78c290807ce710180111df227df3b7a4fe845452/codex-rs/model-provider-info/src/lib.rs),
+[Responses request fields](https://github.com/openai/codex/blob/78c290807ce710180111df227df3b7a4fe845452/codex-rs/codex-api/src/common.rs),
+[stream retry handling](https://github.com/openai/codex/blob/78c290807ce710180111df227df3b7a4fe845452/codex-rs/core/src/responses_retry.rs),
+and [feature defaults](https://github.com/openai/codex/blob/78c290807ce710180111df227df3b7a4fe845452/codex-rs/features/src/lib.rs).
+
+The optional `TestCodexCLIPinnedBinarySingleAttemptTransport` test requires
+`SENTINEL_TEST_CODEX_CLI_BINARY` to identify the pinned local executable and
+`TMPDIR` to point to an issue-owned directory under `/work/tmp`. Without that
+explicit binary it is skipped. The normal Go suite always checks the effective
+argv contract. No binary download, login, or real provider request is performed
+by the conformance test.
 
 ## Request binding
 

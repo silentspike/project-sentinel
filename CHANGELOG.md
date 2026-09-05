@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Disable hidden Codex CLI HTTP/stream retries, WebSocket fallback, unbounded
+  connection retry, and inference-only shell snapshots through an explicit
+  native-auth provider configuration. Verify the pinned binary against a local
+  failure/success endpoint and distinguish reported usage from an unsupported
+  hard generation-token cap (#856).
+
 - Add an off-by-default, assignment-bound model proposal bridge through the
   Cortex Gateway, durable LLM completion outbox, workflow intent compiler, and
   Workbench execution queue. Preserve usage on rejected work responses, prohibit
