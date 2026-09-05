@@ -1255,6 +1255,50 @@ impl WorkbenchInvocationStore {
         Ok(false)
     }
 
+    /// Checks the logical snapshot fence, not whether a business outcome is known.
+    /// The caller holds the owner tick barrier through the guarded effect.
+    pub(crate) fn blocks_runtime_snapshot(
+        &self,
+        runtime: &mut dyn WorkbenchRuntimeClient,
+    ) -> anyhow::Result<bool> {
+        let mut agents = BTreeMap::new();
+        for item in self.recovery_items()? {
+            match item.record.state {
+                WorkbenchInvocationState::Reserved => return Ok(true),
+                WorkbenchInvocationState::Executing => {
+                    agents.insert(item.record.agent_id.0, item.record.agent_id);
+                }
+                _ => {}
+            }
+        }
+        for agent_id in agents.into_values() {
+            let exchange = runtime.exchange(
+                agent_id,
+                NanoExecRequest {
+                    operation: "workbench_quiescent".to_string(),
+                    input: String::new(),
+                },
+            )?;
+            exchange.revalidate()?;
+            let result = exchange.result();
+            anyhow::ensure!(
+                result.success
+                    && result.runtime_key == sentinel_common::WORKBENCH_RUNTIME_BWRAP
+                    && result.workload_id == format!("AGENT-{:02}", agent_id.0),
+                "workbench quiescence response has a foreign or unavailable owner"
+            );
+            let quiescent: bool = serde_json::from_str(&result.output)
+                .context("decode workbench quiescence response")?;
+            exchange.revalidate()?;
+            if !quiescent {
+                return Ok(true);
+            }
+        }
+        // No row is changed: an ambiguous invocation remains non-replayable
+        // even when its runtime has already been reaped or replaced safely.
+        Ok(false)
+    }
+
     fn transition(
         &self,
         invocation_id: &str,
@@ -3074,6 +3118,99 @@ mod tests {
         );
         assert_eq!(items[1].action, WorkbenchRecoveryAction::ProbeExecuting);
         assert!(store.has_inflight().unwrap());
+    }
+
+    fn quiescence_result(output: &str) -> NanoExecResult {
+        NanoExecResult {
+            runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
+            workload_id: "AGENT-07".to_string(),
+            success: true,
+            output: output.to_string(),
+        }
+    }
+
+    #[test]
+    fn quiescence_releases_only_runtime_fence_and_preserves_restart_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workbench.redb");
+        let store = WorkbenchInvocationStore::open(&path).unwrap();
+        let request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2819");
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+        let mut runtime = FakeRuntime {
+            calls: 0,
+            responses: VecDeque::from([Ok(quiescence_result("true"))]),
+        };
+        assert!(store.blocks_runtime_snapshot(&mut runtime).unwrap());
+        assert_eq!(runtime.calls, 0, "reserved work must remain fenced");
+        let before = store
+            .mark_executing(
+                &request.invocation_id,
+                &request.input_digest,
+                1_900_000_000_001,
+            )
+            .unwrap();
+        assert!(!store.blocks_runtime_snapshot(&mut runtime).unwrap());
+        assert_eq!(runtime.calls, 1);
+        assert!(store.has_inflight().unwrap());
+        assert!(matches!(
+            store.reserve(&request, request.deadline_unix_ms + 1).unwrap(),
+            ReservationOutcome::Replay(record) if record == before
+        ));
+        drop(store);
+        let reopened = WorkbenchInvocationStore::open(&path).unwrap();
+        assert_eq!(reopened.load(&request.invocation_id).unwrap(), Some(before));
+        assert_eq!(
+            reopened.recovery_items().unwrap()[0].action,
+            WorkbenchRecoveryAction::ProbeExecuting
+        );
+    }
+
+    #[test]
+    fn quiescence_busy_missing_foreign_malformed_and_stale_proofs_stay_fenced() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2821");
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+        let before = store
+            .mark_executing(
+                &request.invocation_id,
+                &request.input_digest,
+                1_900_000_000_001,
+            )
+            .unwrap();
+        let mut runtime = FakeRuntime {
+            calls: 0,
+            responses: VecDeque::from([Ok(quiescence_result("false"))]),
+        };
+        assert!(store.blocks_runtime_snapshot(&mut runtime).unwrap());
+        assert!(store.blocks_runtime_snapshot(&mut runtime).is_err());
+        for field in ["owner", "runtime", "success", "output"] {
+            let mut response = quiescence_result("true");
+            match field {
+                "owner" => response.workload_id = "AGENT-08".to_string(),
+                "runtime" => response.runtime_key = "ecs-native".to_string(),
+                "success" => response.success = false,
+                _ => response.output = r#"{"quiescent":true}"#.to_string(),
+            }
+            runtime.responses.push_back(Ok(response));
+            assert!(
+                store.blocks_runtime_snapshot(&mut runtime).is_err(),
+                "{field}"
+            );
+        }
+        for fail_validation in [1, 2] {
+            let operations = Arc::new(Mutex::new(Vec::new()));
+            let mut guarded = GuardedRuntime {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                validations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                operations: operations.clone(),
+                fail_validation,
+                response: quiescence_result("true"),
+            };
+            assert!(store.blocks_runtime_snapshot(&mut guarded).is_err());
+            assert_eq!(*operations.lock().unwrap(), ["workbench_quiescent"]);
+        }
+        assert_eq!(store.load(&request.invocation_id).unwrap(), Some(before));
     }
 
     #[test]
