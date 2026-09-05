@@ -1423,6 +1423,47 @@ impl BwrapNanoRuntime {
         failure.into()
     }
 
+    fn workbench_quiescent(&self, handle: &NanoHandle) -> Result<NanoExecResult> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        let state = self.workloads.get(&handle.workload_id);
+        let retained = self.exchanges.get(&handle.workload_id);
+        if let Some(state) = state {
+            ensure_handle_instance(handle, state.instance_id)?;
+        } else if let Some(exchange) = retained {
+            // Failed exchanges retain exact incarnation ownership after their
+            // process and workload maps were removed by successful teardown.
+            ensure_handle_instance(handle, exchange.instance_id)?;
+        } else {
+            return Err(anyhow!("workbench quiescence has no runtime owner"));
+        }
+        let quiescent = if self.pending_spawns.contains_key(&handle.workload_id) {
+            false
+        } else if let Some(exchange) = retained {
+            ensure_handle_instance(handle, exchange.instance_id)?;
+            !exchange.cleanup_pending
+                && ((exchange.finalized
+                    && state.is_some()
+                    && self.processes.contains_key(&handle.workload_id)
+                    && self.handles.contains_key(&handle.workload_id))
+                    || (exchange.terminal_error.is_some()
+                        && state.is_none()
+                        && !self.processes.contains_key(&handle.workload_id)
+                        && !self.handles.contains_key(&handle.workload_id)))
+        } else {
+            // A committed fresh owner has no invocation until start/recover
+            // registers its exchange. Missing participants are not proof of
+            // successful cleanup or permission to trust a partial spawn.
+            self.processes.contains_key(&handle.workload_id)
+                && self.handles.contains_key(&handle.workload_id)
+        };
+        Ok(NanoExecResult {
+            runtime_key: self.runtime_key().to_string(),
+            workload_id: handle.workload_id.clone(),
+            success: true,
+            output: serde_json::to_string(&quiescent)?,
+        })
+    }
+
     fn synchronize_protocol_supervision(
         &mut self,
         workload_id: &str,
@@ -2599,6 +2640,7 @@ impl NanoRuntime for BwrapNanoRuntime {
 
     fn exec(&mut self, handle: &NanoHandle, request: NanoExecRequest) -> Result<NanoExecResult> {
         match request.operation.as_str() {
+            "workbench_quiescent" if request.input.is_empty() => self.workbench_quiescent(handle),
             "health" => {
                 let health = self.health(handle)?;
                 Ok(NanoExecResult {
@@ -2978,6 +3020,118 @@ mod tests {
             agent_id: None,
             pid: Some(pid),
         }
+    }
+
+    #[test]
+    fn workbench_quiescence_is_read_only_and_exact_instance_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_fixture(
+            &mut runtime,
+            fixture_workload("AGENT-07", "quiescence"),
+            Vec::new(),
+        );
+        let probe = || NanoExecRequest {
+            operation: "workbench_quiescent".to_string(),
+            input: String::new(),
+        };
+        assert_eq!(runtime.exec(&handle, probe()).unwrap().output, "true");
+        assert!(runtime.exchanges.is_empty());
+        assert!(runtime.processes[&handle.workload_id].pid > 0);
+        let mut stale = handle.clone();
+        stale.instance_id = uuid::Uuid::new_v4();
+        assert!(runtime.exec(&stale, probe()).is_err());
+        let mut invalid = probe();
+        invalid.input = "start".to_string();
+        assert!(runtime.exec(&handle, invalid).is_err());
+
+        runtime.exchanges.insert(
+            handle.workload_id.clone(),
+            WorkbenchExchange {
+                instance_id: handle.instance_id,
+                invocation_id: "018f3f32-4f01-7f2c-a6c1-f6f4a81b2983".to_string(),
+                request_digest: "a".repeat(64),
+                input_digest: "a".repeat(64),
+                artifact_authority: None,
+                cancel_requested_at_ms: None,
+                cancel_digest: None,
+                deadline_cancel_digest: None,
+                cancel_origin: None,
+                messages: Vec::new(),
+                retained_bytes: 0,
+                result_seen: false,
+                terminal: None,
+                terminal_error: None,
+                finalized: false,
+                cleanup_pending: false,
+            },
+        );
+        assert_eq!(runtime.exec(&handle, probe()).unwrap().output, "false");
+        {
+            let exchange = runtime.exchanges.get_mut(&handle.workload_id).unwrap();
+            exchange.finalized = true;
+            exchange.cleanup_pending = true;
+        }
+        assert_eq!(runtime.exec(&handle, probe()).unwrap().output, "false");
+        runtime
+            .exchanges
+            .get_mut(&handle.workload_id)
+            .unwrap()
+            .cleanup_pending = false;
+        assert_eq!(runtime.exec(&handle, probe()).unwrap().output, "true");
+        assert_eq!(
+            runtime.exchanges.len(),
+            1,
+            "probe must not forget replay state"
+        );
+        runtime.stop(&handle).unwrap();
+        assert!(runtime.exec(&handle, probe()).is_err());
+    }
+
+    #[test]
+    fn workbench_quiescence_rejects_partial_owner_and_waits_for_failed_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_fixture(
+            &mut runtime,
+            fixture_workload("AGENT-07", "quiescence"),
+            Vec::new(),
+        );
+        let sandbox = runtime.handles.remove(&handle.workload_id).unwrap();
+        assert_eq!(
+            runtime.workbench_quiescent(&handle).unwrap().output,
+            "false"
+        );
+        runtime.handles.insert(handle.workload_id.clone(), sandbox);
+        let failed = runtime.exec(
+            &handle,
+            NanoExecRequest {
+                operation: "workbench_start".to_string(),
+                input: start_frame(
+                    "018f3f32-4f01-7f2c-a6c1-f6f4a81b2984",
+                    unix_time_ms() + 10_000,
+                ),
+            },
+        );
+        assert!(failed.is_err(), "fixture has no protocol channel");
+        assert!(!runtime.processes.contains_key(&handle.workload_id));
+        assert!(!runtime.handles.contains_key(&handle.workload_id));
+        assert_eq!(runtime.workbench_quiescent(&handle).unwrap().output, "true");
+        runtime
+            .exchanges
+            .get_mut(&handle.workload_id)
+            .unwrap()
+            .cleanup_pending = true;
+        assert_eq!(
+            runtime.workbench_quiescent(&handle).unwrap().output,
+            "false"
+        );
+        runtime
+            .exchanges
+            .get_mut(&handle.workload_id)
+            .unwrap()
+            .cleanup_pending = false;
+        runtime.stop(&handle).unwrap();
     }
 
     fn transactional_fixture_state(workload_id: &str, agent_name: &str) -> BwrapWorkloadState {

@@ -11884,19 +11884,39 @@ fn ecs_tick_loop(
 
         // Periodischer Runtime-Snapshot (alle 600 Ticks = ~10 Minuten bei 1s Tick-Rate).
         // Owner authority alone is insufficient while restore recovery fences the World.
-        if unfenced_world_background_work_allowed(owner_registry, &restore_fence) {
-            if tick_count > 0 && tick_count.is_multiple_of(600) && shift_snapshot_fenced {
+        if tick_count > 0
+            && tick_count.is_multiple_of(600)
+            && unfenced_world_background_work_allowed(owner_registry, &restore_fence)
+        {
+            // A logical roster snapshot needs current runtime quiescence, not
+            // acceptance of every historical business result. Broader World
+            // snapshots and shift/restore admission retain their existing fence.
+            let workbench_snapshot_fenced = match workbench_service.as_ref() {
+                Some(service) => service
+                    .store
+                    .blocks_runtime_snapshot(&mut DaemonWorkbenchRuntimeClient {
+                        runtimes: &mut nano_runtimes,
+                        owner_registry,
+                    })
+                    .unwrap_or(true),
+                None => false,
+            };
+            let runtime_snapshot_fenced = pending_shift_target.is_some()
+                || shift_snapshot_blocked_this_tick
+                || workbench_snapshot_fenced;
+            if runtime_snapshot_fenced {
                 warn!(
                     tick = tick_count,
                     target_shift = ?pending_shift_target,
                     pressure_blocked_this_tick = shift_snapshot_blocked_this_tick,
+                    workbench_snapshot_fenced,
                     "Periodischer Runtime-Snapshot bleibt bis zum Schichtabschluss aus; letzter guter Snapshot bleibt autoritativ"
                 );
             }
             if let Some(snapshot_result) = attempt_periodic_runtime_snapshot(
                 tick_count,
                 owner_registry,
-                shift_snapshot_fenced,
+                runtime_snapshot_fenced,
                 || {
                     #[cfg(test)]
                     if let Some(observer) = startup_config_apply_probe
@@ -11974,7 +11994,9 @@ fn ecs_tick_loop(
     )
     .context("shutdown blocked by NanoRuntime cleanup failure")?;
     anyhow::ensure!(
-        agent_processes.is_empty() && sandbox_handles.is_empty(),
+        nano_runtimes.agent_ids().is_empty()
+            && agent_processes.is_empty()
+            && sandbox_handles.is_empty(),
         "shutdown found runtime observations without registry ownership"
     );
     if let Ok(mut state) = security_runtime_state.write() {
@@ -12013,12 +12035,10 @@ fn ecs_tick_loop(
     //    nicht 0. Beim Restart erkennt shift_transition() ob Schichtwechsel stattfand
     //    und entfernt/spawnt Agents entsprechend.)
     let t = Instant::now();
-    let workbench_inflight = match workbench_service.as_ref() {
-        Some(service) => service.store.has_inflight().unwrap_or(true),
-        None => false,
-    };
-    let shift_snapshot_fenced =
-        pending_shift_target.is_some() || shift_snapshot_blocked_this_tick || workbench_inflight;
+    // Successful owning-adapter teardown above already proves that no
+    // Workbench process survives. Durable unresolved outcomes remain in redb;
+    // they must not suppress a snapshot of the current logical roster.
+    let shift_snapshot_fenced = pending_shift_target.is_some() || shift_snapshot_blocked_this_tick;
     if shift_snapshot_fenced {
         warn!(
             target_shift = ?pending_shift_target,
@@ -12870,6 +12890,73 @@ mod tests {
         assert!(sim_hour.is_none());
         assert!(runtime.is_none());
         assert_eq!(attempts.get(), 0);
+    }
+
+    #[test]
+    fn quiescence_shutdown_snapshot_retains_resumed_status_across_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let events =
+            Arc::new(EventStore::open(temp.path().join("events.db").to_str().unwrap()).unwrap());
+        let mut runtime = RuntimeOrchestrator::new(10).with_event_store(events.clone());
+        runtime
+            .spawn_agent(
+                AgentIdentity {
+                    agent_id: AgentId(7),
+                    name: "Snapshot Test".to_string(),
+                    role: "Developer".to_string(),
+                },
+                ShiftInfo {
+                    shift_set: 1,
+                    shift_start_hour: 6,
+                    shift_end_hour: 14,
+                    is_on_duty: true,
+                },
+                "empfang",
+            )
+            .unwrap();
+        runtime.pause_agent(AgentId(7)).unwrap();
+        runtime.save_state().unwrap();
+        runtime.resume_agent(AgentId(7)).unwrap();
+        let owner = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+        attempt_shutdown_runtime_snapshot(&owner, &RestoreFence::default(), false, || {
+            runtime.save_state()
+        })
+        .expect("quiescent shutdown must attempt the new logical snapshot")
+        .unwrap();
+        drop(runtime);
+        let restored = RuntimeOrchestrator::restore(events, 10).unwrap();
+        assert_eq!(
+            restored.agents()[&AgentId(7)].status,
+            sentinel_runtime::AgentStatus::Active
+        );
+    }
+
+    #[test]
+    fn quiescence_callsite_holds_owner_barrier_and_shutdown_requires_all_cleanup() {
+        let source = include_str!("orchestrator.rs");
+        let tick = source
+            .find("let owner_tick_barrier = sentinel_common::owner_tick_barrier()")
+            .unwrap();
+        let probe = source.find(".blocks_runtime_snapshot(").unwrap();
+        let shift = source.find("// Shift-Erkennung").unwrap();
+        assert!(tick < shift && shift < probe);
+        let shutdown = &source[source.find("let shutdown_start = Instant::now()").unwrap()..];
+        let stop = shutdown
+            .find("stop_all_nano_runtimes_with_retries(")
+            .unwrap();
+        let stop_error = shutdown
+            .find(".context(\"shutdown blocked by NanoRuntime cleanup failure\")?")
+            .unwrap();
+        let empty = shutdown
+            .find("nano_runtimes.agent_ids().is_empty()")
+            .unwrap();
+        let snapshot = shutdown
+            .find("let runtime_snapshot_result = attempt_shutdown_runtime_snapshot(")
+            .unwrap();
+        assert!(stop < stop_error && stop_error < empty && empty < snapshot);
+        assert!(!shutdown[..snapshot].contains(".has_inflight()"));
+        assert!(shutdown[..snapshot]
+            .contains("pending_shift_target.is_some() || shift_snapshot_blocked_this_tick"));
     }
 
     #[tokio::test]
@@ -20339,7 +20426,7 @@ mod tests {
             );
         }
         assert!(source.contains(
-            "attempt_periodic_runtime_snapshot(\n                tick_count,\n                owner_registry,\n                shift_snapshot_fenced,"
+            "attempt_periodic_runtime_snapshot(\n                tick_count,\n                owner_registry,\n                runtime_snapshot_fenced,"
         ));
         assert!(source.contains(
             "attempt_shutdown_runtime_snapshot(\n        owner_registry,\n        &restore_fence,\n        shift_snapshot_fenced,"

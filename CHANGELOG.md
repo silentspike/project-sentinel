@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Separate logical runtime snapshot eligibility from retained ambiguous business outcomes.
+  Read exact-owner quiescence before periodic snapshots, keep active execution,
+  cleanup, shifts and whole-World recovery fenced, and save the current roster after
+  successful owning-adapter shutdown without altering invocation history (#740).
+
 - Recognize the exact collaboration-admission snapshot event emitted by the
   workflow writer during projection reads, event reads, and projection rebuilds.
   Keep unknown event types rejected and verify admission, completion, and

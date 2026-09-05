@@ -39,6 +39,32 @@ After restart, a `reserved` request waits for the authoritative caller to replay
 
 The completion receipt retains only outcome, resource accounting, artifact references, and safe error classification. Transient tool output and file contents are removed before persistence. Receipt writes are bounded, synced, and installed without overwrite; an existing receipt must match byte-for-byte after decoding.
 
+### Runtime quiescence and unresolved outcomes
+
+A durable `executing` row is not proof that a tool process still exists. A lost
+response can leave the workflow blocked with an unknown outcome after its
+isolated process has been cleaned up. The row must retain its digest and
+no-reexecution protection, but it must not indefinitely prevent fresh logical
+runtime snapshots.
+
+Before a periodic logical runtime snapshot, the daemon reads the current owning
+adapter's `workbench_quiescent` observation under the World tick barrier. This
+operation accepts no payload and performs no process, tool, or storage mutation.
+The adapter checks the exact runtime incarnation. Running exchanges, pending
+cleanup, partial ownership, missing handles, malformed responses, and stale World
+authority keep the fence closed. Reserved requests still block transitions.
+Successfully cleaned exchanges or a committed fresh idle runtime can release the
+logical snapshot fence without changing the unresolved invocation or its workflow
+state. Shift changes, whole-World snapshots, and restore admission retain the
+existing durable-invocation fence; a quiescence observation is not sufficient to
+close their broader recovery contract.
+
+Graceful shutdown saves the logical roster only after every owning adapter has
+successfully stopped its workloads. Unfinished shifts and restore fences still
+prevent that snapshot. This is not Workbench result recovery or a whole-product
+backup: retained ambiguous results still require their existing authorized
+recovery path and cannot be accepted, discarded, or executed again by this check.
+
 ## Workspace and tools
 
 Workspace roots are assigned per project and work item. Tool paths are relative, parent traversal and absolute paths are rejected, and symlinks are denied at effect boundaries. Input mounts are explicit and content-addressed. Outputs remain inside the assigned workspace or artifact root.
