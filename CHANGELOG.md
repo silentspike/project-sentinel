@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add an off-by-default, assignment-bound model proposal bridge through the
+  Cortex Gateway, durable LLM completion outbox, workflow intent compiler, and
+  Workbench execution queue. Preserve usage on rejected work responses, prohibit
+  synthesis/hidden regeneration and legacy action delivery for typed work, and
+  retain exact-plan replay with current-authority validation (#856).
+
 - Separate logical runtime snapshot eligibility from retained ambiguous business outcomes.
   Read exact-owner quiescence before periodic snapshots, keep active execution,
   cleanup, shifts and whole-World recovery fenced, and save the current roster after

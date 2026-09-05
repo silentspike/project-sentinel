@@ -15,6 +15,59 @@ Tool-bearing agent work has one supported path:
 
 There is no host-shell, ECS-only, or less-isolated fallback for an M0 tool request.
 
+### Opt-in model work proposals
+
+The first M1 bridge is selected by `SENTINEL_MODEL_WORKBENCH_ENABLED=true`.
+It is off by default, requires the enabled company workflow, the `llm` feature,
+and `SENTINEL_LLM_USAGE_V2_ENABLED=true`, and is visible as
+`company_workflow.model_work_enabled` in runtime health. Enabling it is not a
+claim that the autonomous-company acceptance has passed.
+
+For one assigned Designer or Developer with exactly one active work-item
+provider reservation, the daemon derives a task and authority snapshot from
+the existing workflow. The initial slice accepts one output contract and no
+upstream artifact inputs. The provider window is five minutes from the durable
+reservation timestamp; a new perception does not renew that window. Unsupported
+work fails closed instead of becoming an unbound tool or a host-shell action.
+
+The request uses the reservation's stable ID and binds the assignment,
+principal, organization, profile, runtime, policy, and task content. Volatile
+tick, room chat, and body metadata cannot change its retry identity. The
+Gateway still selects the agent's model through its normal authenticated
+agent-runtime route, catalog, activation gate, queue, and guardrails. The work
+response mode disables synthesis and learned-response substitution. Existing
+deterministic personality, quality, and fourth-wall checks reject concerns
+without making an additional hidden provider call. An operator-rewritten
+response is not accepted as the model's proposal. The requested output-token
+ceiling cannot be raised by a larger global default.
+
+The model returns only a strict JSON object with `schema_version: 1` and a
+bounded `tools` list. It supplies the actual proposed file contents and relative
+paths, not project identities, capabilities, credentials, success attestations,
+or authority generations. The existing workflow intent compiler derives the
+execution plan, checks every tool against the immutable work profile and output
+contract, and enqueues work through the existing Workbench adapter. A proposal
+does not mark work Done or bypass independent QA, release, or customer acceptance.
+
+The existing private LLM outbox stores the bounded proposal and dispatch context
+before admission. Usage is persisted first, including paid responses rejected
+after dispatch. Local admission can then retry without another provider call.
+Its stable operation ID and the workflow's existing transactional plan/outbox
+contract prevent a second execution after restart. Exact plan replay is checked
+before new-admission freshness, but changed authority or tool content is still
+rejected. Model work never enters the legacy Chat/ToolUse action channel. Failed
+or claimed completion rows are not implicitly reactivated. There is no new store
+or schema migration; version-1 legacy completion payloads remain readable.
+
+This bridge is not the full M1 conversation/tool-result loop. Additional inputs,
+iterative rework, model-selected team decisions, OAuth quota-native reservations,
+and the real-provider customer-to-artifact journey remain #856 acceptance work.
+In particular, the existing monetary reservation API must not be presented as a
+valid substitute for ChatGPT subscription call/token/time limits or be populated
+with an invented marginal USD price. The activation stays off until that provider
+contract and the target-runtime readiness are verified. Test fixtures use the
+existing `local-loop` exemption, not a production OAuth exemption.
+
 ## Request binding
 
 `WorkbenchRequest` binds the schema version, invocation and caller identities, agent, project, work item, workspace, assignment and credential generations, policy and profile digests, runtime key, effective capabilities, permitted artifact kinds, content-addressed inputs, command allowlist, resource limits, deadline, attempt, tool parameters, and canonical request digest.

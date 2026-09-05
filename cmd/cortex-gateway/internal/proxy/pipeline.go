@@ -389,6 +389,11 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		return
 	}
 	req.CallerRole = callerRole
+	modelWork, modelWorkErr := classifyModelWorkRequest(&req, requestID)
+	if modelWorkErr != nil {
+		ph.writeRequestError(w, &req, modelWorkErr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
 	if req.RequestClass == RequestClassAgentRuntime && req.Stream {
 		ph.writeRequestError(w, &req, "agent-runtime wire contract does not support streaming", http.StatusUnprocessableEntity)
 		return
@@ -459,7 +464,11 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	// --- Step 4: Config-Werte anwenden ---
 	req.Temperature = snap.Temperature
 	if snap.MaxTokens > 0 {
-		req.MaxTokens = snap.MaxTokens
+		if modelWork {
+			req.MaxTokens = min(req.MaxTokens, snap.MaxTokens)
+		} else {
+			req.MaxTokens = snap.MaxTokens
+		}
 	}
 
 	// --- Step 5: Perception Injection (3-Source Assembly) ---
@@ -475,7 +484,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	ph.injectPerception(&req, agentName, agentRole, providerName, snap)
 
 	// --- Step 7.5: Traffic Control — Synthesis Check ---
-	if ph.synthesis != nil && snap.SynthesisEnabled && !isAnthropicStreamingRequest(&req) {
+	if !modelWork && ph.synthesis != nil && snap.SynthesisEnabled && !isAnthropicStreamingRequest(&req) {
 		result := ph.synthesis.Decide(req.Metadata, agentName)
 		if result.Decision == synthesis.Synthesize {
 			content := result.Content
@@ -541,7 +550,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 			}
 		}
 	}
-	if ph.observer != nil && snap.APICPEnabled && !isAnthropicStreamingRequest(&req) {
+	if !modelWork && ph.observer != nil && snap.APICPEnabled && !isAnthropicStreamingRequest(&req) {
 		fp, ctx, err := synthesis.PrepareInputs(req.Metadata)
 		if err == nil && synthesis.CanSynthesize(fp, ctx) {
 			agentID := req.Metadata["agent_id"]
@@ -753,22 +762,26 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 
 	// --- Step 6d: Personality Guard Check ---
 	content := resp.Content
-	if agentName != "" {
+	if !modelWork && agentName != "" {
 		content = ph.personalityGuardCheck(ctx, content, agentName, provider, &req, snap)
 	}
 
 	// --- Step 6e: Quality Gate Check ---
-	if agentName != "" {
+	if !modelWork && agentName != "" {
 		content = ph.qualityGateCheck(ctx, content, agentName, provider, &req, snap)
 	}
 
 	// --- Step 7: Fourth-Wall Detection ---
 	fourthWallVerdict := ""
-	if agentName != "" {
+	if !modelWork && agentName != "" {
 		content, fourthWallVerdict = ph.fourthWallCheck(ctx, content, agentName, agentRole, provider, &req)
 	}
+	modelWorkRejected := modelWork && !ph.modelWorkResponseAllowed(content, agentName, snap)
 
 	content, dropped := ph.applyOutboundInterception(requestID, agentName, providerName, &req, content, snap)
+	// A rewritten operator response is not the recorded model proposal. Keep its
+	// usage, but never silently execute the substitute under the provider request.
+	dropped = dropped || modelWorkRejected || (modelWork && content != resp.Content)
 	if dropped {
 		ph.writePipelineResponse(r.Context(), w, &req, PipelineResponse{
 			Content:         "",
@@ -790,14 +803,17 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	}
 
 	// --- Step 8: Action Extraction ---
-	actions := ph.ext.Extract(content)
-	actions = ph.enforceActionPolicy(actions, agentName, requestID, &req)
+	var actions []extraction.ExtractedAction
+	if !modelWork {
+		actions = ph.ext.Extract(content)
+		actions = ph.enforceActionPolicy(actions, agentName, requestID, &req)
+	}
 
 	// The daemon owns action application and persists AgentActionReceived only
 	// after ECS accepts the action. Gateway output is an uncommitted proposal.
 
 	// --- Step 8b: API-CP Observation (record call for learning) ---
-	if ph.observer != nil && snap.APICPEnabled {
+	if !modelWork && ph.observer != nil && snap.APICPEnabled {
 		fp := req.Metadata["synth_fp"]
 		agentID := req.Metadata["agent_id"]
 		if prepFP, prepCtx, err := synthesis.PrepareInputs(req.Metadata); err == nil && synthesis.CanSynthesize(prepFP, prepCtx) {

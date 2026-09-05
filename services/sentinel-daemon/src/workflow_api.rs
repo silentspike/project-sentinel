@@ -2,6 +2,8 @@
 
 mod delivery_intent;
 mod delivery_runtime;
+#[cfg(feature = "llm")]
+pub mod model_work;
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -2410,6 +2412,7 @@ enum ProductDeliveryCommand {
 #[serde(deny_unknown_fields)]
 pub struct WorkflowHealthSnapshot {
     pub enabled: bool,
+    pub model_work_enabled: bool,
     pub status: String,
     pub ready: bool,
     pub dependencies_ready: bool,
@@ -2438,6 +2441,7 @@ pub struct WorkflowApi {
     event_store: Option<sentinel_limbo::EventStore>,
     mutation_fence: RwLock<()>,
     enabled: bool,
+    model_work_enabled: bool,
     scan_succeeded: AtomicBool,
     collaboration_publication_pending: AtomicUsize,
     last_error: Mutex<Option<String>>,
@@ -2467,6 +2471,14 @@ impl WorkflowApi {
         workbench_artifact_roots: HashMap<AgentId, PathBuf>,
     ) -> Result<Self, WorkflowError> {
         let enabled = workflow_enabled()?;
+        let model_work_enabled = workflow_flag("SENTINEL_MODEL_WORKBENCH_ENABLED")?;
+        if model_work_enabled
+            && (!enabled
+                || !cfg!(feature = "llm")
+                || !workflow_flag("SENTINEL_LLM_USAGE_V2_ENABLED")?)
+        {
+            return Err(workflow_unavailable());
+        }
         let store_path = if enabled {
             data_dir.join("company-workflow.sqlite")
         } else {
@@ -2546,6 +2558,7 @@ impl WorkflowApi {
             event_store: Some(event_store),
             mutation_fence: RwLock::new(()),
             enabled: true,
+            model_work_enabled,
             scan_succeeded: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(usize::MAX),
             last_error: Mutex::new(None),
@@ -2576,6 +2589,7 @@ impl WorkflowApi {
             event_store: None,
             mutation_fence: RwLock::new(()),
             enabled: false,
+            model_work_enabled: false,
             scan_succeeded: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(0),
             last_error: Mutex::new(None),
@@ -4037,6 +4051,7 @@ impl WorkflowApi {
             && canonical_event_cursor.is_ok();
         WorkflowHealthSnapshot {
             enabled: self.enabled,
+            model_work_enabled: self.model_work_enabled,
             status: if ready {
                 "ready".to_owned()
             } else if self.enabled {
@@ -4067,6 +4082,22 @@ impl WorkflowApi {
 
 #[cfg(feature = "llm")]
 impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
+    fn model_work_context(
+        &self,
+        binding: &crate::llm_bridge::bridge::ProviderUsageAuthority,
+    ) -> Result<Option<model_work::ModelWorkContext>, &'static str> {
+        self.prepare_model_work(binding)
+    }
+
+    fn admit_model_work(
+        &self,
+        completion: &model_work::ModelWorkCompletion,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<(), &'static str> {
+        self.accept_model_work(completion, request_id, request_digest)
+    }
+
     fn resolve_provider_usage_authority(
         &self,
         agent_id: AgentId,
@@ -4245,7 +4276,11 @@ fn independent_gate_principal(
 }
 
 fn workflow_enabled() -> Result<bool, WorkflowError> {
-    match std::env::var("SENTINEL_COMPANY_WORKFLOW_ENABLED") {
+    workflow_flag("SENTINEL_COMPANY_WORKFLOW_ENABLED")
+}
+
+fn workflow_flag(name: &str) -> Result<bool, WorkflowError> {
+    match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => Ok(false),
         Ok(value) if matches!(value.as_str(), "1" | "true" | "TRUE") => Ok(true),
         Ok(value) if matches!(value.as_str(), "0" | "false" | "FALSE") => Ok(false),
