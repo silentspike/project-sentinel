@@ -394,6 +394,13 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		ph.writeRequestError(w, &req, modelWorkErr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
+	if modelWork {
+		// Work grants cap the whole gateway attempt, not a fresh timer after
+		// queuing or operator interception. Preserve a shorter caller deadline.
+		ctx, cancel := context.WithDeadline(r.Context(), start.Add(maxModelWorkDuration))
+		defer cancel()
+		r = r.WithContext(ctx)
+	}
 	if req.RequestClass == RequestClassAgentRuntime && req.Stream {
 		ph.writeRequestError(w, &req, "agent-runtime wire contract does not support streaming", http.StatusUnprocessableEntity)
 		return
@@ -693,6 +700,15 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	// provider applies req.ProviderTimeout only after it has acquired a queue slot.
 	ctx := r.Context()
 	req.ProviderTimeout = ph.providerDeadline
+	if modelWork {
+		if req.ProviderTimeout <= 0 || req.ProviderTimeout > maxModelWorkDuration {
+			req.ProviderTimeout = maxModelWorkDuration
+		}
+		if ctx.Err() != nil {
+			ph.writeRequestError(w, &req, "company execution deadline exceeded", http.StatusGatewayTimeout)
+			return
+		}
+	}
 
 	ph.trackInflight(requestID, req.Metadata)
 

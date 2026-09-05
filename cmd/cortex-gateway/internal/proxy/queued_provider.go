@@ -56,6 +56,11 @@ func (p *queuedProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 		return nil, fmt.Errorf("forward queue wait: %w", err)
 	}
 	defer release()
+	// A queue grant can race cancellation, or be immediately available for an
+	// already expired caller. Recheck before invoking the actual provider.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("forward queue dispatch: %w", err)
+	}
 	return p.wrapped.Send(ctx, req)
 }
 

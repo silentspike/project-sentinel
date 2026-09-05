@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/control"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/synthesis"
@@ -91,6 +93,61 @@ func TestModelWorkForwardsOnceWithoutSynthesisRegenerationOrLegacyActions(t *tes
 			}
 			if test.decision == "dropped" && result.Content != "" {
 				t.Fatal("rejected proposal leaked")
+			}
+		})
+	}
+}
+
+func TestModelWorkDeadlineBoundsQueueAndProviderWithoutExtendingCaller(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		providerTimeout time.Duration
+		callerTimeout   time.Duration
+		wantTimeout     time.Duration
+	}{
+		{"long_global", 5 * time.Minute, 5 * time.Minute, maxModelWorkDuration},
+		{"unset_global", 0, 5 * time.Minute, maxModelWorkDuration},
+		{"short_global", 10 * time.Second, 5 * time.Minute, 10 * time.Second},
+		{"short_caller", 5 * time.Minute, 5 * time.Second, maxModelWorkDuration},
+		{"expired_caller", 5 * time.Minute, -time.Second, maxModelWorkDuration},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			started := time.Now()
+			callerDeadline := started.Add(test.callerTimeout)
+			provider := &pipelineMockProvider{name: "mock", sendFunc: func(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+				deadline, exists := ctx.Deadline()
+				if !exists || deadline.After(time.Now().Add(maxModelWorkDuration)) || deadline.After(callerDeadline) {
+					t.Fatal("missing or extended whole-attempt deadline")
+				}
+				if req.ProviderTimeout != test.wantTimeout {
+					t.Fatalf("provider timeout=%s, want %s", req.ProviderTimeout, test.wantTimeout)
+				}
+				return &LLMResponse{Content: "A bounded proposal", Model: "mock-tier2", InputTokens: 1, OutputTokens: 1, TokensUsed: 2}, nil
+			}}
+			reg := NewRegistry()
+			reg.Register("mock", provider)
+			ph := newTestPipelineHandler(reg, control.NewConfig("mock"))
+			ph.providerDeadline = test.providerTimeout
+			encoded, err := json.Marshal(map[string]any{
+				"max_tokens": 128,
+				"messages":   []map[string]string{{"role": "user", "content": "Perform the assigned work"}},
+				"metadata":   modelWorkMetadata(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := newAgentRuntimeTestRequest(t, string(encoded))
+			req.Header.Set("X-Request-ID", "company-provider-reservation-test")
+			ctx, cancel := context.WithDeadline(req.Context(), callerDeadline)
+			defer cancel()
+			w := httptest.NewRecorder()
+			ph.ServeHTTP(w, req.WithContext(ctx))
+			if test.callerTimeout < 0 {
+				if w.Code != http.StatusGatewayTimeout || provider.calls != 0 {
+					t.Fatalf("expired request status=%d calls=%d", w.Code, provider.calls)
+				}
+			} else if w.Code != http.StatusOK || provider.calls != 1 {
+				t.Fatalf("bounded request status=%d calls=%d body=%s", w.Code, provider.calls, w.Body.String())
 			}
 		})
 	}
