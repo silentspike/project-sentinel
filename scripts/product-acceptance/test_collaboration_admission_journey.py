@@ -153,7 +153,7 @@ class CollaborationAdmissionJourneyTests(unittest.TestCase):
 
         projection = self.steps["observe_final_admission_projection"]
         self.assertEqual(projection["path"], "/operator/workflow/projections")
-        self.assertEqual(len(projection["assertions"]), 8)
+        self.assertEqual(len(projection["assertions"]), 13)
         self.assertEqual(
             projection["capture"]["projection_digest"]["type"], "digest"
         )
@@ -194,6 +194,49 @@ class CollaborationAdmissionJourneyTests(unittest.TestCase):
             self.assertEqual(
                 completed["replay_assertions"][0]["one_of"], ["completed"]
             )
+
+    def test_projection_boundary_replays_growth_without_rewriting_history(self) -> None:
+        step = self.steps["observe_pre_panel_projection"]
+        recorded = {
+            "source_sequence": 40,
+            "project_id": "project-1",
+            "admission_id": "admission-3",
+        }
+        advanced = {**recorded, "source_sequence": 43}
+        self.assertTrue(journey.replay_captures_match(step, advanced, recorded))
+        self.assertEqual(recorded["source_sequence"], 40)
+        self.assertFalse(journey.replay_captures_match(
+            step, {**advanced, "source_sequence": 39}, recorded
+        ))
+        for name in ("project_id", "admission_id"):
+            self.assertFalse(journey.replay_captures_match(
+                step, {**advanced, name: "foreign-id"}, recorded
+            ))
+        self.assertNotIn("projection_digest", step["capture"])
+        self.assertIn(
+            "projection_digest",
+            self.steps["observe_final_admission_projection"]["capture"],
+        )
+
+    def test_admission_replay_requires_same_identity_and_allowed_state(self) -> None:
+        step = self.steps["observe_solo_admitted"]
+        references = {
+            "admit_solo.admission_id": "admission-solo",
+            step["query"]["project_id"]["$ref"]: "project-1",
+        }
+        payload = {
+            "project_id": "project-1",
+            "collaboration_admissions": [
+                {}, {"admission_id": "admission-solo", "state": "completed"}
+            ],
+        }
+        assertions = step["assertions"] + step["replay_assertions"]
+        journey.evaluate_assertions(assertions, payload, references, "operation-1")
+        for field, invalid in (("admission_id", "foreign"), ("state", "rejected")):
+            changed = copy.deepcopy(payload)
+            changed["collaboration_admissions"][1][field] = invalid
+            with self.assertRaises(journey.JourneyError):
+                journey.evaluate_assertions(assertions, changed, references, "operation-1")
 
     def test_m0_designer_and_qa_match_their_pinned_tool_profiles(self) -> None:
         authoring = tomllib.loads(
