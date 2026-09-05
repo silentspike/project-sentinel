@@ -2,14 +2,22 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
 func TestCodexCLIProviderParsesCompletedInference(t *testing.T) {
@@ -182,6 +190,7 @@ esac
 		"exec", "--json", "--ephemeral", "--strict-config", "--ignore-user-config", "--ignore-rules",
 		"--skip-git-repo-check", "read-only", "gpt-5.6-luna", "code_mode", "code_mode_host",
 		"shell_tool", "multi_agent", "-",
+		"unbounded_connection_retries", "shell_snapshot", "shell_snapshot_v2",
 	} {
 		if !slices.Contains(args, required) {
 			t.Fatalf("missing argument %q in %#v", required, args)
@@ -205,6 +214,133 @@ esac
 	}
 	if err := provider.HealthCheck(context.Background()); err != nil {
 		t.Fatalf("health check: %v", err)
+	}
+}
+
+func TestCodexCLIProviderUsesExplicitNativeAuthWithoutTransportRetries(t *testing.T) {
+	p := NewCodexCLIProvider(ProviderConfig{Name: CodexCLIProviderName}, nil)
+	args := p.commandArgs("test-model")
+	var config map[string]any
+	for index, arg := range args {
+		if arg == "-c" && index+1 < len(args) {
+			if _, err := toml.Decode(args[index+1], &config); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if config["model_provider"] != "sentinel_chatgpt" {
+		t.Fatal("retry overrides would be ignored for the built-in provider")
+	}
+	providers := config["model_providers"].(map[string]any)
+	provider := providers["sentinel_chatgpt"].(map[string]any)
+	if provider["name"] != "OpenAI" || provider["wire_api"] != "responses" ||
+		provider["requires_openai_auth"] != true || provider["supports_websockets"] != false ||
+		provider["request_max_retries"] != int64(0) || provider["stream_max_retries"] != int64(0) {
+		t.Fatalf("invalid provider contract: %#v", provider)
+	}
+	for _, key := range []string{"base_url", "env_key", "experimental_bearer_token", "auth"} {
+		if _, present := provider[key]; present {
+			t.Fatalf("native ChatGPT authority overridden by %s", key)
+		}
+	}
+	if !slices.Contains(args, "unbounded_connection_retries") {
+		t.Fatal("unbounded connection retries remain enabled")
+	}
+}
+
+// Optional binary conformance, never a real-provider test. The exact deployed
+// CLI talks only to this loopback fixture and receives an empty private home.
+func TestCodexCLIPinnedBinarySingleAttemptTransport(t *testing.T) {
+	binary := os.Getenv("SENTINEL_TEST_CODEX_CLI_BINARY")
+	if binary == "" {
+		t.Skip("set SENTINEL_TEST_CODEX_CLI_BINARY to the pinned CLI for local conformance")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	version, err := exec.CommandContext(ctx, binary, "--version").Output() //nolint:gosec // explicitly selected local test binary
+	if err != nil || strings.TrimSpace(string(version)) != "codex-cli "+pinnedCodexCLIVersion {
+		t.Fatalf("pinned test binary unavailable: %v", err)
+	}
+	for _, outcome := range []string{"http_500", "stream_disconnect", "completed"} {
+		t.Run(outcome, func(t *testing.T) {
+			var mu sync.Mutex
+			var requests []map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "" {
+					t.Error("loopback fixture must never receive credentials")
+				}
+				if r.Method != http.MethodPost || !strings.Contains(r.URL.Path, "/responses") {
+					http.Error(w, "fixture rejects unrelated endpoint", http.StatusNotFound)
+					return
+				}
+				var body map[string]any
+				if err := json.NewDecoder(io.LimitReader(r.Body, 1024*1024)).Decode(&body); err != nil {
+					http.Error(w, "invalid fixture request", http.StatusBadRequest)
+					return
+				}
+				mu.Lock()
+				requests = append(requests, body)
+				mu.Unlock()
+				if outcome == "http_500" {
+					http.Error(w, `{"error":{"message":"fixture failure","type":"server_error"}}`, http.StatusInternalServerError)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"fixture-response\"}}\n\n")
+				if outcome == "completed" {
+					_, _ = io.WriteString(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"fixture-message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Fixture response\"}]}}\n\n")
+					_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture-response\",\"usage\":{\"input_tokens\":12,\"output_tokens\":2,\"total_tokens\":14}}}\n\n")
+				}
+				w.(http.Flusher).Flush()
+			}))
+			defer server.Close()
+			workdir, home := t.TempDir(), t.TempDir()
+			p := NewCodexCLIProvider(ProviderConfig{Name: CodexCLIProviderName}, nil)
+			p.workdir, p.home, p.codexHome = workdir, home, home
+			args := p.commandArgs(defaultCodexCLIModel)
+			args = append(args[:len(args)-1],
+				"-c", fmt.Sprintf("model_providers.sentinel_chatgpt.base_url=%q", server.URL+"/v1"),
+				"-c", "model_providers.sentinel_chatgpt.requires_openai_auth=false", "-")
+			runCtx, stop := context.WithTimeout(context.Background(), 15*time.Second)
+			defer stop()
+			cmd := exec.CommandContext(runCtx, binary, args...) //nolint:gosec // pinned test executable, loopback-only fixture args
+			cmd.Dir, cmd.Env = workdir, p.commandEnv()
+			cmd.Stdin = strings.NewReader("Return one short word. Do not use tools.")
+			stdout := &cappedBuffer{limit: codexCLIMaxDiagnosticSize}
+			stderr := &cappedBuffer{limit: codexCLIMaxDiagnosticSize}
+			cmd.Stdout, cmd.Stderr = stdout, stderr
+			runErr := cmd.Run()
+			if runCtx.Err() != nil || (runErr == nil) != (outcome == "completed") {
+				t.Fatalf("unexpected terminal result: %v, context %v: %s %s", runErr, runCtx.Err(), stdout.String(), stderr.String())
+			}
+			if outcome == "completed" {
+				response, parseErr := p.parseOutputStream(strings.NewReader(stdout.String()), codexCLIMaxResponseBytes)
+				if parseErr != nil || response.Content != "Fixture response" || response.InputTokens != 12 || response.OutputTokens != 2 {
+					t.Fatalf("pinned response/usage not preserved: %+v, %v", response, parseErr)
+				}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(requests) != 1 {
+				t.Fatalf("provider requests=%d, expected exactly one: %s %s", len(requests), stdout.String(), stderr.String())
+			}
+			assertCodexCLIInferenceOnlyRequest(t, requests[0])
+		})
+	}
+}
+
+func assertCodexCLIInferenceOnlyRequest(t *testing.T, request map[string]any) {
+	t.Helper()
+	if value, present := request["tools"]; present {
+		if tools, ok := value.([]any); !ok || len(tools) != 0 {
+			t.Fatalf("inference-only CLI advertised tools: %#v", value)
+		}
+	}
+	if request["model"] != defaultCodexCLIModel {
+		t.Fatal("pinned CLI changed the selected model")
+	}
+	if _, present := request["max_output_tokens"]; present {
+		t.Fatal("pinned CLI transport capability changed; re-review the token-limit contract")
 	}
 }
 
