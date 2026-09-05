@@ -3970,6 +3970,7 @@ fn collaboration_admission_is_solo_first_durable_fenced_and_exactly_replayable()
     assert_eq!(decision.publication_revision, 1);
     assert_eq!(decision.request_bindings.len(), 1);
     assert_eq!(project.collaboration_publications.len(), 1);
+    assert_admission_snapshot_readback(&state, &project);
     assert_eq!(
         state
             .store
@@ -4102,6 +4103,7 @@ fn collaboration_admission_is_solo_first_durable_fenced_and_exactly_replayable()
     assert_eq!(decision.publication_revision, 2);
     assert!(decision.reservations.iter().all(|value| value.released));
     assert_eq!(project.collaboration_publications.len(), 2);
+    assert_admission_snapshot_readback(&state, &project);
     assert!(state
         .store
         .collaboration_capacity_snapshot(&project.tenant_id, &project.project_id)
@@ -5069,4 +5071,39 @@ fn reliability_requires_attributed_claim_accepted_output_and_independent_gate() 
     );
     assert_eq!(project.collaboration_reliability, vec![observation]);
     assert_eq!(project.collaboration_generation, 3);
+    assert_admission_snapshot_readback(&state, &project);
+}
+
+fn assert_admission_snapshot_readback(state: &Journey, project: &sentinel_workflow::ProjectV1) {
+    let projection = state
+        .store
+        .company_project_projection(&project.tenant_id, &project.project_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&projection.project, project);
+    let events = state
+        .store
+        .company_project_events_since(&project.tenant_id, 0, 100)
+        .unwrap();
+    let event = events.last().unwrap();
+    assert_eq!(event.event_type, "project_collaboration_admission_recorded");
+    assert_eq!(event.sequence, projection.source_sequence);
+    assert_eq!(&event.project, project);
+    assert_eq!(
+        state.store.rebuild_company_project_projections().unwrap(),
+        1
+    );
+    let reopened = WorkflowStore::open(state._temp.path().join("workflow.sqlite")).unwrap();
+    assert_eq!(
+        reopened
+            .company_project_projection(&project.tenant_id, &project.project_id)
+            .unwrap(),
+        Some(projection)
+    );
+    assert_eq!(
+        reopened
+            .company_project_events_since(&project.tenant_id, 0, 100)
+            .unwrap(),
+        events
+    );
 }
