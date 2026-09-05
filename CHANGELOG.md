@@ -1,5 +1,7 @@
 # Changelog
 
+- Bind collaboration journey observations to the exact project and admission IDs, and retain the pre-panel event cursor across replay while validating the final projection digest at the final boundary (#740).
+
 - Issue #740 M0 acceptance: collaboration projection observations now distinguish exact initial assertions from monotone replay assertions. A resumed token-free journey keeps its historical version/generation captures while accepting only forward state progression and non-decreasing counters, so durable replay cannot mistake a later `completed` admission for drift from its earlier `admitted` checkpoint.
 
 - Add deterministic solo-first collaboration admission, hard server-derived

@@ -14,7 +14,7 @@ import run_m0_journey as journey
 
 
 BASE_JOURNEY_ID = "single-node-web-company-v5"
-COLLABORATION_JOURNEY_ID = "single-node-collaboration-admission-v2"
+COLLABORATION_JOURNEY_ID = "single-node-collaboration-admission-v3"
 ORGANIZATION_DIGEST = "8573b066e5b7205e3af66a58352c4c698387b6f17e657f7f57f6daa9edadb1c6"
 DESIGN_CONTRACT_DIGEST = "4a6aac2362da98d08ad589ba5e36a12eda339a3c0f61f73f30af2a6d714dbd93"
 SOURCE_CONTRACT_DIGEST = "7af74cf0681ccef86e9b28d2caac337e5f08448435d9eb139ade1590a67ab702"
@@ -67,6 +67,7 @@ def _observe_project(
     phase: str,
     project_id_ref: str,
     admission_index: int,
+    admission_id_ref: str,
     expected_state: str,
 ) -> dict[str, Any]:
     return {
@@ -79,7 +80,13 @@ def _observe_project(
         "route_role": "operator",
         "query": {"project_id": _ref(project_id_ref)},
         "expected_status": [200],
-        "assertions": [],
+        "assertions": [
+            {"pointer": "/project_id", "equals": _ref(project_id_ref)},
+            {
+                "pointer": f"/collaboration_admissions/{admission_index}/admission_id",
+                "equals": _ref(admission_id_ref),
+            },
+        ],
         "initial_assertions": [
             {
                 "pointer": f"/collaboration_admissions/{admission_index}/state",
@@ -125,23 +132,36 @@ def _observe_projection_boundary(project_id_ref: str) -> dict[str, Any]:
         "query": {"project_id": _ref(project_id_ref)},
         "expected_status": [200],
         "assertions": [
+            {"pointer": "/project_id", "equals": _ref(project_id_ref)},
+            {"pointer": "/project/project_id", "equals": _ref(project_id_ref)},
+            {
+                "pointer": "/project/collaboration_admissions/2/admission_id",
+                "equals": _ref("admit_directed_handoff.admission_id"),
+            },
             {
                 "pointer": "/project/collaboration_admissions/2/state",
                 "equals": "completed",
             }
         ],
+        "initial_assertions": [
+            {"pointer": "/project/collaboration_admissions/2/state", "equals": "completed"}
+        ],
+        "replay_assertions": [
+            {"pointer": "/project/collaboration_admissions/2/state", "equals": "completed"}
+        ],
         "capture": {
             "source_sequence": {"pointer": "/source_sequence", "type": "integer"},
-            "projection_digest": {
-                "pointer": "/projection_digest",
-                "type": "digest",
+            "project_id": {"pointer": "/project_id", "type": "id"},
+            "admission_id": {
+                "pointer": "/project/collaboration_admissions/2/admission_id",
+                "type": "id",
             },
         },
         "observe": {
             "interval_ms": 50,
             "max_attempts": 5,
             "max_elapsed_ms": 5_000,
-            "replay": "exact_status_and_captures",
+            "replay": "monotone_status_and_captures",
             "retry_statuses": [404, 409, 425, 429],
         },
     }
@@ -159,6 +179,18 @@ def _observe_final_projection(project_id_ref: str) -> dict[str, Any]:
         "query": {"project_id": _ref(project_id_ref)},
         "expected_status": [200],
         "assertions": [
+            {"pointer": "/project_id", "equals": _ref(project_id_ref)},
+        ]
+        + [
+            {
+                "pointer": f"/project/collaboration_admissions/{index}/admission_id",
+                "equals": _ref(f"admit_{prefix}.admission_id"),
+            }
+            for index, prefix in enumerate(
+                ("independent_review", "solo", "directed_handoff", "specialist_panel")
+            )
+        ]
+        + [
             {
                 "pointer": f"/project/collaboration_admissions/{index}/mode",
                 "equals": mode,
@@ -356,6 +388,7 @@ def _admission_steps(
             phase=phase,
             project_id_ref=project_id_ref,
             admission_index=admission_index,
+            admission_id_ref=f"{admit_id}.admission_id",
             expected_state="admitted",
         ),
         _positive(
@@ -404,6 +437,7 @@ def _admission_steps(
             phase=phase,
             project_id_ref=project_id_ref,
             admission_index=admission_index,
+            admission_id_ref=f"{admit_id}.admission_id",
             expected_state="completed",
         ),
     ]
