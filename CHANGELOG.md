@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Bound each model-work Gateway attempt to 120 seconds including queue and
+  pre-provider waiting. Preserve shorter caller/provider deadlines, reject
+  expired work before dispatch, and release cancelled queue grants without
+  invoking the provider (#856).
+
 - Disable hidden Codex CLI HTTP/stream retries, WebSocket fallback, unbounded
   connection retry, and inference-only shell snapshots through an explicit
   native-auth provider configuration. Verify the pinned binary against a local

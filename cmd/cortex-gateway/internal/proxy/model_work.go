@@ -4,12 +4,16 @@ import (
 	"encoding/hex"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/control"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/detection"
 )
 
-const maxModelWorkResponseBytes = 128 * 1024
+const (
+	maxModelWorkResponseBytes = 128 * 1024
+	maxModelWorkDuration      = 120 * time.Second
+)
 
 // This marker selects a response contract, not execution authority. The daemon
 // derives and revalidates the actual workflow authority before admitting tools.

@@ -30,6 +30,15 @@ upstream artifact inputs. The provider window is five minutes from the durable
 reservation timestamp; a new perception does not renew that window. Unsupported
 work fails closed instead of becoming an unbound tool or a host-shell action.
 
+Within that admission window, each model-work Gateway attempt has a separate
+maximum duration of 120 seconds from Gateway request start. That deadline covers
+queuing and pre-provider waits, is passed to the CLI, and cannot extend an
+earlier caller deadline or shorter configured provider timeout. An expired
+attempt is rejected before provider dispatch. The queue wrapper rechecks
+cancellation after acquiring capacity, including an immediately available grant,
+and releases expired capacity without invoking the provider. This is a local
+execution bound, not proof that a remote server stops token generation instantly.
+
 The request uses the reservation's stable ID and binds the assignment,
 principal, organization, profile, runtime, policy, and task content. Volatile
 tick, room chat, and body metadata cannot change its retry identity. The
