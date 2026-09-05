@@ -441,6 +441,7 @@ fn is_project_event_type(value: &str) -> bool {
             | "project_action_resolved"
             | "project_governed_rework_created"
             | "project_collaboration_recorded"
+            | "project_collaboration_admission_recorded"
     )
 }
 
@@ -7079,6 +7080,20 @@ mod tests {
     use tempfile::TempDir;
 
     const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn admission_snapshot_type_does_not_open_an_event_prefix_allowlist() {
+        assert!(is_project_event_type(
+            "project_collaboration_admission_recorded"
+        ));
+        for unknown in [
+            "project_collaboration_admission_recorded_v2",
+            "project_collaboration_admission_unknown",
+            "project_unknown",
+        ] {
+            assert!(!is_project_event_type(unknown));
+        }
+    }
 
     fn profile(id: &str) -> WorkProfileBindingV1 {
         WorkProfileBindingV1 {
