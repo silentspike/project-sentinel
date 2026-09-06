@@ -59,7 +59,7 @@ export function DeliveryView(props: DeliveryViewProps): JSX.Element {
   return (
     <div
       data-testid="view-delivery"
-      class="col"
+      class="col delivery-view"
       style={{ gap: "12px", padding: "12px", overflow: "auto", height: "100%" }}
     >
       <header class="control-card">
@@ -98,14 +98,8 @@ export function DeliveryView(props: DeliveryViewProps): JSX.Element {
 
             <Show when={failures().length === 0}>
               <section class="control-card">
-                <div
-                  style={{
-                    display: "grid",
-                    "grid-template-columns": "repeat(3, minmax(0, 1fr))",
-                    gap: "8px",
-                  }}
-                >
-                  <span data-testid="delivery-project">Project {safe().projectLabel}</span>
+                <div class="delivery-summary">
+                  <span data-testid="delivery-project">{safe().projectLabel}</span>
                   <span>Revision {safe().revision}</span>
                   <span>{safe().nodes.length} lineage records</span>
                 </div>
@@ -116,18 +110,12 @@ export function DeliveryView(props: DeliveryViewProps): JSX.Element {
                   {(node, index) => (
                     <article
                       data-testid="delivery-lineage-node"
-                      style={{
-                        display: "grid",
-                        "grid-template-columns": "140px 1fr 150px 180px 100px",
-                        gap: "10px",
-                        padding: "9px 0",
-                        "border-bottom": "1px solid var(--border, #333)",
-                      }}
+                      class="delivery-lineage-node"
                     >
-                      <strong>
+                      <strong class="delivery-node-stage">
                         {index() + 1}. {STAGE_LABELS[node.stage]}
                       </strong>
-                      <span>
+                      <span class="delivery-node-label">
                         {node.label} <span class="muted">({node.state})</span>
                       </span>
                       <span data-testid="delivery-authority">{node.actorRole}</span>

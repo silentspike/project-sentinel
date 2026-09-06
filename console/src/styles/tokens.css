@@ -519,6 +519,23 @@ input, select { font: inherit; color: var(--text); background: var(--surface-0);
   background: var(--surface-1);
 }
 .control-card h3 { margin: 0; font-size: 15px; }
+.delivery-view { container-type: inline-size; min-width: 0; }
+.delivery-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.delivery-lineage-node {
+  display: grid;
+  grid-template-columns: minmax(0, 140px) minmax(0, 1fr) minmax(0, 150px) minmax(0, 180px) minmax(0, 100px);
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
+}
+.delivery-lineage-node > *, .delivery-summary > * { min-width: 0; overflow-wrap: anywhere; }
+@container (max-width: 900px) {
+  .delivery-lineage-node { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .delivery-node-stage, .delivery-node-label { grid-column: 1 / -1; }
+}
+@container (max-width: 480px) {
+  .delivery-lineage-node, .delivery-summary { grid-template-columns: minmax(0, 1fr); }
+}
 .control-action-row, .control-status-grid, .form-grid, .control-stack {
   display: grid;
   gap: 8px;
