@@ -10,6 +10,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use uuid::Uuid;
 
+mod subscription;
+
 use crate::admission::*;
 use crate::collaboration::*;
 use crate::digest::{canonical_sha256, constant_time_eq};
@@ -432,6 +434,8 @@ fn is_project_event_type(value: &str) -> bool {
             | "project_blocker_resolved"
             | "project_approval_recorded"
             | "project_cost_reserved"
+            | "project_subscription_call_granted"
+            | "project_subscription_call_claimed"
             | "project_cost_committed"
             | "project_cost_released"
             | "project_room_created"
@@ -1245,6 +1249,7 @@ fn apply_company_command(
                 blockers: Vec::new(),
                 approvals: Vec::new(),
                 reservations: Vec::new(),
+                subscription_call: None,
                 rooms: Vec::new(),
                 questions: Vec::new(),
                 actions: Vec::new(),
@@ -2291,6 +2296,24 @@ fn mutate_project(
                 created_at_unix_ms: now_ms,
             });
         }
+        CompanyWorkflowCommandV1::GrantSubscriptionCall { grant, .. } => {
+            subscription::grant(&mut project, principal, operation_id, grant, now_ms)?;
+        }
+        CompanyWorkflowCommandV1::ClaimSubscriptionCall {
+            allowance_id,
+            request_id,
+            request_digest,
+            ..
+        } => {
+            subscription::claim(
+                &mut project,
+                principal,
+                allowance_id,
+                request_id,
+                request_digest,
+                now_ms,
+            )?;
+        }
         CompanyWorkflowCommandV1::ReserveCost {
             work_item_id,
             provider,
@@ -2306,6 +2329,13 @@ fn mutate_project(
             }
             validate_identifier(provider)?;
             validate_optional_work(&project, work_item_id.as_ref())?;
+            if project.subscription_call.as_ref().is_some_and(|allowance| {
+                work_item_id.as_ref() == Some(&allowance.grant.work_item_id)
+            }) {
+                return Err(invalid(
+                    "subscription call cannot use monetary reservations",
+                ));
+            }
             let provider_ceiling = project
                 .provider_cost_ceilings_micros
                 .get(provider)
@@ -4816,6 +4846,16 @@ fn project_target(command: &CompanyWorkflowCommandV1) -> Option<(&ProjectId, u64
             expected_version,
             ..
         }
+        | CompanyWorkflowCommandV1::GrantSubscriptionCall {
+            project_id,
+            expected_version,
+            ..
+        }
+        | CompanyWorkflowCommandV1::ClaimSubscriptionCall {
+            project_id,
+            expected_version,
+            ..
+        }
         | CompanyWorkflowCommandV1::ReserveCost {
             project_id,
             expected_version,
@@ -4953,6 +4993,12 @@ fn project_event_type(command: &CompanyWorkflowCommandV1) -> Result<&'static str
         CompanyWorkflowCommandV1::ResolveBlocker { .. } => Ok("project_blocker_resolved"),
         CompanyWorkflowCommandV1::RecordApproval { .. } => Ok("project_approval_recorded"),
         CompanyWorkflowCommandV1::ReserveCost { .. } => Ok("project_cost_reserved"),
+        CompanyWorkflowCommandV1::GrantSubscriptionCall { .. } => {
+            Ok("project_subscription_call_granted")
+        }
+        CompanyWorkflowCommandV1::ClaimSubscriptionCall { .. } => {
+            Ok("project_subscription_call_claimed")
+        }
         CompanyWorkflowCommandV1::CommitCost { .. } => Ok("project_cost_committed"),
         CompanyWorkflowCommandV1::ReleaseCost { .. } => Ok("project_cost_released"),
         CompanyWorkflowCommandV1::CreateProjectRoom { .. } => Ok("project_room_created"),
@@ -5961,6 +6007,7 @@ fn validate_work_graph_if_present(
 }
 
 fn validate_project_collections(project: &ProjectV1) -> Result<(), WorkflowError> {
+    subscription::validate(project)?;
     let participant = |agent_id: crate::AgentId| {
         project
             .governance

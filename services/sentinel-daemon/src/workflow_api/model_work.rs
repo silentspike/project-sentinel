@@ -86,6 +86,7 @@ impl ModelWorkCompletion {
             assignment_version: binding.assignment_version,
             agent_id: binding.agent_id,
             provider: binding.provider.clone(),
+            subscription_grant: binding.subscription_grant.clone(),
         };
         let payload: DomainEventPayload = serde_json::from_str(&event.payload)
             .map_err(|_| "model work usage payload is invalid")?;
@@ -180,24 +181,29 @@ impl WorkflowApi {
             || current.project_id != binding.project_id
             || current.work_item_id != binding.work_item_id
             || current.provider != binding.provider
+            || current.subscription_grant != binding.subscription_grant
         {
             return Err("model work reservation changed");
         }
-        let reservation = project
-            .reservations
-            .iter()
-            .find(|r| r.reservation_id == binding.reservation_id)
-            .ok_or("model work reservation missing")?;
+        let deadline_unix_ms = if let Some(grant) = &binding.subscription_grant {
+            grant.expires_at_unix_ms
+        } else {
+            project
+                .reservations
+                .iter()
+                .find(|r| r.reservation_id == binding.reservation_id)
+                .ok_or("model work reservation missing")?
+                .created_at_unix_ms
+                .checked_add(MODEL_WORK_WINDOW_MS)
+                .ok_or("model work deadline overflow")?
+        };
         let context = ModelWorkContext {
             binding: binding.clone(),
             authority: authority
                 .snapshot_for_admission(&tenant, &project_id, &work_id, binding.agent_id, false)
                 .map_err(|_| "model work authority unavailable")?,
             task: work.spec.clone(),
-            deadline_unix_ms: reservation
-                .created_at_unix_ms
-                .checked_add(MODEL_WORK_WINDOW_MS)
-                .ok_or("model work deadline overflow")?,
+            deadline_unix_ms,
         };
         context.prompt()?;
         Ok(Some(context))
@@ -223,6 +229,26 @@ impl WorkflowApi {
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         {
             return Err("model work completion authority changed");
+        }
+        if let Some(grant) = &context.binding.subscription_grant {
+            let project = self
+                .store
+                .company_project(&context.authority.tenant_id, &context.authority.project_id)
+                .map_err(|_| "subscription completion store unavailable")?
+                .ok_or("subscription project missing")?;
+            let allowance = project
+                .subscription_call
+                .as_ref()
+                .ok_or("subscription allowance missing")?;
+            if self.subscription_allowance_id.as_deref() != Some(allowance.allowance_id.as_str())
+                || allowance.allowance_id != context.binding.reservation_id
+                || &allowance.grant != grant
+                || !allowance.dispatch.as_ref().is_some_and(|dispatch| {
+                    dispatch.request_id == request_id && dispatch.request_digest == request_digest
+                })
+            {
+                return Err("subscription result is not bound to a consumed dispatch");
+            }
         }
         let tools = parse_proposal(&completion.content)?;
         let operation_id = stable_operation_id(
@@ -326,6 +352,7 @@ pub(crate) fn test_context() -> ModelWorkContext {
             assignment_version: 1,
             agent_id: authority.agent_id,
             provider: "codex-cli".to_owned(),
+            subscription_grant: None,
         },
         task: sentinel_workflow::CompanyWorkItemSpecV1 {
             work_item_id: authority.work_item_id.clone(),
@@ -454,6 +481,10 @@ mod tests {
     }
 
     fn assign_test_work(api: &WorkflowApi) -> ProviderUsageAuthority {
+        assign_test_work_mode(api, false)
+    }
+
+    fn assign_test_work_mode(api: &WorkflowApi, subscription: bool) -> ProviderUsageAuthority {
         use sentinel_workflow::{CompanyWorkflowResponseV1 as Response, WorkProfileBindingV1};
         let now = now_unix_ms();
         let mut operation = 0_u128;
@@ -597,6 +628,46 @@ mod tests {
         ) else {
             panic!("assignment")
         };
+        if subscription {
+            let assignment = &project.work_items[&spec.work_item_id].assignments[0];
+            let grant = sentinel_workflow::SubscriptionCallGrantV1 {
+                schema_version: 1,
+                work_item_id: spec.work_item_id.clone(),
+                assignment_id: assignment.assignment_id.clone(),
+                assignment_version: assignment.assignment_version,
+                agent_id: AgentId(6),
+                provider: "codex-cli".into(),
+                model: "gpt-5.4".into(),
+                catalog_digest: "c".repeat(64),
+                max_calls: 1,
+                max_concurrent: 1,
+                max_duration_ms: 120_000,
+                token_policy:
+                    sentinel_workflow::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+                expires_at_unix_ms: now + 300_000,
+            };
+            let Response::Project(project) = apply(
+                "pm",
+                CompanyWorkflowCommandV1::GrantSubscriptionCall {
+                    project_id: project.project_id,
+                    expected_version: project.version,
+                    grant: grant.clone(),
+                },
+            ) else {
+                panic!("subscription grant")
+            };
+            return ProviderUsageAuthority {
+                tenant_id: project.tenant_id.0,
+                project_id: project.project_id.0,
+                work_item_id: spec.work_item_id.0,
+                reservation_id: project.subscription_call.unwrap().allowance_id,
+                assignment_id: grant.assignment_id.clone(),
+                assignment_version: grant.assignment_version,
+                agent_id: grant.agent_id,
+                provider: grant.provider.clone(),
+                subscription_grant: Some(grant),
+            };
+        }
         let Response::Project(project) = apply(
             "pm",
             CompanyWorkflowCommandV1::ReserveCost {
@@ -619,7 +690,107 @@ mod tests {
             assignment_version: assignment.assignment_version,
             agent_id: AgentId(6),
             provider: "local-loop".to_owned(),
+            subscription_grant: None,
         }
+    }
+
+    #[test]
+    fn subscription_dispatch_consumes_once_across_restart_without_changing_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events_path = temp.path().join("events.sqlite");
+        let mut api = configured_test_api(&path);
+        let binding = assign_test_work_mode(&api, true);
+        api.subscription_allowance_id = Some(binding.reservation_id.clone());
+        api.event_store =
+            Some(sentinel_limbo::EventStore::open(events_path.to_str().unwrap()).unwrap());
+        let context = api.prepare_model_work(&binding).unwrap().unwrap();
+        let id = format!("company-provider-{}", binding.reservation_id);
+        let digest = "d".repeat(64);
+        let context_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&context).unwrap())
+        );
+        let request = serde_json::json!({
+            "schema_version": 1, "allowance_id": binding.reservation_id, "agent_id": 6,
+            "request_id": id, "request_digest": digest, "context_digest": context_digest,
+            "provider": "codex-cli", "model": "gpt-5.4", "catalog_digest": "c".repeat(64),
+        });
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let principal = api.principals.principal("developer-6").unwrap();
+        let command = serde_json::to_vec(&serde_json::json!({"operation_id": Uuid::new_v4(), "command": {
+            "command": "claim_subscription_call", "project_id": binding.project_id, "expected_version": 5,
+            "allowance_id": binding.reservation_id, "request_id": id, "request_digest": digest
+        }})).unwrap();
+        assert_eq!(
+            api.company_command(&principal, CompanyPrincipalKindV1::Agent, &command)
+                .status,
+            403,
+            "public command cannot consume or forge a dispatch"
+        );
+        assert_eq!(
+            api.subscription_dispatch(&bytes).status,
+            403,
+            "no EventStore reservation"
+        );
+        api.event_store
+            .as_ref()
+            .unwrap()
+            .reserve_llm_request(&id, &digest, &AgentId(6).to_string())
+            .unwrap();
+        for key in [
+            "model",
+            "catalog_digest",
+            "context_digest",
+            "request_digest",
+            "allowance_id",
+        ] {
+            let mut wrong = request.clone();
+            wrong[key] = serde_json::json!("foreign");
+            assert_eq!(
+                api.subscription_dispatch(&serde_json::to_vec(&wrong).unwrap())
+                    .status,
+                403,
+                "{key}"
+            );
+        }
+        assert_eq!(api.subscription_dispatch(&bytes).status, 200);
+        assert_eq!(api.prepare_model_work(&binding).unwrap().unwrap(), context);
+        assert_eq!(
+            api.subscription_dispatch(&bytes).status,
+            403,
+            "same HTTP request cannot reauthorize"
+        );
+        assert!(
+            api.provider_usage_binding_for_agent(AgentId(7)).is_err(),
+            "other agents stay blocked"
+        );
+        drop(api);
+        let mut api = configured_test_api(&path);
+        api.subscription_allowance_id = Some(binding.reservation_id.clone());
+        api.event_store =
+            Some(sentinel_limbo::EventStore::open(events_path.to_str().unwrap()).unwrap());
+        assert_eq!(
+            api.subscription_dispatch(&bytes).status,
+            403,
+            "restart retains the dispatch tombstone"
+        );
+        assert_eq!(api.prepare_model_work(&binding).unwrap().unwrap(), context);
+        let completion = ModelWorkCompletion { context,
+            content: r#"{"schema_version":1,"tools":[{"kind":"write_file","path":"index.js","content":"console.log(42);","expected_sha256":null},{"kind":"package_artifact","artifact_kind":"source_tree","media_type":"application/vnd.sentinel.source-tree","paths":["index.js"]}]}"#.into(), admissible: true };
+        api.accept_model_work(&completion, &id, &digest).unwrap();
+        api.accept_model_work(&completion, &id, &digest).unwrap();
+        assert_eq!(api.store.pending_executions(10).unwrap().len(), 1);
+        assert!(api
+            .store
+            .company_project(
+                &TenantId::parse(&binding.tenant_id).unwrap(),
+                &ProjectId::parse(&binding.project_id).unwrap()
+            )
+            .unwrap()
+            .unwrap()
+            .reservations
+            .is_empty());
     }
 
     #[test]

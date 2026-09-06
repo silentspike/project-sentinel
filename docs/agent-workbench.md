@@ -70,13 +70,62 @@ or claimed completion rows are not implicitly reactivated. There is no new store
 or schema migration; version-1 legacy completion payloads remain readable.
 
 This bridge is not the full M1 conversation/tool-result loop. Additional inputs,
-iterative rework, model-selected team decisions, OAuth quota-native reservations,
+iterative rework, model-selected team decisions,
 and the real-provider customer-to-artifact journey remain #856 acceptance work.
 In particular, the existing monetary reservation API must not be presented as a
 valid substitute for ChatGPT subscription call/token/time limits or be populated
 with an invented marginal USD price. The activation stays off until that provider
 contract and the target-runtime readiness are verified. Test fixtures use the
 existing `local-loop` exemption, not a production OAuth exemption.
+
+### Single-call subscription allowance
+
+`GrantSubscriptionCall` authorizes one assigned Designer or Developer work item
+inside the existing project transaction, journal, and projection. It is separate
+from `ReserveCost`: a Project Manager or Technical Lead binds the exact assignment,
+employee, provider `codex-cli`, model, and semantic catalog digest. Limits are one
+call, one concurrent dispatch, at most 120 seconds locally, and an expiry no later
+than five minutes after creation. The explicit token policy is
+`measured_without_generation_cap`; it is not a hard generation-token guarantee.
+
+The project retains its allowance permanently, including a consumed or unknown
+outcome. It cannot create a replacement grant or mix a money reservation into the
+same work item. Projects without an allowance retain their previous serialized
+bytes and digests. No separate admission database or monetary exemption is added.
+An older release that does not know this additive project field must not open an
+allowance-bearing store. Roll back through the declared compatible backup/restore
+procedure, with provider activity disabled and external outcomes accounted for.
+
+Set the same `SENTINEL_MODEL_WORK_ALLOWANCE_ID` on the daemon and Gateway for this
+bounded mode. Configure it only after creating the grant through the authenticated
+company command API, with provider activity still disabled during preparation.
+The daemon also requires model work and usage-v2. The Gateway requires its existing
+protected operator credential and a loopback-only `SENTINEL_OPERATOR_API_URL`.
+A subscription-marked request without the Gateway mode fails closed.
+
+Immediately before provider I/O, after queue admission and model resolution, the
+Gateway calls `POST /operator/workflow/subscription-dispatch`. The daemon checks
+the existing EventStore request reservation, current assignment/context, exact
+model/catalog and expiry, then atomically records `ClaimSubscriptionCall` in the
+workflow store. This command is internal, not a caller-selectable company command.
+Each callback uses a fresh operation ID so an identical HTTP retry is denied after
+consumption rather than replaying a reusable dispatch permission. The Gateway
+neither retries this callback nor follows redirects. A lost response or cancellation
+can consume permission without dispatch; it never makes a second call permissible.
+
+All registered providers pass this check while the mode is configured. Unrelated
+agent, Judge, Gaia, operator, background and local-loop requests cannot bypass it.
+The checked raw HTTP request digest, server-derived context and immutable grant
+remain stable across retries. Terminal result adoption additionally requires the
+exact consumed dispatch. Local result recovery does not reauthorize provider I/O.
+Reported tokens remain linked to that request. Codex `usage_price_table` values
+are API-equivalent estimates, not ChatGPT billed spend, and are not committed as
+actual subscription charges. Missing terminal usage remains unknown, never zero.
+
+Changing or removing this runtime mode is a separate operator action, not an
+automatic reset. Deployment must verify both services use the same grant before
+provider activity is enabled. Restoring a pre-dispatch database snapshot is not
+permission to repeat an external effect; review its outcome before reactivation.
 
 ### Codex OAuth transport limits
 

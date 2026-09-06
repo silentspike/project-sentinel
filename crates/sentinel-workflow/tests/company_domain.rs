@@ -371,6 +371,9 @@ fn project_command(
     *project
 }
 
+#[path = "company_domain/subscription.rs"]
+mod subscription;
+
 fn collaboration_authority(
     project: &sentinel_workflow::ProjectV1,
     work_item_id: &WorkItemId,

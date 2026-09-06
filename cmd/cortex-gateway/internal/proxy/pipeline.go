@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -348,6 +349,9 @@ func (ph *PipelineHandler) parseRequest(w http.ResponseWriter, r *http.Request) 
 	}
 	if req.Metadata == nil {
 		req.Metadata = make(map[string]string)
+	}
+	if digest := r.Header.Get("X-Request-Digest"); digest != "" && digest == fmt.Sprintf("%x", sha256.Sum256(body)) {
+		req.AuthorityRequestDigest = digest
 	}
 
 	return req, requestID, true

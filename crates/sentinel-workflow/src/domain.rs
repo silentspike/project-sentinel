@@ -647,6 +647,50 @@ pub enum CostReservationStateV1 {
     Released,
 }
 
+/// Explicit first-rung subscription authority, never a monetary exemption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionCallGrantV1 {
+    pub schema_version: u16,
+    pub work_item_id: WorkItemId,
+    pub assignment_id: String,
+    pub assignment_version: u64,
+    pub agent_id: AgentId,
+    pub provider: String,
+    pub model: String,
+    pub catalog_digest: String,
+    pub max_calls: u16,
+    pub max_concurrent: u16,
+    pub max_duration_ms: u64,
+    pub token_policy: SubscriptionTokenPolicyV1,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionTokenPolicyV1 {
+    MeasuredWithoutGenerationCap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionCallAllowanceV1 {
+    pub allowance_id: String,
+    pub grant: SubscriptionCallGrantV1,
+    pub created_by: String,
+    pub created_at_unix_ms: u64,
+    /// Never cleared, including when the provider outcome or usage is unknown.
+    pub dispatch: Option<SubscriptionCallDispatchV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionCallDispatchV1 {
+    pub request_id: String,
+    pub request_digest: String,
+    pub dispatched_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectRoomKindV1 {
@@ -712,6 +756,8 @@ pub struct ProjectV1 {
     pub blockers: Vec<BlockerV1>,
     pub approvals: Vec<ApprovalV1>,
     pub reservations: Vec<CostReservationV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_call: Option<SubscriptionCallAllowanceV1>,
     pub rooms: Vec<ProjectRoomV1>,
     pub questions: Vec<ProjectQuestionV1>,
     pub actions: Vec<ProjectActionV1>,
@@ -950,6 +996,19 @@ pub enum CompanyWorkflowCommandV1 {
         work_item_id: WorkItemId,
         subject_digest: String,
         approved: bool,
+    },
+    GrantSubscriptionCall {
+        project_id: ProjectId,
+        expected_version: u64,
+        grant: SubscriptionCallGrantV1,
+    },
+    /// Internal dispatcher command. Public command routes must reject it.
+    ClaimSubscriptionCall {
+        project_id: ProjectId,
+        expected_version: u64,
+        allowance_id: String,
+        request_id: String,
+        request_digest: String,
     },
     ReserveCost {
         project_id: ProjectId,
