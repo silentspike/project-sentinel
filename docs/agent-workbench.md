@@ -103,6 +103,17 @@ The daemon also requires model work and usage-v2. The Gateway requires its exist
 protected operator credential and a loopback-only `SENTINEL_OPERATOR_API_URL`.
 A subscription-marked request without the Gateway mode fails closed.
 
+Check the entire timeout chain before granting a call. The Gateway defaults to
+a 60-second provider timeout; `SENTINEL_CORTEX_PROVIDER_TIMEOUT_SECONDS=120`
+explicitly enables the full two-minute provider window when approved. Shorter
+configured timeouts are never extended by the allowance. The proxy HTTP write
+deadline covers request reading, the configured in-flight budget, and five
+seconds for terminal response delivery. The control-plane deadline remains
+60 seconds. The subscription context still caps actual model work at 120 seconds
+including queue waiting; the longer socket lifetime does not authorize more
+provider time, retries, or another call. A cancelled CLI with an incomplete stream
+reports its context deadline, not successful completion or zero consumption.
+
 Immediately before provider I/O, after queue admission and model resolution, the
 Gateway calls `POST /operator/workflow/subscription-dispatch`. The daemon checks
 the existing EventStore request reservation, current assignment/context, exact

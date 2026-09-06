@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Keep the Gateway proxy HTTP response deadline beyond the bounded in-flight
+  request budget, retain the shorter control-plane deadline, and preserve
+  Codex cancellation causes when an incomplete stream follows a timeout.
+  Document the explicit provider timeout required for an approved two-minute
+  model-work window without increasing dispatch or retry authority (#856).
+
 - Select the exact configured subscription allowance before evaluating other
   employee assignments. Preserve unrelated projects and historical outcomes,
   while rejecting duplicate or mismatched dispatch authority (#856).
