@@ -485,9 +485,16 @@ mod tests {
     }
 
     fn assign_test_work_mode(api: &WorkflowApi, subscription: bool) -> ProviderUsageAuthority {
+        assign_test_work_from(api, subscription, 0)
+    }
+
+    fn assign_test_work_from(
+        api: &WorkflowApi,
+        subscription: bool,
+        mut operation: u128,
+    ) -> ProviderUsageAuthority {
         use sentinel_workflow::{CompanyWorkflowResponseV1 as Response, WorkProfileBindingV1};
         let now = now_unix_ms();
-        let mut operation = 0_u128;
         let mut apply = |actor: &str, command| {
             operation += 1;
             api.store
@@ -692,6 +699,76 @@ mod tests {
             provider: "local-loop".to_owned(),
             subscription_grant: None,
         }
+    }
+
+    #[test]
+    fn subscription_selection_preserves_other_projects_across_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let mut api = configured_test_api(&path);
+        let old = assign_test_work_from(&api, false, 0);
+        let binding = assign_test_work_from(&api, true, 100);
+        let original = api.store.company_projects().unwrap();
+        assert_eq!(original.len(), 2);
+        assert!(api.provider_usage_binding_for_agent(AgentId(6)).is_err());
+        api.subscription_allowance_id = Some(binding.reservation_id.clone());
+        let context = api.prepare_model_work(&binding).unwrap().unwrap();
+        assert_eq!(context.binding, binding);
+        assert!(api.prepare_model_work(&old).is_err());
+        assert!(api.provider_usage_binding_for_agent(AgentId(7)).is_err());
+        assert_eq!(api.store.company_projects().unwrap(), original);
+        drop(api);
+        let mut api = configured_test_api(&path);
+        api.subscription_allowance_id = Some(binding.reservation_id.clone());
+        assert_eq!(api.prepare_model_work(&binding).unwrap().unwrap(), context);
+        assert_eq!(api.store.company_projects().unwrap(), original);
+        api.subscription_allowance_id = Some("subscription-foreign".into());
+        assert!(api.provider_usage_binding_for_agent(AgentId(6)).is_err());
+    }
+
+    #[test]
+    fn subscription_selection_ignores_unfunded_siblings_but_rejects_duplicate_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = configured_test_api(&temp.path().join("company.sqlite"));
+        let binding = assign_test_work_mode(&api, true);
+        let mut projects = api.store.company_projects().unwrap();
+        let selected = &mut projects[0];
+        let mut sibling = selected.work_items.values().next().unwrap().clone();
+        sibling.spec.work_item_id = WorkItemId::parse("older-assigned-work").unwrap();
+        selected
+            .work_items
+            .insert(sibling.spec.work_item_id.clone(), sibling);
+        let mut unrelated = selected.clone();
+        unrelated.project_id = ProjectId::parse("project-unrelated").unwrap();
+        unrelated.subscription_call = None;
+        unrelated.reservations.clear();
+        projects.insert(0, unrelated);
+        let bytes_before = serde_json::to_vec(&projects).unwrap();
+        let selected =
+            select_provider_usage_binding(&projects, AgentId(6), Some(&binding.reservation_id))
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected.reservation_id, binding.reservation_id);
+        assert_eq!(selected.work_item_id, binding.work_item_id);
+        assert_eq!(serde_json::to_vec(&projects).unwrap(), bytes_before);
+        assert!(select_provider_usage_binding(&projects, AgentId(6), None).is_err());
+        let mut changed = projects.clone();
+        changed[1]
+            .subscription_call
+            .as_mut()
+            .unwrap()
+            .grant
+            .assignment_version += 1;
+        assert_eq!(
+            select_provider_usage_binding(&changed, AgentId(6), Some(&binding.reservation_id)),
+            Err("subscription assignment authority changed")
+        );
+        let duplicate = projects[1].clone();
+        projects.push(duplicate);
+        assert_eq!(
+            select_provider_usage_binding(&projects, AgentId(6), Some(&binding.reservation_id)),
+            Err("agent has ambiguous provider usage authority")
+        );
     }
 
     #[test]
