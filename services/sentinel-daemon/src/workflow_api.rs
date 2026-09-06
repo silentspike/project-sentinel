@@ -2100,13 +2100,27 @@ struct ProviderUsageBinding {
 fn select_provider_usage_binding(
     projects: &[sentinel_workflow::ProjectV1],
     agent_id: AgentId,
+    allowance_id: Option<&str>,
 ) -> Result<Option<ProviderUsageBinding>, &'static str> {
     let mut selected = None;
     for project in projects {
         if project.lifecycle_state != sentinel_workflow::ProjectLifecycleStateV1::Active {
             continue;
         }
+        // A configured allowance selects one work item, not all of the employee's jobs.
+        let scoped_work_item = match allowance_id {
+            Some(id) => match &project.subscription_call {
+                Some(allowance) if allowance.allowance_id == id => {
+                    Some(&allowance.grant.work_item_id)
+                }
+                _ => continue,
+            },
+            None => None,
+        };
         for (work_item_id, work_item) in &project.work_items {
+            if scoped_work_item.is_some_and(|id| id != work_item_id) {
+                continue;
+            }
             if !matches!(
                 work_item.state,
                 sentinel_workflow::CompanyWorkStateV1::Assigned
@@ -3299,7 +3313,11 @@ impl WorkflowApi {
             .store
             .company_projects()
             .map_err(|_| "company provider authority could not be read")?;
-        let binding = select_provider_usage_binding(&projects, agent_id)?;
+        let binding = select_provider_usage_binding(
+            &projects,
+            agent_id,
+            self.subscription_allowance_id.as_deref(),
+        )?;
         if let Some(allowance_id) = &self.subscription_allowance_id {
             if !binding.as_ref().is_some_and(|binding| {
                 &binding.reservation_id == allowance_id && binding.subscription_grant.is_some()
@@ -4904,11 +4922,13 @@ mod tests {
     fn provider_usage_authority_requires_one_exact_active_reservation() {
         let project = project_with_provider_authority();
         assert_eq!(
-            select_provider_usage_binding(std::slice::from_ref(&project), AgentId(6)).unwrap(),
+            select_provider_usage_binding(std::slice::from_ref(&project), AgentId(6), None)
+                .unwrap(),
             Some(provider_usage_binding())
         );
         assert_eq!(
-            select_provider_usage_binding(std::slice::from_ref(&project), AgentId(7)).unwrap(),
+            select_provider_usage_binding(std::slice::from_ref(&project), AgentId(7), None)
+                .unwrap(),
             None
         );
 
@@ -4918,13 +4938,14 @@ mod tests {
         assert!(select_provider_usage_binding(
             &[project_with_provider_authority(), second],
             AgentId(6),
+            None,
         )
         .is_err());
 
         let mut missing_reservation = project_with_provider_authority();
         missing_reservation.reservations.clear();
         assert_eq!(
-            select_provider_usage_binding(&[missing_reservation], AgentId(6)),
+            select_provider_usage_binding(&[missing_reservation], AgentId(6), None),
             Err("assigned provider work item has no active reservation")
         );
     }
