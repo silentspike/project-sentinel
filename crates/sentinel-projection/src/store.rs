@@ -8,7 +8,8 @@
 //! tolerieren Re-Processing bei Restart.
 
 use anyhow::Context;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info};
@@ -424,7 +425,30 @@ impl ReadModelStore {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        Ok(ReadModelTransaction { guard })
+        anyhow::ensure!(guard.is_autocommit(), "unresolved read-model transaction");
+        Ok(ReadModelTransaction {
+            guard,
+            active: Cell::new(false),
+        })
+    }
+
+    pub(crate) fn transaction<T>(
+        &self,
+        apply: impl FnOnce(&ReadModelTransaction<'_>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let txn = self.begin_transaction()?;
+        txn.begin()?;
+        let result = apply(&txn).and_then(|value| txn.commit().map(|()| value));
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if let Err(rollback) = txn.rollback() {
+                    // Do not expose a nested BUSY as retryable after rollback fails.
+                    anyhow::bail!("read-model rollback failed: {rollback}; original: {error}");
+                }
+                Err(error)
+            }
+        }
     }
 
     // ── Query-Methoden (fuer Tests und Dashboard) ──
@@ -774,6 +798,17 @@ pub struct WorkbenchInvocationView {
 /// Methoden auf und committed am Ende mit `commit()`.
 pub struct ReadModelTransaction<'a> {
     guard: std::sync::MutexGuard<'a, Connection>,
+    active: Cell<bool>,
+}
+
+impl Drop for ReadModelTransaction<'_> {
+    fn drop(&mut self) {
+        if self.active.get() {
+            if let Err(error) = self.guard.execute_batch("ROLLBACK") {
+                tracing::error!(error = %error, "read-model transaction cleanup failed");
+            }
+        }
+    }
 }
 
 impl<'a> ReadModelTransaction<'a> {
@@ -783,19 +818,34 @@ impl<'a> ReadModelTransaction<'a> {
         // concurrent short writer can invalidate the WAL read snapshot and
         // make the later write-upgrade fail immediately with SQLITE_BUSY.
         self.guard.execute_batch("BEGIN IMMEDIATE")?;
+        self.active.set(true);
         Ok(())
     }
 
     /// Committed die SQLite-Transaktion.
     pub fn commit(&self) -> anyhow::Result<()> {
         self.guard.execute_batch("COMMIT")?;
+        self.active.set(false);
         Ok(())
     }
 
     /// Rollback fuer fail-closed Batch-Fehler.
     pub fn rollback(&self) -> anyhow::Result<()> {
         self.guard.execute_batch("ROLLBACK")?;
+        self.active.set(false);
         Ok(())
+    }
+
+    pub(crate) fn projection_watermark(&self, projection_name: &str) -> anyhow::Result<i64> {
+        Ok(self
+            .guard
+            .query_row(
+                "SELECT last_event_id FROM projection_watermarks WHERE projection_name = ?1",
+                [projection_name],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
     }
 
     /// Globaler Dashboard-Watermark: ein Read aus dieser Tabelle ersetzt die
@@ -1251,9 +1301,8 @@ impl<'a> ReadModelTransaction<'a> {
     /// UND ActiveAgents). `last_event_id` trackt den hoechsten gesehenen
     /// Wert (MAX), wird aber nicht als Gate verwendet.
     ///
-    /// Idempotenz wird stattdessen auf Batch-Ebene via Projection-Offset
-    /// sichergestellt. Bei Crash-Recovery koennten KPI-Werte minimal
-    /// abweichen (akzeptabel fuer Monitoring). `rebuild()` ist immer korrekt.
+    /// The worker skips already committed events using the read-model watermark
+    /// in the same transaction. A lagging EventStore mirror cannot recount them.
     pub fn increment_kpi(
         &self,
         timestamp_ms: u64,
@@ -1606,6 +1655,168 @@ mod tests {
 
         // Idempotent: nochmal initialisieren aendert nichts
         store.initialize_rooms(&["empfang", "kueche"]).unwrap();
+    }
+
+    #[test]
+    fn dropped_read_model_transaction_rolls_back_rows_and_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReadModelStore::open(dir.path().join("rollback.db").to_str().unwrap()).unwrap();
+        {
+            let txn = store.begin_transaction().unwrap();
+            txn.begin().unwrap();
+            txn.upsert_agent(7, "Uncommitted", "QA", 1, "active", 10)
+                .unwrap();
+            txn.update_projection_watermark(PROJECTION_NAME, 10)
+                .unwrap();
+        }
+        assert!(store.get_agent(7).unwrap().is_none());
+        store
+            .transaction(|txn| {
+                assert_eq!(txn.projection_watermark(PROJECTION_NAME)?, 0);
+                txn.upsert_agent(7, "Committed", "QA", 1, "active", 11)
+            })
+            .unwrap();
+        assert_eq!(store.get_agent(7).unwrap().unwrap().name, "Committed");
+    }
+
+    #[test]
+    fn busy_batch_rollback_prevents_duplicate_additive_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReadModelStore::open(dir.path().join("retry.db").to_str().unwrap()).unwrap();
+        let mut attempts = 0;
+        crate::retry::sqlite_busy("batch fixture", || {
+            attempts += 1;
+            store.transaction(|txn| {
+                txn.guard.execute("INSERT INTO projection_watermarks(projection_name,last_event_id,updated_at) VALUES ('attempt',1,0) ON CONFLICT(projection_name) DO UPDATE SET last_event_id=last_event_id+1", [])?;
+                if attempts == 1 {
+                    return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None).into());
+                }
+                txn.upsert_agent(7, "Committed", "QA", 1, "active", 11)
+            })
+        }).unwrap();
+        assert_eq!(attempts, 2);
+        let conn = store.conn.lock().unwrap();
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.query_row(
+                "SELECT last_event_id FROM projection_watermarks WHERE projection_name='attempt'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_commit_rolls_back_and_releases_the_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ReadModelStore::open(dir.path().join("commit-failed.db").to_str().unwrap()).unwrap();
+        store.conn.lock().unwrap().execute_batch(
+            "PRAGMA foreign_keys=ON; CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);"
+        ).unwrap();
+        let result = store.transaction(|txn| {
+            txn.guard.execute("INSERT INTO child VALUES(99)", [])?;
+            txn.upsert_agent(7, "Uncommitted", "QA", 1, "active", 10)
+        });
+        assert!(result.is_err());
+        assert!(store.get_agent(7).unwrap().is_none());
+        store
+            .transaction(|txn| {
+                assert_eq!(
+                    txn.guard
+                        .query_row("SELECT COUNT(*) FROM child", [], |row| row.get::<_, i64>(0))?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn real_writer_contention_recovers_before_starting_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer-busy.db");
+        let store = ReadModelStore::open(path.to_str().unwrap()).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .busy_timeout(Duration::ZERO)
+            .unwrap();
+        let competitor = Connection::open(path).unwrap();
+        competitor.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut attempts = 0;
+        let mut applied = 0;
+        crate::retry::sqlite_busy("real writer", || {
+            attempts += 1;
+            if attempts == 2 {
+                competitor.execute_batch("ROLLBACK")?;
+            }
+            store.transaction(|txn| {
+                applied += 1;
+                txn.upsert_agent(7, "Committed", "QA", 1, "active", 10)
+            })
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(applied, 1);
+        assert!(store.get_agent(7).unwrap().is_some());
+    }
+
+    #[test]
+    fn unresolved_transaction_is_rejected_before_batch_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ReadModelStore::open(dir.path().join("unresolved.db").to_str().unwrap()).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+        let mut applied = 0;
+        let error = crate::retry::sqlite_busy("unresolved fixture", || {
+            store.transaction(|_| {
+                applied += 1;
+                Ok(())
+            })
+        })
+        .unwrap_err();
+        assert_eq!(applied, 0);
+        assert!(format!("{error:#}").contains("unresolved read-model transaction"));
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("ROLLBACK")
+            .unwrap();
+        store.transaction(|_| Ok(())).unwrap();
+    }
+
+    #[test]
+    fn rollback_failure_does_not_reauthorize_busy_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ReadModelStore::open(dir.path().join("rollback-failed.db").to_str().unwrap()).unwrap();
+        let mut attempts = 0;
+        let error = crate::retry::sqlite_busy::<()>("batch fixture", || {
+            attempts += 1;
+            store.transaction(|txn| {
+                // Inject loss of transaction ownership before the normal rollback.
+                txn.guard.execute_batch("ROLLBACK")?;
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                )
+                .into())
+            })
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(format!("{error:#}").contains("read-model rollback failed"));
+        assert!(error.downcast_ref::<rusqlite::Error>().is_none());
     }
 
     #[test]

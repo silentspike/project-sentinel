@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Retry only rollback-safe Projection batches and exact offset mirrors on
+  bounded SQLite writer contention; retain terminal integrity/authority errors
+  and roll back abandoned or failed transactions. Keep all Delivery lineage
+  fields visible in narrow panels and mobile viewports (#881).
+
 - Keep the Gateway proxy HTTP response deadline beyond the bounded in-flight
   request budget, retain the shorter control-plane deadline, and preserve
   Codex cancellation causes when an incomplete stream follows a timeout.

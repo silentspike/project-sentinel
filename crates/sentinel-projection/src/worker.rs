@@ -22,6 +22,7 @@ use crate::handlers::room_live_view::RoomLiveViewHandler;
 use crate::handlers::task_kanban_view::TaskKanbanHandler;
 use crate::handlers::workbench::WorkbenchHandler;
 use crate::handlers::ProjectionHandler;
+use crate::retry::{commit_then_mirror, sqlite_busy};
 use crate::store::{LlmHierarchyCostUpdate, ReadModelStore};
 
 /// Alle 26 Raum-IDs aus config/rooms.toml (statisches Gebaeudelayout).
@@ -131,20 +132,25 @@ impl ProjectionWorker {
                 continue;
             }
 
-            let count = self.process_batch(&batch)?;
             let last_row_id = batch.last().unwrap().0;
-
-            // Abgelaufene Smells bereinigen (basierend auf dem hoechsten Tick im Batch)
-            if let Some(max_tick) = batch.iter().map(|(_, e)| e.tick).max() {
-                self.read_store.cleanup_expired_smells(max_tick)?;
-            }
-
-            // Guard: nur updaten wenn tatsaechlich Fortschritt (schuetzt vor
-            // Race Conditions bei Auto-Restart und idempotenten Batches)
-            if last_row_id > offset {
-                self.event_store
-                    .update_offset(PROJECTION_NAME, last_row_id)?;
-            }
+            let count = commit_then_mirror(
+                || {
+                    let count = self.process_batch(&batch)?;
+                    if let Some(max_tick) = batch.iter().map(|(_, e)| e.tick).max() {
+                        sqlite_busy("expired smell cleanup", || {
+                            self.read_store.cleanup_expired_smells(max_tick)
+                        })?;
+                    }
+                    Ok(count)
+                },
+                || {
+                    if last_row_id > offset {
+                        self.event_store
+                            .update_offset(PROJECTION_NAME, last_row_id)?;
+                    }
+                    Ok(())
+                },
+            )?;
 
             debug!(events = count, offset = last_row_id, "Batch processed");
         }
@@ -193,8 +199,10 @@ impl ProjectionWorker {
 
         // Offset einmalig am Ende setzen — kein Risiko fuer Monotonicity-Konflikte
         if final_offset > 0 {
-            self.event_store
-                .update_offset(PROJECTION_NAME, final_offset)?;
+            sqlite_busy("rebuilt projection offset mirror", || {
+                self.event_store
+                    .update_offset(PROJECTION_NAME, final_offset)
+            })?;
         }
 
         // Post-rebuild consistency: recompute occupant_count from agent_live_view.
@@ -239,121 +247,130 @@ impl ProjectionWorker {
             return Ok(0);
         }
 
-        let txn = self.read_store.begin_transaction()?;
-        txn.begin()?;
-        let apply_result = (|| -> anyhow::Result<()> {
-            for (row_id, event) in &batch {
-                let payload = match deserialize_payload(event) {
-                    Some(payload) => payload,
-                    None if event.schema_version >= 2 && event.event_type == "agent_llm_usage" => {
-                        anyhow::bail!("malformed v2 agent_llm_usage payload at row_id={row_id}")
-                    }
-                    None => continue,
-                };
-                if event.event_type != "agent_llm_usage" {
-                    continue;
-                }
-                let DomainEventPayload::AgentLlmUsage {
-                    tenant_id,
-                    project_id,
-                    work_item_id,
-                    reservation_id,
-                    assignment_id,
-                    assignment_version,
-                    provider,
-                    requested_model,
-                    caller_role,
-                    tier,
-                    hierarchy_tier,
-                    cost_source,
-                    effective_model,
-                    input_tokens,
-                    output_tokens,
-                    cache_read,
-                    cache_creation,
-                    cost_usd,
-                    ..
-                } = payload
-                else {
-                    if event.schema_version >= 2 {
-                        anyhow::bail!(
-                            "v2 agent_llm_usage payload type mismatch at row_id={row_id}"
-                        );
-                    }
-                    continue;
-                };
-                if event.schema_version >= 2 {
-                    if tier.trim().is_empty() {
-                        anyhow::bail!("v2 agent_llm_usage is missing model tier");
-                    }
-                    if !cost_usd.is_finite() || cost_usd < 0.0 {
-                        anyhow::bail!("v2 agent_llm_usage has invalid cost_usd");
-                    }
-                    let hierarchy_key = hierarchy_tier
-                        .context("v2 agent_llm_usage is missing hierarchy_tier")?
-                        .get()
-                        .to_string();
-                    cost_source.context("v2 agent_llm_usage is missing cost_source")?;
-                    if effective_model
-                        .as_deref()
-                        .is_none_or(|model| model.trim().is_empty())
-                    {
-                        anyhow::bail!("v2 agent_llm_usage is missing effective_model");
-                    }
-                    if event.schema_version >= 3 {
-                        if [
-                            tenant_id.as_deref(),
-                            project_id.as_deref(),
-                            work_item_id.as_deref(),
-                            reservation_id.as_deref(),
-                            assignment_id.as_deref(),
-                            provider.as_deref(),
-                            requested_model.as_deref(),
-                        ]
-                        .into_iter()
-                        .any(|value| value.is_none_or(|value| value.trim().is_empty()))
-                        {
-                            anyhow::bail!("v3 agent_llm_usage is missing project authority");
-                        }
-                        if assignment_version.is_none_or(|value| value == 0) {
-                            anyhow::bail!("v3 agent_llm_usage has invalid assignment_version");
-                        }
-                        if caller_role.as_deref() != Some("agent_runtime") {
-                            anyhow::bail!("v3 agent_llm_usage has invalid caller_role");
-                        }
-                    }
-                    txn.record_hierarchy_cost(
-                        &LlmHierarchyCostUpdate {
-                            hierarchy_tier: &hierarchy_key,
-                            input_tokens,
-                            output_tokens,
-                            cache_read,
-                            cache_creation,
-                            cost_usd,
-                        },
-                        *row_id,
-                    )?;
-                    txn.record_hierarchy_usage_meta(*row_id, true)?;
-                } else {
-                    txn.record_hierarchy_usage_meta(*row_id, false)?;
-                }
-            }
-
-            let last_row_id = batch.last().expect("non-empty hierarchy batch").0;
-            txn.update_projection_watermark(HIERARCHY_PROJECTION_NAME, last_row_id)?;
-            Ok(())
-        })();
-        if let Err(error) = apply_result {
-            txn.rollback()
-                .context("hierarchy projection batch rollback failed")?;
-            return Err(error).context("hierarchy projection batch failed");
-        }
-
         let last_row_id = batch.last().expect("non-empty hierarchy batch").0;
-        txn.commit()?;
-        self.event_store
-            .update_offset(HIERARCHY_PROJECTION_NAME, last_row_id)?;
-        Ok(batch.len())
+        commit_then_mirror(
+            || self.process_hierarchy_batch(&batch),
+            || {
+                self.event_store
+                    .update_offset(HIERARCHY_PROJECTION_NAME, last_row_id)
+            },
+        )
+    }
+
+    fn process_hierarchy_batch(
+        &self,
+        batch: &[(i64, sentinel_common::DomainEvent)],
+    ) -> anyhow::Result<usize> {
+        sqlite_busy("hierarchy projection batch", || {
+            self.read_store.transaction(|txn| {
+                let committed = txn.projection_watermark(HIERARCHY_PROJECTION_NAME)?;
+                for (row_id, event) in batch {
+                    if *row_id <= committed {
+                        continue;
+                    }
+                    let payload = match deserialize_payload(event) {
+                        Some(payload) => payload,
+                        None if event.schema_version >= 2
+                            && event.event_type == "agent_llm_usage" =>
+                        {
+                            anyhow::bail!("malformed v2 agent_llm_usage payload at row_id={row_id}")
+                        }
+                        None => continue,
+                    };
+                    if event.event_type != "agent_llm_usage" {
+                        continue;
+                    }
+                    let DomainEventPayload::AgentLlmUsage {
+                        tenant_id,
+                        project_id,
+                        work_item_id,
+                        reservation_id,
+                        assignment_id,
+                        assignment_version,
+                        provider,
+                        requested_model,
+                        caller_role,
+                        tier,
+                        hierarchy_tier,
+                        cost_source,
+                        effective_model,
+                        input_tokens,
+                        output_tokens,
+                        cache_read,
+                        cache_creation,
+                        cost_usd,
+                        ..
+                    } = payload
+                    else {
+                        if event.schema_version >= 2 {
+                            anyhow::bail!(
+                                "v2 agent_llm_usage payload type mismatch at row_id={row_id}"
+                            );
+                        }
+                        continue;
+                    };
+                    if event.schema_version >= 2 {
+                        if tier.trim().is_empty() {
+                            anyhow::bail!("v2 agent_llm_usage is missing model tier");
+                        }
+                        if !cost_usd.is_finite() || cost_usd < 0.0 {
+                            anyhow::bail!("v2 agent_llm_usage has invalid cost_usd");
+                        }
+                        let hierarchy_key = hierarchy_tier
+                            .context("v2 agent_llm_usage is missing hierarchy_tier")?
+                            .get()
+                            .to_string();
+                        cost_source.context("v2 agent_llm_usage is missing cost_source")?;
+                        if effective_model
+                            .as_deref()
+                            .is_none_or(|model| model.trim().is_empty())
+                        {
+                            anyhow::bail!("v2 agent_llm_usage is missing effective_model");
+                        }
+                        if event.schema_version >= 3 {
+                            if [
+                                tenant_id.as_deref(),
+                                project_id.as_deref(),
+                                work_item_id.as_deref(),
+                                reservation_id.as_deref(),
+                                assignment_id.as_deref(),
+                                provider.as_deref(),
+                                requested_model.as_deref(),
+                            ]
+                            .into_iter()
+                            .any(|value| value.is_none_or(|value| value.trim().is_empty()))
+                            {
+                                anyhow::bail!("v3 agent_llm_usage is missing project authority");
+                            }
+                            if assignment_version.is_none_or(|value| value == 0) {
+                                anyhow::bail!("v3 agent_llm_usage has invalid assignment_version");
+                            }
+                            if caller_role.as_deref() != Some("agent_runtime") {
+                                anyhow::bail!("v3 agent_llm_usage has invalid caller_role");
+                            }
+                        }
+                        txn.record_hierarchy_cost(
+                            &LlmHierarchyCostUpdate {
+                                hierarchy_tier: &hierarchy_key,
+                                input_tokens,
+                                output_tokens,
+                                cache_read,
+                                cache_creation,
+                                cost_usd,
+                            },
+                            *row_id,
+                        )?;
+                        txn.record_hierarchy_usage_meta(*row_id, true)?;
+                    } else {
+                        txn.record_hierarchy_usage_meta(*row_id, false)?;
+                    }
+                }
+
+                let last_row_id = batch.last().expect("non-empty hierarchy batch").0;
+                txn.update_projection_watermark(HIERARCHY_PROJECTION_NAME, last_row_id)?;
+                Ok(batch.len())
+            })
+        })
     }
 
     fn handle_rebuild_request_if_present(&self) -> anyhow::Result<bool> {
@@ -399,53 +416,51 @@ impl ProjectionWorker {
         &self,
         batch: &[(i64, sentinel_common::DomainEvent)],
     ) -> anyhow::Result<usize> {
-        let txn = self.read_store.begin_transaction()?;
-        txn.begin()?;
+        sqlite_busy("ordinary projection batch", || {
+            self.read_store.transaction(|txn| {
+                let mut processed = 0usize;
+                let committed = txn.projection_watermark(PROJECTION_NAME)?;
 
-        let mut processed = 0usize;
+                for (row_id, event) in batch {
+                    if *row_id <= committed {
+                        continue;
+                    }
+                    // Payload deserialisieren (mit Fallback fuer alte Events ohne "type" Tag)
+                    let Some(payload) = deserialize_payload(event) else {
+                        warn!(
+                            row_id,
+                            event_type = event.event_type,
+                            "Unknown or malformed event payload, skipping"
+                        );
+                        continue;
+                    };
 
-        for (row_id, event) in batch {
-            // Payload deserialisieren (mit Fallback fuer alte Events ohne "type" Tag)
-            let Some(payload) = deserialize_payload(event) else {
-                warn!(
-                    row_id,
-                    event_type = event.event_type,
-                    "Unknown or malformed event payload, skipping"
-                );
-                continue;
-            };
+                    // Alle Handler aufrufen (Reihenfolge: agent -> room -> kpi)
+                    for handler in &self.handlers {
+                        if let Err(e) = handler.handle(*row_id, event, &payload, txn) {
+                            error!(
+                                row_id,
+                                event_type = event.event_type,
+                                error = %e,
+                                "Handler error, aborting batch"
+                            );
+                            return Err(e).context(format!(
+                                "Projection-Handlerfehler row_id={row_id} event_type={}",
+                                event.event_type
+                            ));
+                        }
+                    }
 
-            // Alle Handler aufrufen (Reihenfolge: agent -> room -> kpi)
-            for handler in &self.handlers {
-                if let Err(e) = handler.handle(*row_id, event, &payload, &txn) {
-                    txn.rollback().with_context(|| {
-                        format!(
-                            "Rollback nach Projection-Handlerfehler fehlgeschlagen row_id={row_id} event_type={}",
-                            event.event_type
-                        )
-                    })?;
-                    error!(
-                        row_id,
-                        event_type = event.event_type,
-                        error = %e,
-                        "Handler error, aborting batch"
-                    );
-                    return Err(e).context(format!(
-                        "Projection-Handlerfehler row_id={row_id} event_type={}",
-                        event.event_type
-                    ));
+                    processed += 1;
                 }
-            }
 
-            processed += 1;
-        }
+                if let Some((last_row_id, _)) = batch.last() {
+                    txn.update_projection_watermark(PROJECTION_NAME, *last_row_id)?;
+                }
 
-        if let Some((last_row_id, _)) = batch.last() {
-            txn.update_projection_watermark(PROJECTION_NAME, *last_row_id)?;
-        }
-
-        txn.commit()?;
-        Ok(processed)
+                Ok(processed)
+            })
+        })
     }
 }
 
@@ -587,6 +602,58 @@ mod tests {
         assert!(worker.handle_rebuild_request_if_present().unwrap());
         assert!(!request_path.exists());
         assert_eq!(worker.read_store().active_agent_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn restart_after_unmirrored_commit_does_not_recount_kpis() {
+        let dir = tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(dir.path().join("events.db").to_str().unwrap()).unwrap());
+        let projection_path = dir.path().join("projection.db");
+        let make_worker = || {
+            ProjectionWorker::new(
+                Arc::clone(&event_store),
+                ProjectionConfig {
+                    db_path: projection_path.to_string_lossy().into_owned(),
+                    ..ProjectionConfig::default()
+                },
+            )
+            .unwrap()
+        };
+        let payload = DomainEventPayload::AgentSpawned {
+            agent_id: AgentId(1),
+            name: "Test Agent".into(),
+            role: "QA".into(),
+            shift_set: 1,
+            room_id: "empfang".into(),
+        };
+        append_event(&event_store, 1, &payload);
+        let batch = event_store.get_events_since_with_id(0, 16).unwrap();
+        let worker = make_worker();
+        assert_eq!(worker.process_batch(&batch).unwrap(), 1);
+        assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), None);
+        drop(worker);
+
+        append_event(&event_store, 2, &payload);
+        let mixed = event_store.get_events_since_with_id(0, 16).unwrap();
+        let restarted = make_worker();
+        assert_eq!(restarted.process_batch(&mixed).unwrap(), 1);
+        assert_eq!(restarted.process_batch(&mixed).unwrap(), 0);
+        let conn = rusqlite::Connection::open(&projection_path).unwrap();
+        let active: i64 = conn
+            .query_row("SELECT SUM(active_agents) FROM kpi_1m", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(active, 2);
+        assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), None);
+        event_store
+            .update_offset(PROJECTION_NAME, mixed.last().unwrap().0)
+            .unwrap();
+        assert_eq!(
+            event_store.get_offset(PROJECTION_NAME).unwrap(),
+            Some(mixed.last().unwrap().0)
+        );
     }
 
     #[test]
