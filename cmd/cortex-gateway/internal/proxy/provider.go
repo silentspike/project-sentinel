@@ -38,6 +38,8 @@ type LLMRequest struct {
 	HierarchyTier      int               `json:"-"`
 	// ProviderTimeout applies only to the real provider execution, not queue wait.
 	ProviderTimeout time.Duration `json:"-"`
+	// Set only from the checked raw HTTP body, never from request metadata.
+	AuthorityRequestDigest string `json:"-"`
 }
 
 // Message represents a single message in an LLM conversation.

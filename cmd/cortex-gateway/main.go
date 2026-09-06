@@ -90,11 +90,28 @@ func main() {
 	// 3. Provider registry
 	registry := proxy.NewRegistry()
 	forwardQueue := forwardqueue.NewManager(envIntOrDefault("SENTINEL_MAX_FORWARD_CONCURRENCY", 3))
+	var subscriptionAdmission *proxy.SubscriptionAdmission
+	if allowanceID, configured := os.LookupEnv("SENTINEL_MODEL_WORK_ALLOWANCE_ID"); configured {
+		credential, credentialErr := proxy.LoadOperatorCredentialFromFile()
+		if credentialErr != nil {
+			logger.Error("subscription operator credential rejected", "error", credentialErr)
+			os.Exit(1)
+		}
+		subscriptionAdmission, err = proxy.NewSubscriptionAdmission(allowanceID, catalog.Digest(),
+			envOrDefault("SENTINEL_OPERATOR_API_URL", "http://127.0.0.1:8084"), credential)
+		if err != nil {
+			logger.Error("subscription dispatch configuration rejected", "error", err)
+			os.Exit(1)
+		}
+	}
+	wrapProvider := func(provider proxy.Provider) proxy.Provider {
+		return proxy.NewSubscriptionQueuedProvider(provider, forwardQueue, subscriptionAdmission)
+	}
 
 	// Optional provider: direct Anthropic Messages API with structured system[]
 	anthropicCatalog, _ := catalog.Entry("anthropic-direct")
 	anthropicModel := anthropicCatalog.DefaultModel
-	anthropicDirectProvider := proxy.NewQueuedProvider(proxy.NewAnthropicDirectProvider(proxy.ProviderConfig{
+	anthropicDirectProvider := wrapProvider(proxy.NewAnthropicDirectProvider(proxy.ProviderConfig{
 		Name:      "anthropic-direct",
 		Type:      "anthropic-direct",
 		BaseURL:   envOrDefault("ANTHROPIC_BASE_URL", anthropicCatalog.BaseURL),
@@ -102,37 +119,37 @@ func main() {
 		Model:     anthropicModel,
 		MaxTokens: 4096,
 		Priority:  1,
-	}), forwardQueue)
+	}))
 	registry.Register("anthropic-direct", anthropicDirectProvider)
 	logger.Info("registered provider", "name", "anthropic-direct", "model", anthropicModel)
 
 	// Optional legacy/debug provider: Claude Code subprocess
 	claudeCodeCatalog, _ := catalog.Entry("claude-code")
-	claudeCodeProvider := proxy.NewQueuedProvider(proxy.NewClaudeCodeProvider(proxy.ProviderConfig{
+	claudeCodeProvider := wrapProvider(proxy.NewClaudeCodeProvider(proxy.ProviderConfig{
 		Name:    "claude-code",
 		Type:    "claude-code",
 		BaseURL: envOrDefault("CLAUDE_CODE_BINARY", claudeCodeCatalog.Binary), // binary path
 		Model:   claudeCodeCatalog.DefaultModel,
-	}, logger), forwardQueue)
+	}, logger))
 	registry.Register("claude-code", claudeCodeProvider)
 	logger.Info("registered provider", "name", "claude-code", "model", claudeCodeCatalog.DefaultModel)
 
 	// Primary subscription-backed provider: pinned Codex CLI using ChatGPT auth.
 	codexCatalog, _ := catalog.Entry(proxy.CodexCLIProviderName)
-	codexProvider := proxy.NewQueuedProvider(proxy.NewCodexCLIProvider(proxy.ProviderConfig{
+	codexProvider := wrapProvider(proxy.NewCodexCLIProvider(proxy.ProviderConfig{
 		Name:    proxy.CodexCLIProviderName,
 		Type:    proxy.CodexCLIProviderName,
 		BaseURL: envOrDefault("CODEX_CLI_BINARY", codexCatalog.Binary), // binary path
 		Model:   codexCatalog.DefaultModel,
-	}, logger), forwardQueue)
+	}, logger))
 	registry.Register(proxy.CodexCLIProviderName, codexProvider)
 	logger.Info("registered provider", "name", proxy.CodexCLIProviderName, "model", codexCatalog.DefaultModel)
 
 	ollamaCatalog, _ := catalog.Entry("ollama")
-	registry.Register("ollama", proxy.NewQueuedProvider(proxy.NewOllamaProvider(proxy.ProviderConfig{
+	registry.Register("ollama", wrapProvider(proxy.NewOllamaProvider(proxy.ProviderConfig{
 		Name: "ollama", Type: "ollama", BaseURL: envOrDefault("OLLAMA_BASE_URL", ollamaCatalog.BaseURL),
 		Model: ollamaCatalog.DefaultModel, MaxTokens: ollamaCatalog.MaxTokens,
-	}), forwardQueue))
+	})))
 	logger.Info("registered provider", "name", "ollama", "model", ollamaCatalog.DefaultModel)
 
 	localLoopCatalog, _ := catalog.Entry(proxy.LocalLoopProviderName)
@@ -145,7 +162,11 @@ func main() {
 		logger.Error("failed to configure local-loop provider", "error", err)
 		os.Exit(1)
 	}
-	registry.Register(proxy.LocalLoopProviderName, localLoopProvider)
+	if subscriptionAdmission != nil {
+		registry.Register(proxy.LocalLoopProviderName, wrapProvider(localLoopProvider))
+	} else {
+		registry.Register(proxy.LocalLoopProviderName, localLoopProvider)
+	}
 	logger.Info("registered provider", "name", proxy.LocalLoopProviderName, "model", localLoopCatalog.DefaultModel)
 	providerActivationAttestation := os.Getenv("CORTEX_MODEL_CATALOG_GATE_B_ATTESTATION")
 	validateProviderActivation := func(providerName string) error {

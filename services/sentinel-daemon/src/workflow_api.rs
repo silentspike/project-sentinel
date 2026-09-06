@@ -2,6 +2,10 @@
 
 mod delivery_intent;
 mod delivery_runtime;
+#[cfg(feature = "llm")]
+pub mod model_work;
+#[cfg(feature = "llm")]
+mod subscription;
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -2090,6 +2094,7 @@ struct ProviderUsageBinding {
     assignment_version: u64,
     agent_id: AgentId,
     provider: String,
+    subscription_grant: Option<sentinel_workflow::SubscriptionCallGrantV1>,
 }
 
 fn select_provider_usage_binding(
@@ -2123,6 +2128,37 @@ fn select_provider_usage_binding(
             if assignment.agent_id != agent_id {
                 continue;
             }
+            if let Some(allowance) = project
+                .subscription_call
+                .as_ref()
+                .filter(|allowance| &allowance.grant.work_item_id == work_item_id)
+            {
+                if allowance.grant.agent_id != agent_id
+                    || allowance.grant.assignment_id != assignment.assignment_id
+                    || allowance.grant.assignment_version != assignment.assignment_version
+                    || project
+                        .reservations
+                        .iter()
+                        .any(|reservation| reservation.work_item_id.as_ref() == Some(work_item_id))
+                {
+                    return Err("subscription assignment authority changed");
+                }
+                let binding = ProviderUsageBinding {
+                    tenant_id: project.tenant_id.0.clone(),
+                    project_id: project.project_id.0.clone(),
+                    work_item_id: work_item_id.0.clone(),
+                    reservation_id: allowance.allowance_id.clone(),
+                    assignment_id: assignment.assignment_id.clone(),
+                    assignment_version: assignment.assignment_version,
+                    agent_id,
+                    provider: allowance.grant.provider.clone(),
+                    subscription_grant: Some(allowance.grant.clone()),
+                };
+                if selected.replace(binding).is_some() {
+                    return Err("agent has ambiguous provider usage authority");
+                }
+                continue;
+            }
             let mut active_reservations = project.reservations.iter().filter(|reservation| {
                 reservation.state == sentinel_workflow::CostReservationStateV1::Active
                     && reservation.work_item_id.as_ref() == Some(work_item_id)
@@ -2142,6 +2178,7 @@ fn select_provider_usage_binding(
                 assignment_version: assignment.assignment_version,
                 agent_id,
                 provider: reservation.provider.clone(),
+                subscription_grant: None,
             };
             if selected.replace(binding).is_some() {
                 return Err("agent has ambiguous provider usage authority");
@@ -2206,6 +2243,13 @@ fn validate_provider_usage_event(
         || usd_to_micros(cost_usd) != Some(expected_cost_micros)
     {
         return Err("provider usage does not match the project reservation");
+    }
+    if let Some(grant) = &expected.subscription_grant {
+        if requested_model.as_deref() != Some(grant.model.as_str())
+            || effective_model.as_deref() != Some(grant.model.as_str())
+        {
+            return Err("subscription usage model differs from the grant");
+        }
     }
     Ok(())
 }
@@ -2410,6 +2454,7 @@ enum ProductDeliveryCommand {
 #[serde(deny_unknown_fields)]
 pub struct WorkflowHealthSnapshot {
     pub enabled: bool,
+    pub model_work_enabled: bool,
     pub status: String,
     pub ready: bool,
     pub dependencies_ready: bool,
@@ -2438,6 +2483,8 @@ pub struct WorkflowApi {
     event_store: Option<sentinel_limbo::EventStore>,
     mutation_fence: RwLock<()>,
     enabled: bool,
+    model_work_enabled: bool,
+    subscription_allowance_id: Option<String>,
     scan_succeeded: AtomicBool,
     collaboration_publication_pending: AtomicUsize,
     last_error: Mutex<Option<String>>,
@@ -2467,6 +2514,21 @@ impl WorkflowApi {
         workbench_artifact_roots: HashMap<AgentId, PathBuf>,
     ) -> Result<Self, WorkflowError> {
         let enabled = workflow_enabled()?;
+        let model_work_enabled = workflow_flag("SENTINEL_MODEL_WORKBENCH_ENABLED")?;
+        let subscription_allowance_id = std::env::var("SENTINEL_MODEL_WORK_ALLOWANCE_ID").ok();
+        if let Some(id) = &subscription_allowance_id {
+            WorkItemId::parse(id).map_err(|_| workflow_unavailable())?;
+            if !model_work_enabled {
+                return Err(workflow_unavailable());
+            }
+        }
+        if model_work_enabled
+            && (!enabled
+                || !cfg!(feature = "llm")
+                || !workflow_flag("SENTINEL_LLM_USAGE_V2_ENABLED")?)
+        {
+            return Err(workflow_unavailable());
+        }
         let store_path = if enabled {
             data_dir.join("company-workflow.sqlite")
         } else {
@@ -2546,6 +2608,8 @@ impl WorkflowApi {
             event_store: Some(event_store),
             mutation_fence: RwLock::new(()),
             enabled: true,
+            model_work_enabled,
+            subscription_allowance_id,
             scan_succeeded: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(usize::MAX),
             last_error: Mutex::new(None),
@@ -2576,6 +2640,8 @@ impl WorkflowApi {
             event_store: None,
             mutation_fence: RwLock::new(()),
             enabled: false,
+            model_work_enabled: false,
+            subscription_allowance_id: None,
             scan_succeeded: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(0),
             last_error: Mutex::new(None),
@@ -3204,6 +3270,7 @@ impl WorkflowApi {
             assignment_version: assignment.assignment_version,
             agent_id: assignment.agent_id,
             provider: reservation.provider.clone(),
+            subscription_grant: None,
         };
         validate_provider_usage_event(&event, usage_operation_id, &expected, *actual_micros)
             .map_err(|message| json_error(409, "evidence_conflict", message, false))?;
@@ -3232,7 +3299,20 @@ impl WorkflowApi {
             .store
             .company_projects()
             .map_err(|_| "company provider authority could not be read")?;
-        select_provider_usage_binding(&projects, agent_id)
+        let binding = select_provider_usage_binding(&projects, agent_id)?;
+        if let Some(allowance_id) = &self.subscription_allowance_id {
+            if !binding.as_ref().is_some_and(|binding| {
+                &binding.reservation_id == allowance_id && binding.subscription_grant.is_some()
+            }) {
+                return Err("only the configured subscription work allowance may dispatch");
+            }
+        } else if binding
+            .as_ref()
+            .is_some_and(|binding| binding.subscription_grant.is_some())
+        {
+            return Err("subscription work allowance is not enabled");
+        }
+        Ok(binding)
     }
 
     fn agent_command(&self, principal: &BoundPrincipal, body: &[u8]) -> WorkflowHttpResponse {
@@ -4037,6 +4117,7 @@ impl WorkflowApi {
             && canonical_event_cursor.is_ok();
         WorkflowHealthSnapshot {
             enabled: self.enabled,
+            model_work_enabled: self.model_work_enabled,
             status: if ready {
                 "ready".to_owned()
             } else if self.enabled {
@@ -4067,6 +4148,22 @@ impl WorkflowApi {
 
 #[cfg(feature = "llm")]
 impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
+    fn model_work_context(
+        &self,
+        binding: &crate::llm_bridge::bridge::ProviderUsageAuthority,
+    ) -> Result<Option<model_work::ModelWorkContext>, &'static str> {
+        self.prepare_model_work(binding)
+    }
+
+    fn admit_model_work(
+        &self,
+        completion: &model_work::ModelWorkCompletion,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<(), &'static str> {
+        self.accept_model_work(completion, request_id, request_digest)
+    }
+
     fn resolve_provider_usage_authority(
         &self,
         agent_id: AgentId,
@@ -4083,6 +4180,7 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
                         assignment_version: binding.assignment_version,
                         agent_id: binding.agent_id,
                         provider: binding.provider,
+                        subscription_grant: binding.subscription_grant,
                     },
                 )
             })
@@ -4245,7 +4343,11 @@ fn independent_gate_principal(
 }
 
 fn workflow_enabled() -> Result<bool, WorkflowError> {
-    match std::env::var("SENTINEL_COMPANY_WORKFLOW_ENABLED") {
+    workflow_flag("SENTINEL_COMPANY_WORKFLOW_ENABLED")
+}
+
+fn workflow_flag(name: &str) -> Result<bool, WorkflowError> {
+    match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => Ok(false),
         Ok(value) if matches!(value.as_str(), "1" | "true" | "TRUE") => Ok(true),
         Ok(value) if matches!(value.as_str(), "0" | "false" | "FALSE") => Ok(false),
@@ -4372,6 +4474,7 @@ fn is_internal_company_command(command: &CompanyWorkflowCommandV1) -> bool {
     matches!(
         command,
         CompanyWorkflowCommandV1::ApplyWorkTransition { .. }
+            | CompanyWorkflowCommandV1::ClaimSubscriptionCall { .. }
             | CompanyWorkflowCommandV1::CreateGovernedRework { .. }
             | CompanyWorkflowCommandV1::AdmitCollaboration { .. }
             | CompanyWorkflowCommandV1::ProgressCollaborationAdmission { .. }
@@ -4682,6 +4785,7 @@ mod tests {
             assignment_version: 1,
             agent_id: AgentId(6),
             provider: "local-loop".to_owned(),
+            subscription_grant: None,
         }
     }
 
@@ -4765,6 +4869,7 @@ mod tests {
             handoffs: Vec::new(),
             blockers: Vec::new(),
             approvals: Vec::new(),
+            subscription_call: None,
             reservations: vec![sentinel_workflow::CostReservationV1 {
                 reservation_id: "reservation-m0".to_owned(),
                 work_item_id: Some(work_item_id),

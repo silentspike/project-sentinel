@@ -943,7 +943,8 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
     let authorized = if matches!(
         path_only,
         OPERATOR_EPISODE_PROJECTION_RESOLVE_PATH | OPERATOR_EPISODE_PROJECTION_GENERATION_PATH
-    ) {
+    ) || path_only == "/operator/workflow/subscription-dispatch"
+    {
         episode_projection_is_authorized(&request.headers, state.shared_secret.as_deref())
     } else {
         is_authorized(&request.headers, state.shared_secret.as_deref())
@@ -968,6 +969,20 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
     }
 
     match path_only {
+        "/operator/workflow/subscription-dispatch" => {
+            #[cfg(feature = "llm")]
+            {
+                let response = state.workflow_api.subscription_dispatch(&request.body);
+                HttpResponse {
+                    status: response.status,
+                    body: response.body,
+                }
+            }
+            #[cfg(not(feature = "llm"))]
+            {
+                ApiError::ServiceUnavailable("Model work is not enabled").to_response()
+            }
+        }
         OPERATOR_EPISODE_PROJECTION_GENERATION_PATH => {
             let request: EpisodeProjectionGenerationRequest =
                 match serde_json::from_slice(&request.body) {
@@ -4023,6 +4038,21 @@ mod tests {
         layer.init_base_root().unwrap();
         state.fs_layer = Some(Arc::clone(&layer));
         layer
+    }
+
+    #[test]
+    fn subscription_dispatch_requires_secret_even_without_general_operator_auth() {
+        for secret in [None, Some("test-secret")] {
+            let (state, _rx, _platform_rx, _runtime_rx) = test_state(secret);
+            let response = handle_http_request(
+                test_request(
+                    "/operator/workflow/subscription-dispatch",
+                    serde_json::json!({}),
+                ),
+                &state,
+            );
+            assert_eq!(response.status, 401);
+        }
     }
 
     #[test]

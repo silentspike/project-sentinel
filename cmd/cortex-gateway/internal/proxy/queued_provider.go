@@ -8,17 +8,25 @@ import (
 )
 
 type queuedProvider struct {
-	wrapped Provider
-	queue   *forwardqueue.Manager
+	wrapped      Provider
+	queue        *forwardqueue.Manager
+	subscription *SubscriptionAdmission
 }
 
 func NewQueuedProvider(wrapped Provider, queue *forwardqueue.Manager) Provider {
+	return NewSubscriptionQueuedProvider(wrapped, queue, nil)
+}
+
+// NewSubscriptionQueuedProvider preserves optional provider capabilities and
+// consumes the durable allowance only after acquiring the shared queue lease.
+func NewSubscriptionQueuedProvider(wrapped Provider, queue *forwardqueue.Manager, subscription *SubscriptionAdmission) Provider {
 	if wrapped == nil || queue == nil {
 		return wrapped
 	}
 	queued := &queuedProvider{
-		wrapped: wrapped,
-		queue:   queue,
+		wrapped:      wrapped,
+		queue:        queue,
+		subscription: subscription,
 	}
 	_, inventoryCapable := wrapped.(ModelInventoryProvider)
 	_, readinessCapable := wrapped.(ProviderReadinessChecker)
@@ -56,6 +64,17 @@ func (p *queuedProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 		return nil, fmt.Errorf("forward queue wait: %w", err)
 	}
 	defer release()
+	// A queue grant can race cancellation, or be immediately available for an
+	// already expired caller. Recheck before invoking the actual provider.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("forward queue dispatch: %w", err)
+	}
+	if p.subscription != nil {
+		return p.subscription.send(ctx, p.wrapped, req)
+	}
+	if req != nil && req.Metadata["subscription_allowance_id"] != "" {
+		return nil, fmt.Errorf("subscription dispatch mode is not configured")
+	}
 	return p.wrapped.Send(ctx, req)
 }
 

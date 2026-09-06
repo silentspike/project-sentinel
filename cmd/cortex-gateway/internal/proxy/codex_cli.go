@@ -49,9 +49,12 @@ var codexCLIDisabledFeatures = []string{
 	"memories",
 	"multi_agent",
 	"plugins",
+	"shell_snapshot",
+	"shell_snapshot_v2",
 	"shell_tool",
 	"skill_search",
 	"tool_suggest",
+	"unbounded_connection_retries",
 	"view_image",
 	"workspace_dependencies",
 }
@@ -238,6 +241,11 @@ func (p *CodexCLIProvider) commandArgs(model string) []string {
 		"--color", "never",
 		"--model", model,
 		"-C", p.workdir,
+		// The pinned CLI ignores overrides of its built-in openai provider.
+		// A dedicated entry retains native ChatGPT auth and endpoint selection,
+		// while preventing hidden retries or WebSocket-to-HTTP redispatch.
+		"-c", `model_provider="sentinel_chatgpt"`,
+		"-c", `model_providers.sentinel_chatgpt={name="OpenAI",wire_api="responses",requires_openai_auth=true,request_max_retries=0,stream_max_retries=0,supports_websockets=false}`,
 		"-c", `web_search="disabled"`,
 		"-c", `check_for_update_on_startup=false`,
 		"-c", `model_reasoning_effort="none"`,

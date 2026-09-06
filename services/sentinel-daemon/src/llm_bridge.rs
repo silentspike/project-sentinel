@@ -24,6 +24,9 @@ pub mod bridge {
     use tokio::task::JoinSet;
     use tracing::{debug, error, info, instrument, warn};
 
+    use crate::workflow_api::model_work::{
+        ModelWorkCompletion, ModelWorkContext, MAX_MODEL_WORK_BYTES,
+    };
     use sentinel_common::{
         ActionType, AgentAction, AgentId, CostSource, DomainEvent, DomainEventPayload,
         HierarchyTier, Perception, Tick, Timestamp,
@@ -34,7 +37,8 @@ pub mod bridge {
     pub type SharedLlmActivityTicks = Arc<Mutex<HashMap<AgentId, u64>>>;
 
     /// Durable company authority attached to exactly one provider effect.
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct ProviderUsageAuthority {
         pub tenant_id: String,
         pub project_id: String,
@@ -44,6 +48,8 @@ pub mod bridge {
         pub assignment_version: u64,
         pub agent_id: AgentId,
         pub provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subscription_grant: Option<sentinel_workflow::SubscriptionCallGrantV1>,
     }
 
     pub trait ProviderUsageAuthorityResolver: Send + Sync {
@@ -51,6 +57,22 @@ pub mod bridge {
             &self,
             agent_id: AgentId,
         ) -> Result<Option<ProviderUsageAuthority>, &'static str>;
+
+        fn model_work_context(
+            &self,
+            _authority: &ProviderUsageAuthority,
+        ) -> Result<Option<ModelWorkContext>, &'static str> {
+            Ok(None)
+        }
+
+        fn admit_model_work(
+            &self,
+            _completion: &ModelWorkCompletion,
+            _request_id: &str,
+            _request_digest: &str,
+        ) -> Result<(), &'static str> {
+            Err("model work adapter is unavailable")
+        }
     }
 
     /// LLM Bridge Konfiguration.
@@ -173,6 +195,8 @@ pub mod bridge {
         #[serde(default)]
         content: String,
         #[serde(default)]
+        decision: String,
+        #[serde(default)]
         actions: Vec<ExtractedAction>,
         #[serde(default)]
         tokens_used: i32,
@@ -209,6 +233,8 @@ pub mod bridge {
         usage_event: DomainEvent,
         actions: Vec<AgentAction>,
         tokens_used: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_work: Option<ModelWorkCompletion>,
     }
 
     trait CompletionStore: Send + Sync {
@@ -489,7 +515,11 @@ pub mod bridge {
         entry: LlmCompletionEntry,
         action_tx: &mpsc::Sender<AgentAction>,
         max_attempts: u32,
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
     ) {
+        if !matches!(entry.status.as_str(), "pending_usage" | "ready_for_action") {
+            return;
+        }
         let completed: CompletedLlmResponse = match serde_json::from_str(&entry.payload) {
             Ok(completed) => completed,
             Err(error) => {
@@ -503,9 +533,19 @@ pub mod bridge {
                 return;
             }
         };
-        if completed.version != 1
-            || completed.request_id != entry.request_id
+        if !matches!(
+            (completed.version, completed.model_work.is_some()),
+            (1, false) | (2, true)
+        ) || completed.request_id != entry.request_id
             || completed.request_digest != entry.request_digest
+            || completed.model_work.as_ref().is_some_and(|model_work| {
+                !completed.actions.is_empty()
+                    || entry.owner_scope
+                        != sentinel_common::StateTransferScope::for_agent(
+                            model_work.context.binding.agent_id.to_string(),
+                        )
+                    || model_work.validate_usage(&completed.usage_event).is_err()
+            })
         {
             error!(request_id = %entry.request_id, "Durable LLM completion identity mismatch");
             let _ = store.record_failure(
@@ -543,6 +583,26 @@ pub mod bridge {
                         "Failed to record LLM completion append failure"
                     ),
                 }
+                return;
+            }
+        }
+
+        // Admission is durable and idempotent by provider request. Retry it before
+        // claiming the legacy channel actions, without repeating provider I/O.
+        if let Some(model_work) = &completed.model_work {
+            let result = resolver
+                .ok_or("model work resolver unavailable")
+                .and_then(|resolver| {
+                    resolver.admit_model_work(model_work, &entry.request_id, &entry.request_digest)
+                });
+            if let Err(reason) = result {
+                let _ = store.record_failure(
+                    &entry.request_id,
+                    &entry.request_digest,
+                    reason,
+                    max_attempts,
+                );
+                warn!(request_id = %entry.request_id, reason, "Model work admission retained fail-closed");
                 return;
             }
         }
@@ -587,11 +647,12 @@ pub mod bridge {
         store: &S,
         action_tx: &mpsc::Sender<AgentAction>,
         max_attempts: u32,
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
     ) {
         match store.poll_completions(64) {
             Ok(entries) => {
                 for entry in entries {
-                    recover_completion(store, entry, action_tx, max_attempts);
+                    recover_completion(store, entry, action_tx, max_attempts, resolver);
                 }
             }
             Err(error) => error!(error = %error, "Failed to poll durable LLM completions"),
@@ -608,6 +669,7 @@ pub mod bridge {
         authority_resolver: Option<&'a dyn ProviderUsageAuthorityResolver>,
         gateway_response: &'a GatewayResponse,
         usage_v2_enabled: bool,
+        model_work: Option<&'a ModelWorkContext>,
     }
 
     fn validate_current_provider_usage_authority(
@@ -649,9 +711,11 @@ pub mod bridge {
         agent_id: AgentId,
         request_id: &str,
         request_digest: &str,
+        model_work: Option<&ModelWorkContext>,
     ) -> Result<(), String> {
-        if let Err(reason) = validate_current_provider_usage_authority(resolver, expected, agent_id)
-        {
+        let validation = validate_current_provider_usage_authority(resolver, expected, agent_id)
+            .and_then(|()| validate_model_work_context(resolver, model_work));
+        if let Err(reason) = validation {
             return match store.release_undispatched_request(request_id, request_digest) {
                 Ok(true) => Err(reason),
                 Ok(false) => Err(format!(
@@ -661,6 +725,28 @@ pub mod bridge {
                     "{reason}; undispatched provider reservation release failed: {error}"
                 )),
             };
+        }
+        Ok(())
+    }
+
+    fn validate_model_work_context(
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
+        expected: Option<&ModelWorkContext>,
+    ) -> Result<(), String> {
+        if let Some(expected) = expected {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| "model work clock is unavailable")?
+                .as_millis();
+            expected.validate_dispatch(
+                u64::try_from(now_ms).map_err(|_| "model work clock overflow")?,
+            )?;
+            let current = resolver
+                .ok_or("model work resolver unavailable")?
+                .model_work_context(&expected.binding)?;
+            if current.as_ref() != Some(expected) {
+                return Err("model work authority changed during provider I/O".to_owned());
+            }
         }
         Ok(())
     }
@@ -695,6 +781,7 @@ pub mod bridge {
             authority_resolver,
             gateway_response,
             usage_v2_enabled,
+            model_work,
         } = context;
         let gateway_resp = gateway_response;
         if gateway_resp.request_id != request_id {
@@ -703,12 +790,24 @@ pub mod bridge {
                 gateway_resp.request_id
             ));
         }
-        validate_gateway_completion_authority(
-            authority_resolver,
-            authority,
-            gateway_resp,
-            agent_id,
-        )?;
+        if let Some(work) = model_work {
+            // Usage belongs to the dispatched authority even when that authority
+            // was revoked while the provider ran. Admission rechecks currentness
+            // only after the completed result is durable.
+            if authority != Some(&work.binding)
+                || gateway_resp.provider != work.binding.provider
+                || agent_id != work.binding.agent_id
+            {
+                return Err("model work response authority mismatch".to_owned());
+            }
+        } else {
+            validate_gateway_completion_authority(
+                authority_resolver,
+                authority,
+                gateway_resp,
+                agent_id,
+            )?;
+        }
         let usage_event = build_usage_event(
             agent_id,
             tick,
@@ -717,19 +816,43 @@ pub mod bridge {
             gateway_resp,
             usage_v2_enabled,
         )?;
+        let model_completion = if let Some(context) = model_work {
+            if authority != Some(&context.binding) {
+                return Err("model work response authority mismatch".to_owned());
+            }
+            let bounded = gateway_resp.content.len() <= MAX_MODEL_WORK_BYTES;
+            Some(ModelWorkCompletion {
+                context: context.clone(),
+                content: if bounded {
+                    gateway_resp.content.clone()
+                } else {
+                    String::new()
+                },
+                admissible: bounded
+                    && gateway_resp.decision == "forward"
+                    && gateway_resp.output_tokens > 0,
+            })
+        } else {
+            None
+        };
         let is_synthesis = gateway_resp.tokens_used == 0;
-        let actions = gateway_resp
-            .actions
-            .iter()
-            .filter_map(|action| map_extracted_to_action(agent_id, action, tick, is_synthesis))
-            .collect();
+        let actions = if model_completion.is_some() {
+            Vec::new()
+        } else {
+            gateway_resp
+                .actions
+                .iter()
+                .filter_map(|action| map_extracted_to_action(agent_id, action, tick, is_synthesis))
+                .collect()
+        };
         let completed = CompletedLlmResponse {
-            version: 1,
+            version: if model_completion.is_some() { 2 } else { 1 },
             request_id: request_id.to_string(),
             request_digest: request_digest.to_string(),
             usage_event,
             actions,
             tokens_used: gateway_resp.tokens_used.max(0) as u64,
+            model_work: model_completion,
         };
         let payload = serde_json::to_string(&completed).map_err(|error| error.to_string())?;
         store
@@ -739,7 +862,7 @@ pub mod bridge {
             .get_completion(request_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("durable LLM completion {request_id} disappeared"))?;
-        recover_completion(store, entry, action_tx, max_attempts);
+        recover_completion(store, entry, action_tx, max_attempts, authority_resolver);
         Ok(())
     }
 
@@ -930,12 +1053,18 @@ pub mod bridge {
         } else {
             config.completion_retry_interval
         };
-        recover_completion_batch(event_store.as_ref(), &action_tx, completion_max_attempts);
+        recover_completion_batch(
+            event_store.as_ref(),
+            &action_tx,
+            completion_max_attempts,
+            config.provider_usage_authority.as_deref(),
+        );
         let (recovery_shutdown_tx, mut recovery_shutdown_rx) = tokio::sync::watch::channel(false);
         let recovery_store = Arc::clone(&event_store);
         let recovery_action_tx = action_tx.clone();
         let recovery_interval = completion_retry_interval;
         let recovery_max_attempts = completion_max_attempts;
+        let recovery_resolver = config.provider_usage_authority.clone();
         let recovery_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(recovery_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -947,6 +1076,7 @@ pub mod bridge {
                         recovery_store.as_ref(),
                         &recovery_action_tx,
                         recovery_max_attempts,
+                        recovery_resolver.as_deref(),
                     ),
                     changed = recovery_shutdown_rx.changed() => {
                         if changed.is_err() || *recovery_shutdown_rx.borrow() {
@@ -1097,12 +1227,33 @@ pub mod bridge {
                 }
 
                 let request_id = agent_runtime_request_id(&perception, usage_authority.as_ref());
-                let request = build_gateway_request(
+                let mut request = build_gateway_request(
                     &perception,
                     &state_store,
                     &request_id,
                     usage_authority.as_ref(),
                 );
+                let model_work = match (
+                    config.provider_usage_authority.as_deref(),
+                    usage_authority.as_ref(),
+                ) {
+                    (Some(resolver), Some(authority)) => {
+                        match resolver.model_work_context(authority) {
+                            Ok(context) => context,
+                            Err(reason) => {
+                                warn!(agent = %agent_id, reason, "Model work context unavailable");
+                                continue;
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(context) = &model_work {
+                    if let Err(reason) = bind_model_work_request(&mut request, context) {
+                        warn!(agent = %agent_id, reason, "Model work request rejected");
+                        continue;
+                    }
+                }
                 let request_digest = match gateway_request_digest(&request) {
                     Ok(digest) => digest,
                     Err(error) => {
@@ -1124,6 +1275,7 @@ pub mod bridge {
                             entry,
                             &action_tx,
                             completion_max_attempts,
+                            config.provider_usage_authority.as_deref(),
                         );
                         continue;
                     }
@@ -1234,6 +1386,7 @@ pub mod bridge {
                             agent_id,
                             &request_id,
                             &request_digest,
+                            model_work.as_ref(),
                         ) {
                             warn!(request_id = %request_id, error, "Provider request reauthorization failed before dispatch");
                             return;
@@ -1271,6 +1424,7 @@ pub mod bridge {
                                                         .as_deref(),
                                                     gateway_response: &gateway_resp,
                                                     usage_v2_enabled,
+                                                    model_work: model_work.as_ref(),
                                                 },
                                                 request_completion_max_attempts,
                                             ) {
@@ -1363,6 +1517,7 @@ pub mod bridge {
                             agent_id,
                             &request_id,
                             &request_digest,
+                            model_work.as_ref(),
                         ) {
                             warn!(request_id = %request_id, error, "Provider request reauthorization failed before dispatch");
                             return;
@@ -1398,6 +1553,7 @@ pub mod bridge {
                                                         .as_deref(),
                                                     gateway_response: &gateway_resp,
                                                     usage_v2_enabled,
+                                                    model_work: model_work.as_ref(),
                                                 },
                                                 request_completion_max_attempts,
                                             ) {
@@ -1654,6 +1810,63 @@ pub mod bridge {
         }
     }
 
+    fn bind_model_work_request(
+        request: &mut GatewayRequest,
+        context: &ModelWorkContext,
+    ) -> Result<(), &'static str> {
+        let binding = &context.binding;
+        let required = [
+            ("agent_id", binding.agent_id.0.to_string()),
+            (
+                "request_id",
+                format!("company-provider-{}", binding.reservation_id),
+            ),
+            ("tenant_id", binding.tenant_id.clone()),
+            ("project_id", binding.project_id.clone()),
+            ("work_item_id", binding.work_item_id.clone()),
+            ("reservation_id", binding.reservation_id.clone()),
+            ("assignment_id", binding.assignment_id.clone()),
+            ("assignment_version", binding.assignment_version.to_string()),
+            ("reserved_provider", binding.provider.clone()),
+        ];
+        for (key, value) in &required {
+            if request.metadata.get(*key) != Some(value) {
+                return Err("model work request authority does not match its context");
+            }
+        }
+        // A reservation names one provider effect, independent of the next tick,
+        // room chat or body state. Do not hash volatile perception into its retry.
+        request.metadata.retain(|key, _| {
+            matches!(key.as_str(), "agent_role" | "hierarchy_tier")
+                || required.iter().any(|(required_key, _)| key == required_key)
+        });
+        let context_bytes =
+            serde_json::to_vec(context).map_err(|_| "model work context encoding failed")?;
+        request
+            .metadata
+            .insert("company_execution_schema".to_owned(), "1".to_owned());
+        request.metadata.insert(
+            "company_execution_context_digest".to_owned(),
+            format!("{:x}", Sha256::digest(context_bytes)),
+        );
+        if let Some(grant) = &binding.subscription_grant {
+            request.model = grant.model.clone();
+            request.metadata.insert(
+                "subscription_allowance_id".to_owned(),
+                binding.reservation_id.clone(),
+            );
+            request.metadata.insert(
+                "subscription_catalog_digest".to_owned(),
+                grant.catalog_digest.clone(),
+            );
+        }
+        request.messages = vec![GatewayMessage {
+            role: "user".to_owned(),
+            content: context.prompt()?,
+        }];
+        Ok(())
+    }
+
     fn format_perception_metadata(perception: &Perception) -> String {
         let mut lines = Vec::new();
 
@@ -1750,6 +1963,221 @@ pub mod bridge {
     mod tests {
         use super::*;
 
+        struct ModelWorkResolver {
+            context: ModelWorkContext,
+            admissions: Mutex<Vec<String>>,
+            fail_next: AtomicBool,
+        }
+
+        impl ProviderUsageAuthorityResolver for ModelWorkResolver {
+            fn resolve_provider_usage_authority(
+                &self,
+                _: AgentId,
+            ) -> Result<Option<ProviderUsageAuthority>, &'static str> {
+                Ok(Some(self.context.binding.clone()))
+            }
+            fn model_work_context(
+                &self,
+                _: &ProviderUsageAuthority,
+            ) -> Result<Option<ModelWorkContext>, &'static str> {
+                Ok(Some(self.context.clone()))
+            }
+            fn admit_model_work(
+                &self,
+                completion: &ModelWorkCompletion,
+                id: &str,
+                _: &str,
+            ) -> Result<(), &'static str> {
+                if self.fail_next.swap(false, Ordering::SeqCst) {
+                    return Err("injected admission failure");
+                }
+                if !completion.admissible || completion.context != self.context {
+                    return Err("provider response is not admissible");
+                }
+                self.admissions.lock().unwrap().push(id.to_owned());
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn model_work_request_is_stable_across_perceptions_and_bound_to_authority() {
+            let context = crate::workflow_api::model_work::test_context();
+            let dir = tempfile::tempdir().unwrap();
+            let state = StateStore::open(dir.path().join("state.redb").to_str().unwrap()).unwrap();
+            let mut first = make_perception(6, "First conversation", true);
+            let id = agent_runtime_request_id(&first, Some(&context.binding));
+            let mut a = build_gateway_request(&first, &state, &id, Some(&context.binding));
+            first.tick = Tick(999);
+            first.heard_text = "Different conversation".to_owned();
+            first.body_text = "Different body state".to_owned();
+            let mut b = build_gateway_request(&first, &state, &id, Some(&context.binding));
+            bind_model_work_request(&mut a, &context).unwrap();
+            bind_model_work_request(&mut b, &context).unwrap();
+            assert_eq!(
+                gateway_request_digest(&a).unwrap(),
+                gateway_request_digest(&b).unwrap()
+            );
+            assert!(!a.metadata.contains_key("heard"));
+            assert!(!a.metadata.contains_key("tick"));
+            let mut changed = context.clone();
+            changed.authority.principal.principal_generation += 1;
+            bind_model_work_request(&mut b, &changed).unwrap();
+            assert_ne!(
+                gateway_request_digest(&a).unwrap(),
+                gateway_request_digest(&b).unwrap()
+            );
+            b.metadata
+                .insert("project_id".to_owned(), "foreign".to_owned());
+            assert!(bind_model_work_request(&mut b, &context).is_err());
+        }
+
+        #[test]
+        fn model_work_outbox_retries_after_restart_without_provider_or_legacy_action() {
+            let context = crate::workflow_api::model_work::test_context();
+            let resolver = ModelWorkResolver {
+                context: context.clone(),
+                admissions: Mutex::new(Vec::new()),
+                fail_next: AtomicBool::new(true),
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("events.db");
+            let store = EventStore::open(path.to_str().unwrap()).unwrap();
+            let request_id = "company-provider-reservation-m0";
+            let digest = "a".repeat(64);
+            let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+                "content": "{\"schema_version\":1,\"tools\":[]}", "decision": "forward",
+                "actions": [{"type":"tool_use","content":"must not execute"}],
+                "request_id":request_id, "provider":"codex-cli", "tokens_used":30,
+                "input_tokens":10,"output_tokens":20,"hierarchy_tier":2,"tier":"mid",
+                "cost_source":"provider_reported","effective_model":"test-model"
+            }))
+            .unwrap();
+            assert!(store
+                .reserve_request(request_id, &digest, &context.binding.agent_id.to_string())
+                .unwrap());
+            let (tx, rx) = mpsc::channel();
+            // One completed provider response enters the production outbox. Only
+            // local admission is retried after reopening the durable EventStore.
+            store_gateway_completion(
+                &store,
+                &tx,
+                GatewayCompletionContext {
+                    request_id,
+                    request_digest: &digest,
+                    agent_id: context.binding.agent_id,
+                    tick: 1,
+                    requested_model: "",
+                    authority: Some(&context.binding),
+                    authority_resolver: Some(&resolver),
+                    gateway_response: &response,
+                    usage_v2_enabled: true,
+                    model_work: Some(&context),
+                },
+                3,
+            )
+            .unwrap();
+            let pending = store.get_completion(request_id).unwrap().unwrap();
+            assert_eq!(pending.status, "ready_for_action");
+            assert_eq!(pending.attempt_count, 1);
+            assert!(resolver.admissions.lock().unwrap().is_empty());
+            assert!(rx.try_recv().is_err());
+            drop(store);
+            let restored = EventStore::open(path.to_str().unwrap()).unwrap();
+            recover_completion_batch(&restored, &tx, 3, Some(&resolver));
+            assert_eq!(
+                *resolver.admissions.lock().unwrap(),
+                vec![request_id.to_owned()]
+            );
+            assert!(restored.get_completion(request_id).unwrap().is_none());
+            assert!(!restored
+                .reserve_request(request_id, &digest, &context.binding.agent_id.to_string())
+                .unwrap());
+            recover_completion_batch(&restored, &tx, 3, Some(&resolver));
+            assert_eq!(resolver.admissions.lock().unwrap().len(), 1);
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[test]
+        fn model_work_failed_completion_cannot_reenter_admission() {
+            let context = crate::workflow_api::model_work::test_context();
+            let resolver = ModelWorkResolver {
+                context: context.clone(),
+                admissions: Mutex::new(Vec::new()),
+                fail_next: AtomicBool::new(false),
+            };
+            let store = EventStore::open(":memory:").unwrap();
+            let id = "company-provider-reservation-m0";
+            let digest = "a".repeat(64);
+            store.reserve_request(id, &digest, "AGENT-06").unwrap();
+            store.enqueue_completion(id, &digest, "{}").unwrap();
+            store.record_failure(id, &digest, "terminal", 1).unwrap();
+            let failed = store.get_completion(id).unwrap().unwrap();
+            assert_eq!(failed.status, "failed");
+            let (tx, _rx) = mpsc::channel();
+            recover_completion(&store, failed, &tx, 3, Some(&resolver));
+            assert!(resolver.admissions.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn model_work_rejected_or_revoked_response_retains_usage_without_execution() {
+            for revoked in [false, true] {
+                let context = crate::workflow_api::model_work::test_context();
+                let mut current = context.clone();
+                if revoked {
+                    current.authority.principal.principal_generation += 1;
+                }
+                let resolver = ModelWorkResolver {
+                    context: current,
+                    admissions: Mutex::new(Vec::new()),
+                    fail_next: AtomicBool::new(false),
+                };
+                let store = EventStore::open(":memory:").unwrap();
+                let request_id = "company-provider-reservation-m0";
+                let digest = "a".repeat(64);
+                let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+                    "content":"{}", "decision":if revoked { "forward" } else { "dropped" },
+                    "request_id":request_id, "provider":"codex-cli", "tokens_used":30,
+                    "input_tokens":10,"output_tokens":20,"hierarchy_tier":2,"tier":"mid",
+                    "cost_source":"provider_reported","effective_model":"test-model"
+                }))
+                .unwrap();
+                store
+                    .reserve_request(request_id, &digest, &context.binding.agent_id.to_string())
+                    .unwrap();
+                let (tx, rx) = mpsc::channel();
+                store_gateway_completion(
+                    &store,
+                    &tx,
+                    GatewayCompletionContext {
+                        request_id,
+                        request_digest: &digest,
+                        agent_id: context.binding.agent_id,
+                        tick: 1,
+                        requested_model: "",
+                        authority: Some(&context.binding),
+                        authority_resolver: Some(&resolver),
+                        gateway_response: &response,
+                        usage_v2_enabled: true,
+                        model_work: Some(&context),
+                    },
+                    1,
+                )
+                .unwrap();
+                assert_eq!(
+                    store.get_completion(request_id).unwrap().unwrap().status,
+                    "failed"
+                );
+                assert!(store
+                    .has_operation(&format!("llm_usage_{request_id}"))
+                    .unwrap());
+                assert!(resolver.admissions.lock().unwrap().is_empty());
+                assert!(rx.try_recv().is_err());
+                assert!(!store
+                    .reserve_request(request_id, &digest, &context.binding.agent_id.to_string())
+                    .unwrap());
+            }
+        }
+
         #[test]
         fn agent_runtime_request_uses_dedicated_path_and_bearer_credential() {
             let request = GatewayRequest {
@@ -1817,6 +2245,7 @@ pub mod bridge {
                 assignment_version: 1,
                 agent_id: AgentId(7),
                 provider: "local-loop".to_owned(),
+                subscription_grant: None,
             };
             let stale_resolver = StaticProviderUsageAuthority {
                 authority: ProviderUsageAuthority {
@@ -1835,6 +2264,7 @@ pub mod bridge {
                 AgentId(7),
                 "company-provider-reservation-m0",
                 "digest-m0",
+                None,
             )
             .unwrap_err();
 
@@ -2182,6 +2612,7 @@ pub mod bridge {
                         assignment_version: 1,
                         agent_id: AgentId(7),
                         provider: "local-loop".to_owned(),
+                        subscription_grant: None,
                     },
                 })),
                 ..Default::default()
@@ -2648,6 +3079,7 @@ pub mod bridge {
             // the event by AGENT-NN + request_id (deterministic operation_id).
             let resp = GatewayResponse {
                 content: String::new(),
+                decision: "forward".to_owned(),
                 actions: vec![],
                 tokens_used: 1800,
                 request_id: "req-abc".to_string(),
@@ -2695,6 +3127,7 @@ pub mod bridge {
                 assignment_version: 2,
                 agent_id: AgentId(8),
                 provider: "local-loop".to_owned(),
+                subscription_grant: None,
             };
             assert_eq!(
                 agent_runtime_request_id(&perception, Some(&authority)),
@@ -2705,6 +3138,7 @@ pub mod bridge {
             assert_eq!(validate_provider_usage_mode(None, false), Ok(()));
             let mut response = GatewayResponse {
                 content: "done".to_owned(),
+                decision: "forward".to_owned(),
                 actions: Vec::new(),
                 tokens_used: 0,
                 request_id: "company-provider-reservation-m0".to_owned(),
