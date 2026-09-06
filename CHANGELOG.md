@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Select the exact configured subscription allowance before evaluating other
+  employee assignments. Preserve unrelated projects and historical outcomes,
+  while rejecting duplicate or mismatched dispatch authority (#856).
+
 - Add a project-bound, durable one-call Codex subscription allowance separate
   from money reservations. Consume it through the authenticated local workflow
   authority before Gateway provider I/O, block unrelated provider paths in the
