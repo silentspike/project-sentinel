@@ -200,6 +200,9 @@ func (p *CodexCLIProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespo
 	waitErr := cmd.Wait()
 
 	if parseErr != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("codex-cli execution: %w", ctx.Err())
+		}
 		if waitErr != nil {
 			classified := codexCLIProcessError(diagnostics.String())
 			var providerErr *ProviderError
