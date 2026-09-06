@@ -316,7 +316,9 @@ describe("DeliveryView", () => {
       DeliveryView({ snapshot: snapshot() }),
     );
     expect(getByTestId("delivery-project").textContent).toContain("project-42");
+    expect(getByTestId("delivery-project").textContent).not.toContain("Project project");
     expect(getAllByTestId("delivery-lineage-node")).toHaveLength(3);
+    expect(getAllByTestId("delivery-lineage-node").every((node) => node.classList.contains("delivery-lineage-node"))).toBe(true);
     expect(getAllByTestId("delivery-authority").map((node) => node.textContent)).toEqual([
       "developer",
       "qa",
