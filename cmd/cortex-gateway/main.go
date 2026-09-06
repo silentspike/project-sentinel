@@ -37,16 +37,29 @@ import (
 // version is set at build time via ldflags.
 var version = "0.1.0"
 
-// Server timeouts for both proxy and control plane.
+// Shared read/idle bounds; the control plane keeps its short write deadline.
 const (
 	readTimeout     = 30 * time.Second
 	writeTimeout    = 60 * time.Second
 	idleTimeout     = 120 * time.Second
+	responseGrace   = 5 * time.Second
 	shutdownTimeout = 10 * time.Second
 )
 
 func listenTCP4(address string) (net.Listener, error) {
 	return net.Listen("tcp4", address)
+}
+
+func newProxyHTTPServer(address string, handler http.Handler, inflightDeadline time.Duration) *http.Server {
+	return &http.Server{
+		Addr:        address,
+		Handler:     handler,
+		ReadTimeout: readTimeout,
+		// The socket must outlive the admitted queue/provider budget so a
+		// terminal result or error can still reach the durable caller.
+		WriteTimeout: readTimeout + inflightDeadline + responseGrace,
+		IdleTimeout:  idleTimeout,
+	}
 }
 
 //nolint:gocyclo // composition root wires many runtime subsystems in one place
@@ -399,13 +412,7 @@ func main() {
 	proxyMux.HandleFunc("GET /ready", handleReady(catalog, controlConfig, registry, providerActivationAttestation))
 	proxyMux.Handle("GET /metrics", promhttp.Handler())
 
-	proxyServer := &http.Server{
-		Addr:         net.JoinHostPort(proxyBind, port),
-		Handler:      credentials.Middleware(proxyMux),
-		ReadTimeout:  readTimeout,
-		WriteTimeout: writeTimeout,
-		IdleTimeout:  idleTimeout,
-	}
+	proxyServer := newProxyHTTPServer(net.JoinHostPort(proxyBind, port), credentials.Middleware(proxyMux), inflightDeadline)
 
 	// 7. Control plane server (shared controlConfig → aenderungen wirken sofort)
 	controlPlane := control.NewPlane(controlConfig, logger)

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,51 @@ import (
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/synthesis"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/ticksync"
 )
+
+func TestProxyHTTPWriteDeadlineCoversInflightBudget(t *testing.T) {
+	for _, seconds := range []int{30, 120, 180, 300} {
+		budget := time.Duration(seconds) * time.Second
+		server := newProxyHTTPServer("127.0.0.1:0", http.NotFoundHandler(), budget)
+		if server.WriteTimeout != readTimeout+budget+responseGrace ||
+			server.ReadTimeout != readTimeout || server.IdleTimeout != idleTimeout {
+			t.Fatalf("proxy bounds do not cover %s: %+v", budget, server)
+		}
+	}
+	if writeTimeout != 60*time.Second {
+		t.Fatal("control-plane write timeout must remain unchanged")
+	}
+}
+
+func TestProxyHTTPDeliversResponseBeyondOldWriteDeadline(t *testing.T) {
+	// Scale both the production server bounds and response delay, without a
+	// minute-long test or bypassing the real net/http connection deadline.
+	const scale = 100
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(writeTimeout/scale + 200*time.Millisecond)
+		_, _ = io.WriteString(w, "terminal-result")
+	})
+	server := httptest.NewUnstartedServer(handler)
+	server.Config = newProxyHTTPServer("", handler, 180*time.Second)
+	server.Config.ReadTimeout /= scale
+	server.Config.WriteTimeout /= scale
+	server.Start()
+	defer server.Close()
+	client := server.Client()
+	client.Timeout = 5 * time.Second
+	response, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	body, err := io.ReadAll(response.Body)
+	if err != nil || response.StatusCode != http.StatusOK || string(body) != "terminal-result" {
+		t.Fatalf("terminal response lost: status=%d body=%q error=%v", response.StatusCode, body, err)
+	}
+}
 
 func TestListenTCP4UsesAnIPv4Socket(t *testing.T) {
 	listener, err := listenTCP4("0.0.0.0:0")

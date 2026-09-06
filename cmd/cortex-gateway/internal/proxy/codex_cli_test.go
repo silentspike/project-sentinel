@@ -217,6 +217,40 @@ esac
 	}
 }
 
+func TestCodexCLIProviderPreservesDeadlineAfterIncompleteStream(t *testing.T) {
+	artifacts := t.TempDir()
+	countPath := filepath.Join(artifacts, "starts")
+	scriptPath := filepath.Join(artifacts, "codex")
+	script := fmt.Sprintf(`#!/bin/sh
+set -eu
+printf 'started\n' >> %q
+printf '%%s\n' '{"type":"thread.started","thread_id":"thread-timeout"}'
+printf '%%s\n' '{"type":"turn.started"}'
+exec sleep 30
+`, countPath)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil { //nolint:gosec // executable local fixture; no real provider
+		t.Fatal(err)
+	}
+	workdir := t.TempDir()
+	if err := os.Chmod(workdir, 0o700); err != nil { //nolint:gosec // private production workdir contract
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_CLI_WORKDIR", workdir)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	provider := NewCodexCLIProvider(ProviderConfig{Name: CodexCLIProviderName, BaseURL: scriptPath}, nil)
+	response, err := provider.Send(context.Background(), &LLMRequest{
+		Messages:        []Message{{Role: "user", Content: "Local timeout fixture."}},
+		MaxTokens:       64,
+		ProviderTimeout: 250 * time.Millisecond,
+	})
+	if response != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deadline was hidden by incomplete-stream error: response=%+v error=%v", response, err)
+	}
+	if starts := readTestFile(t, countPath); starts != "started\n" {
+		t.Fatalf("unexpected provider process count: %q", starts)
+	}
+}
+
 func TestCodexCLIProviderUsesExplicitNativeAuthWithoutTransportRetries(t *testing.T) {
 	p := NewCodexCLIProvider(ProviderConfig{Name: CodexCLIProviderName}, nil)
 	args := p.commandArgs("test-model")
