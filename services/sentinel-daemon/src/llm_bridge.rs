@@ -48,6 +48,8 @@ pub mod bridge {
         pub assignment_version: u64,
         pub agent_id: AgentId,
         pub provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subscription_grant: Option<sentinel_workflow::SubscriptionCallGrantV1>,
     }
 
     pub trait ProviderUsageAuthorityResolver: Send + Sync {
@@ -1847,6 +1849,17 @@ pub mod bridge {
             "company_execution_context_digest".to_owned(),
             format!("{:x}", Sha256::digest(context_bytes)),
         );
+        if let Some(grant) = &binding.subscription_grant {
+            request.model = grant.model.clone();
+            request.metadata.insert(
+                "subscription_allowance_id".to_owned(),
+                binding.reservation_id.clone(),
+            );
+            request.metadata.insert(
+                "subscription_catalog_digest".to_owned(),
+                grant.catalog_digest.clone(),
+            );
+        }
         request.messages = vec![GatewayMessage {
             role: "user".to_owned(),
             content: context.prompt()?,
@@ -2232,6 +2245,7 @@ pub mod bridge {
                 assignment_version: 1,
                 agent_id: AgentId(7),
                 provider: "local-loop".to_owned(),
+                subscription_grant: None,
             };
             let stale_resolver = StaticProviderUsageAuthority {
                 authority: ProviderUsageAuthority {
@@ -2598,6 +2612,7 @@ pub mod bridge {
                         assignment_version: 1,
                         agent_id: AgentId(7),
                         provider: "local-loop".to_owned(),
+                        subscription_grant: None,
                     },
                 })),
                 ..Default::default()
@@ -3112,6 +3127,7 @@ pub mod bridge {
                 assignment_version: 2,
                 agent_id: AgentId(8),
                 provider: "local-loop".to_owned(),
+                subscription_grant: None,
             };
             assert_eq!(
                 agent_runtime_request_id(&perception, Some(&authority)),

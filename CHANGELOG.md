@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a project-bound, durable one-call Codex subscription allowance separate
+  from money reservations. Consume it through the authenticated local workflow
+  authority before Gateway provider I/O, block unrelated provider paths in the
+  configured mode, and retain ambiguous outcomes across restart without retry
+  or invented subscription charges (#856).
+
 - Bound each model-work Gateway attempt to 120 seconds including queue and
   pre-provider waiting. Preserve shorter caller/provider deadlines, reject
   expired work before dispatch, and release cancelled queue grants without
