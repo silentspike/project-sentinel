@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   defaultWorkspace, countLeaves, tilingTree, splitLeaf, closeLeaf, resizeSplit, openPanel,
-  type TileNode,
+  minimumTileSize, leaf, type TileNode,
 } from "../src/tiling/engine";
 
 function firstLeafId(n: TileNode): string {
@@ -9,6 +9,17 @@ function firstLeafId(n: TileNode): string {
 }
 
 describe("tiling engine (#444)", () => {
+  it("preserves minimum panel dimensions through mixed nested splits", () => {
+    expect(minimumTileSize(leaf("agents"))).toEqual({ width: 320, height: 220 });
+    expect(minimumTileSize(defaultWorkspace())).toEqual({ width: 972, height: 220 });
+    const stacked: TileNode = {
+      kind: "split", id: "test-stack", dir: "col", fraction: 0.1,
+      a: defaultWorkspace(), b: leaf("metrics"),
+    };
+    expect(minimumTileSize(stacked)).toEqual({ width: 972, height: 446 });
+    expect(minimumTileSize({ ...stacked, dir: "row" })).toEqual({ width: 1298, height: 220 });
+  });
+
   it("default workspace has three pillars (3 leaves)", () => {
     expect(countLeaves(defaultWorkspace())).toBe(3);
     expect(countLeaves(tilingTree.root)).toBe(3);
