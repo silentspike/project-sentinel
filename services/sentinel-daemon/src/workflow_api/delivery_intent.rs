@@ -82,6 +82,57 @@ struct ProjectMaterial {
     candidate: ReleaseCandidateV1,
 }
 
+pub(super) fn customer_delivery_rows(
+    aggregate: &crate::delivery::DeliveryAggregateV1,
+    caller: &PrincipalV1,
+) -> Result<Vec<serde_json::Value>, DeliveryError> {
+    require_role(caller, AuthorityRole::Customer)?;
+    if aggregate.tenant_id != caller.tenant_id {
+        return Err(DeliveryError::AuthorityDenied(
+            "foreign delivery tenant".to_string(),
+        ));
+    }
+    let mut rows = Vec::new();
+    for receipt in aggregate.deliveries.values() {
+        if receipt.customer_principal_id != caller.principal_id {
+            continue;
+        }
+        if rows.len() >= 128 {
+            return Err(DeliveryError::Validation(
+                "customer delivery inbox limit exceeded".to_string(),
+            ));
+        }
+        let release = aggregate
+            .releases
+            .get(&receipt.release.id)
+            .ok_or_else(|| DeliveryError::CorruptStore("delivery release missing".to_string()))?;
+        let release_ref = VersionedRefV1 {
+            id: release.release_id.clone(),
+            generation: release.generation,
+            digest: canonical_release_reference_digest(release)?,
+        };
+        if receipt.tenant_id != caller.tenant_id || receipt.release != release_ref {
+            return Err(DeliveryError::CorruptStore(
+                "delivery release binding changed".to_string(),
+            ));
+        }
+        rows.push(serde_json::json!({
+            "delivery": VersionedRefV1 {
+                id: receipt.delivery_id.clone(),
+                generation: receipt.generation,
+                digest: receipt.receipt_digest.clone(),
+            },
+            "release": release_ref,
+            "state": receipt.state,
+            "release_state": release.state,
+            "issued_at_ms": receipt.issued_at_ms,
+            "expires_at_ms": receipt.expires_at_ms,
+            "preview_digest": receipt.preview_digest,
+        }));
+    }
+    Ok(rows)
+}
+
 pub(super) fn handle(
     api: &WorkflowApi,
     principal: &BoundPrincipal,
@@ -1466,6 +1517,77 @@ mod tests {
             original_digest,
             ContentDigest::of_domain("m0-delivery-intent", 1, &changed.intent).unwrap()
         );
+    }
+
+    #[test]
+    fn customer_delivery_rows_are_owner_scoped_and_validate_release_binding() {
+        let customer = principal(AuthorityRole::Customer);
+        let reference = VersionedRefV1 {
+            id: "manifest-example".to_string(),
+            generation: 1,
+            digest: ContentDigest::of_domain("test-reference", 1, &"manifest").unwrap(),
+        };
+        let release = ReleaseV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            release_id: "release-example".to_string(),
+            generation: 1,
+            manifest: reference.clone(),
+            state: ReleaseState::Active,
+            activated_at_ms: Some(100),
+            rollout_receipt: Some(reference),
+        };
+        let receipt = DeliveryReceiptV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            delivery_id: "delivery-example".to_string(),
+            generation: 1,
+            tenant_id: customer.tenant_id.clone(),
+            release: VersionedRefV1 {
+                id: release.release_id.clone(),
+                generation: release.generation,
+                digest: canonical_release_reference_digest(&release).unwrap(),
+            },
+            customer_principal_id: customer.principal_id.clone(),
+            preview_digest: ContentDigest::of_domain("test-preview", 1, &"preview").unwrap(),
+            preview_ttl_policy_version: DELIVERY_PREVIEW_TTL_POLICY_V1,
+            receipt_digest: ContentDigest::zero(),
+            state: DeliveryState::Delivered,
+            issued_at_ms: 100,
+            expires_at_ms: 200,
+        }
+        .seal()
+        .unwrap();
+        let mut aggregate =
+            crate::delivery::DeliveryAggregateV1::new(&customer.tenant_id, "project-example");
+        aggregate
+            .releases
+            .insert(release.release_id.clone(), release);
+        aggregate
+            .deliveries
+            .insert(receipt.delivery_id.clone(), receipt.clone());
+        let rows = customer_delivery_rows(&aggregate, &customer).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["delivery"]["digest"],
+            serde_json::to_value(&receipt.receipt_digest).unwrap()
+        );
+        assert_eq!(rows[0].as_object().unwrap().len(), 7);
+        let mut foreign = customer.clone();
+        foreign.principal_id = "another-customer".to_string();
+        assert!(customer_delivery_rows(&aggregate, &foreign)
+            .unwrap()
+            .is_empty());
+        foreign.tenant_id = "another-tenant".to_string();
+        assert!(customer_delivery_rows(&aggregate, &foreign).is_err());
+        assert!(customer_delivery_rows(&aggregate, &principal(AuthorityRole::Developer)).is_err());
+        aggregate
+            .deliveries
+            .get_mut(&receipt.delivery_id)
+            .unwrap()
+            .release
+            .generation += 1;
+        assert!(customer_delivery_rows(&aggregate, &customer).is_err());
+        aggregate.releases.clear();
+        assert!(customer_delivery_rows(&aggregate, &customer).is_err());
     }
 
     #[test]

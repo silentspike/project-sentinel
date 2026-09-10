@@ -35,6 +35,11 @@ ownership, state, version, budget and idempotency checks.
 The overview reads only the authenticated customer's requests and agreements
 inside the authenticated tenant. Project responses contain identifiers and work
 states, not internal governance, agent authority or collaboration payloads.
+Project progress includes customer-owned delivery references and lifecycle states.
+Each release reference is checked against its canonical stored digest; missing
+or inconsistent release authority fails the read instead of displaying stale data.
+The delivery list is bounded to 128 entries per project and does not expose
+internal QA records, roles or credentials.
 Inbox reads are bounded to 128 requests and 128 projects and fail closed if the
 limit is exceeded. No truncated list is presented as a complete inbox.
 

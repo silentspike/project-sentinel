@@ -136,6 +136,13 @@ export function CustomerWorkspace() {
             <For each={(data().projects ?? []).filter(project => project.request_id === request().request_id)}>{project => <section class="customer-history">
               <h3>Projektfortschritt</h3><p>{project.state}</p>
               <table><thead><tr><th>Arbeitspaket</th><th>Status</th></tr></thead><tbody><For each={project.work_items}>{work => <tr><td>{work.work_item_id}</td><td>{work.state}</td></tr>}</For></tbody></table>
+              <Show when={project.deliveries?.length}><h3>Lieferungen</h3>
+                <table><thead><tr><th>Lieferung</th><th>Version</th><th>Status</th></tr></thead>
+                  <tbody><For each={project.deliveries}>{delivery => <tr>
+                    <td>{delivery.delivery.id}</td><td>{delivery.delivery.generation}</td><td>{delivery.state}</td>
+                  </tr>}</For></tbody>
+                </table>
+              </Show>
             </section>}</For>
             <For each={request().clarifications}>{value => <section class="customer-history"><strong>{value.question_ref}</strong><p>{value.answer_ref}</p></section>}</For>
             <For each={proposals()}>{proposal => <article class="customer-proposal">
