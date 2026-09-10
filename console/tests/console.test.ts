@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { uuidFieldToString, frameHeaderSize } from "../src/transport/codec";
-import { appendEventRows, EVENT_LOG_CAP, ingestFrame, consoleStore, type EventLogRow } from "../src/stores/console";
+import { activeAgentCount, appendEventRows, EVENT_LOG_CAP, ingestFrame, consoleStore, type EventLogRow } from "../src/stores/console";
 
 describe("codec helpers", () => {
   it("uuidFieldToString maps 16 raw bytes to hyphenated UUID", () => {
@@ -21,6 +21,18 @@ describe("codec helpers", () => {
 });
 
 describe("store reconcile (delta-merge from pushed frames)", () => {
+  it("distinguishes an unloaded roster from zero active agents and a minute delta", () => {
+    expect(activeAgentCount()).toBeNull();
+    ingestFrame("agent_live", { agents: [
+      { agent_id: 1, status: "active" }, { agent_id: 2, status: "suspended" },
+      { agent_id: 3, status: "despawned" }, { agent_id: 4 },
+    ] });
+    ingestFrame("kpi", { kpi: { active_agents: -2 } });
+    expect(activeAgentCount()).toBe(1);
+    expect(consoleStore.kpi?.active_agents).toBe(-2);
+    ingestFrame("agent_live", { agents: [] });
+    expect(activeAgentCount()).toBe(0);
+  });
   it("ingestFrame('agent_live') reconciles agents by key + updates topic/count", () => {
     ingestFrame("agent_live", {
       agents: [{ agent_id: 1, name: "Thomas", role: "CEO", current_room: "buero-ceo", energy: 0.8, stress: 0.2, mood: "ok" }],

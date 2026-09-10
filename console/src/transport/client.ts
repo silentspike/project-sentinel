@@ -2,7 +2,7 @@ import { parseTopicFrame, frameHeaderSize } from "./codec";
 import {
   hashFromKey,
   readJsonFrame,
-  reassembleEventLogCas,
+  reassembleEventLogCasAsync,
   writeJsonFrame,
   type EventLogCasResponse,
 } from "./cas";
@@ -217,7 +217,8 @@ export class TransportClient {
       await writeJsonFrame(writer, { have: [...this.casBlocks.keys()].map(hashFromKey) });
       await writer.close();
       const response = await readJsonFrame<EventLogCasResponse>(reader);
-      const { events, stats } = reassembleEventLogCas(response, this.casBlocks);
+      const { events, stats } = await reassembleEventLogCasAsync(response, this.casBlocks);
+      if (this.transport !== transport || this.status !== "connected") return;
       this.onFrame?.("event_log", { events, backfill: true, cas: stats });
     } finally {
       writer.releaseLock();
