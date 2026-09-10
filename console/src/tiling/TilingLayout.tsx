@@ -1,12 +1,12 @@
-import { onMount, onCleanup, Show, type JSX } from "solid-js";
-import { type TileNode, type SplitNode, resizeSplit, focusLeaf, type PanelKind } from "./engine";
+import { createMemo, onMount, onCleanup, Show, type JSX } from "solid-js";
+import { type TileNode, type SplitNode, resizeSplit, focusLeaf, minimumTileSize, TILE_GUTTER, type PanelKind } from "./engine";
 
 // Render der Tiling-Engine (#444): rekursiv auf CSS Grid. Split = `grid-template-{columns|rows}`
 // aus `fraction` + Gutter dazwischen. Gutter-Pointer-Drag aktualisiert die Fraktion (60fps).
-// Smooth Re-Tiling via CSS-Transition (GPU) + WAAPI-Fade-in neuer Panels. ResizeObserver cacht
-// das Container-Rect fuer praezise Gutter→Fraktion-Mathematik.
+// Smooth Re-Tiling via CSS-Transition + WAAPI-Fade-in neuer Panels.
+// Das aktuelle Container-Rect bleibt auch nach Workspace-Scroll korrekt.
 
-const GUTTER = 6;
+const GUTTER = TILE_GUTTER;
 const TRANSITION = "grid-template-columns 180ms ease, grid-template-rows 180ms ease";
 
 function Gutter(props: { split: SplitNode; rect: () => DOMRect | null }) {
@@ -22,15 +22,37 @@ function Gutter(props: { split: SplitNode; rect: () => DOMRect | null }) {
     dragging = false;
     document.removeEventListener("pointermove", onMove);
     document.removeEventListener("pointerup", stop);
+    document.removeEventListener("pointercancel", stop);
   };
+  onCleanup(stop);
   return (
     <div
       data-testid={`gutter-${props.split.id}`}
+      role="separator"
+      tabIndex={0}
+      aria-label="Resize workspace panes"
+      aria-orientation={props.split.dir === "row" ? "vertical" : "horizontal"}
+      aria-valuemin={10}
+      aria-valuemax={90}
+      aria-valuenow={Math.round(props.split.fraction * 100)}
+      onKeyDown={(e) => {
+        const decrease = props.split.dir === "row" ? "ArrowLeft" : "ArrowUp";
+        const increase = props.split.dir === "row" ? "ArrowRight" : "ArrowDown";
+        let next: number;
+        if (e.key === decrease) next = props.split.fraction - 0.05;
+        else if (e.key === increase) next = props.split.fraction + 0.05;
+        else if (e.key === "Home") next = 0.1;
+        else if (e.key === "End") next = 0.9;
+        else return;
+        e.preventDefault();
+        resizeSplit(props.split.id, next);
+      }}
       onPointerDown={(e) => {
         e.preventDefault();
         dragging = true;
         document.addEventListener("pointermove", onMove);
         document.addEventListener("pointerup", stop);
+        document.addEventListener("pointercancel", stop);
       }}
       style={{
         background: "var(--border)",
@@ -55,18 +77,13 @@ export function Tiling(props: { node: TileNode; renderPanel: (p: PanelKind, leaf
 
 function SplitTile(props: { split: SplitNode; renderPanel: (p: PanelKind, leafId: string) => JSX.Element }): JSX.Element {
   let el: HTMLDivElement | undefined;
-  let rect: DOMRect | null = null;
-  const getRect = () => rect;
-  onMount(() => {
-    if (!el) return;
-    rect = el.getBoundingClientRect();
-    const ro = new ResizeObserver(() => { if (el) rect = el.getBoundingClientRect(); });
-    ro.observe(el);
-    onCleanup(() => ro.disconnect());
-  });
+  const getRect = () => el?.getBoundingClientRect() ?? null;
+  const minimumA = createMemo(() => minimumTileSize(props.split.a));
+  const minimumB = createMemo(() => minimumTileSize(props.split.b));
   const template = () => {
-    const a = `${props.split.fraction}fr`;
-    const b = `${1 - props.split.fraction}fr`;
+    const axis = props.split.dir === "row" ? "width" : "height";
+    const a = `minmax(${minimumA()[axis]}px, ${props.split.fraction}fr)`;
+    const b = `minmax(${minimumB()[axis]}px, ${1 - props.split.fraction}fr)`;
     return `${a} ${GUTTER}px ${b}`;
   };
   return (
@@ -79,8 +96,8 @@ function SplitTile(props: { split: SplitNode; renderPanel: (p: PanelKind, leafId
         gap: 0,
         height: "100%",
         width: "100%",
-        "min-height": 0,
-        "min-width": 0,
+        "min-height": `${props.split.dir === "col" ? minimumA().height + GUTTER + minimumB().height : Math.max(minimumA().height, minimumB().height)}px`,
+        "min-width": `${props.split.dir === "row" ? minimumA().width + GUTTER + minimumB().width : Math.max(minimumA().width, minimumB().width)}px`,
         transition: TRANSITION,
       }}
     >

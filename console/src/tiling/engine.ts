@@ -23,6 +23,20 @@ export interface SplitNode {
 }
 export type TileNode = LeafNode | SplitNode;
 
+export const TILE_GUTTER = 6;
+export const MIN_TILE_WIDTH = 320;
+export const MIN_TILE_HEIGHT = 220;
+
+/** Preserve usable controls in nested splits; only the workspace scrolls when full. */
+export function minimumTileSize(node: TileNode): { width: number; height: number } {
+  if (node.kind === "leaf") return { width: MIN_TILE_WIDTH, height: MIN_TILE_HEIGHT };
+  const a = minimumTileSize(node.a);
+  const b = minimumTileSize(node.b);
+  return node.dir === "row"
+    ? { width: a.width + TILE_GUTTER + b.width, height: Math.max(a.height, b.height) }
+    : { width: Math.max(a.width, b.width), height: a.height + TILE_GUTTER + b.height };
+}
+
 let counter = 1;
 function nextId(prefix: string): string {
   return `${prefix}-${counter++}`;

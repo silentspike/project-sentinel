@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Keep every desktop workspace navigation control visible without horizontal
+  page overflow, including narrow desktop viewports (#856).
+- Preserve minimum working area dimensions in nested desktop splits and keep
+  overflow scrolling inside the keyboard-accessible workspace (#856).
+
 - Retry only rollback-safe Projection batches and exact offset mirrors on
   bounded SQLite writer contention; retain terminal integrity/authority errors
   and roll back abandoned or failed transactions. Keep all Delivery lineage
