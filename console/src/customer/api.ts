@@ -30,7 +30,17 @@ export interface Proposal {
   expires_at_unix_ms: number;
 }
 
-export interface ProjectProgress { project_id: string; request_id: string; state: string; version: number; work_items: { work_item_id: string; state: string }[] }
+export interface DeliveryReference { id: string; generation: number; digest: string }
+export interface CustomerDelivery {
+  delivery: DeliveryReference;
+  release: DeliveryReference;
+  state: string;
+  release_state: string;
+  issued_at_ms: number;
+  expires_at_ms: number;
+  preview_digest: string;
+}
+export interface ProjectProgress { project_id: string; request_id: string; state: string; version: number; work_items: { work_item_id: string; state: string }[]; deliveries?: CustomerDelivery[] }
 export interface Overview { requests: CustomerRequest[]; proposals: Proposal[]; projects?: ProjectProgress[] }
 export interface PendingCommand { operation_id: string; command: Record<string, unknown>; dispatched?: boolean }
 

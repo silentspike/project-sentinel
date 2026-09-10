@@ -3536,10 +3536,33 @@ impl WorkflowApi {
                     })
                 })
                 .collect();
+            let deliveries = if let Some(delivery) = &self.delivery {
+                let Some(caller) = delivery_principal(&principal.principal) else {
+                    return json_error(
+                        403,
+                        "authority_conflict",
+                        "customer delivery authority is unavailable",
+                        false,
+                    );
+                };
+                match delivery.aggregate(&caller.tenant_id, &project.project_id.0) {
+                    Ok(Some(aggregate)) => {
+                        match delivery_intent::customer_delivery_rows(&aggregate, &caller) {
+                            Ok(rows) => rows,
+                            Err(error) => return delivery_error(error),
+                        }
+                    }
+                    Ok(None) => Vec::new(),
+                    Err(error) => return delivery_error(error),
+                }
+            } else {
+                Vec::new()
+            };
             progress.push(serde_json::json!({
                 "project_id": project.project_id, "request_id": agreement.request_id,
                 "state": project.lifecycle_state, "version": project.version,
                 "work_items": work,
+                "deliveries": deliveries,
             }));
         }
         json(
