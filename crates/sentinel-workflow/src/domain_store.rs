@@ -669,6 +669,58 @@ impl WorkflowStore {
         get_entity(&connection, tenant_id, "request", request_id)
     }
 
+    /// Bounded customer inbox. Entity digests and ownership remain authoritative.
+    pub fn company_customer_requests(
+        &self,
+        tenant_id: &TenantId,
+        customer_id: &str,
+    ) -> Result<Vec<CustomerRequestV1>, WorkflowError> {
+        tenant_id.validate()?;
+        validate_identifier(customer_id)?;
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        let mut statement = connection.prepare(
+            "SELECT entity_id FROM company_entities WHERE tenant_id=?1 AND entity_kind='request' AND json_extract(payload,'$.customer_id')=?2 ORDER BY entity_id LIMIT 129",
+        ).map_err(WorkflowError::from)?;
+        let ids = statement
+            .query_map(params![tenant_id.0, customer_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(WorkflowError::from)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(WorkflowError::from)?;
+        if ids.len() > MAX_AGGREGATE_ITEMS {
+            return Err(invalid(
+                "customer inbox limit exceeded; use an exact request ID",
+            ));
+        }
+        ids.into_iter()
+            .map(|id| {
+                let request: CustomerRequestV1 =
+                    get_entity(&connection, tenant_id, "request", &id)?.ok_or_else(corrupt)?;
+                validate_customer_request(&request)?;
+                if request.customer_id != customer_id {
+                    return Err(corrupt());
+                }
+                Ok(request)
+            })
+            .collect()
+    }
+
+    pub fn company_proposal(
+        &self,
+        tenant_id: &TenantId,
+        proposal_id: &str,
+    ) -> Result<Option<ProposalV1>, WorkflowError> {
+        tenant_id.validate()?;
+        validate_identifier(proposal_id)?;
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        let proposal = get_entity(&connection, tenant_id, "proposal", proposal_id)?;
+        if let Some(value) = &proposal {
+            validate_proposal(value)?;
+        }
+        Ok(proposal)
+    }
+
     pub fn company_project(
         &self,
         tenant_id: &TenantId,
@@ -729,6 +781,46 @@ impl WorkflowStore {
             Ok(project)
         })
         .collect()
+    }
+
+    pub fn company_customer_projects(
+        &self,
+        tenant_id: &TenantId,
+        customer_id: &str,
+    ) -> Result<Vec<ProjectV1>, WorkflowError> {
+        tenant_id.validate()?;
+        validate_identifier(customer_id)?;
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        let mut statement = connection.prepare(
+            "SELECT p.entity_id FROM company_entities p JOIN company_entities a ON a.tenant_id=p.tenant_id AND a.entity_kind='agreement' AND a.entity_id=json_extract(p.payload,'$.agreement_id') WHERE p.tenant_id=?1 AND p.entity_kind='project' AND json_extract(a.payload,'$.customer_id')=?2 ORDER BY p.entity_id LIMIT 129",
+        ).map_err(WorkflowError::from)?;
+        let ids = statement
+            .query_map(params![tenant_id.0, customer_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(WorkflowError::from)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(WorkflowError::from)?;
+        if ids.len() > MAX_AGGREGATE_ITEMS {
+            return Err(invalid("customer project limit exceeded"));
+        }
+        ids.into_iter()
+            .map(|id| {
+                let project: ProjectV1 =
+                    get_entity(&connection, tenant_id, "project", &id)?.ok_or_else(corrupt)?;
+                validate_project(&project)?;
+                let agreement: AgreementV1 =
+                    get_entity(&connection, tenant_id, "agreement", &project.agreement_id)?
+                        .ok_or_else(corrupt)?;
+                validate_agreement(&agreement)?;
+                if agreement.customer_id != customer_id
+                    || agreement.proposal_digest != project.agreement_digest
+                {
+                    return Err(corrupt());
+                }
+                Ok(project)
+            })
+            .collect()
     }
 
     pub fn collaboration_capacity_snapshot(

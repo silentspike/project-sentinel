@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, waitFor } from "@solidjs/testing-library";
 import { DeliveryView } from "../src/views/DeliveryView";
 import {
@@ -355,7 +355,8 @@ describe("DeliveryView", () => {
 });
 
 describe("Delivery navigation", () => {
-  it("opens the reachable product surface and fails closed on unavailable API", async () => {
+  let App: typeof import("../src/App").default;
+  beforeAll(async () => {
     vi.resetModules();
     vi.doMock("../src/auth", () => ({
       authStatus: async () => true,
@@ -382,7 +383,10 @@ describe("Delivery navigation", () => {
       configurable: true,
       value: vi.fn(() => ({ cancel: vi.fn() })),
     });
-    const { default: App } = await import("../src/App");
+    App = (await import("../src/App")).default;
+  });
+
+  it("opens the reachable product surface and fails closed on unavailable API", async () => {
     const { getByTestId } = render(() => App());
 
     await waitFor(() => expect(getByTestId("open-delivery")).toBeTruthy());
