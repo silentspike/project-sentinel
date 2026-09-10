@@ -35,12 +35,29 @@ pub(super) struct DeliveryIntentEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum DeliveryIntentV1 {
-    PrepareCandidate { project_id: ProjectId },
-    AssignQa { project_id: ProjectId },
-    ExecuteQa { project_id: ProjectId },
-    Release { project_id: ProjectId },
-    Accept { project_id: ProjectId },
-    Closeout { project_id: ProjectId },
+    PrepareCandidate {
+        project_id: ProjectId,
+    },
+    AssignQa {
+        project_id: ProjectId,
+    },
+    ExecuteQa {
+        project_id: ProjectId,
+    },
+    Release {
+        project_id: ProjectId,
+    },
+    Accept {
+        project_id: ProjectId,
+    },
+    ConfirmDelivery {
+        project_id: ProjectId,
+        delivery: VersionedRefV1,
+        release: VersionedRefV1,
+    },
+    Closeout {
+        project_id: ProjectId,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -63,6 +80,57 @@ struct ProjectMaterial {
     agreement: sentinel_workflow::AgreementV1,
     request: sentinel_workflow::CustomerRequestV1,
     candidate: ReleaseCandidateV1,
+}
+
+pub(super) fn customer_delivery_rows(
+    aggregate: &crate::delivery::DeliveryAggregateV1,
+    caller: &PrincipalV1,
+) -> Result<Vec<serde_json::Value>, DeliveryError> {
+    require_role(caller, AuthorityRole::Customer)?;
+    if aggregate.tenant_id != caller.tenant_id {
+        return Err(DeliveryError::AuthorityDenied(
+            "foreign delivery tenant".to_string(),
+        ));
+    }
+    let mut rows = Vec::new();
+    for receipt in aggregate.deliveries.values() {
+        if receipt.customer_principal_id != caller.principal_id {
+            continue;
+        }
+        if rows.len() >= 128 {
+            return Err(DeliveryError::Validation(
+                "customer delivery inbox limit exceeded".to_string(),
+            ));
+        }
+        let release = aggregate
+            .releases
+            .get(&receipt.release.id)
+            .ok_or_else(|| DeliveryError::CorruptStore("delivery release missing".to_string()))?;
+        let release_ref = VersionedRefV1 {
+            id: release.release_id.clone(),
+            generation: release.generation,
+            digest: canonical_release_reference_digest(release)?,
+        };
+        if receipt.tenant_id != caller.tenant_id || receipt.release != release_ref {
+            return Err(DeliveryError::CorruptStore(
+                "delivery release binding changed".to_string(),
+            ));
+        }
+        rows.push(serde_json::json!({
+            "delivery": VersionedRefV1 {
+                id: receipt.delivery_id.clone(),
+                generation: receipt.generation,
+                digest: receipt.receipt_digest.clone(),
+            },
+            "release": release_ref,
+            "state": receipt.state,
+            "release_state": release.state,
+            "issued_at_ms": receipt.issued_at_ms,
+            "expires_at_ms": receipt.expires_at_ms,
+            "preview_digest": receipt.preview_digest,
+        }));
+    }
+    Ok(rows)
 }
 
 pub(super) fn handle(
@@ -105,7 +173,9 @@ pub(super) fn handle(
         | DeliveryIntentV1::Release { .. }
         | DeliveryIntentV1::Closeout { .. } => AuthorityRole::ReleaseManager,
         DeliveryIntentV1::ExecuteQa { .. } => AuthorityRole::Qa,
-        DeliveryIntentV1::Accept { .. } => AuthorityRole::Customer,
+        DeliveryIntentV1::Accept { .. } | DeliveryIntentV1::ConfirmDelivery { .. } => {
+            AuthorityRole::Customer
+        }
     };
     if let Err(error) = require_role(&caller, required_role) {
         return delivery_error(error);
@@ -181,6 +251,21 @@ pub(super) fn handle(
             effective_now_ms,
             observed_now_ms,
             project_id,
+            None,
+        ),
+        DeliveryIntentV1::ConfirmDelivery {
+            project_id,
+            delivery: expected_delivery,
+            release: expected_release,
+        } => accept(
+            api,
+            delivery,
+            &caller,
+            envelope.operation_id,
+            effective_now_ms,
+            observed_now_ms,
+            project_id,
+            Some((expected_delivery, expected_release)),
         ),
         DeliveryIntentV1::Closeout { project_id } => closeout(
             api,
@@ -1126,6 +1211,7 @@ fn accept(
     now_ms: u64,
     observed_now_ms: u64,
     project_id: &ProjectId,
+    expected: Option<(&VersionedRefV1, &VersionedRefV1)>,
 ) -> Result<DeliveryIntentResponse, DeliveryError> {
     require_role(caller, AuthorityRole::Customer)?;
     let material = load_material(api, &TenantId(caller.tenant_id.clone()), project_id)?;
@@ -1165,6 +1251,14 @@ fn accept(
         generation: release.generation,
         digest: canonical_release_reference_digest(release)?,
     };
+    if let Some((expected_delivery, expected_release)) = expected {
+        require_displayed_delivery(
+            expected_delivery,
+            expected_release,
+            &delivery_ref,
+            &release_ref,
+        )?;
+    }
     let feedback = CustomerFeedbackV1 {
         schema_version: DELIVERY_SCHEMA_V1,
         feedback_id: format!("feedback-{delivery_id}"),
@@ -1205,6 +1299,20 @@ fn accept(
         Some(acceptance_id),
         None,
     ))
+}
+
+fn require_displayed_delivery(
+    expected_delivery: &VersionedRefV1,
+    expected_release: &VersionedRefV1,
+    current_delivery: &VersionedRefV1,
+    current_release: &VersionedRefV1,
+) -> Result<(), DeliveryError> {
+    if expected_delivery != current_delivery || expected_release != current_release {
+        return Err(DeliveryError::AuthorityDenied(
+            "displayed delivery or release has changed".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn closeout(
@@ -1371,6 +1479,154 @@ mod tests {
             .idempotency_key
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')));
+    }
+
+    #[test]
+    fn customer_confirmation_requires_both_displayed_references() {
+        let reference = VersionedRefV1 {
+            id: "delivery-example".to_string(),
+            generation: 1,
+            digest: ContentDigest::of_domain("test-reference", 1, &"original").unwrap(),
+        };
+        let operation_id = Uuid::new_v4();
+        let wire = serde_json::json!({
+            "operation_id": operation_id,
+            "intent": {
+                "action": "confirm_delivery",
+                "project_id": "project-example",
+                "delivery": reference,
+                "release": reference,
+            }
+        });
+        let parsed: DeliveryIntentEnvelope = serde_json::from_value(wire.clone()).unwrap();
+        assert!(matches!(
+            parsed.intent,
+            DeliveryIntentV1::ConfirmDelivery { .. }
+        ));
+        for required in ["delivery", "release"] {
+            let mut missing = wire.clone();
+            missing["intent"].as_object_mut().unwrap().remove(required);
+            assert!(serde_json::from_value::<DeliveryIntentEnvelope>(missing).is_err());
+        }
+        let original_digest =
+            ContentDigest::of_domain("m0-delivery-intent", 1, &parsed.intent).unwrap();
+        let mut changed = wire;
+        changed["intent"]["delivery"]["generation"] = serde_json::json!(2);
+        let changed: DeliveryIntentEnvelope = serde_json::from_value(changed).unwrap();
+        assert_ne!(
+            original_digest,
+            ContentDigest::of_domain("m0-delivery-intent", 1, &changed.intent).unwrap()
+        );
+    }
+
+    #[test]
+    fn customer_delivery_rows_are_owner_scoped_and_validate_release_binding() {
+        let customer = principal(AuthorityRole::Customer);
+        let reference = VersionedRefV1 {
+            id: "manifest-example".to_string(),
+            generation: 1,
+            digest: ContentDigest::of_domain("test-reference", 1, &"manifest").unwrap(),
+        };
+        let release = ReleaseV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            release_id: "release-example".to_string(),
+            generation: 1,
+            manifest: reference.clone(),
+            state: ReleaseState::Active,
+            activated_at_ms: Some(100),
+            rollout_receipt: Some(reference),
+        };
+        let receipt = DeliveryReceiptV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            delivery_id: "delivery-example".to_string(),
+            generation: 1,
+            tenant_id: customer.tenant_id.clone(),
+            release: VersionedRefV1 {
+                id: release.release_id.clone(),
+                generation: release.generation,
+                digest: canonical_release_reference_digest(&release).unwrap(),
+            },
+            customer_principal_id: customer.principal_id.clone(),
+            preview_digest: ContentDigest::of_domain("test-preview", 1, &"preview").unwrap(),
+            preview_ttl_policy_version: DELIVERY_PREVIEW_TTL_POLICY_V1,
+            receipt_digest: ContentDigest::zero(),
+            state: DeliveryState::Delivered,
+            issued_at_ms: 100,
+            expires_at_ms: 200,
+        }
+        .seal()
+        .unwrap();
+        let mut aggregate =
+            crate::delivery::DeliveryAggregateV1::new(&customer.tenant_id, "project-example");
+        aggregate
+            .releases
+            .insert(release.release_id.clone(), release);
+        aggregate
+            .deliveries
+            .insert(receipt.delivery_id.clone(), receipt.clone());
+        let rows = customer_delivery_rows(&aggregate, &customer).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["delivery"]["digest"],
+            serde_json::to_value(&receipt.receipt_digest).unwrap()
+        );
+        assert_eq!(rows[0].as_object().unwrap().len(), 7);
+        let mut foreign = customer.clone();
+        foreign.principal_id = "another-customer".to_string();
+        assert!(customer_delivery_rows(&aggregate, &foreign)
+            .unwrap()
+            .is_empty());
+        foreign.tenant_id = "another-tenant".to_string();
+        assert!(customer_delivery_rows(&aggregate, &foreign).is_err());
+        assert!(customer_delivery_rows(&aggregate, &principal(AuthorityRole::Developer)).is_err());
+        aggregate
+            .deliveries
+            .get_mut(&receipt.delivery_id)
+            .unwrap()
+            .release
+            .generation += 1;
+        assert!(customer_delivery_rows(&aggregate, &customer).is_err());
+        aggregate.releases.clear();
+        assert!(customer_delivery_rows(&aggregate, &customer).is_err());
+    }
+
+    #[test]
+    fn displayed_delivery_rejects_every_changed_identity_component() {
+        let delivery = VersionedRefV1 {
+            id: "delivery-example".to_string(),
+            generation: 1,
+            digest: ContentDigest::of_domain("test-reference", 1, &"delivery").unwrap(),
+        };
+        let release = VersionedRefV1 {
+            id: "release-example".to_string(),
+            generation: 2,
+            digest: ContentDigest::of_domain("test-reference", 1, &"release").unwrap(),
+        };
+        assert!(require_displayed_delivery(&delivery, &release, &delivery, &release).is_ok());
+        for component in 0..6 {
+            let mut changed_delivery = delivery.clone();
+            let mut changed_release = release.clone();
+            let target = if component < 3 {
+                &mut changed_delivery
+            } else {
+                &mut changed_release
+            };
+            match component % 3 {
+                0 => target.id.push_str("-replaced"),
+                1 => target.generation += 1,
+                _ => target.digest = ContentDigest::zero(),
+            }
+            assert!(
+                require_displayed_delivery(
+                    &delivery,
+                    &release,
+                    &changed_delivery,
+                    &changed_release
+                )
+                .is_err(),
+                "component {component}"
+            );
+        }
     }
 
     #[test]

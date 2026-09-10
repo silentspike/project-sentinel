@@ -35,6 +35,11 @@ ownership, state, version, budget and idempotency checks.
 The overview reads only the authenticated customer's requests and agreements
 inside the authenticated tenant. Project responses contain identifiers and work
 states, not internal governance, agent authority or collaboration payloads.
+Project progress includes customer-owned delivery references and lifecycle states.
+Each release reference is checked against its canonical stored digest; missing
+or inconsistent release authority fails the read instead of displaying stale data.
+The delivery list is bounded to 128 entries per project and does not expose
+internal QA records, roles or credentials.
 Inbox reads are bounded to 128 requests and 128 projects and fail closed if the
 limit is exceeded. No truncated list is presented as a complete inbox.
 
@@ -64,6 +69,16 @@ Retries of an uncertain operation always use the same ID and payload. There is
 no automatic new-ID retry or automatic provider invocation.
 
 ## Acceptance Boundary
+
+The daemon delivery-intent protocol provides `confirm_delivery` for explicit
+version-bound customer acceptance. Its intent contains `project_id`, `delivery`
+and `release`; both references contain `id`, `generation` and `digest`. The
+server includes these references in the durable operation digest and compares
+them with its authoritative records before recording acceptance. A changed
+reference is rejected, never silently replaced with a newer delivery. Customer
+identity, timestamps, feedback and acceptance records remain server-derived.
+The existing project-only `accept` intent remains compatible with the controlled
+journey harness; the customer browser integration must use `confirm_delivery`.
 
 This surface does not by itself prove a delivered customer project. Preview
 serving, explicit final delivery acceptance, the real agent-produced work and
