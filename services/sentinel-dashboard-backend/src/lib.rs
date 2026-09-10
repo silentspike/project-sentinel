@@ -26,6 +26,7 @@ pub mod cockpit;
 pub mod codec;
 pub mod config;
 pub mod control;
+pub mod customer;
 pub mod event_sub;
 pub mod events;
 pub mod gaia;
@@ -522,10 +523,12 @@ impl Config {
 #[derive(Clone)]
 pub struct AppState {
     pub sessions: auth::SessionStore,
+    pub customer_sessions: customer::CustomerSessions,
     /// #474: per-IP brute-force limiter for `POST /api/auth/login`.
     pub login_limiter: auth::LoginRateLimiter,
     pub config: Arc<Config>,
     pub http: reqwest::Client,
+    pub customer_http: reqwest::Client,
     /// Optionaler read-only Limbo EventStore-Handle. Nicht verfuegbar => Routen degradieren.
     pub events: Option<sentinel_limbo::EventStore>,
     /// Control-Pause merkt den vorherigen Gateway rate_limit_rps-Wert fuer Resume.
@@ -565,10 +568,16 @@ impl AppState {
         );
         Ok(Self {
             sessions: auth::SessionStore::new(),
+            customer_sessions: customer::CustomerSessions::default(),
             login_limiter,
             config: Arc::new(config),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
+                .build()?,
+            customer_http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(10))
+                .no_proxy()
                 .build()?,
             events,
             saved_rate_limit: Arc::new(tokio::sync::Mutex::new(None)),
@@ -692,10 +701,19 @@ pub fn build_app(state: AppState) -> axum::Router {
             auth::require_auth,
         ));
 
+    let customer_routes = axum::Router::new()
+        .route("/login", post(customer::login))
+        .route("/logout", post(customer::logout))
+        .route("/status", get(customer::status))
+        .route("/overview", get(customer::overview))
+        .route("/commands", post(customer::commands))
+        .route_layer(middleware::from_fn(customer::no_store));
+
     let api = axum::Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/status", get(auth::status))
+        .nest("/customer", customer_routes)
         .route(
             "/wt-ticket",
             get(auth::wt_ticket).route_layer(middleware::from_fn_with_state(

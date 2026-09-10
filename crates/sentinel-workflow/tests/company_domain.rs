@@ -161,6 +161,56 @@ fn command(
         .response
 }
 
+#[test]
+fn customer_inbox_and_proposal_reads_preserve_tenant_and_customer_binding() {
+    let state = journey();
+    let requests = state
+        .store
+        .company_customer_requests(&state.customer.tenant_id, "customer-a")
+        .unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].request_id, state.request_id);
+    assert!(state
+        .store
+        .company_customer_requests(&state.customer.tenant_id, "customer-other")
+        .unwrap()
+        .is_empty());
+    let foreign = TenantId::parse("tenant-other").unwrap();
+    assert!(state
+        .store
+        .company_customer_requests(&foreign, "customer-a")
+        .unwrap()
+        .is_empty());
+    assert!(state
+        .store
+        .company_proposal(&foreign, &state.proposal_id)
+        .unwrap()
+        .is_none());
+    let proposal = state
+        .store
+        .company_proposal(&state.customer.tenant_id, &state.proposal_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(proposal.request_id, state.request_id);
+    assert_eq!(proposal.proposal_digest, state.proposal_digest);
+    let projects = state
+        .store
+        .company_customer_projects(&state.customer.tenant_id, "customer-a")
+        .unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].project_id, state.project_id);
+    assert!(state
+        .store
+        .company_customer_projects(&foreign, "customer-a")
+        .unwrap()
+        .is_empty());
+    assert!(state
+        .store
+        .company_customer_projects(&state.customer.tenant_id, "customer-other")
+        .unwrap()
+        .is_empty());
+}
+
 fn journey() -> Journey {
     let temp = TempDir::new().unwrap();
     let store = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();

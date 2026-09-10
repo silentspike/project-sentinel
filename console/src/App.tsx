@@ -71,6 +71,7 @@ function Login(props: { onOk: () => void }): JSX.Element {
       <div class="col" style={{ padding: "28px", width: "min(92vw, 360px)" }}>
         <h1 style={{ "font-size": "1.3rem", margin: "0 0 4px" }}>Sentinel Gaia-Konsole</h1>
         <p class="muted" style={{ "margin-top": 0 }}>Operator-Login</p>
+        <a href="/?view=customer" style={{ color: "var(--accent-2)", "margin-bottom": "12px", display: "block" }}>Kundenauftraege</a>
         <input
           data-testid="login-key" type="password" placeholder="Operator-Key" style={{ width: "100%", "margin-bottom": "10px" }}
           value={key()} onInput={(e) => setKey(e.currentTarget.value)}
