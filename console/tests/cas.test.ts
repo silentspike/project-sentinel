@@ -3,6 +3,7 @@ import {
   hashKey,
   readJsonFrame,
   reassembleEventLogCas,
+  reassembleEventLogCasAsync,
   writeJsonFrame,
   type BlockHash,
   type EventLogCasResponse,
@@ -37,6 +38,34 @@ function response(manifest: BlockHash[], blocks: [BlockHash, Uint8Array][]): Eve
 }
 
 describe("event-log CAS transport", () => {
+  it("yields during hydration and reuses decoded immutable blocks on later syncs", async () => {
+    const manifest = Array.from({ length: 40 }, (_, i) => hash(i + 1));
+    const blocks: [BlockHash, Uint8Array][] = manifest.map((h, i) => [h, encoder.encode(`{"id":${i}}\n`)]);
+    const cache = new Map<string, Uint8Array>();
+    let decodes = 0;
+    let yields = 0;
+    const decode = (bytes: Uint8Array) => { decodes++; return bytes; };
+    const yieldControl = async () => { yields++; };
+    const first = await reassembleEventLogCasAsync(response(manifest, blocks), cache, decode, yieldControl);
+    expect(first.events).toHaveLength(40);
+    expect(decodes).toBe(40);
+    expect(yields).toBeGreaterThan(2);
+    const second = await reassembleEventLogCasAsync(response(manifest, []), cache, decode, yieldControl);
+    expect(second.events).toEqual(first.events);
+    expect(decodes).toBe(40);
+  });
+
+  it("preserves UTF-8 across block boundaries and rejects absent blocks", async () => {
+    const bytes = encoder.encode('{"text":"\\u20ac"}\n');
+    const split = bytes.indexOf(0xe2) + 1;
+    const cache = new Map<string, Uint8Array>();
+    const result = await reassembleEventLogCasAsync(response([hash(1), hash(2)], [
+      [hash(1), bytes.slice(0, split)], [hash(2), bytes.slice(split)],
+    ]), cache, b => b);
+    expect(result.events).toEqual([{ text: "\u20ac" }]);
+    await expect(reassembleEventLogCasAsync(response([hash(99)], []), cache)).rejects.toThrow("missing CAS block");
+  });
+
   it("reassembles an ordered manifest from delta blocks and cached blocks", () => {
     const h1 = hash(1);
     const h2 = hash(50);

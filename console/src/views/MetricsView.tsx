@@ -1,6 +1,6 @@
 import { createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { apiJson, type EbpfMetrics, type PipelineMetrics, type TickMetrics } from "../api";
-import { consoleStore } from "../stores/console";
+import { activeAgentCount, consoleStore } from "../stores/console";
 import { formatBucket, formatBytes, formatMs, formatNumber } from "./format";
 
 const BENCHMARK_ROWS = [
@@ -55,7 +55,8 @@ export function MetricsView(): JSX.Element {
         <Show when={consoleStore.kpi} fallback={<p class="muted">Warte auf kpi-Push.</p>}>
           {(kpi) => (
             <div class="metrics-grid" data-testid="kpi-grid">
-              <MetricCard label="Aktive Agents" value={formatNumber(kpi().active_agents)} />
+              <MetricCard label="Aktive Agents" value={activeAgentCount() == null ? "N/A" : formatNumber(activeAgentCount()!)} />
+              <MetricCard label="Agenten-Delta / Minute" value={formatNumber(kpi().active_agents)} />
               <MetricCard label="Agents im Push" value={formatNumber(consoleStore.agents.length)} />
               <MetricCard label="Aktionen" value={formatNumber(kpi().total_actions)} />
               <MetricCard label="Transits" value={formatNumber(kpi().total_transits)} />

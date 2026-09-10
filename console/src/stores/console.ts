@@ -73,6 +73,7 @@ export interface EventLogRow {
 
 interface ConsoleState {
   agents: AgentRow[];
+  agentsLoaded: boolean;
   rooms: RoomRow[];
   kpi: KpiRow | null;
   events: EventLogRow[];
@@ -84,6 +85,7 @@ export const EVENT_LOG_CAP = 10_000;
 
 const [state, setState] = createStore<ConsoleState>({
   agents: [],
+  agentsLoaded: false,
   rooms: [],
   kpi: null,
   events: [],
@@ -126,7 +128,10 @@ export function ingestFrame(topic: string, value: unknown) {
     setState("lastHello", value as Record<string, unknown>);
   } else if (topic === "agent_live" && value && typeof value === "object") {
     const rows = (value as { agents?: AgentRow[] }).agents;
-    if (Array.isArray(rows)) setState("agents", reconcile(rows, { key: "agent_id" }));
+    if (Array.isArray(rows)) {
+      setState("agents", reconcile(rows, { key: "agent_id" }));
+      setState("agentsLoaded", true);
+    }
   } else if (topic === "room_live" && value && typeof value === "object") {
     const rows = (value as { rooms?: RoomRow[] }).rooms;
     if (Array.isArray(rows)) setState("rooms", reconcile(rows, { key: "room_id" }));
@@ -154,4 +159,7 @@ export function connectTransport(url: string): TransportClient {
 }
 
 export const consoleStore = state;
+export const activeAgentCount = () => state.agentsLoaded
+  ? state.agents.filter(agent => agent.status === "active").length
+  : null;
 export { status, frameCount, setStatus, agentFilter, setAgentFilter };
