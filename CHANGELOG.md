@@ -1,5 +1,8 @@
 # Changelog
 
+- Add bounded read-only access to manifest-bound Workbench files without staging
+  mutations, reusing pinned file validation and enforcing the physical work-item binding (#856).
+
 - Add a customer-session-only delivery confirmation proxy that rejects internal
   release actions and caller-supplied authority, preserving the exact operation (#856).
 
