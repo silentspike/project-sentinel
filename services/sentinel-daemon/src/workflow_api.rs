@@ -65,6 +65,8 @@ use delivery_runtime::{
 
 pub const CUSTOMER_COMMAND_PATH: &str = "/customer/workflow/commands";
 pub const CUSTOMER_REQUEST_PATH: &str = "/customer/workflow/requests";
+pub const CUSTOMER_IDENTITY_PATH: &str = "/customer/workflow/identity";
+pub const CUSTOMER_OVERVIEW_PATH: &str = "/customer/workflow/overview";
 pub const OPERATOR_COMMAND_PATH: &str = "/operator/workflow/commands";
 pub const AGENT_COMMAND_PATH: &str = "/agent/workflow/commands";
 pub const OPERATOR_PROJECT_PATH: &str = "/operator/workflow/projects";
@@ -2702,6 +2704,8 @@ impl WorkflowApi {
             }
             ("POST", AGENT_COMMAND_PATH) => self.agent_command(&principal, body),
             ("GET", CUSTOMER_REQUEST_PATH) => self.customer_request(&principal, path),
+            ("GET", CUSTOMER_IDENTITY_PATH) => customer_identity(&principal),
+            ("GET", CUSTOMER_OVERVIEW_PATH) => self.customer_overview(&principal, path),
             ("GET", OPERATOR_PROJECT_PATH) => self.project(&principal, path),
             ("GET", OPERATOR_WORK_ITEM_PATH) => self.work_item(&principal, path),
             ("GET", OPERATOR_PROJECTION_PATH) => self.projection(&principal, path),
@@ -3428,7 +3432,131 @@ impl WorkflowApi {
         self.company_command(principal, CompanyPrincipalKindV1::Agent, body)
     }
 
+    fn customer_overview(&self, principal: &BoundPrincipal, path: &str) -> WorkflowHttpResponse {
+        if principal.principal.kind != CompanyPrincipalKindV1::Customer {
+            return json_error(
+                403,
+                "authority_conflict",
+                "customer authority is required",
+                false,
+            );
+        }
+        let Some(customer_id) = principal.principal.customer_id.as_deref() else {
+            return json_error(
+                403,
+                "authority_conflict",
+                "customer identity is unavailable",
+                false,
+            );
+        };
+        let requests = if let Some(id) = query_parameter(path, "request_id") {
+            self.store
+                .company_customer_request(&principal.principal.tenant_id, id)
+                .map(|value| value.into_iter().collect::<Vec<_>>())
+        } else {
+            self.store
+                .company_customer_requests(&principal.principal.tenant_id, customer_id)
+        };
+        let requests = match requests {
+            Ok(values) if values.iter().all(|value| value.customer_id == customer_id) => values,
+            Ok(_) => {
+                return json_error(
+                    403,
+                    "authority_conflict",
+                    "customer request is foreign",
+                    false,
+                )
+            }
+            Err(error) => return workflow_error(error),
+        };
+        let mut proposals = Vec::new();
+        for request in &requests {
+            for id in &request.proposal_ids {
+                let proposal = match self
+                    .store
+                    .company_proposal(&principal.principal.tenant_id, id)
+                {
+                    Ok(Some(value)) if value.request_id == request.request_id => value,
+                    Ok(_) => {
+                        return json_error(
+                            503,
+                            "workflow_corrupt",
+                            "proposal binding is invalid",
+                            false,
+                        )
+                    }
+                    Err(error) => return workflow_error(error),
+                };
+                proposals.push(serde_json::json!({
+                    "proposal_id": proposal.proposal_id, "request_id": proposal.request_id,
+                    "generation": proposal.generation, "proposal_digest": proposal.proposal_digest,
+                    "scope": proposal.binding.scope, "deliverables": proposal.binding.deliverables,
+                    "exclusions": proposal.binding.exclusions, "acceptance_criteria": proposal.binding.acceptance_criteria,
+                    "assumptions": proposal.binding.assumptions, "cost_ceiling_micros": proposal.binding.cost_ceiling_micros,
+                    "expires_at_unix_ms": proposal.binding.expires_at_unix_ms,
+                }));
+            }
+        }
+        let projects = match self
+            .store
+            .company_customer_projects(&principal.principal.tenant_id, customer_id)
+        {
+            Ok(values) => values,
+            Err(error) => return workflow_error(error),
+        };
+        let mut progress = Vec::new();
+        for project in projects {
+            let agreement = match self
+                .store
+                .company_agreement(&principal.principal.tenant_id, &project.agreement_id)
+            {
+                Ok(Some(value)) if value.customer_id == customer_id => value,
+                Ok(_) => {
+                    return json_error(
+                        503,
+                        "workflow_corrupt",
+                        "agreement binding is invalid",
+                        false,
+                    )
+                }
+                Err(error) => return workflow_error(error),
+            };
+            if !requests
+                .iter()
+                .any(|request| request.request_id == agreement.request_id)
+            {
+                continue;
+            }
+            let work: Vec<_> = project
+                .work_items
+                .iter()
+                .map(|(id, work)| {
+                    serde_json::json!({
+                        "work_item_id": id, "state": work.state,
+                    })
+                })
+                .collect();
+            progress.push(serde_json::json!({
+                "project_id": project.project_id, "request_id": agreement.request_id,
+                "state": project.lifecycle_state, "version": project.version,
+                "work_items": work,
+            }));
+        }
+        json(
+            200,
+            &serde_json::json!({"requests": requests, "proposals": proposals, "projects": progress}),
+        )
+    }
+
     fn customer_request(&self, principal: &BoundPrincipal, path: &str) -> WorkflowHttpResponse {
+        if principal.principal.kind != CompanyPrincipalKindV1::Customer {
+            return json_error(
+                403,
+                "authority_conflict",
+                "customer authority is required",
+                false,
+            );
+        }
         let Some(request_id) = query_parameter(path, "request_id") else {
             return json_error(400, "invalid_input", "request_id is required", false);
         };
@@ -4373,11 +4501,36 @@ fn workflow_flag(name: &str) -> Result<bool, WorkflowError> {
     }
 }
 
+fn customer_identity(principal: &BoundPrincipal) -> WorkflowHttpResponse {
+    if principal.principal.kind != CompanyPrincipalKindV1::Customer
+        || principal.principal.role != CompanyRoleV1::Customer
+        || principal.principal.customer_id.is_none()
+    {
+        return json_error(
+            403,
+            "authority_conflict",
+            "customer authority is required",
+            false,
+        );
+    }
+    json(
+        200,
+        &serde_json::json!({
+            "schema_version": 1,
+            "principal_id": principal.principal.principal_id,
+            "tenant_id": principal.principal.tenant_id,
+            "customer_id": principal.principal.customer_id,
+        }),
+    )
+}
+
 fn is_workflow_path(path: &str) -> bool {
     matches!(
         path,
         CUSTOMER_COMMAND_PATH
             | CUSTOMER_REQUEST_PATH
+            | CUSTOMER_IDENTITY_PATH
+            | CUSTOMER_OVERVIEW_PATH
             | OPERATOR_COMMAND_PATH
             | AGENT_COMMAND_PATH
             | OPERATOR_PROJECT_PATH
@@ -4574,6 +4727,69 @@ mod tests {
             agent_id: Some(AgentId(6)),
             authority_generation: 1,
         }
+    }
+
+    #[test]
+    fn customer_identity_rejects_agent_authority() {
+        let authenticator = PrincipalAuthenticator::new(vec![(
+            "01234567890123456789012345678901".to_owned(),
+            principal_binding("developer"),
+        )])
+        .unwrap();
+        let principal = authenticator.principal("developer").unwrap();
+        assert_eq!(customer_identity(&principal).status, 403);
+        let api = WorkflowApi::disabled().unwrap();
+        assert_eq!(
+            api.customer_overview(&principal, CUSTOMER_OVERVIEW_PATH)
+                .status,
+            403
+        );
+    }
+
+    #[test]
+    fn customer_overview_is_owner_scoped_and_identity_has_no_credential() {
+        let mut binding = principal_binding("customer-principal");
+        binding.kind = CompanyPrincipalKindV1::Customer;
+        binding.role = CompanyRoleV1::Customer;
+        binding.customer_id = Some("customer-one".to_owned());
+        binding.agent_id = None;
+        let authenticator = PrincipalAuthenticator::new(vec![(
+            "01234567890123456789012345678901".to_owned(),
+            binding,
+        )])
+        .unwrap();
+        let principal = authenticator.principal("customer-principal").unwrap();
+        let api = WorkflowApi::disabled().unwrap();
+        let outcome = api
+            .store
+            .apply_company_command(
+                &principal.principal,
+                Uuid::new_v4(),
+                &CompanyWorkflowCommandV1::SubmitCustomerRequest {
+                    summary_ref: "Customer website".to_owned(),
+                    desired_outcome: "Three pages".to_owned(),
+                    constraints: vec![],
+                },
+                1,
+            )
+            .unwrap();
+        let CompanyWorkflowResponseV1::CustomerRequest(request) = outcome.response else {
+            panic!("request response required");
+        };
+        let response = api.customer_overview(&principal, CUSTOMER_OVERVIEW_PATH);
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(body["requests"][0]["request_id"], request.request_id);
+        let mut foreign = principal.clone();
+        foreign.principal.customer_id = Some("customer-other".to_owned());
+        let path = format!("{CUSTOMER_OVERVIEW_PATH}?request_id={}", request.request_id);
+        assert_eq!(api.customer_overview(&foreign, &path).status, 403);
+        let identity = customer_identity(&principal);
+        assert_eq!(identity.status, 200);
+        let body = String::from_utf8(identity.body).unwrap();
+        assert!(!body.contains("01234567890123456789012345678901"));
+        assert!(!body.contains("authority_digest"));
     }
 
     fn collaboration_publication() -> CollaborationPublicationV1 {

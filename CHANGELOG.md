@@ -1,5 +1,10 @@
 # Changelog
 
+- Add a separately authenticated customer workspace for requests, clarification,
+  proposals, feedback and project progress. Keep customer credentials server-side,
+  revalidate customer identity, and preserve command identity across interrupted
+  browser requests without granting Operator access (#856).
+
 - Keep Console controls responsive during event-log CAS hydration by yielding
   between decode batches and reusing decoded immutable blocks. Report active
   agents from the live roster, separately from the minute-bucket delta (#856).
