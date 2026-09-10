@@ -76,6 +76,15 @@ no automatic new-ID retry or automatic provider invocation.
 
 ## Acceptance Boundary
 
+The authenticated daemon `POST /customer/workflow/preview` read accepts only
+`project_id`, `delivery` and `release`. It returns a bounded artifact inventory,
+not HTML or filesystem paths. The customer must own the exact receipt, its
+server-issued preview window must still be valid, and the release must remain
+active. The release-manifest digest, project, tenant and preview digest must
+agree. Expired, changed, rolled-back and foreign deliveries are rejected before
+artifact storage access. Artifact owner principal identifiers are not exposed.
+This inventory endpoint does not yet provide isolated browser rendering.
+
 The daemon delivery-intent protocol provides `confirm_delivery` for explicit
 version-bound customer acceptance. Its intent contains `project_id`, `delivery`
 and `release`; both references contain `id`, `generation` and `digest`. The

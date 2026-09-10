@@ -1,5 +1,8 @@
 # Changelog
 
+- Expose customer-owned preview artifact inventories only for exact, unexpired
+  delivery receipts and active, digest-verified release manifests (#856).
+
 - Add bounded read-only access to manifest-bound Workbench files without staging
   mutations, reusing pinned file validation and enforcing the physical work-item binding (#856).
 
