@@ -65,6 +65,16 @@ no automatic new-ID retry or automatic provider invocation.
 
 ## Acceptance Boundary
 
+The daemon delivery-intent protocol provides `confirm_delivery` for explicit
+version-bound customer acceptance. Its intent contains `project_id`, `delivery`
+and `release`; both references contain `id`, `generation` and `digest`. The
+server includes these references in the durable operation digest and compares
+them with its authoritative records before recording acceptance. A changed
+reference is rejected, never silently replaced with a newer delivery. Customer
+identity, timestamps, feedback and acceptance records remain server-derived.
+The existing project-only `accept` intent remains compatible with the controlled
+journey harness; the customer browser integration must use `confirm_delivery`.
+
 This surface does not by itself prove a delivered customer project. Preview
 serving, explicit final delivery acceptance, the real agent-produced work and
 the complete product journey require their own integration and live evidence.

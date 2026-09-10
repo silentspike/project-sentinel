@@ -35,12 +35,29 @@ pub(super) struct DeliveryIntentEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum DeliveryIntentV1 {
-    PrepareCandidate { project_id: ProjectId },
-    AssignQa { project_id: ProjectId },
-    ExecuteQa { project_id: ProjectId },
-    Release { project_id: ProjectId },
-    Accept { project_id: ProjectId },
-    Closeout { project_id: ProjectId },
+    PrepareCandidate {
+        project_id: ProjectId,
+    },
+    AssignQa {
+        project_id: ProjectId,
+    },
+    ExecuteQa {
+        project_id: ProjectId,
+    },
+    Release {
+        project_id: ProjectId,
+    },
+    Accept {
+        project_id: ProjectId,
+    },
+    ConfirmDelivery {
+        project_id: ProjectId,
+        delivery: VersionedRefV1,
+        release: VersionedRefV1,
+    },
+    Closeout {
+        project_id: ProjectId,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -105,7 +122,9 @@ pub(super) fn handle(
         | DeliveryIntentV1::Release { .. }
         | DeliveryIntentV1::Closeout { .. } => AuthorityRole::ReleaseManager,
         DeliveryIntentV1::ExecuteQa { .. } => AuthorityRole::Qa,
-        DeliveryIntentV1::Accept { .. } => AuthorityRole::Customer,
+        DeliveryIntentV1::Accept { .. } | DeliveryIntentV1::ConfirmDelivery { .. } => {
+            AuthorityRole::Customer
+        }
     };
     if let Err(error) = require_role(&caller, required_role) {
         return delivery_error(error);
@@ -181,6 +200,21 @@ pub(super) fn handle(
             effective_now_ms,
             observed_now_ms,
             project_id,
+            None,
+        ),
+        DeliveryIntentV1::ConfirmDelivery {
+            project_id,
+            delivery: expected_delivery,
+            release: expected_release,
+        } => accept(
+            api,
+            delivery,
+            &caller,
+            envelope.operation_id,
+            effective_now_ms,
+            observed_now_ms,
+            project_id,
+            Some((expected_delivery, expected_release)),
         ),
         DeliveryIntentV1::Closeout { project_id } => closeout(
             api,
@@ -1126,6 +1160,7 @@ fn accept(
     now_ms: u64,
     observed_now_ms: u64,
     project_id: &ProjectId,
+    expected: Option<(&VersionedRefV1, &VersionedRefV1)>,
 ) -> Result<DeliveryIntentResponse, DeliveryError> {
     require_role(caller, AuthorityRole::Customer)?;
     let material = load_material(api, &TenantId(caller.tenant_id.clone()), project_id)?;
@@ -1165,6 +1200,14 @@ fn accept(
         generation: release.generation,
         digest: canonical_release_reference_digest(release)?,
     };
+    if let Some((expected_delivery, expected_release)) = expected {
+        require_displayed_delivery(
+            expected_delivery,
+            expected_release,
+            &delivery_ref,
+            &release_ref,
+        )?;
+    }
     let feedback = CustomerFeedbackV1 {
         schema_version: DELIVERY_SCHEMA_V1,
         feedback_id: format!("feedback-{delivery_id}"),
@@ -1205,6 +1248,20 @@ fn accept(
         Some(acceptance_id),
         None,
     ))
+}
+
+fn require_displayed_delivery(
+    expected_delivery: &VersionedRefV1,
+    expected_release: &VersionedRefV1,
+    current_delivery: &VersionedRefV1,
+    current_release: &VersionedRefV1,
+) -> Result<(), DeliveryError> {
+    if expected_delivery != current_delivery || expected_release != current_release {
+        return Err(DeliveryError::AuthorityDenied(
+            "displayed delivery or release has changed".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn closeout(
@@ -1371,6 +1428,83 @@ mod tests {
             .idempotency_key
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')));
+    }
+
+    #[test]
+    fn customer_confirmation_requires_both_displayed_references() {
+        let reference = VersionedRefV1 {
+            id: "delivery-example".to_string(),
+            generation: 1,
+            digest: ContentDigest::of_domain("test-reference", 1, &"original").unwrap(),
+        };
+        let operation_id = Uuid::new_v4();
+        let wire = serde_json::json!({
+            "operation_id": operation_id,
+            "intent": {
+                "action": "confirm_delivery",
+                "project_id": "project-example",
+                "delivery": reference,
+                "release": reference,
+            }
+        });
+        let parsed: DeliveryIntentEnvelope = serde_json::from_value(wire.clone()).unwrap();
+        assert!(matches!(
+            parsed.intent,
+            DeliveryIntentV1::ConfirmDelivery { .. }
+        ));
+        for required in ["delivery", "release"] {
+            let mut missing = wire.clone();
+            missing["intent"].as_object_mut().unwrap().remove(required);
+            assert!(serde_json::from_value::<DeliveryIntentEnvelope>(missing).is_err());
+        }
+        let original_digest =
+            ContentDigest::of_domain("m0-delivery-intent", 1, &parsed.intent).unwrap();
+        let mut changed = wire;
+        changed["intent"]["delivery"]["generation"] = serde_json::json!(2);
+        let changed: DeliveryIntentEnvelope = serde_json::from_value(changed).unwrap();
+        assert_ne!(
+            original_digest,
+            ContentDigest::of_domain("m0-delivery-intent", 1, &changed.intent).unwrap()
+        );
+    }
+
+    #[test]
+    fn displayed_delivery_rejects_every_changed_identity_component() {
+        let delivery = VersionedRefV1 {
+            id: "delivery-example".to_string(),
+            generation: 1,
+            digest: ContentDigest::of_domain("test-reference", 1, &"delivery").unwrap(),
+        };
+        let release = VersionedRefV1 {
+            id: "release-example".to_string(),
+            generation: 2,
+            digest: ContentDigest::of_domain("test-reference", 1, &"release").unwrap(),
+        };
+        assert!(require_displayed_delivery(&delivery, &release, &delivery, &release).is_ok());
+        for component in 0..6 {
+            let mut changed_delivery = delivery.clone();
+            let mut changed_release = release.clone();
+            let target = if component < 3 {
+                &mut changed_delivery
+            } else {
+                &mut changed_release
+            };
+            match component % 3 {
+                0 => target.id.push_str("-replaced"),
+                1 => target.generation += 1,
+                _ => target.digest = ContentDigest::zero(),
+            }
+            assert!(
+                require_displayed_delivery(
+                    &delivery,
+                    &release,
+                    &changed_delivery,
+                    &changed_release
+                )
+                .is_err(),
+                "component {component}"
+            );
+        }
     }
 
     #[test]

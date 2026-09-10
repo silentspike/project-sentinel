@@ -1,5 +1,8 @@
 # Changelog
 
+- Bind customer delivery confirmation to the displayed delivery and release
+  identifiers, generations and digests before accepting any business effect (#856).
+
 - Add a separately authenticated customer workspace for requests, clarification,
   proposals, feedback and project progress. Keep customer credentials server-side,
   revalidate customer identity, and preserve command identity across interrupted
