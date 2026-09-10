@@ -35,6 +35,7 @@ type DecompressBlock = (bytes: Uint8Array) => Uint8Array;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+const decodedBlocks = new WeakMap<Uint8Array, Uint8Array>();
 
 export function hashKey(hash: BlockHash): string {
   return hash.join(",");
@@ -95,5 +96,39 @@ export function reassembleEventLogCas(
     .split("\n")
     .filter((line) => line.trim().length > 0)
     .map((line) => JSON.parse(line));
+  return { events, stats: response.stats };
+}
+
+/** Yield between blocks so event-history hydration cannot starve live controls. */
+export async function reassembleEventLogCasAsync(
+  response: EventLogCasResponse,
+  cache: Map<string, Uint8Array>,
+  decompressBlock: DecompressBlock = decompress,
+  yieldControl: () => Promise<void> = () => new Promise(resolve => setTimeout(resolve, 0)),
+): Promise<ReassembledEventLog> {
+  for (const [hash, block] of response.delta.blocks) {
+    cache.set(hashKey(hash), new Uint8Array(block));
+  }
+  const decoder = new TextDecoder();
+  const parts: string[] = [];
+  let processed = 0;
+  for (const hash of response.manifest) {
+    if (processed++ % 16 === 0) await yieldControl();
+    const block = cache.get(hashKey(hash));
+    if (!block) throw new Error(`missing CAS block ${hashKey(hash)}`);
+    let decoded = decodedBlocks.get(block);
+    if (!decoded) {
+      decoded = decompressBlock(block);
+      decodedBlocks.set(block, decoded);
+    }
+    parts.push(decoder.decode(decoded, { stream: true }));
+  }
+  parts.push(decoder.decode());
+  const lines = parts.join("").split("\n");
+  const events: unknown[] = [];
+  for (let index = 0; index < lines.length; index++) {
+    if (index % 256 === 0) await yieldControl();
+    if (lines[index].trim()) events.push(JSON.parse(lines[index]));
+  }
   return { events, stats: response.stats };
 }
