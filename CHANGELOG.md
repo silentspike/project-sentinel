@@ -1,5 +1,8 @@
 # Changelog
 
+- Add a customer-session-only delivery confirmation proxy that rejects internal
+  release actions and caller-supplied authority, preserving the exact operation (#856).
+
 - Bind customer delivery confirmation to the displayed delivery and release
   identifiers, generations and digests before accepting any business effect (#856).
   Expose only customer-owned, release-bound delivery status in the customer inbox.

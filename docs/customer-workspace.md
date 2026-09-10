@@ -52,6 +52,12 @@ The routes are:
 | `GET /api/customer/status` | Revalidate and read the customer identity |
 | `GET /api/customer/overview` | Read customer requests, proposals and project progress |
 | `POST /api/customer/commands` | Forward an exact typed customer command |
+| `POST /api/customer/delivery` | Forward only a version-bound `confirm_delivery` intent |
+
+The delivery proxy rejects project-only acceptance, internal QA/release intents,
+missing references and caller-supplied identity or timestamps. It forwards the
+original valid envelope with the revalidated server-side customer credential.
+It never retries internally; a transport failure remains an unknown outcome.
 
 ## Interrupted Commands
 
