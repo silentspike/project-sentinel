@@ -67,6 +67,7 @@ pub const CUSTOMER_COMMAND_PATH: &str = "/customer/workflow/commands";
 pub const CUSTOMER_REQUEST_PATH: &str = "/customer/workflow/requests";
 pub const CUSTOMER_IDENTITY_PATH: &str = "/customer/workflow/identity";
 pub const CUSTOMER_OVERVIEW_PATH: &str = "/customer/workflow/overview";
+pub const CUSTOMER_PREVIEW_PATH: &str = "/customer/workflow/preview";
 pub const OPERATOR_COMMAND_PATH: &str = "/operator/workflow/commands";
 pub const AGENT_COMMAND_PATH: &str = "/agent/workflow/commands";
 pub const OPERATOR_PROJECT_PATH: &str = "/operator/workflow/projects";
@@ -2706,6 +2707,7 @@ impl WorkflowApi {
             ("GET", CUSTOMER_REQUEST_PATH) => self.customer_request(&principal, path),
             ("GET", CUSTOMER_IDENTITY_PATH) => customer_identity(&principal),
             ("GET", CUSTOMER_OVERVIEW_PATH) => self.customer_overview(&principal, path),
+            ("POST", CUSTOMER_PREVIEW_PATH) => delivery_intent::preview(self, &principal, body),
             ("GET", OPERATOR_PROJECT_PATH) => self.project(&principal, path),
             ("GET", OPERATOR_WORK_ITEM_PATH) => self.work_item(&principal, path),
             ("GET", OPERATOR_PROJECTION_PATH) => self.projection(&principal, path),
@@ -4554,6 +4556,7 @@ fn is_workflow_path(path: &str) -> bool {
             | CUSTOMER_REQUEST_PATH
             | CUSTOMER_IDENTITY_PATH
             | CUSTOMER_OVERVIEW_PATH
+            | CUSTOMER_PREVIEW_PATH
             | OPERATOR_COMMAND_PATH
             | AGENT_COMMAND_PATH
             | OPERATOR_PROJECT_PATH
@@ -4762,6 +4765,11 @@ mod tests {
         let principal = authenticator.principal("developer").unwrap();
         assert_eq!(customer_identity(&principal).status, 403);
         let api = WorkflowApi::disabled().unwrap();
+        assert!(is_workflow_path(CUSTOMER_PREVIEW_PATH));
+        assert_eq!(
+            delivery_intent::preview(&api, &principal, b"{}").status,
+            403
+        );
         assert_eq!(
             api.customer_overview(&principal, CUSTOMER_OVERVIEW_PATH)
                 .status,
