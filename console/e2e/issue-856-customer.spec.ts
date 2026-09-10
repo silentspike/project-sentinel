@@ -3,6 +3,31 @@ import { expect, test } from "@playwright/test";
 const identity = { schema_version: 1, principal_id: "customer-one", tenant_id: "tenant-one", customer_id: "customer-one" };
 const request = { request_id: "request-one", summary_ref: "Studio website", desired_outcome: "Three accessible pages", constraints: ["No tracking"], state: "submitted", version: 1, proposal_ids: [], clarifications: [], feedback: [] };
 
+test("delivery overview displays the stored version without issuing an acceptance", async ({ page }) => {
+  const writes: string[] = [];
+  await page.route("**/api/customer/**", async route => {
+    if (route.request().method() !== "GET") writes.push(route.request().url());
+    if (new URL(route.request().url()).pathname.endsWith("status")) {
+      return route.fulfill({ json: { authenticated: true, identity } });
+    }
+    return route.fulfill({ json: { requests: [request], proposals: [], projects: [{
+      project_id: "project-one", request_id: request.request_id, state: "active", version: 5,
+      work_items: [{ work_item_id: "website", state: "done" }],
+      deliveries: [{
+        delivery: { id: "delivery-website-one", generation: 7, digest: "a".repeat(64) },
+        release: { id: "release-one", generation: 3, digest: "b".repeat(64) },
+        state: "delivered", release_state: "active", issued_at_ms: 100, expires_at_ms: 200,
+        preview_digest: "c".repeat(64),
+      }],
+    }] } });
+  });
+  await page.goto("/?view=customer");
+  await expect(page.getByRole("heading", { name: "Lieferungen" })).toBeVisible();
+  const row = page.getByRole("row").filter({ hasText: "delivery-website-one" });
+  await expect(row.getByRole("cell")).toHaveText(["delivery-website-one", "7", "delivered"]);
+  expect(writes).toEqual([]);
+});
+
 test("customer workspace sends only customer commands and preserves ambiguous operations across reload", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   const paths: string[] = [];
