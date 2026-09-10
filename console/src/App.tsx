@@ -169,13 +169,13 @@ export default function App(): JSX.Element {
             </>
           }
         >
-          <div data-testid="tiling-toolbar" style={{ display: "flex", gap: "8px", padding: "6px var(--gap)", "border-bottom": "1px solid var(--border)", background: "var(--surface-0)" }}>
+          <div data-testid="tiling-toolbar" style={{ display: "flex", "flex-wrap": "wrap", gap: "8px", padding: "6px var(--gap)", "border-bottom": "1px solid var(--border)", background: "var(--surface-0)" }}>
             <span class="muted" style={{ "align-self": "center", "font-size": "12px" }}>Workspace (niri layout)</span>
             <For each={MOBILE_PANELS}>
               {(panel) => <button data-testid={`open-${panel}`} onClick={() => openPanel(panel)}>{PANEL_LABEL[panel]}</button>}
             </For>
           </div>
-          <main data-testid="tiling-root" style={{ flex: 1, "min-height": 0, padding: "var(--gap)" }}>
+          <main data-testid="tiling-root" tabIndex={0} aria-label="Workspace" style={{ flex: 1, "min-height": 0, overflow: "auto", padding: "var(--gap)" }}>
             <Tiling node={tilingTree.root} renderPanel={renderPanel} />
           </main>
         </Show>
