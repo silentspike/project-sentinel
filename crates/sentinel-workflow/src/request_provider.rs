@@ -55,6 +55,8 @@ pub struct RequestProviderCallV1 {
     pub dispatch: Option<RequestProviderDispatchV1>,
     pub question_response: Option<CustomerRequestV1>,
     pub model_response_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandonment_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
