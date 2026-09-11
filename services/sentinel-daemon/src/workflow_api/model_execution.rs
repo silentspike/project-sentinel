@@ -257,6 +257,87 @@ struct SalesAuthorization {
 }
 
 impl WorkflowApi {
+    pub(super) fn abandon_sales_request(
+        &self,
+        principal: &BoundPrincipal,
+        body: &[u8],
+    ) -> WorkflowHttpResponse {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            allowance_id: String,
+        }
+        let request: Request = match decode_body(body) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let result = (|| {
+            let _guard = self
+                .mutation_fence
+                .read()
+                .map_err(|_| workflow_unavailable())?;
+            if !self.enabled
+                || !self.model_work_enabled
+                || self.request_sales_tenant.as_ref() != Some(&principal.principal.tenant_id)
+            {
+                return Err(principal_unavailable());
+            }
+            let call = self
+                .store
+                .request_provider_call(&principal.principal.tenant_id, &request.allowance_id)?
+                .ok_or_else(principal_unavailable)?;
+            if call.granted_by != principal.principal {
+                return Err(principal_unavailable());
+            }
+            let dispatch = call.dispatch.as_ref().ok_or_else(principal_unavailable)?;
+            let store = self.event_store.as_ref().ok_or_else(workflow_unavailable)?;
+            let event = store
+                .event_by_operation_id(&format!("llm_resolution_{}", dispatch.request_id))
+                .map_err(|_| workflow_unavailable())?
+                .ok_or_else(principal_unavailable)?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&event.payload).map_err(|_| workflow_unavailable())?;
+            if event.event_type != "llm_completion_resolved"
+                || event.schema_version != 1
+                || event.correlation_id != dispatch.request_id
+                || event.aggregate_id
+                    != call
+                        .grant
+                        .sales_principal
+                        .agent_id
+                        .ok_or_else(principal_unavailable)?
+                        .to_string()
+                || event.timestamp_ms > now_unix_ms()
+                || event.timestamp_ms < dispatch.dispatched_at_unix_ms
+                || payload.get("resolution").and_then(|v| v.as_str()) != Some("operator_abandoned")
+                || payload.get("request_id").and_then(|v| v.as_str())
+                    != Some(dispatch.request_id.as_str())
+                || payload.get("request_digest").and_then(|v| v.as_str())
+                    != Some(dispatch.request_digest.as_str())
+                || store
+                    .get_llm_completion(&dispatch.request_id)
+                    .map_err(|_| workflow_unavailable())?
+                    .is_some()
+            {
+                return Err(principal_unavailable());
+            }
+            self.store.abandon_request_provider_call(
+                &principal.principal,
+                &call.allowance_id,
+                &dispatch.request_digest,
+                &event.event_id,
+                now_unix_ms(),
+            )
+        })();
+        match result {
+            Ok(call) => json(
+                200,
+                &serde_json::json!({"allowance_id":call.allowance_id,"abandonment_event_id":call.abandonment_event_id,"version":call.version}),
+            ),
+            Err(error) => workflow_error(error),
+        }
+    }
+
     pub(super) fn authorize_sales_request(
         &self,
         principal: &BoundPrincipal,
@@ -396,7 +477,10 @@ impl WorkflowApi {
             )
             .map_err(|_| "Sales request unavailable")?
             .ok_or("Sales request missing")?;
-        if current != call.source_request || call.question_response.is_some() {
+        if current != call.source_request
+            || call.question_response.is_some()
+            || call.abandonment_event_id.is_some()
+        {
             return Err("Sales request changed or already answered");
         }
         let context = RequestSalesContext {

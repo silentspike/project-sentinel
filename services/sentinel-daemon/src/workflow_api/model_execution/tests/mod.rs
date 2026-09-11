@@ -96,6 +96,50 @@ fn dispatch(api: &WorkflowApi, context: &RequestSalesContext) -> serde_json::Val
 }
 
 #[test]
+fn sales_abandonment_requires_exact_persisted_resolution_before_new_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = fixture(&temp.path().join("workflow.sqlite"));
+    let request = dispatch(&api, &context);
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+            .status,
+        200
+    );
+    let operator = api.principals.principal("operator").unwrap();
+    let customer = api.principals.principal("customer").unwrap();
+    let body =
+        serde_json::to_vec(&serde_json::json!({"allowance_id": context.binding.allowance_id}))
+            .unwrap();
+    assert_eq!(api.abandon_sales_request(&operator, &body).status, 403);
+    let store = api.event_store.as_ref().unwrap();
+    let id = request["request_id"].as_str().unwrap();
+    store
+        .resolve_llm_completion_terminal(
+            id,
+            &"b".repeat(64),
+            "test operator abandoned terminal inference",
+        )
+        .unwrap();
+    assert_eq!(api.abandon_sales_request(&customer, &body).status, 403);
+    assert_eq!(api.abandon_sales_request(&operator, &body).status, 200);
+    assert_eq!(api.abandon_sales_request(&operator, &body).status, 200);
+    let call = api.request_sales_call().unwrap().unwrap();
+    assert!(call.abandonment_event_id.is_some());
+    assert!(call.dispatch.is_some());
+    assert!(call.question_response.is_none());
+    assert!(api.prepare_request_sales(&context.binding).is_err());
+    assert_eq!(
+        api.store
+            .company_customer_request(
+                &context.source_request.tenant_id,
+                &context.source_request.request_id
+            )
+            .unwrap(),
+        Some(context.source_request)
+    );
+}
+
+#[test]
 fn sales_dispatch_requires_exact_subject_current_roster_and_one_durable_claim() {
     let temp = tempfile::tempdir().unwrap();
     let (api, context) = fixture(&temp.path().join("company.sqlite"));
