@@ -5553,12 +5553,13 @@ mod tests {
         let process = AgentProcess::launch_raw_protocol_fixture(&script).unwrap();
         let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
         let handle = insert_protocol_process(&mut runtime, "deadline-ack", process);
+        // Exercise cancellation after admission, not CI scheduling within 20ms.
         runtime
             .exec(
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_start".to_string(),
-                    input: start_frame(invocation_id, unix_time_ms() + 20),
+                    input: start_frame(invocation_id, unix_time_ms() + 500),
                 },
             )
             .unwrap();
