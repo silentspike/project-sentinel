@@ -1,5 +1,10 @@
 # Changelog
 
+- Carry bounded leadership feedback into the next model turn, bind its exact
+  content to the prior artifact and revision, and reject missing reports on the
+  correction API. Preserve legacy records and reject altered feedback on replay
+  or store validation (#856).
+
 - Connect same-work model correction context to explicit revision admission,
   preserve consumed subscription allowances across bounded renewal, and count
   archived grants in campaign capacity. Add a leadership-only correction route

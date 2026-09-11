@@ -15,6 +15,7 @@ pub(super) fn request(
         expected_work_version,
         execution_revision,
         feedback_ref,
+        feedback,
         next_subscription_grant,
         ..
     } = command
@@ -64,6 +65,9 @@ pub(super) fn request(
         .ok_or_else(not_found)?
         .clone();
     require_version(previous.version, *expected_work_version)?;
+    if let Some(feedback) = feedback {
+        feedback.validate_binding(&previous, &execution_revision.feedback_digest)?;
+    }
     if !matches!(
         previous.state,
         CompanyWorkStateV1::Done | CompanyWorkStateV1::InReview | CompanyWorkStateV1::Blocked
@@ -124,6 +128,7 @@ pub(super) fn request(
         previous: previous.clone(),
         execution_revision: execution_revision.clone(),
         feedback_ref: feedback_ref.clone(),
+        feedback: feedback.clone(),
         requested_by: principal.principal_id.clone(),
         requested_at_unix_ms: now_ms,
         previous_subscription_call: project
@@ -208,6 +213,11 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
         validate_digest(&revision.previous_state_digest).map_err(|_| corrupt())?;
         validate_digest(&revision.feedback_digest).map_err(|_| corrupt())?;
         let previous = &record.previous;
+        if let Some(feedback) = &record.feedback {
+            feedback
+                .validate_binding(previous, &revision.feedback_digest)
+                .map_err(|_| corrupt())?;
+        }
         let current = project
             .work_items
             .get(&previous.spec.work_item_id)

@@ -5,8 +5,8 @@ use sentinel_workflow::{
     IndependentGateEvidence, OrganizationRuntimePort, PendingCompletionEvidenceV1,
     PendingExecutionV1, PendingGateEvidenceV1, PrincipalAuthorityV1, ProjectV1,
     RuntimeAuthoritySnapshotV1, SealedArtifactEvidenceV1, SealedOutputEvidenceV1,
-    TerminalExecutionEvidence, WorkExecutionObservation, WorkExecutionPort, WorkflowCore,
-    WorkflowPortError,
+    TerminalExecutionEvidence, WorkCorrectionFeedbackV1, WorkExecutionObservation,
+    WorkExecutionPort, WorkflowCore, WorkflowPortError,
 };
 
 struct Organization(RuntimeAuthoritySnapshotV1);
@@ -335,9 +335,120 @@ fn correction_fixture(
         )
         .unwrap(),
         feedback_ref: "qa-result-1".into(),
+        feedback: None,
         next_subscription_grant: None,
     };
     (state, project, command)
+}
+
+#[test]
+fn company_correction_feedback_is_bound_to_artifact_and_survives_restart() {
+    let (state, previous, mut command) = correction_fixture(WorkExecutionObservation::Succeeded);
+    let work_id = WorkItemId::parse("build-work").unwrap();
+    let report = WorkCorrectionFeedbackV1 {
+        summary: "Browser rejected two invalid CSS dimensions; preserve working timer controls."
+            .into(),
+        artifact_digest: Some(
+            previous.work_items[&work_id].output_receipts[0]
+                .content_digest
+                .clone(),
+        ),
+    };
+    if let CompanyWorkflowCommandV1::RequestWorkCorrection {
+        feedback,
+        execution_revision,
+        ..
+    } = &mut command
+    {
+        *feedback = Some(report.clone());
+        execution_revision.feedback_digest = report.canonical_digest().unwrap();
+    }
+    for variant in 0..6 {
+        let mut changed = command.clone();
+        if let CompanyWorkflowCommandV1::RequestWorkCorrection {
+            feedback: Some(feedback),
+            execution_revision,
+            ..
+        } = &mut changed
+        {
+            match variant {
+                0 => feedback.summary.push_str(" changed"),
+                1 => feedback.artifact_digest = Some("f".repeat(64)),
+                2 => feedback.artifact_digest = None,
+                3 => feedback.summary = " ".into(),
+                4 => feedback.summary = "x".repeat(4097),
+                _ => feedback.summary = "control\u{0000}text".into(),
+            }
+            if variant == 1 || variant == 2 {
+                execution_revision.feedback_digest = feedback.canonical_digest().unwrap();
+            }
+        }
+        assert!(state
+            .store
+            .apply_company_command(&state.pm, Uuid::from_u128(51), &changed, 51)
+            .is_err());
+        assert_eq!(
+            state
+                .store
+                .company_project(&state.pm.tenant_id, &state.project_id)
+                .unwrap()
+                .unwrap(),
+            previous
+        );
+    }
+    let corrected = project_command(&state.store, &state.pm, 51, command.clone(), 51);
+    assert_eq!(
+        corrected.work_corrections[0].feedback.as_ref(),
+        Some(&report)
+    );
+    let reopened = WorkflowStore::open(state._temp.path().join("workflow.sqlite")).unwrap();
+    assert_eq!(
+        reopened
+            .company_project(&state.pm.tenant_id, &state.project_id)
+            .unwrap()
+            .unwrap(),
+        corrected
+    );
+    assert!(
+        reopened
+            .apply_company_command(&state.pm, Uuid::from_u128(51), &command, 52)
+            .unwrap()
+            .replayed
+    );
+    let mut changed = command.clone();
+    if let CompanyWorkflowCommandV1::RequestWorkCorrection {
+        feedback: Some(report),
+        ..
+    } = &mut changed
+    {
+        report.summary.push_str(" altered");
+    }
+    assert_eq!(
+        reopened
+            .apply_company_command(&state.pm, Uuid::from_u128(51), &changed, 52)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::IdempotencyConflict
+    );
+    let mut corrupted = corrected;
+    corrupted.work_corrections[0]
+        .feedback
+        .as_mut()
+        .unwrap()
+        .summary
+        .push_str(" altered");
+    let db = rusqlite::Connection::open(state._temp.path().join("workflow.sqlite")).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE company_entities SET payload=?1 WHERE entity_kind='project' AND entity_id=?2",
+            rusqlite::params![serde_json::to_vec(&corrupted).unwrap(), state.project_id.0]
+        )
+        .unwrap(),
+        1
+    );
+    assert!(reopened
+        .company_project(&state.pm.tenant_id, &state.project_id)
+        .is_err());
 }
 
 #[test]
