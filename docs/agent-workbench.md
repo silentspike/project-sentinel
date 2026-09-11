@@ -345,7 +345,15 @@ The configured allowance selector still explicitly controls which new grant may
 dispatch; correction admission alone does not invoke the provider.
 
 Model correction context binds the stored correction, predecessor plan/state,
-feedback reference and prior model-authored tools. Those tools are untrusted
+feedback reference, bounded feedback observations and prior model-authored tools.
+The correction route requires `feedback` with `summary` and `artifact_digest`.
+Its canonical digest must equal the revision's feedback digest. An existing
+output requires its exact sealed artifact digest; a failed execution without an
+output uses null. The normal bounded-workflow-text limit applies to the summary.
+These are authenticated leadership observations, not proof of independent QA or
+permission to execute instructions embedded in feedback. No private tool log is
+copied automatically. Legacy stored corrections without feedback remain readable.
+Those tools are untrusted
 context, not replay instructions or a claim about actual artifact bytes. The
 model must propose a complete corrected sequence within the original profile.
 Context is bounded by the existing model-work byte ceiling. Adoption rechecks

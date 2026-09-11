@@ -38,6 +38,7 @@ impl WorkflowApi {
             project_id,
             work_item_id,
             execution_revision,
+            feedback,
             ..
         } = &envelope.command
         else {
@@ -51,6 +52,14 @@ impl WorkflowApi {
         let Ok(_guard) = self.mutation_fence.write() else {
             return json_error(503, "workflow_busy", "workflow recovery is active", true);
         };
+        if feedback.is_none() {
+            return json_error(
+                400,
+                "invalid_input",
+                "bounded correction feedback required",
+                false,
+            );
+        }
         let replay = match self
             .store
             .has_company_operation(&principal.principal, envelope.operation_id)
@@ -250,6 +259,7 @@ mod tests {
             "command": {
                 "command": "request_work_correction", "project_id": "project-m0", "expected_version": 1,
                 "work_item_id": "work-m0", "expected_work_version": 1, "feedback_ref": "repair-css",
+                "feedback": {"summary": "Review found invalid CSS dimensions.", "artifact_digest": null},
                 "execution_revision": {"previous_plan_id": Uuid::new_v4(), "previous_plan_digest": "a".repeat(64),
                     "previous_version": 1, "previous_state_digest": "b".repeat(64), "feedback_digest": "c".repeat(64)}
             }

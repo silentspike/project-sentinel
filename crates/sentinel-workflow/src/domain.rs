@@ -538,10 +538,52 @@ pub struct WorkCorrectionV1 {
     pub previous: CompanyWorkItemV1,
     pub execution_revision: crate::ExecutionRevisionV1,
     pub feedback_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<WorkCorrectionFeedbackV1>,
     pub requested_by: String,
     pub requested_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_subscription_call: Option<SubscriptionCallAllowanceV1>,
+}
+
+/// Leadership-authored observations, not independent QA or tool authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkCorrectionFeedbackV1 {
+    pub summary: String,
+    pub artifact_digest: Option<String>,
+}
+
+impl WorkCorrectionFeedbackV1 {
+    pub fn canonical_digest(&self) -> Result<String, WorkflowError> {
+        validate_text(&self.summary)?;
+        if self.summary.trim().is_empty() {
+            return Err(invalid("correction feedback is empty"));
+        }
+        if let Some(digest) = &self.artifact_digest {
+            validate_digest(digest)?;
+        }
+        canonical_sha256("sentinel.workflow.work-correction-feedback.v1", self)
+    }
+
+    pub(crate) fn validate_binding(
+        &self,
+        previous: &CompanyWorkItemV1,
+        expected_digest: &str,
+    ) -> Result<(), WorkflowError> {
+        if self.canonical_digest()? != expected_digest
+            || self.artifact_digest.as_ref().is_some_and(|digest| {
+                !previous
+                    .output_receipts
+                    .iter()
+                    .any(|output| &output.content_digest == digest)
+            })
+            || (!previous.output_receipts.is_empty() && self.artifact_digest.is_none())
+        {
+            return Err(invalid("correction feedback evidence binding changed"));
+        }
+        Ok(())
+    }
 }
 
 impl CompanyWorkItemV1 {
@@ -991,6 +1033,8 @@ pub enum CompanyWorkflowCommandV1 {
         expected_work_version: u64,
         execution_revision: crate::ExecutionRevisionV1,
         feedback_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<WorkCorrectionFeedbackV1>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next_subscription_grant: Option<SubscriptionCallGrantV1>,
     },

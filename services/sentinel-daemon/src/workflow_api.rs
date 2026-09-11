@@ -5338,6 +5338,7 @@ mod tests {
                     feedback_digest: "c".repeat(64),
                 },
                 feedback_ref: "private-feedback".to_owned(),
+                feedback: None,
                 requested_by: "pm-1".to_owned(),
                 requested_at_unix_ms: 4,
                 previous_subscription_call: None,
@@ -5641,6 +5642,7 @@ mod tests {
                 feedback_digest: "c".repeat(64),
             },
             feedback_ref: "qa-result-1".to_owned(),
+            feedback: None,
             next_subscription_grant: None,
         };
         assert!(is_internal_company_command(&correction));
