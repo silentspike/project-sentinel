@@ -59,7 +59,7 @@ export function CustomerPreview(props: { projectId: string; delivery: CustomerDe
     finally { if (generation === serial) setLoading(false); }
   };
   return <section class="customer-preview" aria-label="Lieferungsvorschau">
-    <div class="customer-section-heading"><h3>Vorschau · Version {props.delivery.delivery.generation}</h3><button onClick={props.close}>Schliessen</button></div>
+    <div class="customer-section-heading"><h3>Vorschau - Version {props.delivery.delivery.generation}</h3><button onClick={props.close}>Schliessen</button></div>
     <Show when={!active()}><p role="status">Diese Vorschau ist nicht mehr verfuegbar.</p></Show>
     <Show when={error()}><p role="alert" class="customer-error">{error()}</p></Show>
     <form class="customer-preview-controls" onSubmit={open}>
