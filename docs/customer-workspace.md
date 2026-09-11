@@ -52,6 +52,12 @@ The routes are:
 | `GET /api/customer/status` | Revalidate and read the customer identity |
 | `GET /api/customer/overview` | Read customer requests, proposals and project progress |
 | `POST /api/customer/commands` | Forward an exact typed customer command |
+| `POST /api/customer/delivery` | Forward only a version-bound `confirm_delivery` intent |
+
+The delivery proxy rejects project-only acceptance, internal QA/release intents,
+missing references and caller-supplied identity or timestamps. It forwards the
+original valid envelope with the revalidated server-side customer credential.
+It never retries internally; a transport failure remains an unknown outcome.
 
 ## Interrupted Commands
 
@@ -69,6 +75,52 @@ Retries of an uncertain operation always use the same ID and payload. There is
 no automatic new-ID retry or automatic provider invocation.
 
 ## Acceptance Boundary
+
+The authenticated daemon `POST /customer/workflow/preview` read accepts only
+`project_id`, `delivery`, `release` and an optional `file` selector. Without a
+selector it returns a bounded artifact inventory,
+not HTML or filesystem paths. The customer must own the exact receipt, its
+server-issued preview window must still be valid, and the release must remain
+active. The release-manifest digest, project, tenant and preview digest must
+agree. Expired, changed, rolled-back and foreign deliveries are rejected before
+artifact storage access. Artifact owner principal identifiers are not exposed.
+This inventory endpoint does not yet provide isolated browser rendering.
+
+The customer-only BFF `POST /api/customer/preview` revalidates its separate
+session and forwards the exact body with the server-held customer credential.
+`file` contains only `artifact_id` and a manifest-declared relative `path`.
+The daemon resolves the source agent and artifact kind from release/workflow
+evidence, never from the browser. Reads use the pinned Workbench validator and
+are limited to 1 MiB per file. The JSON response contains Base64-encoded bytes,
+their length and the bound delivery/release/manifest references. Binary assets
+are preserved without text conversion. Release revision and expiry are checked
+again after file I/O; a concurrent change rejects the response. Responses are
+not cached, and unavailable reads do not imply an uncertain business command.
+This transport neither executes the HTML nor grants it customer-origin access.
+
+### Document preview
+
+The customer delivery row opens an artifact selector and a manifest-declared
+HTML path. The browser checks the complete response binding and bounded UTF-8
+payload before display. Changing the selection removes the old document; late
+responses cannot replace another delivery. Overview refreshes preserve the open
+preview, while expiry or a non-active delivery removes it.
+
+A fixed broker document receives HTML only through a source- and channel-bound
+message. It creates a second sandboxed frame for the artifact. The artifact has
+no script permission, same-origin permission, forms, popups or top navigation.
+Content Security Policy blocks external resources; the broker's frame policy
+also blocks navigation of the child to remote URLs. Artifact HTML is never
+inserted into the customer page or broker DOM. See the browser contracts for
+[iframe sandboxing](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/iframe)
+and [frame-src](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/frame-src).
+
+This is a static document preview: inline CSS and embedded data images can be
+rendered, but JavaScript, external styles/assets and multi-page resource routing
+are not enabled. It does not replace functional website QA or prove the full
+delivery journey. The adversarial browser fixture verifies inert scripts,
+blocked image/frame/form/navigation requests, stable refresh, and revocation;
+its intercepted responses do not constitute live backend acceptance.
 
 The daemon delivery-intent protocol provides `confirm_delivery` for explicit
 version-bound customer acceptance. Its intent contains `project_id`, `delivery`

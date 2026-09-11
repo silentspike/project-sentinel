@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -80,6 +81,292 @@ struct ProjectMaterial {
     agreement: sentinel_workflow::AgreementV1,
     request: sentinel_workflow::CustomerRequestV1,
     candidate: ReleaseCandidateV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomerPreviewRequest {
+    project_id: ProjectId,
+    delivery: VersionedRefV1,
+    release: VersionedRefV1,
+    file: Option<CustomerPreviewFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomerPreviewFile {
+    artifact_id: String,
+    path: String,
+}
+
+pub(super) fn preview(
+    api: &WorkflowApi,
+    principal: &BoundPrincipal,
+    body: &[u8],
+) -> WorkflowHttpResponse {
+    if principal.principal.kind != sentinel_workflow::CompanyPrincipalKindV1::Customer {
+        return json_error(
+            403,
+            "authority_conflict",
+            "customer authority is required",
+            false,
+        );
+    }
+    if body.len() > 4096 {
+        return json_error(413, "invalid_input", "preview request is too large", false);
+    }
+    let request: CustomerPreviewRequest = match super::decode_body(body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Ok(_guard) = api.mutation_fence.read() else {
+        return json_error(
+            503,
+            "workflow_unavailable",
+            "workflow recovery is unavailable",
+            true,
+        );
+    };
+    let Some(caller) = delivery_principal(&principal.principal) else {
+        return json_error(
+            403,
+            "authority_conflict",
+            "customer authority is unavailable",
+            false,
+        );
+    };
+    let Some(delivery) = &api.delivery else {
+        return json_error(
+            503,
+            "delivery_unavailable",
+            "delivery authority is unavailable",
+            true,
+        );
+    };
+    let aggregate = match delivery.aggregate(&caller.tenant_id, &request.project_id.0) {
+        Ok(Some(value)) => value,
+        Ok(None) => return json_error(404, "not_found", "delivery is unavailable", false),
+        Err(error) => return delivery_error(error),
+    };
+    let manifest =
+        match authorized_preview_manifest(&aggregate, &caller, &request, super::now_unix_ms()) {
+            Ok(value) => value,
+            Err(error) => return delivery_error(error),
+        };
+    if let Some(file) = &request.file {
+        let bytes = match read_preview_file(api, manifest, file) {
+            Ok(bytes) => bytes,
+            Err(error) => return delivery_error(error),
+        };
+        // Recheck after filesystem I/O: a concurrent rollback or expiry must not
+        // turn a previously authorized inventory into authority to serve bytes.
+        let current = match delivery.aggregate(&caller.tenant_id, &request.project_id.0) {
+            Ok(Some(current)) if current.revision == aggregate.revision => current,
+            _ => {
+                return json_error(
+                    409,
+                    "preview_changed",
+                    "delivery changed during preview read",
+                    true,
+                )
+            }
+        };
+        if let Err(error) =
+            authorized_preview_manifest(&current, &caller, &request, super::now_unix_ms())
+        {
+            return delivery_error(error);
+        }
+        return json(
+            200,
+            &serde_json::json!({
+                "project_id": request.project_id,
+                "delivery": request.delivery,
+                "release": request.release,
+                "manifest_digest": manifest.manifest_digest,
+                "artifact_id": file.artifact_id,
+                "path": file.path,
+                "encoding": "base64",
+                "size_bytes": bytes.len(),
+                "content": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        );
+    }
+    json(
+        200,
+        &serde_json::json!({
+            "project_id": request.project_id,
+            "delivery": request.delivery,
+            "release": request.release,
+            "manifest_digest": manifest.manifest_digest,
+            "artifacts": manifest.artifacts.iter().map(|artifact| serde_json::json!({
+                "artifact_id": artifact.artifact_id,
+                "digest": artifact.digest,
+                "media_type": artifact.media_type,
+            })).collect::<Vec<_>>(),
+        }),
+    )
+}
+
+fn read_preview_file(
+    api: &WorkflowApi,
+    manifest: &ReleaseManifestV1,
+    file: &CustomerPreviewFile,
+) -> Result<Vec<u8>, DeliveryError> {
+    let denied = || DeliveryError::AuthorityDenied("preview artifact is unavailable".to_string());
+    if file.artifact_id.is_empty()
+        || file.artifact_id.len() > 512
+        || file.path.is_empty()
+        || file.path.len() > 1024
+    {
+        return Err(denied());
+    }
+    let matches = manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_id == file.artifact_id)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(denied());
+    }
+    let artifact = matches[0];
+    let owner = api
+        .principals
+        .principal(&artifact.owner_principal_id)
+        .ok_or_else(denied)?;
+    if owner.principal.tenant_id.0 != manifest.tenant_id
+        || owner.principal.kind != sentinel_workflow::CompanyPrincipalKindV1::Agent
+    {
+        return Err(denied());
+    }
+    let source_agent = owner.principal.agent_id.ok_or_else(denied)?;
+    let tenant = TenantId(manifest.tenant_id.clone());
+    let project_id = ProjectId(manifest.project.id.clone());
+    let project = api
+        .store
+        .company_project(&tenant, &project_id)
+        .map_err(workflow_delivery_error)?
+        .ok_or_else(denied)?;
+    let mut kinds = Vec::new();
+    for work_id in project.work_items.keys() {
+        let execution = api
+            .store
+            .work_item(&tenant, &project_id, work_id)
+            .map_err(workflow_delivery_error)?
+            .ok_or_else(denied)?;
+        if execution.state != WorkItemState::Done {
+            continue;
+        }
+        let Some(terminal) = execution.terminal_execution_evidence else {
+            continue;
+        };
+        for (ordinal, candidate) in terminal.artifacts.iter().enumerate() {
+            if artifact.artifact_id
+                == format!("{}-{}-{ordinal}", work_id.0, candidate.artifact_kind)
+                && candidate.digest == artifact.digest.as_str()
+                && candidate.media_type == artifact.media_type
+            {
+                let work = project.work_items.get(work_id).ok_or_else(denied)?;
+                if !work
+                    .assignments
+                    .iter()
+                    .any(|assignment| assignment.active && assignment.agent_id == source_agent)
+                    || !project.governance.participants.iter().any(|participant| {
+                        participant.agent_id == source_agent
+                            && participant.principal_id == artifact.owner_principal_id
+                    })
+                {
+                    return Err(denied());
+                }
+                kinds.push(candidate.artifact_kind.clone());
+            }
+        }
+    }
+    if kinds.len() != 1 {
+        return Err(denied());
+    }
+    let authority = api.authority.as_ref().ok_or_else(denied)?;
+    crate::workbench::read_verified_artifact_file(
+        &authority.artifact_roots,
+        source_agent,
+        &project_id.0,
+        artifact.digest.as_str(),
+        &kinds[0],
+        &artifact.media_type,
+        &file.path,
+        1024 * 1024,
+    )
+    .map_err(|_| denied())
+}
+
+fn authorized_preview_manifest<'a>(
+    aggregate: &'a crate::delivery::DeliveryAggregateV1,
+    caller: &PrincipalV1,
+    request: &CustomerPreviewRequest,
+    now_ms: u64,
+) -> Result<&'a ReleaseManifestV1, DeliveryError> {
+    require_role(caller, AuthorityRole::Customer)?;
+    let denied = || DeliveryError::AuthorityDenied("preview binding is unavailable".to_string());
+    if aggregate.schema_version != DELIVERY_SCHEMA_V1
+        || aggregate.tenant_id != caller.tenant_id
+        || aggregate.project_id != request.project_id.0
+    {
+        return Err(denied());
+    }
+    let receipt = aggregate
+        .deliveries
+        .get(&request.delivery.id)
+        .ok_or_else(denied)?;
+    if receipt.schema_version != DELIVERY_SCHEMA_V1
+        || receipt.tenant_id != caller.tenant_id
+        || receipt.customer_principal_id != caller.principal_id
+        || receipt.delivery_id != request.delivery.id
+        || receipt.generation != request.delivery.generation
+        || receipt.receipt_digest != request.delivery.digest
+        || receipt.receipt_digest == ContentDigest::zero()
+        || receipt.release != request.release
+        || !matches!(
+            receipt.state,
+            DeliveryState::Delivered | DeliveryState::Accepted
+        )
+        || receipt.preview_ttl_policy_version != DELIVERY_PREVIEW_TTL_POLICY_V1
+        || now_ms < receipt.issued_at_ms
+        || now_ms >= receipt.expires_at_ms
+        || receipt.expires_at_ms.saturating_sub(receipt.issued_at_ms) > DELIVERY_PREVIEW_MAX_TTL_MS
+    {
+        return Err(denied());
+    }
+    let release = aggregate
+        .releases
+        .get(&request.release.id)
+        .ok_or_else(denied)?;
+    if release.schema_version != DELIVERY_SCHEMA_V1
+        || release.release_id != request.release.id
+        || release.generation != request.release.generation
+        || canonical_release_reference_digest(release)? != request.release.digest
+        || release.state != ReleaseState::Active
+        || aggregate.active_release_id.as_deref() != Some(release.release_id.as_str())
+    {
+        return Err(denied());
+    }
+    let manifest = aggregate
+        .manifests
+        .get(&release.manifest.id)
+        .ok_or_else(denied)?;
+    if manifest.schema_version != DELIVERY_SCHEMA_V1
+        || manifest.tenant_id != caller.tenant_id
+        || manifest.project.id != aggregate.project_id
+        || manifest.manifest_id != release.manifest.id
+        || manifest.generation != release.manifest.generation
+        || manifest.manifest_digest != release.manifest.digest
+        || manifest.computed_digest()? != manifest.manifest_digest
+        || manifest.artifacts.is_empty()
+        || manifest.artifacts.len() > 64
+        || ContentDigest::of_domain("m0-preview", DELIVERY_SCHEMA_V1, &manifest.source_digest)?
+            != receipt.preview_digest
+    {
+        return Err(denied());
+    }
+    Ok(manifest)
 }
 
 pub(super) fn customer_delivery_rows(
@@ -1489,6 +1776,28 @@ mod tests {
             digest: ContentDigest::of_domain("test-reference", 1, &"original").unwrap(),
         };
         let operation_id = Uuid::new_v4();
+        let preview = serde_json::json!({
+            "project_id": "project-example",
+            "delivery": reference,
+            "release": reference,
+        });
+        assert!(serde_json::from_value::<CustomerPreviewRequest>(preview.clone()).is_ok());
+        for field in [
+            "principal_id",
+            "tenant_id",
+            "path",
+            "now_ms",
+            "artifact_root",
+        ] {
+            let mut injected = preview.clone();
+            injected[field] = serde_json::json!("injected");
+            assert!(serde_json::from_value::<CustomerPreviewRequest>(injected).is_err());
+        }
+        for field in ["project_id", "delivery", "release"] {
+            let mut missing = preview.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<CustomerPreviewRequest>(missing).is_err());
+        }
         let wire = serde_json::json!({
             "operation_id": operation_id,
             "intent": {
@@ -1571,6 +1880,133 @@ mod tests {
             serde_json::to_value(&receipt.receipt_digest).unwrap()
         );
         assert_eq!(rows[0].as_object().unwrap().len(), 7);
+        let reference = receipt.release.clone();
+        let manifest = ReleaseManifestV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            manifest_id: "manifest-example".to_string(),
+            generation: 1,
+            tenant_id: customer.tenant_id.clone(),
+            agreement: reference.clone(),
+            project: VersionedRefV1 {
+                id: "project-example".to_string(),
+                ..reference.clone()
+            },
+            candidate: reference.clone(),
+            work_items_digest: reference.digest.clone(),
+            source_digest: reference.digest.clone(),
+            artifacts: vec![ArtifactRefV1 {
+                artifact_id: "site".to_string(),
+                generation: 1,
+                digest: reference.digest.clone(),
+                media_type: "text/html".to_string(),
+                owner_principal_id: "developer".to_string(),
+            }],
+            toolchain_digest: reference.digest.clone(),
+            runtime_profile_digest: reference.digest.clone(),
+            qa_gate: reference.clone(),
+            qa_evidence_digest: reference.digest.clone(),
+            sbom_digest: reference.digest.clone(),
+            dependency_snapshot_digest: reference.digest.clone(),
+            provenance_digest: reference.digest.clone(),
+            release_actor: principal(AuthorityRole::ReleaseManager),
+            cost: CostRefV1 {
+                ledger_id: "ledger".to_string(),
+                generation: 1,
+                digest: reference.digest.clone(),
+                currency: "USD".to_string(),
+                amount_minor: 0,
+            },
+            rollback_release: None,
+            manifest_digest: ContentDigest::zero(),
+            created_at_ms: 100,
+        }
+        .seal()
+        .unwrap();
+        let release = aggregate.releases.get_mut(&reference.id).unwrap();
+        release.manifest.digest = manifest.manifest_digest.clone();
+        let updated = aggregate.deliveries.get_mut(&receipt.delivery_id).unwrap();
+        updated.release.digest = canonical_release_reference_digest(release).unwrap();
+        updated.preview_digest =
+            ContentDigest::of_domain("m0-preview", DELIVERY_SCHEMA_V1, &manifest.source_digest)
+                .unwrap();
+        *updated = updated.clone().seal().unwrap();
+        let request = CustomerPreviewRequest {
+            file: None,
+            project_id: ProjectId("project-example".to_string()),
+            delivery: VersionedRefV1 {
+                id: updated.delivery_id.clone(),
+                generation: updated.generation,
+                digest: updated.receipt_digest.clone(),
+            },
+            release: updated.release.clone(),
+        };
+        aggregate.active_release_id = Some(release.release_id.clone());
+        aggregate
+            .manifests
+            .insert(manifest.manifest_id.clone(), manifest);
+        assert!(authorized_preview_manifest(&aggregate, &customer, &request, 150).is_ok());
+        for now_ms in [99, 200, u64::MAX] {
+            assert!(authorized_preview_manifest(&aggregate, &customer, &request, now_ms).is_err());
+        }
+        for case in 0..10 {
+            let mut changed = aggregate.clone();
+            match case {
+                0 => changed.tenant_id.push_str("-foreign"),
+                1 => changed.project_id.push_str("-foreign"),
+                2 => changed.active_release_id = None,
+                3 => {
+                    changed.releases.get_mut(&reference.id).unwrap().state =
+                        ReleaseState::RolledBack
+                }
+                4 => changed
+                    .deliveries
+                    .get_mut(&receipt.delivery_id)
+                    .unwrap()
+                    .customer_principal_id
+                    .push_str("-foreign"),
+                5 => {
+                    changed
+                        .deliveries
+                        .get_mut(&receipt.delivery_id)
+                        .unwrap()
+                        .state = DeliveryState::ChangesRequested
+                }
+                6 => {
+                    changed
+                        .deliveries
+                        .get_mut(&receipt.delivery_id)
+                        .unwrap()
+                        .generation += 1
+                }
+                7 => {
+                    changed
+                        .deliveries
+                        .get_mut(&receipt.delivery_id)
+                        .unwrap()
+                        .preview_digest = ContentDigest::zero()
+                }
+                8 => {
+                    changed
+                        .manifests
+                        .get_mut("manifest-example")
+                        .unwrap()
+                        .artifacts[0]
+                        .digest = ContentDigest::zero()
+                }
+                _ => changed.manifests.clear(),
+            }
+            assert!(
+                authorized_preview_manifest(&changed, &customer, &request, 150).is_err(),
+                "case {case}"
+            );
+        }
+        let mut accepted = aggregate.clone();
+        accepted
+            .deliveries
+            .get_mut(&receipt.delivery_id)
+            .unwrap()
+            .state = DeliveryState::Accepted;
+        assert!(authorized_preview_manifest(&accepted, &customer, &request, 150).is_ok());
         let mut foreign = customer.clone();
         foreign.principal_id = "another-customer".to_string();
         assert!(customer_delivery_rows(&aggregate, &foreign)

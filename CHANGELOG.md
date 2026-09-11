@@ -1,5 +1,20 @@
 # Changelog
 
+- Add a customer document preview with source-checked sandbox messaging,
+  inert HTML rendering, blocked external navigation, and release revocation handling (#856).
+
+- Add bounded customer artifact-file reads with server-resolved ownership,
+  post-read release revalidation and a separately authenticated preview proxy (#856).
+
+- Expose customer-owned preview artifact inventories only for exact, unexpired
+  delivery receipts and active, digest-verified release manifests (#856).
+
+- Add bounded read-only access to manifest-bound Workbench files without staging
+  mutations, reusing pinned file validation and enforcing the physical work-item binding (#856).
+
+- Add a customer-session-only delivery confirmation proxy that rejects internal
+  release actions and caller-supplied authority, preserving the exact operation (#856).
+
 - Bind customer delivery confirmation to the displayed delivery and release
   identifiers, generations and digests before accepting any business effect (#856).
   Expose only customer-owned, release-bound delivery status in the customer inbox.
