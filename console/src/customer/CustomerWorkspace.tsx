@@ -18,6 +18,7 @@ export function CustomerWorkspace() {
   const [feedback, setFeedback] = createSignal("");
   const [question, setQuestion] = createSignal("");
   const [answer, setAnswer] = createSignal("");
+  const [reply, setReply] = createSignal("");
   const [pending, setPending] = createSignal<PendingCommand | null>(null);
   const [previewId, setPreviewId] = createSignal("");
   const current = createMemo(() => data().requests.find(value => value.request_id === selected()));
@@ -84,7 +85,7 @@ export function CustomerWorkspace() {
       });
       setPending(null);
       setSummary(""); setOutcome(""); setConstraints(""); setFeedback("");
-      setQuestion(""); setAnswer("");
+      setQuestion(""); setAnswer(""); setReply("");
       await refresh();
     } catch (cause) {
       setPending(readPending(localStorage, actor));
@@ -125,7 +126,7 @@ export function CustomerWorkspace() {
             setBusy(true); setError(""); try { await refresh(); } catch (cause) { report(cause); } finally { setBusy(false); }
           }}>Aktualisieren</button></div>
             <For each={data().requests} fallback={<p class="muted">Noch keine Anfragen.</p>}>{request =>
-              <button class="customer-request" aria-pressed={selected() === request.request_id} onClick={() => setSelected(request.request_id)}>
+              <button class="customer-request" aria-pressed={selected() === request.request_id} onClick={() => { setSelected(request.request_id); setReply(""); }}>
                 <strong>{request.summary_ref}</strong><span>{request.state}</span>
               </button>
             }</For>
@@ -158,6 +159,17 @@ export function CustomerWorkspace() {
             </section>}</For>
             <Show when={preview()}>{target => <CustomerPreview projectId={target().projectId} delivery={target().delivery} close={() => setPreviewId("")} />}</Show>
             <For each={request().clarifications}>{value => <section class="customer-history"><strong>{value.question_ref}</strong><p>{value.answer_ref}</p></section>}</For>
+            <For each={request().consultation ?? []}>{message => <section class="customer-history">
+              <h3>{message.role === "sales" ? "Sales" : "Ihre Antwort"}</h3><p>{message.content}</p>
+              <Show when={message.role === "sales" && ["submitted", "clarifying"].includes(request().state) && !(request().consultation ?? []).some(value => value.in_reply_to === message.message_id)}>
+                <form class="customer-form" onSubmit={event => {
+                  event.preventDefault(); void command({ command: "send_customer_request_message", request_id: request().request_id, expected_version: request().version, in_reply_to: message.message_id, content: reply().trim() });
+                }}>
+                  <label>Ihre Antwort<textarea required rows={3} maxLength={4096} value={reply()} onInput={event => setReply(event.currentTarget.value)} /></label>
+                  <button disabled={disabled() || !reply().trim()}>Antwort senden</button>
+                </form>
+              </Show>
+            </section>}</For>
             <For each={proposals()}>{proposal => <article class="customer-proposal">
               <h3>Angebot</h3>
               <p>{proposal.scope}</p>

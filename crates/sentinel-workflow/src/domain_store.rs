@@ -1122,6 +1122,7 @@ fn apply_company_command(
                 desired_outcome: desired_outcome.clone(),
                 constraints: constraints.clone(),
                 clarifications: Vec::new(),
+                consultation: Vec::new(),
                 feedback: Vec::new(),
                 state: CustomerRequestStateV1::Submitted,
                 version: 1,
@@ -1155,7 +1156,9 @@ fn apply_company_command(
             question_ref,
             answer_ref,
         } => {
-            require_role(principal, &[CompanyRoleV1::Customer, CompanyRoleV1::Sales])?;
+            // The legacy self-clarification route cannot attest a customer's
+            // answer on behalf of Sales. Agent questions use separate messages.
+            require_role(principal, &[CompanyRoleV1::Customer])?;
             validate_text(question_ref)?;
             validate_text(answer_ref)?;
             let mut request = required_request(transaction, principal, request_id, now_ms)?;
@@ -1185,6 +1188,65 @@ fn apply_company_command(
             )?;
             Ok(CompanyWorkflowResponseV1::CustomerRequest(request))
         }
+        CompanyWorkflowCommandV1::SendCustomerRequestMessage {
+            request_id,
+            expected_version,
+            in_reply_to,
+            content,
+        } => {
+            require_role(principal, &[CompanyRoleV1::Customer, CompanyRoleV1::Sales])?;
+            validate_text(content)?;
+            let mut request = required_request(transaction, principal, request_id, now_ms)?;
+            require_version(request.version, *expected_version)?;
+            if !matches!(
+                request.state,
+                CustomerRequestStateV1::Submitted | CustomerRequestStateV1::Clarifying
+            ) {
+                return Err(transition());
+            }
+            match principal.role {
+                CompanyRoleV1::Sales
+                    if principal.kind == CompanyPrincipalKindV1::Agent && in_reply_to.is_none() =>
+                {
+                    if request_has_unanswered_question(&request) {
+                        return Err(transition());
+                    }
+                }
+                CompanyRoleV1::Customer => {
+                    let question_id = in_reply_to.as_ref().ok_or_else(unauthorized)?;
+                    if !request.consultation.iter().any(|message| {
+                        message.message_id == *question_id && message.role == CompanyRoleV1::Sales
+                    }) || request
+                        .consultation
+                        .iter()
+                        .any(|message| message.in_reply_to.as_ref() == Some(question_id))
+                    {
+                        return Err(transition());
+                    }
+                }
+                _ => return Err(unauthorized()),
+            }
+            ensure_collection_capacity(request.consultation.len())?;
+            request.consultation.push(CustomerConsultationMessageV1 {
+                message_id: stable_domain_id("consultation", &principal.tenant_id, operation_id)?,
+                in_reply_to: in_reply_to.clone(),
+                content: content.clone(),
+                role: principal.role,
+                recorded_by: principal.principal_id.clone(),
+                recorded_at_unix_ms: now_ms,
+            });
+            request.state = CustomerRequestStateV1::Clarifying;
+            bump_request(
+                transaction,
+                principal,
+                operation_id,
+                operation_digest,
+                &mut request,
+                "customer_request_message_recorded",
+                now_ms,
+            )?;
+            Ok(CompanyWorkflowResponseV1::CustomerRequest(request))
+        }
         CompanyWorkflowCommandV1::QualifyCustomerRequest {
             request_id,
             expected_version,
@@ -1201,6 +1263,9 @@ fn apply_company_command(
                 return Err(transition());
             }
             request.state = CustomerRequestStateV1::Qualified;
+            if request_has_unanswered_question(&request) {
+                return Err(transition());
+            }
             bump_request(
                 transaction,
                 principal,
@@ -5127,6 +5192,11 @@ fn command_predecessor_digest(command: &CompanyWorkflowCommandV1) -> Result<Stri
             expected_version,
             ..
         }
+        | CompanyWorkflowCommandV1::SendCustomerRequestMessage {
+            request_id,
+            expected_version,
+            ..
+        }
         | CompanyWorkflowCommandV1::QualifyCustomerRequest {
             request_id,
             expected_version,
@@ -5253,6 +5323,7 @@ fn validate_replay_response(
                 || stored.created_at_unix_ms != value.created_at_unix_ms
                 || stored.version < value.version
                 || !stored.clarifications.starts_with(&value.clarifications)
+                || !stored.consultation.starts_with(&value.consultation)
                 || !stored.feedback.starts_with(&value.feedback)
                 || !stored.proposal_ids.starts_with(&value.proposal_ids)
             {
@@ -5411,12 +5482,20 @@ fn put_projection(
     Ok(())
 }
 
+fn request_has_unanswered_question(request: &CustomerRequestV1) -> bool {
+    request
+        .consultation
+        .last()
+        .is_some_and(|message| message.role == CompanyRoleV1::Sales)
+}
+
 fn validate_customer_request(request: &CustomerRequestV1) -> Result<(), WorkflowError> {
     if request.schema_version != COMPANY_DOMAIN_SCHEMA_VERSION
         || request.version == 0
         || request.created_at_unix_ms == 0
         || request.created_at_unix_ms > request.updated_at_unix_ms
         || request.clarifications.len() > MAX_AGGREGATE_ITEMS
+        || request.consultation.len() > MAX_AGGREGATE_ITEMS
         || request.feedback.len() > MAX_AGGREGATE_ITEMS
         || request.proposal_ids.len() > MAX_AGGREGATE_ITEMS
     {
@@ -5444,6 +5523,41 @@ fn validate_customer_request(request: &CustomerRequestV1) -> Result<(), Workflow
         {
             return Err(corrupt());
         }
+    }
+    let mut message_ids = BTreeSet::new();
+    let mut pending_question: Option<&str> = None;
+    let mut last_message_ms = request.created_at_unix_ms;
+    for message in &request.consultation {
+        validate_identifier(&message.message_id).map_err(|_| corrupt())?;
+        validate_identifier(&message.recorded_by).map_err(|_| corrupt())?;
+        validate_text(&message.content).map_err(|_| corrupt())?;
+        if !message_ids.insert(&message.message_id)
+            || message.recorded_at_unix_ms < last_message_ms
+            || message.recorded_at_unix_ms > request.updated_at_unix_ms
+        {
+            return Err(corrupt());
+        }
+        match message.role {
+            CompanyRoleV1::Sales if pending_question.is_none() && message.in_reply_to.is_none() => {
+                pending_question = Some(&message.message_id);
+            }
+            CompanyRoleV1::Customer
+                if pending_question.is_some()
+                    && message.in_reply_to.as_deref() == pending_question =>
+            {
+                pending_question = None;
+            }
+            _ => return Err(corrupt()),
+        }
+        last_message_ms = message.recorded_at_unix_ms;
+    }
+    if pending_question.is_some()
+        && !matches!(
+            request.state,
+            CustomerRequestStateV1::Clarifying | CustomerRequestStateV1::Cancelled
+        )
+    {
+        return Err(corrupt());
     }
     for feedback in &request.feedback {
         validate_text(&feedback.feedback_ref).map_err(|_| corrupt())?;
@@ -7323,6 +7437,7 @@ mod tests {
             desired_outcome: "outcome".to_owned(),
             constraints: Vec::new(),
             clarifications: Vec::new(),
+            consultation: Vec::new(),
             feedback: Vec::new(),
             state: CustomerRequestStateV1::Proposed,
             version: 1,
@@ -8481,6 +8596,7 @@ mod tests {
             desired_outcome: "outcome".to_owned(),
             constraints: Vec::new(),
             clarifications: Vec::new(),
+            consultation: Vec::new(),
             feedback: Vec::new(),
             state: CustomerRequestStateV1::Proposed,
             version: 1,

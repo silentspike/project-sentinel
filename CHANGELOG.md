@@ -1,5 +1,9 @@
 # Changelog
 
+- Separate Sales questions from customer-authored replies with append-only,
+  version-bound consultation messages; prevent qualification with an unanswered
+  question and prevent Sales from attesting legacy customer answers (#856).
+
 - Add explicit customer delivery acceptance with exact displayed references,
   identity-scoped durable browser retries and no implicit acceptance on preview (#856).
 
