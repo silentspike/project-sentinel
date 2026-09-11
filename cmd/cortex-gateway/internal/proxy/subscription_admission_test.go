@@ -39,6 +39,91 @@ func subscriptionTestRequest() *LLMRequest {
 	}
 }
 
+func salesSubscriptionTestRequest() *LLMRequest {
+	req := subscriptionTestRequest()
+	for key, value := range salesRequestMetadata() {
+		if key == "request_id" || key == "reservation_id" || key == "reserved_provider" || key == "company_execution_context_digest" {
+			continue
+		}
+		req.Metadata[key] = value
+	}
+	req.MaxTokens = 128
+	return req
+}
+
+func TestSalesSubscriptionRequiresMatchingDurableAdmissionBeforeProvider(t *testing.T) {
+	for _, mode := range []string{"approved", "rejected", "legacy-receipt"} {
+		t.Run(mode, func(t *testing.T) {
+			var callbacks atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				callbacks.Add(1)
+				var request subscriptionDispatch
+				decoder := json.NewDecoder(r.Body)
+				decoder.DisallowUnknownFields()
+				if err := decoder.Decode(&request); err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if request.SchemaVersion != 2 || request.Subject == nil || *request.Subject != (customerRequestExecutionSubject{Kind: "customer_request", RequestID: "request-test", RequestVersion: 1}) {
+					t.Error("request subject was lost at the authority boundary")
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if mode == "rejected" || callbacks.Load() > 1 {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				schema := request.SchemaVersion
+				if mode == "legacy-receipt" {
+					schema = 1
+				}
+				_ = json.NewEncoder(w).Encode(subscriptionDispatchReceipt{SchemaVersion: schema, AllowanceID: request.AllowanceID, RequestID: request.RequestID, RequestDigest: request.RequestDigest, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli()})
+			}))
+			defer server.Close()
+			admission, err := NewSubscriptionAdmission("subscription-test", strings.Repeat("c", 64), server.URL, "test-operator")
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider := &subscriptionTestProvider{}
+			_, err = admission.send(context.Background(), provider, salesSubscriptionTestRequest())
+			if (err == nil) != (mode == "approved") {
+				t.Fatalf("unexpected admission result: %v", err)
+			}
+			if _, err := admission.send(context.Background(), provider, salesSubscriptionTestRequest()); err == nil {
+				t.Fatal("consumed authority replay admitted another provider call")
+			}
+			wantCalls := int32(0)
+			if mode == "approved" {
+				wantCalls = 1
+			}
+			if provider.calls.Load() != wantCalls || callbacks.Load() != 2 {
+				t.Fatalf("provider calls=%d callbacks=%d", provider.calls.Load(), callbacks.Load())
+			}
+		})
+	}
+}
+
+func TestSalesSubscriptionRejectsMixedSubjectBeforeAuthorityHTTP(t *testing.T) {
+	admission, err := NewSubscriptionAdmission("subscription-test", strings.Repeat("c", 64), "http://127.0.0.1:1", "test-operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*LLMRequest){
+		func(r *LLMRequest) { r.Metadata["project_id"] = "project-test" },
+		func(r *LLMRequest) { r.Metadata["customer_request_version"] = "0" },
+		func(r *LLMRequest) { r.Metadata["agent_id"] = "65536" },
+		func(r *LLMRequest) { r.RequestClass = RequestClassExternalCompat },
+		func(r *LLMRequest) { r.Stream = true },
+	} {
+		req := salesSubscriptionTestRequest()
+		mutate(req)
+		if _, err := admission.dispatchRequest(&subscriptionTestProvider{}, req); err == nil {
+			t.Fatal("invalid Sales request reached durable admission")
+		}
+	}
+}
+
 func TestSubscriptionAdmissionPersistsPermissionAtAuthorityNotGateway(t *testing.T) {
 	var claimed atomic.Bool
 	var callbacks atomic.Int32

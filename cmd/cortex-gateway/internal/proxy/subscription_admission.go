@@ -30,15 +30,16 @@ type SubscriptionAdmission struct {
 }
 
 type subscriptionDispatch struct {
-	SchemaVersion int    `json:"schema_version"`
-	AllowanceID   string `json:"allowance_id"`
-	AgentID       uint64 `json:"agent_id"`
-	RequestID     string `json:"request_id"`
-	RequestDigest string `json:"request_digest"`
-	ContextDigest string `json:"context_digest"`
-	Provider      string `json:"provider"`
-	Model         string `json:"model"`
-	CatalogDigest string `json:"catalog_digest"`
+	SchemaVersion int                              `json:"schema_version"`
+	AllowanceID   string                           `json:"allowance_id"`
+	AgentID       uint64                           `json:"agent_id"`
+	RequestID     string                           `json:"request_id"`
+	RequestDigest string                           `json:"request_digest"`
+	ContextDigest string                           `json:"context_digest"`
+	Provider      string                           `json:"provider"`
+	Model         string                           `json:"model"`
+	CatalogDigest string                           `json:"catalog_digest"`
+	Subject       *customerRequestExecutionSubject `json:"subject,omitempty"`
 }
 
 type subscriptionDispatchReceipt struct {
@@ -74,15 +75,37 @@ func (a *SubscriptionAdmission) dispatchRequest(provider Provider, req *LLMReque
 	}
 	m := req.Metadata
 	agentID, err := strconv.ParseUint(m["agent_id"], 10, 64)
-	if err != nil || agentID == 0 || m["company_execution_schema"] != "1" || m["subscription_allowance_id"] != a.allowanceID || m["reservation_id"] != a.allowanceID || m["request_id"] != "company-provider-"+a.allowanceID {
+	if err != nil || agentID == 0 || agentID > 65535 || m["subscription_allowance_id"] != a.allowanceID || m["reservation_id"] != a.allowanceID || m["request_id"] != "company-provider-"+a.allowanceID {
 		return subscriptionDispatch{}, errors.New("subscription request identity mismatch")
+	}
+	schemaVersion, subject, err := subscriptionExecutionSubject(req)
+	if err != nil {
+		return subscriptionDispatch{}, err
 	}
 	if m["reserved_provider"] != CodexCLIProviderName || m["subscription_catalog_digest"] != a.catalogDigest || !subscriptionDigest.MatchString(req.AuthorityRequestDigest) || !subscriptionDigest.MatchString(m["company_execution_context_digest"]) || req.Model == "" || req.Model != req.EffectiveModel {
 		return subscriptionDispatch{}, errors.New("subscription request model or digest mismatch")
 	}
-	return subscriptionDispatch{SchemaVersion: 1, AllowanceID: a.allowanceID, AgentID: agentID,
+	return subscriptionDispatch{SchemaVersion: schemaVersion, AllowanceID: a.allowanceID, AgentID: agentID, Subject: subject,
 		RequestID: m["request_id"], RequestDigest: req.AuthorityRequestDigest, ContextDigest: m["company_execution_context_digest"],
 		Provider: provider.Name(), Model: req.EffectiveModel, CatalogDigest: a.catalogDigest}, nil
+}
+
+func subscriptionExecutionSubject(req *LLMRequest) (int, *customerRequestExecutionSubject, error) {
+	switch req.Metadata["company_execution_schema"] {
+	case "1":
+		if hasCustomerRequestMetadata(req.Metadata) {
+			return 0, nil, errors.New("mixed subscription subjects")
+		}
+		return 1, nil, nil
+	case "2":
+		if classified, err := classifyModelWorkRequest(req, req.Metadata["request_id"]); err != nil || !classified {
+			return 0, nil, errors.New("invalid subscription customer request")
+		}
+		subject, err := customerRequestSubject(req.Metadata)
+		return 2, subject, err
+	default:
+		return 0, nil, errors.New("unsupported subscription execution schema")
+	}
 }
 
 func (a *SubscriptionAdmission) claim(ctx context.Context, claim subscriptionDispatch) (time.Time, error) {
@@ -117,7 +140,7 @@ func (a *SubscriptionAdmission) claim(ctx context.Context, claim subscriptionDis
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return time.Time{}, errors.New("invalid subscription claim receipt suffix")
 	}
-	if receipt.SchemaVersion != 1 || receipt.AllowanceID != claim.AllowanceID || receipt.RequestID != claim.RequestID || receipt.RequestDigest != claim.RequestDigest || receipt.DeadlineUnixMS <= 0 {
+	if receipt.SchemaVersion != claim.SchemaVersion || receipt.AllowanceID != claim.AllowanceID || receipt.RequestID != claim.RequestID || receipt.RequestDigest != claim.RequestDigest || receipt.DeadlineUnixMS <= 0 {
 		return time.Time{}, errors.New("subscription claim receipt mismatch")
 	}
 	return time.UnixMilli(receipt.DeadlineUnixMS), nil
