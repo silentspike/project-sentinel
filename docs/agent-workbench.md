@@ -116,6 +116,17 @@ employee credential and is not exposed to the customer dashboard.
 Every grant counts toward the store-wide cumulative ceiling, including legacy
 project grants and expired unsent grants. Unknown dispatched outcomes retain
 their concurrency slot; timeout, restart and a new request do not reset them.
+An operator may explicitly abandon a terminal inference using the existing
+LLM-completion resolution API, after checking that its local provider process
+has ended. The operator then submits the allowance ID to
+`POST /operator/workflow/request-provider/abandon`. The daemon verifies the exact
+immutable Limbo resolution event, its request digest and employee identity, plus
+the absence of an unresolved completion. It records that event on the original
+grant without deleting its dispatch or decrementing cumulative usage. Only a
+separately authorized new operation may try again; the old operation can never
+dispatch or adopt a late response. This is an explicit abandonment of an unknown
+result, not evidence of zero provider usage. Ordinary timeout or restart cannot
+release a slot, and a served Sales question cannot be abandoned this way.
 No live acceptance is implied by enabling this configuration or passing fixtures.
 
 ### Project subscription allowance

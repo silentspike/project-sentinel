@@ -251,7 +251,7 @@ func (p *CodexCLIProvider) commandArgs(model string) []string {
 		"-c", `model_providers.sentinel_chatgpt={name="OpenAI",wire_api="responses",requires_openai_auth=true,request_max_retries=0,stream_max_retries=0,supports_websockets=false}`,
 		"-c", `web_search="disabled"`,
 		"-c", `check_for_update_on_startup=false`,
-		"-c", `model_reasoning_effort="none"`,
+		"-c", `model_reasoning_effort="low"`,
 		"-c", `shell_environment_policy.inherit="none"`,
 	}
 	for _, feature := range codexCLIDisabledFeatures {
@@ -347,9 +347,9 @@ func (s *codexCLIStreamState) apply(event codexCLIEvent) error {
 		s.turnCompleted = true
 		s.usage = *event.Usage
 	case "turn.failed":
-		return fmt.Errorf("codex-cli turn failed")
+		return codexCLIStreamError(event)
 	case "error":
-		return fmt.Errorf("codex-cli stream failed")
+		return codexCLIStreamError(event)
 	default:
 		return fmt.Errorf("codex-cli emitted unknown event type %q", event.Type)
 	}
@@ -511,9 +511,21 @@ func codexTokenCount(name string, value int64) (int, error) {
 	return int(value), nil
 }
 
+// Expose only fixed diagnostic categories, never upstream text or credentials.
+// A classification is not evidence that a prior dispatch is safe to repeat.
+func codexCLIStreamError(event codexCLIEvent) error {
+	diagnostic := event.Message
+	if event.Error != nil {
+		diagnostic += " " + event.Error.Message
+	}
+	return codexCLIProcessError(diagnostic)
+}
+
 func codexCLIProcessError(diagnostic string) error {
 	lower := strings.ToLower(diagnostic)
 	switch {
+	case strings.Contains(lower, "reasoning") && (strings.Contains(lower, "unsupported") || strings.Contains(lower, "not supported")):
+		return errors.New("codex-cli reasoning configuration unsupported")
 	case strings.Contains(lower, "rate limit"), strings.Contains(lower, "usage limit"), strings.Contains(lower, "limit reached"):
 		return &ProviderError{StatusCode: http.StatusTooManyRequests, Message: "codex-cli usage limit active"}
 	case strings.Contains(lower, "not logged in"), strings.Contains(lower, "login required"), strings.Contains(lower, "authentication"):
