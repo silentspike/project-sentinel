@@ -3,6 +3,34 @@ import { expect, test } from "@playwright/test";
 const identity = { schema_version: 1, principal_id: "customer-one", tenant_id: "tenant-one", customer_id: "customer-one" };
 const request = { request_id: "request-one", summary_ref: "Studio website", desired_outcome: "Three accessible pages", constraints: ["No tracking"], state: "submitted", version: 1, proposal_ids: [], clarifications: [], feedback: [] };
 
+test("customer replies to the exact Sales question with durable retry", async ({ page }) => {
+  const consultation = [{ message_id: "question-one", in_reply_to: null as string | null, content: "Which audience should the website address?", role: "sales" }];
+  const writes: { operation_id: string; command: Record<string, unknown> }[] = [];
+  await page.route("**/api/customer/**", async route => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("status")) return route.fulfill({ json: { authenticated: true, identity } });
+    if (path.endsWith("overview")) return route.fulfill({ json: { requests: [{ ...request, state: "clarifying", version: 2, consultation }], proposals: [] } });
+    expect(path).toBe("/api/customer/commands");
+    writes.push(route.request().postDataJSON());
+    if (writes.length === 1) return route.abort("failed");
+    consultation.push({ message_id: "answer-one", in_reply_to: "question-one", content: "Local businesses", role: "customer" });
+    return route.fulfill({ json: {} });
+  });
+  await page.goto("/?view=customer");
+  await expect(page.getByText(consultation[0].content)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Antwort senden", exact: true })).toBeDisabled();
+  await page.getByLabel("Ihre Antwort", { exact: true }).fill("Local businesses");
+  await page.getByRole("button", { name: "Antwort senden", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Gleiche Anfrage erneut pruefen" })).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "Gleiche Anfrage erneut pruefen" }).click();
+  await expect(page.getByRole("button", { name: "Antwort senden", exact: true })).toHaveCount(0);
+  expect(writes).toHaveLength(2);
+  expect(writes[1]).toEqual(writes[0]);
+  expect(writes[0].command).toEqual({ command: "send_customer_request_message", request_id: request.request_id, expected_version: 2, in_reply_to: "question-one", content: "Local businesses" });
+  await expect(page.getByText("Local businesses", { exact: true })).toBeVisible();
+});
+
 test("delivery acceptance requires consent and replays the displayed version after reload", async ({ page }) => {
   const delivery = {
     delivery: { id: "delivery-one", generation: 1, digest: "a".repeat(64) },

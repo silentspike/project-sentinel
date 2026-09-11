@@ -518,7 +518,7 @@ mod tests {
             panic!("request")
         };
         apply(
-            "sales",
+            "customer",
             CompanyWorkflowCommandV1::ClarifyCustomerRequest {
                 request_id: request.request_id.clone(),
                 expected_version: 1,
