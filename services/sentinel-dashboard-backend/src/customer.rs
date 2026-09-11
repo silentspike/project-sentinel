@@ -300,6 +300,85 @@ pub async fn commands(State(st): State<AppState>, headers: HeaderMap, body: Byte
     if body.len() > 65536 || !json_request(&headers) {
         return error(StatusCode::BAD_REQUEST, "invalid_command");
     }
+    forward_command(st, headers, &body, "/customer/workflow/commands").await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryReference {
+    id: String,
+    generation: u64,
+    digest: String,
+}
+
+impl DeliveryReference {
+    fn valid(&self) -> bool {
+        !self.id.is_empty()
+            && self.id.len() <= 512
+            && self.generation > 0
+            && self.digest.len() == 64
+            && self
+                .digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && self.digest.bytes().any(|byte| byte != b'0')
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum CustomerDeliveryIntent {
+    ConfirmDelivery {
+        project_id: String,
+        delivery: DeliveryReference,
+        release: DeliveryReference,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomerDeliveryEnvelope {
+    operation_id: uuid::Uuid,
+    intent: CustomerDeliveryIntent,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewFile {
+    artifact_id: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewRequest {
+    project_id: String,
+    delivery: DeliveryReference,
+    release: DeliveryReference,
+    file: Option<PreviewFile>,
+}
+
+pub async fn preview(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if body.len() > 4096 || !json_request(&headers) {
+        return error(StatusCode::BAD_REQUEST, "invalid_preview_request");
+    }
+    let value: PreviewRequest = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_preview_request"),
+    };
+    if value.project_id.is_empty()
+        || value.project_id.len() > 512
+        || !value.delivery.valid()
+        || !value.release.valid()
+        || value.file.as_ref().is_some_and(|file| {
+            file.artifact_id.is_empty()
+                || file.artifact_id.len() > 512
+                || file.path.is_empty()
+                || file.path.len() > 1024
+        })
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_preview_request");
+    }
     let session = match session(&st, &headers).await {
         Ok(Some(session)) => session,
         Ok(None) => return error(StatusCode::UNAUTHORIZED, "customer_authentication_required"),
@@ -313,12 +392,55 @@ pub async fn commands(State(st): State<AppState>, headers: HeaderMap, body: Byte
     match upstream(
         &st,
         &session.credential,
-        "/customer/workflow/commands",
+        "/customer/workflow/preview",
         &[],
         Some(&body),
     )
     .await
     {
+        Ok((status, value)) => (status, Json(value)).into_response(),
+        Err(_) => error(StatusCode::BAD_GATEWAY, "customer_preview_unavailable"),
+    }
+}
+
+pub async fn delivery(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if body.len() > 4096 || !json_request(&headers) {
+        return error(StatusCode::BAD_REQUEST, "invalid_delivery_confirmation");
+    }
+    let value: CustomerDeliveryEnvelope = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_delivery_confirmation"),
+    };
+    let CustomerDeliveryIntent::ConfirmDelivery {
+        project_id,
+        delivery,
+        release,
+    } = value.intent;
+    if value.operation_id.is_nil()
+        || project_id.is_empty()
+        || project_id.len() > 512
+        || !delivery.valid()
+        || !release.valid()
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_delivery_confirmation");
+    }
+    // Forward the original envelope. No browser authority or timestamp is minted
+    // here; the daemon owns receipt validation and durable replay.
+    forward_command(st, headers, &body, "/company/delivery/intents").await
+}
+
+async fn forward_command(st: AppState, headers: HeaderMap, body: &[u8], path: &str) -> Response {
+    let session = match session(&st, &headers).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return error(StatusCode::UNAUTHORIZED, "customer_authentication_required"),
+        Err(()) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "customer_workflow_unavailable",
+            )
+        }
+    };
+    match upstream(&st, &session.credential, path, &[], Some(body)).await {
         Ok((status, value)) => (status, Json(value)).into_response(),
         Err(_) => error(StatusCode::BAD_GATEWAY, "customer_command_outcome_unknown"),
     }
@@ -344,6 +466,209 @@ mod tests {
         config.events_db = "/nonexistent/customer-tests/events.db".into();
         config.operator_url = "http://127.0.0.1:1".into();
         AppState::new(config).unwrap()
+    }
+
+    fn confirmation() -> Value {
+        json!({
+            "operation_id": "018f3f32-4f01-7f2c-a6c1-f6f4a81b2809",
+            "intent": {
+                "action": "confirm_delivery", "project_id": "project-one",
+                "delivery": {"id":"delivery-one","generation":1,"digest":"a".repeat(64)},
+                "release": {"id":"release-one","generation":1,"digest":"b".repeat(64)},
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn customer_delivery_proxy_rejects_privilege_and_unbound_intents_before_io() {
+        let mut cases = Vec::new();
+        for action in ["accept", "release", "assign_qa", "execute_qa", "closeout"] {
+            let mut value = confirmation();
+            value["intent"]["action"] = json!(action);
+            cases.push(value);
+        }
+        for field in ["principal", "tenant_id", "effective_at_ms"] {
+            let mut value = confirmation();
+            value[field] = json!("injected");
+            cases.push(value);
+        }
+        let mut missing = confirmation();
+        missing["intent"].as_object_mut().unwrap().remove("release");
+        cases.push(missing);
+        for digest in ["bad".to_string(), "0".repeat(64), "A".repeat(64)] {
+            let mut value = confirmation();
+            value["intent"]["delivery"]["digest"] = json!(digest);
+            cases.push(value);
+        }
+        let app = crate::build_app(state());
+        for value in cases {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/customer/delivery")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&value).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/customer/delivery")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(confirmation().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn customer_delivery_proxy_preserves_exact_body_and_server_credential() {
+        let recorded = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let captures = recorded.clone();
+        let preview_captures = recorded.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new()
+            .route(
+                "/customer/workflow/identity",
+                get(|| async { Json(fixture_identity()) }),
+            )
+            .route(
+                "/company/delivery/intents",
+                axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                    let captures = captures.clone();
+                    async move {
+                        assert_eq!(
+                            headers[header::AUTHORIZATION],
+                            "Bearer server-customer-credential"
+                        );
+                        captures.lock().unwrap().push(body.to_vec());
+                        Json(json!({"replayed": true, "action": "accept"}))
+                    }
+                }),
+            )
+            .route(
+                "/customer/workflow/preview",
+                axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                    let captures = preview_captures.clone();
+                    async move {
+                        assert_eq!(
+                            headers[header::AUTHORIZATION],
+                            "Bearer server-customer-credential"
+                        );
+                        captures.lock().unwrap().push(body.to_vec());
+                        Json(json!({"encoding":"base64","content":"AAEC/w==","size_bytes":4}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let mut st = state();
+        Arc::make_mut(&mut st.config).operator_url = url;
+        let token = st
+            .customer_sessions
+            .create("server-customer-credential".into(), fixture_identity())
+            .unwrap();
+        let app = crate::build_app(st);
+        let body = confirmation().to_string();
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/customer/delivery")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, format!("{COOKIE}={token}"))
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&response).contains("server-customer-credential"));
+        }
+        assert_eq!(*recorded.lock().unwrap(), vec![body.as_bytes().to_vec(); 2]);
+        let preview = json!({
+            "project_id":"project-one",
+            "delivery": confirmation()["intent"]["delivery"],
+            "release": confirmation()["intent"]["release"],
+            "file":{"artifact_id":"site","path":"index.html"},
+        });
+        for field in ["principal_id", "tenant_id", "root", "now_ms"] {
+            let mut invalid = preview.clone();
+            invalid[field] = json!("injected");
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/customer/preview")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, format!("{COOKIE}={token}"))
+                        .body(Body::from(invalid.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(recorded.lock().unwrap().len(), 2);
+        let preview_body = preview.to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/customer/preview")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(preview_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/customer/preview")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, format!("{COOKIE}={token}"))
+                    .body(Body::from(preview_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["content"],
+            "AAEC/w=="
+        );
+        assert_eq!(
+            recorded.lock().unwrap().last().unwrap(),
+            preview_body.as_bytes()
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]

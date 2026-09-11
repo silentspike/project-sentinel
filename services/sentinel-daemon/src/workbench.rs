@@ -1555,16 +1555,14 @@ fn validate_concrete_artifact_manifest(
     Ok(())
 }
 
-pub(crate) fn stage_verified_artifact_inputs(
+fn open_verified_source_artifact(
     artifact_roots: &HashMap<AgentId, PathBuf>,
     source_agent: AgentId,
-    destination_agent: AgentId,
     project_id: &str,
-    destination_work_item_id: &str,
     manifest_digest: &str,
     expected_artifact_kind: Option<&str>,
     expected_media_type: &str,
-) -> anyhow::Result<Vec<sentinel_common::WorkbenchInputRef>> {
+) -> anyhow::Result<(PathBuf, VerifiedArtifactManifest)> {
     if !valid_lower_sha256(manifest_digest) {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
@@ -1627,6 +1625,8 @@ pub(crate) fn stage_verified_artifact_inputs(
     if manifest.schema_version != WORKBENCH_SCHEMA_VERSION
         || manifest.project_id != project_id
         || manifest.agent_id != source_agent.0
+        || source_scope.file_name().and_then(|value| value.to_str())
+            != Some(manifest.work_item_id.as_str())
         || daemon_scope_component(&manifest.artifact_kind).is_err()
         || expected_artifact_kind.is_some_and(|value| value != manifest.artifact_kind)
         || manifest.media_type != expected_media_type
@@ -1635,6 +1635,85 @@ pub(crate) fn stage_verified_artifact_inputs(
     {
         return Err(WorkbenchStoreError::OutputRejected.into());
     }
+    Ok((source_scope, manifest))
+}
+
+/// Read only a manifest-declared immutable file. The caller must first bind the
+/// manifest to the authenticated delivery; this function grants no authority.
+pub fn read_verified_artifact_file(
+    artifact_roots: &HashMap<AgentId, PathBuf>,
+    source_agent: AgentId,
+    project_id: &str,
+    manifest_digest: &str,
+    artifact_kind: &str,
+    media_type: &str,
+    path: &str,
+    max_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    const MAX_PREVIEW_FILE_BYTES: u64 = 4 * 1024 * 1024;
+    if !is_canonical_relative_path(path) || max_bytes == 0 || max_bytes > MAX_PREVIEW_FILE_BYTES {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let (source_scope, manifest) = open_verified_source_artifact(
+        artifact_roots,
+        source_agent,
+        project_id,
+        manifest_digest,
+        Some(artifact_kind),
+        media_type,
+    )?;
+    let mut paths = BTreeSet::new();
+    for entry in &manifest.entries {
+        if !is_canonical_relative_path(&entry.path)
+            || !valid_lower_sha256(&entry.sha256)
+            || entry.blob_id != format!("sha256:{}", entry.sha256)
+            || !paths.insert(&entry.path)
+        {
+            return Err(WorkbenchStoreError::OutputRejected.into());
+        }
+    }
+    let entry = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .ok_or(WorkbenchStoreError::OutputRejected)?;
+    if entry.size_bytes > max_bytes {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let blobs_root = canonical_daemon_child_directory(&source_scope, "blobs")?;
+    let blobs = open_pinned_daemon_artifact_directory(&blobs_root)?;
+    let mut file =
+        open_scoped_daemon_artifact_file(&blobs, &entry.sha256, max_bytes, Some(entry.size_bytes))?;
+    if file.metadata()?.mode() & 0o222 != 0 {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let mut bytes = Vec::new();
+    file.by_ref().take(max_bytes + 1).read_to_end(&mut bytes)?;
+    revalidate_scoped_daemon_artifact_file(&blobs, &entry.sha256, &file)?;
+    if bytes.len() as u64 != entry.size_bytes || hex_sha256(&bytes) != entry.sha256 {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn stage_verified_artifact_inputs(
+    artifact_roots: &HashMap<AgentId, PathBuf>,
+    source_agent: AgentId,
+    destination_agent: AgentId,
+    project_id: &str,
+    destination_work_item_id: &str,
+    manifest_digest: &str,
+    expected_artifact_kind: Option<&str>,
+    expected_media_type: &str,
+) -> anyhow::Result<Vec<sentinel_common::WorkbenchInputRef>> {
+    let (source_scope, manifest) = open_verified_source_artifact(
+        artifact_roots,
+        source_agent,
+        project_id,
+        manifest_digest,
+        expected_artifact_kind,
+        expected_media_type,
+    )?;
 
     let source_blobs = canonical_daemon_child_directory(&source_scope, "blobs")?;
     let destination_artifacts = artifact_roots
@@ -3867,6 +3946,60 @@ mod tests {
             (source_agent, source_artifacts),
             (destination_agent, destination_artifacts),
         ]);
+
+        let read = |path: &str, limit| {
+            read_verified_artifact_file(
+                &roots,
+                source_agent,
+                "project-m0",
+                &manifest_digest,
+                "design_specification",
+                "text/markdown",
+                path,
+                limit,
+            )
+        };
+        assert_eq!(read("design.md", 1024).unwrap(), blob);
+        let moved_scope = source_scope.with_file_name("another-work-item");
+        fs::rename(&source_scope, &moved_scope).unwrap();
+        assert!(read("design.md", 1024).is_err());
+        fs::rename(&moved_scope, &source_scope).unwrap();
+        assert_eq!(read("design.md", 1024).unwrap(), blob);
+        assert_eq!(
+            fs::read_dir(destination_root.join("inputs"))
+                .unwrap()
+                .count(),
+            0
+        );
+        for path in ["../design.md", "/design.md", "missing.md", "blobs/other"] {
+            assert!(read(path, 1024).is_err());
+        }
+        assert!(read("design.md", 1).is_err());
+        assert!(read("design.md", 0).is_err());
+        assert!(read("design.md", 4 * 1024 * 1024 + 1).is_err());
+        assert!(read_verified_artifact_file(
+            &roots,
+            destination_agent,
+            "project-m0",
+            &manifest_digest,
+            "design_specification",
+            "text/markdown",
+            "design.md",
+            1024,
+        )
+        .is_err());
+        let alias = source_scope.join("blob-alias");
+        fs::hard_link(&blob_path, &alias).unwrap();
+        assert!(read("design.md", 1024).is_err());
+        fs::remove_file(alias).unwrap();
+        fs::set_permissions(&blob_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read("design.md", 1024).is_err());
+        fs::write(&blob_path, b"# Fake design!").unwrap();
+        fs::set_permissions(&blob_path, fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(read("design.md", 1024).is_err());
+        fs::set_permissions(&blob_path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&blob_path, blob).unwrap();
+        fs::set_permissions(&blob_path, fs::Permissions::from_mode(0o444)).unwrap();
 
         let staged = stage_verified_artifact_inputs(
             &roots,

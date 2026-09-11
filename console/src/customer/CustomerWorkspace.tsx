@@ -2,6 +2,7 @@ import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-j
 import { customerFetch, CustomerApiError, dispatchReserved, pendingKey, readPending, reserveCommand,
   type CustomerIdentity, type Overview, type PendingCommand } from "./api";
 import "./customer.css";
+import { CustomerPreview } from "./CustomerPreview";
 
 export function CustomerWorkspace() {
   const [identity, setIdentity] = createSignal<CustomerIdentity | null>(null);
@@ -18,7 +19,13 @@ export function CustomerWorkspace() {
   const [question, setQuestion] = createSignal("");
   const [answer, setAnswer] = createSignal("");
   const [pending, setPending] = createSignal<PendingCommand | null>(null);
+  const [previewId, setPreviewId] = createSignal("");
   const current = createMemo(() => data().requests.find(value => value.request_id === selected()));
+  const preview = createMemo(() => {
+    const project = data().projects?.find(value => value.request_id === selected() && value.deliveries?.some(delivery => delivery.delivery.id === previewId()));
+    const delivery = project?.deliveries?.find(value => value.delivery.id === previewId());
+    return project && delivery ? { projectId: project.project_id, delivery } : undefined;
+  });
   const proposals = createMemo(() => data().proposals.filter(value => value.request_id === selected()));
   const disabled = () => busy() || pending() !== null;
   let refreshing = false;
@@ -139,11 +146,12 @@ export function CustomerWorkspace() {
               <Show when={project.deliveries?.length}><h3>Lieferungen</h3>
                 <table><thead><tr><th>Lieferung</th><th>Version</th><th>Status</th></tr></thead>
                   <tbody><For each={project.deliveries}>{delivery => <tr>
-                    <td>{delivery.delivery.id}</td><td>{delivery.delivery.generation}</td><td>{delivery.state}</td>
+                    <td>{delivery.delivery.id}<button class="customer-preview-open" disabled={delivery.release_state !== "active" || !["delivered", "accepted"].includes(delivery.state) || delivery.expires_at_ms <= Date.now()} onClick={() => setPreviewId(delivery.delivery.id)}>Vorschau oeffnen</button></td><td>{delivery.delivery.generation}</td><td>{delivery.state}</td>
                   </tr>}</For></tbody>
                 </table>
               </Show>
             </section>}</For>
+            <Show when={preview()}>{target => <CustomerPreview projectId={target().projectId} delivery={target().delivery} close={() => setPreviewId("")} />}</Show>
             <For each={request().clarifications}>{value => <section class="customer-history"><strong>{value.question_ref}</strong><p>{value.answer_ref}</p></section>}</For>
             <For each={proposals()}>{proposal => <article class="customer-proposal">
               <h3>Angebot</h3>

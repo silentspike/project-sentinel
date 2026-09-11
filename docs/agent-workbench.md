@@ -261,6 +261,18 @@ Before terminal commit, the daemon checks that the current assignment and capabi
 
 Command stdout/stderr are bounded and redacted in the transient response. Environment values, credentials, request content, private file content, and raw tool output must not appear in logs, events, projections, or durable workbench records.
 
+### Read-only artifact access
+
+`read_verified_artifact_file` reuses the manifest resolution used by input
+staging, but never creates a destination workspace or copies files. The caller
+must authorize the delivery and supply its exact source agent, project and
+manifest digest; this filesystem primitive does not grant customer authority.
+It accepts only a manifest-declared relative path and a positive byte ceiling
+no larger than 4 MiB. Missing, ambiguous, foreign or physically misbound manifests
+fail closed. Descriptor-pinned blob reads reject hardlinks, writable files, size
+changes and hash mismatches. These checks do not themselves provide HTTP preview
+serving or browser isolation; those boundaries require separate integration.
+
 ## Verification boundary
 
 Focused protocol, authorization, workspace, tool, idempotency, cancellation, and restart tests are necessary but do not prove production isolation. Issue #694 can close only after #75 and #472 are merged and the exact merged release is verified on the authorized single-node target behind an issue-specific VM snapshot. Live evidence must include positive static-site work, denied unassigned-agent and network probes, runtime selection, cgroup/Landlock/capability readback, events/projection, artifact digests, restart counters, and secret scans.
