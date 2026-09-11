@@ -1,5 +1,10 @@
 # Changelog
 
+- Add bounded same-work-item execution revisions using the existing workflow
+  journal. Preserve old plans and receipts, reject unresolved outcomes and
+  reused identities, and atomically admit the next execution without resetting
+  work-item versions or replaying prior effects (#856).
+
 - Preserve bounded, redacted failed-command diagnostics in the immediate
   Workbench response and numeric exit/output accounting in immutable runtime
   receipts and daemon replay. Keep private output out of durable records;

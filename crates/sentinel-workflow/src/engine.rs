@@ -81,6 +81,22 @@ where
         self.store.admit_plan(plan, &authority, now_ms)
     }
 
+    pub fn admit_revision_plan(
+        &self,
+        plan: &crate::ExecutionPlanV1,
+        revision: &crate::ExecutionRevisionV1,
+        now_ms: u64,
+    ) -> Result<(bool, crate::WorkItemExecutionV1), WorkflowError> {
+        plan.validate_canonical()?;
+        require_ready(
+            self.organization.readiness(),
+            WorkflowErrorCode::OrganizationUnavailable,
+        )?;
+        let authority = self.authority_for_plan(plan)?;
+        self.store
+            .admit_revision_plan(plan, revision, &authority, now_ms)
+    }
+
     pub fn reconcile_execution(
         &self,
         request: &PendingExecutionV1,

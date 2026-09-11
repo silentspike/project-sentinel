@@ -267,6 +267,35 @@ than open a newer store with an older binary. Unknown outcomes remain blocked.
 This numeric feedback is a prerequisite, not a claim that the complete model
 correction loop or a restart-safe private diagnostic channel is implemented.
 
+### Same-work-item execution revisions
+
+The workflow core can admit a bounded new execution plan for the same work item
+after `done` or a confirmed `execution_failed` result. The caller must bind the
+previous plan ID, plan digest, work version, complete state digest, and feedback
+digest, and present the unchanged active execution authority. A feedback digest
+identifies evidence; it grants no authority and does not attest its quality.
+Unknown, timed-out, cancelled, or still-running outcomes cannot authorize a
+revision.
+
+One SQLite transaction archives the complete predecessor in the existing
+`workflow_operations` journal, replaces the current execution, advances the work
+version, and appends the new first-step outbox entry and admission event. A failed
+outbox insert rolls back the entire transition. No second database or schema
+migration is required. Prior plans, execution rows, completion and gate receipts,
+and operation IDs remain immutable. Old completed receipt replays resolve their
+archived plan and cannot overwrite the current execution. Historical admission
+replays remain effect-free after their original deadline.
+
+Admission checks the complete predecessor receipt chain, rejects reused plan or
+invocation identities, and permits at most four revisions per work item. Every
+new revision needs fresh deadlines and new step/invocation IDs. Reusing the same
+admission ID with changed feedback is an idempotency conflict.
+
+This core API does not itself reopen a company assignment, authorize another
+provider call, supply private diagnostics to a model, or complete the productive
+model-feedback loop. Those boundaries must explicitly use the revision contract;
+ordinary initial-plan admission still rejects a different plan for existing work.
+
 ### Runtime quiescence and unresolved outcomes
 
 A durable `executing` row is not proof that a tool process still exists. A lost
