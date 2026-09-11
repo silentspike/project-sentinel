@@ -3,6 +3,8 @@
 mod delivery_intent;
 mod delivery_runtime;
 #[cfg(feature = "llm")]
+pub mod model_execution;
+#[cfg(feature = "llm")]
 pub mod model_work;
 #[cfg(feature = "llm")]
 mod subscription;
@@ -69,6 +71,7 @@ pub const CUSTOMER_IDENTITY_PATH: &str = "/customer/workflow/identity";
 pub const CUSTOMER_OVERVIEW_PATH: &str = "/customer/workflow/overview";
 pub const CUSTOMER_PREVIEW_PATH: &str = "/customer/workflow/preview";
 pub const OPERATOR_COMMAND_PATH: &str = "/operator/workflow/commands";
+pub const REQUEST_PROVIDER_PATH: &str = "/operator/workflow/request-provider";
 pub const AGENT_COMMAND_PATH: &str = "/agent/workflow/commands";
 pub const OPERATOR_PROJECT_PATH: &str = "/operator/workflow/projects";
 pub const OPERATOR_WORK_ITEM_PATH: &str = "/operator/workflow/work-items";
@@ -2502,6 +2505,8 @@ pub struct WorkflowApi {
     enabled: bool,
     model_work_enabled: bool,
     subscription_allowance_id: Option<String>,
+    request_sales_tenant: Option<TenantId>,
+    request_sales_total_limit: u16,
     scan_succeeded: AtomicBool,
     collaboration_publication_pending: AtomicUsize,
     last_error: Mutex<Option<String>>,
@@ -2533,6 +2538,20 @@ impl WorkflowApi {
         let enabled = workflow_enabled()?;
         let model_work_enabled = workflow_flag("SENTINEL_MODEL_WORKBENCH_ENABLED")?;
         let subscription_allowance_id = std::env::var("SENTINEL_MODEL_WORK_ALLOWANCE_ID").ok();
+        let request_sales_tenant = std::env::var("SENTINEL_REQUEST_SALES_TENANT")
+            .ok()
+            .map(|value| TenantId::parse(&value))
+            .transpose()?;
+        if request_sales_tenant.is_some() && subscription_allowance_id.is_none() {
+            return Err(workflow_unavailable());
+        }
+        let request_sales_total_limit = std::env::var("SENTINEL_REQUEST_SALES_TOTAL_LIMIT")
+            .map_or(Ok(1), |value| {
+                value.parse::<u16>().map_err(|_| workflow_unavailable())
+            })?;
+        if !matches!(request_sales_total_limit, 1 | 10 | 40) {
+            return Err(workflow_unavailable());
+        }
         if let Some(id) = &subscription_allowance_id {
             WorkItemId::parse(id).map_err(|_| workflow_unavailable())?;
             if !model_work_enabled {
@@ -2627,6 +2646,8 @@ impl WorkflowApi {
             enabled: true,
             model_work_enabled,
             subscription_allowance_id,
+            request_sales_tenant,
+            request_sales_total_limit,
             scan_succeeded: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(usize::MAX),
             last_error: Mutex::new(None),
@@ -2659,6 +2680,8 @@ impl WorkflowApi {
             enabled: false,
             model_work_enabled: false,
             subscription_allowance_id: None,
+            request_sales_tenant: None,
+            request_sales_total_limit: 1,
             scan_succeeded: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(0),
             last_error: Mutex::new(None),
@@ -2703,6 +2726,8 @@ impl WorkflowApi {
             ("POST", OPERATOR_COMMAND_PATH) => {
                 self.company_command(&principal, CompanyPrincipalKindV1::Operator, body)
             }
+            #[cfg(feature = "llm")]
+            ("POST", REQUEST_PROVIDER_PATH) => self.authorize_sales_request(&principal, body),
             ("POST", AGENT_COMMAND_PATH) => self.agent_command(&principal, body),
             ("GET", CUSTOMER_REQUEST_PATH) => self.customer_request(&principal, path),
             ("GET", CUSTOMER_IDENTITY_PATH) => customer_identity(&principal),
@@ -4321,28 +4346,66 @@ impl WorkflowApi {
 impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
     fn model_work_context(
         &self,
-        binding: &crate::llm_bridge::bridge::ProviderUsageAuthority,
-    ) -> Result<Option<model_work::ModelWorkContext>, &'static str> {
-        self.prepare_model_work(binding)
+        binding: &model_execution::ProviderExecutionAuthority,
+    ) -> Result<Option<model_execution::ModelExecutionContext>, &'static str> {
+        match binding {
+            model_execution::ProviderExecutionAuthority::Project(binding) => self
+                .prepare_model_work(binding)
+                .map(|value| value.map(Into::into)),
+            model_execution::ProviderExecutionAuthority::RequestSales(binding) => {
+                self.prepare_request_sales(binding).map(|value| {
+                    Some(model_execution::ModelExecutionContext::RequestSales(
+                        Box::new(value),
+                    ))
+                })
+            }
+        }
     }
 
     fn admit_model_work(
         &self,
-        completion: &model_work::ModelWorkCompletion,
+        completion: &model_execution::ModelExecutionCompletion,
         request_id: &str,
         request_digest: &str,
     ) -> Result<(), &'static str> {
-        self.accept_model_work(completion, request_id, request_digest)
+        match &completion.context {
+            model_execution::ModelExecutionContext::Project(context) => self.accept_model_work(
+                &model_work::ModelWorkCompletion {
+                    context: context.as_ref().clone(),
+                    content: completion.content.clone(),
+                    admissible: completion.admissible,
+                },
+                request_id,
+                request_digest,
+            ),
+            model_execution::ModelExecutionContext::RequestSales(context) => {
+                self.accept_request_sales(completion, context, request_id, request_digest)
+            }
+        }
     }
 
     fn resolve_provider_usage_authority(
         &self,
         agent_id: AgentId,
-    ) -> Result<Option<crate::llm_bridge::bridge::ProviderUsageAuthority>, &'static str> {
+    ) -> Result<Option<model_execution::ProviderExecutionAuthority>, &'static str> {
+        if let Some(call) = self.request_sales_call()? {
+            if call.grant.sales_principal.agent_id != Some(agent_id) {
+                return Err("only the configured Sales employee may dispatch");
+            }
+            let binding = model_execution::RequestSalesAuthority {
+                schema_version: 2,
+                allowance_id: call.allowance_id,
+                grant: call.grant,
+            };
+            self.prepare_request_sales(&binding)?;
+            return Ok(Some(
+                model_execution::ProviderExecutionAuthority::RequestSales(Box::new(binding)),
+            ));
+        }
         self.provider_usage_binding_for_agent(agent_id)
             .map(|binding| {
-                binding.map(
-                    |binding| crate::llm_bridge::bridge::ProviderUsageAuthority {
+                binding.map(|binding| {
+                    crate::llm_bridge::bridge::ProviderUsageAuthority {
                         tenant_id: binding.tenant_id,
                         project_id: binding.project_id,
                         work_item_id: binding.work_item_id,
@@ -4352,8 +4415,9 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
                         agent_id: binding.agent_id,
                         provider: binding.provider,
                         subscription_grant: binding.subscription_grant,
-                    },
-                )
+                    }
+                    .into()
+                })
             })
     }
 }
@@ -4558,6 +4622,7 @@ fn is_workflow_path(path: &str) -> bool {
             | CUSTOMER_OVERVIEW_PATH
             | CUSTOMER_PREVIEW_PATH
             | OPERATOR_COMMAND_PATH
+            | REQUEST_PROVIDER_PATH
             | AGENT_COMMAND_PATH
             | OPERATOR_PROJECT_PATH
             | OPERATOR_WORK_ITEM_PATH

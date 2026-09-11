@@ -384,11 +384,11 @@ pub(crate) fn test_context() -> ModelWorkContext {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn configured_test_api(path: &Path) -> WorkflowApi {
+    pub(crate) fn configured_test_api(path: &Path) -> WorkflowApi {
         let store = Arc::new(WorkflowStore::open(path).unwrap());
         let mut api = WorkflowApi::new_disabled(Arc::clone(&store)).unwrap();
         let bindings = [
@@ -416,6 +416,12 @@ mod tests {
                 CompanyRoleV1::Developer,
                 Some(AgentId(6)),
             ),
+            (
+                "operator",
+                CompanyPrincipalKindV1::Operator,
+                CompanyRoleV1::TechnicalLead,
+                None,
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -428,7 +434,8 @@ mod tests {
                     principal_id: id.to_owned(),
                     kind,
                     role,
-                    customer_id: agent_id.is_none().then(|| "customer-m0".to_owned()),
+                    customer_id: (kind == CompanyPrincipalKindV1::Customer)
+                        .then(|| "customer-m0".to_owned()),
                     agent_id,
                     authority_generation: 1,
                 },
@@ -452,10 +459,10 @@ mod tests {
         let authority = Arc::new(CompanyAuthority {
             store: Arc::clone(&store),
             principals: Arc::clone(&principals),
-            agent_capabilities: Arc::new(HashMap::from([(
-                AgentId(6),
-                profile.capabilities.clone(),
-            )])),
+            agent_capabilities: Arc::new(HashMap::from([
+                (AgentId(6), profile.capabilities.clone()),
+                (AgentId(3), BTreeSet::new()),
+            ])),
             workbench_profile: profile,
             workbench_profile_digest: profile_digest,
             qa_profile_capabilities: BTreeSet::new(),
