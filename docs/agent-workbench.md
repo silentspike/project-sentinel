@@ -256,7 +256,16 @@ reserved -> executing -> succeeded
 
 After restart, a `reserved` request waits for the authoritative caller to replay the same digest-bound request and pass current authorization again. An `executing` request is never re-executed: the daemon sends a `recover` frame carrying the invocation ID and request digest. Before the runtime emits any terminal result, it atomically creates an immutable completion receipt in the artifact boundary. A restarted runtime returns the redacted receipt. A missing, malformed, mismatched, or conflicting receipt becomes durable `unknown_outcome` and requires manual recovery; it is never converted into an ordinary failure or authorization to repeat the tool effect. Terminal and unknown-outcome records remain subject to current assignment and generation authorization when replayed.
 
-The completion receipt retains only outcome, resource accounting, artifact references, and safe error classification. Transient tool output and file contents are removed before persistence. Receipt writes are bounded, synced, and installed without overwrite; an existing receipt must match byte-for-byte after decoding.
+The completion receipt retains only outcome, resource accounting, artifact references, safe error classification, and canonical numeric command status (exit code and stdout/stderr byte counts). A failed command returns its bounded, redacted diagnostics to the immediate authorized caller, just like a successful command. Transient tool output and file contents are removed before persistence. Receipt writes are bounded, synced, and installed without overwrite; an existing receipt must match byte-for-byte after decoding.
+
+Runtime receipt version 2 and daemon record version 3 retain this numeric status
+across restart without repeating the command. The new readers also accept legacy
+runtime receipts (version 1) and daemon records (version 2); absent diagnostics
+remain absent, not inferred or reconstructed by rerunning old work. Old readers
+reject new versions, so rollback must restore the matching prior state rather
+than open a newer store with an older binary. Unknown outcomes remain blocked.
+This numeric feedback is a prerequisite, not a claim that the complete model
+correction loop or a restart-safe private diagnostic channel is implemented.
 
 ### Runtime quiescence and unresolved outcomes
 
