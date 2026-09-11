@@ -171,9 +171,15 @@ impl WorkflowApi {
             provider: allowance.grant.provider.clone(),
             subscription_grant: Some(allowance.grant.clone()),
         };
-        validate_provider_usage_event(&committed_usage, &usage_id, &expected, 0)?;
         let payload: DomainEventPayload =
             serde_json::from_str(&committed_usage.payload).map_err(|_| "provider usage invalid")?;
+        let DomainEventPayload::AgentLlmUsage { cost_usd, .. } = &payload else {
+            return Err("provider usage payload type is invalid");
+        };
+        // A subscription reserves calls, not zero-valued usage accounting.
+        // The canonical event owns the recorded cost; callers cannot supply it.
+        let recorded_cost = usd_to_micros(*cost_usd).ok_or("provider usage cost is invalid")?;
+        validate_provider_usage_event(&committed_usage, &usage_id, &expected, recorded_cost)?;
         if !matches!(payload, DomainEventPayload::AgentLlmUsage { output_tokens, .. } if output_tokens > 0)
             || committed_usage.correlation_id != dispatch.request_id
         {
