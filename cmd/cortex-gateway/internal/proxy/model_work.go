@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/hex"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,16 +21,36 @@ const (
 func classifyModelWorkRequest(req *LLMRequest, requestID string) (bool, error) {
 	schema, present := req.Metadata["company_execution_schema"]
 	if !present {
+		if hasCustomerRequestMetadata(req.Metadata) {
+			return false, errors.New("customer request execution schema is missing")
+		}
 		return false, nil
 	}
 	invalid := errors.New("invalid company execution request")
-	if schema != "1" || req.RequestClass != RequestClassAgentRuntime || req.Stream || req.MaxTokens <= 0 {
+	if req.RequestClass != RequestClassAgentRuntime || req.Stream || req.MaxTokens <= 0 {
 		return false, invalid
 	}
-	for _, key := range []string{"tenant_id", "project_id", "work_item_id", "reservation_id", "assignment_id", "assignment_version", "reserved_provider"} {
+	for _, key := range []string{"tenant_id", "reservation_id", "reserved_provider"} {
 		if strings.TrimSpace(req.Metadata[key]) == "" {
 			return false, invalid
 		}
+	}
+	switch schema {
+	case "1":
+		for _, key := range []string{"project_id", "work_item_id", "assignment_id", "assignment_version"} {
+			if strings.TrimSpace(req.Metadata[key]) == "" {
+				return false, invalid
+			}
+		}
+		if hasCustomerRequestMetadata(req.Metadata) {
+			return false, invalid
+		}
+	case "2":
+		if _, err := customerRequestSubject(req.Metadata); err != nil {
+			return false, invalid
+		}
+	default:
+		return false, invalid
 	}
 	if requestID != "company-provider-"+req.Metadata["reservation_id"] || req.Metadata["request_id"] != requestID {
 		return false, invalid
@@ -40,6 +61,42 @@ func classifyModelWorkRequest(req *LLMRequest, requestID string) (bool, error) {
 		return false, invalid
 	}
 	return true, nil
+}
+
+// Pre-agreement Sales work belongs to a customer request, never a synthetic
+// project. The daemon authenticates the principal and validates this version
+// against durable state; metadata alone grants no permission to call a provider.
+type customerRequestExecutionSubject struct {
+	Kind           string `json:"kind"`
+	RequestID      string `json:"request_id"`
+	RequestVersion uint64 `json:"request_version"`
+}
+
+func hasCustomerRequestMetadata(metadata map[string]string) bool {
+	for _, key := range []string{"company_execution_subject", "customer_request_id", "customer_request_version"} {
+		if _, present := metadata[key]; present {
+			return true
+		}
+	}
+	return false
+}
+
+func customerRequestSubject(metadata map[string]string) (*customerRequestExecutionSubject, error) {
+	invalid := errors.New("invalid customer request execution subject")
+	if metadata["company_execution_schema"] != "2" || metadata["company_execution_subject"] != "customer_request" || !subscriptionIdentifier.MatchString(metadata["customer_request_id"]) {
+		return nil, invalid
+	}
+	for _, key := range []string{"project_id", "work_item_id", "assignment_id", "assignment_version"} {
+		if _, present := metadata[key]; present {
+			return nil, invalid
+		}
+	}
+	versionText := metadata["customer_request_version"]
+	version, err := strconv.ParseUint(versionText, 10, 64)
+	if err != nil || version == 0 || strconv.FormatUint(version, 10) != versionText {
+		return nil, invalid
+	}
+	return &customerRequestExecutionSubject{Kind: "customer_request", RequestID: metadata["customer_request_id"], RequestVersion: version}, nil
 }
 
 // Typed work proposals cannot be regenerated under one provider reservation.

@@ -327,7 +327,34 @@ impl ProjectionWorker {
                         {
                             anyhow::bail!("v2 agent_llm_usage is missing effective_model");
                         }
-                        if event.schema_version >= 3 {
+                        if event.schema_version > 4 {
+                            anyhow::bail!("unsupported agent_llm_usage authority schema");
+                        }
+                        if event.schema_version == 4
+                            && ([
+                                tenant_id.as_deref(),
+                                reservation_id.as_deref(),
+                                provider.as_deref(),
+                                requested_model.as_deref(),
+                            ]
+                            .into_iter()
+                            .any(|value| value.is_none_or(|value| value.trim().is_empty()))
+                                || project_id.is_some()
+                                || work_item_id.is_some()
+                                || assignment_id.is_some()
+                                || assignment_version.is_some()
+                                || caller_role.as_deref() != Some("agent_runtime")
+                                || event.correlation_id
+                                    != format!(
+                                        "company-provider-{}",
+                                        reservation_id.as_deref().unwrap_or_default()
+                                    )
+                                || event.operation_id
+                                    != format!("llm_usage_{}", event.correlation_id))
+                        {
+                            anyhow::bail!("v4 agent_llm_usage has invalid request authority");
+                        }
+                        if event.schema_version == 3 {
                             if [
                                 tenant_id.as_deref(),
                                 project_id.as_deref(),

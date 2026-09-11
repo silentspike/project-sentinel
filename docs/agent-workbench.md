@@ -78,7 +78,47 @@ with an invented marginal USD price. The activation stays off until that provide
 contract and the target-runtime readiness are verified. Test fixtures use the
 existing `local-loop` exemption, not a production OAuth exemption.
 
-### Single-call subscription allowance
+### Pre-agreement Sales inquiries
+
+Sales consultation uses the existing customer request, not a fabricated project
+or work assignment. The daemon resolves the configured Sales principal and its
+healthy runtime, freezes the exact request version and conversation, and sends
+it through the normal authenticated Gateway/Cortex agent-runtime route.
+The provider returns a strict `ask_question` decision; neither tests nor the
+operator supply its answer. Only the customer may answer that question or accept
+a subsequent proposal. This initial consultation increment does not implement
+automatic proposal generation or the complete autonomous company.
+
+Request execution uses Gateway metadata schema 2 with a `customer_request`
+subject. Schema 1 continues to describe project work. Mixed subjects are denied.
+The existing LLM completion outbox persists the response and usage before the
+workflow adopts the question. Local adoption retries reuse that result without
+another provider call; the question and completion receipt commit atomically.
+Usage schema 4 binds tenant and permanent allowance without project/assignment
+fields. The allowance links it to the exact customer request and Sales principal.
+Schema 3 retains its stricter project authority requirements. Deploy the updated
+projection reader before enabling schema-4 production; an old reader fails closed.
+
+Preparation requires `SENTINEL_REQUEST_SALES_TENANT`, the exact
+`SENTINEL_MODEL_WORK_ALLOWANCE_ID`, and the protected
+`SENTINEL_REQUEST_SALES_TOTAL_LIMIT` (1 by default; approved rungs are 10 and 40).
+The authenticated operator endpoint `POST /operator/workflow/request-provider`
+accepts a stable operation ID, request ID/version, registered Sales principal ID,
+model/catalog digest, concurrency bound, and expiry. It derives principal
+authority, provider, total ceiling, token policy, and 120-second duration on the
+server. The configured allowance must equal the canonical operation-derived ID.
+The request body cannot raise the configured total ceiling. Both services must
+bind the same allowance and catalog before any provider effect is enabled.
+The existing credential initializer provisions the independent `workflow-operator`
+credential and the daemon loads it through systemd. It is not a customer or
+employee credential and is not exposed to the customer dashboard.
+
+Every grant counts toward the store-wide cumulative ceiling, including legacy
+project grants and expired unsent grants. Unknown dispatched outcomes retain
+their concurrency slot; timeout, restart and a new request do not reset them.
+No live acceptance is implied by enabling this configuration or passing fixtures.
+
+### Project subscription allowance
 
 `GrantSubscriptionCall` authorizes one assigned Designer or Developer work item
 inside the existing project transaction, journal, and projection. It is separate

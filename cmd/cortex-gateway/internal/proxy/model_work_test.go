@@ -24,6 +24,60 @@ func modelWorkMetadata() map[string]string {
 	}
 }
 
+func salesRequestMetadata() map[string]string {
+	metadata := modelWorkMetadata()
+	for _, key := range []string{"project_id", "work_item_id", "assignment_id", "assignment_version"} {
+		delete(metadata, key)
+	}
+	metadata["company_execution_schema"] = "2"
+	metadata["company_execution_subject"] = "customer_request"
+	metadata["customer_request_id"] = "request-test"
+	metadata["customer_request_version"] = "1"
+	return metadata
+}
+
+func TestCustomerRequestModelWorkRejectsMixedOrNoncanonicalSubjects(t *testing.T) {
+	mutations := map[string]func(map[string]string){
+		"missing_schema":       func(m map[string]string) { delete(m, "company_execution_schema") },
+		"missing_subject":      func(m map[string]string) { delete(m, "company_execution_subject") },
+		"foreign_subject":      func(m map[string]string) { m["company_execution_subject"] = "project" },
+		"missing_request":      func(m map[string]string) { delete(m, "customer_request_id") },
+		"invalid_request":      func(m map[string]string) { m["customer_request_id"] = "../request" },
+		"long_request":         func(m map[string]string) { m["customer_request_id"] = strings.Repeat("a", 129) },
+		"missing_version":      func(m map[string]string) { delete(m, "customer_request_version") },
+		"zero_version":         func(m map[string]string) { m["customer_request_version"] = "0" },
+		"negative_version":     func(m map[string]string) { m["customer_request_version"] = "-1" },
+		"noncanonical_version": func(m map[string]string) { m["customer_request_version"] = "01" },
+		"overflow_version":     func(m map[string]string) { m["customer_request_version"] = "18446744073709551616" },
+		"project":              func(m map[string]string) { m["project_id"] = "project-test" },
+		"empty_project":        func(m map[string]string) { m["project_id"] = "" },
+		"work_item":            func(m map[string]string) { m["work_item_id"] = "work-test" },
+		"assignment":           func(m map[string]string) { m["assignment_id"] = "assignment-test" },
+		"assignment_version":   func(m map[string]string) { m["assignment_version"] = "1" },
+		"schema_downgrade":     func(m map[string]string) { m["company_execution_schema"] = "1" },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			req := LLMRequest{RequestClass: RequestClassAgentRuntime, MaxTokens: 128, Metadata: salesRequestMetadata()}
+			mutate(req.Metadata)
+			if admitted, err := classifyModelWorkRequest(&req, req.Metadata["request_id"]); err == nil || admitted {
+				t.Fatal("invalid Sales subject was classified as model work")
+			}
+		})
+	}
+	for _, metadata := range []map[string]string{modelWorkMetadata(), salesRequestMetadata()} {
+		req := LLMRequest{RequestClass: RequestClassAgentRuntime, MaxTokens: 128, Metadata: metadata}
+		if admitted, err := classifyModelWorkRequest(&req, metadata["request_id"]); err != nil || !admitted {
+			t.Fatalf("valid subject rejected: %v", err)
+		}
+	}
+	legacy := modelWorkMetadata()
+	legacy["customer_request_id"] = "request-test"
+	if _, err := classifyModelWorkRequest(&LLMRequest{RequestClass: RequestClassAgentRuntime, MaxTokens: 128, Metadata: legacy}, legacy["request_id"]); err == nil {
+		t.Fatal("legacy schema accepted a mixed request subject")
+	}
+}
+
 func TestModelWorkRequestRequiresAuthenticatedClassAndCompleteBinding(t *testing.T) {
 	for _, mutation := range []func(*LLMRequest){
 		func(r *LLMRequest) { r.RequestClass = RequestClassExternalCompat },
@@ -43,10 +97,16 @@ func TestModelWorkRequestRequiresAuthenticatedClassAndCompleteBinding(t *testing
 }
 
 func TestModelWorkForwardsOnceWithoutSynthesisRegenerationOrLegacyActions(t *testing.T) {
-	for _, test := range []struct{ name, content, decision string }{
-		{"typed", `{"schema_version":1,"tools":[{"kind":"write_file","path":"a.js","content":"console.log(1)","expected_sha256":null}]}`, "forward"},
-		{"fourth_wall", "Ich bin eine KI", "dropped"},
-		{"oversized", strings.Repeat("x", maxModelWorkResponseBytes+1), "dropped"},
+	for _, test := range []struct {
+		name, content, decision string
+		sales                   bool
+	}{
+		{"typed", `{"schema_version":1,"tools":[{"kind":"write_file","path":"a.js","content":"console.log(1)","expected_sha256":null}]}`, "forward", false},
+		{"fourth_wall", "Ich bin eine KI", "dropped", false},
+		{"oversized", strings.Repeat("x", maxModelWorkResponseBytes+1), "dropped", false},
+		{"sales_question", `{"schema_version":1,"decision":{"kind":"ask_question","content":"Welche Inhalte sollen auf die Kontaktseite?"}}`, "forward", true},
+		{"sales_fourth_wall", "Ich bin eine KI", "dropped", true},
+		{"sales_oversized", strings.Repeat("x", maxModelWorkResponseBytes+1), "dropped", true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			reg := NewRegistry()
@@ -60,10 +120,14 @@ func TestModelWorkForwardsOnceWithoutSynthesisRegenerationOrLegacyActions(t *tes
 			}
 			ph := newTestPipelineHandler(reg, cfg)
 			ph.synthesis = synthesis.NewEngine(true, nil)
+			metadata := modelWorkMetadata()
+			if test.sales {
+				metadata = salesRequestMetadata()
+			}
 			encoded, err := json.Marshal(map[string]any{
 				"max_tokens": 128,
 				"messages":   []map[string]string{{"role": "user", "content": "Build the assigned site"}},
-				"metadata":   modelWorkMetadata(),
+				"metadata":   metadata,
 			})
 			if err != nil {
 				t.Fatal(err)
