@@ -1,5 +1,12 @@
 # Changelog
 
+- Distinguish pre-agreement customer-request model work from project assignments
+  at the Gateway and bind its versioned dispatch to durable daemon admission;
+  reject mixed subjects and incompatible admission receipts (#856).
+  Persist request-version and Sales-principal grants in the existing workflow
+  store, count legacy reservations, and atomically adopt Sales questions with
+  completion receipts without creating a project or resetting unknown calls.
+
 - Separate Sales questions from customer-authored replies with append-only,
   version-bound consultation messages; prevent qualification with an unanswered
   question and prevent Sales from attesting legacy customer answers (#856).

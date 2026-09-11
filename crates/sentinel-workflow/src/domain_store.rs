@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use uuid::Uuid;
 
+mod request_provider;
 mod subscription;
 
 use crate::admission::*;
@@ -2454,6 +2455,7 @@ fn mutate_project(
             });
         }
         CompanyWorkflowCommandV1::GrantSubscriptionCall { grant, .. } => {
+            request_provider::ensure_legacy_grant_allowed(transaction)?;
             subscription::grant(&mut project, principal, operation_id, grant, now_ms)?;
         }
         CompanyWorkflowCommandV1::ClaimSubscriptionCall {
@@ -2462,6 +2464,7 @@ fn mutate_project(
             request_digest,
             ..
         } => {
+            request_provider::ensure_legacy_dispatch_allowed(transaction)?;
             subscription::claim(
                 &mut project,
                 principal,
