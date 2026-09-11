@@ -531,6 +531,17 @@ pub struct CompanyWorkItemV1 {
     pub transition_history: Vec<StateTransitionAuditV1>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkCorrectionV1 {
+    pub correction_id: String,
+    pub previous: CompanyWorkItemV1,
+    pub execution_revision: crate::ExecutionRevisionV1,
+    pub feedback_ref: String,
+    pub requested_by: String,
+    pub requested_at_unix_ms: u64,
+}
+
 impl CompanyWorkItemV1 {
     pub fn canonical_digest(&self) -> Result<String, WorkflowError> {
         canonical_sha256("sentinel.workflow.company-work-item.v1", self)
@@ -772,6 +783,8 @@ pub struct ProjectV1 {
     pub reservations: Vec<CostReservationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_call: Option<SubscriptionCallAllowanceV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_corrections: Vec<WorkCorrectionV1>,
     pub rooms: Vec<ProjectRoomV1>,
     pub questions: Vec<ProjectQuestionV1>,
     pub actions: Vec<ProjectActionV1>,
@@ -967,6 +980,15 @@ pub enum CompanyWorkflowCommandV1 {
         project_id: ProjectId,
         expected_version: u64,
         receipt: WorkTransitionReceiptV1,
+    },
+    /// Internal: the service must exclude an already materialized delivery first.
+    RequestWorkCorrection {
+        project_id: ProjectId,
+        expected_version: u64,
+        work_item_id: WorkItemId,
+        expected_work_version: u64,
+        execution_revision: crate::ExecutionRevisionV1,
+        feedback_ref: String,
     },
     RecordDecision {
         project_id: ProjectId,

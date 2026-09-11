@@ -18,6 +18,7 @@ use crate::{
 
 pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 2;
 mod revisions;
+pub(crate) use revisions::require_completed_source;
 pub use revisions::ExecutionRevisionV1;
 const MAX_NOT_FOUND_RECONCILES: u16 = 3;
 

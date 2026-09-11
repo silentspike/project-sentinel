@@ -251,7 +251,7 @@ fn validate_revision(revision: &ExecutionRevisionV1) -> Result<(), WorkflowError
     Ok(())
 }
 
-fn require_completed_source(
+pub(crate) fn require_completed_source(
     connection: &Connection,
     previous: &WorkItemExecutionV1,
 ) -> Result<(), WorkflowError> {

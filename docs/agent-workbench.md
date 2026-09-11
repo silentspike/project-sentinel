@@ -296,6 +296,32 @@ provider call, supply private diagnostics to a model, or complete the productive
 model-feedback loop. Those boundaries must explicitly use the revision contract;
 ordinary initial-plan admission still rejects a different plan for existing work.
 
+The company layer has a separate internal `RequestWorkCorrection` command. Only
+the project's manager or technical lead can request it, against exact company
+and execution versions. It validates the completed execution and output bindings,
+archives the previous company work item, and reopens that same work item as
+`assigned` without changing its employee or resetting execution/provider records.
+The correction record retains the feedback reference and digest, prior outputs,
+gate receipt, and assignment history. Empty correction history remains absent
+from legacy project encodings. Older readers cannot open aggregates containing
+new correction fields; rollback requires matching prior state.
+
+Corrections are rejected if an affected dependent has already advanced beyond
+dependency-pending, a handoff exists, or a relevant project blocker is unresolved.
+They do not silently invalidate consumed artifacts. Periodic company-state
+synchronization ignores a predecessor superseded by a correction, so its old
+`done` cannot complete the new attempt. Later assignment changes preserve the
+archived assignment rather than rewriting history.
+
+Complete correction history is visible only to the operator and the exact
+governed project manager or technical lead. Ordinary command responses omit
+these archived assignment, output, and feedback bindings for other participants.
+
+This command is not accepted through ordinary customer, agent, or operator HTTP
+commands. Productive exposure additionally requires the delivery-exclusion and
+provider-result checks, bounded feedback, and separately consumed next-call
+allowance. Source-level correction tests do not establish a live model loop.
+
 ### Runtime quiescence and unresolved outcomes
 
 A durable `executing` row is not proof that a tool process still exists. A lost
