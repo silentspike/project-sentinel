@@ -335,6 +335,7 @@ fn correction_fixture(
         )
         .unwrap(),
         feedback_ref: "qa-result-1".into(),
+        next_subscription_grant: None,
     };
     (state, project, command)
 }

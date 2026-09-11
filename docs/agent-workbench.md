@@ -318,9 +318,43 @@ governed project manager or technical lead. Ordinary command responses omit
 these archived assignment, output, and feedback bindings for other participants.
 
 This command is not accepted through ordinary customer, agent, or operator HTTP
-commands. Productive exposure additionally requires the delivery-exclusion and
-provider-result checks, bounded feedback, and separately consumed next-call
-allowance. Source-level correction tests do not establish a live model loop.
+commands. The dedicated `POST /agent/workflow/corrections` route requires an
+authenticated, governed project manager or technical lead. It uses the ordinary
+operation-ID/command envelope, but checks delivery exclusion under the exclusive
+workflow mutation fence before reopening work. Any materialized delivery rejects
+internal correction; customer delivery rework remains a different workflow.
+
+The route also requires the exact consumed subscription dispatch, committed
+usage event with nonzero model output, and the actual execution plan bound to
+that provider request. Normal completion removes the outbox payload; its absence
+is accepted only with those durable bindings and no operator-resolution marker.
+If the payload still exists, it must be `action_claimed`, match the committed
+usage event, and contain the proposal actually adopted as that execution.
+A provider status or missing row alone is not proof. Unresolved, foreign or
+changed provider evidence fails closed. The
+company transaction then verifies the full terminal execution receipt chain.
+An exact successful operation replay cannot authorize another call or revision.
+
+The optional `next_subscription_grant` creates a fresh single-call allowance in
+the same transaction as correction. Its predecessor must have been consumed and
+must name the same work, employee and assignment. The old allowance and dispatch
+remain in the correction history, and campaign accounting counts both old and
+new identities without double-counting unchanged snapshots. An invalid new grant
+rolls back the entire correction. Archived allowances cannot be claimed again.
+The configured allowance selector still explicitly controls which new grant may
+dispatch; correction admission alone does not invoke the provider.
+
+Model correction context binds the stored correction, predecessor plan/state,
+feedback reference and prior model-authored tools. Those tools are untrusted
+context, not replay instructions or a claim about actual artifact bytes. The
+model must propose a complete corrected sequence within the original profile.
+Context is bounded by the existing model-work byte ceiling. Adoption rechecks
+that context and uses revision admission instead of overwriting the old plan.
+Historical execution receipts remain readable after restart.
+
+Source integration tests use controlled model proposals and injected execution
+outcomes. They are not evidence of a live model correction, artifact inspection,
+independent QA or customer acceptance.
 
 ### Runtime quiescence and unresolved outcomes
 

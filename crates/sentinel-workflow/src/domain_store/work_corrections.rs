@@ -15,6 +15,7 @@ pub(super) fn request(
         expected_work_version,
         execution_revision,
         feedback_ref,
+        next_subscription_grant,
         ..
     } = command
     else {
@@ -125,6 +126,11 @@ pub(super) fn request(
         feedback_ref: feedback_ref.clone(),
         requested_by: principal.principal_id.clone(),
         requested_at_unix_ms: now_ms,
+        previous_subscription_call: project
+            .subscription_call
+            .as_ref()
+            .filter(|call| &call.grant.work_item_id == work_item_id)
+            .cloned(),
     };
     let actor = authorize_project_actor(project, principal)?;
     let work = project
@@ -146,6 +152,10 @@ pub(super) fn request(
     )?;
     project.work_corrections.push(correction);
     refresh_project_lifecycle(project);
+    if let Some(grant) = next_subscription_grant {
+        request_provider::ensure_legacy_grant_allowed(connection)?;
+        subscription::renew_for_correction(project, principal, operation_id, grant, now_ms)?;
+    }
     Ok(())
 }
 
@@ -174,6 +184,23 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
     let mut ids = BTreeSet::new();
     let mut plans = BTreeSet::new();
     for record in &project.work_corrections {
+        if let Some(allowance) = &record.previous_subscription_call {
+            subscription::validate_allowance(project, allowance)?;
+            if allowance.grant.work_item_id != record.previous.spec.work_item_id
+                || !record.previous.assignments.iter().any(|assignment| {
+                    assignment.active
+                        && assignment.assignment_id == allowance.grant.assignment_id
+                        && assignment.assignment_version == allowance.grant.assignment_version
+                        && assignment.agent_id == allowance.grant.agent_id
+                })
+                || allowance.created_at_unix_ms > record.requested_at_unix_ms
+                || allowance.dispatch.as_ref().is_some_and(|dispatch| {
+                    dispatch.dispatched_at_unix_ms > record.requested_at_unix_ms
+                })
+            {
+                return Err(corrupt());
+            }
+        }
         validate_identifier(&record.correction_id).map_err(|_| corrupt())?;
         validate_identifier(&record.feedback_ref).map_err(|_| corrupt())?;
         let revision = &record.execution_revision;

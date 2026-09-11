@@ -102,6 +102,12 @@ pub(super) fn claim(
         || allowance.allowance_id != allowance_id
         || request_id != format!("company-provider-{allowance_id}")
         || allowance.dispatch.is_some()
+        || project.work_corrections.iter().any(|record| {
+            record
+                .previous_subscription_call
+                .as_ref()
+                .is_some_and(|previous| previous.allowance_id == allowance.allowance_id)
+        })
         || now_ms < allowance.created_at_unix_ms
         || now_ms >= allowance.grant.expires_at_unix_ms
         || !active_assignment_matches(project, &allowance.grant)
@@ -124,6 +130,13 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
     let Some(allowance) = &project.subscription_call else {
         return Ok(());
     };
+    validate_allowance(project, allowance)
+}
+
+pub(super) fn validate_allowance(
+    project: &ProjectV1,
+    allowance: &SubscriptionCallAllowanceV1,
+) -> Result<(), WorkflowError> {
     validate_identifier(&allowance.allowance_id).map_err(|_| corrupt())?;
     validate_grant(&allowance.grant, allowance.created_at_unix_ms).map_err(|_| corrupt())?;
     let creator = project
@@ -167,4 +180,36 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
         }
     }
     Ok(())
+}
+
+pub(super) fn renew_for_correction(
+    project: &mut ProjectV1,
+    principal: &AuthenticatedCompanyPrincipalV1,
+    operation_id: Uuid,
+    next: &SubscriptionCallGrantV1,
+    now_ms: u64,
+) -> Result<(), WorkflowError> {
+    let record = project.work_corrections.last().ok_or_else(transition)?;
+    let prior = record
+        .previous_subscription_call
+        .as_ref()
+        .ok_or_else(transition)?;
+    if project.subscription_call.as_ref() != Some(prior)
+        || prior.dispatch.is_none()
+        || record.requested_at_unix_ms != now_ms
+        || record.requested_by != principal.principal_id
+        || record.previous.spec.work_item_id != next.work_item_id
+        || prior.grant.work_item_id != next.work_item_id
+        || prior.grant.agent_id != next.agent_id
+        || prior.grant.assignment_id != next.assignment_id
+        || prior.grant.assignment_version != next.assignment_version
+        || stable_domain_id("subscription", &principal.tenant_id, operation_id)?
+            == prior.allowance_id
+    {
+        return Err(invalid(
+            "correction subscription source changed or was not consumed",
+        ));
+    }
+    project.subscription_call = None;
+    grant(project, principal, operation_id, next, now_ms)
 }
