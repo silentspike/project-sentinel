@@ -1,5 +1,10 @@
 # Changelog
 
+- Preserve bounded, redacted failed-command diagnostics in the immediate
+  Workbench response and numeric exit/output accounting in immutable runtime
+  receipts and daemon replay. Keep private output out of durable records;
+  reject changed numeric terminal feedback and retain legacy history (#856).
+
 - Use the supported low reasoning effort for native Codex inference and report
   fixed private-safe error categories from JSONL failures; do not infer that a
   failed provider dispatch is replayable (#856).
