@@ -1,5 +1,31 @@
 # Changelog
 
+- Carry bounded leadership feedback into the next model turn, bind its exact
+  content to the prior artifact and revision, and reject missing reports on the
+  correction API. Preserve legacy records and reject altered feedback on replay
+  or store validation (#856).
+
+- Connect same-work model correction context to explicit revision admission,
+  preserve consumed subscription allowances across bounded renewal, and count
+  archived grants in campaign capacity. Add a leadership-only correction route
+  that checks delivery exclusion, retained provider results, committed usage and
+  the adopted source plan before reopening work (#856).
+
+- Bind internal company work corrections to completed execution evidence and
+  leadership authority. Preserve prior outputs and assignment history, reject
+  already consumed dependencies, and prevent periodic synchronization from
+  closing a pending correction with its predecessor's result (#856).
+
+- Add bounded same-work-item execution revisions using the existing workflow
+  journal. Preserve old plans and receipts, reject unresolved outcomes and
+  reused identities, and atomically admit the next execution without resetting
+  work-item versions or replaying prior effects (#856).
+
+- Preserve bounded, redacted failed-command diagnostics in the immediate
+  Workbench response and numeric exit/output accounting in immutable runtime
+  receipts and daemon replay. Keep private output out of durable records;
+  reject changed numeric terminal feedback and retain legacy history (#856).
+
 - Use the supported low reasoning effort for native Codex inference and report
   fixed private-safe error categories from JSONL failures; do not infer that a
   failed provider dispatch is replayable (#856).

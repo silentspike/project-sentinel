@@ -17,6 +17,9 @@ use crate::{
 };
 
 pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 2;
+mod revisions;
+pub(crate) use revisions::require_completed_source;
+pub use revisions::ExecutionRevisionV1;
 const MAX_NOT_FOUND_RECONCILES: u16 = 3;
 
 const SCHEMA: &str = r#"
@@ -253,11 +256,12 @@ impl WorkflowStore {
             }
             let response: WorkItemExecutionV1 = decode(&response)?;
             validate_operation_response(&response, plan, stored_u64(created_at_ms)?)?;
-            let current = read_work_item(
+            let current = revisions::read_plan_version(
                 &transaction,
                 &plan.tenant_id,
                 &plan.project_id,
                 &plan.work_item_id,
+                plan.plan_id,
             )?
             .ok_or_else(corrupt_store)?;
             if current.plan != *plan {
@@ -1504,6 +1508,18 @@ fn validate_gate_evidence(
 }
 
 fn put_work_item(tx: &Transaction<'_>, value: &WorkItemExecutionV1) -> Result<(), WorkflowError> {
+    if read_work_item(tx, &value.tenant_id, &value.project_id, &value.work_item_id)?
+        .is_some_and(|current| current.plan.plan_id != value.plan.plan_id)
+    {
+        return Err(authority_conflict());
+    }
+    write_current_work_item(tx, value)
+}
+
+fn write_current_work_item(
+    tx: &Transaction<'_>,
+    value: &WorkItemExecutionV1,
+) -> Result<(), WorkflowError> {
     tx.execute(
         "INSERT INTO workflow_work_items (tenant_id,project_id,work_item_id,version,payload) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(tenant_id,project_id,work_item_id) DO UPDATE SET version=excluded.version,payload=excluded.payload",
         params![value.tenant_id.0, value.project_id.0, value.work_item_id.0, sql_u64(value.version)?, encode(value)?],
@@ -1688,20 +1704,25 @@ pub(crate) fn read_work_item_by_invocation(
     connection: &Connection,
     invocation_id: Uuid,
 ) -> Result<Option<WorkItemExecutionV1>, WorkflowError> {
-    let key: Option<(String, String, String)> = connection
+    let key: Option<(String, String, String, Vec<u8>)> = connection
         .query_row(
-            "SELECT tenant_id,project_id,work_item_id FROM workflow_execution_outbox WHERE invocation_id=?1",
+            "SELECT tenant_id,project_id,work_item_id,request FROM workflow_execution_outbox WHERE invocation_id=?1",
             [invocation_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(map_sqlite_error)?;
-    key.map(|(tenant, project, work)| {
-        read_work_item(
+    key.map(|(tenant, project, work, payload)| {
+        let request: PendingExecutionV1 = decode(&payload)?;
+        if request.step.invocation_id != invocation_id {
+            return Err(corrupt_store());
+        }
+        revisions::read_plan_version(
             connection,
             &crate::TenantId(tenant),
             &crate::ProjectId(project),
             &crate::WorkItemId(work),
+            request.plan_id,
         )?
         .ok_or_else(corrupt_store)
     })
@@ -1721,11 +1742,12 @@ fn read_work_item_by_plan(
         .optional()
         .map_err(map_sqlite_error)?;
     key.map(|(tenant, project, work)| {
-        read_work_item(
+        revisions::read_plan_version(
             connection,
             &crate::TenantId(tenant),
             &crate::ProjectId(project),
             &crate::WorkItemId(work),
+            plan_id,
         )?
         .ok_or_else(corrupt_store)
     })
@@ -1806,7 +1828,7 @@ fn operation_namespace(plan: &ExecutionPlanV1) -> String {
 }
 
 fn read_operation(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     namespace: &str,
     operation_id: &str,
 ) -> Result<Option<(String, Vec<u8>, i64)>, WorkflowError> {

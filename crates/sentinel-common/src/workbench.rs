@@ -673,6 +673,61 @@ pub struct WorkbenchResourceUsage {
     pub artifact_bytes: u64,
 }
 
+/// Durable command feedback contains numbers only, never command output or paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkbenchCommandStatus {
+    pub exit_code: i32,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+}
+
+impl WorkbenchCommandStatus {
+    pub fn from_output(output: &BTreeMap<String, String>) -> Result<Option<Self>, &'static str> {
+        let keys = ["exit_code", "stdout_bytes", "stderr_bytes"];
+        if keys.iter().all(|key| !output.contains_key(*key)) {
+            return Ok(None);
+        }
+        let exit_code = output
+            .get(keys[0])
+            .ok_or("incomplete command status")?
+            .parse::<i32>()
+            .map_err(|_| "invalid command exit code")?;
+        let stdout_bytes = output
+            .get(keys[1])
+            .ok_or("incomplete command status")?
+            .parse::<u64>()
+            .map_err(|_| "invalid command output size")?;
+        let stderr_bytes = output
+            .get(keys[2])
+            .ok_or("incomplete command status")?
+            .parse::<u64>()
+            .map_err(|_| "invalid command output size")?;
+        let status = Self {
+            exit_code,
+            stdout_bytes,
+            stderr_bytes,
+        };
+        if !(-1..=255).contains(&exit_code)
+            || status
+                .output()
+                .iter()
+                .any(|(key, value)| output.get(key) != Some(value))
+        {
+            return Err("noncanonical command status");
+        }
+        Ok(Some(status))
+    }
+
+    pub fn output(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("exit_code".to_string(), self.exit_code.to_string()),
+            ("stdout_bytes".to_string(), self.stdout_bytes.to_string()),
+            ("stderr_bytes".to_string(), self.stderr_bytes.to_string()),
+        ])
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkbenchArtifactRef {
@@ -753,6 +808,47 @@ pub enum WorkbenchValidationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_feedback_is_numeric_complete_and_canonical() {
+        let expected = WorkbenchCommandStatus {
+            exit_code: 1,
+            stdout_bytes: 0,
+            stderr_bytes: 42,
+        };
+        let mut output = expected.output();
+        output.insert("stderr".into(), "PRIVATE-DIAGNOSTIC".into());
+        output.insert("suite_id".into(), "PRIVATE-SUITE".into());
+        assert_eq!(
+            WorkbenchCommandStatus::from_output(&output),
+            Ok(Some(expected.clone()))
+        );
+        assert!(!serde_json::to_string(&expected)
+            .unwrap()
+            .contains("PRIVATE"));
+        for (key, value) in [
+            ("exit_code", "256"),
+            ("exit_code", "-2"),
+            ("exit_code", "+1"),
+            ("exit_code", "01"),
+            ("stdout_bytes", "-1"),
+            ("stderr_bytes", "18446744073709551616"),
+            ("stderr_bytes", "PRIVATE"),
+        ] {
+            let mut invalid = output.clone();
+            invalid.insert(key.into(), value.into());
+            assert!(
+                WorkbenchCommandStatus::from_output(&invalid).is_err(),
+                "{key}={value}"
+            );
+        }
+        output.remove("exit_code");
+        assert!(WorkbenchCommandStatus::from_output(&output).is_err());
+        assert_eq!(
+            WorkbenchCommandStatus::from_output(&BTreeMap::new()),
+            Ok(None)
+        );
+    }
 
     fn request() -> WorkbenchRequest {
         WorkbenchRequest {

@@ -617,6 +617,8 @@ fn project_command(
 
 #[path = "company_domain/subscription.rs"]
 mod subscription;
+#[path = "company_domain/work_corrections.rs"]
+mod work_corrections;
 
 fn collaboration_authority(
     project: &sentinel_workflow::ProjectV1,

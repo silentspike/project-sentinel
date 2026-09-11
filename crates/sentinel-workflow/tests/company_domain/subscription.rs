@@ -100,7 +100,7 @@ fn request_provider_accounting_preserves_legacy_grants_and_unknown_dispatches() 
     }
 }
 
-fn assigned() -> (Journey, ProjectV1, SubscriptionCallGrantV1) {
+pub(super) fn assigned() -> (Journey, ProjectV1, SubscriptionCallGrantV1) {
     let state = journey();
     let project = project_command(
         &state.store,

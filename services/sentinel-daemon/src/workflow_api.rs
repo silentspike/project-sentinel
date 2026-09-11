@@ -8,6 +8,7 @@ pub mod model_execution;
 pub mod model_work;
 #[cfg(feature = "llm")]
 mod subscription;
+mod work_correction;
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -74,6 +75,7 @@ pub const OPERATOR_COMMAND_PATH: &str = "/operator/workflow/commands";
 pub const REQUEST_PROVIDER_PATH: &str = "/operator/workflow/request-provider";
 pub const REQUEST_PROVIDER_ABANDON_PATH: &str = "/operator/workflow/request-provider/abandon";
 pub const AGENT_COMMAND_PATH: &str = "/agent/workflow/commands";
+pub const WORK_CORRECTION_PATH: &str = "/agent/workflow/corrections";
 pub const OPERATOR_PROJECT_PATH: &str = "/operator/workflow/projects";
 pub const OPERATOR_WORK_ITEM_PATH: &str = "/operator/workflow/work-items";
 pub const OPERATOR_PROJECTION_PATH: &str = "/operator/workflow/projections";
@@ -432,6 +434,17 @@ impl CompanyAuthority {
         intent: &ExecutionIntentV1,
         now_ms: u64,
     ) -> Result<ExecutionIntentAdmission, WorkflowError> {
+        self.plan_from_intent_revision(principal, operation_id, intent, None, now_ms)
+    }
+
+    fn plan_from_intent_revision(
+        &self,
+        principal: &BoundPrincipal,
+        operation_id: Uuid,
+        intent: &ExecutionIntentV1,
+        revision: Option<&sentinel_workflow::ExecutionRevisionV1>,
+        now_ms: u64,
+    ) -> Result<ExecutionIntentAdmission, WorkflowError> {
         let agent_id = principal
             .principal
             .agent_id
@@ -456,57 +469,67 @@ impl CompanyAuthority {
                     "execution work item was not found",
                 )
             })?;
+        if let Some(revision) = revision {
+            if !project.work_corrections.iter().any(|correction| {
+                correction.previous.spec.work_item_id == intent.work_item_id
+                    && &correction.execution_revision == revision
+            }) {
+                return Err(execution_authority_conflict());
+            }
+        }
+        let replay = self.store.work_item_for_plan(
+            &principal.principal.tenant_id,
+            &intent.project_id,
+            &intent.work_item_id,
+            operation_id,
+        )?;
+        if let Some(existing) = replay {
+            let authority = self
+                .snapshot_for_admission(
+                    &principal.principal.tenant_id,
+                    &intent.project_id,
+                    &intent.work_item_id,
+                    agent_id,
+                    false,
+                )
+                .map_err(execution_intent_port_error)?;
+            if authority.principal != principal.execution_authority
+                || !existing.plan.authority_matches(&authority)
+            {
+                return Err(execution_authority_conflict());
+            }
+            if !execution_intent_matches_plan(intent, &existing.plan) {
+                return Err(WorkflowError::new(
+                    WorkflowErrorCode::IdempotencyConflict,
+                    false,
+                    "execution intent content changed for an existing operation",
+                ));
+            }
+            return Ok(ExecutionIntentAdmission {
+                plan: existing.plan,
+                authority,
+                replay: true,
+            });
+        }
         let existing = self.store.work_item(
             &principal.principal.tenant_id,
             &intent.project_id,
             &intent.work_item_id,
         )?;
-        if let Some(existing) = existing {
-            if existing.plan.plan_id == operation_id {
-                let authority = self
-                    .snapshot_for_admission(
-                        &principal.principal.tenant_id,
-                        &intent.project_id,
-                        &intent.work_item_id,
-                        agent_id,
-                        false,
-                    )
-                    .map_err(execution_intent_port_error)?;
-                if authority.principal != principal.execution_authority
-                    || !existing.plan.authority_matches(&authority)
-                {
-                    return Err(execution_authority_conflict());
-                }
-                if !execution_intent_matches_plan(intent, &existing.plan) {
-                    return Err(WorkflowError::new(
-                        WorkflowErrorCode::IdempotencyConflict,
-                        false,
-                        "execution intent content changed for an existing operation",
-                    ));
-                }
-                return Ok(ExecutionIntentAdmission {
-                    plan: existing.plan,
-                    authority,
-                    replay: true,
-                });
+        match (existing.as_ref(), revision) {
+            (Some(previous), Some(revision))
+                if sentinel_workflow::ExecutionRevisionV1::from_completed_work(
+                    previous,
+                    revision.feedback_digest.clone(),
+                )? == *revision => {}
+            (None, None) => {}
+            _ => {
+                return Err(WorkflowError::new(
+                    WorkflowErrorCode::VersionConflict,
+                    false,
+                    "execution intent does not match an authorized correction",
+                ))
             }
-
-            let authority = self
-                .snapshot(
-                    &principal.principal.tenant_id,
-                    &intent.project_id,
-                    &intent.work_item_id,
-                    agent_id,
-                )
-                .map_err(execution_intent_port_error)?;
-            if authority.principal != principal.execution_authority {
-                return Err(execution_authority_conflict());
-            }
-            return Err(WorkflowError::new(
-                WorkflowErrorCode::VersionConflict,
-                false,
-                "work item already has a different execution intent",
-            ));
         }
 
         let authority = self
@@ -1465,6 +1488,7 @@ fn company_command_response(
         );
     };
     for field in [
+        "work_corrections",
         "collaboration_sessions",
         "handoff_packets",
         "dissent_records",
@@ -2731,6 +2755,7 @@ impl WorkflowApi {
             ("POST", REQUEST_PROVIDER_PATH) => self.authorize_sales_request(&principal, body),
             ("POST", REQUEST_PROVIDER_ABANDON_PATH) => self.abandon_sales_request(&principal, body),
             ("POST", AGENT_COMMAND_PATH) => self.agent_command(&principal, body),
+            ("POST", WORK_CORRECTION_PATH) => self.correct_model_work(&principal, body),
             ("GET", CUSTOMER_REQUEST_PATH) => self.customer_request(&principal, path),
             ("GET", CUSTOMER_IDENTITY_PATH) => customer_identity(&principal),
             ("GET", CUSTOMER_OVERVIEW_PATH) => self.customer_overview(&principal, path),
@@ -4152,6 +4177,14 @@ impl WorkflowApi {
                 .ok_or_else(|| {
                     WorkflowError::new(WorkflowErrorCode::NotFound, false, "project not found")
                 })?;
+            // A correction is pending until its new plan exists. Old completion
+            // replay must not close it again during periodic reconciliation.
+            if project.work_corrections.iter().any(|correction| {
+                correction.previous.spec.work_item_id == execution.work_item_id
+                    && correction.execution_revision.previous_plan_id == execution.plan.plan_id
+            }) {
+                return Ok(());
+            }
             let work = project
                 .work_items
                 .get(&execution.work_item_id)
@@ -4625,6 +4658,7 @@ fn is_workflow_path(path: &str) -> bool {
             | CUSTOMER_PREVIEW_PATH
             | OPERATOR_COMMAND_PATH
             | REQUEST_PROVIDER_PATH
+            | WORK_CORRECTION_PATH
             | REQUEST_PROVIDER_ABANDON_PATH
             | AGENT_COMMAND_PATH
             | OPERATOR_PROJECT_PATH
@@ -4739,6 +4773,7 @@ fn is_internal_company_command(command: &CompanyWorkflowCommandV1) -> bool {
     matches!(
         command,
         CompanyWorkflowCommandV1::ApplyWorkTransition { .. }
+            | CompanyWorkflowCommandV1::RequestWorkCorrection { .. }
             | CompanyWorkflowCommandV1::ClaimSubscriptionCall { .. }
             | CompanyWorkflowCommandV1::CreateGovernedRework { .. }
             | CompanyWorkflowCommandV1::AdmitCollaboration { .. }
@@ -5203,6 +5238,7 @@ mod tests {
             blockers: Vec::new(),
             approvals: Vec::new(),
             subscription_call: None,
+            work_corrections: Vec::new(),
             reservations: vec![sentinel_workflow::CostReservationV1 {
                 reservation_id: "reservation-m0".to_owned(),
                 work_item_id: Some(work_item_id),
@@ -5289,6 +5325,24 @@ mod tests {
         assert!(may_read_full_project(&project, &operator));
 
         project.collaboration_generation = 2;
+        project
+            .work_corrections
+            .push(sentinel_workflow::WorkCorrectionV1 {
+                correction_id: "correction-private".to_owned(),
+                previous: project.work_items.values().next().unwrap().clone(),
+                execution_revision: sentinel_workflow::ExecutionRevisionV1 {
+                    previous_plan_id: Uuid::new_v4(),
+                    previous_plan_digest: "a".repeat(64),
+                    previous_version: 1,
+                    previous_state_digest: "b".repeat(64),
+                    feedback_digest: "c".repeat(64),
+                },
+                feedback_ref: "private-feedback".to_owned(),
+                feedback: None,
+                requested_by: "pm-1".to_owned(),
+                requested_at_unix_ms: 4,
+                previous_subscription_call: None,
+            });
         let outcome = sentinel_workflow::CompanyCommandOutcomeV1 {
             replayed: false,
             response: CompanyWorkflowResponseV1::Project(Box::new(project.clone())),
@@ -5299,6 +5353,9 @@ mod tests {
         assert!(redacted
             .pointer("/response/value/collaboration_generation")
             .is_none());
+        assert!(redacted
+            .pointer("/response/value/work_corrections")
+            .is_none());
 
         let full = company_command_response(&outcome, &operator);
         assert_eq!(full.status, 200);
@@ -5306,6 +5363,10 @@ mod tests {
         assert_eq!(
             full.pointer("/response/value/collaboration_generation"),
             Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            full.pointer("/response/value/work_corrections/0/feedback_ref"),
+            Some(&serde_json::json!("private-feedback"))
         );
     }
 
@@ -5568,6 +5629,23 @@ mod tests {
 
         assert!(is_internal_company_command(&transition));
         assert!(is_internal_company_command(&rework));
+        let correction = CompanyWorkflowCommandV1::RequestWorkCorrection {
+            project_id: ProjectId::parse("project-m0").unwrap(),
+            expected_version: 1,
+            work_item_id: WorkItemId::parse("work-m0").unwrap(),
+            expected_work_version: 1,
+            execution_revision: sentinel_workflow::ExecutionRevisionV1 {
+                previous_plan_id: Uuid::from_u128(1),
+                previous_plan_digest: "a".repeat(64),
+                previous_version: 1,
+                previous_state_digest: "b".repeat(64),
+                feedback_digest: "c".repeat(64),
+            },
+            feedback_ref: "qa-result-1".to_owned(),
+            feedback: None,
+            next_subscription_grant: None,
+        };
+        assert!(is_internal_company_command(&correction));
 
         let reliability = CompanyWorkflowCommandV1::RecordCollaborationReliability {
             project_id: ProjectId::parse("project-m0").unwrap(),

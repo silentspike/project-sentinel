@@ -2125,6 +2125,7 @@ mod tests {
             completed_at_ms: Some(101),
             resources: None,
             result_digest: Some(digest("qa-result").as_str().to_string()),
+            command_status: None,
             artifacts: Vec::new(),
             error: None,
         };

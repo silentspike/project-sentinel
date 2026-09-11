@@ -32,7 +32,7 @@ const MAX_ARTIFACT_MANIFEST_BYTES: u64 = 1024 * 1024;
 const COMPLETION_RECEIPT_DIRECTORY: &str = ".workbench-receipts";
 const COMPLETION_RECEIPT_DIRECTORY_MODE: u32 = 0o700;
 const COMPLETION_RECEIPT_FILE_MODE: u32 = 0o600;
-const COMPLETION_RECEIPT_SCHEMA_VERSION: u16 = 1;
+const COMPLETION_RECEIPT_SCHEMA_VERSION: u16 = 2;
 const SAFE_ENVIRONMENT: [(&str, &str); 4] = [
     ("HOME", "/workspace"),
     ("LANG", "C.UTF-8"),
@@ -1119,20 +1119,23 @@ impl WorkbenchExecutor {
         if let Some(suite_id) = suite_id {
             output.insert("suite_id".to_string(), suite_id.to_string());
         }
-        if !status.success() {
-            return Err(ExecutionError::tool(
-                "command_failed",
-                "the allowlisted command returned a non-zero status",
-            ));
-        }
-        Ok(ExecutionSuccess {
+        let completed = ExecutionSuccess {
             output,
             bytes_read: stdout.total + stderr.total,
             cpu_time_ms: observed.cpu_time_ms,
             peak_memory_bytes: observed.peak_memory_bytes,
             peak_process_count: observed.peak_process_count,
             ..ExecutionSuccess::default()
-        })
+        };
+        if !status.success() {
+            let mut error = ExecutionError::tool(
+                "command_failed",
+                "the allowlisted command returned a non-zero status",
+            );
+            error.command_result = Some(Box::new(completed));
+            return Err(error);
+        }
+        Ok(completed)
     }
 
     fn package_artifact(
@@ -1667,7 +1670,10 @@ fn seal_terminal_result(
     let WorkbenchMessage::Result { output, .. } = &mut durable_result else {
         unreachable!("terminal receipt validation already rejected non-results");
     };
-    output.clear();
+    *output = sentinel_common::WorkbenchCommandStatus::from_output(output)
+        .map_err(|_| recovery_error("command_status_invalid", "command status is invalid"))?
+        .map(|status| status.output())
+        .unwrap_or_default();
     let result_bytes = serde_json::to_vec(&durable_result).map_err(|_| {
         recovery_error(
             "caller_result_encode_failed",
@@ -1696,10 +1702,18 @@ fn serialized_caller_result_size(message: &WorkbenchMessage) -> Option<usize> {
 fn validate_sealed_completion_receipt(
     sealed: SealedCompletionReceipt,
 ) -> Result<WorkbenchMessage, WorkbenchErrorInfo> {
-    if sealed.schema_version != COMPLETION_RECEIPT_SCHEMA_VERSION {
+    if !matches!(sealed.schema_version, 1 | COMPLETION_RECEIPT_SCHEMA_VERSION) {
         return Err(recovery_error(
             "completion_receipt_version_unsupported",
             "the completion receipt version is unsupported",
+        ));
+    }
+    if sealed.schema_version == 1
+        && matches!(&sealed.result, WorkbenchMessage::Result { output, .. } if !output.is_empty())
+    {
+        return Err(recovery_error(
+            "completion_receipt_binding_mismatch",
+            "legacy completion receipts cannot contain command output",
         ));
     }
     let validated = seal_terminal_result(&sealed.result)?;
@@ -1867,12 +1881,24 @@ fn sample_process_group(process_group: u32) -> ProcessGroupUsage {
     usage
 }
 
-#[derive(Debug)]
 struct ExecutionError {
     class: WorkbenchErrorClass,
     code: &'static str,
     safe_message: String,
     retryable: bool,
+    command_result: Option<Box<ExecutionSuccess>>,
+}
+
+impl std::fmt::Debug for ExecutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A diagnostic error may now carry private transient command output.
+        formatter
+            .debug_struct("ExecutionError")
+            .field("class", &self.class)
+            .field("code", &self.code)
+            .field("retryable", &self.retryable)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExecutionError {
@@ -1887,6 +1913,7 @@ impl ExecutionError {
             code,
             safe_message: safe_message.to_string(),
             retryable,
+            command_result: None,
         }
     }
 
@@ -2625,6 +2652,11 @@ fn failure_message(
     outcome: WorkbenchOutcome,
     error: ExecutionError,
 ) -> WorkbenchMessage {
+    let info = error.info();
+    let completed = error
+        .command_result
+        .map(|result| *result)
+        .unwrap_or_default();
     WorkbenchMessage::Result {
         schema_version: WORKBENCH_SCHEMA_VERSION,
         invocation_id: request.invocation_id.clone(),
@@ -2632,11 +2664,15 @@ fn failure_message(
         outcome,
         resources: WorkbenchResourceUsage {
             duration_ms: elapsed_ms(started),
+            cpu_time_ms: completed.cpu_time_ms,
+            peak_memory_bytes: completed.peak_memory_bytes,
+            peak_process_count: completed.peak_process_count,
+            bytes_read: completed.bytes_read,
             ..WorkbenchResourceUsage::default()
         },
         artifacts: Vec::new(),
-        output: BTreeMap::new(),
-        error: Some(error.info()),
+        output: completed.output,
+        error: Some(info),
     }
 }
 
@@ -3376,7 +3412,8 @@ mod tests {
         let WorkbenchMessage::Result { output, .. } = replay else {
             panic!("command replay did not return a durable-safe result");
         };
-        assert!(output.is_empty());
+        assert_eq!(output.get("exit_code").map(String::as_str), Some("0"));
+        assert_eq!(output.len(), 3);
         let receipt = directory
             .path()
             .join("artifacts")
@@ -3592,6 +3629,91 @@ mod tests {
             outcome(&executor.execute(foreign_command, Arc::new(AtomicBool::new(false)))),
             WorkbenchOutcome::Failed
         );
+    }
+
+    #[test]
+    fn failed_command_feedback_survives_restart_without_private_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let artifacts = directory.path().join("artifacts");
+        let executor = WorkbenchExecutor::new(&workspace, &artifacts);
+        let mut command = request(
+            WorkbenchTool::RunCommand {
+                program: "cat".into(),
+                args: vec!["missing-feedback-input".into()],
+            },
+            "command.run_allowlisted",
+        );
+        command.command_policy = vec![CommandRule {
+            program: "cat".into(),
+            required_arg_prefix: Vec::new(),
+            max_args: 1,
+        }];
+        command.input_digest = command.canonical_digest().unwrap();
+        let result = executor.execute(command.clone(), Arc::new(AtomicBool::new(false)));
+        let WorkbenchMessage::Result {
+            outcome,
+            output,
+            resources,
+            error,
+            ..
+        } = &result
+        else {
+            panic!("command did not return a result");
+        };
+        assert_eq!(*outcome, WorkbenchOutcome::Failed);
+        assert_eq!(error.as_ref().unwrap().code, "command_failed");
+        assert_eq!(output["exit_code"], "1");
+        assert!(output["stderr"].contains("missing-feedback-input"));
+        assert!(resources.bytes_read > 0);
+        let expected = sentinel_common::WorkbenchCommandStatus::from_output(output)
+            .unwrap()
+            .unwrap();
+        executor.persist_completion_receipt(&result).unwrap();
+        drop(executor);
+        let restarted = WorkbenchExecutor::new(&workspace, &artifacts);
+        let recovered = restarted
+            .recover_completion(&command.invocation_id, &command.input_digest)
+            .unwrap();
+        let WorkbenchMessage::Result {
+            output,
+            resources: replay_resources,
+            ..
+        } = &recovered
+        else {
+            panic!("recovery did not return a result");
+        };
+        assert_eq!(output, &expected.output());
+        assert_eq!(replay_resources, resources);
+        assert!(!serde_json::to_string(&recovered)
+            .unwrap()
+            .contains("missing-feedback-input"));
+        let receipt_path = artifacts
+            .join(COMPLETION_RECEIPT_DIRECTORY)
+            .join(format!("{}.json", command.invocation_id));
+        assert!(!fs::read_to_string(receipt_path)
+            .unwrap()
+            .contains("missing-feedback-input"));
+        let mut conflicting = result;
+        if let WorkbenchMessage::Result { output, .. } = &mut conflicting {
+            output.insert("exit_code".into(), "2".into());
+        }
+        assert_eq!(
+            restarted
+                .persist_completion_receipt(&conflicting)
+                .unwrap_err()
+                .code,
+            "completion_receipt_conflict"
+        );
+    }
+
+    #[test]
+    fn command_feedback_legacy_receipt_remains_readable_without_backfill() {
+        let (result, _, _) = completion_result();
+        let mut sealed = seal_terminal_result(&result).unwrap();
+        sealed.schema_version = 1;
+        let recovered = validate_sealed_completion_receipt(sealed).unwrap();
+        assert!(matches!(recovered, WorkbenchMessage::Result { output, .. } if output.is_empty()));
     }
 
     #[test]
