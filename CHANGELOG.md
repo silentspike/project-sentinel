@@ -1,5 +1,8 @@
 # Changelog
 
+- Add a customer document preview with source-checked sandbox messaging,
+  inert HTML rendering, blocked external navigation, and release revocation handling (#856).
+
 - Add bounded customer artifact-file reads with server-resolved ownership,
   post-read release revalidation and a separately authenticated preview proxy (#856).
 
