@@ -1,5 +1,8 @@
 # Changelog
 
+- Add explicit customer delivery acceptance with exact displayed references,
+  identity-scoped durable browser retries and no implicit acceptance on preview (#856).
+
 - Add a customer document preview with source-checked sandbox messaging,
   inert HTML rendering, blocked external navigation, and release revocation handling (#856).
 

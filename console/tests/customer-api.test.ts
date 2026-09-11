@@ -1,10 +1,26 @@
-import { beforeEach, describe, expect, it } from "vitest";
-import { CustomerApiError, dispatchReserved, pendingKey, readPending, reserveCommand, type CustomerIdentity } from "../src/customer/api";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CustomerApiError, dispatchReserved, pendingKey, readPending, reserveCommand, sendCustomerCommand, type CustomerIdentity } from "../src/customer/api";
 
 const identity: CustomerIdentity = { schema_version: 1, tenant_id: "tenant-a", customer_id: "customer-a", principal_id: "principal-a" };
 
 describe("customer command reservations", () => {
   beforeEach(() => localStorage.clear());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("replays delivery confirmation on its original endpoint with exact references", async () => {
+    const command = { command: "confirm_delivery", project_id: "project-one", delivery: { id: "delivery-one", generation: 2, digest: "a".repeat(64) }, release: { id: "release-one", generation: 3, digest: "b".repeat(64) } };
+    const pending = reserveCommand(localStorage, identity, command);
+    const fetcher = vi.fn().mockRejectedValueOnce(new Error("connection_lost")).mockResolvedValueOnce(new Response("{}"));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(dispatchReserved(localStorage, identity, pending, sendCustomerCommand)).rejects.toThrow("connection_lost");
+    await dispatchReserved(localStorage, identity, readPending(localStorage, identity)!, sendCustomerCommand);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    for (const [url, options] of fetcher.mock.calls) {
+      expect(url).toBe("/api/customer/delivery");
+      expect(JSON.parse(options.body)).toEqual({ operation_id: pending.operation_id, intent: { action: "confirm_delivery", project_id: command.project_id, delivery: command.delivery, release: command.release } });
+    }
+    expect(readPending(localStorage, identity)).toBeNull();
+  });
 
   it("preserves the exact operation and payload across reload", () => {
     const command = { command: "submit_customer_request", summary_ref: "Studio", desired_outcome: "Website", constraints: [] };

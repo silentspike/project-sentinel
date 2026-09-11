@@ -62,6 +62,14 @@ export async function customerFetch<T>(path: string, body?: unknown): Promise<T>
   return value as T;
 }
 
+export function sendCustomerCommand(body: Pick<PendingCommand, "operation_id" | "command">): Promise<unknown> {
+  if (body.command.command === "confirm_delivery") {
+    const { command: _command, ...intent } = body.command;
+    return customerFetch("delivery", { operation_id: body.operation_id, intent: { ...intent, action: "confirm_delivery" } });
+  }
+  return customerFetch("commands", body);
+}
+
 export function pendingKey(identity: CustomerIdentity): string {
   return `sentinel.customer.pending.v1:${JSON.stringify([identity.tenant_id, identity.customer_id, identity.principal_id])}`;
 }
