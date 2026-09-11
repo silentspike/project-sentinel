@@ -34,6 +34,7 @@ LoadCredential=caller-agent-runtime:/etc/sentinel/credentials/caller-agent-runti
 LoadCredential=caller-platform:/etc/sentinel/credentials/caller-platform
 LoadCredential=caller-evolution:/etc/sentinel/credentials/caller-evolution
 LoadCredential=operator-api:/etc/sentinel/credentials/operator-api
+LoadCredential=workflow-operator:/etc/sentinel/credentials/workflow-operator
 LoadCredential=workflow-customer:/etc/sentinel/credentials/workflow-customer
 LoadCredential=workflow-sales:/etc/sentinel/credentials/workflow-sales
 LoadCredential=workflow-project-manager:/etc/sentinel/credentials/workflow-project-manager

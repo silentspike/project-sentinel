@@ -13,6 +13,17 @@ struct DispatchRequest {
     provider: String,
     model: String,
     catalog_digest: String,
+    #[serde(default)]
+    subject: Option<RequestSubject>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RequestSubject {
+    CustomerRequest {
+        request_id: String,
+        request_version: u64,
+    },
 }
 
 impl WorkflowApi {
@@ -27,7 +38,7 @@ impl WorkflowApi {
             Ok(deadline) => json(
                 200,
                 &serde_json::json!({
-                    "schema_version": 1,
+                    "schema_version": request.schema_version,
                     "allowance_id": request.allowance_id,
                     "request_id": request.request_id,
                     "request_digest": request.request_digest,
@@ -51,13 +62,20 @@ impl WorkflowApi {
         let now_ms = now_unix_ms();
         if !self.enabled
             || !self.model_work_enabled
-            || request.schema_version != 1
+            || !matches!(request.schema_version, 1 | 2)
             || self.subscription_allowance_id.as_deref() != Some(request.allowance_id.as_str())
         {
             return Err("subscription mode unavailable");
         }
+        if request.schema_version == 2 {
+            return self.claim_sales_dispatch(request, now_ms);
+        }
+        if request.subject.is_some() || self.request_sales_tenant.is_some() {
+            return Err("subscription subject mismatch");
+        }
         let binding = <Self as crate::llm_bridge::bridge::ProviderUsageAuthorityResolver>::resolve_provider_usage_authority(self, AgentId(request.agent_id))?
             .ok_or("subscription binding unavailable")?;
+        let binding = binding.project().ok_or("project binding unavailable")?;
         let grant = binding
             .subscription_grant
             .as_ref()
@@ -71,7 +89,7 @@ impl WorkflowApi {
             return Err("subscription binding changed");
         }
         let context = self
-            .prepare_model_work(&binding)?
+            .prepare_model_work(binding)?
             .ok_or("model context unavailable")?;
         context.validate_dispatch(now_ms)?;
         let context_bytes = serde_json::to_vec(&context).map_err(|_| "model context invalid")?;
@@ -123,6 +141,85 @@ impl WorkflowApi {
                 now_ms,
             )
             .map_err(|_| "subscription claim denied")?;
+        Ok(grant
+            .expires_at_unix_ms
+            .min(now_ms.saturating_add(grant.max_duration_ms)))
+    }
+
+    fn claim_sales_dispatch(
+        &self,
+        request: &DispatchRequest,
+        now_ms: u64,
+    ) -> Result<u64, &'static str> {
+        use super::model_execution::{ModelExecutionContext, RequestSalesAuthority};
+        let Some(RequestSubject::CustomerRequest {
+            request_id,
+            request_version,
+        }) = &request.subject
+        else {
+            return Err("Sales request subject missing");
+        };
+        let call = self
+            .request_sales_call()?
+            .ok_or("Sales allowance unavailable")?;
+        let grant = &call.grant;
+        if request_id != &grant.request_id
+            || *request_version != grant.expected_version
+            || grant.sales_principal.agent_id != Some(AgentId(request.agent_id))
+            || request.allowance_id != call.allowance_id
+            || request.provider != grant.provider
+            || request.model != grant.model
+            || request.catalog_digest != grant.catalog_digest
+            || request.request_id != format!("company-provider-{}", call.allowance_id)
+        {
+            return Err("Sales dispatch binding mismatch");
+        }
+        let context = ModelExecutionContext::RequestSales(Box::new(self.prepare_request_sales(
+            &RequestSalesAuthority {
+                schema_version: 2,
+                allowance_id: call.allowance_id.clone(),
+                grant: grant.clone(),
+            },
+        )?));
+        context.validate_dispatch(now_ms)?;
+        if format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&context).map_err(|_| "Sales context invalid")?)
+        ) != request.context_digest
+        {
+            return Err("Sales dispatch context mismatch");
+        }
+        let pending = self
+            .event_store
+            .as_ref()
+            .ok_or("Sales EventStore unavailable")?
+            .get_llm_completion(&request.request_id)
+            .map_err(|_| "Sales reservation unavailable")?
+            .ok_or("Sales request not reserved")?;
+        if pending.request_digest != request.request_digest
+            || pending.status != "provider_in_flight"
+            || !pending.payload.is_empty()
+            || pending.owner_scope
+                != sentinel_common::StateTransferScope::for_agent(
+                    AgentId(request.agent_id).to_string(),
+                )
+        {
+            return Err("Sales request reservation mismatch");
+        }
+        let now_ms = now_unix_ms();
+        context.validate_dispatch(now_ms)?;
+        self.store
+            .claim_request_provider_call(
+                &grant.sales_principal,
+                &sentinel_workflow::ClaimRequestProviderCallV1 {
+                    allowance_id: call.allowance_id,
+                    request_id: request.request_id.clone(),
+                    request_digest: request.request_digest.clone(),
+                    context_digest: request.context_digest.clone(),
+                },
+                now_ms,
+            )
+            .map_err(|_| "Sales dispatch already consumed or denied")?;
         Ok(grant
             .expires_at_unix_ms
             .min(now_ms.saturating_add(grant.max_duration_ms)))

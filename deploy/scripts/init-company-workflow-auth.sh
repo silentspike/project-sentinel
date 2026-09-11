@@ -8,6 +8,7 @@ CREDENTIAL_DIR="${SENTINEL_WORKFLOW_CREDENTIAL_DIR:-${DEFAULT_CREDENTIAL_DIR}}"
 DATA_DIR="${SENTINEL_WORKFLOW_DATA_DIR:-${DEFAULT_DATA_DIR}}"
 TEST_ROOT="${SENTINEL_WORKFLOW_AUTH_TEST_ROOT:-}"
 NAMES=(
+  workflow-operator
   workflow-customer
   workflow-sales
   workflow-project-manager

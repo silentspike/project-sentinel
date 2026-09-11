@@ -1,6 +1,105 @@
 use super::*;
 use sentinel_workflow::{ProjectV1, SubscriptionCallGrantV1, SubscriptionTokenPolicyV1};
 
+#[test]
+fn request_provider_accounting_preserves_legacy_grants_and_unknown_dispatches() {
+    for dispatched in [false, true] {
+        let (state, project, grant) = assigned();
+        let mut project = project_command(
+            &state.store,
+            &state.pm,
+            43,
+            grant_command(&project, grant),
+            43,
+        );
+        if dispatched {
+            project = project_command(
+                &state.store,
+                &state.developer,
+                44,
+                claim_command(&project),
+                44,
+            );
+        }
+        let operator = AuthenticatedCompanyPrincipalV1 {
+            principal_id: "operator-test".into(),
+            kind: CompanyPrincipalKindV1::Operator,
+            agent_id: None,
+            ..state.pm.clone()
+        };
+        let sales = principal(
+            "tenant-a",
+            "sales-test",
+            CompanyPrincipalKindV1::Agent,
+            CompanyRoleV1::Sales,
+            None,
+            Some(10),
+        );
+        let CompanyWorkflowResponseV1::CustomerRequest(request) = command(
+            &state.store,
+            &state.customer,
+            50,
+            CompanyWorkflowCommandV1::SubmitCustomerRequest {
+                summary_ref: "New website".into(),
+                desired_outcome: "Three pages".into(),
+                constraints: vec![],
+            },
+            50,
+        ) else {
+            panic!()
+        };
+        let mut request_grant = sentinel_workflow::RequestProviderGrantV1 {
+            schema_version: 1,
+            request_id: request.request_id,
+            expected_version: 1,
+            sales_principal: sales.clone(),
+            provider: "codex-cli".into(),
+            model: "model-test".into(),
+            catalog_digest: DIGEST.into(),
+            total_call_limit: 1,
+            concurrent_call_limit: 1,
+            max_duration_ms: 120_000,
+            token_policy: SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+            expires_at_unix_ms: 300_000,
+        };
+        assert!(state
+            .store
+            .authorize_request_provider_call(&operator, Uuid::from_u128(51), &request_grant, 51)
+            .is_err());
+        request_grant.total_call_limit = 10;
+        let call = state
+            .store
+            .authorize_request_provider_call(&operator, Uuid::from_u128(51), &request_grant, 51)
+            .unwrap();
+        let claim = sentinel_workflow::ClaimRequestProviderCallV1 {
+            allowance_id: call.allowance_id.clone(),
+            request_id: format!("company-provider-{}", call.allowance_id),
+            request_digest: DIGEST.into(),
+            context_digest: OTHER_DIGEST.into(),
+        };
+        let result = state.store.claim_request_provider_call(&sales, &claim, 52);
+        assert_eq!(result.is_err(), dispatched);
+        if !dispatched {
+            // A legacy claim cannot race around the new request capacity gate.
+            assert!(state
+                .store
+                .apply_company_command(
+                    &state.developer,
+                    Uuid::from_u128(53),
+                    &claim_command(&project),
+                    53
+                )
+                .is_err());
+        }
+        let stored = state
+            .store
+            .company_project(&state.pm.tenant_id, &state.project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.subscription_call, project.subscription_call);
+    }
+}
+
 fn assigned() -> (Journey, ProjectV1, SubscriptionCallGrantV1) {
     let state = journey();
     let project = project_command(

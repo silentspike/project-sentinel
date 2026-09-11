@@ -2,6 +2,16 @@
   "schema_version": 1,
   "bindings": [
     {
+      "credential_name": "workflow-operator",
+      "tenant_id": "m0-company",
+      "principal_id": "operator-company",
+      "kind": "operator",
+      "role": "technical_lead",
+      "customer_id": null,
+      "agent_id": null,
+      "authority_generation": 1
+    },
+    {
       "credential_name": "workflow-customer",
       "tenant_id": "m0-company",
       "principal_id": "customer-m0",
