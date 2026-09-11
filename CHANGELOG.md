@@ -1,5 +1,10 @@
 # Changelog
 
+- Accept finite nonzero canonical subscription usage accounting when authorizing
+  same-work corrections, while preserving exact provider, model, assignment,
+  receipt and predecessor checks. Do not confuse a call allowance with a
+  zero-cost usage event (#856).
+
 - Carry bounded leadership feedback into the next model turn, bind its exact
   content to the prior artifact and revision, and reject missing reports on the
   correction API. Preserve legacy records and reject altered feedback on replay
