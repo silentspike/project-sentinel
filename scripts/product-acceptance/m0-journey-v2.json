@@ -52,9 +52,9 @@
       "phase": "customer_request",
       "kind": "positive",
       "method": "POST",
-      "path": "/agent/workflow/commands",
-      "credential_alias": "sales",
-      "route_role": "agent",
+      "path": "/customer/workflow/commands",
+      "credential_alias": "customer",
+      "route_role": "customer",
       "body": {
         "operation_id": {"$operation_id": true},
         "command": {

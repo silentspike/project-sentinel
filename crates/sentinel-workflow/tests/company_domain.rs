@@ -33,6 +33,189 @@ use uuid::Uuid;
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OTHER_DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+#[test]
+fn customer_consultation_separates_authors_and_replays_after_restart() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("consultation.sqlite");
+    let store = WorkflowStore::open(&path).unwrap();
+    let customer = principal(
+        "tenant-a",
+        "customer-a",
+        CompanyPrincipalKindV1::Customer,
+        CompanyRoleV1::Customer,
+        Some("customer-a"),
+        None,
+    );
+    let sales = principal(
+        "tenant-a",
+        "sales-a",
+        CompanyPrincipalKindV1::Agent,
+        CompanyRoleV1::Sales,
+        None,
+        Some(10),
+    );
+    let CompanyWorkflowResponseV1::CustomerRequest(request) = command(
+        &store,
+        &customer,
+        1,
+        CompanyWorkflowCommandV1::SubmitCustomerRequest {
+            summary_ref: "Studio website".into(),
+            desired_outcome: "Three accessible pages".into(),
+            constraints: vec![],
+        },
+        1,
+    ) else {
+        panic!()
+    };
+    let old_json = serde_json::to_value(&request).unwrap();
+    assert!(old_json.get("consultation").is_none());
+    let decoded: sentinel_workflow::CustomerRequestV1 =
+        serde_json::from_value(old_json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), old_json);
+    let question = CompanyWorkflowCommandV1::SendCustomerRequestMessage {
+        request_id: request.request_id.clone(),
+        expected_version: 1,
+        in_reply_to: None,
+        content: "Which audience should the website address?".into(),
+    };
+    assert!(store
+        .apply_company_command(&customer, Uuid::from_u128(2), &question, 2)
+        .is_err());
+    let asked = store
+        .apply_company_command(&sales, Uuid::from_u128(2), &question, 2)
+        .unwrap();
+    let CompanyWorkflowResponseV1::CustomerRequest(ref asked_request) = asked.response else {
+        panic!()
+    };
+    assert_eq!(asked_request.consultation.len(), 1);
+    assert_eq!(
+        asked_request.consultation[0].recorded_by,
+        sales.principal_id
+    );
+    assert_eq!(asked_request.consultation[0].role, CompanyRoleV1::Sales);
+    let qualify = CompanyWorkflowCommandV1::QualifyCustomerRequest {
+        request_id: request.request_id.clone(),
+        expected_version: 2,
+        reason_ref: "scope clear".into(),
+    };
+    assert!(store
+        .apply_company_command(&sales, Uuid::from_u128(3), &qualify, 3)
+        .is_err());
+    let legacy = CompanyWorkflowCommandV1::ClarifyCustomerRequest {
+        request_id: request.request_id.clone(),
+        expected_version: 2,
+        question_ref: "audience".into(),
+        answer_ref: "invented customer answer".into(),
+    };
+    assert!(store
+        .apply_company_command(&sales, Uuid::from_u128(4), &legacy, 3)
+        .is_err());
+    let reply = CompanyWorkflowCommandV1::SendCustomerRequestMessage {
+        request_id: request.request_id.clone(),
+        expected_version: 2,
+        in_reply_to: Some(asked_request.consultation[0].message_id.clone()),
+        content: "Independent local businesses.".into(),
+    };
+    assert!(store
+        .apply_company_command(&sales, Uuid::from_u128(5), &reply, 3)
+        .is_err());
+    let foreign = principal(
+        "tenant-a",
+        "customer-b",
+        CompanyPrincipalKindV1::Customer,
+        CompanyRoleV1::Customer,
+        Some("customer-b"),
+        None,
+    );
+    assert!(store
+        .apply_company_command(&foreign, Uuid::from_u128(5), &reply, 3)
+        .is_err());
+    let other_tenant = principal(
+        "tenant-b",
+        "customer-a",
+        CompanyPrincipalKindV1::Customer,
+        CompanyRoleV1::Customer,
+        Some("customer-a"),
+        None,
+    );
+    assert!(store
+        .apply_company_command(&other_tenant, Uuid::from_u128(5), &reply, 3)
+        .is_err());
+    let mut wrong_question = reply.clone();
+    if let CompanyWorkflowCommandV1::SendCustomerRequestMessage { in_reply_to, .. } =
+        &mut wrong_question
+    {
+        *in_reply_to = Some("consultation-foreign".into());
+    }
+    assert!(store
+        .apply_company_command(&customer, Uuid::from_u128(5), &wrong_question, 3)
+        .is_err());
+    drop(store);
+    let store = WorkflowStore::open(&path).unwrap();
+    let replay = store
+        .apply_company_command(&sales, Uuid::from_u128(2), &question, 4)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.response, asked.response);
+    let answered = store
+        .apply_company_command(&customer, Uuid::from_u128(5), &reply, 4)
+        .unwrap();
+    let CompanyWorkflowResponseV1::CustomerRequest(ref answered_request) = answered.response else {
+        panic!()
+    };
+    assert_eq!(answered_request.consultation.len(), 2);
+    assert_eq!(
+        answered_request.consultation[1].recorded_by,
+        customer.principal_id
+    );
+    assert_eq!(
+        answered_request.consultation[1].role,
+        CompanyRoleV1::Customer
+    );
+    let mut duplicate = reply.clone();
+    if let CompanyWorkflowCommandV1::SendCustomerRequestMessage {
+        expected_version, ..
+    } = &mut duplicate
+    {
+        *expected_version = 3;
+    }
+    assert!(store
+        .apply_company_command(&customer, Uuid::from_u128(6), &duplicate, 5)
+        .is_err());
+    drop(store);
+    let store = WorkflowStore::open(&path).unwrap();
+    assert_eq!(
+        store
+            .apply_company_command(&customer, Uuid::from_u128(5), &reply, 6)
+            .unwrap()
+            .response,
+        answered.response
+    );
+    assert_eq!(
+        store
+            .apply_company_command(&sales, Uuid::from_u128(2), &question, 6)
+            .unwrap()
+            .response,
+        asked.response
+    );
+    let qualify = CompanyWorkflowCommandV1::QualifyCustomerRequest {
+        request_id: request.request_id,
+        expected_version: 3,
+        reason_ref: "customer answered".into(),
+    };
+    let result = store
+        .apply_company_command(&sales, Uuid::from_u128(7), &qualify, 7)
+        .unwrap();
+    let CompanyWorkflowResponseV1::CustomerRequest(result) = result.response else {
+        panic!()
+    };
+    assert_eq!(
+        result.state,
+        sentinel_workflow::CustomerRequestStateV1::Qualified
+    );
+    assert_eq!(result.consultation.len(), 2);
+}
+
 struct Journey {
     _temp: TempDir,
     store: WorkflowStore,
@@ -279,7 +462,7 @@ fn journey() -> Journey {
     let request_id = request.request_id;
     command(
         &store,
-        &sales,
+        &customer,
         2,
         CompanyWorkflowCommandV1::ClarifyCustomerRequest {
             request_id: request_id.clone(),

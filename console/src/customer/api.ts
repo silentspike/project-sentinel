@@ -14,6 +14,7 @@ export interface CustomerRequest {
   version: number;
   proposal_ids: string[];
   clarifications: { question_ref: string; answer_ref: string }[];
+  consultation?: { message_id: string; in_reply_to: string | null; content: string; role: "sales" | "customer" }[];
   feedback: { feedback_ref: string }[];
 }
 

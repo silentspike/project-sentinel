@@ -74,6 +74,30 @@ an error after any earlier uncertain dispatch does not clear the operation.
 Retries of an uncertain operation always use the same ID and payload. There is
 no automatic new-ID retry or automatic provider invocation.
 
+## Sales Consultation
+
+`send_customer_request_message` carries a request ID, expected request version,
+message content and an optional `in_reply_to` message ID. The server derives the
+author, role, timestamp and message ID from the authenticated operation. Sales
+may ask one outstanding question with `in_reply_to: null`. Only the request's
+customer may answer that exact question. A Sales credential cannot submit the
+customer's answer, and another customer's credential cannot access the request.
+
+The customer workspace displays this conversation and reserves replies through
+the same durable browser command path. A failed response or reload reuses the
+original operation, question ID, version and answer. The workflow commits each
+message together with its event and idempotency result. Consultation history is
+append-only; qualification is blocked until the customer answers. A duplicate
+answer under a new operation is rejected, while an exact committed operation
+can be replayed after restart without adding another message.
+
+The older `clarify_customer_request` command is customer-only self-clarification;
+Sales can no longer use it to write a question and purported customer answer
+together. Previously persisted clarification records remain unchanged. Empty
+consultation history is omitted when serializing old records, preserving their
+existing digests. This command contract does not itself schedule a model call
+or prove that an autonomous Sales agent has answered a live request.
+
 ## Acceptance Boundary
 
 The authenticated daemon `POST /customer/workflow/preview` read accepts only
