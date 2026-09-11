@@ -98,6 +98,30 @@ again after file I/O; a concurrent change rejects the response. Responses are
 not cached, and unavailable reads do not imply an uncertain business command.
 This transport neither executes the HTML nor grants it customer-origin access.
 
+### Document preview
+
+The customer delivery row opens an artifact selector and a manifest-declared
+HTML path. The browser checks the complete response binding and bounded UTF-8
+payload before display. Changing the selection removes the old document; late
+responses cannot replace another delivery. Overview refreshes preserve the open
+preview, while expiry or a non-active delivery removes it.
+
+A fixed broker document receives HTML only through a source- and channel-bound
+message. It creates a second sandboxed frame for the artifact. The artifact has
+no script permission, same-origin permission, forms, popups or top navigation.
+Content Security Policy blocks external resources; the broker's frame policy
+also blocks navigation of the child to remote URLs. Artifact HTML is never
+inserted into the customer page or broker DOM. See the browser contracts for
+[iframe sandboxing](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/iframe)
+and [frame-src](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/frame-src).
+
+This is a static document preview: inline CSS and embedded data images can be
+rendered, but JavaScript, external styles/assets and multi-page resource routing
+are not enabled. It does not replace functional website QA or prove the full
+delivery journey. The adversarial browser fixture verifies inert scripts,
+blocked image/frame/form/navigation requests, stable refresh, and revocation;
+its intercepted responses do not constitute live backend acceptance.
+
 The daemon delivery-intent protocol provides `confirm_delivery` for explicit
 version-bound customer acceptance. Its intent contains `project_id`, `delivery`
 and `release`; both references contain `id`, `generation` and `digest`. The
