@@ -783,16 +783,14 @@ fn process_workbench_dispatch(
                 authority,
                 response,
             } => {
-                let profile = if request.tool_profile == service.profile.id {
-                    (&service.profile, service.profile_digest.as_str())
-                } else if request.tool_profile == service.qa_profile.id {
-                    (&service.qa_profile, service.qa_profile_digest.as_str())
-                } else {
-                    let error = anyhow::anyhow!("unknown workbench profile");
-                    if response.send(Err(error)).is_err() {
-                        warn!("workbench requester disconnected before profile rejection");
+                let profile = match service.profile_for_id(&request.tool_profile) {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        if response.send(Err(error)).is_err() {
+                            warn!("workbench requester disconnected before profile rejection");
+                        }
+                        continue;
                     }
-                    continue;
                 };
                 let coordinator = crate::workbench::WorkbenchCoordinator::new(
                     &service.store,
@@ -809,8 +807,8 @@ fn process_workbench_dispatch(
                 authority,
                 response,
             } => {
-                let use_qa_profile =
-                    match workbench_invocation_uses_qa_profile(service, &invocation_id) {
+                let (profile, profile_digest) =
+                    match workbench_invocation_profile(service, &invocation_id) {
                         Ok(value) => value,
                         Err(error) => {
                             if response.send(Err(error)).is_err() {
@@ -819,11 +817,6 @@ fn process_workbench_dispatch(
                             continue;
                         }
                     };
-                let (profile, profile_digest) = if use_qa_profile {
-                    (&service.qa_profile, service.qa_profile_digest.as_str())
-                } else {
-                    (&service.profile, service.profile_digest.as_str())
-                };
                 let coordinator = crate::workbench::WorkbenchCoordinator::new(
                     &service.store,
                     profile,
@@ -839,8 +832,8 @@ fn process_workbench_dispatch(
                 authority,
                 response,
             } => {
-                let use_qa_profile =
-                    match workbench_invocation_uses_qa_profile(service, &invocation_id) {
+                let (profile, profile_digest) =
+                    match workbench_invocation_profile(service, &invocation_id) {
                         Ok(value) => value,
                         Err(error) => {
                             if response.send(Err(error)).is_err() {
@@ -849,11 +842,6 @@ fn process_workbench_dispatch(
                             continue;
                         }
                     };
-                let (profile, profile_digest) = if use_qa_profile {
-                    (&service.qa_profile, service.qa_profile_digest.as_str())
-                } else {
-                    (&service.profile, service.profile_digest.as_str())
-                };
                 let coordinator = crate::workbench::WorkbenchCoordinator::new(
                     &service.store,
                     profile,
@@ -875,8 +863,8 @@ fn process_workbench_dispatch(
                 authority,
                 response,
             } => {
-                let use_qa_profile =
-                    match workbench_invocation_uses_qa_profile(service, &invocation_id) {
+                let (profile, profile_digest) =
+                    match workbench_invocation_profile(service, &invocation_id) {
                         Ok(value) => value,
                         Err(error) => {
                             if response.send(Err(error)).is_err() {
@@ -885,11 +873,6 @@ fn process_workbench_dispatch(
                             continue;
                         }
                     };
-                let (profile, profile_digest) = if use_qa_profile {
-                    (&service.qa_profile, service.qa_profile_digest.as_str())
-                } else {
-                    (&service.profile, service.profile_digest.as_str())
-                };
                 let coordinator = crate::workbench::WorkbenchCoordinator::new(
                     &service.store,
                     profile,
@@ -984,33 +967,20 @@ fn workbench_submit_runtime_available(handle: Option<&NanoHandle>) -> bool {
     handle.is_some_and(|handle| handle.runtime_key == RUNTIME_BWRAP_LANDLOCK)
 }
 
-fn workbench_invocation_uses_qa_profile(
-    service: &crate::workbench::WorkbenchService,
+fn workbench_invocation_profile<'a>(
+    service: &'a crate::workbench::WorkbenchService,
     invocation_id: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(&'a crate::workbench::WorkbenchProfile, &'a str)> {
     let record = service
         .store
         .load(invocation_id)?
         .ok_or_else(|| anyhow::anyhow!("workbench invocation is not reserved"))?;
-    workbench_profile_is_qa(
-        &record.tool_profile,
-        &service.profile.id,
-        &service.qa_profile.id,
-    )
-}
-
-fn workbench_profile_is_qa(
-    record_profile: &str,
-    authoring_profile: &str,
-    qa_profile: &str,
-) -> anyhow::Result<bool> {
-    if record_profile == qa_profile {
-        Ok(true)
-    } else if record_profile == authoring_profile {
-        Ok(false)
-    } else {
-        anyhow::bail!("workbench invocation uses an unknown profile")
-    }
+    let profile = service.profile_for_id(&record.tool_profile)?;
+    anyhow::ensure!(
+        record.tool_profile_digest == profile.1,
+        "reserved workbench profile changed"
+    );
+    Ok(profile)
 }
 
 fn parse_judge_alert_agent_id(agent_id: &str, bounds: AgentIdBounds) -> Result<AgentId> {
@@ -12371,17 +12341,6 @@ mod tests {
             .to_string()
             .contains("terminate unowned Sentinel cgroup live-orphan"));
         assert!(removed.into_inner().is_empty());
-    }
-
-    #[test]
-    fn workbench_follow_up_dispatch_retains_the_reserved_profile() {
-        assert!(
-            !workbench_profile_is_qa("web-authoring-v1", "web-authoring-v1", "web-qa-v1").unwrap()
-        );
-        assert!(workbench_profile_is_qa("web-qa-v1", "web-authoring-v1", "web-qa-v1").unwrap());
-        assert!(
-            workbench_profile_is_qa("foreign-profile", "web-authoring-v1", "web-qa-v1").is_err()
-        );
     }
 
     fn workbench_recycle_observation_fixture() -> (

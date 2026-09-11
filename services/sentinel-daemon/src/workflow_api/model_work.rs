@@ -51,11 +51,17 @@ impl ModelWorkContext {
             return Err("model work context is stale or unsupported");
         }
         self.validate_artifact_inputs()?;
+        if self.task.required_role == CompanyRoleV1::Qa {
+            super::model_review::source_inventory(self)?;
+        }
         Ok(())
     }
 
     pub fn prompt(&self) -> Result<String, &'static str> {
         self.validate_artifact_inputs()?;
+        if self.task.required_role == CompanyRoleV1::Qa {
+            return super::model_review::prompt(self);
+        }
         let artifact_kind = artifact_kind(self.task.required_role)?;
         let output = self
             .task
@@ -181,6 +187,7 @@ fn artifact_kind(role: CompanyRoleV1) -> Result<&'static str, &'static str> {
     match role {
         CompanyRoleV1::Designer => Ok("design_specification"),
         CompanyRoleV1::Developer => Ok("source_tree"),
+        CompanyRoleV1::Qa => Ok("qa_report"),
         _ => Err("model work role is unsupported"),
     }
 }
@@ -340,7 +347,11 @@ impl WorkflowApi {
                 return Err("subscription result is not bound to a consumed dispatch");
             }
         }
-        let tools = parse_proposal(&completion.content)?;
+        let tools = if context.task.required_role == CompanyRoleV1::Qa {
+            super::model_review::proposal_tools(&completion.content, context)?
+        } else {
+            parse_proposal(&completion.content)?
+        };
         let operation_id = stable_operation_id(
             "sentinel.model-work.v1",
             &format!("{request_id}:{request_digest}"),
@@ -614,6 +625,7 @@ mod tests {
             ])),
             workbench_profile: profile,
             workbench_profile_digest: profile_digest,
+            review_profile: None,
             qa_profile_capabilities: BTreeSet::new(),
             runtime_health: Arc::new(RwLock::new(Default::default())),
             artifact_roots: Arc::new(HashMap::new()),

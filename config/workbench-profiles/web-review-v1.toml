@@ -1,0 +1,18 @@
+schema_version = 1
+id = "web-review-v1"
+runtime_key = "bwrap-landlock"
+network = "deny"
+environment = { HOME = "/workspace", LANG = "C.UTF-8", LC_ALL = "C.UTF-8", PATH = "/usr/bin:/bin" }
+capabilities = ["file.inspect", "file.write", "artifact.commit"]
+output_artifact_kinds = ["qa_report"]
+command_rules = []
+test_suites = []
+
+[resource_ceilings]
+wall_time_ms = 30000
+cpu_time_ms = 10000
+memory_bytes = 134217728
+process_count = 8
+file_bytes = 1048576
+stdout_bytes = 4096
+stderr_bytes = 4096

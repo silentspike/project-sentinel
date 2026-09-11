@@ -3,12 +3,12 @@ use super::model_execution::{ModelExecutionCompletion, ModelExecutionContext};
 use super::*;
 
 #[derive(Deserialize)]
-struct StoredModelResult {
-    version: u32,
-    request_id: String,
-    request_digest: String,
-    usage_event: DomainEvent,
-    model_work: Option<ModelExecutionCompletion>,
+pub(super) struct StoredModelResult {
+    pub(super) version: u32,
+    pub(super) request_id: String,
+    pub(super) request_digest: String,
+    pub(super) usage_event: DomainEvent,
+    pub(super) model_work: Option<ModelExecutionCompletion>,
 }
 
 impl WorkflowApi {

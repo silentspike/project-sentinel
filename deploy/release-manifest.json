@@ -106,6 +106,12 @@
       "type": "config"
     },
     {
+      "path": "/opt/sentinel/config/workbench-profiles/web-review-v1.toml",
+      "source": "config/workbench-profiles/web-review-v1.toml",
+      "sha256": "0403ed94d849d03baabbbe87097106e022a02ae4138817e35911b8aa1f9677be",
+      "type": "config"
+    },
+    {
       "path": "/etc/nats/nats.conf",
       "source": "config/nats.conf",
       "sha256": "3ab5bb5d9fa5a1b51dc4f4d575be81ecd568a4b16a2b157b7d38d3242f6d309f",
