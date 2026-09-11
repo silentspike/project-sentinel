@@ -1,5 +1,9 @@
 # Changelog
 
+- Use the supported low reasoning effort for native Codex inference and report
+  fixed private-safe error categories from JSONL failures; do not infer that a
+  failed provider dispatch is replayable (#856).
+
 - Distinguish pre-agreement customer-request model work from project assignments
   at the Gateway and bind its versioned dispatch to durable daemon admission;
   reject mixed subjects and incompatible admission receipts (#856).
