@@ -3,6 +3,47 @@ import { expect, test } from "@playwright/test";
 const identity = { schema_version: 1, principal_id: "customer-one", tenant_id: "tenant-one", customer_id: "customer-one" };
 const request = { request_id: "request-one", summary_ref: "Studio website", desired_outcome: "Three accessible pages", constraints: ["No tracking"], state: "submitted", version: 1, proposal_ids: [], clarifications: [], feedback: [] };
 
+test("delivery acceptance requires consent and replays the displayed version after reload", async ({ page }) => {
+  const delivery = {
+    delivery: { id: "delivery-one", generation: 1, digest: "a".repeat(64) },
+    release: { id: "release-one", generation: 2, digest: "b".repeat(64) },
+    state: "delivered", release_state: "active", issued_at_ms: Date.now(), expires_at_ms: Date.now() + 60000,
+    preview_digest: "c".repeat(64),
+  };
+  const expected = { action: "confirm_delivery", project_id: "project-one", delivery: { ...delivery.delivery }, release: { ...delivery.release } };
+  const writes: { operation_id: string; intent: unknown }[] = [];
+  await page.route("**/api/customer/**", async route => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("status")) return route.fulfill({ json: { authenticated: true, identity } });
+    if (path.endsWith("overview")) return route.fulfill({ json: { requests: [request], proposals: [], projects: [{ project_id: "project-one", request_id: request.request_id, state: "delivery_candidate", version: 2, work_items: [], deliveries: [delivery] }] } });
+    expect(path).toBe("/api/customer/delivery");
+    writes.push(route.request().postDataJSON());
+    if (writes.length === 1) return route.abort("failed");
+    delivery.state = "accepted";
+    return route.fulfill({ json: {} });
+  });
+  await page.goto("/?view=customer");
+  page.once("dialog", dialog => dialog.dismiss());
+  await page.getByRole("button", { name: "Lieferung abnehmen" }).click();
+  expect(writes).toEqual([]);
+  page.once("dialog", async dialog => {
+    expect(dialog.message()).toContain("delivery-one, Version 1");
+    await dialog.accept();
+  });
+  await page.getByRole("button", { name: "Lieferung abnehmen" }).click();
+  await expect(page.getByRole("button", { name: "Gleiche Anfrage erneut pruefen" })).toBeVisible();
+  delivery.delivery.generation = 2;
+  delivery.delivery.digest = "d".repeat(64);
+  await page.reload();
+  await expect(page.getByRole("button", { name: "Lieferung abnehmen" })).toBeDisabled();
+  await page.getByRole("button", { name: "Gleiche Anfrage erneut pruefen" }).click();
+  await expect(page.getByRole("button", { name: "Gleiche Anfrage erneut pruefen" })).toHaveCount(0);
+  expect(writes).toHaveLength(2);
+  expect(writes[0].intent).toEqual(expected);
+  expect(writes[1]).toEqual(writes[0]);
+  await expect(page.getByRole("button", { name: "Lieferung abnehmen" })).toBeDisabled();
+});
+
 test("delivery preview is isolated, inert, network-blocked and stable across overview refresh", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   const delivery = {
