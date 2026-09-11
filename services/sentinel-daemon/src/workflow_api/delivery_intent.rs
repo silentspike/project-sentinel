@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -88,6 +89,14 @@ struct CustomerPreviewRequest {
     project_id: ProjectId,
     delivery: VersionedRefV1,
     release: VersionedRefV1,
+    file: Option<CustomerPreviewFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomerPreviewFile {
+    artifact_id: String,
+    path: String,
 }
 
 pub(super) fn preview(
@@ -109,6 +118,14 @@ pub(super) fn preview(
     let request: CustomerPreviewRequest = match super::decode_body(body) {
         Ok(value) => value,
         Err(response) => return response,
+    };
+    let Ok(_guard) = api.mutation_fence.read() else {
+        return json_error(
+            503,
+            "workflow_unavailable",
+            "workflow recovery is unavailable",
+            true,
+        );
     };
     let Some(caller) = delivery_principal(&principal.principal) else {
         return json_error(
@@ -136,6 +153,44 @@ pub(super) fn preview(
             Ok(value) => value,
             Err(error) => return delivery_error(error),
         };
+    if let Some(file) = &request.file {
+        let bytes = match read_preview_file(api, manifest, file) {
+            Ok(bytes) => bytes,
+            Err(error) => return delivery_error(error),
+        };
+        // Recheck after filesystem I/O: a concurrent rollback or expiry must not
+        // turn a previously authorized inventory into authority to serve bytes.
+        let current = match delivery.aggregate(&caller.tenant_id, &request.project_id.0) {
+            Ok(Some(current)) if current.revision == aggregate.revision => current,
+            _ => {
+                return json_error(
+                    409,
+                    "preview_changed",
+                    "delivery changed during preview read",
+                    true,
+                )
+            }
+        };
+        if let Err(error) =
+            authorized_preview_manifest(&current, &caller, &request, super::now_unix_ms())
+        {
+            return delivery_error(error);
+        }
+        return json(
+            200,
+            &serde_json::json!({
+                "project_id": request.project_id,
+                "delivery": request.delivery,
+                "release": request.release,
+                "manifest_digest": manifest.manifest_digest,
+                "artifact_id": file.artifact_id,
+                "path": file.path,
+                "encoding": "base64",
+                "size_bytes": bytes.len(),
+                "content": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        );
+    }
     json(
         200,
         &serde_json::json!({
@@ -150,6 +205,97 @@ pub(super) fn preview(
             })).collect::<Vec<_>>(),
         }),
     )
+}
+
+fn read_preview_file(
+    api: &WorkflowApi,
+    manifest: &ReleaseManifestV1,
+    file: &CustomerPreviewFile,
+) -> Result<Vec<u8>, DeliveryError> {
+    let denied = || DeliveryError::AuthorityDenied("preview artifact is unavailable".to_string());
+    if file.artifact_id.is_empty()
+        || file.artifact_id.len() > 512
+        || file.path.is_empty()
+        || file.path.len() > 1024
+    {
+        return Err(denied());
+    }
+    let matches = manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_id == file.artifact_id)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(denied());
+    }
+    let artifact = matches[0];
+    let owner = api
+        .principals
+        .principal(&artifact.owner_principal_id)
+        .ok_or_else(denied)?;
+    if owner.principal.tenant_id.0 != manifest.tenant_id
+        || owner.principal.kind != sentinel_workflow::CompanyPrincipalKindV1::Agent
+    {
+        return Err(denied());
+    }
+    let source_agent = owner.principal.agent_id.ok_or_else(denied)?;
+    let tenant = TenantId(manifest.tenant_id.clone());
+    let project_id = ProjectId(manifest.project.id.clone());
+    let project = api
+        .store
+        .company_project(&tenant, &project_id)
+        .map_err(workflow_delivery_error)?
+        .ok_or_else(denied)?;
+    let mut kinds = Vec::new();
+    for work_id in project.work_items.keys() {
+        let execution = api
+            .store
+            .work_item(&tenant, &project_id, work_id)
+            .map_err(workflow_delivery_error)?
+            .ok_or_else(denied)?;
+        if execution.state != WorkItemState::Done {
+            continue;
+        }
+        let Some(terminal) = execution.terminal_execution_evidence else {
+            continue;
+        };
+        for (ordinal, candidate) in terminal.artifacts.iter().enumerate() {
+            if artifact.artifact_id
+                == format!("{}-{}-{ordinal}", work_id.0, candidate.artifact_kind)
+                && candidate.digest == artifact.digest.as_str()
+                && candidate.media_type == artifact.media_type
+            {
+                let work = project.work_items.get(work_id).ok_or_else(denied)?;
+                if !work
+                    .assignments
+                    .iter()
+                    .any(|assignment| assignment.active && assignment.agent_id == source_agent)
+                    || !project.governance.participants.iter().any(|participant| {
+                        participant.agent_id == source_agent
+                            && participant.principal_id == artifact.owner_principal_id
+                    })
+                {
+                    return Err(denied());
+                }
+                kinds.push(candidate.artifact_kind.clone());
+            }
+        }
+    }
+    if kinds.len() != 1 {
+        return Err(denied());
+    }
+    let authority = api.authority.as_ref().ok_or_else(denied)?;
+    crate::workbench::read_verified_artifact_file(
+        &authority.artifact_roots,
+        source_agent,
+        &project_id.0,
+        artifact.digest.as_str(),
+        &kinds[0],
+        &artifact.media_type,
+        &file.path,
+        1024 * 1024,
+    )
+    .map_err(|_| denied())
 }
 
 fn authorized_preview_manifest<'a>(
@@ -1785,6 +1931,7 @@ mod tests {
                 .unwrap();
         *updated = updated.clone().seal().unwrap();
         let request = CustomerPreviewRequest {
+            file: None,
             project_id: ProjectId("project-example".to_string()),
             delivery: VersionedRefV1 {
                 id: updated.delivery_id.clone(),

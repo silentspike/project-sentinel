@@ -77,13 +77,26 @@ no automatic new-ID retry or automatic provider invocation.
 ## Acceptance Boundary
 
 The authenticated daemon `POST /customer/workflow/preview` read accepts only
-`project_id`, `delivery` and `release`. It returns a bounded artifact inventory,
+`project_id`, `delivery`, `release` and an optional `file` selector. Without a
+selector it returns a bounded artifact inventory,
 not HTML or filesystem paths. The customer must own the exact receipt, its
 server-issued preview window must still be valid, and the release must remain
 active. The release-manifest digest, project, tenant and preview digest must
 agree. Expired, changed, rolled-back and foreign deliveries are rejected before
 artifact storage access. Artifact owner principal identifiers are not exposed.
 This inventory endpoint does not yet provide isolated browser rendering.
+
+The customer-only BFF `POST /api/customer/preview` revalidates its separate
+session and forwards the exact body with the server-held customer credential.
+`file` contains only `artifact_id` and a manifest-declared relative `path`.
+The daemon resolves the source agent and artifact kind from release/workflow
+evidence, never from the browser. Reads use the pinned Workbench validator and
+are limited to 1 MiB per file. The JSON response contains Base64-encoded bytes,
+their length and the bound delivery/release/manifest references. Binary assets
+are preserved without text conversion. Release revision and expiry are checked
+again after file I/O; a concurrent change rejects the response. Responses are
+not cached, and unavailable reads do not imply an uncertain business command.
+This transport neither executes the HTML nor grants it customer-origin access.
 
 The daemon delivery-intent protocol provides `confirm_delivery` for explicit
 version-bound customer acceptance. Its intent contains `project_id`, `delivery`

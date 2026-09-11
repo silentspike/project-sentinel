@@ -708,6 +708,7 @@ pub fn build_app(state: AppState) -> axum::Router {
         .route("/overview", get(customer::overview))
         .route("/commands", post(customer::commands))
         .route("/delivery", post(customer::delivery))
+        .route("/preview", post(customer::preview))
         .route_layer(middleware::from_fn(customer::no_store));
 
     let api = axum::Router::new()

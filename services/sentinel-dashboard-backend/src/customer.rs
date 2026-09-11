@@ -342,6 +342,67 @@ struct CustomerDeliveryEnvelope {
     intent: CustomerDeliveryIntent,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewFile {
+    artifact_id: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewRequest {
+    project_id: String,
+    delivery: DeliveryReference,
+    release: DeliveryReference,
+    file: Option<PreviewFile>,
+}
+
+pub async fn preview(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if body.len() > 4096 || !json_request(&headers) {
+        return error(StatusCode::BAD_REQUEST, "invalid_preview_request");
+    }
+    let value: PreviewRequest = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_preview_request"),
+    };
+    if value.project_id.is_empty()
+        || value.project_id.len() > 512
+        || !value.delivery.valid()
+        || !value.release.valid()
+        || value.file.as_ref().is_some_and(|file| {
+            file.artifact_id.is_empty()
+                || file.artifact_id.len() > 512
+                || file.path.is_empty()
+                || file.path.len() > 1024
+        })
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_preview_request");
+    }
+    let session = match session(&st, &headers).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return error(StatusCode::UNAUTHORIZED, "customer_authentication_required"),
+        Err(()) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "customer_workflow_unavailable",
+            )
+        }
+    };
+    match upstream(
+        &st,
+        &session.credential,
+        "/customer/workflow/preview",
+        &[],
+        Some(&body),
+    )
+    .await
+    {
+        Ok((status, value)) => (status, Json(value)).into_response(),
+        Err(_) => error(StatusCode::BAD_GATEWAY, "customer_preview_unavailable"),
+    }
+}
+
 pub async fn delivery(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if body.len() > 4096 || !json_request(&headers) {
         return error(StatusCode::BAD_REQUEST, "invalid_delivery_confirmation");
@@ -474,6 +535,7 @@ mod tests {
     async fn customer_delivery_proxy_preserves_exact_body_and_server_credential() {
         let recorded = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let captures = recorded.clone();
+        let preview_captures = recorded.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let router = Router::new()
@@ -492,6 +554,20 @@ mod tests {
                         );
                         captures.lock().unwrap().push(body.to_vec());
                         Json(json!({"replayed": true, "action": "accept"}))
+                    }
+                }),
+            )
+            .route(
+                "/customer/workflow/preview",
+                axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                    let captures = preview_captures.clone();
+                    async move {
+                        assert_eq!(
+                            headers[header::AUTHORIZATION],
+                            "Bearer server-customer-credential"
+                        );
+                        captures.lock().unwrap().push(body.to_vec());
+                        Json(json!({"encoding":"base64","content":"AAEC/w==","size_bytes":4}))
                     }
                 }),
             );
@@ -527,6 +603,70 @@ mod tests {
             assert!(!String::from_utf8_lossy(&response).contains("server-customer-credential"));
         }
         assert_eq!(*recorded.lock().unwrap(), vec![body.as_bytes().to_vec(); 2]);
+        let preview = json!({
+            "project_id":"project-one",
+            "delivery": confirmation()["intent"]["delivery"],
+            "release": confirmation()["intent"]["release"],
+            "file":{"artifact_id":"site","path":"index.html"},
+        });
+        for field in ["principal_id", "tenant_id", "root", "now_ms"] {
+            let mut invalid = preview.clone();
+            invalid[field] = json!("injected");
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/customer/preview")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, format!("{COOKIE}={token}"))
+                        .body(Body::from(invalid.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(recorded.lock().unwrap().len(), 2);
+        let preview_body = preview.to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/customer/preview")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(preview_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/customer/preview")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, format!("{COOKIE}={token}"))
+                    .body(Body::from(preview_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["content"],
+            "AAEC/w=="
+        );
+        assert_eq!(
+            recorded.lock().unwrap().last().unwrap(),
+            preview_body.as_bytes()
+        );
         server.abort();
         let _ = server.await;
     }
