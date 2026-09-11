@@ -1205,7 +1205,9 @@ fn apply_company_command(
                 return Err(transition());
             }
             match principal.role {
-                CompanyRoleV1::Sales if in_reply_to.is_none() => {
+                CompanyRoleV1::Sales
+                    if principal.kind == CompanyPrincipalKindV1::Agent && in_reply_to.is_none() =>
+                {
                     if request_has_unanswered_question(&request) {
                         return Err(transition());
                     }
