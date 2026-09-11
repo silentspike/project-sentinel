@@ -1,5 +1,10 @@
 # Changelog
 
+- Resolve model-work upstream inputs through the existing completed-output
+  authority and immutable artifact reader. Bind bounded UTF-8 source content to
+  the provider context, reject changed or unavailable inputs, and retain legacy
+  no-input request digests. This does not grant QA or release authority (#856).
+
 - Accept finite nonzero canonical subscription usage accounting when authorizing
   same-work corrections, while preserving exact provider, model, assignment,
   receipt and predecessor checks. Do not confuse a call allowance with a

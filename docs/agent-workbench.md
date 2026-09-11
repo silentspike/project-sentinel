@@ -25,8 +25,27 @@ claim that the autonomous-company acceptance has passed.
 
 For one assigned Designer or Developer with exactly one active work-item
 provider reservation, the daemon derives a task and authority snapshot from
-the existing workflow. The initial slice accepts one output contract and no
-upstream artifact inputs. The provider window is five minutes from the durable
+the existing workflow. Model work accepts one output contract and bounded
+upstream text artifacts from declared dependency inputs. The same authority
+resolver used by Workbench mounts requires a completed producer, its current
+assignment, matching contract generation/digest, and committed output evidence.
+The daemon reads the actual immutable files through the protected artifact
+reader, not historical write commands or a caller-supplied source snapshot.
+Inputs are limited to eight artifacts, 64 files and 64 KiB of UTF-8 content in
+total; binary, oversized, missing or invalid inputs fail closed without
+truncation. The complete serialized prompt retains its separate 128 KiB bound.
+Paths, file digests and content are included in the private provider context;
+they are untrusted task data, not instructions, permissions or passing tests.
+The context is re-resolved at dispatch and before new plan admission, so changed
+upstream results cannot silently authorize execution. Input reads do not stage
+files or modify either employee's workspace. Existing no-input context bytes
+are unchanged. This input support does not enable the QA role, manufacture a
+model review, or replace the separate deterministic QA gate.
+Once input-bearing requests have been persisted, recovery requires a binary
+that understands those contexts. Do not downgrade across a pending request or
+delete its journal to make an older binary accept it.
+
+The provider window is five minutes from the durable
 reservation timestamp; a new perception does not renew that window. Unsupported
 work fails closed instead of becoming an unbound tool or a host-shell action.
 
@@ -69,8 +88,8 @@ rejected. Model work never enters the legacy Chat/ToolUse action channel. Failed
 or claimed completion rows are not implicitly reactivated. There is no new store
 or schema migration; version-1 legacy completion payloads remain readable.
 
-This bridge is not the full M1 conversation/tool-result loop. Additional inputs,
-iterative rework, model-selected team decisions,
+This bridge is not the full M1 conversation/tool-result loop. Model-driven
+independent QA, model-selected team decisions,
 and the real-provider customer-to-artifact journey remain #856 acceptance work.
 In particular, the existing monetary reservation API must not be presented as a
 valid substitute for ChatGPT subscription call/token/time limits or be populated

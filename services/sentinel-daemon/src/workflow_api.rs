@@ -575,73 +575,17 @@ impl CompanyAuthority {
     ) -> Result<Vec<ArtifactInputV1>, WorkflowError> {
         let mut inputs = Vec::new();
         for binding in &spec.inputs {
-            let producer = project
-                .work_items
-                .get(&binding.producer_work_item_id)
-                .ok_or_else(execution_authority_conflict)?;
-            let assignment = producer
-                .assignments
-                .iter()
-                .find(|value| value.active)
-                .ok_or_else(execution_authority_conflict)?;
-            let output_contract = producer
-                .spec
-                .outputs
-                .iter()
-                .find(|value| value.name == binding.producer_output_name)
-                .ok_or_else(execution_authority_conflict)?;
-            let output_receipt = producer
-                .output_receipts
-                .iter()
-                .find(|value| value.name == binding.producer_output_name)
-                .ok_or_else(execution_authority_conflict)?;
-            if producer.state != sentinel_workflow::CompanyWorkStateV1::Done
-                || output_contract.contract_generation != binding.expected_contract_generation
-                || output_contract.contract_digest != binding.expected_contract_digest
-                || output_receipt.contract_generation != binding.expected_contract_generation
-                || output_receipt.contract_digest != binding.expected_contract_digest
-            {
-                return Err(execution_authority_conflict());
-            }
-            let execution = self
-                .store
-                .work_item(
-                    &project.tenant_id,
-                    &project.project_id,
-                    &binding.producer_work_item_id,
-                )?
-                .ok_or_else(execution_authority_conflict)?;
-            let terminal = execution
-                .terminal_execution_evidence
-                .as_ref()
-                .filter(|_| execution.state == sentinel_workflow::WorkItemState::Done)
-                .ok_or_else(execution_authority_conflict)?;
-            let output = terminal
-                .outputs
-                .iter()
-                .find(|value| value.name == binding.producer_output_name)
-                .filter(|value| value.digest == output_receipt.content_digest)
-                .ok_or_else(execution_authority_conflict)?;
-            let matching_artifacts = terminal
-                .artifacts
-                .iter()
-                .filter(|value| {
-                    value.artifact_kind == output.kind
-                        && value.media_type == output_contract.media_type
-                })
-                .collect::<Vec<_>>();
-            let [artifact] = matching_artifacts.as_slice() else {
-                return Err(execution_authority_conflict());
-            };
+            let (source_agent, artifact, media_type) =
+                self.resolve_execution_input(project, binding)?;
             let staged = stage_verified_artifact_inputs(
                 &self.artifact_roots,
-                assignment.agent_id,
+                source_agent,
                 destination_agent,
                 &project.project_id.0,
                 &spec.work_item_id.0,
                 &artifact.digest,
                 Some(&artifact.artifact_kind),
-                &artifact.media_type,
+                &media_type,
             )
             .map_err(|_| execution_input_unavailable())?;
             if staged.is_empty() {
@@ -665,6 +609,75 @@ impl CompanyAuthority {
             return Err(execution_authority_conflict());
         }
         Ok(inputs)
+    }
+
+    fn resolve_execution_input(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        binding: &sentinel_workflow::WorkInputContractV1,
+    ) -> Result<(AgentId, SealedArtifactEvidenceV1, String), WorkflowError> {
+        let producer = project
+            .work_items
+            .get(&binding.producer_work_item_id)
+            .ok_or_else(execution_authority_conflict)?;
+        let assignment = producer
+            .assignments
+            .iter()
+            .find(|value| value.active)
+            .ok_or_else(execution_authority_conflict)?;
+        let output_contract = producer
+            .spec
+            .outputs
+            .iter()
+            .find(|value| value.name == binding.producer_output_name)
+            .ok_or_else(execution_authority_conflict)?;
+        let output_receipt = producer
+            .output_receipts
+            .iter()
+            .find(|value| value.name == binding.producer_output_name)
+            .ok_or_else(execution_authority_conflict)?;
+        if producer.state != sentinel_workflow::CompanyWorkStateV1::Done
+            || output_contract.contract_generation != binding.expected_contract_generation
+            || output_contract.contract_digest != binding.expected_contract_digest
+            || output_receipt.contract_generation != binding.expected_contract_generation
+            || output_receipt.contract_digest != binding.expected_contract_digest
+        {
+            return Err(execution_authority_conflict());
+        }
+        let execution = self
+            .store
+            .work_item(
+                &project.tenant_id,
+                &project.project_id,
+                &binding.producer_work_item_id,
+            )?
+            .ok_or_else(execution_authority_conflict)?;
+        let terminal = execution
+            .terminal_execution_evidence
+            .as_ref()
+            .filter(|_| execution.state == sentinel_workflow::WorkItemState::Done)
+            .ok_or_else(execution_authority_conflict)?;
+        let output = terminal
+            .outputs
+            .iter()
+            .find(|value| value.name == binding.producer_output_name)
+            .filter(|value| value.digest == output_receipt.content_digest)
+            .ok_or_else(execution_authority_conflict)?;
+        let matching_artifacts = terminal
+            .artifacts
+            .iter()
+            .filter(|value| {
+                value.artifact_kind == output.kind && value.media_type == output_contract.media_type
+            })
+            .collect::<Vec<_>>();
+        let [artifact] = matching_artifacts.as_slice() else {
+            return Err(execution_authority_conflict());
+        };
+        Ok((
+            assignment.agent_id,
+            (**artifact).clone(),
+            output_contract.media_type.clone(),
+        ))
     }
 
     fn workbench_snapshot(
