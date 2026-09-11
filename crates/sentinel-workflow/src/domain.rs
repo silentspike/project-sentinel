@@ -157,6 +157,17 @@ pub struct ClarificationV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CustomerConsultationMessageV1 {
+    pub message_id: String,
+    pub in_reply_to: Option<String>,
+    pub content: String,
+    pub role: CompanyRoleV1,
+    pub recorded_by: String,
+    pub recorded_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustomerFeedbackV1 {
     pub feedback_ref: String,
     pub recorded_by: String,
@@ -174,6 +185,9 @@ pub struct CustomerRequestV1 {
     pub desired_outcome: String,
     pub constraints: Vec<String>,
     pub clarifications: Vec<ClarificationV1>,
+    // Omit empty history to preserve the digest of pre-consultation records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consultation: Vec<CustomerConsultationMessageV1>,
     pub feedback: Vec<CustomerFeedbackV1>,
     pub state: CustomerRequestStateV1,
     pub version: u64,
@@ -865,6 +879,12 @@ pub enum CompanyWorkflowCommandV1 {
         expected_version: u64,
         question_ref: String,
         answer_ref: String,
+    },
+    SendCustomerRequestMessage {
+        request_id: String,
+        expected_version: u64,
+        in_reply_to: Option<String>,
+        content: String,
     },
     QualifyCustomerRequest {
         request_id: String,
