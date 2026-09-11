@@ -72,6 +72,7 @@ pub const CUSTOMER_OVERVIEW_PATH: &str = "/customer/workflow/overview";
 pub const CUSTOMER_PREVIEW_PATH: &str = "/customer/workflow/preview";
 pub const OPERATOR_COMMAND_PATH: &str = "/operator/workflow/commands";
 pub const REQUEST_PROVIDER_PATH: &str = "/operator/workflow/request-provider";
+pub const REQUEST_PROVIDER_ABANDON_PATH: &str = "/operator/workflow/request-provider/abandon";
 pub const AGENT_COMMAND_PATH: &str = "/agent/workflow/commands";
 pub const OPERATOR_PROJECT_PATH: &str = "/operator/workflow/projects";
 pub const OPERATOR_WORK_ITEM_PATH: &str = "/operator/workflow/work-items";
@@ -2728,6 +2729,7 @@ impl WorkflowApi {
             }
             #[cfg(feature = "llm")]
             ("POST", REQUEST_PROVIDER_PATH) => self.authorize_sales_request(&principal, body),
+            ("POST", REQUEST_PROVIDER_ABANDON_PATH) => self.abandon_sales_request(&principal, body),
             ("POST", AGENT_COMMAND_PATH) => self.agent_command(&principal, body),
             ("GET", CUSTOMER_REQUEST_PATH) => self.customer_request(&principal, path),
             ("GET", CUSTOMER_IDENTITY_PATH) => customer_identity(&principal),
@@ -4623,6 +4625,7 @@ fn is_workflow_path(path: &str) -> bool {
             | CUSTOMER_PREVIEW_PATH
             | OPERATOR_COMMAND_PATH
             | REQUEST_PROVIDER_PATH
+            | REQUEST_PROVIDER_ABANDON_PATH
             | AGENT_COMMAND_PATH
             | OPERATOR_PROJECT_PATH
             | OPERATOR_WORK_ITEM_PATH

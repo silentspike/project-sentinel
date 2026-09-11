@@ -89,17 +89,24 @@ impl CompanyEntity for RequestProviderCallV1 {
         {
             return Err(corrupt());
         }
-        let expected_version = if self.question_response.is_some() {
-            3
-        } else if self.dispatch.is_some() {
-            2
-        } else {
-            1
-        };
+        let expected_version =
+            if self.question_response.is_some() || self.abandonment_event_id.is_some() {
+                3
+            } else if self.dispatch.is_some() {
+                2
+            } else {
+                1
+            };
         if self.version != expected_version
             || self.question_response.is_some() != self.model_response_digest.is_some()
+            || (self.abandonment_event_id.is_some() && self.question_response.is_some())
         {
             return Err(corrupt());
+        }
+        if let Some(event_id) = &self.abandonment_event_id {
+            if self.dispatch.is_none() || Uuid::parse_str(event_id).is_err() {
+                return Err(corrupt());
+            }
         }
         if let Some(dispatch) = &self.dispatch {
             validate_digest(&dispatch.request_digest)?;
@@ -201,10 +208,11 @@ pub(super) fn ensure_legacy_grant_allowed(connection: &Connection) -> Result<(),
 }
 
 pub(super) fn ensure_legacy_dispatch_allowed(connection: &Connection) -> Result<(), WorkflowError> {
-    if all_calls(connection)?
-        .iter()
-        .any(|call| call.dispatch.is_some() && call.question_response.is_none())
-    {
+    if all_calls(connection)?.iter().any(|call| {
+        call.dispatch.is_some()
+            && call.question_response.is_none()
+            && call.abandonment_event_id.is_none()
+    }) {
         return Err(invalid("request provider call occupies dispatch capacity"));
     }
     Ok(())
@@ -325,6 +333,7 @@ impl WorkflowStore {
                 call.granted_by.tenant_id == principal.tenant_id
                     && call.grant.request_id == grant.request_id
                     && call.grant.expected_version == grant.expected_version
+                    && call.abandonment_event_id.is_none()
                     && (call.dispatch.is_some() || now_ms < call.grant.expires_at_unix_ms)
             })
         {
@@ -345,6 +354,7 @@ impl WorkflowStore {
             dispatch: None,
             question_response: None,
             model_response_digest: None,
+            abandonment_event_id: None,
         };
         store_call(
             &transaction,
@@ -389,7 +399,11 @@ impl WorkflowStore {
         current_request_matches(&transaction, &call)?;
         let active = all_calls(&transaction)?
             .iter()
-            .filter(|call| call.dispatch.is_some() && call.question_response.is_none())
+            .filter(|call| {
+                call.dispatch.is_some()
+                    && call.question_response.is_none()
+                    && call.abandonment_event_id.is_none()
+            })
             .count()
             + legacy_usage(&transaction)?.1;
         if active >= usize::from(call.grant.concurrent_call_limit) {
@@ -408,6 +422,55 @@ impl WorkflowStore {
             &call,
             principal,
             "request_provider_call_dispatched",
+        )?;
+        transaction.commit()?;
+        Ok(call)
+    }
+
+    /// Record the daemon-verified immutable operator-abandonment event. The
+    /// dispatch and cumulative authorization remain permanently consumed.
+    pub fn abandon_request_provider_call(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        allowance_id: &str,
+        request_digest: &str,
+        resolution_event_id: &str,
+        now_ms: u64,
+    ) -> Result<RequestProviderCallV1, WorkflowError> {
+        grant_actor(principal)?;
+        validate_digest(request_digest)?;
+        Uuid::parse_str(resolution_event_id).map_err(|_| invalid("invalid resolution event"))?;
+        let mut connection = self.connection.lock().map_err(|_| persistence())?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut call: RequestProviderCallV1 =
+            get_entity(&transaction, &principal.tenant_id, KIND, allowance_id)?
+                .ok_or_else(not_found)?;
+        if call.granted_by != *principal
+            || call.question_response.is_some()
+            || call
+                .dispatch
+                .as_ref()
+                .is_none_or(|dispatch| dispatch.request_digest != request_digest)
+        {
+            return Err(unauthorized());
+        }
+        if let Some(existing) = &call.abandonment_event_id {
+            if existing != resolution_event_id {
+                return Err(invalid("resolution event changed"));
+            }
+            return Ok(call);
+        }
+        if now_ms < call.updated_at_unix_ms {
+            return Err(invalid("resolution clock moved backwards"));
+        }
+        call.abandonment_event_id = Some(resolution_event_id.to_owned());
+        call.version = 3;
+        call.updated_at_unix_ms = now_ms;
+        store_call(
+            &transaction,
+            &call,
+            principal,
+            "request_provider_call_abandoned",
         )?;
         transaction.commit()?;
         Ok(call)
@@ -438,7 +501,8 @@ impl WorkflowStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut call = owned_call(&transaction, principal, &adoption.allowance_id)?;
         let dispatch = call.dispatch.as_ref().ok_or_else(unauthorized)?;
-        if dispatch.request_digest != adoption.request_digest {
+        if dispatch.request_digest != adoption.request_digest || call.abandonment_event_id.is_some()
+        {
             return Err(unauthorized());
         }
         if let Some(response) = &call.question_response {

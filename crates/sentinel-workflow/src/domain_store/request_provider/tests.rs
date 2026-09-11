@@ -6,6 +6,91 @@ use tempfile::TempDir;
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 #[test]
+fn explicit_abandonment_preserves_consumption_and_allows_only_a_new_bounded_call() {
+    let f = fixture();
+    let mut g = grant(&f, 1, 1, 1);
+    let original = f
+        .store
+        .authorize_request_provider_call(&f.operator, Uuid::from_u128(100), &g, 2)
+        .unwrap();
+    let dispatched = f
+        .store
+        .claim_request_provider_call(&f.sales, &claim(&original), 3)
+        .unwrap();
+    let receipt = Uuid::from_u128(200).to_string();
+    assert!(f
+        .store
+        .abandon_request_provider_call(&f.sales, &original.allowance_id, DIGEST, &receipt, 4)
+        .is_err());
+    assert!(f
+        .store
+        .abandon_request_provider_call(
+            &f.operator,
+            &original.allowance_id,
+            &"b".repeat(64),
+            &receipt,
+            4
+        )
+        .is_err());
+    let abandoned = f
+        .store
+        .abandon_request_provider_call(&f.operator, &original.allowance_id, DIGEST, &receipt, 4)
+        .unwrap();
+    assert_eq!(abandoned.dispatch, dispatched.dispatch);
+    assert_eq!(abandoned.grant, dispatched.grant);
+    assert!(abandoned.question_response.is_none());
+    assert_eq!(
+        f.store
+            .abandon_request_provider_call(&f.operator, &original.allowance_id, DIGEST, &receipt, 5)
+            .unwrap(),
+        abandoned
+    );
+    assert!(f
+        .store
+        .abandon_request_provider_call(
+            &f.operator,
+            &original.allowance_id,
+            DIGEST,
+            &Uuid::from_u128(201).to_string(),
+            5
+        )
+        .is_err());
+    assert!(f
+        .store
+        .claim_request_provider_call(&f.sales, &claim(&original), 5)
+        .is_err());
+    assert!(f
+        .store
+        .adopt_sales_question(&f.sales, &question(&original), 5)
+        .is_err());
+    assert!(f
+        .store
+        .authorize_request_provider_call(&f.operator, Uuid::from_u128(101), &g, 5)
+        .is_err());
+    let reopened = WorkflowStore::open(f.temp.path().join("workflow.sqlite")).unwrap();
+    assert_eq!(
+        reopened
+            .request_provider_call(&f.operator.tenant_id, &original.allowance_id)
+            .unwrap(),
+        Some(abandoned)
+    );
+    g.total_call_limit = 10;
+    let next = reopened
+        .authorize_request_provider_call(&f.operator, Uuid::from_u128(101), &g, 5)
+        .unwrap();
+    assert_ne!(next.allowance_id, original.allowance_id);
+    reopened
+        .claim_request_provider_call(&f.sales, &claim(&next), 6)
+        .unwrap();
+    assert_eq!(
+        all_calls(&reopened.connection.lock().unwrap())
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn expired_unsent_grant_can_be_replaced_but_still_counts_toward_the_ceiling() {
     let f = fixture();
     let mut grant = grant(&f, 1, 1, 1);

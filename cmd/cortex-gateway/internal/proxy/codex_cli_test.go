@@ -20,6 +20,35 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+func TestCodexCLIReasoningAndPrivateErrorClassification(t *testing.T) {
+	provider := NewCodexCLIProvider(ProviderConfig{Name: CodexCLIProviderName}, nil)
+	for _, model := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+		args := provider.commandArgs(model)
+		if !slices.Contains(args, `model_reasoning_effort="low"`) || slices.Contains(args, `model_reasoning_effort="none"`) {
+			t.Fatalf("unsupported reasoning arguments for %s", model)
+		}
+	}
+	for _, eventType := range []string{"error", "turn.failed"} {
+		event := codexCLIEvent{Type: eventType, Message: "Unsupported reasoning effort; private-secret"}
+		if eventType == "turn.failed" {
+			event.Error = &codexCLIError{Message: event.Message}
+			event.Message = ""
+		}
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := provider.parseOutputStream(strings.NewReader(string(encoded)), 1024)
+		if response != nil || err == nil || err.Error() != "codex-cli reasoning configuration unsupported" {
+			t.Fatalf("response=%v error=%v", response, err)
+		}
+	}
+	err := codexCLIStreamError(codexCLIEvent{Message: "private-secret arbitrary unknown failure"})
+	if err.Error() != "codex-cli subprocess failed" {
+		t.Fatalf("private upstream details escaped: %v", err)
+	}
+}
+
 func TestCodexCLIProviderParsesCompletedInference(t *testing.T) {
 	stream := strings.Join([]string{
 		`{"type":"thread.started","thread_id":"thread-1"}`,
