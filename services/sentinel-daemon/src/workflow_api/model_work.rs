@@ -1233,7 +1233,7 @@ mod tests {
             output_tokens: 20,
             cache_read: 0,
             cache_creation: 0,
-            cost_usd: 0.0,
+            cost_usd: 0.00354,
         };
         let usage = DomainEvent::new(
             usage_payload.event_type_str(),
