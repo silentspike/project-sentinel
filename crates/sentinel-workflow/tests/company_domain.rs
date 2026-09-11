@@ -78,6 +78,17 @@ fn customer_consultation_separates_authors_and_replays_after_restart() {
         in_reply_to: None,
         content: "Which audience should the website address?".into(),
     };
+    let operator = principal(
+        "tenant-a",
+        "operator",
+        CompanyPrincipalKindV1::Operator,
+        CompanyRoleV1::Sales,
+        None,
+        None,
+    );
+    assert!(store
+        .apply_company_command(&operator, Uuid::from_u128(2), &question, 2)
+        .is_err());
     assert!(store
         .apply_company_command(&customer, Uuid::from_u128(2), &question, 2)
         .is_err());
