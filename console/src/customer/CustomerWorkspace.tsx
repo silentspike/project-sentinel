@@ -1,5 +1,5 @@
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { customerFetch, CustomerApiError, dispatchReserved, pendingKey, readPending, reserveCommand,
+import { customerFetch, CustomerApiError, dispatchReserved, pendingKey, readPending, reserveCommand, sendCustomerCommand,
   type CustomerIdentity, type Overview, type PendingCommand } from "./api";
 import "./customer.css";
 import { CustomerPreview } from "./CustomerPreview";
@@ -80,7 +80,7 @@ export function CustomerWorkspace() {
       if (!navigator.locks) throw new Error("customer_command_lock_unavailable");
       await navigator.locks.request(pendingKey(actor), { ifAvailable: true }, async lock => {
         if (!lock) throw new Error("customer_command_active_in_another_tab");
-        await dispatchReserved(localStorage, actor, value, body => customerFetch("commands", body));
+        await dispatchReserved(localStorage, actor, value, sendCustomerCommand);
       });
       setPending(null);
       setSummary(""); setOutcome(""); setConstraints(""); setFeedback("");
@@ -146,7 +146,12 @@ export function CustomerWorkspace() {
               <Show when={project.deliveries?.length}><h3>Lieferungen</h3>
                 <table><thead><tr><th>Lieferung</th><th>Version</th><th>Status</th></tr></thead>
                   <tbody><For each={project.deliveries}>{delivery => <tr>
-                    <td>{delivery.delivery.id}<button class="customer-preview-open" disabled={delivery.release_state !== "active" || !["delivered", "accepted"].includes(delivery.state) || delivery.expires_at_ms <= Date.now()} onClick={() => setPreviewId(delivery.delivery.id)}>Vorschau oeffnen</button></td><td>{delivery.delivery.generation}</td><td>{delivery.state}</td>
+                    <td>{delivery.delivery.id}<button class="customer-preview-open" disabled={delivery.release_state !== "active" || !["delivered", "accepted"].includes(delivery.state) || delivery.expires_at_ms <= Date.now()} onClick={() => setPreviewId(delivery.delivery.id)}>Vorschau oeffnen</button>
+                      <button class="customer-preview-open" disabled={disabled() || delivery.release_state !== "active" || delivery.state !== "delivered" || delivery.expires_at_ms <= Date.now()} onClick={() => {
+                        if (delivery.expires_at_ms <= Date.now()) return;
+                        if (window.confirm(`Lieferung ${delivery.delivery.id}, Version ${delivery.delivery.generation}, verbindlich abnehmen?`)) void command({ command: "confirm_delivery", project_id: project.project_id, delivery: { ...delivery.delivery }, release: { ...delivery.release } });
+                      }}>Lieferung abnehmen</button>
+                    </td><td>{delivery.delivery.generation}</td><td>{delivery.state}</td>
                   </tr>}</For></tbody>
                 </table>
               </Show>

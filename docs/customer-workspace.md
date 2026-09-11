@@ -132,6 +132,15 @@ identity, timestamps, feedback and acceptance records remain server-derived.
 The existing project-only `accept` intent remains compatible with the controlled
 journey harness; the customer browser integration must use `confirm_delivery`.
 
+The delivery row offers explicit acceptance only for an active, unexpired,
+delivered receipt. A confirmation dialog identifies its delivery and version;
+dismissing it causes no reservation or network mutation. Confirming persists
+the exact project, delivery and release references before sending the customer
+intent. The stored command determines its endpoint on every retry, including
+after reload. A newer overview never replaces the reserved references. Pending
+operations block new acceptance; accepted receipts cannot be accepted again
+through the button. Server validation remains authoritative for stale views.
+
 This surface does not by itself prove a delivered customer project. Preview
 serving, explicit final delivery acceptance, the real agent-produced work and
 the complete product journey require their own integration and live evidence.
