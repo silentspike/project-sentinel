@@ -1,5 +1,8 @@
 # Changelog
 
+- Add bounded customer artifact-file reads with server-resolved ownership,
+  post-read release revalidation and a separately authenticated preview proxy (#856).
+
 - Expose customer-owned preview artifact inventories only for exact, unexpired
   delivery receipts and active, digest-verified release manifests (#856).
 
