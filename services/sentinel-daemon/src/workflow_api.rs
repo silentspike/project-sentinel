@@ -1465,6 +1465,7 @@ fn company_command_response(
         );
     };
     for field in [
+        "work_corrections",
         "collaboration_sessions",
         "handoff_packets",
         "dissent_records",
@@ -4152,6 +4153,14 @@ impl WorkflowApi {
                 .ok_or_else(|| {
                     WorkflowError::new(WorkflowErrorCode::NotFound, false, "project not found")
                 })?;
+            // A correction is pending until its new plan exists. Old completion
+            // replay must not close it again during periodic reconciliation.
+            if project.work_corrections.iter().any(|correction| {
+                correction.previous.spec.work_item_id == execution.work_item_id
+                    && correction.execution_revision.previous_plan_id == execution.plan.plan_id
+            }) {
+                return Ok(());
+            }
             let work = project
                 .work_items
                 .get(&execution.work_item_id)
@@ -4739,6 +4748,7 @@ fn is_internal_company_command(command: &CompanyWorkflowCommandV1) -> bool {
     matches!(
         command,
         CompanyWorkflowCommandV1::ApplyWorkTransition { .. }
+            | CompanyWorkflowCommandV1::RequestWorkCorrection { .. }
             | CompanyWorkflowCommandV1::ClaimSubscriptionCall { .. }
             | CompanyWorkflowCommandV1::CreateGovernedRework { .. }
             | CompanyWorkflowCommandV1::AdmitCollaboration { .. }
@@ -5203,6 +5213,7 @@ mod tests {
             blockers: Vec::new(),
             approvals: Vec::new(),
             subscription_call: None,
+            work_corrections: Vec::new(),
             reservations: vec![sentinel_workflow::CostReservationV1 {
                 reservation_id: "reservation-m0".to_owned(),
                 work_item_id: Some(work_item_id),
@@ -5289,6 +5300,22 @@ mod tests {
         assert!(may_read_full_project(&project, &operator));
 
         project.collaboration_generation = 2;
+        project
+            .work_corrections
+            .push(sentinel_workflow::WorkCorrectionV1 {
+                correction_id: "correction-private".to_owned(),
+                previous: project.work_items.values().next().unwrap().clone(),
+                execution_revision: sentinel_workflow::ExecutionRevisionV1 {
+                    previous_plan_id: Uuid::new_v4(),
+                    previous_plan_digest: "a".repeat(64),
+                    previous_version: 1,
+                    previous_state_digest: "b".repeat(64),
+                    feedback_digest: "c".repeat(64),
+                },
+                feedback_ref: "private-feedback".to_owned(),
+                requested_by: "pm-1".to_owned(),
+                requested_at_unix_ms: 4,
+            });
         let outcome = sentinel_workflow::CompanyCommandOutcomeV1 {
             replayed: false,
             response: CompanyWorkflowResponseV1::Project(Box::new(project.clone())),
@@ -5299,6 +5326,9 @@ mod tests {
         assert!(redacted
             .pointer("/response/value/collaboration_generation")
             .is_none());
+        assert!(redacted
+            .pointer("/response/value/work_corrections")
+            .is_none());
 
         let full = company_command_response(&outcome, &operator);
         assert_eq!(full.status, 200);
@@ -5306,6 +5336,10 @@ mod tests {
         assert_eq!(
             full.pointer("/response/value/collaboration_generation"),
             Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            full.pointer("/response/value/work_corrections/0/feedback_ref"),
+            Some(&serde_json::json!("private-feedback"))
         );
     }
 
@@ -5568,6 +5602,21 @@ mod tests {
 
         assert!(is_internal_company_command(&transition));
         assert!(is_internal_company_command(&rework));
+        let correction = CompanyWorkflowCommandV1::RequestWorkCorrection {
+            project_id: ProjectId::parse("project-m0").unwrap(),
+            expected_version: 1,
+            work_item_id: WorkItemId::parse("work-m0").unwrap(),
+            expected_work_version: 1,
+            execution_revision: sentinel_workflow::ExecutionRevisionV1 {
+                previous_plan_id: Uuid::from_u128(1),
+                previous_plan_digest: "a".repeat(64),
+                previous_version: 1,
+                previous_state_digest: "b".repeat(64),
+                feedback_digest: "c".repeat(64),
+            },
+            feedback_ref: "qa-result-1".to_owned(),
+        };
+        assert!(is_internal_company_command(&correction));
 
         let reliability = CompanyWorkflowCommandV1::RecordCollaborationReliability {
             project_id: ProjectId::parse("project-m0").unwrap(),

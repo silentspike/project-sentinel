@@ -1,5 +1,10 @@
 # Changelog
 
+- Bind internal company work corrections to completed execution evidence and
+  leadership authority. Preserve prior outputs and assignment history, reject
+  already consumed dependencies, and prevent periodic synchronization from
+  closing a pending correction with its predecessor's result (#856).
+
 - Add bounded same-work-item execution revisions using the existing workflow
   journal. Preserve old plans and receipts, reject unresolved outcomes and
   reused identities, and atomically admit the next execution without resetting

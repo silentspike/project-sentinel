@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 mod request_provider;
 mod subscription;
+mod work_corrections;
 
 use crate::admission::*;
 use crate::collaboration::*;
@@ -1408,6 +1409,7 @@ fn apply_company_command(
                 approvals: Vec::new(),
                 reservations: Vec::new(),
                 subscription_call: None,
+                work_corrections: Vec::new(),
                 rooms: Vec::new(),
                 questions: Vec::new(),
                 actions: Vec::new(),
@@ -1806,6 +1808,16 @@ fn mutate_project(
     require_version(project.version, expected_version)?;
     let actor_id = authorize_project_actor(&project, principal)?;
     match command {
+        CompanyWorkflowCommandV1::RequestWorkCorrection { .. } => {
+            work_corrections::request(
+                transaction,
+                &mut project,
+                principal,
+                operation_id,
+                command,
+                now_ms,
+            )?;
+        }
         CompanyWorkflowCommandV1::PlanWorkGraph { items, .. } => {
             require_role(
                 principal,
@@ -4971,6 +4983,11 @@ fn project_target(command: &CompanyWorkflowCommandV1) -> Option<(&ProjectId, u64
             expected_version,
             ..
         }
+        | CompanyWorkflowCommandV1::RequestWorkCorrection {
+            project_id,
+            expected_version,
+            ..
+        }
         | CompanyWorkflowCommandV1::RecordDecision {
             project_id,
             expected_version,
@@ -5144,6 +5161,9 @@ fn project_event_type(command: &CompanyWorkflowCommandV1) -> Result<&'static str
         CompanyWorkflowCommandV1::DelegateWork { .. } => Ok("project_work_delegated"),
         CompanyWorkflowCommandV1::ApplyWorkTransition { .. } => {
             Ok("project_work_transition_applied")
+        }
+        CompanyWorkflowCommandV1::RequestWorkCorrection { .. } => {
+            Ok("project_work_correction_requested")
         }
         CompanyWorkflowCommandV1::RecordDecision { .. } => Ok("project_decision_recorded"),
         CompanyWorkflowCommandV1::CreateHandoff { .. } => Ok("project_handoff_created"),
@@ -6217,6 +6237,7 @@ fn validate_work_graph_if_present(
 
 fn validate_project_collections(project: &ProjectV1) -> Result<(), WorkflowError> {
     subscription::validate(project)?;
+    work_corrections::validate(project)?;
     let participant = |agent_id: crate::AgentId| {
         project
             .governance
@@ -6246,12 +6267,8 @@ fn validate_project_collections(project: &ProjectV1) -> Result<(), WorkflowError
         let assignment_edges = work
             .transition_history
             .iter()
-            .filter(|audit| {
-                matches!(
-                    (audit.before.as_str(), audit.after.as_str()),
-                    ("Ready", "Assigned") | ("Assigned", "Assigned") | ("Blocked", "Assigned")
-                )
-            })
+            .enumerate()
+            .filter(|(index, audit)| is_assignment_edge(project, work, *index, audit))
             .count();
         if assignment_edges != work.assignments.len() {
             return Err(corrupt());
@@ -6721,6 +6738,8 @@ fn validate_work_transition_history(
                 | ("InReview", "Done")
                 | ("Assigned", "Assigned")
                 | ("Blocked", "Assigned")
+                | ("Done", "Assigned")
+                | ("InReview", "Assigned")
         );
         if !legal {
             return Err(corrupt());
@@ -6740,7 +6759,7 @@ fn work_transition_actor_is_authorized(
         actor.role,
         CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
     );
-    let active_assignment = assignment_at_transition(work, audit_index);
+    let active_assignment = assignment_at_transition(project, work, audit_index);
     let is_independent_qa = matches!(
         actor.role,
         CompanyRoleV1::Qa | CompanyRoleV1::ReleaseManager
@@ -6749,6 +6768,11 @@ fn work_transition_actor_is_authorized(
     let is_assignee =
         active_assignment.map(|assignment| assignment.agent_id) == Some(actor.agent_id);
     match (audit.before.as_str(), audit.after.as_str()) {
+        ("Done", "Assigned") | ("InReview", "Assigned") | ("Blocked", "Assigned")
+            if work_corrections::matches_transition(project, work, audit_index, audit) =>
+        {
+            is_manager
+        }
         ("Ready", "Assigned") => {
             is_manager
                 && active_assignment.is_some_and(|assignment| {
@@ -6768,7 +6792,7 @@ fn work_transition_actor_is_authorized(
                         None => is_manager,
                         Some(delegator) => {
                             delegator == actor.agent_id
-                                && assignment_index_at_transition(work, audit_index)
+                                && assignment_index_at_transition(project, work, audit_index)
                                     .and_then(|index| index.checked_sub(1))
                                     .and_then(|index| work.assignments.get(index))
                                     .map(|previous| previous.agent_id)
@@ -6804,22 +6828,38 @@ fn work_transition_actor_is_authorized(
     }
 }
 
-fn assignment_at_transition(work: &CompanyWorkItemV1, audit_index: usize) -> Option<&AssignmentV1> {
+fn assignment_at_transition<'a>(
+    project: &ProjectV1,
+    work: &'a CompanyWorkItemV1,
+    audit_index: usize,
+) -> Option<&'a AssignmentV1> {
     work.assignments
-        .get(assignment_index_at_transition(work, audit_index)?)
+        .get(assignment_index_at_transition(project, work, audit_index)?)
 }
 
-fn assignment_index_at_transition(work: &CompanyWorkItemV1, audit_index: usize) -> Option<usize> {
+fn assignment_index_at_transition(
+    project: &ProjectV1,
+    work: &CompanyWorkItemV1,
+    audit_index: usize,
+) -> Option<usize> {
     work.transition_history[..=audit_index]
         .iter()
-        .filter(|audit| {
-            matches!(
-                (audit.before.as_str(), audit.after.as_str()),
-                ("Ready", "Assigned") | ("Assigned", "Assigned") | ("Blocked", "Assigned")
-            )
-        })
+        .enumerate()
+        .filter(|(index, audit)| is_assignment_edge(project, work, *index, audit))
         .count()
         .checked_sub(1)
+}
+
+fn is_assignment_edge(
+    project: &ProjectV1,
+    work: &CompanyWorkItemV1,
+    index: usize,
+    audit: &StateTransitionAuditV1,
+) -> bool {
+    matches!(
+        (audit.before.as_str(), audit.after.as_str()),
+        ("Ready", "Assigned") | ("Assigned", "Assigned") | ("Blocked", "Assigned")
+    ) && !work_corrections::matches_transition(project, work, index, audit)
 }
 
 fn assignment_active_at(
