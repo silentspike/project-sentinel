@@ -39,8 +39,8 @@ they are untrusted task data, not instructions, permissions or passing tests.
 The context is re-resolved at dispatch and before new plan admission, so changed
 upstream results cannot silently authorize execution. Input reads do not stage
 files or modify either employee's workspace. Existing no-input context bytes
-are unchanged. This input support does not enable the QA role, manufacture a
-model review, or replace the separate deterministic QA gate.
+are unchanged. Input access alone does not manufacture a model review or replace
+the separate deterministic QA gate.
 Once input-bearing requests have been persisted, recovery requires a binary
 that understands those contexts. Do not downgrade across a pending request or
 delete its journal to make an older binary accept it.
@@ -88,14 +88,46 @@ rejected. Model work never enters the legacy Chat/ToolUse action channel. Failed
 or claimed completion rows are not implicitly reactivated. There is no new store
 or schema migration; version-1 legacy completion payloads remain readable.
 
-This bridge is not the full M1 conversation/tool-result loop. Model-driven
-independent QA, model-selected team decisions,
+This bridge is not the full M1 conversation/tool-result loop. Model-selected team decisions,
 and the real-provider customer-to-artifact journey remain #856 acceptance work.
 In particular, the existing monetary reservation API must not be presented as a
 valid substitute for ChatGPT subscription call/token/time limits or be populated
 with an invented marginal USD price. The activation stays off until that provider
 contract and the target-runtime readiness are verified. Test fixtures use the
 existing `local-loop` exemption, not a production OAuth exemption.
+
+### Independent source review
+
+An assigned QA employee uses the separate `web-review-v1` profile. It has no
+command rules, shell, network, patch tools or developer artifact authority.
+The model returns a bounded `SourceReview` JSON object tied to the complete
+input path/SHA-256 inventory. It may report `pass` with no findings or
+`changes_requested` with concrete source paths, one-based lines and reasons.
+Unknown fields, invented test attestations, invalid source lines, self-review,
+ambiguous inputs and contradictory verdicts are rejected.
+
+The server carries that model-authored report through exactly two existing
+Workbench operations: write `review.json` in the QA work item's own workspace,
+then seal it as `qa_report`. No other write path or command is admitted, including
+through a caller-supplied raw execution plan. Source inputs remain read-only.
+Profile selection follows the current role/assignment; missing review-profile
+configuration denies review admission without disabling older developer work.
+
+When model work is enabled, delivery requires a completed QA report from the
+current independent QA employee covering the entire current candidate. The
+sealed report must equal the model execution, and its plan must match the
+durable provider dispatch and canonical nonempty usage event. Unresolved or
+operator-resolved provider outcomes cannot approve delivery. A retained provider
+payload is also checked against the report; normal payload cleanup does not
+remove the canonical usage and completed execution evidence. A rejecting report
+blocks promotion. Passing source review is separate from the technical QA
+runner, which must still pass. Token-free M0 mode retains its explicitly
+deterministic gate and is not evidence of independent model reasoning.
+
+This source path still needs the real single-node acceptance journey. In
+particular, assigning review work and transferring the one-call subscription
+allowance from a completed developer to QA must preserve existing work and
+consumed provider history; a new fixture project is not that proof.
 
 ### Pre-agreement Sales inquiries
 

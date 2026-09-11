@@ -167,12 +167,25 @@ impl WorkbenchProfile {
             || self.capabilities.is_empty()
             || self.output_artifact_kinds.is_empty()
             || self.environment != safe_environment
-            || self.command_rules.is_empty()
+            || (self.command_rules.is_empty() && self.id != "web-review-v1")
             || self.command_rules.len() > MAX_PROFILE_RULES
-            || self.test_suites.is_empty()
+            || (self.test_suites.is_empty() && self.id != "web-review-v1")
             || self.test_suites.len() > MAX_PROFILE_TEST_SUITES
         {
             bail!("invalid or unsafe workbench profile definition");
+        }
+        if self.id == "web-review-v1"
+            && (!self.command_rules.is_empty()
+                || !self.test_suites.is_empty()
+                || self.capabilities
+                    != BTreeSet::from([
+                        "file.inspect".to_owned(),
+                        "file.write".to_owned(),
+                        "artifact.commit".to_owned(),
+                    ])
+                || self.output_artifact_kinds != BTreeSet::from(["qa_report".to_owned()]))
+        {
+            bail!("source review profile must remain report-only");
         }
         for (index, rule) in self.command_rules.iter().enumerate() {
             rule.validate()
@@ -2454,7 +2467,40 @@ pub(crate) struct WorkbenchService {
     pub(crate) profile_digest: String,
     pub(crate) qa_profile: WorkbenchProfile,
     pub(crate) qa_profile_digest: String,
+    pub(crate) review_profile: Option<(WorkbenchProfile, String)>,
     pub(crate) receiver: mpsc::Receiver<WorkbenchDispatchCommand>,
+}
+
+impl WorkbenchService {
+    pub(crate) fn profile_for_id(&self, id: &str) -> anyhow::Result<(&WorkbenchProfile, &str)> {
+        select_workbench_profile(
+            id,
+            &self.profile,
+            &self.profile_digest,
+            &self.qa_profile,
+            &self.qa_profile_digest,
+            self.review_profile.as_ref(),
+        )
+    }
+}
+
+fn select_workbench_profile<'a>(
+    id: &str,
+    authoring: &'a WorkbenchProfile,
+    authoring_digest: &'a str,
+    qa: &'a WorkbenchProfile,
+    qa_digest: &'a str,
+    review: Option<&'a (WorkbenchProfile, String)>,
+) -> anyhow::Result<(&'a WorkbenchProfile, &'a str)> {
+    if id == authoring.id {
+        Ok((authoring, authoring_digest))
+    } else if id == qa.id {
+        Ok((qa, qa_digest))
+    } else if let Some((profile, digest)) = review.filter(|(profile, _)| profile.id == id) {
+        Ok((profile, digest))
+    } else {
+        bail!("unknown workbench profile")
+    }
 }
 
 pub(crate) fn install_workbench_service(
@@ -2476,6 +2522,23 @@ pub(crate) fn install_workbench_service(
     if qa_profile.id == profile.id {
         bail!("workbench profile identifiers must be unique");
     }
+    let review_path = config_dir.join("workbench-profiles/web-review-v1.toml");
+    let review_profile = match std::fs::symlink_metadata(&review_path) {
+        Ok(_) => {
+            let review = WorkbenchProfile::load(review_path)?;
+            anyhow::ensure!(
+                review.0.id == "web-review-v1",
+                "invalid source review profile id"
+            );
+            anyhow::ensure!(
+                review.0.id != profile.id && review.0.id != qa_profile.id,
+                "workbench profile identifiers must be unique"
+            );
+            Some(review)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     let store = WorkbenchInvocationStore::open_with_artifact_roots(
         data_dir.join("workbench.redb"),
         artifact_roots,
@@ -2488,6 +2551,7 @@ pub(crate) fn install_workbench_service(
         profile_digest,
         qa_profile,
         qa_profile_digest,
+        review_profile,
         receiver,
     });
     Ok(())
@@ -3432,6 +3496,82 @@ mod tests {
         let mut stale = authority;
         stale.assignment_version += 1;
         assert!(authorize_workbench_request(&request, &stale).is_err());
+    }
+
+    #[test]
+    fn source_review_profile_loads_without_execution_authority() {
+        let bytes = include_bytes!("../../../config/workbench-profiles/web-review-v1.toml");
+        let authority = secure_test_workbench_profile_authority_with_bytes(bytes);
+        let (review, _) = WorkbenchProfile::load(authority.path()).unwrap();
+        assert!(review.command_rules.is_empty());
+        assert!(review.test_suites.is_empty());
+        let authoring_authority = secure_test_workbench_profile_authority();
+        let (authoring, _) = WorkbenchProfile::load(authoring_authority.path()).unwrap();
+        let mut altered = review.clone();
+        altered.command_rules = authoring.command_rules.clone();
+        assert!(altered.validate_definition().is_err());
+        altered = review.clone();
+        altered
+            .capabilities
+            .insert("command.run_allowlisted".into());
+        assert!(altered.validate_definition().is_err());
+        altered = review.clone();
+        altered.output_artifact_kinds.insert("source_tree".into());
+        assert!(altered.validate_definition().is_err());
+        altered = review;
+        altered.id = "foreign-empty-profile".into();
+        assert!(altered.validate_definition().is_err());
+    }
+
+    #[test]
+    fn source_review_dispatch_selects_exact_profile_without_fallback() {
+        let authoring_authority = secure_test_workbench_profile_authority();
+        let (authoring, authoring_digest) =
+            WorkbenchProfile::load(authoring_authority.path()).unwrap();
+        let qa: WorkbenchProfile = toml::from_str(include_str!(
+            "../../../config/workbench-profiles/web-qa-v1.toml"
+        ))
+        .unwrap();
+        let review: WorkbenchProfile = toml::from_str(include_str!(
+            "../../../config/workbench-profiles/web-review-v1.toml"
+        ))
+        .unwrap();
+        let review = (review, "review-digest".to_owned());
+        for (id, digest) in [
+            ("web-authoring-v1", authoring_digest.as_str()),
+            ("web-qa-v1", "qa-digest"),
+            ("web-review-v1", "review-digest"),
+        ] {
+            let selected = select_workbench_profile(
+                id,
+                &authoring,
+                &authoring_digest,
+                &qa,
+                "qa-digest",
+                Some(&review),
+            )
+            .unwrap();
+            assert_eq!(selected.0.id, id);
+            assert_eq!(selected.1, digest);
+        }
+        assert!(select_workbench_profile(
+            "foreign",
+            &authoring,
+            &authoring_digest,
+            &qa,
+            "qa-digest",
+            Some(&review)
+        )
+        .is_err());
+        assert!(select_workbench_profile(
+            "web-review-v1",
+            &authoring,
+            &authoring_digest,
+            &qa,
+            "qa-digest",
+            None
+        )
+        .is_err());
     }
 
     #[test]

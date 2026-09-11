@@ -1,5 +1,11 @@
 # Changelog
 
+- Add independent, source-bound QA report proposals under a separate command-free
+  review profile. Restrict execution to writing and sealing review.json, reject
+  direct caller-authored QA plans, and require matching model usage, committed
+  report evidence and full candidate coverage before model-enabled delivery
+  can approve technical QA. A source review never attests executed tests (#856).
+
 - Resolve model-work upstream inputs through the existing completed-output
   authority and immutable artifact reader. Bind bounded UTF-8 source content to
   the provider context, reject changed or unavailable inputs, and retain legacy

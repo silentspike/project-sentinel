@@ -4,6 +4,7 @@ mod delivery_intent;
 mod delivery_runtime;
 #[cfg(feature = "llm")]
 pub mod model_execution;
+mod model_review;
 #[cfg(feature = "llm")]
 pub mod model_work;
 #[cfg(feature = "llm")]
@@ -293,6 +294,7 @@ struct CompanyAuthority {
     principals: Arc<PrincipalAuthenticator>,
     workbench_profile: WorkbenchProfile,
     workbench_profile_digest: String,
+    review_profile: Option<(WorkbenchProfile, String)>,
     qa_profile_capabilities: BTreeSet<String>,
     agent_capabilities: Arc<HashMap<AgentId, BTreeSet<String>>>,
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
@@ -300,6 +302,19 @@ struct CompanyAuthority {
 }
 
 impl CompanyAuthority {
+    fn profile_for_role(
+        &self,
+        role: CompanyRoleV1,
+    ) -> Result<(&WorkbenchProfile, &str), WorkflowPortError> {
+        if role == CompanyRoleV1::Qa {
+            return self
+                .review_profile
+                .as_ref()
+                .map(|(profile, digest)| (profile, digest.as_str()))
+                .ok_or(WorkflowPortError::Unavailable);
+        }
+        Ok((&self.workbench_profile, &self.workbench_profile_digest))
+    }
     fn validate_plan_contract(&self, plan: &ExecutionPlanV1) -> Result<(), WorkflowPortError> {
         let project = self
             .store
@@ -310,6 +325,12 @@ impl CompanyAuthority {
             .work_items
             .get(&plan.work_item_id)
             .ok_or(WorkflowPortError::AuthorityConflict)?;
+        if work.spec.required_role == CompanyRoleV1::Qa {
+            let (profile, digest) = self.profile_for_role(CompanyRoleV1::Qa)?;
+            if plan.profile_id != profile.id || plan.profile_digest != digest {
+                return Err(WorkflowPortError::AuthorityConflict);
+            }
+        }
         validate_execution_contract(plan, &work.spec)
     }
 
@@ -359,13 +380,14 @@ impl CompanyAuthority {
             &project, work, assignment,
         )
         .map_err(map_authority_store_error)?;
+        let (profile, profile_digest) = self.profile_for_role(work.spec.required_role)?;
         if assignment.agent_id != agent_id
             || participant.role != assignment.role
             || principal.principal.agent_id != Some(agent_id)
             || principal.principal.role != assignment.role
             || principal.principal.tenant_id != *tenant_id
-            || assignment.profile.profile_id != self.workbench_profile.id
-            || assignment.profile.digest != self.workbench_profile_digest
+            || assignment.profile.profile_id != profile.id
+            || assignment.profile.digest != profile_digest
             || assignment.profile.generation != PROFILE_GENERATION
             || project.governance.project_profile.profile_id != "web-project-v1"
             || !capability_coverage
@@ -384,7 +406,7 @@ impl CompanyAuthority {
             .get(&agent_id)
             .cloned()
             .unwrap_or_default()
-            .intersection(&self.workbench_profile.capabilities)
+            .intersection(&profile.capabilities)
             .cloned()
             .collect::<BTreeSet<_>>();
         if capabilities.is_empty() {
@@ -394,7 +416,7 @@ impl CompanyAuthority {
             "sentinel.workflow.runtime.v1",
             &[
                 WORKBENCH_RUNTIME_BWRAP.as_bytes(),
-                self.workbench_profile_digest.as_bytes(),
+                profile_digest.as_bytes(),
             ],
         );
         let snapshot = RuntimeAuthoritySnapshotV1 {
@@ -544,10 +566,13 @@ impl CompanyAuthority {
             return Err(execution_authority_conflict());
         }
         let inputs = self.materialize_execution_inputs(&project, &spec.spec, agent_id)?;
+        let (profile, _) = self
+            .profile_for_role(spec.spec.required_role)
+            .map_err(execution_intent_port_error)?;
         let created_at_unix_ms = now_ms;
         let deadline_unix_ms = execution_deadline_unix_ms(
             now_ms,
-            self.workbench_profile.resource_ceilings.wall_time_ms,
+            profile.resource_ceilings.wall_time_ms,
             intent.tools.len(),
         )?;
         let plan = build_execution_plan(
@@ -555,7 +580,7 @@ impl CompanyAuthority {
             &authority,
             &spec.spec,
             inputs,
-            &self.workbench_profile,
+            profile,
             intent,
             created_at_unix_ms,
             deadline_unix_ms,
@@ -700,10 +725,13 @@ impl CompanyAuthority {
             })
             .ok_or_else(|| anyhow::anyhow!("workbench principal authority changed"))?;
         let role = principal.principal.role;
+        let (profile, _) = self
+            .profile_for_role(role)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let role_capabilities = role_capabilities(
             role,
             &self.workbench_profile.capabilities,
-            &self.qa_profile_capabilities,
+            &profile.capabilities,
         );
         Ok(WorkbenchAuthoritySnapshot {
             agent_id,
@@ -722,7 +750,7 @@ impl CompanyAuthority {
             role_capabilities,
             assignment_capabilities: runtime.capabilities.clone(),
             project_capabilities: runtime.capabilities.clone(),
-            profile_capabilities: self.workbench_profile.capabilities.clone(),
+            profile_capabilities: profile.capabilities.clone(),
         })
     }
 }
@@ -765,6 +793,14 @@ fn build_execution_plan(
     let artifact_kind = match spec.required_role {
         CompanyRoleV1::Designer => "design_specification",
         CompanyRoleV1::Developer => "source_tree",
+        CompanyRoleV1::Qa => {
+            if profile.id != model_review::PROFILE_ID {
+                return Err(execution_authority_conflict());
+            }
+            model_review::validate_tools(&intent.tools, &inputs)
+                .map_err(|_| execution_intent_invalid())?;
+            "qa_report"
+        }
         _ => return Err(execution_authority_conflict()),
     };
     let output = &spec.outputs[0];
@@ -790,7 +826,11 @@ fn build_execution_plan(
         profile_id: spec.quality_gate.gate_id.clone(),
         profile_generation: spec.quality_gate.generation,
         profile_digest: spec.quality_gate.digest.clone(),
-        required_checks: BTreeSet::from(["html_structure".to_owned()]),
+        required_checks: BTreeSet::from([if spec.required_role == CompanyRoleV1::Qa {
+            "sealed_report_integrity".to_owned()
+        } else {
+            "html_structure".to_owned()
+        }]),
     };
     let output_expectation = OutputExpectationV1 {
         name: output.name.clone(),
@@ -994,6 +1034,23 @@ fn validate_execution_contract(
     plan: &ExecutionPlanV1,
     spec: &sentinel_workflow::CompanyWorkItemSpecV1,
 ) -> Result<(), WorkflowPortError> {
+    if spec.required_role == CompanyRoleV1::Qa {
+        if plan.profile_id != model_review::PROFILE_ID {
+            return Err(WorkflowPortError::AuthorityConflict);
+        }
+        let tools = plan
+            .steps
+            .iter()
+            .map(|step| step.tool.clone())
+            .collect::<Vec<_>>();
+        let inputs = plan
+            .steps
+            .first()
+            .ok_or(WorkflowPortError::Rejected)?
+            .inputs
+            .as_slice();
+        model_review::validate_tools(&tools, inputs).map_err(|_| WorkflowPortError::Rejected)?;
+    }
     let final_step = plan.steps.last().ok_or(WorkflowPortError::Rejected)?;
     let derived_inputs = plan
         .steps
@@ -1668,7 +1725,8 @@ impl WorkbenchExecutionAdapter {
             .iter()
             .map(map_command_rule)
             .collect();
-        let tool = map_execution_tool(&pending.step.tool, &self.authority.workbench_profile)?;
+        let (profile, _) = self.authority.profile_for_role(caller.principal.role)?;
+        let tool = map_execution_tool(&pending.step.tool, profile)?;
         let inputs = pending.step.inputs.iter().map(map_artifact_input).collect();
         let mut request = WorkbenchRequest {
             schema_version: WORKBENCH_SCHEMA_VERSION,
@@ -2625,12 +2683,26 @@ impl WorkflowApi {
         let (qa_profile, qa_profile_digest) =
             WorkbenchProfile::load(config_dir.join("workbench-profiles/web-qa-v1.toml"))
                 .map_err(|_| workflow_unavailable())?;
+        let review_path = config_dir.join("workbench-profiles/web-review-v1.toml");
+        let review_profile = match fs::symlink_metadata(&review_path) {
+            Ok(_) => {
+                let (review, digest) =
+                    WorkbenchProfile::load(&review_path).map_err(|_| workflow_unavailable())?;
+                if review.id != model_review::PROFILE_ID {
+                    return Err(workflow_unavailable());
+                }
+                Some((review, digest))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(workflow_unavailable()),
+        };
         let agent_capabilities = Arc::new(agent_capabilities);
         let authority = Arc::new(CompanyAuthority {
             store: Arc::clone(&store),
             principals: Arc::clone(&principals),
             workbench_profile: profile,
             workbench_profile_digest: profile_digest,
+            review_profile,
             qa_profile_capabilities: qa_profile.capabilities.clone(),
             agent_capabilities: Arc::clone(&agent_capabilities),
             runtime_health,
@@ -3414,6 +3486,14 @@ impl WorkflowApi {
             );
         }
         if let Ok(envelope) = serde_json::from_slice::<ExecutionPlanEnvelope>(body) {
+            if principal.principal.role == CompanyRoleV1::Qa {
+                return json_error(
+                    403,
+                    "authority_conflict",
+                    "QA reports require canonical model admission",
+                    false,
+                );
+            }
             if envelope.plan.principal != principal.execution_authority
                 || envelope.plan.agent_id != principal.principal.agent_id.unwrap_or(AgentId(0))
                 || envelope.operation_id != envelope.plan.plan_id
@@ -3451,6 +3531,14 @@ impl WorkflowApi {
             };
         }
         if let Ok(envelope) = serde_json::from_slice::<ExecutionIntentEnvelope>(body) {
+            if principal.principal.role == CompanyRoleV1::Qa {
+                return json_error(
+                    403,
+                    "authority_conflict",
+                    "QA reports require canonical model admission",
+                    false,
+                );
+            }
             let Ok(_guard) = self.mutation_fence.read() else {
                 return json_error(503, "workflow_busy", "workflow recovery is active", true);
             };
@@ -5820,6 +5908,7 @@ mod tests {
             principals,
             workbench_profile: profile,
             workbench_profile_digest: "a".repeat(64),
+            review_profile: None,
             qa_profile_capabilities: BTreeSet::from([
                 "file.inspect".to_owned(),
                 "test.run_profile".to_owned(),

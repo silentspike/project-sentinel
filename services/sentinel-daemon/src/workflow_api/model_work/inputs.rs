@@ -77,7 +77,7 @@ fn lower_digest(value: &str) -> bool {
 }
 
 impl WorkflowApi {
-    pub(super) fn model_artifact_inputs(
+    pub(in crate::workflow_api) fn model_artifact_inputs(
         &self,
         project: &ProjectV1,
         spec: &CompanyWorkItemSpecV1,

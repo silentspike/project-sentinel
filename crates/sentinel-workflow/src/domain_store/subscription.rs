@@ -2,6 +2,11 @@ use super::*;
 
 const MAX_GRANT_WINDOW_MS: u64 = 300_000;
 
+fn subscription_role_supported(role: CompanyRoleV1, profile_id: &str, has_inputs: bool) -> bool {
+    matches!(role, CompanyRoleV1::Developer | CompanyRoleV1::Designer)
+        || (role == CompanyRoleV1::Qa && profile_id == "web-review-v1" && has_inputs)
+}
+
 fn validate_grant(
     grant: &SubscriptionCallGrantV1,
     created_at_ms: u64,
@@ -34,9 +39,6 @@ fn active_assignment_matches(project: &ProjectV1, grant: &SubscriptionCallGrantV
             matches!(
                 work.state,
                 CompanyWorkStateV1::Assigned | CompanyWorkStateV1::InProgress
-            ) && matches!(
-                work.spec.required_role,
-                CompanyRoleV1::Developer | CompanyRoleV1::Designer
             ) && work
                 .assignments
                 .iter()
@@ -48,6 +50,11 @@ fn active_assignment_matches(project: &ProjectV1, grant: &SubscriptionCallGrantV
                         && assignment.assignment_id == grant.assignment_id
                         && assignment.assignment_version == grant.assignment_version
                         && assignment.agent_id == grant.agent_id
+                        && subscription_role_supported(
+                            work.spec.required_role,
+                            &assignment.profile.profile_id,
+                            !work.spec.inputs.is_empty(),
+                        )
                 })
         })
 }
@@ -154,14 +161,15 @@ pub(super) fn validate_allowance(
         CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
     ) || allowance.created_at_unix_ms < project.created_at_unix_ms
         || allowance.created_at_unix_ms > project.updated_at_unix_ms
-        || !matches!(
-            work.spec.required_role,
-            CompanyRoleV1::Developer | CompanyRoleV1::Designer
-        )
         || !work.assignments.iter().any(|assignment| {
             assignment.assignment_id == allowance.grant.assignment_id
                 && assignment.assignment_version == allowance.grant.assignment_version
                 && assignment.agent_id == allowance.grant.agent_id
+                && subscription_role_supported(
+                    work.spec.required_role,
+                    &assignment.profile.profile_id,
+                    !work.spec.inputs.is_empty(),
+                )
         })
         || project.reservations.iter().any(|reservation| {
             reservation.work_item_id.as_ref() == Some(&allowance.grant.work_item_id)
@@ -212,4 +220,42 @@ pub(super) fn renew_for_correction(
     }
     project.subscription_call = None;
     grant(project, principal, operation_id, next, now_ms)
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+    #[test]
+    fn subscription_qa_requires_the_review_profile_and_bound_inputs() {
+        assert!(subscription_role_supported(
+            CompanyRoleV1::Qa,
+            "web-review-v1",
+            true
+        ));
+        assert!(!subscription_role_supported(
+            CompanyRoleV1::Qa,
+            "web-authoring-v1",
+            true
+        ));
+        assert!(!subscription_role_supported(
+            CompanyRoleV1::Qa,
+            "web-review-v1",
+            false
+        ));
+        assert!(!subscription_role_supported(
+            CompanyRoleV1::Customer,
+            "web-review-v1",
+            true
+        ));
+        assert!(subscription_role_supported(
+            CompanyRoleV1::Developer,
+            "web-authoring-v1",
+            false
+        ));
+        assert!(subscription_role_supported(
+            CompanyRoleV1::Designer,
+            "web-authoring-v1",
+            false
+        ));
+    }
 }
