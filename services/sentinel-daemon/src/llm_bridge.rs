@@ -24,9 +24,11 @@ pub mod bridge {
     use tokio::task::JoinSet;
     use tracing::{debug, error, info, instrument, warn};
 
-    use crate::workflow_api::model_work::{
-        ModelWorkCompletion, ModelWorkContext, MAX_MODEL_WORK_BYTES,
+    use crate::workflow_api::model_execution::{
+        ModelExecutionCompletion as ModelWorkCompletion, ModelExecutionContext as ModelWorkContext,
+        ProviderExecutionAuthority,
     };
+    use crate::workflow_api::model_work::MAX_MODEL_WORK_BYTES;
     use sentinel_common::{
         ActionType, AgentAction, AgentId, CostSource, DomainEvent, DomainEventPayload,
         HierarchyTier, Perception, Tick, Timestamp,
@@ -56,11 +58,11 @@ pub mod bridge {
         fn resolve_provider_usage_authority(
             &self,
             agent_id: AgentId,
-        ) -> Result<Option<ProviderUsageAuthority>, &'static str>;
+        ) -> Result<Option<ProviderExecutionAuthority>, &'static str>;
 
         fn model_work_context(
             &self,
-            _authority: &ProviderUsageAuthority,
+            _authority: &ProviderExecutionAuthority,
         ) -> Result<Option<ModelWorkContext>, &'static str> {
             Ok(None)
         }
@@ -407,7 +409,7 @@ pub mod bridge {
 
     fn agent_runtime_request_id(
         perception: &Perception,
-        authority: Option<&ProviderUsageAuthority>,
+        authority: Option<&ProviderExecutionAuthority>,
     ) -> String {
         authority.map_or_else(
             || {
@@ -416,7 +418,7 @@ pub mod bridge {
                     perception.agent_id.0, perception.tick.0
                 )
             },
-            |binding| format!("company-provider-{}", binding.reservation_id),
+            |binding| format!("company-provider-{}", binding.reservation_id()),
         )
     }
 
@@ -433,7 +435,7 @@ pub mod bridge {
         agent_id: AgentId,
         tick: u64,
         requested_model: &str,
-        authority: Option<&ProviderUsageAuthority>,
+        authority: Option<&ProviderExecutionAuthority>,
         resp: &GatewayResponse,
         usage_v2_enabled: bool,
     ) -> Result<DomainEvent, String> {
@@ -457,12 +459,20 @@ pub mod bridge {
             .saturating_sub(resp.cache_creation);
         let payload = DomainEventPayload::AgentLlmUsage {
             agent_id,
-            tenant_id: authority.map(|value| value.tenant_id.clone()),
-            project_id: authority.map(|value| value.project_id.clone()),
-            work_item_id: authority.map(|value| value.work_item_id.clone()),
-            reservation_id: authority.map(|value| value.reservation_id.clone()),
-            assignment_id: authority.map(|value| value.assignment_id.clone()),
-            assignment_version: authority.map(|value| value.assignment_version),
+            tenant_id: authority.map(|value| value.tenant_id().to_owned()),
+            project_id: authority
+                .and_then(|value| value.project())
+                .map(|value| value.project_id.clone()),
+            work_item_id: authority
+                .and_then(|value| value.project())
+                .map(|value| value.work_item_id.clone()),
+            reservation_id: authority.map(|value| value.reservation_id().to_owned()),
+            assignment_id: authority
+                .and_then(|value| value.project())
+                .map(|value| value.assignment_id.clone()),
+            assignment_version: authority
+                .and_then(|value| value.project())
+                .map(|value| value.assignment_version),
             provider: usage_v2_enabled.then(|| resp.provider.clone()),
             requested_model: usage_v2_enabled.then(|| {
                 if requested_model.trim().is_empty() {
@@ -505,7 +515,11 @@ pub mod bridge {
             event = event.with_operation_id(&format!("llm_usage_{}", resp.request_id));
         }
         if usage_v2_enabled {
-            event = event.with_schema_version(if authority.is_some() { 3 } else { 2 });
+            event = event.with_schema_version(match authority {
+                Some(ProviderExecutionAuthority::RequestSales(_)) => 4,
+                Some(ProviderExecutionAuthority::Project(_)) => 3,
+                None => 2,
+            });
         }
         Ok(event)
     }
@@ -542,7 +556,7 @@ pub mod bridge {
                 !completed.actions.is_empty()
                     || entry.owner_scope
                         != sentinel_common::StateTransferScope::for_agent(
-                            model_work.context.binding.agent_id.to_string(),
+                            model_work.context.binding().agent_id().to_string(),
                         )
                     || model_work.validate_usage(&completed.usage_event).is_err()
             })
@@ -665,7 +679,7 @@ pub mod bridge {
         agent_id: AgentId,
         tick: u64,
         requested_model: &'a str,
-        authority: Option<&'a ProviderUsageAuthority>,
+        authority: Option<&'a ProviderExecutionAuthority>,
         authority_resolver: Option<&'a dyn ProviderUsageAuthorityResolver>,
         gateway_response: &'a GatewayResponse,
         usage_v2_enabled: bool,
@@ -674,7 +688,7 @@ pub mod bridge {
 
     fn validate_current_provider_usage_authority(
         resolver: Option<&dyn ProviderUsageAuthorityResolver>,
-        expected: Option<&ProviderUsageAuthority>,
+        expected: Option<&ProviderExecutionAuthority>,
         agent_id: AgentId,
     ) -> Result<(), String> {
         match resolver {
@@ -695,7 +709,7 @@ pub mod bridge {
     }
 
     fn validate_provider_usage_mode(
-        authority: Option<&ProviderUsageAuthority>,
+        authority: Option<&ProviderExecutionAuthority>,
         usage_v2_enabled: bool,
     ) -> Result<(), &'static str> {
         if authority.is_some() && !usage_v2_enabled {
@@ -707,7 +721,7 @@ pub mod bridge {
     fn validate_pre_dispatch_provider_authority<S: CompletionStore>(
         store: &S,
         resolver: Option<&dyn ProviderUsageAuthorityResolver>,
-        expected: Option<&ProviderUsageAuthority>,
+        expected: Option<&ProviderExecutionAuthority>,
         agent_id: AgentId,
         request_id: &str,
         request_digest: &str,
@@ -743,7 +757,7 @@ pub mod bridge {
             )?;
             let current = resolver
                 .ok_or("model work resolver unavailable")?
-                .model_work_context(&expected.binding)?;
+                .model_work_context(&expected.binding())?;
             if current.as_ref() != Some(expected) {
                 return Err("model work authority changed during provider I/O".to_owned());
             }
@@ -753,12 +767,12 @@ pub mod bridge {
 
     fn validate_gateway_completion_authority(
         resolver: Option<&dyn ProviderUsageAuthorityResolver>,
-        expected: Option<&ProviderUsageAuthority>,
+        expected: Option<&ProviderExecutionAuthority>,
         gateway_response: &GatewayResponse,
         agent_id: AgentId,
     ) -> Result<(), String> {
         if let Some(expected) = expected {
-            if gateway_response.provider != expected.provider {
+            if gateway_response.provider != expected.provider() {
                 return Err("gateway provider does not match the reserved provider".to_string());
             }
         }
@@ -794,9 +808,9 @@ pub mod bridge {
             // Usage belongs to the dispatched authority even when that authority
             // was revoked while the provider ran. Admission rechecks currentness
             // only after the completed result is durable.
-            if authority != Some(&work.binding)
-                || gateway_resp.provider != work.binding.provider
-                || agent_id != work.binding.agent_id
+            if authority != Some(&work.binding())
+                || gateway_resp.provider != work.binding().provider()
+                || agent_id != work.binding().agent_id()
             {
                 return Err("model work response authority mismatch".to_owned());
             }
@@ -817,7 +831,7 @@ pub mod bridge {
             usage_v2_enabled,
         )?;
         let model_completion = if let Some(context) = model_work {
-            if authority != Some(&context.binding) {
+            if authority != Some(&context.binding()) {
                 return Err("model work response authority mismatch".to_owned());
             }
             let bounded = gateway_resp.content.len() <= MAX_MODEL_WORK_BYTES;
@@ -1203,7 +1217,7 @@ pub mod bridge {
                 };
                 if usage_authority
                     .as_ref()
-                    .is_some_and(|authority| authority.agent_id != agent_id)
+                    .is_some_and(|authority| authority.agent_id() != agent_id)
                 {
                     error!(agent = %agent_id, "Provider usage authority returned another agent");
                     continue;
@@ -1694,7 +1708,7 @@ pub mod bridge {
         perception: &Perception,
         store: &StateStore,
         request_id: &str,
-        authority: Option<&ProviderUsageAuthority>,
+        authority: Option<&ProviderExecutionAuthority>,
     ) -> GatewayRequest {
         let user_prompt = if perception.impulse_text.is_empty() {
             "Was machst du als naechstes? Reagiere natuerlich auf deine aktuelle Situation."
@@ -1732,16 +1746,7 @@ pub mod bridge {
         metadata.insert("tick".to_string(), perception.tick.0.to_string());
         metadata.insert("request_id".to_string(), request_id.to_string());
         if let Some(binding) = authority {
-            metadata.insert("tenant_id".to_string(), binding.tenant_id.clone());
-            metadata.insert("project_id".to_string(), binding.project_id.clone());
-            metadata.insert("work_item_id".to_string(), binding.work_item_id.clone());
-            metadata.insert("reservation_id".to_string(), binding.reservation_id.clone());
-            metadata.insert("assignment_id".to_string(), binding.assignment_id.clone());
-            metadata.insert("reserved_provider".to_string(), binding.provider.clone());
-            metadata.insert(
-                "assignment_version".to_string(),
-                binding.assignment_version.to_string(),
-            );
+            metadata.extend(provider_metadata(binding));
         }
 
         // Traffic Control Metadata (Synthesis, Chat-Sequencing)
@@ -1814,50 +1819,81 @@ pub mod bridge {
         request: &mut GatewayRequest,
         context: &ModelWorkContext,
     ) -> Result<(), &'static str> {
-        let binding = &context.binding;
-        let required = [
-            ("agent_id", binding.agent_id.0.to_string()),
-            (
-                "request_id",
-                format!("company-provider-{}", binding.reservation_id),
-            ),
-            ("tenant_id", binding.tenant_id.clone()),
-            ("project_id", binding.project_id.clone()),
-            ("work_item_id", binding.work_item_id.clone()),
-            ("reservation_id", binding.reservation_id.clone()),
-            ("assignment_id", binding.assignment_id.clone()),
-            ("assignment_version", binding.assignment_version.to_string()),
-            ("reserved_provider", binding.provider.clone()),
-        ];
+        let binding = context.binding();
+        let forbidden = if binding.project().is_some() {
+            &[
+                "company_execution_subject",
+                "customer_request_id",
+                "customer_request_version",
+            ][..]
+        } else {
+            &[
+                "project_id",
+                "work_item_id",
+                "assignment_id",
+                "assignment_version",
+            ][..]
+        };
+        if forbidden
+            .iter()
+            .any(|key| request.metadata.contains_key(*key))
+        {
+            return Err("mixed model execution subjects");
+        }
+        let mut required = provider_metadata(&binding);
+        required.insert("agent_id".to_owned(), binding.agent_id().0.to_string());
+        required.insert(
+            "request_id".to_owned(),
+            format!("company-provider-{}", binding.reservation_id()),
+        );
         for (key, value) in &required {
-            if request.metadata.get(*key) != Some(value) {
+            if request.metadata.get(key) != Some(value) {
                 return Err("model work request authority does not match its context");
             }
         }
         // A reservation names one provider effect, independent of the next tick,
         // room chat or body state. Do not hash volatile perception into its retry.
         request.metadata.retain(|key, _| {
-            matches!(key.as_str(), "agent_role" | "hierarchy_tier")
-                || required.iter().any(|(required_key, _)| key == required_key)
+            matches!(key.as_str(), "agent_role" | "hierarchy_tier") || required.contains_key(key)
         });
         let context_bytes =
             serde_json::to_vec(context).map_err(|_| "model work context encoding failed")?;
-        request
-            .metadata
-            .insert("company_execution_schema".to_owned(), "1".to_owned());
+        request.metadata.insert(
+            "company_execution_schema".to_owned(),
+            if matches!(binding, ProviderExecutionAuthority::RequestSales(_)) {
+                "2"
+            } else {
+                "1"
+            }
+            .to_owned(),
+        );
         request.metadata.insert(
             "company_execution_context_digest".to_owned(),
             format!("{:x}", Sha256::digest(context_bytes)),
         );
-        if let Some(grant) = &binding.subscription_grant {
+        if let Some(grant) = binding
+            .project()
+            .and_then(|value| value.subscription_grant.as_ref())
+        {
             request.model = grant.model.clone();
             request.metadata.insert(
                 "subscription_allowance_id".to_owned(),
-                binding.reservation_id.clone(),
+                binding.reservation_id().to_owned(),
             );
             request.metadata.insert(
                 "subscription_catalog_digest".to_owned(),
                 grant.catalog_digest.clone(),
+            );
+        }
+        if let ProviderExecutionAuthority::RequestSales(sales) = &binding {
+            request.model = sales.grant.model.clone();
+            request.metadata.insert(
+                "subscription_allowance_id".to_owned(),
+                sales.allowance_id.clone(),
+            );
+            request.metadata.insert(
+                "subscription_catalog_digest".to_owned(),
+                sales.grant.catalog_digest.clone(),
             );
         }
         request.messages = vec![GatewayMessage {
@@ -1865,6 +1901,46 @@ pub mod bridge {
             content: context.prompt()?,
         }];
         Ok(())
+    }
+
+    fn provider_metadata(binding: &ProviderExecutionAuthority) -> BTreeMap<String, String> {
+        let mut values = BTreeMap::from([
+            ("tenant_id".to_owned(), binding.tenant_id().to_owned()),
+            (
+                "reservation_id".to_owned(),
+                binding.reservation_id().to_owned(),
+            ),
+            (
+                "reserved_provider".to_owned(),
+                binding.provider().to_owned(),
+            ),
+        ]);
+        match binding {
+            ProviderExecutionAuthority::Project(value) => values.extend([
+                ("project_id".to_owned(), value.project_id.clone()),
+                ("work_item_id".to_owned(), value.work_item_id.clone()),
+                ("assignment_id".to_owned(), value.assignment_id.clone()),
+                (
+                    "assignment_version".to_owned(),
+                    value.assignment_version.to_string(),
+                ),
+            ]),
+            ProviderExecutionAuthority::RequestSales(value) => values.extend([
+                (
+                    "company_execution_subject".to_owned(),
+                    "customer_request".to_owned(),
+                ),
+                (
+                    "customer_request_id".to_owned(),
+                    value.grant.request_id.clone(),
+                ),
+                (
+                    "customer_request_version".to_owned(),
+                    value.grant.expected_version.to_string(),
+                ),
+            ]),
+        }
+        values
     }
 
     fn format_perception_metadata(perception: &Perception) -> String {
@@ -1973,12 +2049,12 @@ pub mod bridge {
             fn resolve_provider_usage_authority(
                 &self,
                 _: AgentId,
-            ) -> Result<Option<ProviderUsageAuthority>, &'static str> {
-                Ok(Some(self.context.binding.clone()))
+            ) -> Result<Option<ProviderExecutionAuthority>, &'static str> {
+                Ok(Some(self.context.binding()))
             }
             fn model_work_context(
                 &self,
-                _: &ProviderUsageAuthority,
+                _: &ProviderExecutionAuthority,
             ) -> Result<Option<ModelWorkContext>, &'static str> {
                 Ok(Some(self.context.clone()))
             }
@@ -2001,16 +2077,16 @@ pub mod bridge {
 
         #[test]
         fn model_work_request_is_stable_across_perceptions_and_bound_to_authority() {
-            let context = crate::workflow_api::model_work::test_context();
+            let context: ModelWorkContext = crate::workflow_api::model_work::test_context().into();
             let dir = tempfile::tempdir().unwrap();
             let state = StateStore::open(dir.path().join("state.redb").to_str().unwrap()).unwrap();
             let mut first = make_perception(6, "First conversation", true);
-            let id = agent_runtime_request_id(&first, Some(&context.binding));
-            let mut a = build_gateway_request(&first, &state, &id, Some(&context.binding));
+            let id = agent_runtime_request_id(&first, Some(&context.binding()));
+            let mut a = build_gateway_request(&first, &state, &id, Some(&context.binding()));
             first.tick = Tick(999);
             first.heard_text = "Different conversation".to_owned();
             first.body_text = "Different body state".to_owned();
-            let mut b = build_gateway_request(&first, &state, &id, Some(&context.binding));
+            let mut b = build_gateway_request(&first, &state, &id, Some(&context.binding()));
             bind_model_work_request(&mut a, &context).unwrap();
             bind_model_work_request(&mut b, &context).unwrap();
             assert_eq!(
@@ -2020,7 +2096,10 @@ pub mod bridge {
             assert!(!a.metadata.contains_key("heard"));
             assert!(!a.metadata.contains_key("tick"));
             let mut changed = context.clone();
-            changed.authority.principal.principal_generation += 1;
+            let ModelWorkContext::Project(work) = &mut changed else {
+                panic!("project fixture");
+            };
+            work.authority.principal.principal_generation += 1;
             bind_model_work_request(&mut b, &changed).unwrap();
             assert_ne!(
                 gateway_request_digest(&a).unwrap(),
@@ -2032,8 +2111,94 @@ pub mod bridge {
         }
 
         #[test]
+        fn sales_request_uses_the_normal_gateway_and_durable_question_adoption_path() {
+            let dir = tempfile::tempdir().unwrap();
+            let (api, sales) = crate::workflow_api::model_execution::tests::fixture(
+                &dir.path().join("company.sqlite"),
+            );
+            let context = ModelWorkContext::RequestSales(Box::new(sales.clone()));
+            let binding = context.binding();
+            let state = StateStore::open(dir.path().join("state.redb").to_str().unwrap()).unwrap();
+            let perception = make_perception(3, "Customer inquiry", true);
+            let id = agent_runtime_request_id(&perception, Some(&binding));
+            let mut request = build_gateway_request(&perception, &state, &id, Some(&binding));
+            bind_model_work_request(&mut request, &context).unwrap();
+            assert_eq!(request.metadata["company_execution_schema"], "2");
+            assert_eq!(
+                request.metadata["customer_request_id"],
+                sales.source_request.request_id
+            );
+            assert!(!request.metadata.contains_key("project_id"));
+            assert!(request.messages[0]
+                .content
+                .contains("Three accessible pages"));
+            let mut mixed = build_gateway_request(&perception, &state, &id, Some(&binding));
+            mixed
+                .metadata
+                .insert("project_id".to_owned(), "foreign".to_owned());
+            assert!(bind_model_work_request(&mut mixed, &context).is_err());
+            let digest = gateway_request_digest(&request).unwrap();
+            let store =
+                EventStore::open(dir.path().join("company.events.sqlite").to_str().unwrap())
+                    .unwrap();
+            store
+                .reserve_request(&id, &digest, &AgentId(3).to_string())
+                .unwrap();
+            let dispatch = serde_json::json!({"schema_version":2,"allowance_id":sales.binding.allowance_id,
+                "agent_id":3,"request_id":id,"request_digest":digest,
+                "context_digest":request.metadata["company_execution_context_digest"],
+                "provider":"codex-cli","model":"model-test","catalog_digest":"a".repeat(64),
+                "subject":{"kind":"customer_request","request_id":sales.source_request.request_id,"request_version":1}});
+            assert_eq!(
+                api.subscription_dispatch(&serde_json::to_vec(&dispatch).unwrap())
+                    .status,
+                200
+            );
+            // Fixture response, not live provider evidence. The production bridge,
+            // EventStore recovery and workflow adapter perform the actual adoption.
+            let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+                "content":r#"{"schema_version":1,"decision":{"kind":"ask_question","content":"Which pages do you need?"}}"#,
+                "decision":"forward","request_id":id,"provider":"codex-cli","tokens_used":15,
+                "input_tokens":5,"output_tokens":10,"hierarchy_tier":2,"tier":"mid",
+                "cost_source":"provider_reported","effective_model":"model-test"
+            })).unwrap();
+            let (tx, rx) = mpsc::channel();
+            store_gateway_completion(
+                &store,
+                &tx,
+                GatewayCompletionContext {
+                    request_id: &id,
+                    request_digest: &digest,
+                    agent_id: AgentId(3),
+                    tick: 1,
+                    requested_model: "model-test",
+                    authority: Some(&binding),
+                    authority_resolver: Some(&api),
+                    gateway_response: &response,
+                    usage_v2_enabled: true,
+                    model_work: Some(&context),
+                },
+                3,
+            )
+            .unwrap();
+            assert!(store.get_completion(&id).unwrap().is_none());
+            assert!(!store
+                .reserve_request(&id, &digest, &AgentId(3).to_string())
+                .unwrap());
+            assert!(rx.try_recv().is_err());
+            let customer = api
+                .request_sales_call()
+                .unwrap()
+                .unwrap()
+                .question_response
+                .unwrap();
+            assert_eq!(customer.consultation.len(), 1);
+            assert!(api.resolve_provider_usage_authority(AgentId(3)).is_err());
+        }
+
+        #[test]
         fn model_work_outbox_retries_after_restart_without_provider_or_legacy_action() {
-            let context = crate::workflow_api::model_work::test_context();
+            let context: ModelWorkContext = crate::workflow_api::model_work::test_context().into();
             let resolver = ModelWorkResolver {
                 context: context.clone(),
                 admissions: Mutex::new(Vec::new()),
@@ -2053,7 +2218,11 @@ pub mod bridge {
             }))
             .unwrap();
             assert!(store
-                .reserve_request(request_id, &digest, &context.binding.agent_id.to_string())
+                .reserve_request(
+                    request_id,
+                    &digest,
+                    &context.binding().agent_id().to_string()
+                )
                 .unwrap());
             let (tx, rx) = mpsc::channel();
             // One completed provider response enters the production outbox. Only
@@ -2064,10 +2233,10 @@ pub mod bridge {
                 GatewayCompletionContext {
                     request_id,
                     request_digest: &digest,
-                    agent_id: context.binding.agent_id,
+                    agent_id: context.binding().agent_id(),
                     tick: 1,
                     requested_model: "",
-                    authority: Some(&context.binding),
+                    authority: Some(&context.binding()),
                     authority_resolver: Some(&resolver),
                     gateway_response: &response,
                     usage_v2_enabled: true,
@@ -2090,7 +2259,11 @@ pub mod bridge {
             );
             assert!(restored.get_completion(request_id).unwrap().is_none());
             assert!(!restored
-                .reserve_request(request_id, &digest, &context.binding.agent_id.to_string())
+                .reserve_request(
+                    request_id,
+                    &digest,
+                    &context.binding().agent_id().to_string()
+                )
                 .unwrap());
             recover_completion_batch(&restored, &tx, 3, Some(&resolver));
             assert_eq!(resolver.admissions.lock().unwrap().len(), 1);
@@ -2099,7 +2272,7 @@ pub mod bridge {
 
         #[test]
         fn model_work_failed_completion_cannot_reenter_admission() {
-            let context = crate::workflow_api::model_work::test_context();
+            let context: ModelWorkContext = crate::workflow_api::model_work::test_context().into();
             let resolver = ModelWorkResolver {
                 context: context.clone(),
                 admissions: Mutex::new(Vec::new()),
@@ -2121,10 +2294,14 @@ pub mod bridge {
         #[test]
         fn model_work_rejected_or_revoked_response_retains_usage_without_execution() {
             for revoked in [false, true] {
-                let context = crate::workflow_api::model_work::test_context();
+                let context: ModelWorkContext =
+                    crate::workflow_api::model_work::test_context().into();
                 let mut current = context.clone();
                 if revoked {
-                    current.authority.principal.principal_generation += 1;
+                    let ModelWorkContext::Project(work) = &mut current else {
+                        panic!("project fixture");
+                    };
+                    work.authority.principal.principal_generation += 1;
                 }
                 let resolver = ModelWorkResolver {
                     context: current,
@@ -2142,7 +2319,11 @@ pub mod bridge {
                 }))
                 .unwrap();
                 store
-                    .reserve_request(request_id, &digest, &context.binding.agent_id.to_string())
+                    .reserve_request(
+                        request_id,
+                        &digest,
+                        &context.binding().agent_id().to_string(),
+                    )
                     .unwrap();
                 let (tx, rx) = mpsc::channel();
                 store_gateway_completion(
@@ -2151,10 +2332,10 @@ pub mod bridge {
                     GatewayCompletionContext {
                         request_id,
                         request_digest: &digest,
-                        agent_id: context.binding.agent_id,
+                        agent_id: context.binding().agent_id(),
                         tick: 1,
                         requested_model: "",
-                        authority: Some(&context.binding),
+                        authority: Some(&context.binding()),
                         authority_resolver: Some(&resolver),
                         gateway_response: &response,
                         usage_v2_enabled: true,
@@ -2173,7 +2354,11 @@ pub mod bridge {
                 assert!(resolver.admissions.lock().unwrap().is_empty());
                 assert!(rx.try_recv().is_err());
                 assert!(!store
-                    .reserve_request(request_id, &digest, &context.binding.agent_id.to_string())
+                    .reserve_request(
+                        request_id,
+                        &digest,
+                        &context.binding().agent_id().to_string()
+                    )
                     .unwrap());
             }
         }
@@ -2227,8 +2412,8 @@ pub mod bridge {
             fn resolve_provider_usage_authority(
                 &self,
                 agent_id: AgentId,
-            ) -> Result<Option<ProviderUsageAuthority>, &'static str> {
-                Ok((self.authority.agent_id == agent_id).then(|| self.authority.clone()))
+            ) -> Result<Option<ProviderExecutionAuthority>, &'static str> {
+                Ok((self.authority.agent_id == agent_id).then(|| self.authority.clone().into()))
             }
         }
 
@@ -2260,7 +2445,7 @@ pub mod bridge {
             let error = validate_pre_dispatch_provider_authority(
                 &store,
                 Some(&stale_resolver),
-                Some(&expected),
+                Some(&expected.clone().into()),
                 AgentId(7),
                 "company-provider-reservation-m0",
                 "digest-m0",
@@ -3130,11 +3315,14 @@ pub mod bridge {
                 subscription_grant: None,
             };
             assert_eq!(
-                agent_runtime_request_id(&perception, Some(&authority)),
+                agent_runtime_request_id(&perception, Some(&authority.clone().into())),
                 "company-provider-reservation-m0"
             );
-            assert_eq!(validate_provider_usage_mode(Some(&authority), true), Ok(()));
-            assert!(validate_provider_usage_mode(Some(&authority), false).is_err());
+            assert_eq!(
+                validate_provider_usage_mode(Some(&authority.clone().into()), true),
+                Ok(())
+            );
+            assert!(validate_provider_usage_mode(Some(&authority.clone().into()), false).is_err());
             assert_eq!(validate_provider_usage_mode(None, false), Ok(()));
             let mut response = GatewayResponse {
                 content: "done".to_owned(),
@@ -3153,8 +3341,15 @@ pub mod bridge {
                 cost_source: Some(CostSource::ProviderReported),
                 effective_model: "local-loop-tier2".to_owned(),
             };
-            let event =
-                build_usage_event(AgentId(8), 42, "", Some(&authority), &response, true).unwrap();
+            let event = build_usage_event(
+                AgentId(8),
+                42,
+                "",
+                Some(&authority.clone().into()),
+                &response,
+                true,
+            )
+            .unwrap();
             assert_eq!(event.schema_version, 3);
             assert!(event.payload.contains("\"tenant_id\":\"tenant-m0\""));
             assert!(event.payload.contains("\"project_id\":\"project-m0\""));
@@ -3172,7 +3367,7 @@ pub mod bridge {
             assert_eq!(
                 validate_gateway_completion_authority(
                     Some(&resolver),
-                    Some(&authority),
+                    Some(&authority.clone().into()),
                     &response,
                     AgentId(8),
                 ),
@@ -3181,7 +3376,7 @@ pub mod bridge {
             response.provider = "anthropic-direct".to_owned();
             assert!(validate_gateway_completion_authority(
                 Some(&resolver),
-                Some(&authority),
+                Some(&authority.clone().into()),
                 &response,
                 AgentId(8),
             )
@@ -3195,7 +3390,7 @@ pub mod bridge {
             };
             assert!(validate_gateway_completion_authority(
                 Some(&stale_resolver),
-                Some(&authority),
+                Some(&authority.clone().into()),
                 &response,
                 AgentId(8),
             )

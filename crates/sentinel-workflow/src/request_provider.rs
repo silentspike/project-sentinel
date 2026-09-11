@@ -5,6 +5,14 @@ use uuid::Uuid;
 
 use crate::{AuthenticatedCompanyPrincipalV1, CustomerRequestV1, SubscriptionTokenPolicyV1};
 
+pub fn request_provider_allowance_id(
+    tenant: &crate::TenantId,
+    operation: Uuid,
+) -> Result<String, crate::WorkflowError> {
+    tenant.validate()?;
+    crate::domain::stable_domain_id("subscription", tenant, operation)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestProviderGrantV1 {

@@ -820,3 +820,72 @@ fn cost_record_is_idempotent_on_replay() {
     assert_eq!(agents[0].call_count, 2);
     assert!((agents[0].cost_usd - 0.04).abs() < 1e-9);
 }
+
+#[test]
+fn hierarchy_projection_accounts_request_usage_without_invented_project_authority() {
+    for invalid in [
+        None,
+        Some("mixed"),
+        Some("missing"),
+        Some("identity"),
+        Some("future"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(EventStore::open(dir.path().join("events.db").to_str().unwrap()).unwrap());
+        let payload = DomainEventPayload::AgentLlmUsage {
+            agent_id: AgentId(3),
+            tenant_id: Some("tenant-m0".into()),
+            project_id: (invalid == Some("mixed")).then(|| "fake-project".into()),
+            work_item_id: None,
+            assignment_id: None,
+            assignment_version: None,
+            reservation_id: (invalid != Some("missing")).then(|| "subscription-test".into()),
+            provider: Some("codex-cli".into()),
+            requested_model: Some("test-model".into()),
+            caller_role: Some("agent_runtime".into()),
+            tier: "mid".into(),
+            hierarchy_tier: Some(HierarchyTier::TIER_2),
+            cost_source: Some(CostSource::ProviderReported),
+            effective_model: Some("test-model".into()),
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_read: 0,
+            cache_creation: 0,
+            cost_usd: 0.0,
+        };
+        let id = if invalid == Some("identity") {
+            "foreign"
+        } else {
+            "company-provider-subscription-test"
+        };
+        let event = DomainEvent::new("agent_llm_usage", "AGENT-03", &payload.to_json(), id, 1)
+            .with_operation_id(&format!("llm_usage_{id}"))
+            .with_schema_version(if invalid == Some("future") { 5 } else { 4 });
+        store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+            .append_event(&event)
+            .unwrap();
+        let worker = ProjectionWorker::new(
+            Arc::clone(&store),
+            make_config(dir.path().join("read.db").to_str().unwrap()),
+        )
+        .unwrap();
+        let result = worker.catch_up_hierarchy();
+        if invalid.is_some() {
+            assert!(result.is_err(), "{invalid:?}");
+            assert_eq!(store.get_offset(HIERARCHY_PROJECTION_NAME).unwrap(), None);
+        } else {
+            result.unwrap();
+            assert_eq!(
+                worker.read_store().cost_by_hierarchy_tier().unwrap().len(),
+                1
+            );
+            worker.catch_up_hierarchy().unwrap();
+            assert_eq!(
+                worker.read_store().cost_by_hierarchy_tier().unwrap().len(),
+                1
+            );
+        }
+    }
+}

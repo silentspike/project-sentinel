@@ -67,7 +67,7 @@ class CompanyWorkflowWiringTests(unittest.TestCase):
             values[path.name] = path.read_text(encoding="ascii")
             self.assertEqual(len(values[path.name]), 64)
             self.assertNotIn(values[path.name], first.stdout + first.stderr)
-        self.assertEqual(len(values), 8)
+        self.assertEqual(len(values), 9)
         self.assertTrue(self.workflow_data.is_dir())
         self.assertEqual(self.workflow_data.stat().st_mode & 0o777, 0o700)
 
@@ -86,7 +86,12 @@ class CompanyWorkflowWiringTests(unittest.TestCase):
         names = {binding["credential_name"] for binding in config["bindings"]}
         self.assertEqual(config["schema_version"], 1)
         self.assertEqual(len(names), len(config["bindings"]))
-        self.assertEqual(len(names), 8)
+        self.assertEqual(len(names), 9)
+        operators = [binding for binding in config["bindings"] if binding["kind"] == "operator"]
+        self.assertEqual(len(operators), 1)
+        self.assertEqual(operators[0]["credential_name"], "workflow-operator")
+        self.assertIsNone(operators[0]["agent_id"])
+        self.assertIsNone(operators[0]["customer_id"])
 
         daemon = DAEMON_UNIT.read_text(encoding="utf-8")
         for name in names:

@@ -6,6 +6,10 @@
   Persist request-version and Sales-principal grants in the existing workflow
   store, count legacy reservations, and atomically adopt Sales questions with
   completion receipts without creating a project or resetting unknown calls.
+  Route request-bound Sales through the normal daemon/Gateway durable response
+  path, with registered on-duty principal checks and typed question adoption.
+  Provision a separate workflow Operator credential and project request-bound
+  usage schema 4 without weakening schema-3 project authority validation.
 
 - Separate Sales questions from customer-authored replies with append-only,
   version-bound consultation messages; prevent qualification with an unanswered
