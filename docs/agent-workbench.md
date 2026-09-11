@@ -256,7 +256,113 @@ reserved -> executing -> succeeded
 
 After restart, a `reserved` request waits for the authoritative caller to replay the same digest-bound request and pass current authorization again. An `executing` request is never re-executed: the daemon sends a `recover` frame carrying the invocation ID and request digest. Before the runtime emits any terminal result, it atomically creates an immutable completion receipt in the artifact boundary. A restarted runtime returns the redacted receipt. A missing, malformed, mismatched, or conflicting receipt becomes durable `unknown_outcome` and requires manual recovery; it is never converted into an ordinary failure or authorization to repeat the tool effect. Terminal and unknown-outcome records remain subject to current assignment and generation authorization when replayed.
 
-The completion receipt retains only outcome, resource accounting, artifact references, and safe error classification. Transient tool output and file contents are removed before persistence. Receipt writes are bounded, synced, and installed without overwrite; an existing receipt must match byte-for-byte after decoding.
+The completion receipt retains only outcome, resource accounting, artifact references, safe error classification, and canonical numeric command status (exit code and stdout/stderr byte counts). A failed command returns its bounded, redacted diagnostics to the immediate authorized caller, just like a successful command. Transient tool output and file contents are removed before persistence. Receipt writes are bounded, synced, and installed without overwrite; an existing receipt must match byte-for-byte after decoding.
+
+Runtime receipt version 2 and daemon record version 3 retain this numeric status
+across restart without repeating the command. The new readers also accept legacy
+runtime receipts (version 1) and daemon records (version 2); absent diagnostics
+remain absent, not inferred or reconstructed by rerunning old work. Old readers
+reject new versions, so rollback must restore the matching prior state rather
+than open a newer store with an older binary. Unknown outcomes remain blocked.
+This numeric feedback is a prerequisite, not a claim that the complete model
+correction loop or a restart-safe private diagnostic channel is implemented.
+
+### Same-work-item execution revisions
+
+The workflow core can admit a bounded new execution plan for the same work item
+after `done` or a confirmed `execution_failed` result. The caller must bind the
+previous plan ID, plan digest, work version, complete state digest, and feedback
+digest, and present the unchanged active execution authority. A feedback digest
+identifies evidence; it grants no authority and does not attest its quality.
+Unknown, timed-out, cancelled, or still-running outcomes cannot authorize a
+revision.
+
+One SQLite transaction archives the complete predecessor in the existing
+`workflow_operations` journal, replaces the current execution, advances the work
+version, and appends the new first-step outbox entry and admission event. A failed
+outbox insert rolls back the entire transition. No second database or schema
+migration is required. Prior plans, execution rows, completion and gate receipts,
+and operation IDs remain immutable. Old completed receipt replays resolve their
+archived plan and cannot overwrite the current execution. Historical admission
+replays remain effect-free after their original deadline.
+
+Admission checks the complete predecessor receipt chain, rejects reused plan or
+invocation identities, and permits at most four revisions per work item. Every
+new revision needs fresh deadlines and new step/invocation IDs. Reusing the same
+admission ID with changed feedback is an idempotency conflict.
+
+This core API does not itself reopen a company assignment, authorize another
+provider call, supply private diagnostics to a model, or complete the productive
+model-feedback loop. Those boundaries must explicitly use the revision contract;
+ordinary initial-plan admission still rejects a different plan for existing work.
+
+The company layer has a separate internal `RequestWorkCorrection` command. Only
+the project's manager or technical lead can request it, against exact company
+and execution versions. It validates the completed execution and output bindings,
+archives the previous company work item, and reopens that same work item as
+`assigned` without changing its employee or resetting execution/provider records.
+The correction record retains the feedback reference and digest, prior outputs,
+gate receipt, and assignment history. Empty correction history remains absent
+from legacy project encodings. Older readers cannot open aggregates containing
+new correction fields; rollback requires matching prior state.
+
+Corrections are rejected if an affected dependent has already advanced beyond
+dependency-pending, a handoff exists, or a relevant project blocker is unresolved.
+They do not silently invalidate consumed artifacts. Periodic company-state
+synchronization ignores a predecessor superseded by a correction, so its old
+`done` cannot complete the new attempt. Later assignment changes preserve the
+archived assignment rather than rewriting history.
+
+Complete correction history is visible only to the operator and the exact
+governed project manager or technical lead. Ordinary command responses omit
+these archived assignment, output, and feedback bindings for other participants.
+
+This command is not accepted through ordinary customer, agent, or operator HTTP
+commands. The dedicated `POST /agent/workflow/corrections` route requires an
+authenticated, governed project manager or technical lead. It uses the ordinary
+operation-ID/command envelope, but checks delivery exclusion under the exclusive
+workflow mutation fence before reopening work. Any materialized delivery rejects
+internal correction; customer delivery rework remains a different workflow.
+
+The route also requires the exact consumed subscription dispatch, committed
+usage event with nonzero model output, and the actual execution plan bound to
+that provider request. Normal completion removes the outbox payload; its absence
+is accepted only with those durable bindings and no operator-resolution marker.
+If the payload still exists, it must be `action_claimed`, match the committed
+usage event, and contain the proposal actually adopted as that execution.
+A provider status or missing row alone is not proof. Unresolved, foreign or
+changed provider evidence fails closed. The
+company transaction then verifies the full terminal execution receipt chain.
+An exact successful operation replay cannot authorize another call or revision.
+
+The optional `next_subscription_grant` creates a fresh single-call allowance in
+the same transaction as correction. Its predecessor must have been consumed and
+must name the same work, employee and assignment. The old allowance and dispatch
+remain in the correction history, and campaign accounting counts both old and
+new identities without double-counting unchanged snapshots. An invalid new grant
+rolls back the entire correction. Archived allowances cannot be claimed again.
+The configured allowance selector still explicitly controls which new grant may
+dispatch; correction admission alone does not invoke the provider.
+
+Model correction context binds the stored correction, predecessor plan/state,
+feedback reference, bounded feedback observations and prior model-authored tools.
+The correction route requires `feedback` with `summary` and `artifact_digest`.
+Its canonical digest must equal the revision's feedback digest. An existing
+output requires its exact sealed artifact digest; a failed execution without an
+output uses null. The normal bounded-workflow-text limit applies to the summary.
+These are authenticated leadership observations, not proof of independent QA or
+permission to execute instructions embedded in feedback. No private tool log is
+copied automatically. Legacy stored corrections without feedback remain readable.
+Those tools are untrusted
+context, not replay instructions or a claim about actual artifact bytes. The
+model must propose a complete corrected sequence within the original profile.
+Context is bounded by the existing model-work byte ceiling. Adoption rechecks
+that context and uses revision admission instead of overwriting the old plan.
+Historical execution receipts remain readable after restart.
+
+Source integration tests use controlled model proposals and injected execution
+outcomes. They are not evidence of a live model correction, artifact inspection,
+independent QA or customer acceptance.
 
 ### Runtime quiescence and unresolved outcomes
 

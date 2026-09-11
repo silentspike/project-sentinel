@@ -1130,6 +1130,314 @@ fn exact_plan_replay_is_idempotent_but_changed_content_conflicts() {
     );
 }
 
+fn revision_plan(previous: &ExecutionPlanV1, now_ms: u64) -> ExecutionPlanV1 {
+    let mut next = previous.clone();
+    next.plan_id = Uuid::new_v4();
+    next.created_at_unix_ms = now_ms;
+    next.deadline_unix_ms = now_ms + 60_000;
+    for step in &mut next.steps {
+        step.step_id = Uuid::new_v4();
+        step.invocation_id = Uuid::new_v4();
+        step.deadline_unix_ms = next.deadline_unix_ms;
+    }
+    next.bind_digest().unwrap()
+}
+
+#[test]
+fn same_work_revision_preserves_old_receipts_and_replays_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("revision.sqlite");
+    let previous_plan = package_only_plan();
+    let initial;
+    let previous;
+    let old_completion;
+    let old_gate;
+    let next;
+    let revision;
+    let admitted;
+    {
+        let core = core(&database, vec![WorkExecutionObservation::Succeeded]);
+        initial = core.admit_plan(&previous_plan, NOW).unwrap().1;
+        let execution = core.store().pending_executions(1).unwrap().remove(0);
+        core.reconcile_execution(&execution, NOW + 1).unwrap();
+        old_completion = core
+            .store()
+            .pending_completion_evidence(1)
+            .unwrap()
+            .remove(0);
+        core.reconcile_completion_evidence(&old_completion, NOW + 3)
+            .unwrap();
+        old_gate = core.store().pending_gate_evidence(1).unwrap().remove(0);
+        previous = core.reconcile_gate_evidence(&old_gate, NOW + 5).unwrap();
+        revision =
+            sentinel_workflow::ExecutionRevisionV1::from_completed_work(&previous, "a".repeat(64))
+                .unwrap();
+        next = revision_plan(&previous_plan, NOW + 6);
+        admitted = core
+            .admit_revision_plan(&next, &revision, NOW + 6)
+            .unwrap()
+            .1;
+        assert_eq!(admitted.work_item_id, previous.work_item_id);
+        assert_eq!(admitted.version, previous.version + 1);
+        assert_eq!(admitted.state, WorkItemState::Claimed);
+        assert!(admitted.terminal_execution_evidence.is_none());
+        assert_eq!(
+            core.store()
+                .work_item_for_plan(
+                    &previous.tenant_id,
+                    &previous.project_id,
+                    &previous.work_item_id,
+                    previous_plan.plan_id
+                )
+                .unwrap(),
+            Some(previous.clone())
+        );
+        assert_eq!(
+            core.reconcile_completion_evidence(&old_completion, NOW + 7)
+                .unwrap(),
+            previous
+        );
+        assert_eq!(
+            core.reconcile_gate_evidence(&old_gate, NOW + 7).unwrap(),
+            previous
+        );
+        assert_eq!(
+            core.store()
+                .work_item(
+                    &previous.tenant_id,
+                    &previous.project_id,
+                    &previous.work_item_id
+                )
+                .unwrap(),
+            Some(admitted.clone())
+        );
+    }
+    let reopened = core(&database, Vec::new());
+    assert_eq!(
+        reopened
+            .admit_revision_plan(&next, &revision, NOW + 100_000)
+            .unwrap(),
+        (true, admitted.clone())
+    );
+    assert_eq!(
+        reopened.admit_plan(&previous_plan, NOW + 100_000).unwrap(),
+        (true, initial)
+    );
+    assert_eq!(reopened.store().pending_executions(10).unwrap().len(), 1);
+    let mut changed = revision.clone();
+    changed.feedback_digest = "b".repeat(64);
+    assert_eq!(
+        reopened
+            .admit_revision_plan(&next, &changed, NOW + 7)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::IdempotencyConflict
+    );
+    assert_eq!(
+        reopened
+            .store()
+            .work_item(
+                &previous.tenant_id,
+                &previous.project_id,
+                &previous.work_item_id
+            )
+            .unwrap(),
+        Some(admitted)
+    );
+    assert!(reopened
+        .store()
+        .work_item_for_plan(
+            &TenantId("another-tenant".into()),
+            &previous.project_id,
+            &previous.work_item_id,
+            previous_plan.plan_id
+        )
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn same_work_revision_rejects_unknown_pending_stale_and_reused_invocations() {
+    for observation in [
+        WorkExecutionObservation::UnknownOutcome,
+        WorkExecutionObservation::Executing,
+        WorkExecutionObservation::TimedOut,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let core = core(&directory.path().join("blocked.sqlite"), vec![observation]);
+        let plan = plan(1);
+        core.admit_plan(&plan, NOW).unwrap();
+        let pending = core.store().pending_executions(1).unwrap().remove(0);
+        let blocked = core.reconcile_execution(&pending, NOW + 1).unwrap();
+        let revision =
+            sentinel_workflow::ExecutionRevisionV1::from_completed_work(&blocked, "a".repeat(64))
+                .unwrap();
+        assert!(core
+            .admit_revision_plan(&revision_plan(&plan, NOW + 2), &revision, NOW + 2)
+            .is_err());
+        assert_eq!(
+            core.store()
+                .work_item(&plan.tenant_id, &plan.project_id, &plan.work_item_id)
+                .unwrap(),
+            Some(blocked)
+        );
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let core = core(
+        &directory.path().join("failed.sqlite"),
+        vec![WorkExecutionObservation::Failed],
+    );
+    let plan = plan(1);
+    core.admit_plan(&plan, NOW).unwrap();
+    let pending = core.store().pending_executions(1).unwrap().remove(0);
+    let failed = core.reconcile_execution(&pending, NOW + 1).unwrap();
+    let revision =
+        sentinel_workflow::ExecutionRevisionV1::from_completed_work(&failed, "a".repeat(64))
+            .unwrap();
+    let next = revision_plan(&plan, NOW + 2);
+    let mut stale = revision.clone();
+    stale.previous_version += 1;
+    assert!(core.admit_revision_plan(&next, &stale, NOW + 2).is_err());
+    let mut reused = next.clone();
+    reused.steps[0].invocation_id = pending.step.invocation_id;
+    reused = reused.bind_digest().unwrap();
+    assert!(core
+        .admit_revision_plan(&reused, &revision, NOW + 2)
+        .is_err());
+    let admitted = core
+        .admit_revision_plan(&next, &revision, NOW + 2)
+        .unwrap()
+        .1;
+    assert_eq!(admitted.version, failed.version + 1);
+    assert!(core.reconcile_execution(&pending, NOW + 3).is_err());
+    assert_eq!(
+        core.store()
+            .work_item(&plan.tenant_id, &plan.project_id, &plan.work_item_id)
+            .unwrap(),
+        Some(admitted)
+    );
+}
+
+#[test]
+fn same_work_revision_transaction_rolls_back_when_the_next_outbox_insert_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("atomic.sqlite");
+    let core = core(&database, vec![WorkExecutionObservation::Failed]);
+    let plan = plan(1);
+    core.admit_plan(&plan, NOW).unwrap();
+    let pending = core.store().pending_executions(1).unwrap().remove(0);
+    let previous = core.reconcile_execution(&pending, NOW + 1).unwrap();
+    let revision =
+        sentinel_workflow::ExecutionRevisionV1::from_completed_work(&previous, "a".repeat(64))
+            .unwrap();
+    let next = revision_plan(&plan, NOW + 2);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection.execute_batch("CREATE TRIGGER revision_test_failure BEFORE INSERT ON workflow_execution_outbox BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    assert!(core.admit_revision_plan(&next, &revision, NOW + 2).is_err());
+    assert_eq!(
+        core.store()
+            .work_item(&plan.tenant_id, &plan.project_id, &plan.work_item_id)
+            .unwrap(),
+        Some(previous)
+    );
+    let histories: i64 = connection.query_row("SELECT COUNT(*) FROM workflow_operations WHERE operation_namespace LIKE 'execution-history:%'", [], |row| row.get(0)).unwrap();
+    assert_eq!(histories, 0);
+    connection
+        .execute_batch("DROP TRIGGER revision_test_failure;")
+        .unwrap();
+    assert!(
+        !core
+            .admit_revision_plan(&next, &revision, NOW + 2)
+            .unwrap()
+            .0
+    );
+}
+
+#[test]
+fn same_work_revision_limit_and_archived_tampering_fail_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("bounded.sqlite");
+    let core = core(&database, vec![WorkExecutionObservation::Failed; 5]);
+    let original = plan(1);
+    let mut current_plan = original.clone();
+    core.admit_plan(&current_plan, NOW).unwrap();
+    for turn in 0..5 {
+        let now = NOW + turn * 3 + 1;
+        let pending = core.store().pending_executions(1).unwrap().remove(0);
+        let previous = core.reconcile_execution(&pending, now).unwrap();
+        let revision =
+            sentinel_workflow::ExecutionRevisionV1::from_completed_work(&previous, "a".repeat(64))
+                .unwrap();
+        let next = revision_plan(&current_plan, now + 1);
+        if turn == 1 {
+            let mut reused_plan = next.clone();
+            reused_plan.plan_id = original.plan_id;
+            let reused_plan = reused_plan.bind_digest().unwrap();
+            assert_eq!(
+                core.admit_revision_plan(&reused_plan, &revision, now + 1)
+                    .unwrap_err()
+                    .code,
+                WorkflowErrorCode::IdempotencyConflict
+            );
+        }
+        if turn < 4 {
+            core.admit_revision_plan(&next, &revision, now + 1).unwrap();
+        } else {
+            assert!(core.admit_revision_plan(&next, &revision, now + 1).is_err());
+        }
+        current_plan = next;
+    }
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection.execute("UPDATE workflow_operations SET request_digest=?1 WHERE operation_namespace LIKE 'execution-history:%' AND operation_id=?2", rusqlite::params!["0".repeat(64), original.plan_id.to_string()]).unwrap();
+    assert!(core
+        .store()
+        .work_item_for_plan(
+            &original.tenant_id,
+            &original.project_id,
+            &original.work_item_id,
+            original.plan_id
+        )
+        .is_err());
+}
+
+#[test]
+fn same_work_revision_requires_the_complete_receipt_chain() {
+    for table in ["workflow_completion_outbox", "workflow_gate_outbox"] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("missing-receipt.sqlite");
+        let core = core(&database, vec![WorkExecutionObservation::Succeeded]);
+        let plan = package_only_plan();
+        core.admit_plan(&plan, NOW).unwrap();
+        let execution = core.store().pending_executions(1).unwrap().remove(0);
+        core.reconcile_execution(&execution, NOW + 1).unwrap();
+        let completion = core
+            .store()
+            .pending_completion_evidence(1)
+            .unwrap()
+            .remove(0);
+        core.reconcile_completion_evidence(&completion, NOW + 3)
+            .unwrap();
+        let gate = core.store().pending_gate_evidence(1).unwrap().remove(0);
+        let previous = core.reconcile_gate_evidence(&gate, NOW + 5).unwrap();
+        let revision =
+            sentinel_workflow::ExecutionRevisionV1::from_completed_work(&previous, "a".repeat(64))
+                .unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(&format!("DELETE FROM {table}"), [])
+            .unwrap();
+        assert!(core
+            .admit_revision_plan(&revision_plan(&plan, NOW + 6), &revision, NOW + 6)
+            .is_err());
+        assert_eq!(
+            core.store()
+                .work_item(&plan.tenant_id, &plan.project_id, &plan.work_item_id)
+                .unwrap(),
+            Some(previous)
+        );
+    }
+}
+
 #[test]
 fn committed_plan_replays_after_deadline_but_new_or_changed_operations_do_not() {
     let directory = tempfile::tempdir().unwrap();
