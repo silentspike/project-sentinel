@@ -384,7 +384,10 @@ pub(crate) fn test_context() -> ModelWorkContext {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) use tests::configured_test_api;
+
+#[cfg(test)]
+mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 

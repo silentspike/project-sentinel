@@ -2,7 +2,7 @@ use super::*;
 use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
 
 pub(crate) fn fixture(path: &Path) -> (WorkflowApi, RequestSalesContext) {
-    let mut api = super::super::model_work::tests::configured_test_api(path);
+    let mut api = super::super::model_work::configured_test_api(path);
     api.event_store = Some(
         sentinel_limbo::EventStore::open(path.with_extension("events.sqlite").to_str().unwrap())
             .unwrap(),
