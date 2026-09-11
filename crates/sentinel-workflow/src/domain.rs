@@ -540,6 +540,8 @@ pub struct WorkCorrectionV1 {
     pub feedback_ref: String,
     pub requested_by: String,
     pub requested_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_subscription_call: Option<SubscriptionCallAllowanceV1>,
 }
 
 impl CompanyWorkItemV1 {
@@ -989,6 +991,8 @@ pub enum CompanyWorkflowCommandV1 {
         expected_work_version: u64,
         execution_revision: crate::ExecutionRevisionV1,
         feedback_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_subscription_grant: Option<SubscriptionCallGrantV1>,
     },
     RecordDecision {
         project_id: ProjectId,

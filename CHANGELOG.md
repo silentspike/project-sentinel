@@ -1,5 +1,11 @@
 # Changelog
 
+- Connect same-work model correction context to explicit revision admission,
+  preserve consumed subscription allowances across bounded renewal, and count
+  archived grants in campaign capacity. Add a leadership-only correction route
+  that checks delivery exclusion, retained provider results, committed usage and
+  the adopted source plan before reopening work (#856).
+
 - Bind internal company work corrections to completed execution evidence and
   leadership authority. Preserve prior outputs and assignment history, reject
   already consumed dependencies, and prevent periodic synchronization from

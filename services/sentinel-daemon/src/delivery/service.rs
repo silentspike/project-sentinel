@@ -2332,6 +2332,15 @@ where
         self.core.command_readiness(command)
     }
 
+    /// Any materialized delivery consumes the source project for internal repair.
+    pub(crate) fn contains_project(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Result<bool, DeliveryError> {
+        Ok(self.core.load(tenant_id, project_id)?.is_some())
+    }
+
     /// Read-only lineage needs the verified local authority plus the exact
     /// workflow/authentication integration contract. Workbench execution,
     /// delivery effects, and event publication are independent capabilities
