@@ -4879,6 +4879,7 @@ fn is_internal_company_command(command: &CompanyWorkflowCommandV1) -> bool {
         CompanyWorkflowCommandV1::ApplyWorkTransition { .. }
             | CompanyWorkflowCommandV1::RequestWorkCorrection { .. }
             | CompanyWorkflowCommandV1::AppendSourceReview { .. }
+            | CompanyWorkflowCommandV1::AssignSourceReview { .. }
             | CompanyWorkflowCommandV1::ClaimSubscriptionCall { .. }
             | CompanyWorkflowCommandV1::CreateGovernedRework { .. }
             | CompanyWorkflowCommandV1::AdmitCollaboration { .. }

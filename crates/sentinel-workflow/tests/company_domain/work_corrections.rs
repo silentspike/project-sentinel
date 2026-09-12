@@ -417,6 +417,61 @@ fn source_review_append_preserves_completed_work_and_replays_after_restart() {
             .unwrap(),
         after
     );
+    let review_profile = profile("web-review-v1");
+    let assign = CompanyWorkflowCommandV1::AssignSourceReview {
+        project_id: after.project_id.clone(),
+        expected_version: after.version,
+        work_item_id: review.work_item_id.clone(),
+        agent_id: AgentId(3),
+        organization_generation: 1,
+        organization_digest: DIGEST.into(),
+        reason_ref: "source-review-profile".into(),
+        profile: review_profile.clone(),
+    };
+    for variant in 0..4 {
+        let mut bad = assign.clone();
+        if let CompanyWorkflowCommandV1::AssignSourceReview {
+            profile,
+            reason_ref,
+            agent_id,
+            ..
+        } = &mut bad
+        {
+            match variant {
+                0 => profile.profile_id = "web-authoring-v1".into(),
+                1 => profile.generation = 2,
+                2 => *reason_ref = "ordinary-assignment".into(),
+                _ => *agent_id = AgentId(2),
+            }
+        }
+        assert!(reopened
+            .apply_company_command(&state.pm, Uuid::from_u128(720 + variant), &bad, 62)
+            .is_err());
+    }
+    let assigned = project_command(&reopened, &state.pm, 730, assign.clone(), 62);
+    assert_eq!(assigned.governance, before.governance);
+    assert_eq!(
+        assigned.work_items[&WorkItemId::parse("build-work").unwrap()],
+        before.work_items[&WorkItemId::parse("build-work").unwrap()]
+    );
+    assert_eq!(
+        assigned.work_items[&review.work_item_id].assignments[0].profile,
+        review_profile
+    );
+    assert!(
+        reopened
+            .apply_company_command(&state.pm, Uuid::from_u128(730), &assign, 63)
+            .unwrap()
+            .replayed
+    );
+    let restarted = WorkflowStore::open(state._temp.path().join("workflow.sqlite")).unwrap();
+    assert_eq!(
+        restarted
+            .company_project(&state.pm.tenant_id, &before.project_id)
+            .unwrap()
+            .unwrap(),
+        assigned
+    );
 }
 
 #[test]

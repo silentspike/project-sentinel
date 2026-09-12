@@ -1,5 +1,10 @@
 # Changelog
 
+- Bind appended QA work to the exact installed report-only profile through a
+  leadership-owned assignment. Preserve accepted company governance and prior
+  work; reject foreign profiles, changed digests and ordinary-command bypasses
+  before mutation (#856).
+
 - Append an independent source-review work item to the existing completed
   project without replacing its graph, outputs or provider history. Bind the
   full developer candidate, enforce leadership and budget authority, preserve

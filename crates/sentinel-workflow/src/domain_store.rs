@@ -1792,6 +1792,26 @@ fn apply_governed_rework(
     Ok(CompanyWorkflowResponseV1::Project(Box::new(project)))
 }
 
+fn source_review_profile_allowed(
+    work: &CompanyWorkItemV1,
+    profile: &WorkProfileBindingV1,
+    reason_ref: &str,
+) -> bool {
+    work.spec.required_role == CompanyRoleV1::Qa
+        && work.spec.rework.is_none()
+        && !work.spec.inputs.is_empty()
+        && work.spec.outputs.len() == 1
+        && work.spec.outputs[0].media_type == "application/vnd.sentinel.qa-report+json"
+        && profile.profile_id == "web-review-v1"
+        && profile.generation == 1
+        && reason_ref == "source-review-profile"
+        && work.transition_history.first().is_some_and(|transition| {
+            transition.before == "DependencyPending"
+                && transition.after == "Ready"
+                && transition.reason_ref == "source-review-planned"
+        })
+}
+
 fn append_source_review(
     project: &mut ProjectV1,
     principal: &AuthenticatedCompanyPrincipalV1,
@@ -2006,6 +2026,14 @@ fn mutate_project(
             organization_digest,
             reason_ref,
             ..
+        }
+        | CompanyWorkflowCommandV1::AssignSourceReview {
+            work_item_id,
+            agent_id,
+            organization_generation,
+            organization_digest,
+            reason_ref,
+            ..
         } => {
             require_role(
                 principal,
@@ -2039,12 +2067,22 @@ fn mutate_project(
                 return Err(unauthorized());
             }
             ensure_collection_capacity(work.assignments.len())?;
+            let profile =
+                if let CompanyWorkflowCommandV1::AssignSourceReview { profile, .. } = command {
+                    profile.validate()?;
+                    if !source_review_profile_allowed(work, profile, reason_ref) {
+                        return Err(unauthorized());
+                    }
+                    profile.clone()
+                } else {
+                    participant.profile.clone()
+                };
             work.assignments.push(AssignmentV1 {
                 assignment_id: stable_domain_id("assignment", &principal.tenant_id, operation_id)?,
                 agent_id: *agent_id,
                 role: participant.role,
                 specialties: participant.specialties.clone(),
-                profile: participant.profile.clone(),
+                profile,
                 organization_generation: *organization_generation,
                 organization_digest: organization_digest.clone(),
                 assignment_version: 1,
@@ -5091,6 +5129,11 @@ fn project_target(command: &CompanyWorkflowCommandV1) -> Option<(&ProjectId, u64
             expected_version,
             ..
         }
+        | CompanyWorkflowCommandV1::AssignSourceReview {
+            project_id,
+            expected_version,
+            ..
+        }
         | CompanyWorkflowCommandV1::ReassignWork {
             project_id,
             expected_version,
@@ -5280,7 +5323,8 @@ fn project_event_type(command: &CompanyWorkflowCommandV1) -> Result<&'static str
         CompanyWorkflowCommandV1::PlanWorkGraph { .. } => Ok("project_work_graph_planned"),
         CompanyWorkflowCommandV1::AppendSourceReview { .. } => Ok("project_source_review_planned"),
         CompanyWorkflowCommandV1::ActivateProject { .. } => Ok("project_activated"),
-        CompanyWorkflowCommandV1::AssignWork { .. } => Ok("project_work_assigned"),
+        CompanyWorkflowCommandV1::AssignWork { .. }
+        | CompanyWorkflowCommandV1::AssignSourceReview { .. } => Ok("project_work_assigned"),
         CompanyWorkflowCommandV1::ReassignWork { .. } => Ok("project_work_reassigned"),
         CompanyWorkflowCommandV1::DelegateWork { .. } => Ok("project_work_delegated"),
         CompanyWorkflowCommandV1::ApplyWorkTransition { .. } => {
@@ -6407,7 +6451,12 @@ fn validate_project_collections(project: &ProjectV1) -> Result<(), WorkflowError
                 .ok_or_else(corrupt)?;
             if bound.role != assignment.role
                 || bound.specialties != assignment.specialties
-                || bound.profile != assignment.profile
+                || (bound.profile != assignment.profile
+                    && !source_review_profile_allowed(
+                        work,
+                        &assignment.profile,
+                        &assignment.reason_ref,
+                    ))
                 || assignment.role != work.spec.required_role
                 || work
                     .spec
