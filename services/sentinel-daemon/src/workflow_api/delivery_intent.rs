@@ -1119,6 +1119,34 @@ fn execute_qa(
     let material = load_material(api, &TenantId(caller.tenant_id.clone()), project_id)?;
     let qa = current_principal(api, &material.project, CompanyRoleV1::Qa)?;
     require_current_principal(caller, &qa)?;
+    let model_review_digest: Option<String> = if api.model_work_enabled {
+        #[cfg(feature = "llm")]
+        {
+            let artifacts = material
+                .candidate
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.digest.as_str().to_owned())
+                .collect::<BTreeSet<_>>();
+            Some(
+                super::model_review::validated_project_review(
+                    api,
+                    &material.project,
+                    &caller.principal_id,
+                    &artifacts,
+                )
+                .map_err(|reason| DeliveryError::MissingEvidence(reason.to_owned()))?,
+            )
+        }
+        #[cfg(not(feature = "llm"))]
+        {
+            return Err(DeliveryError::MissingEvidence(
+                "model QA is unavailable".to_owned(),
+            ));
+        }
+    } else {
+        None
+    };
     let plan = build_plan(&material)?;
     let run_id = run_id(&material);
     let admitted = delivery.transition_qa(
@@ -1203,7 +1231,10 @@ fn execute_qa(
         &run_id,
         ReviewV1 {
             schema_version: DELIVERY_SCHEMA_V1,
-            review_id: format!("review-{}", material.candidate.candidate_id),
+            review_id: model_review_digest
+                .as_ref()
+                .map(|digest| format!("model-review-{digest}"))
+                .unwrap_or_else(|| format!("review-{}", material.candidate.candidate_id)),
             generation: material.candidate.generation,
             candidate: candidate_ref.clone(),
             reviewer: caller.clone(),

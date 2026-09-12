@@ -40,8 +40,10 @@ ARTIFACT_DEFS=(
   "config/company.toml|/opt/sentinel/config/company.toml|config"
   "config/controlplane.toml|/opt/sentinel/config/controlplane.toml|config"
   "config/company-principals.json|/opt/sentinel/config/company-principals.json|config"
+  "config/agents/AGENT-55-LAURA-QA.toml|/opt/sentinel/config/agents/AGENT-55-LAURA-QA.toml|config"
   "config/workbench-profiles/web-authoring-v1.toml|/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml|config"
   "config/workbench-profiles/web-qa-v1.toml|/opt/sentinel/config/workbench-profiles/web-qa-v1.toml|config"
+  "config/workbench-profiles/web-review-v1.toml|/opt/sentinel/config/workbench-profiles/web-review-v1.toml|config"
   "config/nats.conf|/etc/nats/nats.conf|config"
   # systemd units
   "deploy/systemd/sentinel-auth-init.service|/etc/systemd/system/sentinel-auth-init.service|systemd"

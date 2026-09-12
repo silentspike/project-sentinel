@@ -423,6 +423,7 @@ fn is_project_event_type(value: &str) -> bool {
         value,
         "project_created"
             | "project_work_graph_planned"
+            | "project_source_review_planned"
             | "project_activated"
             | "project_work_assigned"
             | "project_work_reassigned"
@@ -1409,6 +1410,7 @@ fn apply_company_command(
                 approvals: Vec::new(),
                 reservations: Vec::new(),
                 subscription_call: None,
+                source_review_previous_call: None,
                 work_corrections: Vec::new(),
                 rooms: Vec::new(),
                 questions: Vec::new(),
@@ -1791,6 +1793,125 @@ fn apply_governed_rework(
     Ok(CompanyWorkflowResponseV1::Project(Box::new(project)))
 }
 
+fn source_review_profile_allowed(
+    work: &CompanyWorkItemV1,
+    profile: &WorkProfileBindingV1,
+    reason_ref: &str,
+) -> bool {
+    work.spec.required_role == CompanyRoleV1::Qa
+        && work.spec.rework.is_none()
+        && !work.spec.inputs.is_empty()
+        && work.spec.outputs.len() == 1
+        && work.spec.outputs[0].media_type == "application/vnd.sentinel.qa-report+json"
+        && profile.profile_id == "web-review-v1"
+        && profile.generation == 1
+        && reason_ref == "source-review-profile"
+        && work.transition_history.first().is_some_and(|transition| {
+            transition.before == "DependencyPending"
+                && transition.after == "Ready"
+                && transition.reason_ref == "source-review-planned"
+        })
+}
+
+fn append_source_review(
+    project: &mut ProjectV1,
+    principal: &AuthenticatedCompanyPrincipalV1,
+    item: &CompanyWorkItemSpecV1,
+) -> Result<(), WorkflowError> {
+    require_role(
+        principal,
+        &[CompanyRoleV1::ProjectManager, CompanyRoleV1::TechnicalLead],
+    )?;
+    if project.lifecycle_state != ProjectLifecycleStateV1::DeliveryCandidate
+        || project.work_items.is_empty()
+        || project
+            .work_items
+            .values()
+            .any(|work| work.state != CompanyWorkStateV1::Done)
+        || project.work_items.contains_key(&item.work_item_id)
+        || item.required_role != CompanyRoleV1::Qa
+        || item.rework.is_some()
+        || item.inputs.is_empty()
+        || item.outputs.len() != 1
+        || item.outputs[0].media_type != "application/vnd.sentinel.qa-report+json"
+    {
+        return Err(transition());
+    }
+    let reviewer = project
+        .governance
+        .participants
+        .iter()
+        .find(|participant| participant.agent_id == item.owner)
+        .ok_or_else(unauthorized)?;
+    if reviewer.role != CompanyRoleV1::Qa {
+        return Err(unauthorized());
+    }
+    let mut expected_inputs = BTreeSet::new();
+    let mut expected_dependencies = BTreeSet::new();
+    for work in project.work_items.values().filter(|work| {
+        matches!(
+            work.spec.required_role,
+            CompanyRoleV1::Developer | CompanyRoleV1::Designer
+        )
+    }) {
+        let assignment = current_assignment(work).ok_or_else(unauthorized)?;
+        if assignment.agent_id == item.owner {
+            return Err(unauthorized());
+        }
+        expected_dependencies.insert(work.spec.work_item_id.clone());
+        for output in &work.spec.outputs {
+            expected_inputs.insert((work.spec.work_item_id.clone(), output.name.clone()));
+        }
+    }
+    let actual_inputs = item
+        .inputs
+        .iter()
+        .map(|input| {
+            (
+                input.producer_work_item_id.clone(),
+                input.producer_output_name.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if expected_inputs.is_empty()
+        || actual_inputs != expected_inputs
+        || actual_inputs.len() != item.inputs.len()
+        || item.dependency_ids != expected_dependencies
+    {
+        return Err(invalid(
+            "source review must cover the complete developer candidate",
+        ));
+    }
+    let mut graph = project
+        .work_items
+        .values()
+        .map(|work| work.spec.clone())
+        .collect::<Vec<_>>();
+    graph.push(item.clone());
+    validate_work_graph(&graph)?;
+    let total = graph
+        .iter()
+        .try_fold(0_u64, |sum, work| sum.checked_add(work.budget_micros))
+        .ok_or_else(|| invalid("work graph budget overflow"))?;
+    if total > project.cost_ceiling_micros {
+        return Err(invalid("source review exceeds project cost ceiling"));
+    }
+    project.work_items.insert(
+        item.work_item_id.clone(),
+        CompanyWorkItemV1 {
+            spec: item.clone(),
+            state: CompanyWorkStateV1::DependencyPending,
+            version: 1,
+            assignments: Vec::new(),
+            output_receipts: Vec::new(),
+            gate_receipt: None,
+            transition_history: Vec::new(),
+        },
+    );
+    project.lifecycle_state = ProjectLifecycleStateV1::Active;
+    Ok(())
+}
+
 fn mutate_project(
     transaction: &Transaction<'_>,
     principal: &AuthenticatedCompanyPrincipalV1,
@@ -1868,6 +1989,24 @@ fn mutate_project(
                 })
                 .collect();
         }
+        CompanyWorkflowCommandV1::AppendSourceReview { item, .. } => {
+            append_source_review(&mut project, principal, item)?;
+            let work = project
+                .work_items
+                .get_mut(&item.work_item_id)
+                .ok_or_else(corrupt)?;
+            append_work_transition(
+                work,
+                principal,
+                actor_id,
+                CompanyWorkStateV1::DependencyPending,
+                CompanyWorkStateV1::Ready,
+                "source-review-planned",
+                now_ms,
+            )?;
+            work.state = CompanyWorkStateV1::Ready;
+            work.version = 2;
+        }
         CompanyWorkflowCommandV1::ActivateProject { reason_ref, .. } => {
             require_role(
                 principal,
@@ -1882,6 +2021,14 @@ fn mutate_project(
             project.lifecycle_state = ProjectLifecycleStateV1::Active;
         }
         CompanyWorkflowCommandV1::AssignWork {
+            work_item_id,
+            agent_id,
+            organization_generation,
+            organization_digest,
+            reason_ref,
+            ..
+        }
+        | CompanyWorkflowCommandV1::AssignSourceReview {
             work_item_id,
             agent_id,
             organization_generation,
@@ -1921,12 +2068,22 @@ fn mutate_project(
                 return Err(unauthorized());
             }
             ensure_collection_capacity(work.assignments.len())?;
+            let profile =
+                if let CompanyWorkflowCommandV1::AssignSourceReview { profile, .. } = command {
+                    profile.validate()?;
+                    if !source_review_profile_allowed(work, profile, reason_ref) {
+                        return Err(unauthorized());
+                    }
+                    profile.clone()
+                } else {
+                    participant.profile.clone()
+                };
             work.assignments.push(AssignmentV1 {
                 assignment_id: stable_domain_id("assignment", &principal.tenant_id, operation_id)?,
                 agent_id: *agent_id,
                 role: participant.role,
                 specialties: participant.specialties.clone(),
-                profile: participant.profile.clone(),
+                profile,
                 organization_generation: *organization_generation,
                 organization_digest: organization_digest.clone(),
                 assignment_version: 1,
@@ -2470,6 +2627,21 @@ fn mutate_project(
             request_provider::ensure_legacy_grant_allowed(transaction)?;
             subscription::grant(&mut project, principal, operation_id, grant, now_ms)?;
         }
+        CompanyWorkflowCommandV1::GrantSourceReviewCall {
+            previous_allowance_id,
+            grant,
+            ..
+        } => {
+            request_provider::ensure_legacy_grant_allowed(transaction)?;
+            subscription::handoff_to_review(
+                &mut project,
+                principal,
+                operation_id,
+                previous_allowance_id,
+                grant,
+                now_ms,
+            )?;
+        }
         CompanyWorkflowCommandV1::ClaimSubscriptionCall {
             allowance_id,
             request_id,
@@ -2501,9 +2673,12 @@ fn mutate_project(
             }
             validate_identifier(provider)?;
             validate_optional_work(&project, work_item_id.as_ref())?;
-            if project.subscription_call.as_ref().is_some_and(|allowance| {
-                work_item_id.as_ref() == Some(&allowance.grant.work_item_id)
-            }) {
+            if project
+                .subscription_call
+                .iter()
+                .chain(project.source_review_previous_call.iter())
+                .any(|allowance| work_item_id.as_ref() == Some(&allowance.grant.work_item_id))
+            {
                 return Err(invalid(
                     "subscription call cannot use monetary reservations",
                 ));
@@ -4953,6 +5128,11 @@ fn project_target(command: &CompanyWorkflowCommandV1) -> Option<(&ProjectId, u64
             expected_version,
             ..
         }
+        | CompanyWorkflowCommandV1::AppendSourceReview {
+            project_id,
+            expected_version,
+            ..
+        }
         | CompanyWorkflowCommandV1::CreateGovernedRework {
             project_id,
             expected_version,
@@ -4964,6 +5144,11 @@ fn project_target(command: &CompanyWorkflowCommandV1) -> Option<(&ProjectId, u64
             ..
         }
         | CompanyWorkflowCommandV1::AssignWork {
+            project_id,
+            expected_version,
+            ..
+        }
+        | CompanyWorkflowCommandV1::AssignSourceReview {
             project_id,
             expected_version,
             ..
@@ -5024,6 +5209,11 @@ fn project_target(command: &CompanyWorkflowCommandV1) -> Option<(&ProjectId, u64
             ..
         }
         | CompanyWorkflowCommandV1::GrantSubscriptionCall {
+            project_id,
+            expected_version,
+            ..
+        }
+        | CompanyWorkflowCommandV1::GrantSourceReviewCall {
             project_id,
             expected_version,
             ..
@@ -5155,8 +5345,10 @@ fn project_target(command: &CompanyWorkflowCommandV1) -> Option<(&ProjectId, u64
 fn project_event_type(command: &CompanyWorkflowCommandV1) -> Result<&'static str, WorkflowError> {
     match command {
         CompanyWorkflowCommandV1::PlanWorkGraph { .. } => Ok("project_work_graph_planned"),
+        CompanyWorkflowCommandV1::AppendSourceReview { .. } => Ok("project_source_review_planned"),
         CompanyWorkflowCommandV1::ActivateProject { .. } => Ok("project_activated"),
-        CompanyWorkflowCommandV1::AssignWork { .. } => Ok("project_work_assigned"),
+        CompanyWorkflowCommandV1::AssignWork { .. }
+        | CompanyWorkflowCommandV1::AssignSourceReview { .. } => Ok("project_work_assigned"),
         CompanyWorkflowCommandV1::ReassignWork { .. } => Ok("project_work_reassigned"),
         CompanyWorkflowCommandV1::DelegateWork { .. } => Ok("project_work_delegated"),
         CompanyWorkflowCommandV1::ApplyWorkTransition { .. } => {
@@ -5173,7 +5365,8 @@ fn project_event_type(command: &CompanyWorkflowCommandV1) -> Result<&'static str
         CompanyWorkflowCommandV1::ResolveBlocker { .. } => Ok("project_blocker_resolved"),
         CompanyWorkflowCommandV1::RecordApproval { .. } => Ok("project_approval_recorded"),
         CompanyWorkflowCommandV1::ReserveCost { .. } => Ok("project_cost_reserved"),
-        CompanyWorkflowCommandV1::GrantSubscriptionCall { .. } => {
+        CompanyWorkflowCommandV1::GrantSubscriptionCall { .. }
+        | CompanyWorkflowCommandV1::GrantSourceReviewCall { .. } => {
             Ok("project_subscription_call_granted")
         }
         CompanyWorkflowCommandV1::ClaimSubscriptionCall { .. } => {
@@ -6283,7 +6476,12 @@ fn validate_project_collections(project: &ProjectV1) -> Result<(), WorkflowError
                 .ok_or_else(corrupt)?;
             if bound.role != assignment.role
                 || bound.specialties != assignment.specialties
-                || bound.profile != assignment.profile
+                || (bound.profile != assignment.profile
+                    && !source_review_profile_allowed(
+                        work,
+                        &assignment.profile,
+                        &assignment.reason_ref,
+                    ))
                 || assignment.role != work.spec.required_role
                 || work
                     .spec
@@ -6807,6 +7005,25 @@ fn work_transition_actor_is_authorized(
             })
         }
         ("DependencyPending", "Ready") => {
+            if audit.reason_ref == "source-review-planned" {
+                return is_manager
+                    && audit_index == 0
+                    && work.spec.required_role == CompanyRoleV1::Qa
+                    && work.spec.rework.is_none()
+                    && !work.spec.inputs.is_empty()
+                    && work.spec.outputs.len() == 1
+                    && work.spec.outputs[0].media_type
+                        == "application/vnd.sentinel.qa-report+json"
+                    && dependencies_satisfied(project, work)
+                    && work.spec.dependency_ids.iter().all(|id| {
+                        project.work_items.get(id).is_some_and(|dependency| {
+                            dependency.transition_history.last().is_some_and(|last| {
+                                last.after == "Done"
+                                    && last.occurred_at_unix_ms <= audit.occurred_at_unix_ms
+                            })
+                        })
+                    });
+            }
             audit.reason_ref == "dependency-contract-satisfied"
                 && is_independent_qa
                 && work.spec.dependency_ids.iter().any(|dependency_id| {

@@ -25,8 +25,27 @@ claim that the autonomous-company acceptance has passed.
 
 For one assigned Designer or Developer with exactly one active work-item
 provider reservation, the daemon derives a task and authority snapshot from
-the existing workflow. The initial slice accepts one output contract and no
-upstream artifact inputs. The provider window is five minutes from the durable
+the existing workflow. Model work accepts one output contract and bounded
+upstream text artifacts from declared dependency inputs. The same authority
+resolver used by Workbench mounts requires a completed producer, its current
+assignment, matching contract generation/digest, and committed output evidence.
+The daemon reads the actual immutable files through the protected artifact
+reader, not historical write commands or a caller-supplied source snapshot.
+Inputs are limited to eight artifacts, 64 files and 64 KiB of UTF-8 content in
+total; binary, oversized, missing or invalid inputs fail closed without
+truncation. The complete serialized prompt retains its separate 128 KiB bound.
+Paths, file digests and content are included in the private provider context;
+they are untrusted task data, not instructions, permissions or passing tests.
+The context is re-resolved at dispatch and before new plan admission, so changed
+upstream results cannot silently authorize execution. Input reads do not stage
+files or modify either employee's workspace. Existing no-input context bytes
+are unchanged. Input access alone does not manufacture a model review or replace
+the separate deterministic QA gate.
+Once input-bearing requests have been persisted, recovery requires a binary
+that understands those contexts. Do not downgrade across a pending request or
+delete its journal to make an older binary accept it.
+
+The provider window is five minutes from the durable
 reservation timestamp; a new perception does not renew that window. Unsupported
 work fails closed instead of becoming an unbound tool or a host-shell action.
 
@@ -69,14 +88,71 @@ rejected. Model work never enters the legacy Chat/ToolUse action channel. Failed
 or claimed completion rows are not implicitly reactivated. There is no new store
 or schema migration; version-1 legacy completion payloads remain readable.
 
-This bridge is not the full M1 conversation/tool-result loop. Additional inputs,
-iterative rework, model-selected team decisions,
+This bridge is not the full M1 conversation/tool-result loop. Model-selected team decisions,
 and the real-provider customer-to-artifact journey remain #856 acceptance work.
 In particular, the existing monetary reservation API must not be presented as a
 valid substitute for ChatGPT subscription call/token/time limits or be populated
 with an invented marginal USD price. The activation stays off until that provider
 contract and the target-runtime readiness are verified. Test fixtures use the
 existing `local-loop` exemption, not a production OAuth exemption.
+
+### Independent source review
+
+An assigned QA employee uses the separate `web-review-v1` profile. It has no
+command rules, shell, network, patch tools or developer artifact authority.
+The model returns a bounded `SourceReview` JSON object tied to the complete
+input path/SHA-256 inventory. It may report `pass` with no findings or
+`changes_requested` with concrete source paths, one-based lines and reasons.
+Unknown fields, invented test attestations, invalid source lines, self-review,
+ambiguous inputs and contradictory verdicts are rejected.
+
+The server carries that model-authored report through exactly two existing
+Workbench operations: write `review.json` in the QA work item's own workspace,
+then seal it as `qa_report`. No other write path or command is admitted, including
+through a caller-supplied raw execution plan. Source inputs remain read-only.
+Profile selection follows the current role/assignment; missing review-profile
+configuration denies review admission without disabling older developer work.
+
+When model work is enabled, delivery requires a completed QA report from the
+current independent QA employee covering the entire current candidate. The
+sealed report must equal the model execution, and its plan must match the
+durable provider dispatch and canonical nonempty usage event. Unresolved or
+operator-resolved provider outcomes cannot approve delivery. A retained provider
+payload is also checked against the report; normal payload cleanup does not
+remove the canonical usage and completed execution evidence. A rejecting report
+blocks promotion. Passing source review is separate from the technical QA
+runner, which must still pass. Token-free M0 mode retains its explicitly
+deterministic gate and is not evidence of independent model reasoning.
+
+Leadership can append review work through `POST /agent/workflow/source-reviews`
+using the normal operation envelope with `append_source_review`, project ID,
+expected project version and the new work specification. The project must be a
+completed delivery candidate, not already present in delivery. The new item
+must cover every developer/designer output, use an independent QA owner and
+fit the existing budget. Existing work and provider records are preserved.
+`assign_source_review` on the same route assigns that appended item to its QA
+owner with an explicit `web-review-v1` profile binding and
+`reason_ref=source-review-profile`. Profile ID, digest and generation must match
+the installed immutable profile. The assignment retains this binding without
+rewriting the accepted participant/governance profile. Other work cannot use
+this specialization. Both commands remain versioned and replay-safe.
+
+The ordinary command routes reject these internal commands. Their dedicated route
+shares the delivery mutation fence; replay uses the original operation result.
+
+`grant_source_review_call` on that route performs one developer-to-QA handoff,
+bound to the previous allowance ID and the assigned QA work. Canonical model
+usage and adopted completed execution are required; unknown or operator-resolved
+outcomes cannot authorize it. The consumed developer allowance is retained in
+`source_review_previous_call`, remains counted in the provider campaign and
+cannot be claimed again or switched to monetary accounting. Replays return the
+original result; a second handoff is denied. Empty history is omitted from old
+project serialization. A binary without this field cannot read a handed-off
+project; rollback therefore requires the matching pre-handoff store snapshot,
+not an in-place downgrade or removal of provider history.
+
+This source path still needs integrated provenance tests and the real single-node
+acceptance journey; a new fixture project is not that proof.
 
 ### Pre-agreement Sales inquiries
 

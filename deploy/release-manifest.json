@@ -4,6 +4,12 @@
   "git_sha": "4c2d6b9a8e655f620e89b3550180d1810cc46fc7",
   "artifacts": [
     {
+      "path": "/opt/sentinel/config/agents/AGENT-55-LAURA-QA.toml",
+      "source": "config/agents/AGENT-55-LAURA-QA.toml",
+      "sha256": "1a5c6caa46f52338d7c49b9ceca4663244a69184f13602211dad693598fa6dc7",
+      "type": "config"
+    },
+    {
       "path": "/opt/sentinel/bin/sentinel-daemon",
       "source": "target/release/sentinel-daemon",
       "sha256": "7dab17eef01e35a172338e530d2ab80778859692e06371d1211145ba167f70eb",
@@ -103,6 +109,12 @@
       "path": "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml",
       "source": "config/workbench-profiles/web-authoring-v1.toml",
       "sha256": "e7e704d11a951e97d8246385f99cfa4c0fa835e4de2eec8e1272ce7dfae712a6",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/workbench-profiles/web-review-v1.toml",
+      "source": "config/workbench-profiles/web-review-v1.toml",
+      "sha256": "0403ed94d849d03baabbbe87097106e022a02ae4138817e35911b8aa1f9677be",
       "type": "config"
     },
     {

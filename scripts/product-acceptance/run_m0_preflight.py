@@ -347,6 +347,10 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
         "config",
     ),
     str(M0_QA_PROFILE_PATH): ("config/workbench-profiles/web-qa-v1.toml", "config"),
+    "/opt/sentinel/config/workbench-profiles/web-review-v1.toml": (
+        "config/workbench-profiles/web-review-v1.toml",
+        "config",
+    ),
     "/usr/bin/sentinel-web-qa": ("deploy/scripts/web-qa-v1.py", "script"),
     "/usr/bin/sentinel-work-item-gate": (
         "deploy/scripts/work-item-gate-v1.py",
