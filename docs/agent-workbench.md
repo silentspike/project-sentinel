@@ -130,11 +130,18 @@ expected project version and the new work specification. The project must be a
 completed delivery candidate, not already present in delivery. The new item
 must cover every developer/designer output, use an independent QA owner and
 fit the existing budget. Existing work and provider records are preserved.
-The ordinary command routes reject this internal command. Its dedicated route
+`assign_source_review` on the same route assigns that appended item to its QA
+owner with an explicit `web-review-v1` profile binding and
+`reason_ref=source-review-profile`. Profile ID, digest and generation must match
+the installed immutable profile. The assignment retains this binding without
+rewriting the accepted participant/governance profile. Other work cannot use
+this specialization. Both commands remain versioned and replay-safe.
+
+The ordinary command routes reject these internal commands. Their dedicated route
 shares the delivery mutation fence; replay uses the original operation result.
 
 This source path still needs the real single-node acceptance journey. In
-particular, assigning the exact review profile and transferring the one-call subscription
+particular, transferring the one-call subscription
 allowance from a completed developer to QA must preserve existing work and
 consumed provider history; a new fixture project is not that proof.
 

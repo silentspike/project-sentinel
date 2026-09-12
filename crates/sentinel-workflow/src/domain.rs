@@ -1008,6 +1008,17 @@ pub enum CompanyWorkflowCommandV1 {
         organization_digest: String,
         reason_ref: String,
     },
+    /// Internal: the service pins the report-only profile before assignment.
+    AssignSourceReview {
+        project_id: ProjectId,
+        expected_version: u64,
+        work_item_id: WorkItemId,
+        agent_id: AgentId,
+        organization_generation: u64,
+        organization_digest: String,
+        reason_ref: String,
+        profile: WorkProfileBindingV1,
+    },
     ReassignWork {
         project_id: ProjectId,
         expected_version: u64,

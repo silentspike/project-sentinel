@@ -30,14 +30,17 @@ impl WorkflowApi {
             Ok(value) => value,
             Err(response) => return response,
         };
-        let CompanyWorkflowCommandV1::AppendSourceReview { project_id, .. } = &envelope.command
-        else {
-            return json_error(
-                400,
-                "invalid_input",
-                "source review command required",
-                false,
-            );
+        let project_id = match &envelope.command {
+            CompanyWorkflowCommandV1::AppendSourceReview { project_id, .. }
+            | CompanyWorkflowCommandV1::AssignSourceReview { project_id, .. } => project_id,
+            _ => {
+                return json_error(
+                    400,
+                    "invalid_input",
+                    "source review command required",
+                    false,
+                )
+            }
         };
         let Ok(_guard) = self.mutation_fence.write() else {
             return json_error(503, "workflow_busy", "workflow recovery is active", true);
@@ -50,6 +53,25 @@ impl WorkflowApi {
             Err(error) => return workflow_error(error),
         };
         if !replay {
+            if let CompanyWorkflowCommandV1::AssignSourceReview { profile, .. } = &envelope.command
+            {
+                let expected = self
+                    .authority
+                    .as_ref()
+                    .and_then(|authority| authority.review_profile.as_ref());
+                if !expected.is_some_and(|(current, digest)| {
+                    profile.profile_id == current.id
+                        && profile.generation == PROFILE_GENERATION
+                        && profile.digest == *digest
+                }) {
+                    return json_error(
+                        409,
+                        "authority_conflict",
+                        "exact review profile unavailable",
+                        false,
+                    );
+                }
+            }
             let Some(delivery) = self.delivery.as_ref() else {
                 return json_error(
                     503,
@@ -582,6 +604,63 @@ mod tests {
         assert!(!api
             .store
             .has_company_operation(&pm.principal, Uuid::from_u128(85601))
+            .unwrap());
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn source_review_assignment_requires_the_exact_installed_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut api = model_work::configured_test_api(&temp.path().join("company.sqlite"));
+        let pm = api.principals.principal("pm").unwrap();
+        let context = review_context();
+        let command = CompanyWorkflowCommandV1::AssignSourceReview {
+            project_id: context.authority.project_id,
+            expected_version: 1,
+            work_item_id: context.authority.work_item_id,
+            agent_id: context.authority.agent_id,
+            organization_generation: 1,
+            organization_digest: "a".repeat(64),
+            reason_ref: "source-review-profile".into(),
+            profile: sentinel_workflow::WorkProfileBindingV1 {
+                profile_id: PROFILE_ID.into(),
+                generation: PROFILE_GENERATION,
+                digest: "b".repeat(64),
+            },
+        };
+        let body = |command: &CompanyWorkflowCommandV1| {
+            serde_json::to_vec(&serde_json::json!({
+                "operation_id": Uuid::from_u128(85602), "command": command,
+            }))
+            .unwrap()
+        };
+        assert!(is_internal_company_command(&command));
+        assert_eq!(api.append_source_review(&pm, &body(&command)).status, 409);
+        let mut authority = api.authority.as_ref().unwrap().as_ref().clone();
+        authority.review_profile = Some((
+            toml::from_str(include_str!(
+                "../../../../config/workbench-profiles/web-review-v1.toml"
+            ))
+            .unwrap(),
+            "b".repeat(64),
+        ));
+        api.authority = Some(Arc::new(authority));
+        // A valid profile reaches the independent delivery exclusion gate.
+        assert_eq!(api.append_source_review(&pm, &body(&command)).status, 503);
+        for variant in 0..3 {
+            let mut changed = command.clone();
+            if let CompanyWorkflowCommandV1::AssignSourceReview { profile, .. } = &mut changed {
+                match variant {
+                    0 => profile.profile_id = "web-authoring-v1".into(),
+                    1 => profile.digest = "c".repeat(64),
+                    _ => profile.generation += 1,
+                }
+            }
+            assert_eq!(api.append_source_review(&pm, &body(&changed)).status, 409);
+        }
+        assert!(!api
+            .store
+            .has_company_operation(&pm.principal, Uuid::from_u128(85602))
             .unwrap());
     }
 
