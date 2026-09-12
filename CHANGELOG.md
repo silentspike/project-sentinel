@@ -1,5 +1,9 @@
 # Changelog
 
+- Allow zero monetary allocation only for bound, report-only source QA. Its
+  separate one-call subscription authority remains mandatory; preserve the
+  completed developer's budget/history and reject zero-budget authoring (#856).
+
 - Align the canonical single-node provisioner and release preflight with the
   source-review profile so the validated QA package is installable (#856).
 
