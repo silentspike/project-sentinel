@@ -342,6 +342,84 @@ fn correction_fixture(
 }
 
 #[test]
+fn source_review_append_preserves_completed_work_and_replays_after_restart() {
+    let (state, before, _) = correction_fixture(WorkExecutionObservation::Succeeded);
+    let mut review = work(
+        "source-review",
+        CompanyRoleV1::Qa,
+        &["qa"],
+        &["build-work"],
+        100,
+    );
+    review.outputs[0].media_type = "application/vnd.sentinel.qa-report+json".into();
+    let command = CompanyWorkflowCommandV1::AppendSourceReview {
+        project_id: before.project_id.clone(),
+        expected_version: before.version,
+        item: review.clone(),
+    };
+    for actor in [&state.developer, &state.qa, &state.customer] {
+        assert!(state
+            .store
+            .apply_company_command(actor, Uuid::from_u128(701), &command, 60)
+            .is_err());
+    }
+    for variant in 0..6 {
+        let mut bad = review.clone();
+        match variant {
+            0 => bad.inputs.clear(),
+            1 => bad.required_role = CompanyRoleV1::Developer,
+            2 => bad.owner = AgentId(2),
+            3 => bad.work_item_id = WorkItemId::parse("build-work").unwrap(),
+            4 => bad.inputs[0].expected_contract_digest = OTHER_DIGEST.into(),
+            _ => bad.budget_micros = 1001,
+        }
+        let command = CompanyWorkflowCommandV1::AppendSourceReview {
+            project_id: before.project_id.clone(),
+            expected_version: before.version,
+            item: bad,
+        };
+        assert!(state
+            .store
+            .apply_company_command(&state.pm, Uuid::from_u128(702 + variant), &command, 60)
+            .is_err());
+        assert_eq!(
+            state
+                .store
+                .company_project(&state.pm.tenant_id, &before.project_id)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+    }
+    let after = project_command(&state.store, &state.pm, 710, command.clone(), 60);
+    assert_eq!(after.lifecycle_state, ProjectLifecycleStateV1::Active);
+    assert_eq!(after.work_items.len(), before.work_items.len() + 1);
+    for (id, work) in &before.work_items {
+        assert_eq!(&after.work_items[id], work);
+    }
+    assert_eq!(after.subscription_call, before.subscription_call);
+    assert_eq!(after.work_corrections, before.work_corrections);
+    assert_eq!(
+        after.work_items[&review.work_item_id].state,
+        CompanyWorkStateV1::Ready
+    );
+    let reopened = WorkflowStore::open(state._temp.path().join("workflow.sqlite")).unwrap();
+    assert!(
+        reopened
+            .apply_company_command(&state.pm, Uuid::from_u128(710), &command, 61)
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(
+        reopened
+            .company_project(&state.pm.tenant_id, &before.project_id)
+            .unwrap()
+            .unwrap(),
+        after
+    );
+}
+
+#[test]
 fn company_correction_feedback_is_bound_to_artifact_and_survives_restart() {
     let (state, previous, mut command) = correction_fixture(WorkExecutionObservation::Succeeded);
     let work_id = WorkItemId::parse("build-work").unwrap();

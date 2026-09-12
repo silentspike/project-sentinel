@@ -988,6 +988,12 @@ pub enum CompanyWorkflowCommandV1 {
         expected_version: u64,
         items: Vec<CompanyWorkItemSpecV1>,
     },
+    /// Internal: the service excludes any existing delivery before appending QA.
+    AppendSourceReview {
+        project_id: ProjectId,
+        expected_version: u64,
+        item: CompanyWorkItemSpecV1,
+    },
     ActivateProject {
         project_id: ProjectId,
         expected_version: u64,
