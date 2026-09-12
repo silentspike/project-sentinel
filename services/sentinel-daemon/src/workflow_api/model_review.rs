@@ -474,36 +474,8 @@ pub(super) fn validated_project_review(
         })
         .collect::<Vec<_>>();
     expected.sort_by(|a, b| a.path.cmp(&b.path));
-    let first = execution.plan.steps.first().ok_or("QA plan empty")?;
-    validate_tools(&tools, &first.inputs)?;
-    let ExecutionToolV1::WriteFile { content, .. } = &tools[0] else {
-        return Err("QA report missing");
-    };
-    let report = parse_report(content, &expected)?;
-    let terminal = execution
-        .terminal_execution_evidence
-        .as_ref()
-        .ok_or("QA completion missing")?;
-    let [artifact] = terminal.artifacts.as_slice() else {
-        return Err("QA artifact inventory changed");
-    };
-    if artifact.artifact_kind != "qa_report" || artifact.media_type != MEDIA_TYPE {
-        return Err("QA artifact type changed");
-    }
-    let bytes = crate::workbench::read_verified_artifact_file(
-        &authority.artifact_roots,
-        agent,
-        &project.project_id.0,
-        &artifact.digest,
-        "qa_report",
-        MEDIA_TYPE,
-        REPORT_PATH,
-        MAX_REPORT_BYTES as u64,
-    )
-    .map_err(|_| "QA artifact unavailable")?;
-    if bytes != content.as_bytes() {
-        return Err("QA report differs from model execution");
-    }
+    let (report, report_digest) =
+        verified_report_artifact(&authority.artifact_roots, &execution, &expected)?;
     let events = api
         .event_store
         .as_ref()
@@ -587,7 +559,55 @@ pub(super) fn validated_project_review(
     if report.verdict != Verdict::Pass {
         return Err("model source review requests changes");
     }
-    Ok(artifact.digest.clone())
+    Ok(report_digest)
+}
+
+#[cfg(feature = "llm")]
+fn verified_report_artifact(
+    roots: &HashMap<AgentId, PathBuf>,
+    execution: &sentinel_workflow::WorkItemExecutionV1,
+    expected: &[SourceFile],
+) -> Result<(SourceReview, String), &'static str> {
+    let tools = execution
+        .plan
+        .steps
+        .iter()
+        .map(|step| step.tool.clone())
+        .collect::<Vec<_>>();
+    let first = execution.plan.steps.first().ok_or("QA plan empty")?;
+    validate_tools(&tools, &first.inputs)?;
+    let ExecutionToolV1::WriteFile { content, .. } = &tools[0] else {
+        return Err("QA report missing");
+    };
+    let report = parse_report(content, expected)?;
+    let terminal = execution
+        .terminal_execution_evidence
+        .as_ref()
+        .ok_or("QA completion missing")?;
+    let [artifact] = terminal.artifacts.as_slice() else {
+        return Err("QA artifact inventory changed");
+    };
+    if artifact.artifact_kind != "qa_report"
+        || artifact.media_type != MEDIA_TYPE
+        || artifact.paths != [REPORT_PATH]
+    {
+        return Err("QA artifact type or paths changed");
+    }
+    let bytes = crate::workbench::read_verified_artifact_file(
+        roots,
+        execution.agent_id,
+        &execution.project_id.0,
+        &artifact.digest,
+        "qa_report",
+        MEDIA_TYPE,
+        REPORT_PATH,
+        MAX_REPORT_BYTES as u64,
+    )
+    .map_err(|_| "QA artifact unavailable")?;
+    if bytes != content.as_bytes() {
+        return Err("QA report differs from model execution");
+    }
+    Ok((report, artifact.digest.clone()))
 }
 
 #[cfg(test)]
@@ -767,6 +787,160 @@ mod tests {
             .store
             .has_company_operation(&pm.principal, Uuid::from_u128(85602))
             .unwrap());
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn source_review_artifact_requires_exact_bytes_scope_and_inventory() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let context = review_context();
+        let expected = source_inventory(&context).unwrap();
+        let review = SourceReview {
+            source_files: expected.clone(),
+            ..report()
+        };
+        let content = encoded(&review);
+        let profile: WorkbenchProfile = toml::from_str(include_str!(
+            "../../../../config/workbench-profiles/web-review-v1.toml"
+        ))
+        .unwrap();
+        let inputs = expected
+            .iter()
+            .map(|source| ArtifactInputV1 {
+                artifact_id: format!("sha256:{}", source.sha256),
+                digest: source.sha256.clone(),
+                mount_path: source.path.clone(),
+                media_type: "text/javascript".into(),
+            })
+            .collect();
+        let intent = ExecutionIntentV1 {
+            project_id: context.authority.project_id.clone(),
+            work_item_id: context.authority.work_item_id.clone(),
+            tools: proposal_tools(&content, &context).unwrap(),
+        };
+        let plan = build_execution_plan(
+            Uuid::new_v4(),
+            &context.authority,
+            &context.task,
+            inputs,
+            &profile,
+            &intent,
+            1,
+            30_001,
+        )
+        .unwrap();
+        let package = plan.steps.last().unwrap();
+        let root = temp.path().join("artifacts");
+        fs::write(
+            temp.path().join(".nano-runtime"),
+            context.authority.agent_id.to_string(),
+        )
+        .unwrap();
+        let scope = root.join(&plan.project_id.0).join(&plan.work_item_id.0);
+        fs::create_dir_all(scope.join("blobs")).unwrap();
+        let blob_digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let blob = scope.join("blobs").join(&blob_digest);
+        fs::write(&blob, &content).unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o400)).unwrap();
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1, "invocation_id": package.invocation_id.to_string(),
+            "input_digest": "a".repeat(64), "project_id": plan.project_id.0,
+            "work_item_id": plan.work_item_id.0, "workspace_id": plan.workspace_id,
+            "agent_id": plan.agent_id.0, "artifact_kind": "qa_report", "media_type": MEDIA_TYPE,
+            "runtime_key": plan.runtime_key, "tool_profile": PROFILE_ID,
+            "tool_profile_digest": plan.profile_digest, "policy_digest": plan.policy_digest,
+            "entries": [{"path": REPORT_PATH, "blob_id": format!("sha256:{blob_digest}"),
+                "sha256": blob_digest, "size_bytes": content.len()}]
+        }))
+        .unwrap();
+        let digest = format!("{:x}", Sha256::digest(&manifest));
+        let manifest_path = scope.join(format!("{digest}.manifest.json"));
+        fs::write(&manifest_path, &manifest).unwrap();
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o400)).unwrap();
+        let execution = sentinel_workflow::WorkItemExecutionV1 {
+            schema_version: 1,
+            tenant_id: plan.tenant_id.clone(),
+            project_id: plan.project_id.clone(),
+            work_item_id: plan.work_item_id.clone(),
+            agent_id: plan.agent_id,
+            state: sentinel_workflow::WorkItemState::Done,
+            version: 4,
+            next_step_ordinal: 1,
+            blocker_code: None,
+            updated_at_unix_ms: 3,
+            gate_evidence: None,
+            terminal_execution_evidence: Some(sentinel_workflow::ExecutionEvidenceReadbackV1 {
+                schema_version: 1,
+                receipt_id: "test-receipt".into(),
+                invocation_id: package.invocation_id,
+                plan_digest: plan.request_digest.clone(),
+                step_digest: "a".repeat(64),
+                output_bundle_digest: "b".repeat(64),
+                outputs: vec![],
+                completed_at_unix_ms: 3,
+                artifacts: vec![SealedArtifactEvidenceV1 {
+                    artifact_kind: "qa_report".into(),
+                    media_type: MEDIA_TYPE.into(),
+                    paths: vec![REPORT_PATH.into()],
+                    digest: digest.clone(),
+                }],
+            }),
+            plan,
+        };
+        let roots = HashMap::from([(execution.agent_id, root.clone())]);
+        assert_eq!(
+            verified_report_artifact(&roots, &execution, &expected).unwrap(),
+            (review, digest)
+        );
+        for variant in 0..6 {
+            let mut changed = execution.clone();
+            match variant {
+                0 => changed.agent_id = AgentId(99),
+                1 => changed.project_id = ProjectId::parse("foreign-project").unwrap(),
+                2 => changed.terminal_execution_evidence = None,
+                3 => changed
+                    .terminal_execution_evidence
+                    .as_mut()
+                    .unwrap()
+                    .artifacts[0]
+                    .paths
+                    .push("foreign.js".into()),
+                4 => {
+                    changed
+                        .terminal_execution_evidence
+                        .as_mut()
+                        .unwrap()
+                        .artifacts[0]
+                        .media_type = "text/plain".into()
+                }
+                _ => {
+                    if let ExecutionToolV1::WriteFile { content, .. } =
+                        &mut changed.plan.steps[0].tool
+                    {
+                        content.push(' ');
+                    }
+                }
+            }
+            assert!(
+                verified_report_artifact(&roots, &changed, &expected).is_err(),
+                "variant {variant}"
+            );
+        }
+        let mut foreign_source = expected.clone();
+        foreign_source[0].sha256 = "f".repeat(64);
+        assert!(verified_report_artifact(&roots, &execution, &foreign_source).is_err());
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            verified_report_artifact(&roots, &execution, &expected).is_err(),
+            "mutable report"
+        );
+        fs::write(&blob, b"tampered").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(
+            verified_report_artifact(&roots, &execution, &expected).is_err(),
+            "changed bytes"
+        );
     }
 
     #[cfg(feature = "llm")]

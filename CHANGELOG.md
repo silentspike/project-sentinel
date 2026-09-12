@@ -1,5 +1,10 @@
 # Changelog
 
+- Verify QA reports through the production immutable-artifact reader, require
+  exactly review.json, and reject changed model text, source inventory, project,
+  agent, artifact type, mutable blobs and tampered bytes. Filesystem regressions
+  cover the report path without claiming a live model review (#856).
+
 - Cover source-review predecessor authority through persisted multi-step
   execution, independent completion evidence, canonical model usage, outbox
   cleanup and store reopen. Keep failed-execution correction and successful
