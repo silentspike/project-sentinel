@@ -439,7 +439,12 @@ impl CompanyWorkItemSpecV1 {
         if self.required_role == CompanyRoleV1::Customer
             || self.required_specialties.is_empty()
             || self.owner.0 == 0
-            || self.budget_micros == 0
+            || (self.budget_micros == 0
+                && !(self.required_role == CompanyRoleV1::Qa
+                    && self.rework.is_none()
+                    && !self.inputs.is_empty()
+                    && self.outputs.len() == 1
+                    && self.outputs[0].media_type == "application/vnd.sentinel.qa-report+json"))
             || self.dependency_ids.contains(&self.work_item_id)
         {
             return Err(invalid("work item specification is invalid"));
@@ -1616,6 +1621,27 @@ mod tests {
             budget_micros: 1,
             rework: None,
         }
+    }
+
+    #[test]
+    fn source_review_zero_monetary_budget_does_not_authorize_other_work() {
+        let mut review = work("review", Some("source"));
+        review.required_role = CompanyRoleV1::Qa;
+        review.outputs[0].media_type = "application/vnd.sentinel.qa-report+json".into();
+        review.budget_micros = 0;
+        assert!(review.validate().is_ok());
+        let mut changed = review.clone();
+        changed.required_role = CompanyRoleV1::Developer;
+        assert!(changed.validate().is_err());
+        changed = review.clone();
+        changed.inputs.clear();
+        assert!(changed.validate().is_err());
+        changed = review.clone();
+        changed.outputs[0].media_type = "text/html".into();
+        assert!(changed.validate().is_err());
+        changed = review;
+        changed.outputs.push(changed.outputs[0].clone());
+        assert!(changed.validate().is_err());
     }
 
     #[test]
