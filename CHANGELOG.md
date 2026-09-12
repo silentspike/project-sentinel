@@ -1,5 +1,9 @@
 # Changelog
 
+- Provision the independent QA agent's report-write and artifact-commit
+  capabilities required by the confined source-review profile. Retain the
+  profile's command denial and report-only output scope (#856).
+
 - Verify QA reports through the production immutable-artifact reader, require
   exactly review.json, and reject changed model text, source inventory, project,
   agent, artifact type, mutable blobs and tampered bytes. Filesystem regressions
