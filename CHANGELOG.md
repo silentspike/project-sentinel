@@ -1,5 +1,8 @@
 # Changelog
 
+- Align the canonical single-node provisioner and release preflight with the
+  source-review profile so the validated QA package is installable (#856).
+
 - Provision the independent QA agent's report-write and artifact-commit
   capabilities required by the confined source-review profile. Retain the
   profile's command denial and report-only output scope (#856).
