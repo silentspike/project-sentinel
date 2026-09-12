@@ -974,6 +974,19 @@ mod tests {
         .unwrap();
         assert!(profile.command_rules.is_empty());
         assert!(!profile.capabilities.contains("command.run_allowlisted"));
+        let qa: toml::Value = toml::from_str(include_str!(
+            "../../../../config/agents/AGENT-55-LAURA-QA.toml"
+        ))
+        .unwrap();
+        let capabilities = qa["capabilities"]["tools"].as_array().unwrap();
+        for capability in &profile.capabilities {
+            assert!(capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(capability.as_str())));
+        }
+        assert!(!capabilities
+            .iter()
+            .any(|value| value.as_str() == Some("command.run_allowlisted")));
         let intent = ExecutionIntentV1 {
             project_id: context.authority.project_id.clone(),
             work_item_id: context.authority.work_item_id.clone(),
