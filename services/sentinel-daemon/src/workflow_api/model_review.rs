@@ -32,7 +32,8 @@ impl WorkflowApi {
         };
         let project_id = match &envelope.command {
             CompanyWorkflowCommandV1::AppendSourceReview { project_id, .. }
-            | CompanyWorkflowCommandV1::AssignSourceReview { project_id, .. } => project_id,
+            | CompanyWorkflowCommandV1::AssignSourceReview { project_id, .. }
+            | CompanyWorkflowCommandV1::GrantSourceReviewCall { project_id, .. } => project_id,
             _ => {
                 return json_error(
                     400,
@@ -53,6 +54,74 @@ impl WorkflowApi {
             Err(error) => return workflow_error(error),
         };
         if !replay {
+            if let CompanyWorkflowCommandV1::GrantSourceReviewCall {
+                previous_allowance_id,
+                grant,
+                ..
+            } = &envelope.command
+            {
+                let project = match self
+                    .store
+                    .company_project(&principal.principal.tenant_id, project_id)
+                {
+                    Ok(Some(project)) => project,
+                    _ => {
+                        return json_error(
+                            409,
+                            "authority_conflict",
+                            "source-review project unavailable",
+                            false,
+                        )
+                    }
+                };
+                let Some(previous) = project
+                    .subscription_call
+                    .as_ref()
+                    .filter(|call| call.allowance_id == *previous_allowance_id)
+                else {
+                    return json_error(
+                        409,
+                        "authority_conflict",
+                        "source-review predecessor changed",
+                        false,
+                    );
+                };
+                if let Err(error) = self.validate_model_work_result(
+                    &principal.principal,
+                    project_id,
+                    &previous.grant.work_item_id,
+                    None,
+                ) {
+                    return json_error(409, "source_review_evidence_unavailable", error, false);
+                }
+                let assignment = project
+                    .work_items
+                    .get(&grant.work_item_id)
+                    .and_then(|work| {
+                        work.assignments.iter().find(|assignment| {
+                            assignment.active && assignment.assignment_id == grant.assignment_id
+                        })
+                    });
+                let expected = self
+                    .authority
+                    .as_ref()
+                    .and_then(|authority| authority.review_profile.as_ref());
+                if !assignment
+                    .zip(expected)
+                    .is_some_and(|(assignment, (profile, digest))| {
+                        assignment.profile.profile_id == profile.id
+                            && assignment.profile.generation == PROFILE_GENERATION
+                            && assignment.profile.digest == *digest
+                    })
+                {
+                    return json_error(
+                        409,
+                        "authority_conflict",
+                        "exact review profile unavailable",
+                        false,
+                    );
+                }
+            }
             if let CompanyWorkflowCommandV1::AssignSourceReview { profile, .. } = &envelope.command
             {
                 let expected = self
@@ -604,6 +673,42 @@ mod tests {
         assert!(!api
             .store
             .has_company_operation(&pm.principal, Uuid::from_u128(85601))
+            .unwrap());
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn source_review_handoff_denies_missing_provider_evidence_before_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = model_work::configured_test_api(&temp.path().join("company.sqlite"));
+        let operation_id = Uuid::from_u128(85603);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "operation_id": operation_id,
+            "command": {
+                "command": "grant_source_review_call", "project_id": "project-m0",
+                "expected_version": 1, "previous_allowance_id": "subscription-old",
+                "grant": {
+                    "schema_version": 1, "work_item_id": "review-work",
+                    "assignment_id": "assignment-qa", "assignment_version": 1,
+                    "agent_id": 3, "provider": "codex-cli", "model": "gpt-5.4",
+                    "catalog_digest": "a".repeat(64), "max_calls": 1, "max_concurrent": 1,
+                    "max_duration_ms": 120000, "token_policy": "measured_without_generation_cap",
+                    "expires_at_unix_ms": 300000
+                }
+            }
+        }))
+        .unwrap();
+        let envelope: CompanyCommandEnvelope = serde_json::from_slice(&body).unwrap();
+        assert!(is_internal_company_command(&envelope.command));
+        for id in ["customer", "sales", "developer-6", "operator"] {
+            let principal = api.principals.principal(id).unwrap();
+            assert_eq!(api.append_source_review(&principal, &body).status, 403);
+        }
+        let pm = api.principals.principal("pm").unwrap();
+        assert_eq!(api.append_source_review(&pm, &body).status, 409);
+        assert!(!api
+            .store
+            .has_company_operation(&pm.principal, operation_id)
             .unwrap());
     }
 

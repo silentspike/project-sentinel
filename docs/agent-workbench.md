@@ -140,10 +140,19 @@ this specialization. Both commands remain versioned and replay-safe.
 The ordinary command routes reject these internal commands. Their dedicated route
 shares the delivery mutation fence; replay uses the original operation result.
 
-This source path still needs the real single-node acceptance journey. In
-particular, transferring the one-call subscription
-allowance from a completed developer to QA must preserve existing work and
-consumed provider history; a new fixture project is not that proof.
+`grant_source_review_call` on that route performs one developer-to-QA handoff,
+bound to the previous allowance ID and the assigned QA work. Canonical model
+usage and adopted completed execution are required; unknown or operator-resolved
+outcomes cannot authorize it. The consumed developer allowance is retained in
+`source_review_previous_call`, remains counted in the provider campaign and
+cannot be claimed again or switched to monetary accounting. Replays return the
+original result; a second handoff is denied. Empty history is omitted from old
+project serialization. A binary without this field cannot read a handed-off
+project; rollback therefore requires the matching pre-handoff store snapshot,
+not an in-place downgrade or removal of provider history.
+
+This source path still needs integrated provenance tests and the real single-node
+acceptance journey; a new fixture project is not that proof.
 
 ### Pre-agreement Sales inquiries
 

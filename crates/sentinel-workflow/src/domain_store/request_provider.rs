@@ -188,12 +188,17 @@ fn legacy_usage(connection: &Connection) -> Result<(usize, usize), WorkflowError
         let project: ProjectV1 = get_entity(connection, &TenantId::parse(tenant)?, "project", id)?
             .ok_or_else(corrupt)?;
         let mut allowances = BTreeMap::new();
-        for allowance in project.subscription_call.iter().chain(
-            project
-                .work_corrections
-                .iter()
-                .filter_map(|record| record.previous_subscription_call.as_ref()),
-        ) {
+        for allowance in project
+            .subscription_call
+            .iter()
+            .chain(project.source_review_previous_call.iter())
+            .chain(
+                project
+                    .work_corrections
+                    .iter()
+                    .filter_map(|record| record.previous_subscription_call.as_ref()),
+            )
+        {
             if let Some(previous) = allowances.insert(&allowance.allowance_id, allowance) {
                 if previous != allowance {
                     return Err(corrupt());
