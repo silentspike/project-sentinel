@@ -124,8 +124,17 @@ blocks promotion. Passing source review is separate from the technical QA
 runner, which must still pass. Token-free M0 mode retains its explicitly
 deterministic gate and is not evidence of independent model reasoning.
 
+Leadership can append review work through `POST /agent/workflow/source-reviews`
+using the normal operation envelope with `append_source_review`, project ID,
+expected project version and the new work specification. The project must be a
+completed delivery candidate, not already present in delivery. The new item
+must cover every developer/designer output, use an independent QA owner and
+fit the existing budget. Existing work and provider records are preserved.
+The ordinary command routes reject this internal command. Its dedicated route
+shares the delivery mutation fence; replay uses the original operation result.
+
 This source path still needs the real single-node acceptance journey. In
-particular, assigning review work and transferring the one-call subscription
+particular, assigning the exact review profile and transferring the one-call subscription
 allowance from a completed developer to QA must preserve existing work and
 consumed provider history; a new fixture project is not that proof.
 

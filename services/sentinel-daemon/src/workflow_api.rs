@@ -77,6 +77,7 @@ pub const REQUEST_PROVIDER_PATH: &str = "/operator/workflow/request-provider";
 pub const REQUEST_PROVIDER_ABANDON_PATH: &str = "/operator/workflow/request-provider/abandon";
 pub const AGENT_COMMAND_PATH: &str = "/agent/workflow/commands";
 pub const WORK_CORRECTION_PATH: &str = "/agent/workflow/corrections";
+pub const SOURCE_REVIEW_PATH: &str = "/agent/workflow/source-reviews";
 pub const OPERATOR_PROJECT_PATH: &str = "/operator/workflow/projects";
 pub const OPERATOR_WORK_ITEM_PATH: &str = "/operator/workflow/work-items";
 pub const OPERATOR_PROJECTION_PATH: &str = "/operator/workflow/projections";
@@ -2841,6 +2842,7 @@ impl WorkflowApi {
             ("POST", REQUEST_PROVIDER_ABANDON_PATH) => self.abandon_sales_request(&principal, body),
             ("POST", AGENT_COMMAND_PATH) => self.agent_command(&principal, body),
             ("POST", WORK_CORRECTION_PATH) => self.correct_model_work(&principal, body),
+            ("POST", SOURCE_REVIEW_PATH) => self.append_source_review(&principal, body),
             ("GET", CUSTOMER_REQUEST_PATH) => self.customer_request(&principal, path),
             ("GET", CUSTOMER_IDENTITY_PATH) => customer_identity(&principal),
             ("GET", CUSTOMER_OVERVIEW_PATH) => self.customer_overview(&principal, path),
@@ -4760,6 +4762,7 @@ fn is_workflow_path(path: &str) -> bool {
             | OPERATOR_COMMAND_PATH
             | REQUEST_PROVIDER_PATH
             | WORK_CORRECTION_PATH
+            | SOURCE_REVIEW_PATH
             | REQUEST_PROVIDER_ABANDON_PATH
             | AGENT_COMMAND_PATH
             | OPERATOR_PROJECT_PATH
@@ -4875,6 +4878,7 @@ fn is_internal_company_command(command: &CompanyWorkflowCommandV1) -> bool {
         command,
         CompanyWorkflowCommandV1::ApplyWorkTransition { .. }
             | CompanyWorkflowCommandV1::RequestWorkCorrection { .. }
+            | CompanyWorkflowCommandV1::AppendSourceReview { .. }
             | CompanyWorkflowCommandV1::ClaimSubscriptionCall { .. }
             | CompanyWorkflowCommandV1::CreateGovernedRework { .. }
             | CompanyWorkflowCommandV1::AdmitCollaboration { .. }

@@ -7,6 +7,81 @@ const REPORT_PATH: &str = "review.json";
 const MAX_REPORT_BYTES: usize = 32 * 1024;
 const MAX_FINDINGS: usize = 16;
 
+impl WorkflowApi {
+    pub(super) fn append_source_review(
+        &self,
+        principal: &BoundPrincipal,
+        body: &[u8],
+    ) -> WorkflowHttpResponse {
+        if principal.principal.kind != CompanyPrincipalKindV1::Agent
+            || !matches!(
+                principal.principal.role,
+                CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+            )
+        {
+            return json_error(
+                403,
+                "authority_conflict",
+                "project leadership authority required",
+                false,
+            );
+        }
+        let envelope: CompanyCommandEnvelope = match decode_body(body) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let CompanyWorkflowCommandV1::AppendSourceReview { project_id, .. } = &envelope.command
+        else {
+            return json_error(
+                400,
+                "invalid_input",
+                "source review command required",
+                false,
+            );
+        };
+        let Ok(_guard) = self.mutation_fence.write() else {
+            return json_error(503, "workflow_busy", "workflow recovery is active", true);
+        };
+        let replay = match self
+            .store
+            .has_company_operation(&principal.principal, envelope.operation_id)
+        {
+            Ok(value) => value,
+            Err(error) => return workflow_error(error),
+        };
+        if !replay {
+            let Some(delivery) = self.delivery.as_ref() else {
+                return json_error(
+                    503,
+                    "workflow_unavailable",
+                    "delivery exclusion unavailable",
+                    true,
+                );
+            };
+            match delivery.contains_project(&principal.principal.tenant_id.0, &project_id.0) {
+                Ok(false) => {}
+                _ => {
+                    return json_error(
+                        409,
+                        "authority_conflict",
+                        "delivery already exists or exclusion unavailable",
+                        false,
+                    )
+                }
+            }
+        }
+        match self.core.apply_company_command(
+            &principal.principal,
+            envelope.operation_id,
+            &envelope.command,
+            now_unix_ms(),
+        ) {
+            Ok(outcome) => company_command_response(&outcome, &principal.principal),
+            Err(error) => workflow_error(error),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SourceFile {
@@ -479,6 +554,35 @@ mod tests {
             }],
         }];
         context
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn source_review_append_route_requires_leadership_and_delivery_exclusion() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = model_work::configured_test_api(&temp.path().join("company.sqlite"));
+        let context = review_context();
+        let command = CompanyWorkflowCommandV1::AppendSourceReview {
+            project_id: context.authority.project_id,
+            expected_version: 1,
+            item: context.task,
+        };
+        assert!(is_internal_company_command(&command));
+        assert!(is_workflow_path(SOURCE_REVIEW_PATH));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "operation_id": Uuid::from_u128(85601), "command": command,
+        }))
+        .unwrap();
+        for name in ["customer", "developer-6", "operator"] {
+            let principal = api.principals.principal(name).unwrap();
+            assert_eq!(api.append_source_review(&principal, &body).status, 403);
+        }
+        let pm = api.principals.principal("pm").unwrap();
+        assert_eq!(api.append_source_review(&pm, &body).status, 503);
+        assert!(!api
+            .store
+            .has_company_operation(&pm.principal, Uuid::from_u128(85601))
+            .unwrap());
     }
 
     #[cfg(feature = "llm")]

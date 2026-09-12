@@ -1,5 +1,11 @@
 # Changelog
 
+- Append an independent source-review work item to the existing completed
+  project without replacing its graph, outputs or provider history. Bind the
+  full developer candidate, enforce leadership and budget authority, preserve
+  dependency-transition evidence, and exclude projects already in delivery
+  through a dedicated authenticated route (#856).
+
 - Add independent, source-bound QA report proposals under a separate command-free
   review profile. Restrict execution to writing and sealing review.json, reject
   direct caller-authored QA plans, and require matching model usage, committed
