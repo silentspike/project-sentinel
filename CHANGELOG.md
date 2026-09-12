@@ -1,5 +1,11 @@
 # Changelog
 
+- Cover source-review predecessor authority through persisted multi-step
+  execution, independent completion evidence, canonical model usage, outbox
+  cleanup and store reopen. Keep failed-execution correction and successful
+  review handoff distinct; test execution ports do not attest a live agent
+  review (#856).
+
 - Preserve consumed developer subscription authority during a one-time,
   evidence-gated handoff to assigned source-review QA. Keep both calls in
   campaign accounting, reject repeated handoffs and monetary double accounting,
