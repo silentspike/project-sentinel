@@ -377,6 +377,8 @@ fn source_review_append_preserves_completed_work_and_replays_after_restart() {
         100,
     );
     review.outputs[0].media_type = "application/vnd.sentinel.qa-report+json".into();
+    // OAuth call admission is separately bounded; report work cannot reserve money.
+    review.budget_micros = 0;
     let command = CompanyWorkflowCommandV1::AppendSourceReview {
         project_id: before.project_id.clone(),
         expected_version: before.version,
@@ -424,6 +426,19 @@ fn source_review_append_preserves_completed_work_and_replays_after_restart() {
     }
     assert_eq!(after.subscription_call, before.subscription_call);
     assert_eq!(after.work_corrections, before.work_corrections);
+    assert_eq!(after.cost_ceiling_micros, before.cost_ceiling_micros);
+    assert_eq!(
+        after
+            .work_items
+            .values()
+            .map(|work| work.spec.budget_micros)
+            .sum::<u64>(),
+        before
+            .work_items
+            .values()
+            .map(|work| work.spec.budget_micros)
+            .sum::<u64>()
+    );
     assert_eq!(
         after.work_items[&review.work_item_id].state,
         CompanyWorkStateV1::Ready
