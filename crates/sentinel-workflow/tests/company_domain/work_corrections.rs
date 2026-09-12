@@ -148,7 +148,31 @@ impl GateEvidencePort for Evidence {
 fn correction_fixture(
     observation: WorkExecutionObservation,
 ) -> (Journey, ProjectV1, CompanyWorkflowCommandV1) {
-    let (state, mut project, _) = super::subscription::assigned();
+    correction_fixture_with_subscription(observation, false)
+}
+
+fn correction_fixture_with_subscription(
+    observation: WorkExecutionObservation,
+    subscription: bool,
+) -> (Journey, ProjectV1, CompanyWorkflowCommandV1) {
+    let (state, mut project, grant) = super::subscription::assigned();
+    if subscription {
+        let command = CompanyWorkflowCommandV1::GrantSubscriptionCall {
+            project_id: project.project_id.clone(),
+            expected_version: project.version,
+            grant,
+        };
+        project = project_command(&state.store, &state.pm, 840, command, 42);
+        let allowance = project.subscription_call.as_ref().unwrap();
+        let command = CompanyWorkflowCommandV1::ClaimSubscriptionCall {
+            project_id: project.project_id.clone(),
+            expected_version: project.version,
+            allowance_id: allowance.allowance_id.clone(),
+            request_id: format!("company-provider-{}", allowance.allowance_id),
+            request_digest: DIGEST.into(),
+        };
+        project = project_command(&state.store, &state.developer, 841, command, 42);
+    }
     let work_id = WorkItemId::parse("build-work").unwrap();
     let assignment = &project.work_items[&work_id].assignments[0];
     let authority = RuntimeAuthoritySnapshotV1 {
@@ -343,7 +367,8 @@ fn correction_fixture(
 
 #[test]
 fn source_review_append_preserves_completed_work_and_replays_after_restart() {
-    let (state, before, _) = correction_fixture(WorkExecutionObservation::Succeeded);
+    let (state, before, _) =
+        correction_fixture_with_subscription(WorkExecutionObservation::Succeeded, true);
     let mut review = work(
         "source-review",
         CompanyRoleV1::Qa,
@@ -472,6 +497,145 @@ fn source_review_append_preserves_completed_work_and_replays_after_restart() {
             .unwrap(),
         assigned
     );
+    let previous = assigned.subscription_call.as_ref().unwrap();
+    let binding = &assigned.work_items[&review.work_item_id].assignments[0];
+    let mut next = previous.grant.clone();
+    next.work_item_id = review.work_item_id.clone();
+    next.assignment_id = binding.assignment_id.clone();
+    next.assignment_version = binding.assignment_version;
+    next.agent_id = binding.agent_id;
+    let handoff = CompanyWorkflowCommandV1::GrantSourceReviewCall {
+        project_id: assigned.project_id.clone(),
+        expected_version: assigned.version,
+        previous_allowance_id: previous.allowance_id.clone(),
+        grant: next,
+    };
+    for variant in 0..4 {
+        let mut bad = handoff.clone();
+        if let CompanyWorkflowCommandV1::GrantSourceReviewCall {
+            previous_allowance_id,
+            grant,
+            ..
+        } = &mut bad
+        {
+            match variant {
+                0 => *previous_allowance_id = "subscription-foreign".into(),
+                1 => grant.agent_id = AgentId(2),
+                2 => grant.max_calls = 2,
+                _ => grant.expires_at_unix_ms = 1,
+            }
+        }
+        assert!(restarted
+            .apply_company_command(&state.pm, Uuid::from_u128(850 + variant), &bad, 64)
+            .is_err());
+        assert_eq!(
+            restarted
+                .company_project(&state.pm.tenant_id, &assigned.project_id)
+                .unwrap()
+                .unwrap(),
+            assigned
+        );
+    }
+    let handed = project_command(&restarted, &state.pm, 860, handoff.clone(), 64);
+    assert_eq!(handed.source_review_previous_call.as_ref(), Some(previous));
+    assert_ne!(
+        handed.subscription_call.as_ref().unwrap().allowance_id,
+        previous.allowance_id
+    );
+    assert_eq!(handed.work_items, assigned.work_items);
+    assert_eq!(handed.work_corrections, assigned.work_corrections);
+    assert!(
+        restarted
+            .apply_company_command(&state.pm, Uuid::from_u128(860), &handoff, 65)
+            .unwrap()
+            .replayed
+    );
+    let reopened = WorkflowStore::open(state._temp.path().join("workflow.sqlite")).unwrap();
+    assert_eq!(
+        reopened
+            .company_project(&state.pm.tenant_id, &assigned.project_id)
+            .unwrap()
+            .unwrap(),
+        handed
+    );
+    let reserve = CompanyWorkflowCommandV1::ReserveCost {
+        project_id: handed.project_id.clone(),
+        expected_version: handed.version,
+        work_item_id: Some(previous.grant.work_item_id.clone()),
+        provider: "codex-cli".into(),
+        amount_micros: 1,
+    };
+    assert!(reopened
+        .apply_company_command(&state.pm, Uuid::from_u128(861), &reserve, 65)
+        .is_err());
+    let mut repeated = handoff;
+    if let CompanyWorkflowCommandV1::GrantSourceReviewCall {
+        expected_version, ..
+    } = &mut repeated
+    {
+        *expected_version = handed.version;
+    }
+    assert!(reopened
+        .apply_company_command(&state.pm, Uuid::from_u128(862), &repeated, 65)
+        .is_err());
+    for index in 0..9_u128 {
+        let CompanyWorkflowResponseV1::CustomerRequest(request) = super::command(
+            &reopened,
+            &state.customer,
+            900 + index,
+            CompanyWorkflowCommandV1::SubmitCustomerRequest {
+                summary_ref: "Another website".into(),
+                desired_outcome: "Landing page".into(),
+                constraints: vec![],
+            },
+            66,
+        ) else {
+            panic!()
+        };
+        let operator = AuthenticatedCompanyPrincipalV1 {
+            principal_id: "operator-test".into(),
+            kind: CompanyPrincipalKindV1::Operator,
+            agent_id: None,
+            ..state.pm.clone()
+        };
+        let request_grant = sentinel_workflow::RequestProviderGrantV1 {
+            schema_version: 1,
+            request_id: request.request_id,
+            expected_version: 1,
+            sales_principal: principal(
+                "tenant-a",
+                "sales-test",
+                CompanyPrincipalKindV1::Agent,
+                CompanyRoleV1::Sales,
+                None,
+                Some(10),
+            ),
+            provider: "codex-cli".into(),
+            model: "model-test".into(),
+            catalog_digest: DIGEST.into(),
+            total_call_limit: 10,
+            concurrent_call_limit: 1,
+            max_duration_ms: 120_000,
+            token_policy:
+                sentinel_workflow::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+            expires_at_unix_ms: 300_000,
+        };
+        // Both current QA and archived developer grants consume the campaign budget.
+        let result = reopened.authorize_request_provider_call(
+            &operator,
+            Uuid::from_u128(920 + index),
+            &request_grant,
+            67,
+        );
+        if index < 8 {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result.unwrap_err().message,
+                "request provider allowance exhausted or already reserved"
+            );
+        }
+    }
 }
 
 #[test]

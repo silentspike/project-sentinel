@@ -4880,6 +4880,7 @@ fn is_internal_company_command(command: &CompanyWorkflowCommandV1) -> bool {
             | CompanyWorkflowCommandV1::RequestWorkCorrection { .. }
             | CompanyWorkflowCommandV1::AppendSourceReview { .. }
             | CompanyWorkflowCommandV1::AssignSourceReview { .. }
+            | CompanyWorkflowCommandV1::GrantSourceReviewCall { .. }
             | CompanyWorkflowCommandV1::ClaimSubscriptionCall { .. }
             | CompanyWorkflowCommandV1::CreateGovernedRework { .. }
             | CompanyWorkflowCommandV1::AdmitCollaboration { .. }
@@ -5344,6 +5345,7 @@ mod tests {
             blockers: Vec::new(),
             approvals: Vec::new(),
             subscription_call: None,
+            source_review_previous_call: None,
             work_corrections: Vec::new(),
             reservations: vec![sentinel_workflow::CostReservationV1 {
                 reservation_id: "reservation-m0".to_owned(),

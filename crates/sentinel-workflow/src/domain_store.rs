@@ -1410,6 +1410,7 @@ fn apply_company_command(
                 approvals: Vec::new(),
                 reservations: Vec::new(),
                 subscription_call: None,
+                source_review_previous_call: None,
                 work_corrections: Vec::new(),
                 rooms: Vec::new(),
                 questions: Vec::new(),
@@ -2626,6 +2627,21 @@ fn mutate_project(
             request_provider::ensure_legacy_grant_allowed(transaction)?;
             subscription::grant(&mut project, principal, operation_id, grant, now_ms)?;
         }
+        CompanyWorkflowCommandV1::GrantSourceReviewCall {
+            previous_allowance_id,
+            grant,
+            ..
+        } => {
+            request_provider::ensure_legacy_grant_allowed(transaction)?;
+            subscription::handoff_to_review(
+                &mut project,
+                principal,
+                operation_id,
+                previous_allowance_id,
+                grant,
+                now_ms,
+            )?;
+        }
         CompanyWorkflowCommandV1::ClaimSubscriptionCall {
             allowance_id,
             request_id,
@@ -2657,9 +2673,12 @@ fn mutate_project(
             }
             validate_identifier(provider)?;
             validate_optional_work(&project, work_item_id.as_ref())?;
-            if project.subscription_call.as_ref().is_some_and(|allowance| {
-                work_item_id.as_ref() == Some(&allowance.grant.work_item_id)
-            }) {
+            if project
+                .subscription_call
+                .iter()
+                .chain(project.source_review_previous_call.iter())
+                .any(|allowance| work_item_id.as_ref() == Some(&allowance.grant.work_item_id))
+            {
                 return Err(invalid(
                     "subscription call cannot use monetary reservations",
                 ));
@@ -5194,6 +5213,11 @@ fn project_target(command: &CompanyWorkflowCommandV1) -> Option<(&ProjectId, u64
             expected_version,
             ..
         }
+        | CompanyWorkflowCommandV1::GrantSourceReviewCall {
+            project_id,
+            expected_version,
+            ..
+        }
         | CompanyWorkflowCommandV1::ClaimSubscriptionCall {
             project_id,
             expected_version,
@@ -5341,7 +5365,8 @@ fn project_event_type(command: &CompanyWorkflowCommandV1) -> Result<&'static str
         CompanyWorkflowCommandV1::ResolveBlocker { .. } => Ok("project_blocker_resolved"),
         CompanyWorkflowCommandV1::RecordApproval { .. } => Ok("project_approval_recorded"),
         CompanyWorkflowCommandV1::ReserveCost { .. } => Ok("project_cost_reserved"),
-        CompanyWorkflowCommandV1::GrantSubscriptionCall { .. } => {
+        CompanyWorkflowCommandV1::GrantSubscriptionCall { .. }
+        | CompanyWorkflowCommandV1::GrantSourceReviewCall { .. } => {
             Ok("project_subscription_call_granted")
         }
         CompanyWorkflowCommandV1::ClaimSubscriptionCall { .. } => {

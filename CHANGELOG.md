@@ -1,5 +1,11 @@
 # Changelog
 
+- Preserve consumed developer subscription authority during a one-time,
+  evidence-gated handoff to assigned source-review QA. Keep both calls in
+  campaign accounting, reject repeated handoffs and monetary double accounting,
+  and require canonical model usage plus adopted completion before mutation
+  (#856).
+
 - Bind appended QA work to the exact installed report-only profile through a
   leadership-owned assignment. Preserve accepted company governance and prior
   work; reject foreign profiles, changed digests and ordinary-command bypasses

@@ -109,6 +109,10 @@ pub(super) fn claim(
         || allowance.allowance_id != allowance_id
         || request_id != format!("company-provider-{allowance_id}")
         || allowance.dispatch.is_some()
+        || project
+            .source_review_previous_call
+            .as_ref()
+            .is_some_and(|previous| previous.allowance_id == allowance.allowance_id)
         || project.work_corrections.iter().any(|record| {
             record
                 .previous_subscription_call
@@ -134,10 +138,80 @@ pub(super) fn claim(
 }
 
 pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
+    if let Some(previous) = &project.source_review_previous_call {
+        validate_allowance(project, previous)?;
+        let current = project.subscription_call.as_ref().ok_or_else(corrupt)?;
+        if !review_handoff_matches(project, previous, &current.grant)
+            || previous.allowance_id == current.allowance_id
+            || previous.created_at_unix_ms > current.created_at_unix_ms
+        {
+            return Err(corrupt());
+        }
+    }
     let Some(allowance) = &project.subscription_call else {
         return Ok(());
     };
     validate_allowance(project, allowance)
+}
+
+fn review_handoff_matches(
+    project: &ProjectV1,
+    previous: &SubscriptionCallAllowanceV1,
+    next: &SubscriptionCallGrantV1,
+) -> bool {
+    let Some(source) = project.work_items.get(&previous.grant.work_item_id) else {
+        return false;
+    };
+    let Some(review) = project.work_items.get(&next.work_item_id) else {
+        return false;
+    };
+    previous.dispatch.is_some()
+        && source.state == CompanyWorkStateV1::Done
+        && matches!(
+            source.spec.required_role,
+            CompanyRoleV1::Developer | CompanyRoleV1::Designer
+        )
+        && previous.grant.agent_id != next.agent_id
+        && review
+            .spec
+            .inputs
+            .iter()
+            .any(|input| input.producer_work_item_id == source.spec.work_item_id)
+        && review.assignments.iter().any(|assignment| {
+            assignment.assignment_id == next.assignment_id
+                && assignment.assignment_version == next.assignment_version
+                && assignment.agent_id == next.agent_id
+                && source_review_profile_allowed(
+                    review,
+                    &assignment.profile,
+                    &assignment.reason_ref,
+                )
+        })
+}
+
+pub(super) fn handoff_to_review(
+    project: &mut ProjectV1,
+    principal: &AuthenticatedCompanyPrincipalV1,
+    operation_id: Uuid,
+    previous_allowance_id: &str,
+    next: &SubscriptionCallGrantV1,
+    now_ms: u64,
+) -> Result<(), WorkflowError> {
+    let previous = project.subscription_call.as_ref().ok_or_else(transition)?;
+    if project.source_review_previous_call.is_some()
+        || previous.allowance_id != previous_allowance_id
+        || !review_handoff_matches(project, previous, next)
+        || stable_domain_id("subscription", &principal.tenant_id, operation_id)?
+            == previous.allowance_id
+    {
+        return Err(invalid("source-review subscription handoff unavailable"));
+    }
+    // Work on a candidate so even a direct failed call cannot clear authority.
+    let mut candidate = project.clone();
+    candidate.source_review_previous_call = candidate.subscription_call.take();
+    grant(&mut candidate, principal, operation_id, next, now_ms)?;
+    *project = candidate;
+    Ok(())
 }
 
 pub(super) fn validate_allowance(

@@ -827,6 +827,9 @@ pub struct ProjectV1 {
     pub reservations: Vec<CostReservationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_call: Option<SubscriptionCallAllowanceV1>,
+    /// Consumed developer authority retained by the one-time source-review handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_review_previous_call: Option<SubscriptionCallAllowanceV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub work_corrections: Vec<WorkCorrectionV1>,
     pub rooms: Vec<ProjectRoomV1>,
@@ -1107,6 +1110,13 @@ pub enum CompanyWorkflowCommandV1 {
     GrantSubscriptionCall {
         project_id: ProjectId,
         expected_version: u64,
+        grant: SubscriptionCallGrantV1,
+    },
+    /// Internal: requires canonical completed-model evidence in the service.
+    GrantSourceReviewCall {
+        project_id: ProjectId,
+        expected_version: u64,
+        previous_allowance_id: String,
         grant: SubscriptionCallGrantV1,
     },
     /// Internal dispatcher command. Public command routes must reject it.
