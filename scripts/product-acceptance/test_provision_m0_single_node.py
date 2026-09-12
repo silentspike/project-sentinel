@@ -195,6 +195,7 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
             "console/dist/assets/app.js",
             "console/dist/assets/app.js.map",
             "console/dist/assets/index.css",
+            "config/workbench-profiles/web-review-v1.toml",
         }.issubset(sources))
 
     def test_complete_fake_root_install_and_receipt(self) -> None:

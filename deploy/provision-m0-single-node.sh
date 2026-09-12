@@ -154,6 +154,7 @@ def artifact_authority() -> dict[str, tuple[str, str]]:
         "/etc/systemd/system/sentinel-health-monitor.timer": ("deploy/systemd/sentinel-health-monitor.timer", "systemd"),
         "/opt/sentinel/config/work-profiles/web-project-v1.toml": ("config/work-profiles/web-project-v1.toml", "config"),
         "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml": ("config/workbench-profiles/web-authoring-v1.toml", "config"),
+        "/opt/sentinel/config/workbench-profiles/web-review-v1.toml": ("config/workbench-profiles/web-review-v1.toml", "config"),
         "/opt/sentinel/config/product-acceptance/m0-contract.toml": ("scripts/product-acceptance/m0-contract.toml", "config"),
         "/opt/sentinel/config/product-acceptance/collaboration-admission-study-v1.json": ("scripts/product-acceptance/collaboration-admission-study-v1.json", "config"),
         "/opt/sentinel/config/product-acceptance/m0-journey-v2.json": ("scripts/product-acceptance/m0-journey-v2.json", "config"),
