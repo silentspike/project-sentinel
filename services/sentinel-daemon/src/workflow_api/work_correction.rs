@@ -3,12 +3,12 @@ use super::model_execution::{ModelExecutionCompletion, ModelExecutionContext};
 use super::*;
 
 #[derive(Deserialize)]
-struct StoredModelResult {
-    version: u32,
-    request_id: String,
-    request_digest: String,
-    usage_event: DomainEvent,
-    model_work: Option<ModelExecutionCompletion>,
+pub(super) struct StoredModelResult {
+    pub(super) version: u32,
+    pub(super) request_id: String,
+    pub(super) request_digest: String,
+    pub(super) usage_event: DomainEvent,
+    pub(super) model_work: Option<ModelExecutionCompletion>,
 }
 
 impl WorkflowApi {
@@ -95,6 +95,16 @@ impl WorkflowApi {
         work_id: &WorkItemId,
         revision: &sentinel_workflow::ExecutionRevisionV1,
     ) -> Result<(), &'static str> {
+        self.validate_model_work_result(principal, project_id, work_id, Some(revision))
+    }
+
+    pub(super) fn validate_model_work_result(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        project_id: &ProjectId,
+        work_id: &WorkItemId,
+        revision: Option<&sentinel_workflow::ExecutionRevisionV1>,
+    ) -> Result<(), &'static str> {
         let tenant = &principal.tenant_id;
         let project = self
             .store
@@ -145,14 +155,22 @@ impl WorkflowApi {
             .work_item(tenant, project_id, work_id)
             .map_err(|_| "execution predecessor unavailable")?
             .ok_or("execution predecessor missing")?;
-        if previous.plan.plan_id != operation
-            || sentinel_workflow::ExecutionRevisionV1::from_completed_work(
+        let revision_matches = if let Some(revision) = revision {
+            sentinel_workflow::ExecutionRevisionV1::from_completed_work(
                 &previous,
                 revision.feedback_digest.clone(),
             )
             .map_err(|_| "execution predecessor invalid")?
-                != *revision
-        {
+                == *revision
+        } else {
+            previous.state == sentinel_workflow::WorkItemState::Done
+                && previous.terminal_execution_evidence.is_some()
+                && previous
+                    .gate_evidence
+                    .as_ref()
+                    .is_some_and(|gate| gate.passed)
+        };
+        if previous.plan.plan_id != operation || !revision_matches {
             return Err("provider result was not adopted as this execution");
         }
         let usage_id = format!("llm_usage_{}", dispatch.request_id);
@@ -237,12 +255,6 @@ impl WorkflowApi {
         if previous.plan.plan_id != operation
             || !previous.plan.authority_matches(&context.authority)
             || !execution_intent_matches_plan(&intent, &previous.plan)
-            || sentinel_workflow::ExecutionRevisionV1::from_completed_work(
-                &previous,
-                revision.feedback_digest.clone(),
-            )
-            .map_err(|_| "execution predecessor invalid")?
-                != *revision
         {
             return Err("provider result was not adopted as this execution");
         }

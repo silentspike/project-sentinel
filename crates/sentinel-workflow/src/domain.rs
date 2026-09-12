@@ -827,6 +827,9 @@ pub struct ProjectV1 {
     pub reservations: Vec<CostReservationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_call: Option<SubscriptionCallAllowanceV1>,
+    /// Consumed developer authority retained by the one-time source-review handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_review_previous_call: Option<SubscriptionCallAllowanceV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub work_corrections: Vec<WorkCorrectionV1>,
     pub rooms: Vec<ProjectRoomV1>,
@@ -988,6 +991,12 @@ pub enum CompanyWorkflowCommandV1 {
         expected_version: u64,
         items: Vec<CompanyWorkItemSpecV1>,
     },
+    /// Internal: the service excludes any existing delivery before appending QA.
+    AppendSourceReview {
+        project_id: ProjectId,
+        expected_version: u64,
+        item: CompanyWorkItemSpecV1,
+    },
     ActivateProject {
         project_id: ProjectId,
         expected_version: u64,
@@ -1001,6 +1010,17 @@ pub enum CompanyWorkflowCommandV1 {
         organization_generation: u64,
         organization_digest: String,
         reason_ref: String,
+    },
+    /// Internal: the service pins the report-only profile before assignment.
+    AssignSourceReview {
+        project_id: ProjectId,
+        expected_version: u64,
+        work_item_id: WorkItemId,
+        agent_id: AgentId,
+        organization_generation: u64,
+        organization_digest: String,
+        reason_ref: String,
+        profile: WorkProfileBindingV1,
     },
     ReassignWork {
         project_id: ProjectId,
@@ -1090,6 +1110,13 @@ pub enum CompanyWorkflowCommandV1 {
     GrantSubscriptionCall {
         project_id: ProjectId,
         expected_version: u64,
+        grant: SubscriptionCallGrantV1,
+    },
+    /// Internal: requires canonical completed-model evidence in the service.
+    GrantSourceReviewCall {
+        project_id: ProjectId,
+        expected_version: u64,
+        previous_allowance_id: String,
         grant: SubscriptionCallGrantV1,
     },
     /// Internal dispatcher command. Public command routes must reject it.

@@ -167,12 +167,25 @@ impl WorkbenchProfile {
             || self.capabilities.is_empty()
             || self.output_artifact_kinds.is_empty()
             || self.environment != safe_environment
-            || self.command_rules.is_empty()
+            || (self.command_rules.is_empty() && self.id != "web-review-v1")
             || self.command_rules.len() > MAX_PROFILE_RULES
-            || self.test_suites.is_empty()
+            || (self.test_suites.is_empty() && self.id != "web-review-v1")
             || self.test_suites.len() > MAX_PROFILE_TEST_SUITES
         {
             bail!("invalid or unsafe workbench profile definition");
+        }
+        if self.id == "web-review-v1"
+            && (!self.command_rules.is_empty()
+                || !self.test_suites.is_empty()
+                || self.capabilities
+                    != BTreeSet::from([
+                        "file.inspect".to_owned(),
+                        "file.write".to_owned(),
+                        "artifact.commit".to_owned(),
+                    ])
+                || self.output_artifact_kinds != BTreeSet::from(["qa_report".to_owned()]))
+        {
+            bail!("source review profile must remain report-only");
         }
         for (index, rule) in self.command_rules.iter().enumerate() {
             rule.validate()
@@ -1713,6 +1726,81 @@ pub fn read_verified_artifact_file(
     Ok(bytes)
 }
 
+#[cfg(any(feature = "llm", test))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerifiedArtifactTextFile {
+    pub path: String,
+    pub sha256: String,
+    pub content: String,
+}
+
+/// Content only, not authority: callers must resolve the producer from the
+/// current workflow first. Never silently truncate a review's source material.
+#[cfg(any(feature = "llm", test))]
+pub(crate) fn read_verified_artifact_text(
+    artifact_roots: &HashMap<AgentId, PathBuf>,
+    source_agent: AgentId,
+    project_id: &str,
+    manifest_digest: &str,
+    artifact_kind: &str,
+    media_type: &str,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<VerifiedArtifactTextFile>> {
+    const MAX_MODEL_SOURCE_BYTES: usize = 64 * 1024;
+    if max_bytes == 0 || max_bytes > MAX_MODEL_SOURCE_BYTES {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    let (_, mut manifest) = open_verified_source_artifact(
+        artifact_roots,
+        source_agent,
+        project_id,
+        manifest_digest,
+        Some(artifact_kind),
+        media_type,
+    )?;
+    let total = manifest
+        .entries
+        .iter()
+        .try_fold(0u64, |total, entry| total.checked_add(entry.size_bytes))
+        .ok_or(WorkbenchStoreError::OutputRejected)?;
+    if total > max_bytes as u64 {
+        return Err(WorkbenchStoreError::OutputRejected.into());
+    }
+    manifest
+        .entries
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    manifest
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let bytes = read_verified_artifact_file(
+                artifact_roots,
+                source_agent,
+                project_id,
+                manifest_digest,
+                artifact_kind,
+                media_type,
+                &entry.path,
+                max_bytes as u64,
+            )?;
+            let content =
+                String::from_utf8(bytes).map_err(|_| WorkbenchStoreError::OutputRejected)?;
+            if content
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+            {
+                return Err(WorkbenchStoreError::OutputRejected.into());
+            }
+            Ok(VerifiedArtifactTextFile {
+                path: entry.path,
+                sha256: entry.sha256,
+                content,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn stage_verified_artifact_inputs(
     artifact_roots: &HashMap<AgentId, PathBuf>,
     source_agent: AgentId,
@@ -1946,7 +2034,7 @@ fn secure_descendant_directories(root: &Path, relative: &Path) -> anyhow::Result
     Ok(current)
 }
 
-fn is_canonical_relative_path(value: &str) -> bool {
+pub(crate) fn is_canonical_relative_path(value: &str) -> bool {
     let path = Path::new(value);
     if value.is_empty() || path.is_absolute() {
         return false;
@@ -2379,7 +2467,40 @@ pub(crate) struct WorkbenchService {
     pub(crate) profile_digest: String,
     pub(crate) qa_profile: WorkbenchProfile,
     pub(crate) qa_profile_digest: String,
+    pub(crate) review_profile: Option<(WorkbenchProfile, String)>,
     pub(crate) receiver: mpsc::Receiver<WorkbenchDispatchCommand>,
+}
+
+impl WorkbenchService {
+    pub(crate) fn profile_for_id(&self, id: &str) -> anyhow::Result<(&WorkbenchProfile, &str)> {
+        select_workbench_profile(
+            id,
+            &self.profile,
+            &self.profile_digest,
+            &self.qa_profile,
+            &self.qa_profile_digest,
+            self.review_profile.as_ref(),
+        )
+    }
+}
+
+fn select_workbench_profile<'a>(
+    id: &str,
+    authoring: &'a WorkbenchProfile,
+    authoring_digest: &'a str,
+    qa: &'a WorkbenchProfile,
+    qa_digest: &'a str,
+    review: Option<&'a (WorkbenchProfile, String)>,
+) -> anyhow::Result<(&'a WorkbenchProfile, &'a str)> {
+    if id == authoring.id {
+        Ok((authoring, authoring_digest))
+    } else if id == qa.id {
+        Ok((qa, qa_digest))
+    } else if let Some((profile, digest)) = review.filter(|(profile, _)| profile.id == id) {
+        Ok((profile, digest))
+    } else {
+        bail!("unknown workbench profile")
+    }
 }
 
 pub(crate) fn install_workbench_service(
@@ -2401,6 +2522,23 @@ pub(crate) fn install_workbench_service(
     if qa_profile.id == profile.id {
         bail!("workbench profile identifiers must be unique");
     }
+    let review_path = config_dir.join("workbench-profiles/web-review-v1.toml");
+    let review_profile = match std::fs::symlink_metadata(&review_path) {
+        Ok(_) => {
+            let review = WorkbenchProfile::load(review_path)?;
+            anyhow::ensure!(
+                review.0.id == "web-review-v1",
+                "invalid source review profile id"
+            );
+            anyhow::ensure!(
+                review.0.id != profile.id && review.0.id != qa_profile.id,
+                "workbench profile identifiers must be unique"
+            );
+            Some(review)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     let store = WorkbenchInvocationStore::open_with_artifact_roots(
         data_dir.join("workbench.redb"),
         artifact_roots,
@@ -2413,6 +2551,7 @@ pub(crate) fn install_workbench_service(
         profile_digest,
         qa_profile,
         qa_profile_digest,
+        review_profile,
         receiver,
     });
     Ok(())
@@ -3360,6 +3499,82 @@ mod tests {
     }
 
     #[test]
+    fn source_review_profile_loads_without_execution_authority() {
+        let bytes = include_bytes!("../../../config/workbench-profiles/web-review-v1.toml");
+        let authority = secure_test_workbench_profile_authority_with_bytes(bytes);
+        let (review, _) = WorkbenchProfile::load(authority.path()).unwrap();
+        assert!(review.command_rules.is_empty());
+        assert!(review.test_suites.is_empty());
+        let authoring_authority = secure_test_workbench_profile_authority();
+        let (authoring, _) = WorkbenchProfile::load(authoring_authority.path()).unwrap();
+        let mut altered = review.clone();
+        altered.command_rules = authoring.command_rules.clone();
+        assert!(altered.validate_definition().is_err());
+        altered = review.clone();
+        altered
+            .capabilities
+            .insert("command.run_allowlisted".into());
+        assert!(altered.validate_definition().is_err());
+        altered = review.clone();
+        altered.output_artifact_kinds.insert("source_tree".into());
+        assert!(altered.validate_definition().is_err());
+        altered = review;
+        altered.id = "foreign-empty-profile".into();
+        assert!(altered.validate_definition().is_err());
+    }
+
+    #[test]
+    fn source_review_dispatch_selects_exact_profile_without_fallback() {
+        let authoring_authority = secure_test_workbench_profile_authority();
+        let (authoring, authoring_digest) =
+            WorkbenchProfile::load(authoring_authority.path()).unwrap();
+        let qa: WorkbenchProfile = toml::from_str(include_str!(
+            "../../../config/workbench-profiles/web-qa-v1.toml"
+        ))
+        .unwrap();
+        let review: WorkbenchProfile = toml::from_str(include_str!(
+            "../../../config/workbench-profiles/web-review-v1.toml"
+        ))
+        .unwrap();
+        let review = (review, "review-digest".to_owned());
+        for (id, digest) in [
+            ("web-authoring-v1", authoring_digest.as_str()),
+            ("web-qa-v1", "qa-digest"),
+            ("web-review-v1", "review-digest"),
+        ] {
+            let selected = select_workbench_profile(
+                id,
+                &authoring,
+                &authoring_digest,
+                &qa,
+                "qa-digest",
+                Some(&review),
+            )
+            .unwrap();
+            assert_eq!(selected.0.id, id);
+            assert_eq!(selected.1, digest);
+        }
+        assert!(select_workbench_profile(
+            "foreign",
+            &authoring,
+            &authoring_digest,
+            &qa,
+            "qa-digest",
+            Some(&review)
+        )
+        .is_err());
+        assert!(select_workbench_profile(
+            "web-review-v1",
+            &authoring,
+            &authoring_digest,
+            &qa,
+            "qa-digest",
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
     fn immutable_profile_binds_runtime_capabilities_and_resource_ceilings() {
         let profile_authority = secure_test_workbench_profile_authority();
         let (profile, digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
@@ -4035,6 +4250,81 @@ mod tests {
     }
 
     #[test]
+    fn model_text_inputs_are_complete_ordered_and_never_decode_lossily() {
+        let directory = tempfile::tempdir().unwrap();
+        let agent = AgentId(6);
+        let root = directory.path().join("agent");
+        let artifacts = root.join("artifacts");
+        let scope = artifacts.join("project-source").join("source-work");
+        fs::create_dir_all(scope.join("blobs")).unwrap();
+        fs::write(root.join(".nano-runtime"), "AGENT-06").unwrap();
+        let roots = HashMap::from([(agent, artifacts)]);
+        for (bytes, valid) in [
+            (b"body {}".as_slice(), true),
+            (&[0xff], false),
+            (b"a\0b", false),
+        ] {
+            let digest = hex_sha256(bytes);
+            let blob = scope.join("blobs").join(&digest);
+            fs::write(&blob, bytes).unwrap();
+            fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+            let entries: Vec<_> = ["z.css", "a.css"]
+                .into_iter()
+                .map(|path| {
+                    serde_json::json!({
+                        "path": path, "blob_id": format!("sha256:{digest}"),
+                        "sha256": digest, "size_bytes": bytes.len(),
+                    })
+                })
+                .collect();
+            let manifest = serde_json::to_vec(&serde_json::json!({
+                "schema_version": WORKBENCH_SCHEMA_VERSION,
+                "invocation_id": "018f3f32-4f01-7f2c-a6c1-f6f4a81b2897",
+                "input_digest": "a".repeat(64), "project_id": "project-source",
+                "work_item_id": "source-work", "workspace_id": "project-source:source-work",
+                "agent_id": agent.0, "artifact_kind": "source_tree", "media_type": "text/css",
+                "runtime_key": WORKBENCH_RUNTIME_BWRAP, "tool_profile": "web-authoring-v1",
+                "tool_profile_digest": "b".repeat(64), "policy_digest": "c".repeat(64), "entries": entries,
+            })).unwrap();
+            let manifest_digest = hex_sha256(&manifest);
+            fs::write(
+                scope.join(format!("{manifest_digest}.manifest.json")),
+                manifest,
+            )
+            .unwrap();
+            let read = |budget| {
+                read_verified_artifact_text(
+                    &roots,
+                    agent,
+                    "project-source",
+                    &manifest_digest,
+                    "source_tree",
+                    "text/css",
+                    budget,
+                )
+            };
+            let result = read(bytes.len() * 2);
+            assert_eq!(result.is_ok(), valid);
+            if valid {
+                let files = result.unwrap();
+                assert_eq!(
+                    files
+                        .iter()
+                        .map(|file| file.path.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["a.css", "z.css"]
+                );
+                assert!(files
+                    .iter()
+                    .all(|file| file.content.as_bytes() == bytes && file.sha256 == digest));
+                assert!(read(bytes.len() * 2 - 1).is_err());
+                assert!(!root.join("inputs").exists());
+                assert!(!root.join("workspace").exists());
+            }
+        }
+    }
+
+    #[test]
     fn artifact_input_staging_accepts_the_bound_design_contract_only() {
         let directory = tempfile::tempdir().unwrap();
         let source_agent = AgentId(3);
@@ -4101,6 +4391,29 @@ mod tests {
             )
         };
         assert_eq!(read("design.md", 1024).unwrap(), blob);
+        let read_text = |limit| {
+            read_verified_artifact_text(
+                &roots,
+                source_agent,
+                "project-m0",
+                &manifest_digest,
+                "design_specification",
+                "text/markdown",
+                limit,
+            )
+        };
+        let text = read_text(1024).unwrap();
+        assert_eq!(
+            text,
+            vec![VerifiedArtifactTextFile {
+                path: "design.md".into(),
+                sha256: blob_digest.clone(),
+                content: String::from_utf8(blob.to_vec()).unwrap(),
+            }]
+        );
+        for limit in [0, blob.len() - 1, 64 * 1024 + 1] {
+            assert!(read_text(limit).is_err());
+        }
         let moved_scope = source_scope.with_file_name("another-work-item");
         fs::rename(&source_scope, &moved_scope).unwrap();
         assert!(read("design.md", 1024).is_err());
@@ -4132,6 +4445,7 @@ mod tests {
         let alias = source_scope.join("blob-alias");
         fs::hard_link(&blob_path, &alias).unwrap();
         assert!(read("design.md", 1024).is_err());
+        assert!(read_text(1024).is_err());
         fs::remove_file(alias).unwrap();
         fs::set_permissions(&blob_path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read("design.md", 1024).is_err());

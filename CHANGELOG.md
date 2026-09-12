@@ -1,5 +1,51 @@
 # Changelog
 
+- Align the canonical single-node provisioner and release preflight with the
+  source-review profile so the validated QA package is installable (#856).
+
+- Provision the independent QA agent's report-write and artifact-commit
+  capabilities required by the confined source-review profile. Retain the
+  profile's command denial and report-only output scope (#856).
+
+- Verify QA reports through the production immutable-artifact reader, require
+  exactly review.json, and reject changed model text, source inventory, project,
+  agent, artifact type, mutable blobs and tampered bytes. Filesystem regressions
+  cover the report path without claiming a live model review (#856).
+
+- Cover source-review predecessor authority through persisted multi-step
+  execution, independent completion evidence, canonical model usage, outbox
+  cleanup and store reopen. Keep failed-execution correction and successful
+  review handoff distinct; test execution ports do not attest a live agent
+  review (#856).
+
+- Preserve consumed developer subscription authority during a one-time,
+  evidence-gated handoff to assigned source-review QA. Keep both calls in
+  campaign accounting, reject repeated handoffs and monetary double accounting,
+  and require canonical model usage plus adopted completion before mutation
+  (#856).
+
+- Bind appended QA work to the exact installed report-only profile through a
+  leadership-owned assignment. Preserve accepted company governance and prior
+  work; reject foreign profiles, changed digests and ordinary-command bypasses
+  before mutation (#856).
+
+- Append an independent source-review work item to the existing completed
+  project without replacing its graph, outputs or provider history. Bind the
+  full developer candidate, enforce leadership and budget authority, preserve
+  dependency-transition evidence, and exclude projects already in delivery
+  through a dedicated authenticated route (#856).
+
+- Add independent, source-bound QA report proposals under a separate command-free
+  review profile. Restrict execution to writing and sealing review.json, reject
+  direct caller-authored QA plans, and require matching model usage, committed
+  report evidence and full candidate coverage before model-enabled delivery
+  can approve technical QA. A source review never attests executed tests (#856).
+
+- Resolve model-work upstream inputs through the existing completed-output
+  authority and immutable artifact reader. Bind bounded UTF-8 source content to
+  the provider context, reject changed or unavailable inputs, and retain legacy
+  no-input request digests. This does not grant QA or release authority (#856).
+
 - Accept finite nonzero canonical subscription usage accounting when authorizing
   same-work corrections, while preserving exact provider, model, assignment,
   receipt and predecessor checks. Do not confuse a call allowance with a
