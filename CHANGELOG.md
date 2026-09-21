@@ -3,7 +3,8 @@
 - Align the real Sales prompt and parser on one strict top-level decision schema.
   Requeue only the exact digest-bound completion that exhausted the former
   parser mismatch, without repeating provider I/O; all other failures remain
-  terminal (#856).
+  terminal. Require live Sales health before dispatch, but let durable result
+  adoption survive a transiently unavailable runtime after restart (#856).
 
 - Add explicit-capability private Workbench observations for restart-safe model
   feedback, including terminal outcome, safe errors and immutable artifact

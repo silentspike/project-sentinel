@@ -1171,17 +1171,7 @@ impl WorkflowApi {
         &self,
         expected: &AuthenticatedCompanyPrincipalV1,
     ) -> Result<(), &'static str> {
-        let bound = self
-            .principals
-            .principal(&expected.principal_id)
-            .filter(|bound| &bound.principal == expected)
-            .ok_or("Sales principal changed")?;
-        if bound.principal.kind != CompanyPrincipalKindV1::Agent
-            || bound.principal.role != CompanyRoleV1::Sales
-        {
-            return Err("Sales role is unavailable");
-        }
-        let agent_id = expected.agent_id.ok_or("Sales agent missing")?;
+        let agent_id = self.validate_sales_principal_identity(expected)?;
         let authority = self.authority.as_ref().ok_or("Sales runtime unavailable")?;
         let health = authority
             .runtime_health
@@ -1198,6 +1188,23 @@ impl WorkflowApi {
             return Err("Sales employee is not healthy and on duty");
         }
         Ok(())
+    }
+
+    fn validate_sales_principal_identity(
+        &self,
+        expected: &AuthenticatedCompanyPrincipalV1,
+    ) -> Result<AgentId, &'static str> {
+        let bound = self
+            .principals
+            .principal(&expected.principal_id)
+            .filter(|bound| &bound.principal == expected)
+            .ok_or("Sales principal changed")?;
+        if bound.principal.kind != CompanyPrincipalKindV1::Agent
+            || bound.principal.role != CompanyRoleV1::Sales
+        {
+            return Err("Sales role is unavailable");
+        }
+        expected.agent_id.ok_or("Sales agent missing")
     }
 
     pub(super) fn prepare_request_sales(
@@ -1274,7 +1281,7 @@ impl WorkflowApi {
         {
             return Err("Sales completion dispatch mismatch");
         }
-        self.validate_sales_principal(&call.grant.sales_principal)?;
+        self.validate_sales_principal_identity(&call.grant.sales_principal)?;
         // This API is internal to durable recovery. Verify the stored payload too,
         // rather than accepting a caller's assertion that a provider answered.
         let stored = self
@@ -1402,13 +1409,7 @@ impl WorkflowApi {
             allowance_id: call.allowance_id.clone(),
             grant: call.grant.clone(),
         };
-        let current_sales = self
-            .principals
-            .principal(&call.grant.sales_principal.principal_id)
-            .ok_or("Sales principal unavailable")?;
-        if current_sales.principal != call.grant.sales_principal {
-            return Err("Sales principal changed");
-        }
+        self.validate_sales_principal_identity(&call.grant.sales_principal)?;
         let expected_context = RequestSalesContext {
             binding,
             source_request: call.source_request.clone(),

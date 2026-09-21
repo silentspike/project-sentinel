@@ -453,6 +453,14 @@ fn corrected_sales_schema_requeues_only_the_exact_failed_completion_without_prov
     assert_eq!(requeued.attempt_count, 0);
     assert!(requeued.last_error.is_none());
     assert!(!api.requeue_request_sales_schema_mismatch().unwrap());
+    api.authority
+        .as_ref()
+        .unwrap()
+        .runtime_health
+        .write()
+        .unwrap()
+        .agents
+        .clear();
     api.accept_request_sales(&completion, &context, id, digest)
         .unwrap();
     assert!(api

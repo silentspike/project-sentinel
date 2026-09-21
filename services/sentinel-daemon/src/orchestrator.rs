@@ -3150,7 +3150,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     #[cfg(feature = "llm")]
     if workflow_api
         .requeue_request_sales_schema_mismatch()
-        .context("recover Sales completion after schema correction")?
+        .map_err(|error| {
+            anyhow::anyhow!("recover Sales completion after schema correction: {error}")
+        })?
     {
         info!("Requeued exact durable Sales completion after schema correction");
     }
