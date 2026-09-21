@@ -385,7 +385,7 @@ fn sales_parser_does_not_accept_answers_approvals_or_legacy_tools() {
             r#"{"schema_version":1,"kind":"propose_offer","scope":"site","deliverables":["source"],"exclusions":["hosting"],"acceptance_criteria":["qa"],"assumptions":["no external media"]}"#
         )
         .unwrap()
-        .decision,
+        .into_action(),
         SalesAction::ProposeOffer { .. }
     ));
 }
