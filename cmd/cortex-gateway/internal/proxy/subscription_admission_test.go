@@ -51,6 +51,82 @@ func salesSubscriptionTestRequest() *LLMRequest {
 	return req
 }
 
+func adaptiveSubscriptionTestRequest() *LLMRequest {
+	req := subscriptionTestRequest()
+	for key, value := range adaptiveRequestMetadata() {
+		if key == "reservation_id" || key == "reserved_provider" || key == "company_execution_context_digest" {
+			continue
+		}
+		req.Metadata[key] = value
+	}
+	req.Metadata["reservation_id"] = "subscription-test"
+	req.Metadata["subscription_allowance_id"] = "subscription-test"
+	req.Metadata["subscription_catalog_digest"] = strings.Repeat("c", 64)
+	req.MaxTokens = 128
+	return req
+}
+
+func TestAdaptiveSubscriptionClaimsExactSubjectBeforeProvider(t *testing.T) {
+	var callbacks atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbacks.Add(1)
+		var request subscriptionDispatch
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		want := customerRequestExecutionSubject{
+			Kind: "adaptive_session", SessionID: "01991c34-e03c-70c2-b97e-0591f4be2311",
+			EffectID: "01991c34-e03c-70c2-b97e-0591f4be2312", SessionVersion: 1,
+		}
+		if request.SchemaVersion != 3 || request.Subject == nil || *request.Subject != want || callbacks.Load() > 1 {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(subscriptionDispatchReceipt{
+			SchemaVersion: 3, AllowanceID: request.AllowanceID, RequestID: request.RequestID,
+			RequestDigest: request.RequestDigest, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli(),
+		})
+	}))
+	defer server.Close()
+	admission, err := NewSubscriptionAdmission("subscription-test", strings.Repeat("c", 64), server.URL, "test-operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &subscriptionTestProvider{}
+	if _, err := admission.send(context.Background(), provider, adaptiveSubscriptionTestRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admission.send(context.Background(), provider, adaptiveSubscriptionTestRequest()); err == nil {
+		t.Fatal("consumed adaptive authority replay admitted another provider call")
+	}
+	if provider.calls.Load() != 1 || callbacks.Load() != 2 {
+		t.Fatalf("provider calls=%d callbacks=%d", provider.calls.Load(), callbacks.Load())
+	}
+}
+
+func TestAdaptiveSubscriptionRejectsChangedIdentityBeforeAuthorityHTTP(t *testing.T) {
+	admission, err := NewSubscriptionAdmission("subscription-test", strings.Repeat("c", 64), "http://127.0.0.1:1", "test-operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*LLMRequest){
+		func(r *LLMRequest) { r.Metadata["adaptive_session_id"] = "01991c34-e03c-70c2-b97e-0591f4be2313" },
+		func(r *LLMRequest) { r.Metadata["adaptive_effect_id"] = "01991c34-e03c-70c2-b97e-0591f4be2313" },
+		func(r *LLMRequest) { r.Metadata["adaptive_session_version"] = "01" },
+		func(r *LLMRequest) { r.Metadata["request_id"] = "company-adaptive-not-a-uuid-not-a-uuid" },
+	} {
+		req := adaptiveSubscriptionTestRequest()
+		mutate(req)
+		if _, err := admission.dispatchRequest(&subscriptionTestProvider{}, req); err == nil {
+			t.Fatal("changed adaptive identity reached durable admission")
+		}
+	}
+}
+
 func TestSalesSubscriptionRequiresMatchingDurableAdmissionBeforeProvider(t *testing.T) {
 	for _, mode := range []string{"approved", "rejected", "legacy-receipt"} {
 		t.Run(mode, func(t *testing.T) {

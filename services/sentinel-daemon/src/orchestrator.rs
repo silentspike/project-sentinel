@@ -746,6 +746,7 @@ fn process_workbench_dispatch(
             break;
         };
         let affected_agent_id = match &command {
+            crate::workbench::WorkbenchDispatchCommand::PrivateObservation { .. } => None,
             crate::workbench::WorkbenchDispatchCommand::Submit { request, .. } => {
                 Some(request.agent_id)
             }
@@ -778,6 +779,23 @@ fn process_workbench_dispatch(
             owner_registry,
         };
         let (result, response) = match command {
+            crate::workbench::WorkbenchDispatchCommand::PrivateObservation {
+                invocation_id,
+                authority,
+                response,
+            } => {
+                let result = workbench_invocation_profile(service, &invocation_id).and_then(
+                    |(profile, digest)| {
+                        crate::workbench::WorkbenchCoordinator::new(&service.store, profile, digest)
+                            .private_observation(&invocation_id, authority.as_ref())
+                    },
+                );
+                if response.send(result).is_err() {
+                    warn!("private workbench observation requester disconnected");
+                }
+                // Readback must not publish events, touch the runtime, or refresh ownership.
+                continue;
+            }
             crate::workbench::WorkbenchDispatchCommand::Submit {
                 request,
                 authority,

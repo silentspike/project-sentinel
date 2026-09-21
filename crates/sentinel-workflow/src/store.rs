@@ -16,7 +16,8 @@ use crate::{
     WorkflowErrorCode, WORKFLOW_SCHEMA_VERSION,
 };
 
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 2;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 3;
+mod adaptive;
 mod revisions;
 pub(crate) use revisions::require_completed_source;
 pub use revisions::ExecutionRevisionV1;
@@ -27,7 +28,7 @@ CREATE TABLE IF NOT EXISTS workflow_schema_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO workflow_schema_meta (singleton, schema_version) VALUES (1, 2);
+INSERT OR IGNORE INTO workflow_schema_meta (singleton, schema_version) VALUES (1, 3);
 CREATE TABLE IF NOT EXISTS workflow_work_items (
     tenant_id TEXT NOT NULL,
     project_id TEXT NOT NULL,
@@ -43,6 +44,17 @@ CREATE TABLE IF NOT EXISTS workflow_operations (
     response BLOB NOT NULL,
     created_at_ms INTEGER NOT NULL,
     PRIMARY KEY (operation_namespace, operation_id)
+);
+CREATE TABLE IF NOT EXISTS workflow_adaptive_heads (
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    agent_id INTEGER NOT NULL,
+    authority_digest TEXT NOT NULL,
+    session_id TEXT NOT NULL UNIQUE,
+    version INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, project_id, work_item_id, agent_id, authority_digest)
 );
 CREATE TABLE IF NOT EXISTS workflow_execution_outbox (
     invocation_id TEXT PRIMARY KEY,
@@ -117,6 +129,21 @@ CREATE TABLE workflow_gate_outbox (
 CREATE INDEX idx_workflow_gate_pending
     ON workflow_gate_outbox(state, updated_at_ms, request_id);
 UPDATE workflow_schema_meta SET schema_version = 2 WHERE singleton = 1;
+"#;
+
+const MIGRATE_V2_TO_V3: &str = r#"
+CREATE TABLE workflow_adaptive_heads (
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    agent_id INTEGER NOT NULL,
+    authority_digest TEXT NOT NULL,
+    session_id TEXT NOT NULL UNIQUE,
+    version INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, project_id, work_item_id, agent_id, authority_digest)
+);
+UPDATE workflow_schema_meta SET schema_version = 3 WHERE singleton = 1;
 "#;
 
 #[derive(Debug)]
@@ -211,6 +238,20 @@ impl WorkflowStore {
                     validate_store_schema(&transaction, 1)?;
                     transaction
                         .execute_batch(MIGRATE_V1_TO_V2)
+                        .map_err(map_sqlite_error)?;
+                    validate_store_schema(&transaction, 2)?;
+                    transaction
+                        .execute_batch(MIGRATE_V2_TO_V3)
+                        .map_err(map_sqlite_error)?;
+                    if fail_after_migration {
+                        return Err(corrupt_store());
+                    }
+                    validate_store_schema(&transaction, WORKFLOW_STORE_SCHEMA_VERSION)?;
+                }
+                2 => {
+                    validate_store_schema(&transaction, 2)?;
+                    transaction
+                        .execute_batch(MIGRATE_V2_TO_V3)
                         .map_err(map_sqlite_error)?;
                     if fail_after_migration {
                         return Err(corrupt_store());
@@ -1971,6 +2012,19 @@ fn validate_store_schema(
             ],
         ),
         (
+            "workflow_adaptive_heads",
+            &[
+                column("tenant_id", "TEXT", true, None, 1),
+                column("project_id", "TEXT", true, None, 2),
+                column("work_item_id", "TEXT", true, None, 3),
+                column("agent_id", "INTEGER", true, None, 4),
+                column("authority_digest", "TEXT", true, None, 5),
+                column("session_id", "TEXT", true, None, 0),
+                column("version", "INTEGER", true, None, 0),
+                column("updated_at_ms", "INTEGER", true, None, 0),
+            ],
+        ),
+        (
             "workflow_execution_outbox",
             &[
                 column("invocation_id", "TEXT", false, None, 1),
@@ -2035,7 +2089,10 @@ fn validate_store_schema(
     let expected_tables = TABLES
         .iter()
         .copied()
-        .filter(|(table, _)| expected_version == 2 || *table != "workflow_gate_outbox")
+        .filter(|(table, _)| {
+            (*table != "workflow_gate_outbox" || expected_version >= 2)
+                && (*table != "workflow_adaptive_heads" || expected_version >= 3)
+        })
         .collect::<Vec<_>>();
     let actual_tables = connection
         .prepare(
@@ -2137,6 +2194,30 @@ fn validate_store_schema(
     ] {
         validate_index(connection, table, None, columns, true, origin)?;
     }
+    if expected_version >= 3 {
+        validate_index(
+            connection,
+            "workflow_adaptive_heads",
+            None,
+            &[
+                "tenant_id",
+                "project_id",
+                "work_item_id",
+                "agent_id",
+                "authority_digest",
+            ],
+            true,
+            "pk",
+        )?;
+        validate_index(
+            connection,
+            "workflow_adaptive_heads",
+            None,
+            &["session_id"],
+            true,
+            "u",
+        )?;
+    }
     for (table, name, columns) in [
         (
             "workflow_execution_outbox",
@@ -2151,7 +2232,7 @@ fn validate_store_schema(
     ] {
         validate_index(connection, table, Some(name), columns, false, "c")?;
     }
-    if expected_version == 2 {
+    if expected_version >= 2 {
         validate_index(
             connection,
             "workflow_gate_outbox",
@@ -2187,8 +2268,11 @@ fn validate_store_schema(
     ] {
         validate_index_count(connection, table, expected_count)?;
     }
-    if expected_version == 2 {
+    if expected_version >= 2 {
         validate_index_count(connection, "workflow_gate_outbox", 3)?;
+    }
+    if expected_version >= 3 {
+        validate_index_count(connection, "workflow_adaptive_heads", 2)?;
     }
     Ok(())
 }
@@ -2434,7 +2518,8 @@ mod tests {
         connection.execute_batch(SCHEMA).unwrap();
         connection
             .execute_batch(
-                "DROP INDEX idx_workflow_gate_pending;
+                "DROP TABLE workflow_adaptive_heads;
+                 DROP INDEX idx_workflow_gate_pending;
                  DROP TABLE workflow_gate_outbox;
                  UPDATE workflow_schema_meta SET schema_version=1;",
             )
@@ -2496,5 +2581,23 @@ mod tests {
         assert!(!gate_exists);
         drop(connection);
         WorkflowStore::open(&migration).unwrap();
+        let connection = rusqlite::Connection::open(&migration).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT schema_version FROM workflow_schema_meta",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .unwrap(),
+            super::WORKFLOW_STORE_SCHEMA_VERSION
+        );
+        assert!(connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_adaptive_heads')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
     }
 }

@@ -36,6 +36,16 @@ func salesRequestMetadata() map[string]string {
 	return metadata
 }
 
+func adaptiveRequestMetadata() map[string]string {
+	metadata := modelWorkMetadata()
+	metadata["company_execution_schema"] = "3"
+	metadata["adaptive_session_id"] = "01991c34-e03c-70c2-b97e-0591f4be2311"
+	metadata["adaptive_effect_id"] = "01991c34-e03c-70c2-b97e-0591f4be2312"
+	metadata["adaptive_session_version"] = "1"
+	metadata["request_id"] = "company-adaptive-" + metadata["adaptive_session_id"] + "-" + metadata["adaptive_effect_id"]
+	return metadata
+}
+
 func TestCustomerRequestModelWorkRejectsMixedOrNoncanonicalSubjects(t *testing.T) {
 	mutations := map[string]func(map[string]string){
 		"missing_schema":       func(m map[string]string) { delete(m, "company_execution_schema") },
@@ -93,6 +103,34 @@ func TestModelWorkRequestRequiresAuthenticatedClassAndCompleteBinding(t *testing
 		if _, err := classifyModelWorkRequest(&req, "company-provider-reservation-test"); err == nil {
 			t.Fatal("invalid model work request admitted")
 		}
+	}
+}
+
+func TestAdaptiveModelWorkRequiresCanonicalRequestBoundSessionAndEffect(t *testing.T) {
+	valid := adaptiveRequestMetadata()
+	req := LLMRequest{RequestClass: RequestClassAgentRuntime, MaxTokens: 1024, Metadata: valid}
+	if admitted, err := classifyModelWorkRequest(&req, valid["request_id"]); err != nil || !admitted {
+		t.Fatalf("valid adaptive request rejected: %v", err)
+	}
+	mutations := map[string]func(map[string]string){
+		"missing_session":  func(m map[string]string) { delete(m, "adaptive_session_id") },
+		"missing_effect":   func(m map[string]string) { delete(m, "adaptive_effect_id") },
+		"session_mismatch": func(m map[string]string) { m["adaptive_session_id"] = "01991c34-e03c-70c2-b97e-0591f4be2313" },
+		"effect_mismatch":  func(m map[string]string) { m["adaptive_effect_id"] = "01991c34-e03c-70c2-b97e-0591f4be2313" },
+		"bad_request_uuid": func(m map[string]string) {
+			m["request_id"] = "company-adaptive-01991c34-e03c-70c2-b97e-0591f4be2311-01991c34-e03c-00c2-b97e-0591f4be2312"
+		},
+		"sales_subject": func(m map[string]string) { m["customer_request_id"] = "request-test" },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			metadata := adaptiveRequestMetadata()
+			mutate(metadata)
+			request := LLMRequest{RequestClass: RequestClassAgentRuntime, MaxTokens: 1024, Metadata: metadata}
+			if admitted, err := classifyModelWorkRequest(&request, metadata["request_id"]); err == nil || admitted {
+				t.Fatal("invalid adaptive request admitted")
+			}
+		})
 	}
 }
 

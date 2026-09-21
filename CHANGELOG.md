@@ -1,5 +1,15 @@
 # Changelog
 
+- Add explicit-capability private Workbench observations for restart-safe model
+  feedback, including terminal outcome, safe errors and immutable artifact
+  references. Preserve legacy receipt behavior and public-safe status replay;
+  commit private feedback and its terminal reference in one transaction (#856).
+
+- Add a bounded adaptive execution journal to the existing workflow store.
+  Bind each model and tool effect to stable digests, preserve exact replay and
+  unknown outcomes, and treat confirmed failed-tool output as model feedback
+  without granting completion, provider, or QA authority (#856).
+
 - Allow zero monetary allocation only for bound, report-only source QA. Its
   separate one-call subscription authority remains mandatory; preserve the
   completed developer's budget/history and reject zero-budget authoring (#856).

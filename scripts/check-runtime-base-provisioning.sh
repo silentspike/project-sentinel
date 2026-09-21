@@ -70,9 +70,12 @@ require_once "${MANIFEST}" 'deploy/scripts/init-runtime-base-dirs.sh|/opt/sentin
 require_once "${MANIFEST}" 'deploy/runtime-base.env|/opt/sentinel/share/runtime-base.env|config'
 require_once "${MANIFEST}" 'deploy/apt/sentinel-runtime.pref|/etc/apt/preferences.d/sentinel-runtime|config'
 require_once "${MANIFEST}" 'deploy/vm-config/99-sentinel-bwrap.conf|/etc/sysctl.d/99-sentinel-bwrap.conf|config'
+require_once "${MANIFEST}" 'config/work-profiles/web-project-v1.toml|/opt/sentinel/config/work-profiles/web-project-v1.toml|config'
 require_once "${MANIFEST}" 'config/workbench-profiles/web-authoring-v1.toml|/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml|config'
+require_once "${MANIFEST}" 'config/agents/*.toml'
+require_once "${MANIFEST}" '/opt/sentinel/config/agents/${source##*/}'
 require_once "${RELEASE_MANIFEST}" '"path": "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml"'
-require_once "${RELEASE_MANIFEST}" '"sha256": "e7e704d11a951e97d8246385f99cfa4c0fa835e4de2eec8e1272ce7dfae712a6"'
+require_once "${RELEASE_MANIFEST}" '"sha256": "d2042f1ed9a4136e51caea205aeb3c925c7a843edcc5bd307efce57f81bb0a27"'
 require_once "${WORKBENCH_PROFILE}" 'environment = { HOME = "/workspace", LANG = "C.UTF-8", LC_ALL = "C.UTF-8", PATH = "/usr/bin:/bin" }'
 
 # These are deliberately literal fragments from the remote heredoc.
