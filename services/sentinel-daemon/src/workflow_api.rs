@@ -225,6 +225,16 @@ impl PrincipalAuthenticator {
     fn principal(&self, principal_id: &str) -> Option<BoundPrincipal> {
         self.by_principal_id.get(principal_id).cloned()
     }
+
+    fn agent_for_role(&self, tenant: &TenantId, role: CompanyRoleV1) -> Option<BoundPrincipal> {
+        let mut matching = self.by_principal_id.values().filter(|bound| {
+            bound.principal.tenant_id == *tenant
+                && bound.principal.kind == CompanyPrincipalKindV1::Agent
+                && bound.principal.role == role
+        });
+        let result = matching.next()?.clone();
+        matching.next().is_none().then_some(result)
+    }
 }
 
 fn read_principal_bindings_file(path: &Path) -> Result<Vec<u8>, WorkflowError> {
@@ -297,6 +307,8 @@ struct CompanyAuthority {
     principals: Arc<PrincipalAuthenticator>,
     workbench_profile: WorkbenchProfile,
     workbench_profile_digest: String,
+    qa_profile_digest: String,
+    project_profile_digest: String,
     review_profile: Option<(WorkbenchProfile, String)>,
     qa_profile_capabilities: BTreeSet<String>,
     agent_capabilities: Arc<HashMap<AgentId, BTreeSet<String>>>,
@@ -2876,6 +2888,14 @@ impl WorkflowApi {
         let (qa_profile, qa_profile_digest) =
             WorkbenchProfile::load(config_dir.join("workbench-profiles/web-qa-v1.toml"))
                 .map_err(|_| workflow_unavailable())?;
+        let project_profile_bytes =
+            read_principal_bindings_file(&config_dir.join("work-profiles/web-project-v1.toml"))?;
+        if project_profile_bytes
+            != include_bytes!("../../../config/work-profiles/web-project-v1.toml")
+        {
+            return Err(workflow_unavailable());
+        }
+        let project_profile_digest = hex_sha256(&project_profile_bytes);
         let review_path = config_dir.join("workbench-profiles/web-review-v1.toml");
         let review_profile = match fs::symlink_metadata(&review_path) {
             Ok(_) => {
@@ -2895,6 +2915,8 @@ impl WorkflowApi {
             principals: Arc::clone(&principals),
             workbench_profile: profile,
             workbench_profile_digest: profile_digest,
+            qa_profile_digest: qa_profile_digest.clone(),
+            project_profile_digest,
             review_profile,
             qa_profile_capabilities: qa_profile.capabilities.clone(),
             agent_capabilities: Arc::clone(&agent_capabilities),
@@ -6133,6 +6155,8 @@ mod tests {
             principals,
             workbench_profile: profile,
             workbench_profile_digest: "a".repeat(64),
+            qa_profile_digest: "b".repeat(64),
+            project_profile_digest: "c".repeat(64),
             review_profile: None,
             qa_profile_capabilities: BTreeSet::from([
                 "file.inspect".to_owned(),

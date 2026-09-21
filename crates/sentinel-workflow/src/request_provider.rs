@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AuthenticatedCompanyPrincipalV1, CustomerRequestV1, SubscriptionTokenPolicyV1};
+use crate::{
+    AuthenticatedCompanyPrincipalV1, CustomerRequestV1, ProposalBindingV1, ProposalV1,
+    SubscriptionTokenPolicyV1,
+};
 
 pub fn request_provider_allowance_id(
     tenant: &crate::TenantId,
@@ -54,6 +57,8 @@ pub struct RequestProviderCallV1 {
     /// A possible send consumes authority permanently, including unknown outcomes.
     pub dispatch: Option<RequestProviderDispatchV1>,
     pub question_response: Option<CustomerRequestV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_response: Option<SalesProposalResponseV1>,
     pub model_response_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abandonment_event_id: Option<String>,
@@ -75,4 +80,20 @@ pub struct AdoptSalesQuestionV1 {
     pub request_digest: String,
     pub model_response_digest: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdoptSalesProposalV1 {
+    pub allowance_id: String,
+    pub request_digest: String,
+    pub model_response_digest: String,
+    pub binding: ProposalBindingV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SalesProposalResponseV1 {
+    pub request: CustomerRequestV1,
+    pub proposal: ProposalV1,
 }
