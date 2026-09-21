@@ -47,6 +47,18 @@ func TestCodexCLIReasoningAndPrivateErrorClassification(t *testing.T) {
 	if err.Error() != "codex-cli subprocess failed" {
 		t.Fatalf("private upstream details escaped: %v", err)
 	}
+	classifications := map[string]string{
+		"model_not_found: private model name": "codex-cli model unavailable",
+		"HTTP 403 forbidden: private account": "codex-cli access unavailable",
+		"error sending request: private host": "codex-cli transport unavailable",
+		"invalid request: private prompt":     "codex-cli request rejected",
+	}
+	for diagnostic, expected := range classifications {
+		got := codexCLIProcessError(diagnostic).Error()
+		if !strings.Contains(got, expected) || strings.Contains(got, "private") {
+			t.Fatalf("diagnostic %q classified as %q, want private-safe %q", diagnostic, got, expected)
+		}
+	}
 }
 
 func TestCodexCLIProviderParsesCompletedInference(t *testing.T) {

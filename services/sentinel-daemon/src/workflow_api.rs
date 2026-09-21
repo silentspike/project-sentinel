@@ -4698,6 +4698,18 @@ impl WorkflowApi {
 
 #[cfg(feature = "llm")]
 impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
+    fn is_provider_usage_candidate(&self, agent_id: AgentId) -> Result<bool, &'static str> {
+        if self.request_sales_tenant.is_none() {
+            return Ok(true);
+        }
+        Ok(self.request_sales_call()?.is_some_and(|call| {
+            call.grant.sales_principal.agent_id == Some(agent_id)
+                && call.question_response.is_none()
+                && call.proposal_response.is_none()
+                && call.abandonment_event_id.is_none()
+        }))
+    }
+
     fn model_work_context(
         &self,
         binding: &model_execution::ProviderExecutionAuthority,
