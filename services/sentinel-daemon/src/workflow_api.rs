@@ -31,17 +31,19 @@ use sentinel_workflow::{
     collaboration_policy_reversibility, collaboration_policy_role_name,
     collaboration_policy_separation_requirements, collaboration_policy_task_risk,
     collaboration_policy_team_shape, collaboration_policy_uncertainty, filtered_collaboration_view,
-    is_collaboration_command_v1, sealed_output_bundle_digest, ArtifactExpectationV1,
-    ArtifactInputV1, AuthenticatedCompanyPrincipalV1, CollaborationAdmissionBudgetV1,
-    CollaborationAdmissionFenceV1, CollaborationAdmissionInputV1, CollaborationCandidateV1,
-    CollaborationProgressDispositionV1, CollaborationProgressV1, CollaborationPublicationV1,
-    CommandRuleV1, CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkflowCommandV1,
-    CompanyWorkflowResponseV1, CompletionEvidencePort, DependencyReadiness, ExecutionPlanV1,
-    ExecutionReconcileState, ExecutionResourceBoundsV1, ExecutionStepV1, ExecutionToolV1,
-    GateEvidencePort, GateExpectationV1, OutputExpectationV1, PendingCompletionEvidenceV1,
-    PendingExecutionV1, PrincipalAuthorityV1, ProjectId, ReversibilityV1,
-    RuntimeAuthoritySnapshotV1, SealedArtifactEvidenceV1, SealedOutputEvidenceV1, TenantId,
-    TerminalExecutionEvidence, UnavailableGateEvidencePort, WorkExecutionObservation,
+    is_collaboration_command_v1, sealed_output_bundle_digest, AdaptiveCursorV1, AdaptiveEffectV1,
+    AdaptiveModelObservationV1, AdaptiveModelPort, AdaptiveSessionGrantV1, AdaptiveSessionV1,
+    AdaptiveToolObservationV1, AdaptiveToolPort, AdaptiveTransitionV1, AdaptiveWorkflowCore,
+    ArtifactExpectationV1, ArtifactInputV1, AuthenticatedCompanyPrincipalV1,
+    CollaborationAdmissionBudgetV1, CollaborationAdmissionFenceV1, CollaborationAdmissionInputV1,
+    CollaborationCandidateV1, CollaborationProgressDispositionV1, CollaborationProgressV1,
+    CollaborationPublicationV1, CommandRuleV1, CompanyPrincipalKindV1, CompanyRoleV1,
+    CompanyWorkflowCommandV1, CompanyWorkflowResponseV1, CompletionEvidencePort,
+    DependencyReadiness, ExecutionPlanV1, ExecutionReconcileState, ExecutionResourceBoundsV1,
+    ExecutionStepV1, ExecutionToolV1, GateEvidencePort, GateExpectationV1, OutputExpectationV1,
+    PendingCompletionEvidenceV1, PendingExecutionV1, PrincipalAuthorityV1, ProjectId,
+    ReversibilityV1, RuntimeAuthoritySnapshotV1, SealedArtifactEvidenceV1, SealedOutputEvidenceV1,
+    TenantId, TerminalExecutionEvidence, UnavailableGateEvidencePort, WorkExecutionObservation,
     WorkExecutionPort, WorkItemId, WorkflowCore, WorkflowError, WorkflowErrorCode,
     WorkflowPortError, WorkflowStore, COLLABORATION_ADMISSION_SCHEMA_VERSION,
     COLLABORATION_POLICY_MAX_PARTICIPANTS, COLLABORATION_POLICY_MAX_ROUNDS,
@@ -1697,6 +1699,19 @@ struct WorkbenchExecutionAdapter {
     authority: Arc<CompanyAuthority>,
 }
 
+#[derive(Clone, Copy)]
+struct UnavailableAdaptiveModel;
+
+impl AdaptiveModelPort for UnavailableAdaptiveModel {
+    fn reconcile_model(
+        &self,
+        _session: &AdaptiveSessionV1,
+        _effect: &AdaptiveEffectV1,
+    ) -> Result<AdaptiveModelObservationV1, WorkflowPortError> {
+        Err(WorkflowPortError::Unavailable)
+    }
+}
+
 impl WorkbenchExecutionAdapter {
     fn build_request(
         &self,
@@ -1817,6 +1832,182 @@ impl WorkbenchExecutionAdapter {
             .last()
             .filter(|record| record.state == WorkbenchInvocationState::Succeeded)
             .ok_or(WorkflowPortError::Rejected)
+    }
+
+    fn private_observation(
+        &self,
+        invocation_id: Uuid,
+    ) -> Result<sentinel_common::WorkbenchPrivateObservation, WorkflowPortError> {
+        let authority: Arc<dyn WorkbenchAuthoritySource> = self.authority.clone();
+        let (response, receiver) = mpsc::sync_channel(1);
+        dispatch_workbench(WorkbenchDispatchCommand::PrivateObservation {
+            invocation_id: invocation_id.to_string(),
+            authority,
+            response,
+        })
+        .map_err(|_| WorkflowPortError::Unavailable)?;
+        match receiver.recv_timeout(DISPATCH_RESPONSE_TIMEOUT) {
+            Ok(Ok(Some(observation))) => Ok(observation),
+            Ok(Ok(None)) => Err(WorkflowPortError::Rejected),
+            Ok(Err(error)) => Err(map_workbench_dispatch_error(error)),
+            Err(_) => Err(WorkflowPortError::Unavailable),
+        }
+    }
+
+    fn build_adaptive_request(
+        &self,
+        session: &AdaptiveSessionV1,
+        effect: &AdaptiveEffectV1,
+        tool: &WorkbenchTool,
+    ) -> Result<WorkbenchRequest, WorkflowPortError> {
+        let authority = self.authority.snapshot(
+            &session.grant.authority.tenant_id,
+            &session.grant.authority.project_id,
+            &session.grant.authority.work_item_id,
+            session.grant.authority.agent_id,
+        )?;
+        if authority != session.grant.authority {
+            return Err(WorkflowPortError::AuthorityConflict);
+        }
+        let caller = self
+            .authority
+            .principals
+            .principal(&authority.principal.principal_id)
+            .filter(|caller| caller.execution_authority == authority.principal)
+            .ok_or(WorkflowPortError::AuthorityConflict)?;
+        let (profile, _) = self.authority.profile_for_role(caller.principal.role)?;
+        let command_policy = tool.command().map_or_else(Vec::new, |(program, args)| {
+            profile
+                .command_rules
+                .iter()
+                .find(|rule| rule.allows(program, args))
+                .cloned()
+                .into_iter()
+                .collect()
+        });
+        if tool.command().is_some() && command_policy.is_empty() {
+            return Err(WorkflowPortError::Rejected);
+        }
+        let output_artifact_kinds = match tool {
+            WorkbenchTool::PackageArtifact { artifact_kind, .. } => {
+                BTreeSet::from([artifact_kind.clone()])
+            }
+            _ => BTreeSet::new(),
+        };
+        let mut request = WorkbenchRequest {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: effect.id.to_string(),
+            agent_id: authority.agent_id,
+            project_id: authority.project_id.0.clone(),
+            work_item_id: authority.work_item_id.0.clone(),
+            workspace_id: format!("{}:{}", authority.project_id, authority.work_item_id),
+            caller_id: authority.principal.principal_id.clone(),
+            caller_role: collaboration_policy_role_name(caller.principal.role).to_owned(),
+            assignment_version: authority.assignment_version,
+            credential_generation: authority.principal.principal_generation,
+            policy_digest: authority.policy_digest.clone(),
+            tool_profile: authority.profile_id.clone(),
+            tool_profile_digest: authority.profile_digest.clone(),
+            runtime_key: authority.runtime_key.clone(),
+            capabilities: BTreeSet::from([
+                tool.required_capability().to_owned(),
+                sentinel_common::WORKBENCH_RETAIN_OBSERVATION.to_owned(),
+            ]),
+            output_artifact_kinds,
+            inputs: Vec::new(),
+            command_policy,
+            resource_limits: profile.resource_ceilings.clone(),
+            deadline_unix_ms: session.grant.deadline_ms,
+            attempt: 1,
+            tool: tool.clone(),
+            input_digest: String::new(),
+        };
+        request.input_digest = request
+            .canonical_digest()
+            .map_err(|_| WorkflowPortError::Rejected)?;
+        request
+            .validate_for_replay()
+            .map_err(|_| WorkflowPortError::Rejected)?;
+        Ok(request)
+    }
+
+    fn adaptive_tool_effect(
+        &self,
+        session: &AdaptiveSessionV1,
+        tool: &WorkbenchTool,
+    ) -> Result<AdaptiveEffectV1, WorkflowPortError> {
+        let id = stable_operation_id(
+            "sentinel.workflow.adaptive-tool-effect.v1",
+            &format!("{}:{}", session.grant.session_id, session.version),
+            u64::from(session.tool_calls).saturating_add(1),
+        );
+        let provisional = AdaptiveEffectV1 {
+            id,
+            request_digest: "0".repeat(64),
+        };
+        let request = self.build_adaptive_request(session, &provisional, tool)?;
+        Ok(AdaptiveEffectV1 {
+            id,
+            request_digest: request.input_digest,
+        })
+    }
+}
+
+impl AdaptiveToolPort for WorkbenchExecutionAdapter {
+    fn reconcile_tool(
+        &self,
+        session: &AdaptiveSessionV1,
+        effect: &AdaptiveEffectV1,
+        tool: &WorkbenchTool,
+        tool_digest: &str,
+    ) -> Result<AdaptiveToolObservationV1, WorkflowPortError> {
+        if sentinel_workflow::adaptive_tool_digest(tool).as_deref() != Ok(tool_digest) {
+            return Err(WorkflowPortError::Rejected);
+        }
+        let request = self.build_adaptive_request(session, effect, tool)?;
+        if request.input_digest != effect.request_digest {
+            return Err(WorkflowPortError::AuthorityConflict);
+        }
+        let authority: Arc<dyn WorkbenchAuthoritySource> = self.authority.clone();
+        let update = match session.cursor {
+            sentinel_workflow::AdaptiveCursorV1::ToolPending { .. } => {
+                self.exchange(|response| WorkbenchDispatchCommand::Submit {
+                    request: Box::new(request),
+                    authority,
+                    response,
+                })?
+            }
+            sentinel_workflow::AdaptiveCursorV1::ToolUnknown { .. } => {
+                self.exchange(|response| WorkbenchDispatchCommand::Recover {
+                    invocation_id: effect.id.to_string(),
+                    authority,
+                    response,
+                })?
+            }
+            _ => return Err(WorkflowPortError::Rejected),
+        };
+        let record = update
+            .records
+            .last()
+            .ok_or(WorkflowPortError::UnknownOutcome)?;
+        if record.invocation_id != effect.id.to_string()
+            || record.request_digest != effect.request_digest
+        {
+            return Err(WorkflowPortError::AuthorityConflict);
+        }
+        if record.state == WorkbenchInvocationState::UnknownOutcome {
+            return Ok(AdaptiveToolObservationV1::UnknownOutcome);
+        }
+        if !record.state.is_terminal() {
+            return Ok(AdaptiveToolObservationV1::Pending);
+        }
+        let observation = self.private_observation(effect.id)?;
+        observation
+            .validate(&effect.id.to_string(), &effect.request_digest)
+            .map_err(|_| WorkflowPortError::Rejected)?;
+        Ok(AdaptiveToolObservationV1::Completed {
+            observation_digest: observation.digest().to_owned(),
+        })
     }
 }
 
@@ -2597,6 +2788,7 @@ pub struct WorkflowApi {
     store: Arc<WorkflowStore>,
     principals: Arc<PrincipalAuthenticator>,
     authority: Option<Arc<CompanyAuthority>>,
+    workbench: Option<Arc<WorkbenchExecutionAdapter>>,
     event_store: Option<sentinel_limbo::EventStore>,
     mutation_fence: RwLock<()>,
     enabled: bool,
@@ -2715,7 +2907,7 @@ impl WorkflowApi {
         });
         let organization: Arc<dyn sentinel_workflow::OrganizationRuntimePort> = authority.clone();
         let execution: Arc<dyn WorkExecutionPort> = workbench.clone();
-        let completion: Arc<dyn CompletionEvidencePort> = workbench;
+        let completion: Arc<dyn CompletionEvidencePort> = workbench.clone();
         let delivery_integration = WorkflowDeliveryIntegration::new(
             Arc::clone(&store),
             Arc::clone(&principals),
@@ -2752,6 +2944,7 @@ impl WorkflowApi {
             store,
             principals,
             authority: Some(authority),
+            workbench: Some(workbench),
             event_store: Some(event_store),
             mutation_fence: RwLock::new(()),
             enabled: true,
@@ -2786,6 +2979,7 @@ impl WorkflowApi {
             store,
             principals: Arc::new(PrincipalAuthenticator::default()),
             authority: None,
+            workbench: None,
             event_store: None,
             mutation_fence: RwLock::new(()),
             enabled: false,
@@ -4490,6 +4684,13 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
             model_execution::ProviderExecutionAuthority::Project(binding) => self
                 .prepare_model_work(binding)
                 .map(|value| value.map(Into::into)),
+            model_execution::ProviderExecutionAuthority::Adaptive(binding) => {
+                self.prepare_adaptive_model(binding).map(|value| {
+                    Some(model_execution::ModelExecutionContext::Adaptive(Box::new(
+                        value,
+                    )))
+                })
+            }
             model_execution::ProviderExecutionAuthority::RequestSales(binding) => {
                 self.prepare_request_sales(binding).map(|value| {
                     Some(model_execution::ModelExecutionContext::RequestSales(
@@ -4516,6 +4717,9 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
                 request_id,
                 request_digest,
             ),
+            model_execution::ModelExecutionContext::Adaptive(context) => {
+                self.accept_adaptive_model(completion, context, request_id, request_digest)
+            }
             model_execution::ModelExecutionContext::RequestSales(context) => {
                 self.accept_request_sales(completion, context, request_id, request_digest)
             }
@@ -4540,21 +4744,35 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
                 model_execution::ProviderExecutionAuthority::RequestSales(Box::new(binding)),
             ));
         }
+        if let Some(binding) = self.adaptive_provider_authority(agent_id)? {
+            return Ok(Some(model_execution::ProviderExecutionAuthority::Adaptive(
+                Box::new(binding),
+            )));
+        }
         self.provider_usage_binding_for_agent(agent_id)
             .map(|binding| {
-                binding.map(|binding| {
-                    crate::llm_bridge::bridge::ProviderUsageAuthority {
-                        tenant_id: binding.tenant_id,
-                        project_id: binding.project_id,
-                        work_item_id: binding.work_item_id,
-                        reservation_id: binding.reservation_id,
-                        assignment_id: binding.assignment_id,
-                        assignment_version: binding.assignment_version,
-                        agent_id: binding.agent_id,
-                        provider: binding.provider,
-                        subscription_grant: binding.subscription_grant,
+                binding.and_then(|binding| {
+                    if binding
+                        .subscription_grant
+                        .as_ref()
+                        .is_some_and(|grant| grant.max_calls > 1)
+                    {
+                        return None;
                     }
-                    .into()
+                    Some(
+                        crate::llm_bridge::bridge::ProviderUsageAuthority {
+                            tenant_id: binding.tenant_id,
+                            project_id: binding.project_id,
+                            work_item_id: binding.work_item_id,
+                            reservation_id: binding.reservation_id,
+                            assignment_id: binding.assignment_id,
+                            assignment_version: binding.assignment_version,
+                            agent_id: binding.agent_id,
+                            provider: binding.provider,
+                            subscription_grant: binding.subscription_grant,
+                        }
+                        .into(),
+                    )
                 })
             })
     }

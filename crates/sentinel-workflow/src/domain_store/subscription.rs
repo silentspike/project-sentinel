@@ -19,7 +19,7 @@ fn validate_grant(
         || grant.agent_id.0 == 0
         || grant.assignment_version == 0
         || grant.provider != "codex-cli"
-        || grant.max_calls != 1
+        || !(1..=crate::ADAPTIVE_SESSION_MAX_CALLS).contains(&grant.max_calls)
         || grant.max_concurrent != 1
         || grant.max_duration_ms != 120_000
         || grant.expires_at_unix_ms <= created_at_ms

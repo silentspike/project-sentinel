@@ -15,6 +15,58 @@ Tool-bearing agent work has one supported path:
 
 There is no host-shell, ECS-only, or less-isolated fallback for an M0 tool request.
 
+### Private observations for model continuation
+
+`observation.retain_private` is an opt-in capability, checked through the same
+agent/role/assignment/project/profile intersection as execution. Existing profiles
+do not grant it implicitly. It authorizes bounded, request-bound tool feedback,
+not additional commands, network access, provider calls, or business completion.
+
+For a retained invocation, agent-runtime writes a version-3 private completion
+receipt before emitting the terminal result. Its safe result remains separate
+from the private observation and both are validated on recovery. The observation
+contains the terminal outcome, validated immutable artifact references, sanitized
+error classification, and bounded transient output. File inspection, failed-command
+diagnostics, and a packaged artifact digest can therefore drive the next model
+round without reading changed state or executing the tool again. Version-1/2
+receipts and ordinary invocations retain their previous output-free replay behavior.
+
+The daemon commits the private observation and its terminal reference in one
+transaction in the existing `workbench.redb`. Public invocation records contain
+only the reference digest; events and normal status replay contain no private
+output. The internal `PrivateObservation` dispatch resolves current authority
+before and after reading and requires the exact profile and retention capability.
+It performs no runtime invocation and publishes no business event. Private output
+is untrusted task data, never evidence of permission or independent QA.
+
+A missing or conflicting observation is an integrity failure, not permission to
+repeat a tool. Backups must retain the entire workbench database and runtime
+receipt roots together with their existing invocation frontier. Legacy rows remain
+version 3; retained rows use version 4. Once retained invocations exist, rollback
+requires a compatible reader or restoration of the complete pre-activation state;
+do not remove private rows or downgrade their version to force compatibility.
+
+This transport is necessary but is not by itself proof of a live autonomous loop.
+Activation still requires the bounded adaptive journal, productive Gateway and
+Workbench adapters, release-profile pinning, and real-model continuation evidence.
+
+The workflow core now owns a bounded adaptive-session journal. A session seals
+the exact employee/runtime authority, provider-authority digest, model/tool call
+ceilings and deadline. Every model or tool effect receives one stable UUID and
+request digest before I/O. Reconciliation may recover that exact effect after a
+restart; an unknown outcome cannot mint another effect. Confirmed tool output,
+including a nonzero command status, safe failure details, and immutable artifact
+references, becomes a digest-bound observation for the next model round and does
+not by itself fail or complete the company work item.
+
+The journal uses the existing workflow SQLite transaction boundary and its
+append-only operation chain. It creates no second business workflow. Current
+organization authority is checked before and after model or Workbench I/O.
+Completion remains a proposal until the normal artifact, independent QA, release
+and customer authorities accept it. The productive adapters use the same Gateway
+subscription claim and Workbench authority paths; source tests do not substitute
+for activation and live acceptance on the reviewed single-node release.
+
 ### Opt-in model work proposals
 
 The first M1 bridge is selected by `SENTINEL_MODEL_WORKBENCH_ENABLED=true`.

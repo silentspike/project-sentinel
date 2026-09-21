@@ -287,3 +287,157 @@ fn sales_parser_does_not_accept_answers_approvals_or_legacy_tools() {
         assert!(serde_json::from_str::<SalesDecision>(content).is_err());
     }
 }
+
+#[test]
+fn adaptive_parser_accepts_one_typed_decision_and_rejects_ambiguous_output() {
+    let tool = parse_adaptive_decision(
+        r#"{"schema_version":1,"decision":{"kind":"tool","tool":{"tool":"inspect_file","path":"src/main.rs","max_bytes":4096}}}"#,
+    )
+    .unwrap();
+    assert!(matches!(tool, AdaptiveModelDecisionV1::Tool { .. }));
+    assert!(matches!(
+        parse_adaptive_decision(&format!(
+            r#"{{"schema_version":1,"decision":{{"kind":"propose_completion","artifact_digest":"{}"}}}}"#,
+            "a".repeat(64)
+        ))
+        .unwrap(),
+        AdaptiveModelDecisionV1::ProposeCompletion { .. }
+    ));
+    assert!(matches!(
+        parse_adaptive_decision(
+            r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"dependency_unavailable"}}"#
+        )
+        .unwrap(),
+        AdaptiveModelDecisionV1::Blocked { .. }
+    ));
+    for invalid in [
+        r#"{"schema_version":2,"decision":{"kind":"blocked","reason_code":"blocked"}}"#,
+        r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"../blocked"}}"#,
+        r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"Dependency.Unavailable"}}"#,
+        r#"{"schema_version":1,"decision":{"kind":"tool","tool":{"tool":"inspect_file","path":"../secret","max_bytes":4096}}}"#,
+        r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"blocked"},"extra":true}"#,
+        r#"{"schema_version":1,"decision":{"kind":"propose_completion","artifact_digest":"ABC"}}"#,
+    ] {
+        assert!(parse_adaptive_decision(invalid).is_err(), "{invalid}");
+    }
+}
+
+#[test]
+fn adaptive_completion_requires_an_observed_successful_artifact() {
+    let digest = "a".repeat(64);
+    let result = sentinel_common::WorkbenchMessage::Result {
+        schema_version: WORKBENCH_SCHEMA_VERSION,
+        invocation_id: "01991c34-e03c-70c2-b97e-0591f4be2501".into(),
+        input_digest: "b".repeat(64),
+        outcome: sentinel_common::WorkbenchOutcome::Succeeded,
+        resources: sentinel_common::WorkbenchResourceUsage::default(),
+        artifacts: vec![WorkbenchArtifactRef {
+            artifact_id: format!("sha256:{digest}"),
+            sha256: digest.clone(),
+            artifact_kind: "source_tree".into(),
+            media_type: "application/vnd.sentinel.source-tree+json".into(),
+            size_bytes: 42,
+            manifest_path: format!("{digest}.manifest.json"),
+        }],
+        output: std::collections::BTreeMap::new(),
+        error: None,
+    };
+    let observation = WorkbenchPrivateObservation::from_result(&result).unwrap();
+    let accepted = AdaptiveModelDecisionV1::ProposeCompletion {
+        artifact_digest: digest,
+    };
+    validate_adaptive_decision_evidence(Some(&observation), &accepted).unwrap();
+    assert!(validate_adaptive_decision_evidence(None, &accepted).is_err());
+    assert!(validate_adaptive_decision_evidence(
+        Some(&observation),
+        &AdaptiveModelDecisionV1::ProposeCompletion {
+            artifact_digest: "c".repeat(64),
+        },
+    )
+    .is_err());
+
+    let failed = sentinel_common::WorkbenchMessage::Result {
+        schema_version: WORKBENCH_SCHEMA_VERSION,
+        invocation_id: "01991c34-e03c-70c2-b97e-0591f4be2501".into(),
+        input_digest: "b".repeat(64),
+        outcome: sentinel_common::WorkbenchOutcome::Failed,
+        resources: sentinel_common::WorkbenchResourceUsage::default(),
+        artifacts: Vec::new(),
+        output: std::collections::BTreeMap::new(),
+        error: Some(sentinel_common::WorkbenchErrorInfo {
+            class: sentinel_common::WorkbenchErrorClass::Tool,
+            code: "package_failed".into(),
+            safe_message: "package failed".into(),
+            retryable: false,
+        }),
+    };
+    let failed = WorkbenchPrivateObservation::from_result(&failed).unwrap();
+    assert!(validate_adaptive_decision_evidence(Some(&failed), &accepted).is_err());
+}
+
+#[test]
+fn adaptive_usage_requires_exact_schema_aggregate_and_cost_classification() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, authority, _) = super::super::model_work::configured_adaptive_test_api(
+        &temp.path().join("company.sqlite"),
+        &temp.path().join("events.sqlite"),
+    );
+    let binding = ProviderExecutionAuthority::Adaptive(Box::new(authority.clone()));
+    let context = api.model_work_context(&binding).unwrap().unwrap();
+    let completion = ModelExecutionCompletion {
+        context,
+        content: r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"dependency_unavailable"}}"#.into(),
+        admissible: true,
+    };
+    let request_id = authority.request_id();
+    let payload = serde_json::json!({
+        "type": "AgentLlmUsage",
+        "agent_id": authority.grant.authority.agent_id,
+        "tenant_id": authority.grant.authority.tenant_id,
+        "project_id": authority.grant.authority.project_id,
+        "work_item_id": authority.grant.authority.work_item_id,
+        "reservation_id": authority.grant.provider_allowance_id,
+        "assignment_id": authority.assignment_id,
+        "assignment_version": authority.grant.authority.assignment_version,
+        "provider": authority.grant.provider,
+        "caller_role": "agent_runtime",
+        "effective_model": authority.grant.model,
+        "requested_model": authority.grant.model,
+        "tier": "mid",
+        "hierarchy_tier": 2,
+        "cost_source": "provider_reported",
+        "input_tokens": 5,
+        "output_tokens": 5,
+        "cache_read": 0,
+        "cache_creation": 0,
+        "cost_usd": 0.0
+    });
+    let event = DomainEvent::new(
+        "agent_llm_usage",
+        &authority.grant.authority.agent_id.to_string(),
+        &payload.to_string(),
+        &request_id,
+        1,
+    )
+    .with_operation_id(&format!("llm_usage_{request_id}"))
+    .with_schema_version(3);
+    completion.validate_usage(&event).unwrap();
+
+    let mut wrong_schema = event.clone();
+    wrong_schema.schema_version = 2;
+    assert!(completion.validate_usage(&wrong_schema).is_err());
+    let mut wrong_aggregate = event.clone();
+    wrong_aggregate.aggregate_id = AgentId(99).to_string();
+    assert!(completion.validate_usage(&wrong_aggregate).is_err());
+    for (field, value) in [
+        ("tier", serde_json::json!("")),
+        ("hierarchy_tier", serde_json::Value::Null),
+        ("cost_source", serde_json::Value::Null),
+    ] {
+        let mut changed = payload.clone();
+        changed[field] = value;
+        let mut invalid = event.clone();
+        invalid.payload = changed.to_string();
+        assert!(completion.validate_usage(&invalid).is_err(), "{field}");
+    }
+}

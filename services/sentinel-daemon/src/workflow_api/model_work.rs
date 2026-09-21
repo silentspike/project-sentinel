@@ -541,7 +541,7 @@ pub(crate) fn test_context() -> ModelWorkContext {
 }
 
 #[cfg(test)]
-pub(crate) use tests::configured_test_api;
+pub(crate) use tests::{configured_adaptive_test_api, configured_test_api};
 
 #[cfg(test)]
 mod tests {
@@ -649,17 +649,37 @@ mod tests {
         api
     }
 
+    pub(crate) fn configured_adaptive_test_api(
+        path: &Path,
+        event_path: &Path,
+    ) -> (
+        WorkflowApi,
+        super::super::model_execution::AdaptiveProviderAuthority,
+        sentinel_limbo::EventStore,
+    ) {
+        let mut api = configured_test_api(path);
+        let binding = assign_test_work_from(&api, Some(8), 0);
+        api.subscription_allowance_id = Some(binding.reservation_id);
+        let event_store = sentinel_limbo::EventStore::open(event_path.to_str().unwrap()).unwrap();
+        api.event_store = Some(event_store.clone());
+        let authority = api
+            .adaptive_provider_authority(AgentId(6))
+            .unwrap()
+            .unwrap();
+        (api, authority, event_store)
+    }
+
     fn assign_test_work(api: &WorkflowApi) -> ProviderUsageAuthority {
         assign_test_work_mode(api, false)
     }
 
     fn assign_test_work_mode(api: &WorkflowApi, subscription: bool) -> ProviderUsageAuthority {
-        assign_test_work_from(api, subscription, 0)
+        assign_test_work_from(api, subscription.then_some(1), 0)
     }
 
     fn assign_test_work_from(
         api: &WorkflowApi,
-        subscription: bool,
+        subscription_calls: Option<u16>,
         mut operation: u128,
     ) -> ProviderUsageAuthority {
         use sentinel_workflow::{CompanyWorkflowResponseV1 as Response, WorkProfileBindingV1};
@@ -804,7 +824,7 @@ mod tests {
         ) else {
             panic!("assignment")
         };
-        if subscription {
+        if let Some(max_calls) = subscription_calls {
             let assignment = &project.work_items[&spec.work_item_id].assignments[0];
             let grant = sentinel_workflow::SubscriptionCallGrantV1 {
                 schema_version: 1,
@@ -815,7 +835,7 @@ mod tests {
                 provider: "codex-cli".into(),
                 model: "gpt-5.4".into(),
                 catalog_digest: "c".repeat(64),
-                max_calls: 1,
+                max_calls,
                 max_concurrent: 1,
                 max_duration_ms: 120_000,
                 token_policy:
@@ -875,8 +895,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("company.sqlite");
         let mut api = configured_test_api(&path);
-        let old = assign_test_work_from(&api, false, 0);
-        let binding = assign_test_work_from(&api, true, 100);
+        let old = assign_test_work_from(&api, None, 0);
+        let binding = assign_test_work_from(&api, Some(1), 100);
         let original = api.store.company_projects().unwrap();
         assert_eq!(original.len(), 2);
         assert!(api.provider_usage_binding_for_agent(AgentId(6)).is_err());
@@ -1037,6 +1057,70 @@ mod tests {
             .unwrap()
             .reservations
             .is_empty());
+    }
+
+    #[test]
+    fn adaptive_dispatch_claim_is_a_permanent_provider_call_tombstone() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events_path = temp.path().join("events.sqlite");
+        let mut api = configured_test_api(&path);
+        let binding = assign_test_work_from(&api, Some(8), 0);
+        api.subscription_allowance_id = Some(binding.reservation_id.clone());
+        api.event_store =
+            Some(sentinel_limbo::EventStore::open(events_path.to_str().unwrap()).unwrap());
+        let authority = api
+            .adaptive_provider_authority(AgentId(6))
+            .unwrap()
+            .unwrap();
+        let context = super::model_execution::ModelExecutionContext::Adaptive(Box::new(
+            api.prepare_adaptive_model(&authority).unwrap(),
+        ));
+        let id = authority.request_id();
+        let digest = "e".repeat(64);
+        let request = serde_json::json!({
+            "schema_version": 3,
+            "allowance_id": authority.grant.provider_allowance_id,
+            "agent_id": 6,
+            "request_id": id,
+            "request_digest": digest,
+            "context_digest": format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&context).unwrap())
+            ),
+            "provider": authority.grant.provider,
+            "model": authority.grant.model,
+            "catalog_digest": authority.grant.catalog_digest,
+            "subject": {
+                "kind": "adaptive_session",
+                "session_id": authority.grant.session_id,
+                "effect_id": authority.effect_id,
+                "session_version": authority.session_version,
+            },
+        });
+        api.event_store
+            .as_ref()
+            .unwrap()
+            .reserve_llm_request(&id, &digest, &AgentId(6).to_string())
+            .unwrap();
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert_eq!(api.subscription_dispatch(&bytes).status, 200);
+        assert_eq!(
+            api.subscription_dispatch(&bytes).status,
+            403,
+            "an exact HTTP replay must not authorize a second provider call"
+        );
+        drop(api);
+
+        let mut api = configured_test_api(&path);
+        api.subscription_allowance_id = Some(binding.reservation_id);
+        api.event_store =
+            Some(sentinel_limbo::EventStore::open(events_path.to_str().unwrap()).unwrap());
+        assert_eq!(
+            api.subscription_dispatch(&bytes).status,
+            403,
+            "the consumed model effect remains a tombstone after restart"
+        );
     }
 
     #[test]
@@ -1321,7 +1405,7 @@ mod tests {
             ..
         } = &mut invalid
         {
-            grant.max_calls = 2;
+            grant.max_calls = 65;
         }
         assert!(api
             .store

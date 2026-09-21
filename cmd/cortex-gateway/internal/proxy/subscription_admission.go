@@ -75,12 +75,15 @@ func (a *SubscriptionAdmission) dispatchRequest(provider Provider, req *LLMReque
 	}
 	m := req.Metadata
 	agentID, err := strconv.ParseUint(m["agent_id"], 10, 64)
-	if err != nil || agentID == 0 || agentID > 65535 || m["subscription_allowance_id"] != a.allowanceID || m["reservation_id"] != a.allowanceID || m["request_id"] != "company-provider-"+a.allowanceID {
+	if err != nil || agentID == 0 || agentID > 65535 || m["subscription_allowance_id"] != a.allowanceID || m["reservation_id"] != a.allowanceID {
 		return subscriptionDispatch{}, errors.New("subscription request identity mismatch")
 	}
 	schemaVersion, subject, err := subscriptionExecutionSubject(req)
 	if err != nil {
 		return subscriptionDispatch{}, err
+	}
+	if (schemaVersion == 3 && !adaptiveRequestIdentity(m["request_id"], m)) || (schemaVersion != 3 && m["request_id"] != "company-provider-"+a.allowanceID) {
+		return subscriptionDispatch{}, errors.New("subscription request identity mismatch")
 	}
 	if m["reserved_provider"] != CodexCLIProviderName || m["subscription_catalog_digest"] != a.catalogDigest || !subscriptionDigest.MatchString(req.AuthorityRequestDigest) || !subscriptionDigest.MatchString(m["company_execution_context_digest"]) || req.Model == "" || req.Model != req.EffectiveModel {
 		return subscriptionDispatch{}, errors.New("subscription request model or digest mismatch")
@@ -103,6 +106,18 @@ func subscriptionExecutionSubject(req *LLMRequest) (int, *customerRequestExecuti
 		}
 		subject, err := customerRequestSubject(req.Metadata)
 		return 2, subject, err
+	case "3":
+		if classified, err := classifyModelWorkRequest(req, req.Metadata["request_id"]); err != nil || !classified {
+			return 0, nil, errors.New("invalid adaptive execution request")
+		}
+		version, err := strconv.ParseUint(req.Metadata["adaptive_session_version"], 10, 64)
+		if err != nil || version == 0 || strconv.FormatUint(version, 10) != req.Metadata["adaptive_session_version"] {
+			return 0, nil, errors.New("invalid adaptive execution version")
+		}
+		return 3, &customerRequestExecutionSubject{
+			Kind: "adaptive_session", SessionID: req.Metadata["adaptive_session_id"],
+			EffectID: req.Metadata["adaptive_effect_id"], SessionVersion: version,
+		}, nil
 	default:
 		return 0, nil, errors.New("unsupported subscription execution schema")
 	}
