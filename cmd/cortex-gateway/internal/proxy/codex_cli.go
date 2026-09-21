@@ -528,8 +528,16 @@ func codexCLIProcessError(diagnostic string) error {
 		return errors.New("codex-cli reasoning configuration unsupported")
 	case strings.Contains(lower, "rate limit"), strings.Contains(lower, "usage limit"), strings.Contains(lower, "limit reached"):
 		return &ProviderError{StatusCode: http.StatusTooManyRequests, Message: "codex-cli usage limit active"}
-	case strings.Contains(lower, "not logged in"), strings.Contains(lower, "login required"), strings.Contains(lower, "authentication"):
+	case strings.Contains(lower, "not logged in"), strings.Contains(lower, "login required"), strings.Contains(lower, "authentication"), strings.Contains(lower, "unauthorized"), strings.Contains(lower, "status 401"):
 		return &ProviderError{StatusCode: http.StatusServiceUnavailable, Message: "codex-cli authentication unavailable"}
+	case strings.Contains(lower, "model_not_found"), strings.Contains(lower, "model not found"), strings.Contains(lower, "unknown model"), strings.Contains(lower, "unsupported model"), strings.Contains(lower, "does not have access to model"), strings.Contains(lower, "model is not available"):
+		return &ProviderError{StatusCode: http.StatusServiceUnavailable, Message: "codex-cli model unavailable"}
+	case strings.Contains(lower, "forbidden"), strings.Contains(lower, "access denied"), strings.Contains(lower, "permission denied"), strings.Contains(lower, "status 403"):
+		return &ProviderError{StatusCode: http.StatusServiceUnavailable, Message: "codex-cli access unavailable"}
+	case strings.Contains(lower, "bad request"), strings.Contains(lower, "invalid request"), strings.Contains(lower, "status 400"):
+		return &ProviderError{StatusCode: http.StatusBadGateway, Message: "codex-cli request rejected"}
+	case strings.Contains(lower, "connection failed"), strings.Contains(lower, "connection error"), strings.Contains(lower, "error sending request"), strings.Contains(lower, "request failed"), strings.Contains(lower, "backend request failed"), strings.Contains(lower, "service unavailable"):
+		return &ProviderError{StatusCode: http.StatusServiceUnavailable, Message: "codex-cli transport unavailable"}
 	default:
 		return errors.New("codex-cli subprocess failed")
 	}

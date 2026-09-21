@@ -55,6 +55,10 @@ pub mod bridge {
     }
 
     pub trait ProviderUsageAuthorityResolver: Send + Sync {
+        fn is_provider_usage_candidate(&self, _agent_id: AgentId) -> Result<bool, &'static str> {
+            Ok(true)
+        }
+
         fn resolve_provider_usage_authority(
             &self,
             agent_id: AgentId,
@@ -1222,6 +1226,17 @@ pub mod bridge {
                     && perception.heard_text.is_empty()
                 {
                     continue;
+                }
+
+                if let Some(resolver) = config.provider_usage_authority.as_ref() {
+                    match resolver.is_provider_usage_candidate(agent_id) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(reason) => {
+                            error!(agent = %agent_id, reason, "Provider usage candidate selection failed closed");
+                            continue;
+                        }
+                    }
                 }
 
                 let usage_authority = match config.provider_usage_authority.as_ref() {

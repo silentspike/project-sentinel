@@ -110,6 +110,20 @@ fn sales_abandonment_requires_exact_persisted_resolution_before_new_authority() 
     );
     let operator = api.principals.principal("operator").unwrap();
     let customer = api.principals.principal("customer").unwrap();
+    assert!(
+        <WorkflowApi as crate::llm_bridge::bridge::ProviderUsageAuthorityResolver>::is_provider_usage_candidate(
+            &api,
+            AgentId(3)
+        )
+        .unwrap()
+    );
+    assert!(
+        !<WorkflowApi as crate::llm_bridge::bridge::ProviderUsageAuthorityResolver>::is_provider_usage_candidate(
+            &api,
+            AgentId(2)
+        )
+        .unwrap()
+    );
     let body =
         serde_json::to_vec(&serde_json::json!({"allowance_id": context.binding.allowance_id}))
             .unwrap();
@@ -130,6 +144,13 @@ fn sales_abandonment_requires_exact_persisted_resolution_before_new_authority() 
     assert!(call.abandonment_event_id.is_some());
     assert!(call.dispatch.is_some());
     assert!(call.question_response.is_none());
+    assert!(
+        !<WorkflowApi as crate::llm_bridge::bridge::ProviderUsageAuthorityResolver>::is_provider_usage_candidate(
+            &api,
+            AgentId(3)
+        )
+        .unwrap()
+    );
     assert!(api.prepare_request_sales(&context.binding).is_err());
     assert_eq!(
         api.store
