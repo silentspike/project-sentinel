@@ -237,6 +237,44 @@ fn question(call: &RequestProviderCallV1) -> AdoptSalesQuestionV1 {
     }
 }
 
+fn proposal(call: &RequestProviderCallV1) -> AdoptSalesProposalV1 {
+    AdoptSalesProposalV1 {
+        allowance_id: call.allowance_id.clone(),
+        request_digest: DIGEST.into(),
+        model_response_digest: "d".repeat(64),
+        binding: ProposalBindingV1 {
+            scope: "Design and implement the requested website".into(),
+            deliverables: vec!["Validated source tree".into()],
+            exclusions: vec!["External hosting".into()],
+            acceptance_criteria: vec!["Independent QA passes".into()],
+            assumptions: vec!["Customer supplies no external media".into()],
+            cost_ceiling_micros: 2_000_000,
+            provider_cost_ceilings_micros: BTreeMap::from([("local-loop".into(), 1_000_000)]),
+            governance: ProposalGovernanceV1 {
+                owner: AgentId(11),
+                participants: vec![ParticipantBindingV1 {
+                    agent_id: AgentId(11),
+                    principal_id: "sales-test".into(),
+                    role: CompanyRoleV1::Sales,
+                    specialties: BTreeSet::from(["scope_analysis".into()]),
+                    reports_to: None,
+                    profile: WorkProfileBindingV1 {
+                        profile_id: "web-project-v1".into(),
+                        generation: 1,
+                        digest: DIGEST.into(),
+                    },
+                }],
+                project_profile: WorkProfileBindingV1 {
+                    profile_id: "web-project-v1".into(),
+                    generation: 1,
+                    digest: DIGEST.into(),
+                },
+            },
+            expires_at_unix_ms: 500_000,
+        },
+    }
+}
+
 #[test]
 fn request_grant_replay_preserves_source_and_never_resets_allowance() {
     let f = fixture();
@@ -494,6 +532,61 @@ fn question_and_receipt_are_atomic_and_replay_survives_new_customer_reply() {
     assert!(reopened
         .claim_request_provider_call(&f.sales, &claim(&call), 400_004)
         .is_err());
+}
+
+#[test]
+fn qualification_proposal_and_receipt_commit_atomically_and_replay_once() {
+    let f = fixture();
+    let grant = grant(&f, 1, 10, 2);
+    let call = f
+        .store
+        .authorize_request_provider_call(&f.operator, Uuid::from_u128(100), &grant, 2)
+        .unwrap();
+    f.store
+        .claim_request_provider_call(&f.sales, &claim(&call), 3)
+        .unwrap();
+    let cursor = f.store.company_event_cursor().unwrap();
+    assert!(f
+        .store
+        .adopt_sales_proposal_inner(&f.sales, &proposal(&call), 4, true)
+        .is_err());
+    assert_eq!(f.store.company_event_cursor().unwrap(), cursor);
+    assert_eq!(
+        f.store
+            .company_customer_request(&f.sales.tenant_id, &grant.request_id)
+            .unwrap(),
+        Some(call.source_request.clone())
+    );
+    assert!(f.store.company_projects().unwrap().is_empty());
+    let reopened = WorkflowStore::open(f.temp.path().join("workflow.sqlite")).unwrap();
+    let response = reopened
+        .adopt_sales_proposal(&f.sales, &proposal(&call), 400_000)
+        .unwrap();
+    assert_eq!(response.request.state, CustomerRequestStateV1::Proposed);
+    assert_eq!(response.request.version, call.source_request.version + 2);
+    assert_eq!(
+        response.request.proposal_ids,
+        vec![response.proposal.proposal_id.clone()]
+    );
+    assert_eq!(response.proposal.created_by, f.sales.principal_id);
+    assert!(reopened.company_projects().unwrap().is_empty());
+    let after = reopened.company_event_cursor().unwrap();
+    assert_eq!(
+        reopened
+            .adopt_sales_proposal(&f.sales, &proposal(&call), 500_001)
+            .unwrap(),
+        response
+    );
+    assert_eq!(reopened.company_event_cursor().unwrap(), after);
+    let mut changed = proposal(&call);
+    changed.binding.scope = "Changed scope".into();
+    assert_eq!(
+        reopened
+            .adopt_sales_proposal(&f.sales, &changed, 500_002)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::IdempotencyConflict
+    );
 }
 
 #[test]
