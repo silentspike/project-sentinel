@@ -806,15 +806,51 @@ impl WorkflowApi {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SalesDecision {
-    schema_version: u16,
-    #[serde(flatten)]
-    decision: SalesAction,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum SalesDecision {
+    AskQuestion {
+        schema_version: u16,
+        content: String,
+    },
+    ProposeOffer {
+        schema_version: u16,
+        scope: String,
+        deliverables: Vec<String>,
+        exclusions: Vec<String>,
+        acceptance_criteria: Vec<String>,
+        assumptions: Vec<String>,
+    },
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+impl SalesDecision {
+    fn schema_version(&self) -> u16 {
+        match self {
+            Self::AskQuestion { schema_version, .. }
+            | Self::ProposeOffer { schema_version, .. } => *schema_version,
+        }
+    }
+
+    fn into_action(self) -> SalesAction {
+        match self {
+            Self::AskQuestion { content, .. } => SalesAction::AskQuestion { content },
+            Self::ProposeOffer {
+                scope,
+                deliverables,
+                exclusions,
+                acceptance_criteria,
+                assumptions,
+                ..
+            } => SalesAction::ProposeOffer {
+                scope,
+                deliverables,
+                exclusions,
+                acceptance_criteria,
+                assumptions,
+            },
+        }
+    }
+}
+
 enum SalesAction {
     AskQuestion {
         content: String,
@@ -1321,12 +1357,12 @@ impl WorkflowApi {
         completion.validate_usage(&usage)?;
         let decision: SalesDecision = serde_json::from_str(&completion.content)
             .map_err(|_| "Sales decision is not strict JSON")?;
-        if decision.schema_version != 1 {
+        if decision.schema_version() != 1 {
             return Err("Sales decision schema unsupported");
         }
         let now_ms = now_unix_ms();
         let response_digest = format!("{:x}", Sha256::digest(completion.content.as_bytes()));
-        match decision.decision {
+        match decision.into_action() {
             SalesAction::AskQuestion { content } => {
                 self.store
                     .adopt_sales_question(
@@ -1422,7 +1458,7 @@ impl WorkflowApi {
         }
         let decision: SalesDecision = serde_json::from_str(&completion.content)
             .map_err(|_| "Sales completion still violates the active schema")?;
-        if decision.schema_version != 1 {
+        if decision.schema_version() != 1 {
             return Err("Sales decision schema unsupported");
         }
         store
