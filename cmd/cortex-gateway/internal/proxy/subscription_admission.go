@@ -75,22 +75,44 @@ func (a *SubscriptionAdmission) dispatchRequest(provider Provider, req *LLMReque
 	}
 	m := req.Metadata
 	agentID, err := strconv.ParseUint(m["agent_id"], 10, 64)
-	if err != nil || agentID == 0 || agentID > 65535 || m["subscription_allowance_id"] != a.allowanceID || m["reservation_id"] != a.allowanceID {
+	if err != nil || !a.validSubscriptionIdentity(m, agentID) {
 		return subscriptionDispatch{}, errors.New("subscription request identity mismatch")
 	}
 	schemaVersion, subject, err := subscriptionExecutionSubject(req)
 	if err != nil {
 		return subscriptionDispatch{}, err
 	}
-	if (schemaVersion == 3 && !adaptiveRequestIdentity(m["request_id"], m)) || (schemaVersion != 3 && m["request_id"] != "company-provider-"+a.allowanceID) {
+	if !a.validSubscriptionRequestID(m, schemaVersion) {
 		return subscriptionDispatch{}, errors.New("subscription request identity mismatch")
 	}
-	if m["reserved_provider"] != CodexCLIProviderName || m["subscription_catalog_digest"] != a.catalogDigest || !subscriptionDigest.MatchString(req.AuthorityRequestDigest) || !subscriptionDigest.MatchString(m["company_execution_context_digest"]) || req.Model == "" || req.Model != req.EffectiveModel {
+	if !a.validSubscriptionModelBinding(req) {
 		return subscriptionDispatch{}, errors.New("subscription request model or digest mismatch")
 	}
 	return subscriptionDispatch{SchemaVersion: schemaVersion, AllowanceID: a.allowanceID, AgentID: agentID, Subject: subject,
 		RequestID: m["request_id"], RequestDigest: req.AuthorityRequestDigest, ContextDigest: m["company_execution_context_digest"],
 		Provider: provider.Name(), Model: req.EffectiveModel, CatalogDigest: a.catalogDigest}, nil
+}
+
+func (a *SubscriptionAdmission) validSubscriptionIdentity(metadata map[string]string, agentID uint64) bool {
+	return agentID > 0 && agentID <= 65535 &&
+		metadata["subscription_allowance_id"] == a.allowanceID &&
+		metadata["reservation_id"] == a.allowanceID
+}
+
+func (a *SubscriptionAdmission) validSubscriptionRequestID(metadata map[string]string, schemaVersion int) bool {
+	if schemaVersion == 3 {
+		return adaptiveRequestIdentity(metadata["request_id"], metadata)
+	}
+	return metadata["request_id"] == "company-provider-"+a.allowanceID
+}
+
+func (a *SubscriptionAdmission) validSubscriptionModelBinding(req *LLMRequest) bool {
+	metadata := req.Metadata
+	return metadata["reserved_provider"] == CodexCLIProviderName &&
+		metadata["subscription_catalog_digest"] == a.catalogDigest &&
+		subscriptionDigest.MatchString(req.AuthorityRequestDigest) &&
+		subscriptionDigest.MatchString(metadata["company_execution_context_digest"]) &&
+		req.Model != "" && req.Model == req.EffectiveModel
 }
 
 func subscriptionExecutionSubject(req *LLMRequest) (int, *customerRequestExecutionSubject, error) {
