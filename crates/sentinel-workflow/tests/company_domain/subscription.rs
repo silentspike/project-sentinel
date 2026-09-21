@@ -90,6 +90,75 @@ fn request_provider_accounting_preserves_legacy_grants_and_unknown_dispatches() 
                     53
                 )
                 .is_err());
+        } else {
+            let project = project_command(
+                &state.store,
+                &state.developer,
+                53,
+                transition(
+                    &state.project_id,
+                    project.version,
+                    "build-work",
+                    2,
+                    1,
+                    CompanyWorkStateV1::Assigned,
+                    CompanyWorkStateV1::InProgress,
+                    Vec::new(),
+                    None,
+                    53,
+                ),
+                53,
+            );
+            let project = project_command(
+                &state.store,
+                &state.developer,
+                54,
+                transition(
+                    &state.project_id,
+                    project.version,
+                    "build-work",
+                    3,
+                    1,
+                    CompanyWorkStateV1::InProgress,
+                    CompanyWorkStateV1::InReview,
+                    output_receipt(),
+                    None,
+                    54,
+                ),
+                54,
+            );
+            let project = project_command(
+                &state.store,
+                &state.qa,
+                55,
+                transition(
+                    &state.project_id,
+                    project.version,
+                    "build-work",
+                    4,
+                    1,
+                    CompanyWorkStateV1::InReview,
+                    CompanyWorkStateV1::Done,
+                    output_receipt(),
+                    Some(QualityGateReceiptBindingV1 {
+                        gate_id: "web-work-item-qa-v1".into(),
+                        generation: 1,
+                        gate_digest: DIGEST.into(),
+                        subject_digest: OTHER_DIGEST.into(),
+                        passed: true,
+                    }),
+                    55,
+                ),
+                55,
+            );
+            assert_eq!(
+                project.work_items[&WorkItemId::parse("build-work").unwrap()].state,
+                CompanyWorkStateV1::Done
+            );
+            state
+                .store
+                .claim_request_provider_call(&sales, &claim, 56)
+                .unwrap();
         }
         let stored = state
             .store

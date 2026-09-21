@@ -217,8 +217,11 @@ fn all_calls(connection: &Connection) -> Result<Vec<RequestProviderCallV1>, Work
         .collect()
 }
 
-// Legacy grants are never reset or inferred successful. They consume total
-// allowance, and a dispatched legacy grant conservatively occupies a slot.
+// Legacy grants are never reset or inferred successful. Every grant consumes
+// total allowance. Only the current dispatched grant can occupy concurrency;
+// archived grants have already crossed a validated handoff/correction, while a
+// current grant releases its slot only after durable work completion. Missing
+// work remains active so corrupted or incomplete state fails closed.
 fn legacy_usage(connection: &Connection) -> Result<(usize, usize), WorkflowError> {
     // Inspect the validated aggregate, not a JSON filter that could hide a
     // corrupted allowance before its row digest is checked.
@@ -256,7 +259,14 @@ fn legacy_usage(connection: &Connection) -> Result<(usize, usize), WorkflowError
         }
         for allowance in allowances.values() {
             total += 1;
-            if allowance.dispatch.is_some() {
+            if project.subscription_call.as_ref().is_some_and(|current| {
+                current.allowance_id == allowance.allowance_id
+                    && current.dispatch.is_some()
+                    && project
+                        .work_items
+                        .get(&current.grant.work_item_id)
+                        .is_none_or(|work| work.state != CompanyWorkStateV1::Done)
+            }) {
                 dispatched += 1;
             }
         }
