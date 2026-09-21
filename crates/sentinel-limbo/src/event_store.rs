@@ -2305,6 +2305,102 @@ impl EventStore {
         Ok((attempts, terminal))
     }
 
+    /// Requeue one exact failed completion after the owning admission parser has
+    /// been corrected. This never repeats provider I/O: the immutable stored
+    /// payload and request digest remain unchanged and normal admission still
+    /// revalidates the complete authority and usage envelope.
+    pub fn requeue_failed_llm_completion(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        expected_error: &str,
+    ) -> anyhow::Result<bool> {
+        let expected_error = expected_error.trim();
+        anyhow::ensure!(
+            !expected_error.is_empty(),
+            "expected error must not be empty"
+        );
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
+        let state: Option<(String, String, String, Option<String>)> = conn
+            .query_row(
+                "SELECT request_digest, owner_scope, status, last_error
+                 FROM llm_completion_outbox WHERE request_id = ?1",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((stored_digest, owner_scope, status, last_error)) = state else {
+            conn.commit()?;
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            stored_digest == request_digest,
+            "LLM completion digest conflict for {request_id}"
+        );
+        if status != "failed" || last_error.as_deref() != Some(expected_error) {
+            conn.commit()?;
+            return Ok(false);
+        }
+
+        let scope = self.llm_completion_scope_from_wire(&owner_scope)?;
+        let aggregate_id = match scope {
+            StateTransferScope::NanoContainer(agent_id) => agent_id,
+            StateTransferScope::World => unreachable!("validated agent scope"),
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut event = DomainEvent::new(
+            "llm_completion_requeued",
+            &aggregate_id,
+            &serde_json::json!({
+                "request_id": request_id,
+                "request_digest": request_digest,
+                "prior_error": expected_error,
+                "recovery": "admission_schema_corrected",
+            })
+            .to_string(),
+            request_id,
+            0,
+        )
+        .with_operation_id(&format!("llm_requeue_{request_id}"));
+        event.timestamp_ms = now_ms;
+        conn.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                event.event_id,
+                event.event_type,
+                event.aggregate_id,
+                event.payload,
+                event.correlation_id,
+                event.causation_id,
+                event.operation_id,
+                event.tick as i64,
+                event.timestamp_ms as i64,
+                event.schema_version,
+                event.compensation_type,
+            ],
+        )?;
+        let changed = conn.execute(
+            "UPDATE llm_completion_outbox
+             SET status = 'ready_for_action', attempt_count = 0, last_error = NULL,
+                 updated_at = ?3
+             WHERE request_id = ?1 AND request_digest = ?2 AND owner_scope = ?4
+               AND status = 'failed' AND last_error = ?5",
+            params![
+                request_id,
+                request_digest,
+                now_ms as i64,
+                owner_scope,
+                expected_error
+            ],
+        )?;
+        anyhow::ensure!(changed == 1, "LLM completion changed during requeue");
+        conn.commit()?;
+        Ok(true)
+    }
+
     /// Claim actions before sending them. A crash after this transition is
     /// intentionally at-most-once/fail-closed: claimed actions are never replayed.
     pub fn claim_llm_completion_actions(
