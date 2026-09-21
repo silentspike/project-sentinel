@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -266,6 +267,32 @@ func TestSubscriptionAdmissionRejectsOtherCallersAndBindingsBeforeHTTP(t *testin
 	}
 	if _, err := admission.dispatchRequest(&mockProvider{name: "local-loop"}, subscriptionTestRequest()); err == nil {
 		t.Fatal("local-loop bypass")
+	}
+}
+
+func TestSubscriptionAdmissionFailureDoesNotTripProviderBreaker(t *testing.T) {
+	admission, err := NewSubscriptionAdmission("subscription-test", strings.Repeat("c", 64), "http://127.0.0.1:1", "test-operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &subscriptionTestProvider{}
+	req := subscriptionTestRequest()
+	req.CallerRole = CallerRolePlatformControlplane
+	_, sendErr := NewSubscriptionQueuedProvider(provider, forwardqueue.NewManager(1), admission).Send(context.Background(), req)
+	if sendErr == nil {
+		t.Fatal("unauthorized pre-dispatch request succeeded")
+	}
+	var admissionErr *ProviderAdmissionError
+	if !errors.As(sendErr, &admissionErr) {
+		t.Fatalf("error type = %T, want ProviderAdmissionError", sendErr)
+	}
+	breaker := NewCircuitBreaker(BreakerConfig{WindowSeconds: 60, MinRequests: 1, FailureRatio: 1, FailureThreshold: 1, OpenSeconds: 10, HalfOpenProbes: 1, Enabled: true})
+	breaker.Record(sendErr)
+	if state := breaker.State(); state != "closed" {
+		t.Fatalf("pre-dispatch rejection changed provider breaker to %s", state)
+	}
+	if provider.calls.Load() != 0 {
+		t.Fatal("provider was called before authority admission")
 	}
 }
 

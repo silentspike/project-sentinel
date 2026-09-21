@@ -29,6 +29,23 @@ type SubscriptionAdmission struct {
 	client        *http.Client
 }
 
+// ProviderAdmissionError reports a failure before provider I/O. Authority,
+// queue, and local dispatch failures must not degrade provider health or trip
+// its circuit breaker.
+type ProviderAdmissionError struct {
+	err error
+}
+
+func (e *ProviderAdmissionError) Error() string { return e.err.Error() }
+func (e *ProviderAdmissionError) Unwrap() error { return e.err }
+
+func providerAdmissionError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &ProviderAdmissionError{err: err}
+}
+
 type subscriptionDispatch struct {
 	SchemaVersion int                              `json:"schema_version"`
 	AllowanceID   string                           `json:"allowance_id"`
@@ -186,18 +203,18 @@ func (a *SubscriptionAdmission) claim(ctx context.Context, claim subscriptionDis
 func (a *SubscriptionAdmission) send(ctx context.Context, provider Provider, req *LLMRequest) (*LLMResponse, error) {
 	claim, err := a.dispatchRequest(provider, req)
 	if err != nil {
-		return nil, err
+		return nil, providerAdmissionError(err)
 	}
 	ctx, cancel := context.WithTimeout(ctx, maxModelWorkDuration)
 	defer cancel()
 	deadline, err := a.claim(ctx, claim)
 	if err != nil {
-		return nil, err
+		return nil, providerAdmissionError(err)
 	}
 	ctx, cancelDispatch := context.WithDeadline(ctx, deadline)
 	defer cancelDispatch()
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("subscription dispatch expired: %w", err)
+		return nil, providerAdmissionError(fmt.Errorf("subscription dispatch expired: %w", err))
 	}
 	if req.ProviderTimeout <= 0 || req.ProviderTimeout > maxModelWorkDuration {
 		req.ProviderTimeout = maxModelWorkDuration

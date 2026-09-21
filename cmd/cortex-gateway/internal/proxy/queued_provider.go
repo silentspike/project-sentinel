@@ -61,19 +61,19 @@ func (p *queuedProvider) Name() string {
 func (p *queuedProvider) Send(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
 	release, err := p.queue.Acquire(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("forward queue wait: %w", err)
+		return nil, providerAdmissionError(fmt.Errorf("forward queue wait: %w", err))
 	}
 	defer release()
 	// A queue grant can race cancellation, or be immediately available for an
 	// already expired caller. Recheck before invoking the actual provider.
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("forward queue dispatch: %w", err)
+		return nil, providerAdmissionError(fmt.Errorf("forward queue dispatch: %w", err))
 	}
 	if p.subscription != nil {
 		return p.subscription.send(ctx, p.wrapped, req)
 	}
 	if req != nil && req.Metadata["subscription_allowance_id"] != "" {
-		return nil, fmt.Errorf("subscription dispatch mode is not configured")
+		return nil, providerAdmissionError(fmt.Errorf("subscription dispatch mode is not configured"))
 	}
 	return p.wrapped.Send(ctx, req)
 }

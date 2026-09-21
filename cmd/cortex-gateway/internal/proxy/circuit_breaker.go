@@ -252,6 +252,10 @@ func isCircuitBreakerFailure(err error) bool {
 	if err == nil {
 		return false
 	}
+	var admissionErr *ProviderAdmissionError
+	if errors.As(err, &admissionErr) {
+		return false
+	}
 
 	// Timeout
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
