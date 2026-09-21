@@ -125,6 +125,7 @@ runtime = "bwrap"
 tools = [
   "file.inspect",
   "file.write",
+  "observation.retain_private",
   "patch.apply",
   "command.run_allowlisted",
   "test.run_profile",

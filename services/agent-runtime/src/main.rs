@@ -399,9 +399,10 @@ fn handle_command(
                     WorkbenchProgressStage::Executing,
                     0,
                 );
-                let mut result = executor.execute(*request, cancellation);
+                let mut result = executor.execute(*request.clone(), cancellation);
                 apply_outer_deadline_outcome(&mut result, &deadline_cancellation);
-                let receipt_persisted = match executor.persist_completion_receipt(&result) {
+                let receipt_persisted = match executor.persist_request_completion(&request, &result)
+                {
                     Ok(()) => {
                         emit(&output_lock, &result);
                         true

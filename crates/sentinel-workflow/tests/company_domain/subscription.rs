@@ -247,10 +247,33 @@ fn subscription_claim_is_durable_once_and_separate_from_money() {
 }
 
 #[test]
+fn subscription_grant_accepts_a_bounded_adaptive_campaign() {
+    let (state, project, mut grant) = assigned();
+    grant.max_calls = 8;
+    let project = project_command(
+        &state.store,
+        &state.pm,
+        43,
+        grant_command(&project, grant.clone()),
+        43,
+    );
+    assert_eq!(
+        project.subscription_call.as_ref().unwrap().grant.max_calls,
+        grant.max_calls
+    );
+    assert!(project
+        .subscription_call
+        .as_ref()
+        .unwrap()
+        .dispatch
+        .is_none());
+}
+
+#[test]
 fn subscription_grant_rejects_wrong_limits_identity_role_and_expiry() {
     let (state, project, grant) = assigned();
     let mutations: [fn(&mut SubscriptionCallGrantV1); 10] = [
-        |g| g.max_calls = 2,
+        |g| g.max_calls = 65,
         |g| g.max_concurrent = 2,
         |g| g.max_duration_ms = 120_001,
         |g| g.provider = "local-loop".into(),

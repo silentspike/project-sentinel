@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -45,17 +46,57 @@ impl Drop for AttestationCleanup {
     }
 }
 
+struct ChildCleanup(Option<Child>);
+
+impl ChildCleanup {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn into_inner(mut self) -> Child {
+        self.0.take().expect("child must remain owned")
+    }
+}
+
+impl Deref for ChildCleanup {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("child must remain owned")
+    }
+}
+
+impl DerefMut for ChildCleanup {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("child must remain owned")
+    }
+}
+
+impl Drop for ChildCleanup {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn next_attestation_nonce() -> String {
+    const COUNTER_BITS: u32 = 26;
+    const COUNTER_MASK: u64 = (1_u64 << COUNTER_BITS) - 1;
+    const PID_LIMIT: u64 = 1_u64 << (48 - COUNTER_BITS);
+
     let counter = ATTESTATION_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let entropy = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
-        ^ (u64::from(std::process::id()) << 16)
-        ^ counter;
+    let pid = u64::from(std::process::id());
+    assert!(pid < PID_LIMIT, "test process ID exceeds nonce allocation");
+    assert!(
+        counter <= COUNTER_MASK,
+        "attestation nonce counter exhausted"
+    );
+    let process_and_counter = (pid << COUNTER_BITS) | counter;
     format!(
         "018f3f32-4f01-4f2c-a6c1-{:012x}",
-        entropy & 0xffff_ffff_ffff
+        process_and_counter & 0xffff_ffff_ffff
     )
 }
 
@@ -68,20 +109,22 @@ fn spawn_attested_runtime(
     let attestation_path =
         PathBuf::from(format!("/tmp/.sentinel-workbench-attestation-{nonce}.json"));
     let mut cleanup = AttestationCleanup(Some(attestation_path.clone()));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-runtime"))
-        .env("SENTINEL_WORKSPACE_ROOT", workspace)
-        .env("SENTINEL_ARTIFACT_ROOT", artifacts)
-        .env("SENTINEL_WORKBENCH_ATTESTATION_NONCE", &nonce)
-        .env("SENTINEL_WORKBENCH_WRAPPER_VERSION", wrapper_version)
-        .env(
-            "SENTINEL_WORKBENCH_LANDLOCK_ABI",
-            TEST_LANDLOCK_ABI.to_string(),
-        )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = ChildCleanup::new(
+        Command::new(env!("CARGO_BIN_EXE_agent-runtime"))
+            .env("SENTINEL_WORKSPACE_ROOT", workspace)
+            .env("SENTINEL_ARTIFACT_ROOT", artifacts)
+            .env("SENTINEL_WORKBENCH_ATTESTATION_NONCE", &nonce)
+            .env("SENTINEL_WORKBENCH_WRAPPER_VERSION", wrapper_version)
+            .env(
+                "SENTINEL_WORKBENCH_LANDLOCK_ABI",
+                TEST_LANDLOCK_ABI.to_string(),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(2);
     let bytes = loop {
         match fs::symlink_metadata(&attestation_path) {
@@ -126,7 +169,21 @@ fn spawn_attested_runtime(
     cleanup.0 = None;
     let input = child.stdin.take().unwrap();
     let output = BufReader::new(child.stdout.take().unwrap());
-    (child, input, output)
+    (child.into_inner(), input, output)
+}
+
+#[test]
+fn startup_attestation_nonces_are_unique_under_parallel_generation() {
+    let handles = (0..32)
+        .map(|_| thread::spawn(next_attestation_nonce))
+        .collect::<Vec<_>>();
+    let nonces = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(nonces.len(), 32);
+    assert!(nonces.iter().all(|nonce| nonce.len() == 36));
 }
 
 fn read_runtime_line(child: &mut Child, output: &mut BufReader<ChildStdout>, line: &mut String) {
@@ -236,6 +293,102 @@ fn prepare_completion_receipt_crash_state(
     let temporary = receipt_directory.join(format!(".{}.deadbeef.tmp", request.invocation_id));
     fs::hard_link(&receipt, &temporary).unwrap();
     (request, receipt, temporary)
+}
+
+#[test]
+fn private_observation_protocol_restart_replays_failed_command_without_executing_it_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let artifacts = directory.path().join("artifacts");
+    let mut request = write_request();
+    request.capabilities = BTreeSet::from([
+        "command.run_allowlisted".into(),
+        sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into(),
+    ]);
+    request.command_policy = vec![sentinel_common::CommandRule {
+        program: "ls".into(),
+        required_arg_prefix: vec!["missing-directory".into()],
+        max_args: 1,
+    }];
+    request.tool = WorkbenchTool::RunCommand {
+        program: "ls".into(),
+        args: vec!["missing-directory".into()],
+    };
+    request.input_digest = request.canonical_digest().unwrap();
+    let (mut child, mut input, mut output) = spawn_attested_runtime(&workspace, &artifacts);
+    writeln!(
+        input,
+        "{}",
+        serde_json::to_string(&WorkbenchCommand::Execute {
+            request: Box::new(request.clone())
+        })
+        .unwrap()
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut original = None;
+    loop {
+        let mut line = String::new();
+        read_runtime_line(&mut child, &mut output, &mut line);
+        match serde_json::from_str::<WorkbenchMessage>(&line).unwrap() {
+            result @ WorkbenchMessage::Result { .. } => original = Some(result),
+            WorkbenchMessage::Progress {
+                stage: sentinel_common::WorkbenchProgressStage::Completed,
+                ..
+            } => break,
+            WorkbenchMessage::Error { error, .. } => {
+                panic!("unexpected protocol failure: {}", error.code)
+            }
+            _ => {}
+        }
+    }
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    let original = original.unwrap();
+    let WorkbenchMessage::Result {
+        outcome,
+        output: feedback,
+        ..
+    } = &original
+    else {
+        unreachable!()
+    };
+    assert_eq!(*outcome, WorkbenchOutcome::Failed);
+    assert!(!feedback.get("stderr").unwrap().is_empty());
+    // A second execution would now succeed, but recovery must retain the first failure.
+    fs::create_dir_all(workspace.join("project-01/work-04/missing-directory")).unwrap();
+    let (mut child, mut input, mut output) = spawn_attested_runtime(&workspace, &artifacts);
+    writeln!(
+        input,
+        "{}",
+        serde_json::to_string(&WorkbenchCommand::Recover {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id,
+            input_digest: request.input_digest
+        })
+        .unwrap()
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut recovered = None;
+    loop {
+        let mut line = String::new();
+        read_runtime_line(&mut child, &mut output, &mut line);
+        match serde_json::from_str::<WorkbenchMessage>(&line).unwrap() {
+            result @ WorkbenchMessage::Result { .. } => recovered = Some(result),
+            WorkbenchMessage::Progress {
+                stage: sentinel_common::WorkbenchProgressStage::Completed,
+                ..
+            } => break,
+            WorkbenchMessage::Error { error, .. } => {
+                panic!("unexpected recovery failure: {}", error.code)
+            }
+            _ => {}
+        }
+    }
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(recovered, Some(original));
 }
 
 #[test]

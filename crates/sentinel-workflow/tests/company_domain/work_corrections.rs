@@ -536,7 +536,7 @@ fn source_review_append_preserves_completed_work_and_replays_after_restart() {
             match variant {
                 0 => *previous_allowance_id = "subscription-foreign".into(),
                 1 => grant.agent_id = AgentId(2),
-                2 => grant.max_calls = 2,
+                2 => grant.max_calls = 65,
                 _ => grant.expires_at_unix_ms = 1,
             }
         }

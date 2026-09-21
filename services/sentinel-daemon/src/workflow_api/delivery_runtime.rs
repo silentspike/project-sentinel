@@ -2126,6 +2126,7 @@ mod tests {
             resources: None,
             result_digest: Some(digest("qa-result").as_str().to_string()),
             command_status: None,
+            observation_digest: None,
             artifacts: Vec::new(),
             error: None,
         };

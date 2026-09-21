@@ -97,6 +97,103 @@ where
             .admit_revision_plan(plan, revision, &authority, now_ms)
     }
 
+    pub fn begin_adaptive_session(
+        &self,
+        grant: &crate::AdaptiveSessionGrantV1,
+        now_ms: u64,
+    ) -> Result<(bool, crate::AdaptiveSessionV1), WorkflowError> {
+        require_ready(
+            self.organization.readiness(),
+            WorkflowErrorCode::OrganizationUnavailable,
+        )?;
+        let current = self
+            .organization
+            .authority_snapshot(
+                &grant.authority.tenant_id,
+                &grant.authority.project_id,
+                &grant.authority.work_item_id,
+                grant.authority.agent_id,
+            )
+            .map_err(map_organization_error)?;
+        self.store.begin_adaptive_session(grant, &current, now_ms)
+    }
+
+    pub fn adaptive_session(
+        &self,
+        session_id: uuid::Uuid,
+        authority: &crate::RuntimeAuthoritySnapshotV1,
+    ) -> Result<Option<crate::AdaptiveSessionV1>, WorkflowError> {
+        require_ready(
+            self.organization.readiness(),
+            WorkflowErrorCode::OrganizationUnavailable,
+        )?;
+        let current = self
+            .organization
+            .authority_snapshot(
+                &authority.tenant_id,
+                &authority.project_id,
+                &authority.work_item_id,
+                authority.agent_id,
+            )
+            .map_err(map_organization_error)?;
+        self.store.adaptive_session(session_id, &current)
+    }
+
+    pub fn adaptive_session_for_authority(
+        &self,
+        authority: &crate::RuntimeAuthoritySnapshotV1,
+    ) -> Result<Option<crate::AdaptiveSessionV1>, WorkflowError> {
+        require_ready(
+            self.organization.readiness(),
+            WorkflowErrorCode::OrganizationUnavailable,
+        )?;
+        let current = self
+            .organization
+            .authority_snapshot(
+                &authority.tenant_id,
+                &authority.project_id,
+                &authority.work_item_id,
+                authority.agent_id,
+            )
+            .map_err(map_organization_error)?;
+        if current != *authority {
+            return Err(authority_conflict());
+        }
+        self.store.adaptive_session_for_authority(&current)
+    }
+
+    pub fn advance_adaptive_session(
+        &self,
+        session_id: uuid::Uuid,
+        expected_version: u64,
+        operation_id: uuid::Uuid,
+        command: &crate::AdaptiveTransitionV1,
+        authority: &crate::RuntimeAuthoritySnapshotV1,
+        now_ms: u64,
+    ) -> Result<(bool, crate::AdaptiveSessionV1), WorkflowError> {
+        require_ready(
+            self.organization.readiness(),
+            WorkflowErrorCode::OrganizationUnavailable,
+        )?;
+        let current = self
+            .organization
+            .authority_snapshot(
+                &authority.tenant_id,
+                &authority.project_id,
+                &authority.work_item_id,
+                authority.agent_id,
+            )
+            .map_err(map_organization_error)?;
+        self.store.advance_adaptive_session(
+            session_id,
+            expected_version,
+            operation_id,
+            command,
+            &current,
+            now_ms,
+        )
+    }
+
     pub fn reconcile_execution(
         &self,
         request: &PendingExecutionV1,
