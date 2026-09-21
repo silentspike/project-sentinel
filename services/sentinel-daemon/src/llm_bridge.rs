@@ -2228,7 +2228,7 @@ pub mod bridge {
             // Fixture response, not live provider evidence. The production bridge,
             // EventStore recovery and workflow adapter perform the actual adoption.
             let response: GatewayResponse = serde_json::from_value(serde_json::json!({
-                "content":r#"{"schema_version":1,"decision":{"kind":"ask_question","content":"Which pages do you need?"}}"#,
+                "content":r#"{"schema_version":1,"kind":"ask_question","content":"Which pages do you need?"}"#,
                 "decision":"forward","request_id":id,"provider":"codex-cli","tokens_used":15,
                 "input_tokens":5,"output_tokens":10,"hierarchy_tier":2,"tier":"mid",
                 "cost_source":"provider_reported","effective_model":"model-test"
