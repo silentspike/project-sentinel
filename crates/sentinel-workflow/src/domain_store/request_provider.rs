@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    AdoptSalesQuestionV1, ClaimRequestProviderCallV1, RequestProviderCallV1,
-    RequestProviderDispatchV1, RequestProviderGrantV1,
+    AdoptSalesProposalV1, AdoptSalesQuestionV1, ClaimRequestProviderCallV1, RequestProviderCallV1,
+    RequestProviderDispatchV1, RequestProviderGrantV1, SalesProposalResponseV1,
 };
 
 const KIND: &str = "request_provider_call";
@@ -44,12 +44,24 @@ fn validate_grant(grant: &RequestProviderGrantV1, now_ms: u64) -> Result<(), Wor
     Ok(())
 }
 
-fn question_operation(call: &RequestProviderCallV1) -> Result<Uuid, WorkflowError> {
-    let digest = canonical_sha256(
-        "sentinel.workflow.sales-question-operation.v1",
-        &call.allowance_id,
-    )?;
+fn sales_operation(
+    call: &RequestProviderCallV1,
+    domain: &'static str,
+) -> Result<Uuid, WorkflowError> {
+    let digest = canonical_sha256(domain, &call.allowance_id)?;
     Uuid::parse_str(&digest[..32]).map_err(|_| corrupt())
+}
+
+fn question_operation(call: &RequestProviderCallV1) -> Result<Uuid, WorkflowError> {
+    sales_operation(call, "sentinel.workflow.sales-question-operation.v1")
+}
+
+fn qualification_operation(call: &RequestProviderCallV1) -> Result<Uuid, WorkflowError> {
+    sales_operation(call, "sentinel.workflow.sales-qualification-operation.v1")
+}
+
+fn proposal_operation(call: &RequestProviderCallV1) -> Result<Uuid, WorkflowError> {
+    sales_operation(call, "sentinel.workflow.sales-proposal-operation.v1")
 }
 
 impl CompanyEntity for RequestProviderCallV1 {
@@ -89,17 +101,18 @@ impl CompanyEntity for RequestProviderCallV1 {
         {
             return Err(corrupt());
         }
-        let expected_version =
-            if self.question_response.is_some() || self.abandonment_event_id.is_some() {
-                3
-            } else if self.dispatch.is_some() {
-                2
-            } else {
-                1
-            };
+        let answered = self.question_response.is_some() || self.proposal_response.is_some();
+        let expected_version = if answered || self.abandonment_event_id.is_some() {
+            3
+        } else if self.dispatch.is_some() {
+            2
+        } else {
+            1
+        };
         if self.version != expected_version
-            || self.question_response.is_some() != self.model_response_digest.is_some()
-            || (self.abandonment_event_id.is_some() && self.question_response.is_some())
+            || answered != self.model_response_digest.is_some()
+            || (self.question_response.is_some() && self.proposal_response.is_some())
+            || (self.abandonment_event_id.is_some() && answered)
         {
             return Err(corrupt());
         }
@@ -118,9 +131,7 @@ impl CompanyEntity for RequestProviderCallV1 {
             {
                 return Err(corrupt());
             }
-        } else if self.question_response.is_some()
-            || self.updated_at_unix_ms != self.created_at_unix_ms
-        {
+        } else if answered || self.updated_at_unix_ms != self.created_at_unix_ms {
             return Err(corrupt());
         }
         if let Some(response) = &self.question_response {
@@ -144,6 +155,44 @@ impl CompanyEntity for RequestProviderCallV1 {
                 recorded_at_unix_ms: self.updated_at_unix_ms,
             });
             if &expected != response {
+                return Err(corrupt());
+            }
+        }
+        if let Some(response) = &self.proposal_response {
+            validate_digest(self.model_response_digest.as_deref().ok_or_else(corrupt)?)?;
+            validate_customer_request(&response.request)?;
+            response
+                .proposal
+                .binding
+                .validate(self.updated_at_unix_ms)?;
+            let mut expected = self.source_request.clone();
+            expected.version = expected.version.checked_add(2).ok_or_else(corrupt)?;
+            expected.updated_at_unix_ms = self.updated_at_unix_ms;
+            expected.state = CustomerRequestStateV1::Proposed;
+            expected
+                .proposal_ids
+                .push(response.proposal.proposal_id.clone());
+            if response.request != expected
+                || response.proposal.schema_version != COMPANY_DOMAIN_SCHEMA_VERSION
+                || response.proposal.tenant_id != self.granted_by.tenant_id
+                || response.proposal.request_id != self.source_request.request_id
+                || response.proposal.generation
+                    != u32::try_from(self.source_request.proposal_ids.len() + 1)
+                        .map_err(|_| corrupt())?
+                || response.proposal.created_by != self.grant.sales_principal.principal_id
+                || response.proposal.created_at_unix_ms != self.updated_at_unix_ms
+                || response.proposal.proposal_id
+                    != stable_domain_id(
+                        "proposal",
+                        &self.granted_by.tenant_id,
+                        proposal_operation(self)?,
+                    )?
+                || response.proposal.proposal_digest
+                    != canonical_sha256(
+                        "sentinel.workflow.proposal-binding.v1",
+                        &response.proposal.binding,
+                    )?
+            {
                 return Err(corrupt());
             }
         }
@@ -229,6 +278,7 @@ pub(super) fn ensure_legacy_dispatch_allowed(connection: &Connection) -> Result<
     if all_calls(connection)?.iter().any(|call| {
         call.dispatch.is_some()
             && call.question_response.is_none()
+            && call.proposal_response.is_none()
             && call.abandonment_event_id.is_none()
     }) {
         return Err(invalid("request provider call occupies dispatch capacity"));
@@ -371,6 +421,7 @@ impl WorkflowStore {
             updated_at_unix_ms: now_ms,
             dispatch: None,
             question_response: None,
+            proposal_response: None,
             model_response_digest: None,
             abandonment_event_id: None,
         };
@@ -420,6 +471,7 @@ impl WorkflowStore {
             .filter(|call| {
                 call.dispatch.is_some()
                     && call.question_response.is_none()
+                    && call.proposal_response.is_none()
                     && call.abandonment_event_id.is_none()
             })
             .count()
@@ -465,6 +517,7 @@ impl WorkflowStore {
                 .ok_or_else(not_found)?;
         if call.granted_by != *principal
             || call.question_response.is_some()
+            || call.proposal_response.is_some()
             || call
                 .dispatch
                 .as_ref()
@@ -572,6 +625,105 @@ impl WorkflowStore {
             &call,
             principal,
             "request_provider_question_adopted",
+        )?;
+        transaction.commit()?;
+        Ok(response)
+    }
+
+    /// The model supplies business terms, while the daemon supplies the
+    /// immutable governance and budget binding. Qualification, proposal and
+    /// the permanent provider result receipt commit in one SQLite transaction.
+    pub fn adopt_sales_proposal(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        adoption: &AdoptSalesProposalV1,
+        now_ms: u64,
+    ) -> Result<SalesProposalResponseV1, WorkflowError> {
+        self.adopt_sales_proposal_inner(principal, adoption, now_ms, false)
+    }
+
+    fn adopt_sales_proposal_inner(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        adoption: &AdoptSalesProposalV1,
+        now_ms: u64,
+        fail_after_proposal: bool,
+    ) -> Result<SalesProposalResponseV1, WorkflowError> {
+        validate_digest(&adoption.request_digest)?;
+        validate_digest(&adoption.model_response_digest)?;
+        let mut connection = self.connection.lock().map_err(|_| persistence())?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut call = owned_call(&transaction, principal, &adoption.allowance_id)?;
+        let dispatch = call.dispatch.as_ref().ok_or_else(unauthorized)?;
+        if dispatch.request_digest != adoption.request_digest || call.abandonment_event_id.is_some()
+        {
+            return Err(unauthorized());
+        }
+        if let Some(response) = &call.proposal_response {
+            if call.model_response_digest.as_ref() != Some(&adoption.model_response_digest)
+                || response.proposal.binding != adoption.binding
+            {
+                return Err(WorkflowError::new(
+                    WorkflowErrorCode::IdempotencyConflict,
+                    false,
+                    "Sales completion changed",
+                ));
+            }
+            return Ok(response.clone());
+        }
+        if call.question_response.is_some() || now_ms < call.updated_at_unix_ms {
+            return Err(invalid("Sales completion is invalid"));
+        }
+        adoption.binding.validate(now_ms)?;
+        current_request_matches(&transaction, &call)?;
+        let qualification = CompanyWorkflowCommandV1::QualifyCustomerRequest {
+            request_id: call.grant.request_id.clone(),
+            expected_version: call.grant.expected_version,
+            reason_ref: "model-qualified-customer-request".to_owned(),
+        };
+        let qualification_response = apply_company_command(
+            &transaction,
+            principal,
+            qualification_operation(&call)?,
+            &qualification.canonical_digest()?,
+            &qualification,
+            now_ms,
+            false,
+        )?;
+        let CompanyWorkflowResponseV1::CustomerRequest(qualified) = qualification_response else {
+            return Err(corrupt());
+        };
+        let proposal_command = CompanyWorkflowCommandV1::CreateProposal {
+            request_id: call.grant.request_id.clone(),
+            expected_version: qualified.version,
+            binding: adoption.binding.clone(),
+        };
+        let proposal_response = apply_company_command(
+            &transaction,
+            principal,
+            proposal_operation(&call)?,
+            &proposal_command.canonical_digest()?,
+            &proposal_command,
+            now_ms,
+            false,
+        )?;
+        let CompanyWorkflowResponseV1::Proposal(proposal) = proposal_response else {
+            return Err(corrupt());
+        };
+        let request = required_request(&transaction, principal, &call.grant.request_id, now_ms)?;
+        let response = SalesProposalResponseV1 { request, proposal };
+        if fail_after_proposal {
+            return Err(persistence());
+        }
+        call.proposal_response = Some(response.clone());
+        call.model_response_digest = Some(adoption.model_response_digest.clone());
+        call.version = 3;
+        call.updated_at_unix_ms = now_ms;
+        store_call(
+            &transaction,
+            &call,
+            principal,
+            "request_provider_proposal_adopted",
         )?;
         transaction.commit()?;
         Ok(response)

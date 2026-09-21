@@ -1,5 +1,6 @@
 use super::*;
 use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
+use sentinel_workflow::CustomerRequestStateV1;
 
 pub(crate) fn fixture(path: &Path) -> (WorkflowApi, RequestSalesContext) {
     let mut api = super::super::model_work::configured_test_api(path);
@@ -14,20 +15,22 @@ pub(crate) fn fixture(path: &Path) -> (WorkflowApi, RequestSalesContext) {
         .write()
         .unwrap()
         .agents
-        .push(crate::runtime_health::RuntimeHealthAgentSnapshot {
-            agent_id: 3,
-            aggregate_id: AgentId(3).to_string(),
-            name: "Sales".into(),
-            runtime_present: true,
-            projection_present: true,
-            security_runtime_present: true,
-            adapter_handle_present: true,
-            adapter_instance_matches: true,
-            runtime_resources_healthy: true,
-            adapter_health_state: Some(sentinel_common::NanoHealthState::Healthy),
-            logical_status: Some(sentinel_runtime::AgentStatus::Active),
-            ..Default::default()
-        });
+        .extend([3, 4, 5, 6, 7, 8, 9].map(|agent_id| {
+            crate::runtime_health::RuntimeHealthAgentSnapshot {
+                agent_id,
+                aggregate_id: AgentId(agent_id).to_string(),
+                name: format!("Company agent {agent_id}"),
+                runtime_present: true,
+                projection_present: true,
+                security_runtime_present: true,
+                adapter_handle_present: true,
+                adapter_instance_matches: true,
+                runtime_resources_healthy: true,
+                adapter_health_state: Some(sentinel_common::NanoHealthState::Healthy),
+                logical_status: Some(sentinel_runtime::AgentStatus::Active),
+                ..Default::default()
+            }
+        }));
     let customer = api.principals.principal("customer").unwrap();
     let response = api
         .store
@@ -278,14 +281,92 @@ fn sales_question_requires_the_durable_exact_completion_and_never_creates_a_proj
 }
 
 #[test]
+fn sales_model_qualifies_and_authors_one_policy_bound_offer_without_customer_acceptance() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = fixture(&temp.path().join("company.sqlite"));
+    let request = dispatch(&api, &context);
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+            .status,
+        200
+    );
+    let id = request["request_id"].as_str().unwrap();
+    let digest = request["request_digest"].as_str().unwrap();
+    let completion = ModelExecutionCompletion {
+        context: ModelExecutionContext::RequestSales(Box::new(context.clone())),
+        content: r#"{"schema_version":1,"decision":{"kind":"propose_offer","scope":"Design and implement the requested three-page website.","deliverables":["design specification","validated source tree","delivery preview"],"exclusions":["external hosting","production DNS"],"acceptance_criteria":["keyboard-accessible pages","independent QA pass"],"assumptions":["no external media is required"]}}"#.into(),
+        admissible: true,
+    };
+    let usage = serde_json::json!({"type":"AgentLlmUsage", "agent_id":3,
+        "tenant_id":"tenant-m0", "reservation_id":context.binding.allowance_id,
+        "project_id":null,"work_item_id":null,"assignment_id":null,"assignment_version":null,
+        "provider":"codex-cli","caller_role":"agent_runtime","effective_model":"model-test",
+        "requested_model":"model-test","tier":"mid","hierarchy_tier":2,"cost_source":"provider_reported",
+        "input_tokens":5,"output_tokens":5,"cache_read":0,"cache_creation":0,"cost_usd":0.0});
+    let event = DomainEvent::new(
+        "agent_llm_usage",
+        &AgentId(3).to_string(),
+        &usage.to_string(),
+        id,
+        1,
+    )
+    .with_operation_id(&format!("llm_usage_{id}"))
+    .with_schema_version(4);
+    let store = api.event_store.as_ref().unwrap();
+    store
+        .enqueue_llm_completion(
+            id,
+            digest,
+            &serde_json::to_string(&serde_json::json!({
+                "version": 2, "request_id": id, "request_digest": digest,
+                "usage_event": event, "actions": [], "tokens_used": 10, "model_work": completion
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    store
+        .persist_llm_completion_usage(id, digest, &event)
+        .unwrap();
+    api.accept_request_sales(&completion, &context, id, digest)
+        .unwrap();
+    api.accept_request_sales(&completion, &context, id, digest)
+        .unwrap();
+    let call = api.request_sales_call().unwrap().unwrap();
+    assert!(call.question_response.is_none());
+    let outcome = call.proposal_response.unwrap();
+    assert_eq!(outcome.request.state, CustomerRequestStateV1::Proposed);
+    assert_eq!(
+        outcome.request.proposal_ids,
+        vec![outcome.proposal.proposal_id.clone()]
+    );
+    assert_eq!(outcome.proposal.binding.governance.owner, AgentId(5));
+    assert_eq!(outcome.proposal.binding.governance.participants.len(), 7);
+    assert_eq!(outcome.proposal.binding.cost_ceiling_micros, 2_000_000);
+    assert_eq!(
+        outcome.proposal.binding.provider_cost_ceilings_micros,
+        BTreeMap::from([("local-loop".to_owned(), 1_000_000)])
+    );
+    assert!(api.store.company_projects().unwrap().is_empty());
+}
+
+#[test]
 fn sales_parser_does_not_accept_answers_approvals_or_legacy_tools() {
     for content in [
         r#"{"schema_version":1,"decision":{"kind":"accept_proposal"}}"#,
         r#"{"schema_version":1,"decision":{"kind":"ask_question","content":"Question?","approved":true}}"#,
         r#"{"schema_version":1,"tools":[]}"#,
+        r#"{"schema_version":1,"decision":{"kind":"propose_offer","scope":"site","deliverables":["source"],"exclusions":[],"acceptance_criteria":["qa"],"assumptions":[],"cost_ceiling_micros":1}}"#,
     ] {
         assert!(serde_json::from_str::<SalesDecision>(content).is_err());
     }
+    assert!(matches!(
+        serde_json::from_str::<SalesDecision>(
+            r#"{"schema_version":1,"decision":{"kind":"propose_offer","scope":"site","deliverables":["source"],"exclusions":["hosting"],"acceptance_criteria":["qa"],"assumptions":["no external media"]}}"#
+        )
+        .unwrap()
+        .decision,
+        SalesAction::ProposeOffer { .. }
+    ));
 }
 
 #[test]

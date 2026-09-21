@@ -572,10 +572,34 @@ mod tests {
                 Some(AgentId(5)),
             ),
             (
+                "technical-lead",
+                CompanyPrincipalKindV1::Agent,
+                CompanyRoleV1::TechnicalLead,
+                Some(AgentId(7)),
+            ),
+            (
+                "designer",
+                CompanyPrincipalKindV1::Agent,
+                CompanyRoleV1::Designer,
+                Some(AgentId(4)),
+            ),
+            (
                 "developer-6",
                 CompanyPrincipalKindV1::Agent,
                 CompanyRoleV1::Developer,
                 Some(AgentId(6)),
+            ),
+            (
+                "qa",
+                CompanyPrincipalKindV1::Agent,
+                CompanyRoleV1::Qa,
+                Some(AgentId(8)),
+            ),
+            (
+                "release-manager",
+                CompanyPrincipalKindV1::Agent,
+                CompanyRoleV1::ReleaseManager,
+                Some(AgentId(9)),
             ),
             (
                 "operator",
@@ -626,6 +650,12 @@ mod tests {
             ])),
             workbench_profile: profile,
             workbench_profile_digest: profile_digest,
+            qa_profile_digest: hex_sha256(include_bytes!(
+                "../../../../config/workbench-profiles/web-qa-v1.toml"
+            )),
+            project_profile_digest: hex_sha256(include_bytes!(
+                "../../../../config/work-profiles/web-project-v1.toml"
+            )),
             review_profile: None,
             qa_profile_capabilities: BTreeSet::new(),
             runtime_health: Arc::new(RwLock::new(Default::default())),
