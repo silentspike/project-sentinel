@@ -237,18 +237,28 @@ class M0JourneyContractTests(unittest.TestCase):
         )
         preflight = (HERE / "run_m0_preflight.py").read_text(encoding="utf-8")
         for relative in (
+            "external/nats-server",
+            "config/work-profiles/web-project-v1.toml",
+            "config/workbench-profiles/web-authoring-v1.toml",
+            "deploy/scripts/sentinel-health-monitor.sh",
+            "deploy/systemd/sentinel-health-monitor.service",
+            "deploy/systemd/sentinel-health-monitor.timer",
             "scripts/product-acceptance/run_m0_preflight.py",
             "scripts/product-acceptance/run_m0_journey.py",
             "scripts/product-acceptance/build_collaboration_admission_journey.py",
             "scripts/product-acceptance/evaluate_collaboration_admission.py",
             "scripts/product-acceptance/m0-activation/control.py",
             "scripts/product-acceptance/collaboration-admission-study-v1.json",
+            "scripts/product-acceptance/m0-contract.toml",
+            "scripts/product-acceptance/m0-readiness/readiness.py",
             "scripts/product-acceptance/m0-journey-v2.json",
             "scripts/product-acceptance/m0-restart-control-v1.json",
         ):
             self.assertIn(relative, generator)
             self.assertIn(relative, provisioner)
             self.assertIn(relative, preflight)
+        self.assertIn("config/agents/*.toml", generator)
+        self.assertIn('/opt/sentinel/config/agents/${source##*/}', generator)
 
 
 if __name__ == "__main__":

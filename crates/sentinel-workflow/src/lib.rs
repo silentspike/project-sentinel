@@ -3,6 +3,8 @@
 //! This crate owns plans and work-item state. The Workbench, organization, and
 //! independent gate implementations remain behind narrow authority ports.
 
+mod adaptive;
+mod adaptive_core;
 mod admission;
 mod collaboration;
 mod digest;
@@ -15,6 +17,8 @@ mod port;
 mod request_provider;
 mod store;
 
+pub use adaptive::*;
+pub use adaptive_core::*;
 pub use admission::*;
 pub use collaboration::*;
 pub use domain::*;

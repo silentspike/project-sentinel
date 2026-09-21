@@ -24,6 +24,7 @@ ARTIFACT_DEFS=(
   "cmd/cortex-gateway/cortex-gateway|/opt/sentinel/bin/cortex-gateway|binary"
   "services/sentinel-judge/sentinel-judge|/opt/sentinel/bin/sentinel-judge|binary"
   "services/sentinel-nats-bridge/sentinel-nats-bridge|/opt/sentinel/bin/sentinel-nats-bridge|binary"
+  "external/nats-server|/usr/local/bin/nats-server|binary"
   # Console bundle (stable filenames are enforced by console/vite.config.ts)
   "console/dist/index.html|/opt/sentinel/console-dist/index.html|config"
   "console/dist/assets/app.js|/opt/sentinel/console-dist/assets/app.js|config"
@@ -40,7 +41,7 @@ ARTIFACT_DEFS=(
   "config/company.toml|/opt/sentinel/config/company.toml|config"
   "config/controlplane.toml|/opt/sentinel/config/controlplane.toml|config"
   "config/company-principals.json|/opt/sentinel/config/company-principals.json|config"
-  "config/agents/AGENT-55-LAURA-QA.toml|/opt/sentinel/config/agents/AGENT-55-LAURA-QA.toml|config"
+  "config/work-profiles/web-project-v1.toml|/opt/sentinel/config/work-profiles/web-project-v1.toml|config"
   "config/workbench-profiles/web-authoring-v1.toml|/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml|config"
   "config/workbench-profiles/web-qa-v1.toml|/opt/sentinel/config/workbench-profiles/web-qa-v1.toml|config"
   "config/workbench-profiles/web-review-v1.toml|/opt/sentinel/config/workbench-profiles/web-review-v1.toml|config"
@@ -56,6 +57,8 @@ ARTIFACT_DEFS=(
   "deploy/systemd/sentinel-projection.service|/etc/systemd/system/sentinel-projection.service|systemd"
   "deploy/systemd/sentinel-dashboard-backend.service|/etc/systemd/system/sentinel-dashboard-backend.service|systemd"
   "deploy/systemd/sentinel-gaia-loop.service|/etc/systemd/system/sentinel-gaia-loop.service|systemd"
+  "deploy/systemd/sentinel-health-monitor.service|/etc/systemd/system/sentinel-health-monitor.service|systemd"
+  "deploy/systemd/sentinel-health-monitor.timer|/etc/systemd/system/sentinel-health-monitor.timer|systemd"
   "deploy/systemd/nats-server.service|/etc/systemd/system/nats-server.service|systemd"
   "deploy/systemd/sentinel.target|/etc/systemd/system/sentinel.target|systemd"
   # Init scripts
@@ -65,6 +68,7 @@ ARTIFACT_DEFS=(
   "deploy/scripts/init-runtime-base-dirs.sh|/opt/sentinel/scripts/init-runtime-base-dirs.sh|script"
   "deploy/scripts/init-dashboard-auth.sh|/opt/sentinel/scripts/init-dashboard-auth.sh|script"
   "deploy/scripts/init-company-workflow-auth.sh|/opt/sentinel/scripts/init-company-workflow-auth.sh|script"
+  "deploy/scripts/sentinel-health-monitor.sh|/opt/sentinel/scripts/sentinel-health-monitor.sh|script"
   "deploy/scripts/web-qa-v1.py|/usr/bin/sentinel-web-qa|script"
   "deploy/scripts/work-item-gate-v1.py|/usr/bin/sentinel-work-item-gate|script"
   "deploy/scripts/install-native-claude.sh|/opt/sentinel/scripts/install-native-claude.sh|script"
@@ -77,6 +81,8 @@ ARTIFACT_DEFS=(
   "scripts/product-acceptance/build_collaboration_admission_journey.py|/opt/sentinel/scripts/product-acceptance/build_collaboration_admission_journey.py|script"
   "scripts/product-acceptance/evaluate_collaboration_admission.py|/opt/sentinel/scripts/product-acceptance/evaluate_collaboration_admission.py|script"
   "scripts/product-acceptance/m0-activation/control.py|/opt/sentinel/scripts/product-acceptance/m0-activation/control.py|script"
+  "scripts/product-acceptance/m0-readiness/readiness.py|/opt/sentinel/scripts/m0-readiness.py|script"
+  "scripts/product-acceptance/m0-contract.toml|/opt/sentinel/config/product-acceptance/m0-contract.toml|config"
   "scripts/product-acceptance/collaboration-admission-study-v1.json|/opt/sentinel/config/product-acceptance/collaboration-admission-study-v1.json|config"
   "scripts/product-acceptance/m0-journey-v2.json|/opt/sentinel/config/product-acceptance/m0-journey-v2.json|config"
   "scripts/product-acceptance/m0-restart-control-v1.json|/opt/sentinel/config/product-acceptance/m0-restart-control-v1.json|config"
@@ -87,6 +93,13 @@ ARTIFACT_DEFS=(
 )
 
 cd "${REPO_ROOT}"
+
+# Agent files are an exact provisioner authority set. Keep deterministic order;
+# the provisioner rejects missing, additional, or renamed members fail-closed.
+mapfile -t AGENT_CONFIGS < <(printf '%s\n' config/agents/*.toml | LC_ALL=C sort)
+for source in "${AGENT_CONFIGS[@]}"; do
+  ARTIFACT_DEFS+=("${source}|/opt/sentinel/config/agents/${source##*/}|config")
+done
 
 GIT_SHA="$(git rev-parse HEAD)"
 CREATED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"

@@ -418,7 +418,7 @@ pub mod bridge {
                     perception.agent_id.0, perception.tick.0
                 )
             },
-            |binding| format!("company-provider-{}", binding.reservation_id()),
+            ProviderExecutionAuthority::request_id,
         )
     }
 
@@ -460,19 +460,35 @@ pub mod bridge {
         let payload = DomainEventPayload::AgentLlmUsage {
             agent_id,
             tenant_id: authority.map(|value| value.tenant_id().to_owned()),
-            project_id: authority
-                .and_then(|value| value.project())
-                .map(|value| value.project_id.clone()),
-            work_item_id: authority
-                .and_then(|value| value.project())
-                .map(|value| value.work_item_id.clone()),
+            project_id: authority.and_then(|value| match value {
+                ProviderExecutionAuthority::Project(project) => Some(project.project_id.clone()),
+                ProviderExecutionAuthority::Adaptive(adaptive) => {
+                    Some(adaptive.grant.authority.project_id.0.clone())
+                }
+                ProviderExecutionAuthority::RequestSales(_) => None,
+            }),
+            work_item_id: authority.and_then(|value| match value {
+                ProviderExecutionAuthority::Project(project) => Some(project.work_item_id.clone()),
+                ProviderExecutionAuthority::Adaptive(adaptive) => {
+                    Some(adaptive.grant.authority.work_item_id.0.clone())
+                }
+                ProviderExecutionAuthority::RequestSales(_) => None,
+            }),
             reservation_id: authority.map(|value| value.reservation_id().to_owned()),
-            assignment_id: authority
-                .and_then(|value| value.project())
-                .map(|value| value.assignment_id.clone()),
-            assignment_version: authority
-                .and_then(|value| value.project())
-                .map(|value| value.assignment_version),
+            assignment_id: authority.and_then(|value| match value {
+                ProviderExecutionAuthority::Project(project) => Some(project.assignment_id.clone()),
+                ProviderExecutionAuthority::Adaptive(adaptive) => {
+                    Some(adaptive.assignment_id.clone())
+                }
+                ProviderExecutionAuthority::RequestSales(_) => None,
+            }),
+            assignment_version: authority.and_then(|value| match value {
+                ProviderExecutionAuthority::Project(project) => Some(project.assignment_version),
+                ProviderExecutionAuthority::Adaptive(adaptive) => {
+                    Some(adaptive.grant.authority.assignment_version)
+                }
+                ProviderExecutionAuthority::RequestSales(_) => None,
+            }),
             provider: usage_v2_enabled.then(|| resp.provider.clone()),
             requested_model: usage_v2_enabled.then(|| {
                 if requested_model.trim().is_empty() {
@@ -517,7 +533,10 @@ pub mod bridge {
         if usage_v2_enabled {
             event = event.with_schema_version(match authority {
                 Some(ProviderExecutionAuthority::RequestSales(_)) => 4,
-                Some(ProviderExecutionAuthority::Project(_)) => 3,
+                Some(
+                    ProviderExecutionAuthority::Project(_)
+                    | ProviderExecutionAuthority::Adaptive(_),
+                ) => 3,
                 None => 2,
             });
         }
@@ -1820,7 +1839,10 @@ pub mod bridge {
         context: &ModelWorkContext,
     ) -> Result<(), &'static str> {
         let binding = context.binding();
-        let forbidden = if binding.project().is_some() {
+        let forbidden = if matches!(
+            binding,
+            ProviderExecutionAuthority::Project(_) | ProviderExecutionAuthority::Adaptive(_)
+        ) {
             &[
                 "company_execution_subject",
                 "customer_request_id",
@@ -1842,10 +1864,7 @@ pub mod bridge {
         }
         let mut required = provider_metadata(&binding);
         required.insert("agent_id".to_owned(), binding.agent_id().0.to_string());
-        required.insert(
-            "request_id".to_owned(),
-            format!("company-provider-{}", binding.reservation_id()),
-        );
+        required.insert("request_id".to_owned(), binding.request_id());
         for (key, value) in &required {
             if request.metadata.get(key) != Some(value) {
                 return Err("model work request authority does not match its context");
@@ -1860,10 +1879,10 @@ pub mod bridge {
             serde_json::to_vec(context).map_err(|_| "model work context encoding failed")?;
         request.metadata.insert(
             "company_execution_schema".to_owned(),
-            if matches!(binding, ProviderExecutionAuthority::RequestSales(_)) {
-                "2"
-            } else {
-                "1"
+            match binding {
+                ProviderExecutionAuthority::RequestSales(_) => "2",
+                ProviderExecutionAuthority::Adaptive(_) => "3",
+                ProviderExecutionAuthority::Project(_) => "1",
             }
             .to_owned(),
         );
@@ -1896,6 +1915,19 @@ pub mod bridge {
                 sales.grant.catalog_digest.clone(),
             );
         }
+        if let ProviderExecutionAuthority::Adaptive(adaptive) = &binding {
+            request.model = adaptive.grant.model.clone();
+            request.max_tokens = i32::try_from(adaptive.grant.max_output_tokens)
+                .map_err(|_| "adaptive token ceiling is invalid")?;
+            request.metadata.insert(
+                "subscription_allowance_id".to_owned(),
+                adaptive.grant.provider_allowance_id.clone(),
+            );
+            request.metadata.insert(
+                "subscription_catalog_digest".to_owned(),
+                adaptive.grant.catalog_digest.clone(),
+            );
+        }
         request.messages = vec![GatewayMessage {
             role: "user".to_owned(),
             content: context.prompt()?,
@@ -1923,6 +1955,30 @@ pub mod bridge {
                 (
                     "assignment_version".to_owned(),
                     value.assignment_version.to_string(),
+                ),
+            ]),
+            ProviderExecutionAuthority::Adaptive(value) => values.extend([
+                (
+                    "project_id".to_owned(),
+                    value.grant.authority.project_id.0.clone(),
+                ),
+                (
+                    "work_item_id".to_owned(),
+                    value.grant.authority.work_item_id.0.clone(),
+                ),
+                ("assignment_id".to_owned(), value.assignment_id.clone()),
+                (
+                    "assignment_version".to_owned(),
+                    value.grant.authority.assignment_version.to_string(),
+                ),
+                (
+                    "adaptive_session_id".to_owned(),
+                    value.grant.session_id.to_string(),
+                ),
+                ("adaptive_effect_id".to_owned(), value.effect_id.to_string()),
+                (
+                    "adaptive_session_version".to_owned(),
+                    value.session_version.to_string(),
                 ),
             ]),
             ProviderExecutionAuthority::RequestSales(value) => values.extend([
@@ -2194,6 +2250,132 @@ pub mod bridge {
                 .unwrap();
             assert_eq!(customer.consultation.len(), 1);
             assert!(api.resolve_provider_usage_authority(AgentId(3)).is_err());
+        }
+
+        #[test]
+        fn adaptive_gateway_result_is_adopted_once_and_invalid_json_stays_recoverable() {
+            fn run_case(
+                root: &std::path::Path,
+                content: &str,
+            ) -> (
+                crate::workflow_api::WorkflowApi,
+                EventStore,
+                ProviderExecutionAuthority,
+                String,
+            ) {
+                let (api, authority, store) =
+                    crate::workflow_api::model_work::configured_adaptive_test_api(
+                        &root.join("company.sqlite"),
+                        &root.join("events.sqlite"),
+                    );
+                let binding = ProviderExecutionAuthority::Adaptive(Box::new(authority.clone()));
+                let context = api.model_work_context(&binding).unwrap().unwrap();
+                let state = StateStore::open(root.join("state.redb").to_str().unwrap()).unwrap();
+                let perception = make_perception(6, "Continue assigned work", true);
+                let id = agent_runtime_request_id(&perception, Some(&binding));
+                let mut request = build_gateway_request(&perception, &state, &id, Some(&binding));
+                bind_model_work_request(&mut request, &context).unwrap();
+                assert_eq!(request.metadata["company_execution_schema"], "3");
+                assert_eq!(
+                    request.metadata["adaptive_session_id"],
+                    authority.grant.session_id.to_string()
+                );
+                assert_eq!(
+                    request.metadata["adaptive_effect_id"],
+                    authority.effect_id.to_string()
+                );
+                let digest = gateway_request_digest(&request).unwrap();
+                store
+                    .reserve_request(&id, &digest, &AgentId(6).to_string())
+                    .unwrap();
+                let dispatch = serde_json::json!({
+                    "schema_version": 3,
+                    "allowance_id": authority.grant.provider_allowance_id,
+                    "agent_id": 6,
+                    "request_id": id,
+                    "request_digest": digest,
+                    "context_digest": request.metadata["company_execution_context_digest"],
+                    "provider": authority.grant.provider,
+                    "model": authority.grant.model,
+                    "catalog_digest": authority.grant.catalog_digest,
+                    "subject": {
+                        "kind": "adaptive_session",
+                        "session_id": authority.grant.session_id,
+                        "effect_id": authority.effect_id,
+                        "session_version": authority.session_version,
+                    },
+                });
+                assert_eq!(
+                    api.subscription_dispatch(&serde_json::to_vec(&dispatch).unwrap())
+                        .status,
+                    200
+                );
+                let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+                    "content": content,
+                    "decision": "forward",
+                    "request_id": id,
+                    "provider": "codex-cli",
+                    "tokens_used": 15,
+                    "input_tokens": 5,
+                    "output_tokens": 10,
+                    "hierarchy_tier": 2,
+                    "tier": "mid",
+                    "cost_source": "provider_reported",
+                    "cost_usd": 0.0,
+                    "effective_model": "gpt-5.4"
+                }))
+                .unwrap();
+                let (tx, rx) = mpsc::channel();
+                store_gateway_completion(
+                    &store,
+                    &tx,
+                    GatewayCompletionContext {
+                        request_id: &id,
+                        request_digest: &digest,
+                        agent_id: AgentId(6),
+                        tick: 1,
+                        requested_model: "gpt-5.4",
+                        authority: Some(&binding),
+                        authority_resolver: Some(&api),
+                        gateway_response: &response,
+                        usage_v2_enabled: true,
+                        model_work: Some(&context),
+                    },
+                    3,
+                )
+                .unwrap();
+                assert!(rx.try_recv().is_err());
+                (api, store, binding, id)
+            }
+
+            let accepted = tempfile::tempdir().unwrap();
+            let (api, store, _, id) = run_case(
+                accepted.path(),
+                r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"dependency_unavailable"}}"#,
+            );
+            assert!(store.get_completion(&id).unwrap().is_none());
+            let usage = store
+                .event_by_operation_id(&format!("llm_usage_{id}"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(usage.schema_version, 3);
+            assert!(usage.payload.contains("\"project_id\""));
+            assert_eq!(
+                api.resolve_provider_usage_authority(AgentId(6)).unwrap(),
+                None,
+                "a terminal adaptive campaign cannot fall back to legacy execution"
+            );
+
+            let rejected = tempfile::tempdir().unwrap();
+            let (api, store, binding, id) = run_case(rejected.path(), r#"{"not":"a decision"}"#);
+            assert!(store.get_completion(&id).unwrap().is_some());
+            assert_eq!(
+                api.resolve_provider_usage_authority(AgentId(6))
+                    .unwrap()
+                    .unwrap(),
+                binding,
+                "invalid provider output must leave the exact effect recoverable"
+            );
         }
 
         #[test]

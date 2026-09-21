@@ -67,6 +67,8 @@ struct SealedCompletionReceipt {
     input_digest: String,
     result_digest: String,
     result: WorkbenchMessage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observation: Option<sentinel_common::WorkbenchPrivateObservation>,
 }
 
 impl PinnedDirectory {
@@ -504,6 +506,50 @@ impl WorkbenchExecutor {
         message: &WorkbenchMessage,
     ) -> Result<(), WorkbenchErrorInfo> {
         let sealed = seal_terminal_result(message)?;
+        self.persist_sealed_completion_receipt(sealed)
+    }
+
+    /// Retain private feedback only for an explicitly capability-bound request.
+    pub fn persist_request_completion(
+        &self,
+        request: &WorkbenchRequest,
+        message: &WorkbenchMessage,
+    ) -> Result<(), WorkbenchErrorInfo> {
+        request.validate_for_replay().map_err(|_| {
+            recovery_error(
+                "completion_receipt_binding_mismatch",
+                "invalid receipt request",
+            )
+        })?;
+        let mut sealed = seal_terminal_result(message)?;
+        if sealed.invocation_id != request.invocation_id
+            || sealed.input_digest != request.input_digest
+        {
+            return Err(recovery_error(
+                "completion_receipt_binding_mismatch",
+                "receipt request changed",
+            ));
+        }
+        if request
+            .capabilities
+            .contains(sentinel_common::WORKBENCH_RETAIN_OBSERVATION)
+        {
+            sealed.observation = Some(
+                sentinel_common::WorkbenchPrivateObservation::from_result(message).map_err(
+                    |_| {
+                        recovery_error("completion_receipt_invalid", "private observation rejected")
+                    },
+                )?,
+            );
+            sealed.schema_version = 3;
+        }
+        self.persist_sealed_completion_receipt(sealed)
+    }
+
+    fn persist_sealed_completion_receipt(
+        &self,
+        sealed: SealedCompletionReceipt,
+    ) -> Result<(), WorkbenchErrorInfo> {
         let WorkbenchMessage::Result {
             invocation_id,
             input_digest,
@@ -555,7 +601,7 @@ impl WorkbenchExecutor {
                     .remove_entry_if_identity(&temporary, temporary_identity, 1)
                     .map_err(receipt_error)?;
                 let existing = self.recover_completion(invocation_id, input_digest)?;
-                if existing != sealed.result {
+                if existing != validate_sealed_completion_receipt(sealed.clone())? {
                     return Err(recovery_error(
                         "completion_receipt_conflict",
                         "the immutable completion receipt conflicts with this result",
@@ -1692,6 +1738,7 @@ fn seal_terminal_result(
         input_digest: input_digest.clone(),
         result_digest: hex_sha256(&result_bytes),
         result: durable_result,
+        observation: None,
     })
 }
 
@@ -1702,10 +1749,19 @@ fn serialized_caller_result_size(message: &WorkbenchMessage) -> Option<usize> {
 fn validate_sealed_completion_receipt(
     sealed: SealedCompletionReceipt,
 ) -> Result<WorkbenchMessage, WorkbenchErrorInfo> {
-    if !matches!(sealed.schema_version, 1 | COMPLETION_RECEIPT_SCHEMA_VERSION) {
+    if !matches!(
+        sealed.schema_version,
+        1 | COMPLETION_RECEIPT_SCHEMA_VERSION | 3
+    ) {
         return Err(recovery_error(
             "completion_receipt_version_unsupported",
             "the completion receipt version is unsupported",
+        ));
+    }
+    if (sealed.schema_version == 3) != sealed.observation.is_some() {
+        return Err(recovery_error(
+            "completion_receipt_binding_mismatch",
+            "receipt observation version mismatch",
         ));
     }
     if sealed.schema_version == 1
@@ -1727,7 +1783,35 @@ fn validate_sealed_completion_receipt(
             "the completion receipt result binding is invalid",
         ));
     }
-    Ok(validated.result)
+    let mut result = validated.result;
+    if let Some(observation) = sealed.observation {
+        observation
+            .validate_terminal_projection(&result)
+            .map_err(|_| {
+                recovery_error(
+                    "completion_receipt_binding_mismatch",
+                    "private observation binding changed",
+                )
+            })?;
+        let WorkbenchMessage::Result { output, .. } = &mut result else {
+            unreachable!()
+        };
+        *output = observation.output().clone();
+        observation.validate_result(&result).map_err(|_| {
+            recovery_error(
+                "completion_receipt_binding_mismatch",
+                "private observation result changed",
+            )
+        })?;
+        // The restored private output must agree with the numeric safe receipt.
+        if seal_terminal_result(&result)?.result != sealed.result {
+            return Err(recovery_error(
+                "completion_receipt_binding_mismatch",
+                "private observation status changed",
+            ));
+        }
+    }
+    Ok(result)
 }
 
 fn validate_receipt_key(invocation_id: &str, input_digest: &str) -> Result<(), WorkbenchErrorInfo> {
@@ -2992,6 +3076,76 @@ mod tests {
         assert!(!scoped_artifacts
             .join(".sentinel-crash-leftover.tmp")
             .exists());
+    }
+
+    #[test]
+    fn private_observation_receipt_restores_original_inspect_without_reading_changed_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let artifacts = directory.path().join("artifacts");
+        fs::create_dir_all(scoped(&workspace)).unwrap();
+        fs::write(
+            scoped(&workspace).join("input.txt"),
+            "original private content",
+        )
+        .unwrap();
+        let executor = WorkbenchExecutor::new(&workspace, &artifacts);
+        let mut request = request(
+            WorkbenchTool::InspectFile {
+                path: "input.txt".into(),
+                max_bytes: 1024,
+            },
+            "file.inspect",
+        );
+        request
+            .capabilities
+            .insert(sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into());
+        request.input_digest = request.canonical_digest().unwrap();
+        let result = executor.execute(request.clone(), Arc::new(AtomicBool::new(false)));
+        assert_eq!(outcome(&result), WorkbenchOutcome::Succeeded);
+        executor
+            .persist_request_completion(&request, &result)
+            .unwrap();
+        executor
+            .persist_request_completion(&request, &result)
+            .unwrap();
+        fs::write(
+            scoped(&workspace).join("input.txt"),
+            "changed after execution",
+        )
+        .unwrap();
+        let restarted = WorkbenchExecutor::new(&workspace, &artifacts);
+        restarted
+            .reconcile_root_completion_receipts_before_serving()
+            .unwrap();
+        assert_eq!(
+            restarted
+                .recover_completion(&request.invocation_id, &request.input_digest)
+                .unwrap(),
+            result
+        );
+        let mut foreign = request.clone();
+        foreign.project_id = "other-project".into();
+        foreign.input_digest = foreign.canonical_digest().unwrap();
+        assert!(restarted
+            .persist_request_completion(&foreign, &result)
+            .is_err());
+        assert!(restarted
+            .recover_completion(&request.invocation_id, &foreign.input_digest)
+            .is_err());
+        let receipt_path = artifacts
+            .join(COMPLETION_RECEIPT_DIRECTORY)
+            .join(format!("{}.json", request.invocation_id));
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        receipt["observation"]["output"]["content"] = serde_json::json!("tampered");
+        fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(restarted
+            .recover_completion(&request.invocation_id, &request.input_digest)
+            .is_err());
+        assert!(restarted
+            .reconcile_root_completion_receipts_before_serving()
+            .is_err());
     }
 
     #[test]

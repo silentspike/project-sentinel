@@ -13,6 +13,9 @@ use uuid::Uuid;
 
 use crate::AgentId;
 
+mod observation;
+pub use observation::{WorkbenchPrivateObservation, WORKBENCH_RETAIN_OBSERVATION};
+
 pub const WORKBENCH_SCHEMA_VERSION: u16 = 1;
 pub const WORKBENCH_RUNTIME_BWRAP: &str = "bwrap-landlock";
 /// Exact isolated runtime version accepted by the v1 startup attestation.
@@ -129,6 +132,17 @@ pub enum WorkbenchTool {
 }
 
 impl WorkbenchTool {
+    pub fn validate_shape(&self) -> Result<(), WorkbenchValidationError> {
+        validate_tool_paths(self)?;
+        if let Some((program, args)) = self.command() {
+            validate_program(program)?;
+            for argument in args {
+                validate_command_argument(argument)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn required_capability(&self) -> &'static str {
         match self {
             Self::InspectFile { .. } => "file.inspect",
@@ -306,12 +320,8 @@ impl WorkbenchRequest {
         for rule in &self.command_policy {
             rule.validate()?;
         }
-        validate_tool_paths(&self.tool)?;
+        self.tool.validate_shape()?;
         if let Some((program, args)) = self.tool.command() {
-            validate_program(program)?;
-            for argument in args {
-                validate_command_argument(argument)?;
-            }
             if !self
                 .command_policy
                 .iter()

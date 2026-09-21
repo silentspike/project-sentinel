@@ -29,6 +29,23 @@ type SubscriptionAdmission struct {
 	client        *http.Client
 }
 
+// ProviderAdmissionError reports a failure before provider I/O. Authority,
+// queue, and local dispatch failures must not degrade provider health or trip
+// its circuit breaker.
+type ProviderAdmissionError struct {
+	err error
+}
+
+func (e *ProviderAdmissionError) Error() string { return e.err.Error() }
+func (e *ProviderAdmissionError) Unwrap() error { return e.err }
+
+func providerAdmissionError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &ProviderAdmissionError{err: err}
+}
+
 type subscriptionDispatch struct {
 	SchemaVersion int                              `json:"schema_version"`
 	AllowanceID   string                           `json:"allowance_id"`
@@ -75,19 +92,44 @@ func (a *SubscriptionAdmission) dispatchRequest(provider Provider, req *LLMReque
 	}
 	m := req.Metadata
 	agentID, err := strconv.ParseUint(m["agent_id"], 10, 64)
-	if err != nil || agentID == 0 || agentID > 65535 || m["subscription_allowance_id"] != a.allowanceID || m["reservation_id"] != a.allowanceID || m["request_id"] != "company-provider-"+a.allowanceID {
+	if err != nil || !a.validSubscriptionIdentity(m, agentID) {
 		return subscriptionDispatch{}, errors.New("subscription request identity mismatch")
 	}
 	schemaVersion, subject, err := subscriptionExecutionSubject(req)
 	if err != nil {
 		return subscriptionDispatch{}, err
 	}
-	if m["reserved_provider"] != CodexCLIProviderName || m["subscription_catalog_digest"] != a.catalogDigest || !subscriptionDigest.MatchString(req.AuthorityRequestDigest) || !subscriptionDigest.MatchString(m["company_execution_context_digest"]) || req.Model == "" || req.Model != req.EffectiveModel {
+	if !a.validSubscriptionRequestID(m, schemaVersion) {
+		return subscriptionDispatch{}, errors.New("subscription request identity mismatch")
+	}
+	if !a.validSubscriptionModelBinding(req) {
 		return subscriptionDispatch{}, errors.New("subscription request model or digest mismatch")
 	}
 	return subscriptionDispatch{SchemaVersion: schemaVersion, AllowanceID: a.allowanceID, AgentID: agentID, Subject: subject,
 		RequestID: m["request_id"], RequestDigest: req.AuthorityRequestDigest, ContextDigest: m["company_execution_context_digest"],
 		Provider: provider.Name(), Model: req.EffectiveModel, CatalogDigest: a.catalogDigest}, nil
+}
+
+func (a *SubscriptionAdmission) validSubscriptionIdentity(metadata map[string]string, agentID uint64) bool {
+	return agentID > 0 && agentID <= 65535 &&
+		metadata["subscription_allowance_id"] == a.allowanceID &&
+		metadata["reservation_id"] == a.allowanceID
+}
+
+func (a *SubscriptionAdmission) validSubscriptionRequestID(metadata map[string]string, schemaVersion int) bool {
+	if schemaVersion == 3 {
+		return adaptiveRequestIdentity(metadata["request_id"], metadata)
+	}
+	return metadata["request_id"] == "company-provider-"+a.allowanceID
+}
+
+func (a *SubscriptionAdmission) validSubscriptionModelBinding(req *LLMRequest) bool {
+	metadata := req.Metadata
+	return metadata["reserved_provider"] == CodexCLIProviderName &&
+		metadata["subscription_catalog_digest"] == a.catalogDigest &&
+		subscriptionDigest.MatchString(req.AuthorityRequestDigest) &&
+		subscriptionDigest.MatchString(metadata["company_execution_context_digest"]) &&
+		req.Model != "" && req.Model == req.EffectiveModel
 }
 
 func subscriptionExecutionSubject(req *LLMRequest) (int, *customerRequestExecutionSubject, error) {
@@ -103,6 +145,18 @@ func subscriptionExecutionSubject(req *LLMRequest) (int, *customerRequestExecuti
 		}
 		subject, err := customerRequestSubject(req.Metadata)
 		return 2, subject, err
+	case "3":
+		if classified, err := classifyModelWorkRequest(req, req.Metadata["request_id"]); err != nil || !classified {
+			return 0, nil, errors.New("invalid adaptive execution request")
+		}
+		version, err := strconv.ParseUint(req.Metadata["adaptive_session_version"], 10, 64)
+		if err != nil || version == 0 || strconv.FormatUint(version, 10) != req.Metadata["adaptive_session_version"] {
+			return 0, nil, errors.New("invalid adaptive execution version")
+		}
+		return 3, &customerRequestExecutionSubject{
+			Kind: "adaptive_session", SessionID: req.Metadata["adaptive_session_id"],
+			EffectID: req.Metadata["adaptive_effect_id"], SessionVersion: version,
+		}, nil
 	default:
 		return 0, nil, errors.New("unsupported subscription execution schema")
 	}
@@ -149,18 +203,18 @@ func (a *SubscriptionAdmission) claim(ctx context.Context, claim subscriptionDis
 func (a *SubscriptionAdmission) send(ctx context.Context, provider Provider, req *LLMRequest) (*LLMResponse, error) {
 	claim, err := a.dispatchRequest(provider, req)
 	if err != nil {
-		return nil, err
+		return nil, providerAdmissionError(err)
 	}
 	ctx, cancel := context.WithTimeout(ctx, maxModelWorkDuration)
 	defer cancel()
 	deadline, err := a.claim(ctx, claim)
 	if err != nil {
-		return nil, err
+		return nil, providerAdmissionError(err)
 	}
 	ctx, cancelDispatch := context.WithDeadline(ctx, deadline)
 	defer cancelDispatch()
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("subscription dispatch expired: %w", err)
+		return nil, providerAdmissionError(fmt.Errorf("subscription dispatch expired: %w", err))
 	}
 	if req.ProviderTimeout <= 0 || req.ProviderTimeout > maxModelWorkDuration {
 		req.ProviderTimeout = maxModelWorkDuration

@@ -24,6 +24,11 @@ enum RequestSubject {
         request_id: String,
         request_version: u64,
     },
+    AdaptiveSession {
+        session_id: Uuid,
+        effect_id: Uuid,
+        session_version: u64,
+    },
 }
 
 impl WorkflowApi {
@@ -62,13 +67,16 @@ impl WorkflowApi {
         let now_ms = now_unix_ms();
         if !self.enabled
             || !self.model_work_enabled
-            || !matches!(request.schema_version, 1 | 2)
+            || !matches!(request.schema_version, 1..=3)
             || self.subscription_allowance_id.as_deref() != Some(request.allowance_id.as_str())
         {
             return Err("subscription mode unavailable");
         }
         if request.schema_version == 2 {
             return self.claim_sales_dispatch(request, now_ms);
+        }
+        if request.schema_version == 3 {
+            return self.claim_adaptive_dispatch(request, now_ms);
         }
         if request.subject.is_some() || self.request_sales_tenant.is_some() {
             return Err("subscription subject mismatch");
@@ -144,6 +152,102 @@ impl WorkflowApi {
         Ok(grant
             .expires_at_unix_ms
             .min(now_ms.saturating_add(grant.max_duration_ms)))
+    }
+
+    fn claim_adaptive_dispatch(
+        &self,
+        request: &DispatchRequest,
+        now_ms: u64,
+    ) -> Result<u64, &'static str> {
+        let Some(RequestSubject::AdaptiveSession {
+            session_id,
+            effect_id,
+            session_version,
+        }) = &request.subject
+        else {
+            return Err("adaptive dispatch subject missing");
+        };
+        let binding = self
+            .adaptive_provider_authority_for_claim(AgentId(request.agent_id))?
+            .ok_or("adaptive provider authority unavailable")?;
+        if binding.grant.session_id != *session_id
+            || binding.effect_id != *effect_id
+            || binding.session_version != *session_version
+            || binding.grant.provider_allowance_id != request.allowance_id
+            || binding.grant.provider != request.provider
+            || binding.grant.model != request.model
+            || binding.grant.catalog_digest != request.catalog_digest
+            || binding.request_id() != request.request_id
+        {
+            return Err("adaptive dispatch binding changed");
+        }
+        let context = super::model_execution::ModelExecutionContext::Adaptive(Box::new(
+            self.prepare_adaptive_model(&binding)?,
+        ));
+        context.validate_dispatch(now_ms)?;
+        if format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&context).map_err(|_| "adaptive context invalid")?)
+        ) != request.context_digest
+        {
+            return Err("adaptive dispatch context changed");
+        }
+        let event_store = self
+            .event_store
+            .as_ref()
+            .ok_or("request store unavailable")?;
+        let pending = event_store
+            .get_llm_completion(&request.request_id)
+            .map_err(|_| "request reservation unavailable")?
+            .ok_or("request not reserved")?;
+        if pending.request_digest != request.request_digest
+            || pending.status != "provider_in_flight"
+            || !pending.payload.is_empty()
+            || pending.owner_scope
+                != sentinel_common::StateTransferScope::for_aggregate(
+                    &binding.grant.authority.agent_id.to_string(),
+                )
+        {
+            return Err("adaptive request reservation changed");
+        }
+        let session = self
+            .core
+            .adaptive_session(*session_id, &binding.grant.authority)
+            .map_err(|_| "adaptive session unavailable")?
+            .ok_or("adaptive session missing")?;
+        if !matches!(session.cursor, AdaptiveCursorV1::ReadyForModel)
+            || session.version != *session_version
+        {
+            return Err("adaptive model claim changed or was consumed");
+        }
+        let operation_id = stable_operation_id(
+            "sentinel.workflow.adaptive-claim-model.v1",
+            &request.request_id,
+            *session_version,
+        );
+        self.core
+            .advance_adaptive_session(
+                *session_id,
+                *session_version,
+                operation_id,
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: AdaptiveEffectV1 {
+                        id: *effect_id,
+                        request_digest: request.request_digest.clone(),
+                    },
+                    previous_observation_digest: binding
+                        .previous_observation
+                        .as_ref()
+                        .map(|value| value.observation_digest.clone()),
+                },
+                &binding.grant.authority,
+                now_ms,
+            )
+            .map_err(|_| "adaptive model claim denied")?;
+        Ok(binding
+            .grant
+            .deadline_ms
+            .min(now_ms.saturating_add(binding.grant.max_call_duration_ms)))
     }
 
     fn claim_sales_dispatch(

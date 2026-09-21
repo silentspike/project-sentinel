@@ -8,6 +8,7 @@ capabilities = [
   "command.run_allowlisted",
   "file.inspect",
   "file.write",
+  "observation.retain_private",
   "patch.apply",
   "test.run_profile",
 ]

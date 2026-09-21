@@ -1,8 +1,8 @@
 //! Durable, fail-closed coordination for capability-scoped workbench invocations.
 //!
-//! Runtime stdout and private tool output are deliberately absent from durable
-//! records, events, projections, logs, and terminal replay. Only the immediate
-//! authorized response may carry validated transient tool output.
+//! Private tool output is absent from public records, events, and terminal replay.
+//! An explicit retention capability allows a separate private observation table
+//! for authorized model continuation, committed atomically with the result.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const INVOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("workbench_invocations_v1");
-const STORE_SCHEMA_VERSION: u16 = 3;
+const PRIVATE_OBSERVATIONS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("workbench_private_observations_v1");
+const STORE_SCHEMA_VERSION: u16 = 4;
 const PROFILE_SCHEMA_VERSION: u16 = 1;
 const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
 const MAX_ARTIFACT_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -608,6 +610,9 @@ pub struct WorkbenchInvocationRecord {
     /// Safe numeric command outcome, retained across process and daemon restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_status: Option<sentinel_common::WorkbenchCommandStatus>,
+    /// Content stays in the private table, never in this public-safe record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_digest: Option<String>,
     #[serde(default)]
     pub artifacts: Vec<WorkbenchArtifactRef>,
     pub error: Option<WorkbenchErrorInfo>,
@@ -616,7 +621,14 @@ pub struct WorkbenchInvocationRecord {
 impl WorkbenchInvocationRecord {
     fn reserved(request: &WorkbenchRequest, now_ms: u64) -> Self {
         Self {
-            store_schema_version: STORE_SCHEMA_VERSION,
+            store_schema_version: if request
+                .capabilities
+                .contains(sentinel_common::WORKBENCH_RETAIN_OBSERVATION)
+            {
+                STORE_SCHEMA_VERSION
+            } else {
+                3
+            },
             invocation_id: request.invocation_id.clone(),
             request_digest: request.input_digest.clone(),
             agent_id: request.agent_id,
@@ -654,6 +666,7 @@ impl WorkbenchInvocationRecord {
             resources: None,
             result_digest: None,
             command_status: None,
+            observation_digest: None,
             artifacts: Vec::new(),
             error: None,
         }
@@ -791,6 +804,7 @@ impl WorkbenchInvocationStore {
         let write = db.begin_write()?;
         {
             write.open_table(INVOCATIONS)?;
+            write.open_table(PRIVATE_OBSERVATIONS)?;
         }
         write.commit()?;
         Ok(Self {
@@ -906,51 +920,67 @@ impl WorkbenchInvocationStore {
         let command_status = sentinel_common::WorkbenchCommandStatus::from_output(output)
             .map_err(anyhow::Error::msg)?;
         let safe_error = error.as_ref().map(sanitize_runtime_error).transpose()?;
-        self.transition_guarded(invocation_id, input_digest, revalidate, |record| {
-            if record.state == next && record.state.is_terminal() {
-                if record.resources.as_ref() != Some(resources)
-                    || (record.command_status.is_some() && record.command_status != command_status)
-                    || record.artifacts != *artifacts
-                    || record.result_digest.as_deref()
-                        != terminal_result_digest(*outcome, output, artifacts).as_deref()
-                    || record.error.as_ref() != safe_error.as_ref()
+        let retained = self
+            .load(invocation_id)?
+            .ok_or(WorkbenchStoreError::NotReserved)?
+            .capabilities
+            .contains(sentinel_common::WORKBENCH_RETAIN_OBSERVATION);
+        let observation = retained
+            .then(|| sentinel_common::WorkbenchPrivateObservation::from_result(message))
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        self.transition_with_observation_guarded(
+            invocation_id,
+            input_digest,
+            observation.as_ref(),
+            revalidate,
+            |record| {
+                if record.state == next && record.state.is_terminal() {
+                    if record.resources.as_ref() != Some(resources)
+                        || (record.command_status.is_some()
+                            && record.command_status != command_status)
+                        || record.artifacts != *artifacts
+                        || record.result_digest.as_deref()
+                            != terminal_result_digest(*outcome, output, artifacts).as_deref()
+                        || record.error.as_ref() != safe_error.as_ref()
+                    {
+                        return Err(WorkbenchStoreError::ResultDigestConflict.into());
+                    }
+                    return Ok(());
+                }
+                if !record.state.permits(next) {
+                    return Err(WorkbenchStoreError::InvalidTransition {
+                        from: record.state,
+                        to: next,
+                    }
+                    .into());
+                }
+                validate_bound_outputs(
+                    record,
+                    *outcome,
+                    artifacts,
+                    safe_error.as_ref(),
+                    &self.artifact_roots,
+                )?;
+                if command_status.is_some()
+                    && !matches!(
+                        record.tool_class.as_str(),
+                        "command.run_allowlisted" | "test.run_profile"
+                    )
                 {
-                    return Err(WorkbenchStoreError::ResultDigestConflict.into());
+                    bail!("non-command invocation cannot adopt command status");
                 }
-                return Ok(());
-            }
-            if !record.state.permits(next) {
-                return Err(WorkbenchStoreError::InvalidTransition {
-                    from: record.state,
-                    to: next,
-                }
-                .into());
-            }
-            validate_bound_outputs(
-                record,
-                *outcome,
-                artifacts,
-                safe_error.as_ref(),
-                &self.artifact_roots,
-            )?;
-            if command_status.is_some()
-                && !matches!(
-                    record.tool_class.as_str(),
-                    "command.run_allowlisted" | "test.run_profile"
-                )
-            {
-                bail!("non-command invocation cannot adopt command status");
-            }
-            record.store_schema_version = STORE_SCHEMA_VERSION;
-            record.state = next;
-            record.completed_at_ms = Some(now_ms);
-            record.resources = Some(resources.clone());
-            record.result_digest = terminal_result_digest(*outcome, output, artifacts);
-            record.command_status = command_status.clone();
-            record.artifacts = artifacts.clone();
-            record.error = safe_error.clone();
-            Ok(())
-        })
+                record.store_schema_version = if retained { STORE_SCHEMA_VERSION } else { 3 };
+                record.state = next;
+                record.completed_at_ms = Some(now_ms);
+                record.resources = Some(resources.clone());
+                record.result_digest = terminal_result_digest(*outcome, output, artifacts);
+                record.command_status = command_status.clone();
+                record.artifacts = artifacts.clone();
+                record.error = safe_error.clone();
+                Ok(())
+            },
+        )
     }
 
     pub fn mark_failed(
@@ -1346,6 +1376,23 @@ impl WorkbenchInvocationStore {
         revalidate: &dyn Fn() -> anyhow::Result<()>,
         update: impl FnOnce(&mut WorkbenchInvocationRecord) -> anyhow::Result<()>,
     ) -> anyhow::Result<WorkbenchInvocationRecord> {
+        self.transition_with_observation_guarded(
+            invocation_id,
+            request_digest,
+            None,
+            revalidate,
+            update,
+        )
+    }
+
+    fn transition_with_observation_guarded(
+        &self,
+        invocation_id: &str,
+        request_digest: &str,
+        observation: Option<&sentinel_common::WorkbenchPrivateObservation>,
+        revalidate: &dyn Fn() -> anyhow::Result<()>,
+        update: impl FnOnce(&mut WorkbenchInvocationRecord) -> anyhow::Result<()>,
+    ) -> anyhow::Result<WorkbenchInvocationRecord> {
         let write = self.db.begin_write()?;
         let record;
         {
@@ -1359,6 +1406,36 @@ impl WorkbenchInvocationStore {
                 return Err(WorkbenchStoreError::DigestConflict.into());
             }
             update(&mut current)?;
+            if let Some(observation) = observation {
+                if !current
+                    .capabilities
+                    .contains(sentinel_common::WORKBENCH_RETAIN_OBSERVATION)
+                    || !current.state.is_terminal()
+                    || current.state == WorkbenchInvocationState::UnknownOutcome
+                {
+                    bail!("private observation retention is not authorized");
+                }
+                observation
+                    .validate(invocation_id, request_digest)
+                    .map_err(anyhow::Error::msg)?;
+                let bytes = serde_json::to_vec(observation)?;
+                let mut observations = write.open_table(PRIVATE_OBSERVATIONS)?;
+                let previous = observations
+                    .get(invocation_id)?
+                    .map(|value| value.value().to_vec());
+                if previous.as_ref().is_some_and(|previous| previous != &bytes)
+                    || current
+                        .observation_digest
+                        .as_deref()
+                        .is_some_and(|digest| digest != observation.digest())
+                    || (current.observation_digest.is_some() && previous.is_none())
+                {
+                    return Err(WorkbenchStoreError::ResultDigestConflict.into());
+                }
+                observations.insert(invocation_id, bytes.as_slice())?;
+                current.observation_digest = Some(observation.digest().to_owned());
+                current.store_schema_version = STORE_SCHEMA_VERSION;
+            }
             // Recheck the effect's original World capability after any artifact
             // validation and immediately before staging the durable transition.
             revalidate()?;
@@ -1368,6 +1445,33 @@ impl WorkbenchInvocationStore {
         }
         write.commit()?;
         Ok(record)
+    }
+
+    fn private_observation(
+        &self,
+        record: &WorkbenchInvocationRecord,
+    ) -> anyhow::Result<Option<sentinel_common::WorkbenchPrivateObservation>> {
+        let Some(expected) = record.observation_digest.as_deref() else {
+            return Ok(None);
+        };
+        let read = self.db.begin_read()?;
+        let table = read.open_table(PRIVATE_OBSERVATIONS)?;
+        let bytes = table
+            .get(record.invocation_id.as_str())?
+            .ok_or_else(|| anyhow::anyhow!("private observation missing"))?;
+        if bytes.value().len() > sentinel_common::WORKBENCH_MAX_CALLER_RESULT_BYTES + 1024 {
+            bail!("private observation exceeds its storage bound");
+        }
+        let observation: sentinel_common::WorkbenchPrivateObservation =
+            serde_json::from_slice(bytes.value())
+                .map_err(|_| anyhow::anyhow!("private observation decode failed"))?;
+        observation
+            .validate(&record.invocation_id, &record.request_digest)
+            .map_err(anyhow::Error::msg)?;
+        if observation.digest() != expected {
+            bail!("private observation changed");
+        }
+        Ok(Some(observation))
     }
 }
 
@@ -2268,7 +2372,7 @@ fn sanitize_runtime_error(error: &WorkbenchErrorInfo) -> anyhow::Result<Workbenc
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkbenchAuthoritySnapshot {
     pub agent_id: AgentId,
     pub caller_id: String,
@@ -2434,6 +2538,12 @@ pub trait WorkbenchRuntimeClient {
 }
 
 pub enum WorkbenchDispatchCommand {
+    PrivateObservation {
+        invocation_id: String,
+        authority: Arc<dyn WorkbenchAuthoritySource>,
+        response:
+            mpsc::SyncSender<anyhow::Result<Option<sentinel_common::WorkbenchPrivateObservation>>>,
+    },
     Submit {
         request: Box<WorkbenchRequest>,
         authority: Arc<dyn WorkbenchAuthoritySource>,
@@ -2613,6 +2723,41 @@ pub struct WorkbenchCoordinator<'a> {
 }
 
 impl<'a> WorkbenchCoordinator<'a> {
+    /// Internal model-context read. Ordinary poll/replay deliberately stay public-safe.
+    pub fn private_observation(
+        &self,
+        invocation_id: &str,
+        authority: &dyn WorkbenchAuthoritySource,
+    ) -> anyhow::Result<Option<sentinel_common::WorkbenchPrivateObservation>> {
+        let record = self
+            .store
+            .load(invocation_id)?
+            .ok_or(WorkbenchStoreError::NotReserved)?;
+        let current = authority.current_for_record(&record)?;
+        authorize_workbench_record(&record, &current)?;
+        if !record
+            .capabilities
+            .contains(sentinel_common::WORKBENCH_RETAIN_OBSERVATION)
+            || record.tool_profile != self.profile.id
+            || record.tool_profile_digest != self.profile_digest
+            || !self
+                .profile
+                .capabilities
+                .contains(sentinel_common::WORKBENCH_RETAIN_OBSERVATION)
+            || !record.state.is_terminal()
+            || record.state == WorkbenchInvocationState::UnknownOutcome
+        {
+            bail!("private observation read is not authorized");
+        }
+        let observation = self.store.private_observation(&record)?;
+        let after = authority.current_for_record(&record)?;
+        authorize_workbench_record(&record, &after)?;
+        if current != after {
+            bail!("private observation authority changed");
+        }
+        Ok(observation)
+    }
+
     pub fn new(
         store: &'a WorkbenchInvocationStore,
         profile: &'a WorkbenchProfile,
@@ -2941,11 +3086,11 @@ fn encode_record(record: &WorkbenchInvocationRecord) -> anyhow::Result<Vec<u8>> 
 fn decode_record(bytes: &[u8]) -> anyhow::Result<WorkbenchInvocationRecord> {
     let record: WorkbenchInvocationRecord =
         serde_json::from_slice(bytes).context("deserialize workbench invocation record")?;
-    if !matches!(record.store_schema_version, 2 | STORE_SCHEMA_VERSION) {
+    if !matches!(record.store_schema_version, 2 | 3 | STORE_SCHEMA_VERSION) {
         bail!("unsupported workbench invocation store version");
     }
     if let Some(status) = &record.command_status {
-        if record.store_schema_version != STORE_SCHEMA_VERSION
+        if record.store_schema_version < 3
             || !record.state.is_terminal()
             || record.state == WorkbenchInvocationState::UnknownOutcome
             || !matches!(
@@ -2955,6 +3100,21 @@ fn decode_record(bytes: &[u8]) -> anyhow::Result<WorkbenchInvocationRecord> {
             || sentinel_common::WorkbenchCommandStatus::from_output(&status.output()).is_err()
         {
             bail!("invalid durable command status");
+        }
+    }
+    if let Some(digest) = &record.observation_digest {
+        if record.store_schema_version != STORE_SCHEMA_VERSION
+            || !record
+                .capabilities
+                .contains(sentinel_common::WORKBENCH_RETAIN_OBSERVATION)
+            || !record.state.is_terminal()
+            || record.state == WorkbenchInvocationState::UnknownOutcome
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            bail!("invalid private observation reference");
         }
     }
     Ok(record)
@@ -3346,6 +3506,166 @@ mod tests {
             panic!("terminal replay did not use the durable-safe result projection");
         };
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn private_observation_survives_restart_but_public_replay_and_revoked_reads_do_not_expose_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workbench.redb");
+        let store = WorkbenchInvocationStore::open(&path).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2881");
+        request
+            .capabilities
+            .insert(sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into());
+        request.input_digest = request.canonical_digest().unwrap();
+        let fixture = secure_test_workbench_profile_authority();
+        let (mut profile, _) = WorkbenchProfile::load(fixture.path()).unwrap();
+        profile
+            .capabilities
+            .insert(sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into());
+        let current = authority(&request, &profile);
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+        store
+            .mark_executing(
+                &request.invocation_id,
+                &request.input_digest,
+                1_900_000_000_001,
+            )
+            .unwrap();
+        let message = WorkbenchMessage::Result {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            outcome: WorkbenchOutcome::Succeeded,
+            resources: WorkbenchResourceUsage::default(),
+            artifacts: vec![],
+            output: BTreeMap::from([("content".into(), "PRIVATE-CONTINUATION".into())]),
+            error: None,
+        };
+        // A lost World guard must roll back both the row and the observation.
+        assert!(store
+            .accept_result_guarded(&message, 1_900_000_000_002, &|| anyhow::bail!("stale"))
+            .is_err());
+        assert_eq!(
+            store.load(&request.invocation_id).unwrap().unwrap().state,
+            WorkbenchInvocationState::Executing
+        );
+        assert!(store
+            .db
+            .begin_read()
+            .unwrap()
+            .open_table(PRIVATE_OBSERVATIONS)
+            .unwrap()
+            .get(request.invocation_id.as_str())
+            .unwrap()
+            .is_none());
+        let record = store.accept_result(&message, 1_900_000_000_002).unwrap();
+        assert_eq!(
+            store.accept_result(&message, 1_900_000_000_003).unwrap(),
+            record
+        );
+        for public in [
+            serde_json::to_string(&record).unwrap(),
+            record.safe_event_payload().to_json(),
+            serde_json::to_string(&durable_terminal_projection(&record)).unwrap(),
+        ] {
+            assert!(!public.contains("PRIVATE-CONTINUATION"));
+        }
+        drop(store);
+        let reopened = WorkbenchInvocationStore::open(&path).unwrap();
+        let coordinator =
+            WorkbenchCoordinator::new(&reopened, &profile, &request.tool_profile_digest);
+        let observation = coordinator
+            .private_observation(&request.invocation_id, &current)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observation.output().get("content").unwrap(),
+            "PRIVATE-CONTINUATION"
+        );
+        let mut revoked = current.clone();
+        revoked
+            .assignment_capabilities
+            .remove(sentinel_common::WORKBENCH_RETAIN_OBSERVATION);
+        assert!(coordinator
+            .private_observation(&request.invocation_id, &revoked)
+            .is_err());
+        let mut foreign = current.clone();
+        foreign.project_id = "foreign-project".into();
+        assert!(coordinator
+            .private_observation(&request.invocation_id, &foreign)
+            .is_err());
+        let changing = SequencedAuthority {
+            snapshots: Mutex::new(VecDeque::from([current, revoked])),
+        };
+        assert!(coordinator
+            .private_observation(&request.invocation_id, &changing)
+            .is_err());
+        // Losing the private bytes never authorizes a new runtime invocation.
+        let write = reopened.db.begin_write().unwrap();
+        {
+            write
+                .open_table(PRIVATE_OBSERVATIONS)
+                .unwrap()
+                .remove(request.invocation_id.as_str())
+                .unwrap();
+        }
+        write.commit().unwrap();
+        assert!(reopened.private_observation(&record).is_err());
+        assert!(reopened.accept_result(&message, 1_900_000_000_004).is_err());
+    }
+
+    #[test]
+    fn failed_private_observation_replay_rejects_changed_diagnostics() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2882");
+        request
+            .capabilities
+            .insert(sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into());
+        request.input_digest = request.canonical_digest().unwrap();
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+        store
+            .mark_executing(
+                &request.invocation_id,
+                &request.input_digest,
+                1_900_000_000_001,
+            )
+            .unwrap();
+        let mut result = WorkbenchMessage::Result {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            outcome: WorkbenchOutcome::Failed,
+            resources: WorkbenchResourceUsage::default(),
+            artifacts: vec![],
+            output: BTreeMap::from([("diagnostic".into(), "original failure".into())]),
+            error: Some(WorkbenchErrorInfo {
+                class: WorkbenchErrorClass::Tool,
+                code: "command_failed".into(),
+                safe_message: "failed".into(),
+                retryable: false,
+            }),
+        };
+        let original = store.accept_result(&result, 1_900_000_000_002).unwrap();
+        if let WorkbenchMessage::Result { output, .. } = &mut result {
+            output.insert("diagnostic".into(), "different failure".into());
+        }
+        assert!(store.accept_result(&result, 1_900_000_000_003).is_err());
+        assert_eq!(
+            store.load(&request.invocation_id).unwrap().unwrap(),
+            original
+        );
+        assert_eq!(
+            store
+                .private_observation(&original)
+                .unwrap()
+                .unwrap()
+                .output()
+                .get("diagnostic")
+                .unwrap(),
+            "original failure"
+        );
     }
 
     #[test]
