@@ -1,7 +1,7 @@
 {
   "version": "1.0",
-  "created_at": "2026-09-21T18:32:35Z",
-  "git_sha": "5368e259ea2b0e772335a8a34962570923e2cfc8",
+  "created_at": "2026-09-21T18:50:19Z",
+  "git_sha": "c2e1cbe2c35c49f7ebe45c9f4f77a744c89c5a08",
   "artifacts": [
     {
       "path": "/opt/sentinel/bin/sentinel-daemon",
@@ -60,7 +60,7 @@
     {
       "path": "/opt/sentinel/bin/cortex-gateway",
       "source": "cmd/cortex-gateway/cortex-gateway",
-      "sha256": "277edd97cacb0de28b023928dddebbbf055b3c429b34ad5acf62d5526d190fb3",
+      "sha256": "feee9acac13c3eb2fa8acf3ef3100fe45f57f43623246f49015b4986d00b203a",
       "type": "binary"
     },
     {
