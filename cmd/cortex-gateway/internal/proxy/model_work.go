@@ -33,35 +33,10 @@ func classifyModelWorkRequest(req *LLMRequest, requestID string) (bool, error) {
 	if req.RequestClass != RequestClassAgentRuntime || req.Stream || req.MaxTokens <= 0 {
 		return false, invalid
 	}
-	for _, key := range []string{"tenant_id", "reservation_id", "reserved_provider"} {
-		if strings.TrimSpace(req.Metadata[key]) == "" {
-			return false, invalid
-		}
+	if !metadataValuesPresent(req.Metadata, "tenant_id", "reservation_id", "reserved_provider") {
+		return false, invalid
 	}
-	switch schema {
-	case "1":
-		for _, key := range []string{"project_id", "work_item_id", "assignment_id", "assignment_version"} {
-			if strings.TrimSpace(req.Metadata[key]) == "" {
-				return false, invalid
-			}
-		}
-		if hasCustomerRequestMetadata(req.Metadata) {
-			return false, invalid
-		}
-	case "2":
-		if _, err := customerRequestSubject(req.Metadata); err != nil {
-			return false, invalid
-		}
-	case "3":
-		for _, key := range []string{"project_id", "work_item_id", "assignment_id", "assignment_version", "adaptive_session_id", "adaptive_effect_id", "adaptive_session_version"} {
-			if strings.TrimSpace(req.Metadata[key]) == "" {
-				return false, invalid
-			}
-		}
-		if hasCustomerRequestMetadata(req.Metadata) || !adaptiveRequestIdentity(requestID, req.Metadata) {
-			return false, invalid
-		}
-	default:
+	if !validCompanyExecutionSubject(req.Metadata, requestID, schema) {
 		return false, invalid
 	}
 	if req.Metadata["request_id"] != requestID || (schema != "3" && requestID != "company-provider-"+req.Metadata["reservation_id"]) {
@@ -73,6 +48,32 @@ func classifyModelWorkRequest(req *LLMRequest, requestID string) (bool, error) {
 		return false, invalid
 	}
 	return true, nil
+}
+
+func metadataValuesPresent(metadata map[string]string, keys ...string) bool {
+	for _, key := range keys {
+		if strings.TrimSpace(metadata[key]) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func validCompanyExecutionSubject(metadata map[string]string, requestID, schema string) bool {
+	projectBinding := []string{"project_id", "work_item_id", "assignment_id", "assignment_version"}
+	switch schema {
+	case "1":
+		return metadataValuesPresent(metadata, projectBinding...) && !hasCustomerRequestMetadata(metadata)
+	case "2":
+		_, err := customerRequestSubject(metadata)
+		return err == nil
+	case "3":
+		adaptiveBinding := append(projectBinding, "adaptive_session_id", "adaptive_effect_id", "adaptive_session_version")
+		return metadataValuesPresent(metadata, adaptiveBinding...) &&
+			!hasCustomerRequestMetadata(metadata) && adaptiveRequestIdentity(requestID, metadata)
+	default:
+		return false
+	}
 }
 
 func adaptiveRequestIdentity(requestID string, metadata map[string]string) bool {
