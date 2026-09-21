@@ -242,7 +242,7 @@ fn sales_question_requires_the_durable_exact_completion_and_never_creates_a_proj
     let id = request["request_id"].as_str().unwrap();
     let digest = request["request_digest"].as_str().unwrap();
     let completion = ModelExecutionCompletion { context: ModelExecutionContext::RequestSales(Box::new(context.clone())),
-        content: r#"{"schema_version":1,"decision":{"kind":"ask_question","content":"Which three pages should the website contain?"}}"#.into(), admissible: true };
+        content: r#"{"schema_version":1,"kind":"ask_question","content":"Which three pages should the website contain?"}"#.into(), admissible: true };
     assert!(
         api.accept_request_sales(&completion, &context, id, digest)
             .is_err(),
@@ -315,7 +315,7 @@ fn sales_model_qualifies_and_authors_one_policy_bound_offer_without_customer_acc
     let digest = request["request_digest"].as_str().unwrap();
     let completion = ModelExecutionCompletion {
         context: ModelExecutionContext::RequestSales(Box::new(context.clone())),
-        content: r#"{"schema_version":1,"decision":{"kind":"propose_offer","scope":"Design and implement the requested three-page website.","deliverables":["design specification","validated source tree","delivery preview"],"exclusions":["external hosting","production DNS"],"acceptance_criteria":["keyboard-accessible pages","independent QA pass"],"assumptions":["no external media is required"]}}"#.into(),
+        content: r#"{"schema_version":1,"kind":"propose_offer","scope":"Design and implement the requested three-page website.","deliverables":["design specification","validated source tree","delivery preview"],"exclusions":["external hosting","production DNS"],"acceptance_criteria":["keyboard-accessible pages","independent QA pass"],"assumptions":["no external media is required"]}"#.into(),
         admissible: true,
     };
     let usage = serde_json::json!({"type":"AgentLlmUsage", "agent_id":3,
@@ -373,21 +373,94 @@ fn sales_model_qualifies_and_authors_one_policy_bound_offer_without_customer_acc
 #[test]
 fn sales_parser_does_not_accept_answers_approvals_or_legacy_tools() {
     for content in [
-        r#"{"schema_version":1,"decision":{"kind":"accept_proposal"}}"#,
-        r#"{"schema_version":1,"decision":{"kind":"ask_question","content":"Question?","approved":true}}"#,
+        r#"{"schema_version":1,"kind":"accept_proposal"}"#,
+        r#"{"schema_version":1,"kind":"ask_question","content":"Question?","approved":true}"#,
         r#"{"schema_version":1,"tools":[]}"#,
-        r#"{"schema_version":1,"decision":{"kind":"propose_offer","scope":"site","deliverables":["source"],"exclusions":[],"acceptance_criteria":["qa"],"assumptions":[],"cost_ceiling_micros":1}}"#,
+        r#"{"schema_version":1,"kind":"propose_offer","scope":"site","deliverables":["source"],"exclusions":[],"acceptance_criteria":["qa"],"assumptions":[],"cost_ceiling_micros":1}"#,
     ] {
         assert!(serde_json::from_str::<SalesDecision>(content).is_err());
     }
     assert!(matches!(
         serde_json::from_str::<SalesDecision>(
-            r#"{"schema_version":1,"decision":{"kind":"propose_offer","scope":"site","deliverables":["source"],"exclusions":["hosting"],"acceptance_criteria":["qa"],"assumptions":["no external media"]}}"#
+            r#"{"schema_version":1,"kind":"propose_offer","scope":"site","deliverables":["source"],"exclusions":["hosting"],"acceptance_criteria":["qa"],"assumptions":["no external media"]}"#
         )
         .unwrap()
         .decision,
         SalesAction::ProposeOffer { .. }
     ));
+}
+
+#[test]
+fn corrected_sales_schema_requeues_only_the_exact_failed_completion_without_provider_io() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = fixture(&temp.path().join("company.sqlite"));
+    let request = dispatch(&api, &context);
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+            .status,
+        200
+    );
+    let id = request["request_id"].as_str().unwrap();
+    let digest = request["request_digest"].as_str().unwrap();
+    let completion = ModelExecutionCompletion {
+        context: ModelExecutionContext::RequestSales(Box::new(context.clone())),
+        content: r#"{"schema_version":1,"kind":"propose_offer","scope":"site","deliverables":["source"],"exclusions":["hosting"],"acceptance_criteria":["qa"],"assumptions":["no external media"]}"#.into(),
+        admissible: true,
+    };
+    let usage = serde_json::json!({"type":"AgentLlmUsage", "agent_id":3,
+        "tenant_id":"tenant-m0", "reservation_id":context.binding.allowance_id,
+        "project_id":null,"work_item_id":null,"assignment_id":null,"assignment_version":null,
+        "provider":"codex-cli","caller_role":"agent_runtime","effective_model":"model-test",
+        "requested_model":"model-test","tier":"mid","hierarchy_tier":2,"cost_source":"provider_reported",
+        "input_tokens":5,"output_tokens":5,"cache_read":0,"cache_creation":0,"cost_usd":0.0});
+    let event = DomainEvent::new(
+        "agent_llm_usage",
+        &AgentId(3).to_string(),
+        &usage.to_string(),
+        id,
+        1,
+    )
+    .with_operation_id(&format!("llm_usage_{id}"))
+    .with_schema_version(4);
+    let store = api.event_store.as_ref().unwrap();
+    store
+        .enqueue_llm_completion(
+            id,
+            digest,
+            &serde_json::to_string(&serde_json::json!({
+                "version": 2, "request_id": id, "request_digest": digest,
+                "usage_event": event, "actions": [], "tokens_used": 10,
+                "model_work": completion
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    store
+        .persist_llm_completion_usage(id, digest, &event)
+        .unwrap();
+    assert_eq!(
+        store
+            .record_llm_completion_failure(id, digest, "Sales decision is not strict JSON", 1,)
+            .unwrap(),
+        (1, true)
+    );
+    assert!(!store
+        .requeue_failed_llm_completion(id, digest, "different failure")
+        .unwrap());
+    assert!(api.requeue_request_sales_schema_mismatch().unwrap());
+    let requeued = store.get_llm_completion(id).unwrap().unwrap();
+    assert_eq!(requeued.status, "ready_for_action");
+    assert_eq!(requeued.attempt_count, 0);
+    assert!(requeued.last_error.is_none());
+    assert!(!api.requeue_request_sales_schema_mismatch().unwrap());
+    api.accept_request_sales(&completion, &context, id, digest)
+        .unwrap();
+    assert!(api
+        .request_sales_call()
+        .unwrap()
+        .unwrap()
+        .proposal_response
+        .is_some());
 }
 
 #[test]

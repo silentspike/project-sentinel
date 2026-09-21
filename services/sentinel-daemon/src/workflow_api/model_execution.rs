@@ -809,6 +809,7 @@ impl WorkflowApi {
 #[serde(deny_unknown_fields)]
 struct SalesDecision {
     schema_version: u16,
+    #[serde(flatten)]
     decision: SalesAction,
 }
 
@@ -1354,5 +1355,81 @@ impl WorkflowApi {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn requeue_request_sales_schema_mismatch(&self) -> Result<bool, &'static str> {
+        const PRIOR_ERROR: &str = "Sales decision is not strict JSON";
+
+        let Some(call) = self.request_sales_call()? else {
+            return Ok(false);
+        };
+        if call.question_response.is_some()
+            || call.proposal_response.is_some()
+            || call.abandonment_event_id.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(dispatch) = call.dispatch.as_ref() else {
+            return Ok(false);
+        };
+        let store = self
+            .event_store
+            .as_ref()
+            .ok_or("Sales EventStore unavailable")?;
+        let Some(entry) = store
+            .get_llm_completion(&dispatch.request_id)
+            .map_err(|_| "Sales completion unavailable")?
+        else {
+            return Ok(false);
+        };
+        if entry.request_digest != dispatch.request_digest
+            || entry.status != "failed"
+            || entry.last_error.as_deref() != Some(PRIOR_ERROR)
+        {
+            return Ok(false);
+        }
+        let payload: serde_json::Value =
+            serde_json::from_str(&entry.payload).map_err(|_| "Sales completion invalid")?;
+        let completion: ModelExecutionCompletion = serde_json::from_value(
+            payload
+                .get("model_work")
+                .cloned()
+                .ok_or("Sales completion model work missing")?,
+        )
+        .map_err(|_| "Sales completion model work invalid")?;
+        let binding = RequestSalesAuthority {
+            schema_version: 2,
+            allowance_id: call.allowance_id.clone(),
+            grant: call.grant.clone(),
+        };
+        let current_sales = self
+            .principals
+            .principal(&call.grant.sales_principal.principal_id)
+            .ok_or("Sales principal unavailable")?;
+        if current_sales.principal != call.grant.sales_principal {
+            return Err("Sales principal changed");
+        }
+        let expected_context = RequestSalesContext {
+            binding,
+            source_request: call.source_request.clone(),
+        };
+        expected_context.prompt()?;
+        if !completion.admissible
+            || completion.context != ModelExecutionContext::RequestSales(Box::new(expected_context))
+        {
+            return Err("Sales completion context changed");
+        }
+        let decision: SalesDecision = serde_json::from_str(&completion.content)
+            .map_err(|_| "Sales completion still violates the active schema")?;
+        if decision.schema_version != 1 {
+            return Err("Sales decision schema unsupported");
+        }
+        store
+            .requeue_failed_llm_completion(
+                &dispatch.request_id,
+                &dispatch.request_digest,
+                PRIOR_ERROR,
+            )
+            .map_err(|_| "Sales completion requeue rejected")
     }
 }
