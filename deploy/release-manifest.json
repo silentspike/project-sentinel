@@ -1,96 +1,150 @@
 {
-  "version": "1.1",
-  "created_at": "2026-03-14T09:22:00Z",
-  "git_sha": "4c2d6b9a8e655f620e89b3550180d1810cc46fc7",
+  "version": "1.0",
+  "created_at": "2026-09-21T18:17:03Z",
+  "git_sha": "64f27be1a95e881e454fc5678675d02f551c1945",
   "artifacts": [
-    {
-      "path": "/opt/sentinel/config/agents/AGENT-55-LAURA-QA.toml",
-      "source": "config/agents/AGENT-55-LAURA-QA.toml",
-      "sha256": "1a5c6caa46f52338d7c49b9ceca4663244a69184f13602211dad693598fa6dc7",
-      "type": "config"
-    },
     {
       "path": "/opt/sentinel/bin/sentinel-daemon",
       "source": "target/release/sentinel-daemon",
-      "sha256": "7dab17eef01e35a172338e530d2ab80778859692e06371d1211145ba167f70eb",
+      "sha256": "046a10583b692cec44f8efb1ea18edbda17bf8a3b06dd1193b778b76916c9c8b",
+      "type": "binary"
+    },
+    {
+      "path": "/usr/bin/agent-runtime",
+      "source": "target/release/agent-runtime",
+      "sha256": "51185c2b10be35aaf7d449608d880014645ad5feef5a93832c03214b34bcc352",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/bin/landlock-wrapper",
+      "source": "target/release/landlock-wrapper",
+      "sha256": "b3eb6cfd68985f0e68e59690c1dc6f698660fdb5bb3adb8fc83435a1b9fb3b4e",
       "type": "binary"
     },
     {
       "path": "/opt/sentinel/bin/sentinel-nightrun",
       "source": "target/release/sentinel-nightrun",
-      "sha256": "9ad7ffa8dff64b6ea4b80e2b1e9fe2d7690e3a95914b440d7058d332fbdb590c",
+      "sha256": "5fa86cf3c141e54b7302bbd239763dc85cc7ac5e72faa5554d3ce5eb0c488435",
       "type": "binary"
     },
     {
       "path": "/opt/sentinel/bin/sentinel-projection",
       "source": "target/release/sentinel-projection",
-      "sha256": "ed2ce46f79eba9874dcdc72751ebdeb88470d37bab13e0454a591e2a03eb5882",
-      "type": "binary"
-    },
-    {
-      "path": "/opt/sentinel/bin/cortex-gateway",
-      "source": "cmd/cortex-gateway/cortex-gateway",
-      "sha256": "365acf63a85457decd5deaf60ea5645186ba0652588353f26dd7339c40c390a1",
-      "type": "binary"
-    },
-    {
-      "path": "/opt/sentinel/bin/sentinel-judge",
-      "source": "services/sentinel-judge/sentinel-judge",
-      "sha256": "ec61cb259730ff4334b11145491b9e8a9cb856589517875b94b3d9976a56070b",
-      "type": "binary"
-    },
-    {
-      "path": "/opt/sentinel/bin/sentinel-nats-bridge",
-      "source": "services/sentinel-nats-bridge/sentinel-nats-bridge",
-      "sha256": "c0d872633e2ed078dddaebce68ed83515d647216111bd451a020823f03e51eba",
+      "sha256": "457555c8f43724cb146ddb7c399e56382d0c66d9d14bca2fd57f1ea870c601e3",
       "type": "binary"
     },
     {
       "path": "/opt/sentinel/bin/sentinel-dashboard-backend",
       "source": "target/release/sentinel-dashboard-backend",
-      "sha256": "ac91bcbbf61d6c8e3534a58598c1700bdbaa918f9dcbe3acfeb58c6628955da4",
+      "sha256": "ff5ecb259e47e1ac9f76a9bf4f3e39dff0c1d3a7f0d277d942197bf4e76144b8",
       "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/bin/sentinel-gaia-loop",
+      "source": "target/release/sentinel-gaia-loop",
+      "sha256": "1d0887560fe278fbc0cefed5a6863aca41cd7af74a7cfaf5a8073bb9be90e78f",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/bin/sentinel-ctl",
+      "source": "target/release/sentinel-ctl",
+      "sha256": "8520ddcc0d9f53ee791fbf050fe9ae367bdc87b92009b19ea909ad2eb0a2a38b",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/bin/sentinel-gaia",
+      "source": "target/release/sentinel-gaia",
+      "sha256": "88c178ba937cfe4becba99005cfb8369a5a68f3e475bb59973ad83ae2c6190b5",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/bin/cortex-gateway",
+      "source": "cmd/cortex-gateway/cortex-gateway",
+      "sha256": "ce5fb5dd5eb0e22088cc3e5dd3bbcf80dd2ff5d2a585719dfeb9616ae12005d9",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/bin/sentinel-judge",
+      "source": "services/sentinel-judge/sentinel-judge",
+      "sha256": "d88adcc1e90cad3cec0f855a3134ed432b1083e68625b4c3327f22cced4c0521",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/bin/sentinel-nats-bridge",
+      "source": "services/sentinel-nats-bridge/sentinel-nats-bridge",
+      "sha256": "514c3020b6948f81f7af4cf00e59ca6d2c4204bd5a0218a5e781f892dcceb762",
+      "type": "binary"
+    },
+    {
+      "path": "/usr/local/bin/nats-server",
+      "source": "external/nats-server",
+      "sha256": "f3983faa0245b64539c22c7119a0bee6f5d140eae853659cecff77ff5ab5ac88",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/console-dist/index.html",
+      "source": "console/dist/index.html",
+      "sha256": "3ba839dd21a5dd41d745f12f4d41246aef5a37eced92f32ab4b7986e8454e3bc",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/console-dist/assets/app.js",
+      "source": "console/dist/assets/app.js",
+      "sha256": "6de008464aea1155aa4c28273429f0292bcbd4867b64592ce92d46c38dbc9ac6",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/console-dist/assets/app.js.map",
+      "source": "console/dist/assets/app.js.map",
+      "sha256": "c1061df7ca104f1e2e3cdfc590a7b7f49f6ffca7b8b0d7a2cd4ede5fc77724b6",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/console-dist/assets/index.css",
+      "source": "console/dist/assets/index.css",
+      "sha256": "fb8c3529d6278199f9fd873bf8754785481a6a05643543a70441a8f7030a03fe",
+      "type": "config"
     },
     {
       "path": "/opt/sentinel/config/daemon.toml",
       "source": "config/daemon.toml",
-      "sha256": "d8b264e2f47bd1598e3e1d4f384ed46037217dce7d7417ce434fb5a003ebfad0",
+      "sha256": "4515dcd1be98d3396508d6aac80db6ede80f667db5d9014b933f1c51528ba9eb",
       "type": "config"
     },
     {
       "path": "/opt/sentinel/config/cortex-gateway.toml",
       "source": "config/cortex-gateway.toml",
-      "sha256": "df84cc1212ea7ac50274d90bb22823598ac788802ab8a506b78e5987aa5d5b66",
+      "sha256": "8f051f3222e53f64ad492f6684476aef92f5aa95de84427a4314a64a2f98f4da",
       "type": "config"
     },
     {
       "path": "/opt/sentinel/config/nightrun.toml",
       "source": "config/nightrun.toml",
-      "sha256": "298b7c55a2a0da8bc571b5a6a5bedffbdeade0926620db0d29c9886346f39e23",
+      "sha256": "a944603811d36181d13609a6fe4220da56c1e7b205954d77c0760131d0b9e482",
       "type": "config"
     },
     {
       "path": "/opt/sentinel/config/judge.toml",
       "source": "config/judge.toml",
-      "sha256": "5480918785b15b5b6f4ade863cb6f93f1f02dd5c700047feadc09256d70b9236",
+      "sha256": "b2de106118465fcc37c9d04f4283706484cb28c4d56e6d3093dbc613edcecb60",
       "type": "config"
     },
     {
       "path": "/opt/sentinel/config/nats-bridge.toml",
       "source": "config/nats-bridge.toml",
-      "sha256": "676be7a30c8033395f7fa1dbf83b378bc90b8efd8cde25b7f4498a415b6734a1",
+      "sha256": "13dc725ace729a440a40f030f2561756dd647c9c268cff01405ff18ed2937d4a",
       "type": "config"
     },
     {
       "path": "/opt/sentinel/config/simulation.toml",
       "source": "config/simulation.toml",
-      "sha256": "adbd4c4a4c9c92a5756bda9557fe2421b39bde18f7b8da53df2ce78fa38f3132",
+      "sha256": "f91a4059967fe40f82b7925d7d4bcd1787f884191a630358c3ac0d6b4f8d5519",
       "type": "config"
     },
     {
       "path": "/opt/sentinel/config/rooms.toml",
       "source": "config/rooms.toml",
-      "sha256": "1600a4e520a98fabc08c240a57ed29420d9d18ecca00a4350be10cdc359d25fc",
+      "sha256": "dafef6f8bb7b8bd4bfcadc76334c218eb3e7c0012163e505676a88efe0f788f7",
       "type": "config"
     },
     {
@@ -106,9 +160,27 @@
       "type": "config"
     },
     {
+      "path": "/opt/sentinel/config/company-principals.json",
+      "source": "config/company-principals.json",
+      "sha256": "eb3b3ffff7f5e4ea2493f3cc2afe432e62c49b8285de2fa760484f8aa4f1a8ee",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/work-profiles/web-project-v1.toml",
+      "source": "config/work-profiles/web-project-v1.toml",
+      "sha256": "2c5fdfcbfac6d2acfd3f93cc1d183b677f0602b670e6107d71a8b85fd532ca29",
+      "type": "config"
+    },
+    {
       "path": "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml",
       "source": "config/workbench-profiles/web-authoring-v1.toml",
-      "sha256": "e7e704d11a951e97d8246385f99cfa4c0fa835e4de2eec8e1272ce7dfae712a6",
+      "sha256": "d2042f1ed9a4136e51caea205aeb3c925c7a843edcc5bd307efce57f81bb0a27",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/workbench-profiles/web-qa-v1.toml",
+      "source": "config/workbench-profiles/web-qa-v1.toml",
+      "sha256": "24f492112d520225c3bd63bb6c486afebdf35815a1056f918efe0d86d87c80e0",
       "type": "config"
     },
     {
@@ -120,85 +192,91 @@
     {
       "path": "/etc/nats/nats.conf",
       "source": "config/nats.conf",
-      "sha256": "3ab5bb5d9fa5a1b51dc4f4d575be81ecd568a4b16a2b157b7d38d3242f6d309f",
+      "sha256": "a5c82b90a74eb57bf188e4db6842d9d619166ae8d510ee4a740f763a44325427",
       "type": "config"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel-auth-init.service",
+      "source": "deploy/systemd/sentinel-auth-init.service",
+      "sha256": "5df1c69d565ae02266b92284635d9dece07a6ee1c297247df4ee2ae450cdcc1e",
+      "type": "systemd"
     },
     {
       "path": "/etc/systemd/system/sentinel-daemon.service",
       "source": "deploy/systemd/sentinel-daemon.service",
-      "sha256": "b1f7eb5aac0f2a73f6e017882bf04110d8c715a926ec09e30c5240dc0bc1ab52",
+      "sha256": "cbf80c0ce63233770f4b428a025a33a32740e7e140c9128adf9f8578f9c5cc7d",
       "type": "systemd"
     },
     {
-      "path": "/etc/systemd/system/sentinel-cortex.service",
-      "source": "deploy/systemd/sentinel-cortex.service",
-      "sha256": "8da5900ba36e873b894b60cba200e1e2fcd6e8a80b78abfcea4c61c1bd0bfc96",
+      "path": "/etc/systemd/system/sentinel-gateway.service",
+      "source": "deploy/systemd/sentinel-gateway.service",
+      "sha256": "8825824f572c63a4515cb06483b3c68b7e2357026a6c10a9e282eada6ad6941a",
       "type": "systemd"
     },
     {
       "path": "/etc/systemd/system/sentinel-judge.service",
       "source": "deploy/systemd/sentinel-judge.service",
-      "sha256": "f2debaeb71e9fb8bc228a6e214701f74ab96114e5fa3396774b6b3aeef8c72e2",
+      "sha256": "e7fba1c46d8ebd8a622d56c9983936472206bb51c88338639d8f2e113044dbe9",
       "type": "systemd"
     },
     {
       "path": "/etc/systemd/system/sentinel-nats-bridge.service",
       "source": "deploy/systemd/sentinel-nats-bridge.service",
-      "sha256": "03eaedee79846d21b3badb31917d137e663fe28d92cedefa7978161a91810e5b",
+      "sha256": "5da6dea0e35837a77bdbd242e94624919adffb74fa34b43668f407dbace88a0a",
       "type": "systemd"
     },
     {
       "path": "/etc/systemd/system/sentinel-nightrun.service",
       "source": "deploy/systemd/sentinel-nightrun.service",
-      "sha256": "43bb81138fe86c9a1c8593a4db25f0a04caf175bc0ceed752c6208924fb8a8c7",
+      "sha256": "b3d89b0a42474a5f2be25fb3f02de50a6367dff6c3c923a6629942e5efe943cb",
       "type": "systemd"
     },
     {
       "path": "/etc/systemd/system/sentinel-nightrun.timer",
       "source": "deploy/systemd/sentinel-nightrun.timer",
-      "sha256": "6ab0ca2a9d380cb144d5aa5cdaf3f81a71f3b336257e9071e05052ed8b030def",
+      "sha256": "a6c5a0903e616b03387fb59b428c54e386d730acb41c058ff1174535ad12157b",
       "type": "systemd"
     },
     {
       "path": "/etc/systemd/system/sentinel-projection.service",
       "source": "deploy/systemd/sentinel-projection.service",
-      "sha256": "184d0707a6271241ad01dcbbf3825a85ca1ed8917f19088089ba9e7e6371e316",
+      "sha256": "ea20e157c6ed5e7cf9e9cc344576631c31cb811aa5f2c09cd628dd5347e931ba",
       "type": "systemd"
     },
     {
       "path": "/etc/systemd/system/sentinel-dashboard-backend.service",
       "source": "deploy/systemd/sentinel-dashboard-backend.service",
-      "sha256": "12a29f33147347f49060899f8fd70d595ae730582ffe19c464c985612feb2b9f",
+      "sha256": "e275a765828d8e8f516aa7e523d5e4c7f4cd99b33936a3aba7d905ec2bbddac9",
       "type": "systemd"
     },
     {
-      "path": "/etc/systemd/system/nats-server.service",
-      "source": "deploy/systemd/nats-server.service",
-      "sha256": "9bf27f70073cede1728b979bf3621f5ff9416d0a8e7ceb8da8fbe6f7f361973b",
-      "type": "systemd"
-    },
-    {
-      "path": "/etc/systemd/system/sentinel.target",
-      "source": "deploy/systemd/sentinel.target",
-      "sha256": "70ec2d8d90ddb6c0935510453175d0f21380fcd72dffc396ac14341e8af63932",
+      "path": "/etc/systemd/system/sentinel-gaia-loop.service",
+      "source": "deploy/systemd/sentinel-gaia-loop.service",
+      "sha256": "1440a6ba0cb01efd703f78973343e7dace9ab839b40114f8b7f9a35d36921cb2",
       "type": "systemd"
     },
     {
       "path": "/etc/systemd/system/sentinel-health-monitor.service",
       "source": "deploy/systemd/sentinel-health-monitor.service",
-      "sha256": "237e9fc0047932f8b3b23946606228af7f71785456aa3669fe1848e4b828df98",
+      "sha256": "9d8b805eb3e78b8910b315c9d0ac7d7cb83ba9960c3ea42bc7dbae8f75cdbb71",
       "type": "systemd"
     },
     {
       "path": "/etc/systemd/system/sentinel-health-monitor.timer",
       "source": "deploy/systemd/sentinel-health-monitor.timer",
-      "sha256": "a2d5bba97f39ea0c9a9800db91e2aca1aa4b7a29a148a888cbda83577c6c9368",
+      "sha256": "2e45dfaf240cf663d1dc3e66ca437b75d563d833b3ae0e98bbe049de0e12b039",
       "type": "systemd"
     },
     {
-      "path": "/etc/systemd/system/sentinel-agent@.service",
-      "source": "deploy/systemd/sentinel-agent@.service",
-      "sha256": "9676c608c7f507ea8144993ceba6a63646ca3c861ff4e5ba47b388e3e78421e1",
+      "path": "/etc/systemd/system/nats-server.service",
+      "source": "deploy/systemd/nats-server.service",
+      "sha256": "b077dbeac9ec30b106cebae5852dce25255902669454918910a22adfaf3495ce",
+      "type": "systemd"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel.target",
+      "source": "deploy/systemd/sentinel.target",
+      "sha256": "e610fb2f2c7baf899259e1849096aaa63f5e92e6a6609fbb926a8ec1f21b9ba3",
       "type": "systemd"
     },
     {
@@ -210,7 +288,61 @@
     {
       "path": "/opt/sentinel/scripts/init-dirs.sh",
       "source": "deploy/scripts/init-dirs.sh",
-      "sha256": "0d4e24c001728ee54bf24fe05fa5d8b74929ebd37fcefc5bf489bb688f0eaa0c",
+      "sha256": "e709986029375693019fd13c5eb6f01ce64949cea399e3f0d2ddf1c04289793c",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/init-m0-runtime-dirs.py",
+      "source": "deploy/scripts/init-m0-runtime-dirs.py",
+      "sha256": "f2556c930b5af7b5e8a15c60addf219002f93475d3a9504d3a20300681630a72",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/init-runtime-base-dirs.sh",
+      "source": "deploy/scripts/init-runtime-base-dirs.sh",
+      "sha256": "126e8c02614aee337311ff8643c7c797848af63d618e087b891142bba227a060",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/init-dashboard-auth.sh",
+      "source": "deploy/scripts/init-dashboard-auth.sh",
+      "sha256": "21bc6757dffbcbf692238d9f3981797f780ab988dec88f123f151db16ce4e566",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/init-company-workflow-auth.sh",
+      "source": "deploy/scripts/init-company-workflow-auth.sh",
+      "sha256": "08d9c86afe13cb7b336428f5851fab7910f9b8bea66b9214439ea92d126cfa04",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/sentinel-health-monitor.sh",
+      "source": "deploy/scripts/sentinel-health-monitor.sh",
+      "sha256": "ebd35beb33f9265c4b48bf318ccccc8d42d68f25722e27aa5a9542a5f6022c10",
+      "type": "script"
+    },
+    {
+      "path": "/usr/bin/sentinel-web-qa",
+      "source": "deploy/scripts/web-qa-v1.py",
+      "sha256": "71aaaf798dce45bd68ad4aaaf9d8e1004ea0e136f7667dd5739e1b1009f586e9",
+      "type": "script"
+    },
+    {
+      "path": "/usr/bin/sentinel-work-item-gate",
+      "source": "deploy/scripts/work-item-gate-v1.py",
+      "sha256": "c9c39f61fcbbbebded38d1796901c7e353a5415590ee8e6f56d8e9c189b548e8",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/install-native-claude.sh",
+      "source": "deploy/scripts/install-native-claude.sh",
+      "sha256": "168b6ad364b669aa3b1928c9072f383a73bffb40edb98e1711fa888181e7d934",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/install-native-codex.sh",
+      "source": "deploy/scripts/install-native-codex.sh",
+      "sha256": "1e14e15b8a6f4a0e2a62a4fa8cd7004b33cc62983172ec353d212ab702f4964a",
       "type": "script"
     },
     {
@@ -230,6 +362,444 @@
       "source": "deploy/scripts/init-tmpfs.sh",
       "sha256": "30ff0d51aa1778644a5697848525ca6103bddfc9c3df9feb6f368b37f33a30d6",
       "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/product-acceptance/run_m0_preflight.py",
+      "source": "scripts/product-acceptance/run_m0_preflight.py",
+      "sha256": "237c859112427d770f30c18c72f9fabf5287226a77fd8c78a306d0dc7f1b8958",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/product-acceptance/run_m0_journey.py",
+      "source": "scripts/product-acceptance/run_m0_journey.py",
+      "sha256": "f75be03e30f292df43899dd573be9978f1890940d73dd7ea105cab7b19699b07",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/product-acceptance/build_collaboration_admission_journey.py",
+      "source": "scripts/product-acceptance/build_collaboration_admission_journey.py",
+      "sha256": "12f23d63b482b24da8ded036dcd57f12c24fb6783b14cafae19a68919f68aebe",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/product-acceptance/evaluate_collaboration_admission.py",
+      "source": "scripts/product-acceptance/evaluate_collaboration_admission.py",
+      "sha256": "480ea55078a323b841669e6b8155cf6d519ff3ebc2419088248e3362be4b8d86",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/product-acceptance/m0-activation/control.py",
+      "source": "scripts/product-acceptance/m0-activation/control.py",
+      "sha256": "175b36c261e7d3dde9ca73af072e10a923c5d572a3f0eaee97eeb51b73ca2451",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/m0-readiness.py",
+      "source": "scripts/product-acceptance/m0-readiness/readiness.py",
+      "sha256": "ff011ee123d6ba1796616a4664a7c04d400682b257e595f1588bb617de1dc485",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/config/product-acceptance/m0-contract.toml",
+      "source": "scripts/product-acceptance/m0-contract.toml",
+      "sha256": "3caf334089358e74f152b81d4c8c2e4a848c0a1f029c8a246a28890ce9553043",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/product-acceptance/collaboration-admission-study-v1.json",
+      "source": "scripts/product-acceptance/collaboration-admission-study-v1.json",
+      "sha256": "551322e86e87a24bc7664206a15c9d691196a813518bc98ac87e9653b6a6f480",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/product-acceptance/m0-journey-v2.json",
+      "source": "scripts/product-acceptance/m0-journey-v2.json",
+      "sha256": "584658c19fd3689e3d91b86bb329190347db7f05716ac07366605a0e5bf95931",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/product-acceptance/m0-restart-control-v1.json",
+      "source": "scripts/product-acceptance/m0-restart-control-v1.json",
+      "sha256": "5c0a8149439dacbcd3a9d401d85be6796f6ee5f68abe3d7e3f219ac1d00e7e61",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/share/runtime-base.env",
+      "source": "deploy/runtime-base.env",
+      "sha256": "f1a7c6548cf2ff47813ab09451003c63dbdc20311ff3d89c21641eeaff41d78c",
+      "type": "config"
+    },
+    {
+      "path": "/etc/apt/preferences.d/sentinel-runtime",
+      "source": "deploy/apt/sentinel-runtime.pref",
+      "sha256": "3f31ec8c21f8b6aef62c964512002dafb73899549c160fcc1376575f76952096",
+      "type": "config"
+    },
+    {
+      "path": "/etc/sysctl.d/99-sentinel-bwrap.conf",
+      "source": "deploy/vm-config/99-sentinel-bwrap.conf",
+      "sha256": "39ad687623b564454781eece46c30bb43d91cd979db2c45e6d214a886f7c68e5",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-01-THOMAS-CEO.toml",
+      "source": "config/agents/AGENT-01-THOMAS-CEO.toml",
+      "sha256": "b6c881fa9d9a8ec82d7fee6c5665a8de6fd84762f1f9186eab244fcd3256e46b",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-02-LISA-DESIGN.toml",
+      "source": "config/agents/AGENT-02-LISA-DESIGN.toml",
+      "sha256": "23f6552da28bb1779ff0a47677ee481c6fe1173c4952b48a22d4c4e855d3215a",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-03-MAX-DESIGN.toml",
+      "source": "config/agents/AGENT-03-MAX-DESIGN.toml",
+      "sha256": "e8dfe5f89cfd35139f224add9cabd22f40f821cf6f9866197330d2c76aa5a8df",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-04-SOPHIE-DESIGN.toml",
+      "source": "config/agents/AGENT-04-SOPHIE-DESIGN.toml",
+      "sha256": "f31e502cbee1fa80d1ec9ccdc13dbcd9830b617d6946fa9cd69d645a36e3c016",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-05-ANDREAS-DEV.toml",
+      "source": "config/agents/AGENT-05-ANDREAS-DEV.toml",
+      "sha256": "325d25faf551f8a5164aaa5e64adea297efc802ae1b6e7154a3f3492a1df07bf",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-06-JULIA-DEV.toml",
+      "source": "config/agents/AGENT-06-JULIA-DEV.toml",
+      "sha256": "e33c1937aa6c82a37ef5e46807a9c5c7a65224b396361925eae98095d26d9272",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-07-KAI-DEV.toml",
+      "source": "config/agents/AGENT-07-KAI-DEV.toml",
+      "sha256": "69406080de07d09f418f679e0d40755e4bb4d603828a88315d614f04506a4559",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-08-LENA-DEV.toml",
+      "source": "config/agents/AGENT-08-LENA-DEV.toml",
+      "sha256": "831003003172160bac02b1b451391261efdc2f4ddbe5f48f6149d31a8b10ca90",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-09-SARAH-PM.toml",
+      "source": "config/agents/AGENT-09-SARAH-PM.toml",
+      "sha256": "9ddc4ba33a2304be2a42fe94c56d7b10f97455d00b74b86b9babb83efa604be9",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-10-DANIEL-PM.toml",
+      "source": "config/agents/AGENT-10-DANIEL-PM.toml",
+      "sha256": "3d72ebc56b70aabbf80338f4236a82faec8f51b124ec1b864ceb762205594fd3",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-11-MARCO-SALES.toml",
+      "source": "config/agents/AGENT-11-MARCO-SALES.toml",
+      "sha256": "2ab8735ffa2cefef52295ace853c26cece2a3067aed91f829076cb3c1e5847d7",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-12-NINA-MARKETING.toml",
+      "source": "config/agents/AGENT-12-NINA-MARKETING.toml",
+      "sha256": "bf45650e96c4447ce3507f384dfb1860260340d197b99e1ea178b56a255297ac",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-13-PETRA-ADMIN.toml",
+      "source": "config/agents/AGENT-13-PETRA-ADMIN.toml",
+      "sha256": "a365c446c81d78cc37907bad5bfe914ee5ed0018e37d2894e651475e48e5c32d",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-14-FLORIAN-IT.toml",
+      "source": "config/agents/AGENT-14-FLORIAN-IT.toml",
+      "sha256": "338d5dadfc372c540cd2df18e0599ec1e687d4741457fcbb67ccf8ce170f857f",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-15-HANNAH-WERKSTUD.toml",
+      "source": "config/agents/AGENT-15-HANNAH-WERKSTUD.toml",
+      "sha256": "e17710b7f139304b083b9ba5cc939db97fc5db72a7a8315f615b9bfab4fe1eed",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-16-MICHAEL-CEO.toml",
+      "source": "config/agents/AGENT-16-MICHAEL-CEO.toml",
+      "sha256": "deb2149d0137b24cc572790f4b0f80ad060a621a201f1eb52f75db4bbe32f9d8",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-17-CARLA-DESIGN.toml",
+      "source": "config/agents/AGENT-17-CARLA-DESIGN.toml",
+      "sha256": "0dce9022136e657f32bb655a287267cd38e62325ef5798ac80e3cf2cc9f16b3a",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-18-ROBIN-DESIGN.toml",
+      "source": "config/agents/AGENT-18-ROBIN-DESIGN.toml",
+      "sha256": "99aaa7a71b62feb3ee54b3207992003e54e07fed6a21ac6e8f0c6af8d160f5bb",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-19-TIM-DESIGN.toml",
+      "source": "config/agents/AGENT-19-TIM-DESIGN.toml",
+      "sha256": "fdce1ab8015da9ebbd15587549cb8d835c1620c5657ef9f6d1b2a2d71ca8b77f",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-20-MARTIN-DEV.toml",
+      "source": "config/agents/AGENT-20-MARTIN-DEV.toml",
+      "sha256": "0cac8538f442b4cb211cdaa9859ed6f71f47a00eb75e45654f5ff3fa8aa66251",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-21-FATIMA-DEV.toml",
+      "source": "config/agents/AGENT-21-FATIMA-DEV.toml",
+      "sha256": "1c669c0a0d8f8f93db20c096bff8319236c69865f208e6996cf22b72a55cae02",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-22-JONAS-DEV.toml",
+      "source": "config/agents/AGENT-22-JONAS-DEV.toml",
+      "sha256": "5d7c782f778c08fed4ee10871b2a7dfee27018195bdcb33a8f64ed57bef4cbea",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-23-ANNA-DEVOPS.toml",
+      "source": "config/agents/AGENT-23-ANNA-DEVOPS.toml",
+      "sha256": "4b5b7dcaf7a9173ce45b74391f670844bdff6cad0692c25c5c7e5a65681bc7f5",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-24-ELENA-PM.toml",
+      "source": "config/agents/AGENT-24-ELENA-PM.toml",
+      "sha256": "6b32effe28966c696e824e0b17ed0a139cc0efde1b511d1481dd3486b773e7bf",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-25-LUKAS-PM.toml",
+      "source": "config/agents/AGENT-25-LUKAS-PM.toml",
+      "sha256": "7cc34b84d00d0ea50acab221d751bf5b20320b2389f321f927b7a60dd5e8b33f",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-26-OLIVER-SALES.toml",
+      "source": "config/agents/AGENT-26-OLIVER-SALES.toml",
+      "sha256": "8ab2d9e9eb2f47668f872fc650a0ffcf93302486b7e5ae96cee9736b4faf850d",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-27-MARA-MARKETING.toml",
+      "source": "config/agents/AGENT-27-MARA-MARKETING.toml",
+      "sha256": "fa5ee288390fc3160419dcf4821a82ad64275eb6cce8284a550c0aebcc0cc4a1",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-28-GABI-ADMIN.toml",
+      "source": "config/agents/AGENT-28-GABI-ADMIN.toml",
+      "sha256": "23b5211b682184c086dea819682b7eea8cd29aa93d31ca0cd89ed231771ba50c",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-29-TOBIAS-IT.toml",
+      "source": "config/agents/AGENT-29-TOBIAS-IT.toml",
+      "sha256": "59394c3c23f1153c5eec9192a73cd8e260e81c9a090a40307ce7588b73a19f47",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-30-YARA-WERKSTUD.toml",
+      "source": "config/agents/AGENT-30-YARA-WERKSTUD.toml",
+      "sha256": "30cd56c103537ab5007558b70d997c7dcc3a0382277692176980686535b5b5dc",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-31-SANDRA-CEO.toml",
+      "source": "config/agents/AGENT-31-SANDRA-CEO.toml",
+      "sha256": "80fc2d9cc3cf832c12a55063732628f4e8339b8a9548ad5e830093606308c67b",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-32-JENS-DESIGN.toml",
+      "source": "config/agents/AGENT-32-JENS-DESIGN.toml",
+      "sha256": "ec95583371ce1ff821ba269e8ac95a68528e8966c616407b60d6c7ecc9463eb2",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-33-PRIYA-DESIGN.toml",
+      "source": "config/agents/AGENT-33-PRIYA-DESIGN.toml",
+      "sha256": "72ef60fa4c97999de43e0698b3ddfacfc7bafa216245ab40fa8334afba5e401c",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-34-LEA-DESIGN.toml",
+      "source": "config/agents/AGENT-34-LEA-DESIGN.toml",
+      "sha256": "0b5da472ab93c8bf8d4b02030a3ee979c9cf9a85822e5eb6a1975e5c1fc5cb25",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-35-KEVIN-DEV.toml",
+      "source": "config/agents/AGENT-35-KEVIN-DEV.toml",
+      "sha256": "7a8cc768369b5bafe3906bdb818b10bafb5760ef908bdea5ad078972c2bb67f0",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-36-NILS-DEV.toml",
+      "source": "config/agents/AGENT-36-NILS-DEV.toml",
+      "sha256": "7cf5485514b209107c55ff6ef38b717c2fe2f4e7bdaa0b2c3a227c964c27f95f",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-37-SELINA-DEV.toml",
+      "source": "config/agents/AGENT-37-SELINA-DEV.toml",
+      "sha256": "d63aadc3d1fac3bf798a57f1f9fda3ab8df480a50cf1475ef106282ffd17d1d8",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-38-PAUL-DEV.toml",
+      "source": "config/agents/AGENT-38-PAUL-DEV.toml",
+      "sha256": "561937a2b8d9b2e7572938aa329fbc71ba04d60f5b3c49104a49c9e436d8ff6b",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-39-VICTORIA-PM.toml",
+      "source": "config/agents/AGENT-39-VICTORIA-PM.toml",
+      "sha256": "0f5097ce8af958d55839d9c9597ec6251cb046ae95942185b5e65819d1383855",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-40-DAVID-PM.toml",
+      "source": "config/agents/AGENT-40-DAVID-PM.toml",
+      "sha256": "df3312752745162d3c362c7437baf220313b24e1c4d2324b9351588207229c20",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-41-FRANK-SALES.toml",
+      "source": "config/agents/AGENT-41-FRANK-SALES.toml",
+      "sha256": "d69835899a45370d9fb5000cd03b20ee8ba727c6a0482cae1d4b145ef7b65a63",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-42-JASMIN-MARKETING.toml",
+      "source": "config/agents/AGENT-42-JASMIN-MARKETING.toml",
+      "sha256": "1ea529e3a7b17a936d128d870a1451db65f6a399ca6d3a5b3fb8a657566d32bd",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-43-MONIKA-ADMIN.toml",
+      "source": "config/agents/AGENT-43-MONIKA-ADMIN.toml",
+      "sha256": "78b75318ca0f505b697aa9ce77cbc1df53bab3ea396914e08fc2adfd6464f8c4",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-44-MARCUS-IT.toml",
+      "source": "config/agents/AGENT-44-MARCUS-IT.toml",
+      "sha256": "44c39d79891b0c524c322987339bbf784727a0c2c12283b8f832c627189d375a",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-45-EMILIA-WERKSTUD.toml",
+      "source": "config/agents/AGENT-45-EMILIA-WERKSTUD.toml",
+      "sha256": "491c73e596e80f2c7251a24054672d67e5bca90c26a879c22b15ce23a9d2f33d",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-46-RALF-BETRIEBSRAT.toml",
+      "source": "config/agents/AGENT-46-RALF-BETRIEBSRAT.toml",
+      "sha256": "c176050abafadddca2bc94ced1d3ec0d865dd55fab8bfae85b81576f9ca1432b",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-47-AYLIN-BETRIEBSRAT.toml",
+      "source": "config/agents/AGENT-47-AYLIN-BETRIEBSRAT.toml",
+      "sha256": "40ce249f6f4d95d0400879d7333886714e6bc8739ff1208da92e1607135dec4f",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-48-STEFAN-BETRIEBSRAT.toml",
+      "source": "config/agents/AGENT-48-STEFAN-BETRIEBSRAT.toml",
+      "sha256": "c071b0aa8674ce76a4d173fd260f220f4f3d19b674dd01c487d73ffcc5426534",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-49-CARLA-BETRIEBSPSYCH.toml",
+      "source": "config/agents/AGENT-49-CARLA-BETRIEBSPSYCH.toml",
+      "sha256": "8af1c0e7ecbe073d00790bebff267ba5a7cc52c57fc25571442ac7a9a1747796",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-50-KATHARINA-BETRIEBSPSYCH.toml",
+      "source": "config/agents/AGENT-50-KATHARINA-BETRIEBSPSYCH.toml",
+      "sha256": "c27c67bf3cfbca63362febcda28934ce32554f4befd384e8d59c233d46734d14",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-51-HENDRIK-BETRIEBSPSYCH.toml",
+      "source": "config/agents/AGENT-51-HENDRIK-BETRIEBSPSYCH.toml",
+      "sha256": "882ffd0584f293279ae744a64322150d596ad1cad9b0f673b12302d32340440e",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-52-WERNER-BETRIEBSARZT.toml",
+      "source": "config/agents/AGENT-52-WERNER-BETRIEBSARZT.toml",
+      "sha256": "74bfe06af72333249144d9f141791a540db0a971c90c0825677e7385e5644b66",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-53-WIESNER-BETRIEBSARZT.toml",
+      "source": "config/agents/AGENT-53-WIESNER-BETRIEBSARZT.toml",
+      "sha256": "bdc32668c92ab633a7409e723f9f93907abe0dfcf2263cc14eeb404f66dea7cd",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-54-BRANDT-BETRIEBSARZT.toml",
+      "source": "config/agents/AGENT-54-BRANDT-BETRIEBSARZT.toml",
+      "sha256": "20bd90bf4e965f885cf8800a40794ba50b733456e0e4536a22c86930a0466fb0",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-55-LAURA-QA.toml",
+      "source": "config/agents/AGENT-55-LAURA-QA.toml",
+      "sha256": "1a5c6caa46f52338d7c49b9ceca4663244a69184f13602211dad693598fa6dc7",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-56-TOBIAS-DELIVERY.toml",
+      "source": "config/agents/AGENT-56-TOBIAS-DELIVERY.toml",
+      "sha256": "0ca3adf25b4956db97e701b089fd26991e58040a9abbdaae2aef6e29f6c3abb7",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-57-CHEN-QA.toml",
+      "source": "config/agents/AGENT-57-CHEN-QA.toml",
+      "sha256": "dbb60991a1f9862648bb163698b4a50c3a67d8948ceeab4eba41bcaf23cd0da1",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-58-MARIA-DELIVERY.toml",
+      "source": "config/agents/AGENT-58-MARIA-DELIVERY.toml",
+      "sha256": "687a16bb009def1987fad7a5c4e08a216e0862d6b3f6feb0f90aff78864c0d8e",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-59-AMIR-QA.toml",
+      "source": "config/agents/AGENT-59-AMIR-QA.toml",
+      "sha256": "ac373dc63ec5f56e3bf85ed938dc6f02461862de25e628c1c49c05c13b7131f1",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/agents/AGENT-60-KATRIN-DELIVERY.toml",
+      "source": "config/agents/AGENT-60-KATRIN-DELIVERY.toml",
+      "sha256": "5017a7c905b3c757d4be3f7f0af3e1cc9f715e5b016dd825e0aa2b1fade63976",
+      "type": "config"
     }
   ]
 }
