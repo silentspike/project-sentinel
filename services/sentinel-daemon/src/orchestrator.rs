@@ -3147,6 +3147,15 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         )
         .context("initialize M0 company workflow")?,
     );
+    #[cfg(feature = "llm")]
+    if workflow_api
+        .requeue_request_sales_schema_mismatch()
+        .map_err(|error| {
+            anyhow::anyhow!("recover Sales completion after schema correction: {error}")
+        })?
+    {
+        info!("Requeued exact durable Sales completion after schema correction");
+    }
 
     // -- Platform LLM Analyzer starten (daemon-interner Background-Worker) --
     #[cfg(feature = "llm")]
