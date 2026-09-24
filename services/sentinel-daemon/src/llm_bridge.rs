@@ -469,6 +469,9 @@ pub mod bridge {
                 ProviderExecutionAuthority::Adaptive(adaptive) => {
                     Some(adaptive.grant.authority.project_id.0.clone())
                 }
+                ProviderExecutionAuthority::ProjectPlanning(planning) => {
+                    Some(planning.grant.project_id.0.clone())
+                }
                 ProviderExecutionAuthority::RequestSales(_) => None,
             }),
             work_item_id: authority.and_then(|value| match value {
@@ -476,7 +479,8 @@ pub mod bridge {
                 ProviderExecutionAuthority::Adaptive(adaptive) => {
                     Some(adaptive.grant.authority.work_item_id.0.clone())
                 }
-                ProviderExecutionAuthority::RequestSales(_) => None,
+                ProviderExecutionAuthority::RequestSales(_)
+                | ProviderExecutionAuthority::ProjectPlanning(_) => None,
             }),
             reservation_id: authority.map(|value| value.reservation_id().to_owned()),
             assignment_id: authority.and_then(|value| match value {
@@ -484,14 +488,16 @@ pub mod bridge {
                 ProviderExecutionAuthority::Adaptive(adaptive) => {
                     Some(adaptive.assignment_id.clone())
                 }
-                ProviderExecutionAuthority::RequestSales(_) => None,
+                ProviderExecutionAuthority::RequestSales(_)
+                | ProviderExecutionAuthority::ProjectPlanning(_) => None,
             }),
             assignment_version: authority.and_then(|value| match value {
                 ProviderExecutionAuthority::Project(project) => Some(project.assignment_version),
                 ProviderExecutionAuthority::Adaptive(adaptive) => {
                     Some(adaptive.grant.authority.assignment_version)
                 }
-                ProviderExecutionAuthority::RequestSales(_) => None,
+                ProviderExecutionAuthority::RequestSales(_)
+                | ProviderExecutionAuthority::ProjectPlanning(_) => None,
             }),
             provider: usage_v2_enabled.then(|| resp.provider.clone()),
             requested_model: usage_v2_enabled.then(|| {
@@ -537,6 +543,7 @@ pub mod bridge {
         if usage_v2_enabled {
             event = event.with_schema_version(match authority {
                 Some(ProviderExecutionAuthority::RequestSales(_)) => 4,
+                Some(ProviderExecutionAuthority::ProjectPlanning(_)) => 5,
                 Some(
                     ProviderExecutionAuthority::Project(_)
                     | ProviderExecutionAuthority::Adaptive(_),
@@ -1854,22 +1861,27 @@ pub mod bridge {
         context: &ModelWorkContext,
     ) -> Result<(), &'static str> {
         let binding = context.binding();
-        let forbidden = if matches!(
-            binding,
-            ProviderExecutionAuthority::Project(_) | ProviderExecutionAuthority::Adaptive(_)
-        ) {
-            &[
+        let forbidden = match binding {
+            ProviderExecutionAuthority::Project(_) | ProviderExecutionAuthority::Adaptive(_) => &[
                 "company_execution_subject",
                 "customer_request_id",
                 "customer_request_version",
-            ][..]
-        } else {
-            &[
+                "project_version",
+            ][..],
+            ProviderExecutionAuthority::RequestSales(_) => &[
                 "project_id",
+                "project_version",
                 "work_item_id",
                 "assignment_id",
                 "assignment_version",
-            ][..]
+            ][..],
+            ProviderExecutionAuthority::ProjectPlanning(_) => &[
+                "customer_request_id",
+                "customer_request_version",
+                "work_item_id",
+                "assignment_id",
+                "assignment_version",
+            ][..],
         };
         if forbidden
             .iter()
@@ -1897,6 +1909,7 @@ pub mod bridge {
             match binding {
                 ProviderExecutionAuthority::RequestSales(_) => "2",
                 ProviderExecutionAuthority::Adaptive(_) => "3",
+                ProviderExecutionAuthority::ProjectPlanning(_) => "4",
                 ProviderExecutionAuthority::Project(_) => "1",
             }
             .to_owned(),
@@ -1941,6 +1954,17 @@ pub mod bridge {
             request.metadata.insert(
                 "subscription_catalog_digest".to_owned(),
                 adaptive.grant.catalog_digest.clone(),
+            );
+        }
+        if let ProviderExecutionAuthority::ProjectPlanning(planning) = &binding {
+            request.model = planning.grant.model.clone();
+            request.metadata.insert(
+                "subscription_allowance_id".to_owned(),
+                planning.allowance_id.clone(),
+            );
+            request.metadata.insert(
+                "subscription_catalog_digest".to_owned(),
+                planning.grant.catalog_digest.clone(),
             );
         }
         request.messages = vec![GatewayMessage {
@@ -2007,6 +2031,17 @@ pub mod bridge {
                 ),
                 (
                     "customer_request_version".to_owned(),
+                    value.grant.expected_version.to_string(),
+                ),
+            ]),
+            ProviderExecutionAuthority::ProjectPlanning(value) => values.extend([
+                (
+                    "company_execution_subject".to_owned(),
+                    "project_planning".to_owned(),
+                ),
+                ("project_id".to_owned(), value.grant.project_id.0.clone()),
+                (
+                    "project_version".to_owned(),
                     value.grant.expected_version.to_string(),
                 ),
             ]),

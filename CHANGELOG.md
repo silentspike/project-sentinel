@@ -1,5 +1,12 @@
 # Changelog
 
+- Let an accepted customer proposal enter autonomous project planning through
+  the real Gateway/provider path. Persist and single-claim the exact planning
+  authority, bind model-selected tasks to server-owned agents, budgets and
+  work identifiers, reject invalid or cyclic plans, and assign every newly
+  ready dependency without allowing the acceptance harness to author work
+  (#856).
+
 - Align the real Sales prompt and parser on one strict top-level decision schema.
   Requeue only the exact digest-bound completion that exhausted the former
   parser mismatch, without repeating provider I/O; all other failures remain

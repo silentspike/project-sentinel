@@ -117,10 +117,7 @@ func (a *SubscriptionAdmission) validSubscriptionIdentity(metadata map[string]st
 }
 
 func (a *SubscriptionAdmission) validSubscriptionRequestID(metadata map[string]string, schemaVersion int) bool {
-	if schemaVersion == 3 {
-		return adaptiveRequestIdentity(metadata["request_id"], metadata)
-	}
-	return metadata["request_id"] == "company-provider-"+a.allowanceID
+	return companyExecutionRequestIdentity(metadata["request_id"], metadata, strconv.Itoa(schemaVersion))
 }
 
 func (a *SubscriptionAdmission) validSubscriptionModelBinding(req *LLMRequest) bool {
@@ -157,6 +154,12 @@ func subscriptionExecutionSubject(req *LLMRequest) (int, *customerRequestExecuti
 			Kind: "adaptive_session", SessionID: req.Metadata["adaptive_session_id"],
 			EffectID: req.Metadata["adaptive_effect_id"], SessionVersion: version,
 		}, nil
+	case "4":
+		if classified, err := classifyModelWorkRequest(req, req.Metadata["request_id"]); err != nil || !classified {
+			return 0, nil, errors.New("invalid project planning execution request")
+		}
+		subject, err := projectPlanningSubject(req.Metadata)
+		return 4, subject, err
 	default:
 		return 0, nil, errors.New("unsupported subscription execution schema")
 	}
