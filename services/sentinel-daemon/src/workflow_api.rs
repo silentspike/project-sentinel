@@ -3137,6 +3137,20 @@ impl WorkflowApi {
             now_unix_ms(),
         ) {
             Ok(value) => {
+                if let CompanyWorkflowResponseV1::AgreementProject { project, .. } = &value.response
+                {
+                    if let Err(error) = self.ensure_project_planning_call(project) {
+                        if let Ok(mut last_error) = self.last_error.lock() {
+                            *last_error = Some(error.to_owned());
+                        }
+                        return json_error(
+                            503,
+                            "project_planning_pending",
+                            "agreement is durable but autonomous project planning is pending",
+                            true,
+                        );
+                    }
+                }
                 if is_collaboration_command_v1(&envelope.command) {
                     if let Err(error) = self.publish_collaboration_backlog() {
                         if let Ok(mut last_error) = self.last_error.lock() {
@@ -3667,18 +3681,7 @@ impl WorkflowApi {
         &self,
         agent_id: AgentId,
     ) -> Result<Option<ProviderUsageBinding>, &'static str> {
-        if !self.enabled {
-            return Ok(None);
-        }
-        let projects = self
-            .store
-            .company_projects()
-            .map_err(|_| "company provider authority could not be read")?;
-        let binding = select_provider_usage_binding(
-            &projects,
-            agent_id,
-            self.subscription_allowance_id.as_deref(),
-        )?;
+        let binding = self.selected_provider_usage_binding_for_agent(agent_id)?;
         if let Some(allowance_id) = &self.subscription_allowance_id {
             if !binding.as_ref().is_some_and(|binding| {
                 &binding.reservation_id == allowance_id && binding.subscription_grant.is_some()
@@ -3692,6 +3695,24 @@ impl WorkflowApi {
             return Err("subscription work allowance is not enabled");
         }
         Ok(binding)
+    }
+
+    fn selected_provider_usage_binding_for_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<ProviderUsageBinding>, &'static str> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let projects = self
+            .store
+            .company_projects()
+            .map_err(|_| "company provider authority could not be read")?;
+        select_provider_usage_binding(
+            &projects,
+            agent_id,
+            self.subscription_allowance_id.as_deref(),
+        )
     }
 
     fn agent_command(&self, principal: &BoundPrincipal, body: &[u8]) -> WorkflowHttpResponse {
@@ -4421,6 +4442,14 @@ impl WorkflowApi {
     fn reconcile_batch(&self, should_stop: &impl Fn() -> bool) -> Result<(), WorkflowError> {
         self.publish_collaboration_backlog()
             .map_err(|_| workflow_unavailable())?;
+        for project in self.store.company_projects()? {
+            if project.lifecycle_state == sentinel_workflow::ProjectLifecycleStateV1::Planning
+                && project.work_items.is_empty()
+            {
+                self.ensure_project_planning_call(&project)
+                    .map_err(|_| workflow_unavailable())?;
+            }
+        }
         for pending in self.store.pending_executions(MAX_RECONCILE_BATCH)? {
             if should_stop() {
                 return Ok(());
@@ -4627,12 +4656,37 @@ impl WorkflowApi {
                 &execution.plan.request_digest,
                 execution.version,
             );
-            self.core.apply_company_command(
+            let outcome = self.core.apply_company_command(
                 &principal.principal,
                 operation_id,
                 &command,
                 occurred_at,
             )?;
+            if target == sentinel_workflow::CompanyWorkStateV1::Done {
+                let CompanyWorkflowResponseV1::Project(next) = outcome.response else {
+                    return Err(workflow_persistence_failure());
+                };
+                let planner_participant = next
+                    .governance
+                    .participants
+                    .iter()
+                    .find(|participant| participant.role == CompanyRoleV1::ProjectManager)
+                    .ok_or_else(principal_unavailable)?;
+                let planner = self
+                    .principals
+                    .principal(&planner_participant.principal_id)
+                    .filter(|bound| {
+                        bound.principal.agent_id == Some(planner_participant.agent_id)
+                            && bound.principal.role == CompanyRoleV1::ProjectManager
+                    })
+                    .ok_or_else(principal_unavailable)?;
+                self.assign_ready_model_work(
+                    &planner.principal,
+                    *next,
+                    &execution.plan.request_digest,
+                )
+                .map_err(|_| workflow_persistence_failure())?;
+            }
         }
         Ok(())
     }
@@ -4702,12 +4756,22 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         if self.request_sales_tenant.is_none() {
             return Ok(true);
         }
-        Ok(self.request_sales_call()?.is_some_and(|call| {
-            call.grant.sales_principal.agent_id == Some(agent_id)
-                && call.question_response.is_none()
+        if let Some(call) = self.request_sales_call()? {
+            if call.question_response.is_none()
                 && call.proposal_response.is_none()
                 && call.abandonment_event_id.is_none()
-        }))
+            {
+                return Ok(call.grant.sales_principal.agent_id == Some(agent_id));
+            }
+        }
+        if let Some(call) = self.project_planning_call()? {
+            if call.planned_project.is_none() {
+                return Ok(call.grant.planner_principal.agent_id == Some(agent_id));
+            }
+        }
+        Ok(self
+            .selected_provider_usage_binding_for_agent(agent_id)?
+            .is_some())
     }
 
     fn model_work_context(
@@ -4728,6 +4792,13 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
             model_execution::ProviderExecutionAuthority::RequestSales(binding) => {
                 self.prepare_request_sales(binding).map(|value| {
                     Some(model_execution::ModelExecutionContext::RequestSales(
+                        Box::new(value),
+                    ))
+                })
+            }
+            model_execution::ProviderExecutionAuthority::ProjectPlanning(binding) => {
+                self.prepare_project_planning(binding).map(|value| {
+                    Some(model_execution::ModelExecutionContext::ProjectPlanning(
                         Box::new(value),
                     ))
                 })
@@ -4757,6 +4828,9 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
             model_execution::ModelExecutionContext::RequestSales(context) => {
                 self.accept_request_sales(completion, context, request_id, request_digest)
             }
+            model_execution::ModelExecutionContext::ProjectPlanning(context) => {
+                self.accept_project_planning(completion, context, request_id, request_digest)
+            }
         }
     }
 
@@ -4765,18 +4839,39 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         agent_id: AgentId,
     ) -> Result<Option<model_execution::ProviderExecutionAuthority>, &'static str> {
         if let Some(call) = self.request_sales_call()? {
-            if call.grant.sales_principal.agent_id != Some(agent_id) {
-                return Err("only the configured Sales employee may dispatch");
+            if call.question_response.is_none()
+                && call.proposal_response.is_none()
+                && call.abandonment_event_id.is_none()
+            {
+                if call.grant.sales_principal.agent_id != Some(agent_id) {
+                    return Ok(None);
+                }
+                let binding = model_execution::RequestSalesAuthority {
+                    schema_version: 2,
+                    allowance_id: call.allowance_id,
+                    grant: call.grant,
+                };
+                self.prepare_request_sales(&binding)?;
+                return Ok(Some(
+                    model_execution::ProviderExecutionAuthority::RequestSales(Box::new(binding)),
+                ));
             }
-            let binding = model_execution::RequestSalesAuthority {
-                schema_version: 2,
-                allowance_id: call.allowance_id,
-                grant: call.grant,
-            };
-            self.prepare_request_sales(&binding)?;
-            return Ok(Some(
-                model_execution::ProviderExecutionAuthority::RequestSales(Box::new(binding)),
-            ));
+        }
+        if let Some(call) = self.project_planning_call()? {
+            if call.planned_project.is_none() {
+                if call.grant.planner_principal.agent_id != Some(agent_id) {
+                    return Ok(None);
+                }
+                let binding = model_execution::ProjectPlanningAuthority {
+                    schema_version: 4,
+                    allowance_id: call.allowance_id,
+                    grant: call.grant,
+                };
+                self.prepare_project_planning(&binding)?;
+                return Ok(Some(
+                    model_execution::ProviderExecutionAuthority::ProjectPlanning(Box::new(binding)),
+                ));
+            }
         }
         if let Some(binding) = self.adaptive_provider_authority(agent_id)? {
             return Ok(Some(model_execution::ProviderExecutionAuthority::Adaptive(

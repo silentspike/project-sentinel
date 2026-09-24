@@ -67,6 +67,61 @@ func adaptiveSubscriptionTestRequest() *LLMRequest {
 	return req
 }
 
+func projectPlanningSubscriptionTestRequest() *LLMRequest {
+	req := subscriptionTestRequest()
+	for key, value := range projectPlanningMetadata() {
+		if key == "reservation_id" || key == "reserved_provider" || key == "company_execution_context_digest" {
+			continue
+		}
+		req.Metadata[key] = value
+	}
+	req.Metadata["reservation_id"] = "subscription-test"
+	req.Metadata["subscription_allowance_id"] = "subscription-test"
+	req.Metadata["subscription_catalog_digest"] = strings.Repeat("c", 64)
+	req.Metadata["request_id"] = "company-planning-subscription-test-project-test"
+	req.MaxTokens = 128
+	return req
+}
+
+func TestProjectPlanningSubscriptionClaimsExactSubjectBeforeProvider(t *testing.T) {
+	var callbacks atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbacks.Add(1)
+		var request subscriptionDispatch
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		want := customerRequestExecutionSubject{Kind: "project_planning", ProjectID: "project-test", ProjectVersion: 1}
+		if request.SchemaVersion != 4 || request.Subject == nil || *request.Subject != want || callbacks.Load() > 1 {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(subscriptionDispatchReceipt{
+			SchemaVersion: 4, AllowanceID: request.AllowanceID, RequestID: request.RequestID,
+			RequestDigest: request.RequestDigest, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli(),
+		})
+	}))
+	defer server.Close()
+	admission, err := NewSubscriptionAdmission("subscription-test", strings.Repeat("c", 64), server.URL, "test-operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &subscriptionTestProvider{}
+	if _, err := admission.send(context.Background(), provider, projectPlanningSubscriptionTestRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admission.send(context.Background(), provider, projectPlanningSubscriptionTestRequest()); err == nil {
+		t.Fatal("consumed project planning authority replay admitted another provider call")
+	}
+	if provider.calls.Load() != 1 || callbacks.Load() != 2 {
+		t.Fatalf("provider calls=%d callbacks=%d", provider.calls.Load(), callbacks.Load())
+	}
+}
+
 func TestAdaptiveSubscriptionClaimsExactSubjectBeforeProvider(t *testing.T) {
 	var callbacks atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

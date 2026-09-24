@@ -39,7 +39,7 @@ func classifyModelWorkRequest(req *LLMRequest, requestID string) (bool, error) {
 	if !validCompanyExecutionSubject(req.Metadata, requestID, schema) {
 		return false, invalid
 	}
-	if req.Metadata["request_id"] != requestID || (schema != "3" && requestID != "company-provider-"+req.Metadata["reservation_id"]) {
+	if req.Metadata["request_id"] != requestID || !companyExecutionRequestIdentity(requestID, req.Metadata, schema) {
 		return false, invalid
 	}
 	digest := req.Metadata["company_execution_context_digest"]
@@ -48,6 +48,17 @@ func classifyModelWorkRequest(req *LLMRequest, requestID string) (bool, error) {
 		return false, invalid
 	}
 	return true, nil
+}
+
+func companyExecutionRequestIdentity(requestID string, metadata map[string]string, schema string) bool {
+	switch schema {
+	case "3":
+		return adaptiveRequestIdentity(requestID, metadata)
+	case "4":
+		return requestID == "company-planning-"+metadata["reservation_id"]+"-"+metadata["project_id"]
+	default:
+		return requestID == "company-provider-"+metadata["reservation_id"]
+	}
 }
 
 func metadataValuesPresent(metadata map[string]string, keys ...string) bool {
@@ -71,6 +82,9 @@ func validCompanyExecutionSubject(metadata map[string]string, requestID, schema 
 		adaptiveBinding := append(projectBinding, "adaptive_session_id", "adaptive_effect_id", "adaptive_session_version")
 		return metadataValuesPresent(metadata, adaptiveBinding...) &&
 			!hasCustomerRequestMetadata(metadata) && adaptiveRequestIdentity(requestID, metadata)
+	case "4":
+		_, err := projectPlanningSubject(metadata)
+		return err == nil
 	default:
 		return false
 	}
@@ -91,6 +105,26 @@ type customerRequestExecutionSubject struct {
 	SessionID      string `json:"session_id,omitempty"`
 	EffectID       string `json:"effect_id,omitempty"`
 	SessionVersion uint64 `json:"session_version,omitempty"`
+	ProjectID      string `json:"project_id,omitempty"`
+	ProjectVersion uint64 `json:"project_version,omitempty"`
+}
+
+func projectPlanningSubject(metadata map[string]string) (*customerRequestExecutionSubject, error) {
+	invalid := errors.New("invalid project planning execution subject")
+	if metadata["company_execution_schema"] != "4" || metadata["company_execution_subject"] != "project_planning" || !subscriptionIdentifier.MatchString(metadata["project_id"]) {
+		return nil, invalid
+	}
+	for _, key := range []string{"customer_request_id", "customer_request_version", "work_item_id", "assignment_id", "assignment_version"} {
+		if _, present := metadata[key]; present {
+			return nil, invalid
+		}
+	}
+	versionText := metadata["project_version"]
+	version, err := strconv.ParseUint(versionText, 10, 64)
+	if err != nil || version == 0 || strconv.FormatUint(version, 10) != versionText {
+		return nil, invalid
+	}
+	return &customerRequestExecutionSubject{Kind: "project_planning", ProjectID: metadata["project_id"], ProjectVersion: version}, nil
 }
 
 func hasCustomerRequestMetadata(metadata map[string]string) bool {
