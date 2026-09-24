@@ -943,7 +943,7 @@ impl WorkflowStore {
         let connection = self.connection.lock().map_err(|_| persistence())?;
         let mut statement = connection
             .prepare(
-                "SELECT sequence,event_id,tenant_id,project_id,event_type,operation_id,operation_digest,principal_id,principal_kind,principal_role,agent_id,customer_id,authority_generation,authority_digest,authority_binding_digest,payload,payload_digest,created_at_ms FROM company_events WHERE tenant_id=?1 AND event_type GLOB 'project_*' AND sequence>?2 ORDER BY sequence LIMIT ?3",
+                "SELECT sequence,event_id,tenant_id,project_id,event_type,operation_id,operation_digest,principal_id,principal_kind,principal_role,agent_id,customer_id,authority_generation,authority_digest,authority_binding_digest,payload,payload_digest,created_at_ms FROM company_events WHERE tenant_id=?1 AND event_type GLOB 'project_*' AND event_type NOT IN ('project_planning_call_authorized','project_planning_call_renewed','project_planning_call_dispatched','project_planning_call_completed') AND sequence>?2 ORDER BY sequence LIMIT ?3",
             )
             .map_err(WorkflowError::from)?;
         let rows = statement
@@ -1009,7 +1009,7 @@ impl WorkflowStore {
         let snapshots = {
             let mut statement = transaction
                 .prepare(
-                    "SELECT sequence,event_id,tenant_id,project_id,event_type,operation_id,operation_digest,principal_id,principal_kind,principal_role,agent_id,customer_id,authority_generation,authority_digest,authority_binding_digest,payload,payload_digest,created_at_ms FROM company_events WHERE event_type LIKE 'project_%' ORDER BY sequence",
+                    "SELECT sequence,event_id,tenant_id,project_id,event_type,operation_id,operation_digest,principal_id,principal_kind,principal_role,agent_id,customer_id,authority_generation,authority_digest,authority_binding_digest,payload,payload_digest,created_at_ms FROM company_events WHERE event_type LIKE 'project_%' AND event_type NOT IN ('project_planning_call_authorized','project_planning_call_renewed','project_planning_call_dispatched','project_planning_call_completed') ORDER BY sequence",
                 )
                 .map_err(WorkflowError::from)?;
             let rows = statement
