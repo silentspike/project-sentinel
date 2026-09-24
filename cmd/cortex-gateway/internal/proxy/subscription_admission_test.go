@@ -296,6 +296,31 @@ func TestSubscriptionAdmissionPersistsPermissionAtAuthorityNotGateway(t *testing
 	}
 }
 
+func TestSubscriptionAdmissionCarriesDynamicProjectAllowanceToDurableAuthority(t *testing.T) {
+	admission, err := NewSubscriptionAdmission("subscription-bootstrap", strings.Repeat("c", 64), "http://127.0.0.1:1", "test-operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := subscriptionTestRequest()
+	req.Metadata["subscription_allowance_id"] = "subscription-project-work"
+	req.Metadata["reservation_id"] = "subscription-project-work"
+	req.Metadata["request_id"] = "company-provider-subscription-project-work"
+	dispatch, err := admission.dispatchRequest(&subscriptionTestProvider{}, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dispatch.SchemaVersion != 1 || dispatch.AllowanceID != "subscription-project-work" {
+		t.Fatalf("unexpected dynamic dispatch: %#v", dispatch)
+	}
+
+	planning := projectPlanningSubscriptionTestRequest()
+	planning.Metadata["subscription_allowance_id"] = "subscription-project-work"
+	planning.Metadata["reservation_id"] = "subscription-project-work"
+	if _, err := admission.dispatchRequest(&subscriptionTestProvider{}, planning); err == nil {
+		t.Fatal("project planning escaped its exact bootstrap allowance")
+	}
+}
+
 func TestSubscriptionAdmissionRejectsOtherCallersAndBindingsBeforeHTTP(t *testing.T) {
 	admission, err := NewSubscriptionAdmission("subscription-test", strings.Repeat("c", 64), "http://127.0.0.1:1", "test-operator")
 	if err != nil {

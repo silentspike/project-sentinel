@@ -4,6 +4,9 @@ use sentinel_workflow::CustomerRequestStateV1;
 
 pub(crate) fn fixture(path: &Path) -> (WorkflowApi, RequestSalesContext) {
     let mut api = super::super::model_work::configured_test_api(path);
+    // The product campaign covers Sales, planning, and bounded work calls.
+    // Keep this fixture aligned with the deployed single-node contract.
+    api.request_sales_total_limit = 10;
     api.event_store = Some(
         sentinel_limbo::EventStore::open(path.with_extension("events.sqlite").to_str().unwrap())
             .unwrap(),
@@ -703,6 +706,19 @@ fn project_planning_adoption_resumes_after_the_first_durable_workflow_step() {
             .len(),
         1
     );
+    let allowance = project.subscription_call.as_ref().unwrap();
+    let assigned = project.work_items.values().next().unwrap();
+    let assignment = assigned.assignments.first().unwrap();
+    assert_eq!(allowance.grant.work_item_id, assigned.spec.work_item_id);
+    assert_eq!(allowance.grant.agent_id, assignment.agent_id);
+    assert_eq!(allowance.grant.assignment_id, assignment.assignment_id);
+    assert_eq!(
+        allowance.grant.assignment_version,
+        assignment.assignment_version
+    );
+    assert_eq!(allowance.grant.max_calls, 1);
+    assert_eq!(allowance.grant.provider, context.binding.grant.provider);
+    assert_ne!(allowance.allowance_id, context.binding.allowance_id);
     let mut substituted = project;
     substituted.version += 1;
     assert!(api
@@ -717,6 +733,156 @@ fn project_planning_adoption_resumes_after_the_first_durable_workflow_step() {
             now_unix_ms(),
         )
         .is_err());
+}
+
+#[test]
+fn project_planning_reconcile_grants_existing_assigned_project_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
+    let binding = ProviderExecutionAuthority::ProjectPlanning(Box::new(context.binding.clone()));
+    let request_id = binding.request_id();
+    let request_digest = "d".repeat(64);
+    let context_digest = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&ModelExecutionContext::ProjectPlanning(Box::new(
+                context.clone()
+            )))
+            .unwrap()
+        )
+    );
+    api.event_store
+        .as_ref()
+        .unwrap()
+        .reserve_llm_request(
+            &request_id,
+            &request_digest,
+            &context
+                .binding
+                .grant
+                .planner_principal
+                .agent_id
+                .unwrap()
+                .to_string(),
+        )
+        .unwrap();
+    let request = serde_json::json!({
+        "schema_version": 4,
+        "allowance_id": context.binding.allowance_id,
+        "agent_id": context.binding.grant.planner_principal.agent_id.unwrap().0,
+        "request_id": request_id,
+        "request_digest": request_digest,
+        "context_digest": context_digest,
+        "provider": context.binding.grant.provider,
+        "model": context.binding.grant.model,
+        "catalog_digest": context.binding.grant.catalog_digest,
+        "subject": {"kind":"project_planning","project_id":context.source_project.project_id,
+            "project_version":context.source_project.version}
+    });
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+            .status,
+        200
+    );
+
+    let content = r#"{"schema_version":1,"rationale":"Implement the accepted site directly.","tasks":[{"key":"implement","title":"Implement site","objective":"Build and validate the accepted site.","role":"developer","depends_on":[]}] }"#;
+    let decision: ProjectPlanningDecision = serde_json::from_str(content).unwrap();
+    let items = api.bind_project_plan(&context, &decision).unwrap();
+    let outcome = api
+        .core
+        .apply_company_command(
+            &context.binding.grant.planner_principal,
+            stable_operation_id("sentinel.workflow.adopt-project-plan.v1", &request_id, 1),
+            &CompanyWorkflowCommandV1::PlanWorkGraph {
+                project_id: context.source_project.project_id.clone(),
+                expected_version: context.source_project.version,
+                items,
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::Project(planned) = outcome.response else {
+        panic!("planned project")
+    };
+    let outcome = api
+        .core
+        .apply_company_command(
+            &context.binding.grant.planner_principal,
+            stable_operation_id("sentinel.workflow.activate-model-plan.v1", &request_id, 2),
+            &CompanyWorkflowCommandV1::ActivateProject {
+                project_id: planned.project_id.clone(),
+                expected_version: planned.version,
+                reason_ref: "accepted-model-authored-plan".to_owned(),
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::Project(project) = outcome.response else {
+        panic!("activated project")
+    };
+    let outcome = api
+        .core
+        .apply_company_command(
+            &context.binding.grant.planner_principal,
+            stable_operation_id(
+                "sentinel.workflow.record-model-plan-decision.v1",
+                &request_id,
+                3,
+            ),
+            &CompanyWorkflowCommandV1::RecordDecision {
+                project_id: project.project_id.clone(),
+                expected_version: project.version,
+                work_item_id: None,
+                choice_ref: "model-authored-project-plan".to_owned(),
+                rationale_ref: decision.rationale,
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::Project(project) = outcome.response else {
+        panic!("planned decision")
+    };
+    let assigned = api
+        .assign_ready_model_work(
+            &context.binding.grant.planner_principal,
+            *project,
+            &request_id,
+        )
+        .unwrap();
+    assert!(assigned.subscription_call.is_none());
+    api.store
+        .complete_project_planning_call(
+            &context.binding.grant.planner_principal,
+            &context.binding.grant.project_id,
+            &context.binding.allowance_id,
+            &request_digest,
+            &format!("{:x}", Sha256::digest(content.as_bytes())),
+            &assigned,
+            now_unix_ms(),
+        )
+        .unwrap();
+
+    api.reconcile_pending();
+    let granted = api
+        .store
+        .company_project(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .unwrap();
+    let allowance = granted.subscription_call.clone().unwrap();
+    api.reconcile_pending();
+    let replayed = api
+        .store
+        .company_project(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(replayed.subscription_call.as_ref(), Some(&allowance));
+    assert_eq!(replayed.version, granted.version);
 }
 
 #[test]
