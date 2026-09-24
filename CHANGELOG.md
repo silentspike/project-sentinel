@@ -1,5 +1,11 @@
 # Changelog
 
+- Keep autonomous project-planning authority events out of the ProjectV1
+  snapshot feed, while retaining fail-closed rejection for unknown project
+  event types. Accept schema-v5 planning usage in the hierarchy projection
+  only when its tenant, project, reservation and request lineage are exact
+  (#856).
+
 - Let an accepted customer proposal enter autonomous project planning through
   the real Gateway/provider path. Persist and single-claim the exact planning
   authority, bind model-selected tasks to server-owned agents, budgets and

@@ -327,8 +327,33 @@ impl ProjectionWorker {
                         {
                             anyhow::bail!("v2 agent_llm_usage is missing effective_model");
                         }
-                        if event.schema_version > 4 {
+                        if event.schema_version > 5 {
                             anyhow::bail!("unsupported agent_llm_usage authority schema");
+                        }
+                        if event.schema_version == 5
+                            && ([
+                                tenant_id.as_deref(),
+                                project_id.as_deref(),
+                                reservation_id.as_deref(),
+                                provider.as_deref(),
+                                requested_model.as_deref(),
+                            ]
+                            .into_iter()
+                            .any(|value| value.is_none_or(|value| value.trim().is_empty()))
+                                || work_item_id.is_some()
+                                || assignment_id.is_some()
+                                || assignment_version.is_some()
+                                || caller_role.as_deref() != Some("agent_runtime")
+                                || event.correlation_id
+                                    != format!(
+                                        "company-planning-{}-{}",
+                                        reservation_id.as_deref().unwrap_or_default(),
+                                        project_id.as_deref().unwrap_or_default()
+                                    )
+                                || event.operation_id
+                                    != format!("llm_usage_{}", event.correlation_id))
+                        {
+                            anyhow::bail!("v5 agent_llm_usage has invalid planning authority");
                         }
                         if event.schema_version == 4
                             && ([
@@ -557,7 +582,7 @@ fn deserialize_legacy_payload(event_type: &str, payload: &str) -> Option<DomainE
 mod tests {
     use super::*;
     use anyhow::bail;
-    use sentinel_common::{AgentId, DomainEvent, DomainEventPayload};
+    use sentinel_common::{AgentId, CostSource, DomainEvent, DomainEventPayload, HierarchyTier};
     use tempfile::tempdir;
 
     struct FailingHandler;
@@ -587,6 +612,96 @@ mod tests {
             .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
             .append_event(&event)
             .unwrap();
+    }
+
+    fn append_raw_event(store: &EventStore, event: &DomainEvent) {
+        store
+            .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::TestHarness)
+            .append_event(event)
+            .unwrap();
+    }
+
+    fn planning_usage_event(project_id: &str) -> DomainEvent {
+        let allowance = "subscription-planning-a";
+        let request_id = format!("company-planning-{allowance}-{project_id}");
+        let payload = DomainEventPayload::AgentLlmUsage {
+            agent_id: AgentId(9),
+            tenant_id: Some("m0-company".to_owned()),
+            project_id: Some(project_id.to_owned()),
+            work_item_id: None,
+            reservation_id: Some(allowance.to_owned()),
+            assignment_id: None,
+            assignment_version: None,
+            provider: Some("codex-cli".to_owned()),
+            requested_model: Some("gpt-5.6-terra".to_owned()),
+            caller_role: Some("agent_runtime".to_owned()),
+            tier: "mid".to_owned(),
+            hierarchy_tier: Some(HierarchyTier::TIER_2),
+            cost_source: Some(CostSource::ProviderReported),
+            effective_model: Some("gpt-5.6-terra".to_owned()),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read: 0,
+            cache_creation: 0,
+            cost_usd: 0.0,
+        };
+        DomainEvent::new(
+            payload.event_type_str(),
+            "AGENT-09",
+            &payload.to_json(),
+            &request_id,
+            1,
+        )
+        .with_operation_id(&format!("llm_usage_{request_id}"))
+        .with_schema_version(5)
+    }
+
+    #[test]
+    fn hierarchy_projection_accepts_exact_project_planning_usage_authority() {
+        let dir = tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(dir.path().join("events.db").to_str().unwrap()).unwrap());
+        append_raw_event(&event_store, &planning_usage_event("project-a"));
+        let worker = ProjectionWorker::new(
+            Arc::clone(&event_store),
+            ProjectionConfig {
+                db_path: dir
+                    .path()
+                    .join("projection.db")
+                    .to_string_lossy()
+                    .into_owned(),
+                ..ProjectionConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(worker.catch_up_hierarchy().unwrap(), 1);
+    }
+
+    #[test]
+    fn hierarchy_projection_rejects_unbound_project_planning_usage() {
+        let dir = tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(dir.path().join("events.db").to_str().unwrap()).unwrap());
+        let mut event = planning_usage_event("project-a");
+        event.correlation_id = "company-planning-subscription-planning-a-project-b".to_owned();
+        event.operation_id = format!("llm_usage_{}", event.correlation_id);
+        append_raw_event(&event_store, &event);
+        let worker = ProjectionWorker::new(
+            Arc::clone(&event_store),
+            ProjectionConfig {
+                db_path: dir
+                    .path()
+                    .join("projection.db")
+                    .to_string_lossy()
+                    .into_owned(),
+                ..ProjectionConfig::default()
+            },
+        )
+        .unwrap();
+
+        let error = worker.catch_up_hierarchy().unwrap_err();
+        assert!(format!("{error:#}").contains("invalid planning authority"));
     }
 
     #[test]
