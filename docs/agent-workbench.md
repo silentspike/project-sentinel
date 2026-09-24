@@ -267,6 +267,14 @@ call, one concurrent dispatch, at most 120 seconds locally, and an expiry no lat
 than five minutes after creation. The explicit token policy is
 `measured_without_generation_cap`; it is not a hard generation-token guarantee.
 
+After an accepted model-authored plan is activated, the daemon deterministically
+selects the first ready assigned Designer or Developer and grants that exact work
+item. Planning adoption and restart reconciliation use the same stable operation
+identity. A project already carrying a grant is left unchanged, so recovery
+cannot mint a second provider call. This starts the first executable company
+task; advancing authority to later dependency work remains a separate governed
+transition and is not implied by this initial grant.
+
 The project retains its allowance permanently, including a consumed or unknown
 outcome. It cannot create a replacement grant or mix a money reservation into the
 same work item. Projects without an allowance retain their previous serialized
@@ -275,12 +283,16 @@ An older release that does not know this additive project field must not open an
 allowance-bearing store. Roll back through the declared compatible backup/restore
 procedure, with provider activity disabled and external outcomes accounted for.
 
-Set the same `SENTINEL_MODEL_WORK_ALLOWANCE_ID` on the daemon and Gateway for this
-bounded mode. Configure it only after creating the grant through the authenticated
-company command API, with provider activity still disabled during preparation.
-The daemon also requires model work and usage-v2. The Gateway requires its existing
-protected operator credential and a loopback-only `SENTINEL_OPERATOR_API_URL`.
-A subscription-marked request without the Gateway mode fails closed.
+`SENTINEL_MODEL_WORK_ALLOWANCE_ID` remains the shared bootstrap authority for
+pre-agreement Sales and model-authored project planning. It is not rewritten for
+each employee task. Project work carries its durable allowance ID in the exact
+request metadata; the Gateway validates that ID and forwards it to the daemon,
+which resolves it against the current project, assignment and grant before
+claiming dispatch. A dynamic work ID cannot be used for Sales or planning, and
+multiple project grants for one employee fail closed as ambiguous. The daemon
+also requires model work and usage-v2. The Gateway requires its existing protected
+operator credential and a loopback-only `SENTINEL_OPERATOR_API_URL`. A
+subscription-marked request without the Gateway mode fails closed.
 
 Check the entire timeout chain before granting a call. The Gateway defaults to
 a 60-second provider timeout; `SENTINEL_CORTEX_PROVIDER_TIMEOUT_SECONDS=120`
@@ -313,7 +325,8 @@ are API-equivalent estimates, not ChatGPT billed spend, and are not committed as
 actual subscription charges. Missing terminal usage remains unknown, never zero.
 
 Changing or removing this runtime mode is a separate operator action, not an
-automatic reset. Deployment must verify both services use the same grant before
+automatic reset. Deployment must verify both services use the same bootstrap
+configuration and that the daemon resolves the dynamic project grant before
 provider activity is enabled. Restoring a pre-dispatch database snapshot is not
 permission to repeat an external effect; review its outcome before reactivation.
 
@@ -469,8 +482,9 @@ must name the same work, employee and assignment. The old allowance and dispatch
 remain in the correction history, and campaign accounting counts both old and
 new identities without double-counting unchanged snapshots. An invalid new grant
 rolls back the entire correction. Archived allowances cannot be claimed again.
-The configured allowance selector still explicitly controls which new grant may
-dispatch; correction admission alone does not invoke the provider.
+The daemon selects a unique current project allowance for the assigned employee;
+multiple candidates are rejected. Correction admission alone does not invoke the
+provider.
 
 Model correction context binds the stored correction, predecessor plan/state,
 feedback reference, bounded feedback observations and prior model-authored tools.

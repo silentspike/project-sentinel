@@ -337,8 +337,7 @@ impl WorkflowApi {
                 .subscription_call
                 .as_ref()
                 .ok_or("subscription allowance missing")?;
-            if self.subscription_allowance_id.as_deref() != Some(allowance.allowance_id.as_str())
-                || allowance.allowance_id != context.binding.reservation_id
+            if allowance.allowance_id != context.binding.reservation_id
                 || &allowance.grant != grant
                 || !allowance.dispatch.as_ref().is_some_and(|dispatch| {
                     dispatch.request_id == request_id && dispatch.request_digest == request_digest
@@ -929,25 +928,35 @@ mod tests {
     fn subscription_selection_preserves_other_projects_across_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("company.sqlite");
-        let mut api = configured_test_api(&path);
+        let api = configured_test_api(&path);
         let old = assign_test_work_from(&api, None, 0);
         let binding = assign_test_work_from(&api, Some(1), 100);
         let original = api.store.company_projects().unwrap();
         assert_eq!(original.len(), 2);
-        assert!(api.provider_usage_binding_for_agent(AgentId(6)).is_err());
-        api.subscription_allowance_id = Some(binding.reservation_id.clone());
+        assert_eq!(
+            api.provider_usage_binding_for_agent(AgentId(6))
+                .unwrap()
+                .unwrap()
+                .reservation_id,
+            binding.reservation_id
+        );
         let context = api.prepare_model_work(&binding).unwrap().unwrap();
         assert_eq!(context.binding, binding);
         assert!(api.prepare_model_work(&old).is_err());
-        assert!(api.provider_usage_binding_for_agent(AgentId(7)).is_err());
+        assert_eq!(api.provider_usage_binding_for_agent(AgentId(7)), Ok(None));
         assert_eq!(api.store.company_projects().unwrap(), original);
         drop(api);
         let mut api = configured_test_api(&path);
-        api.subscription_allowance_id = Some(binding.reservation_id.clone());
         assert_eq!(api.prepare_model_work(&binding).unwrap().unwrap(), context);
         assert_eq!(api.store.company_projects().unwrap(), original);
         api.subscription_allowance_id = Some("subscription-foreign".into());
-        assert!(api.provider_usage_binding_for_agent(AgentId(6)).is_err());
+        assert_eq!(
+            api.provider_usage_binding_for_agent(AgentId(6))
+                .unwrap()
+                .unwrap()
+                .reservation_id,
+            binding.reservation_id
+        );
     }
 
     #[test]
