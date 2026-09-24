@@ -87,6 +87,13 @@ fn planning_grant_claim_is_exact_durable_and_single_use() {
         .claim_project_planning_call(&planner, &claim(&call), 5)
         .is_err());
 
+    let project_events = store
+        .company_project_events_since(&planner.tenant_id, 0, 100)
+        .unwrap();
+    assert_eq!(project_events.len(), 1);
+    assert_eq!(project_events[0].event_type, "project_created");
+    assert_eq!(store.rebuild_company_project_projections().unwrap(), 1);
+
     let reopened = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();
     assert_eq!(
         reopened
