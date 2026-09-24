@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use uuid::Uuid;
 
+mod project_planning;
 mod request_provider;
 mod subscription;
 mod work_corrections;
@@ -7616,7 +7617,7 @@ mod tests {
         }
     }
 
-    fn accepted_project_fixture() -> (
+    pub(super) fn accepted_project_fixture() -> (
         TempDir,
         std::path::PathBuf,
         WorkflowStore,
