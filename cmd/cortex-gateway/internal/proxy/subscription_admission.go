@@ -99,21 +99,24 @@ func (a *SubscriptionAdmission) dispatchRequest(provider Provider, req *LLMReque
 	if err != nil {
 		return subscriptionDispatch{}, err
 	}
+	if (schemaVersion == 2 || schemaVersion == 4) && m["subscription_allowance_id"] != a.allowanceID {
+		return subscriptionDispatch{}, errors.New("subscription bootstrap authority mismatch")
+	}
 	if !a.validSubscriptionRequestID(m, schemaVersion) {
 		return subscriptionDispatch{}, errors.New("subscription request identity mismatch")
 	}
 	if !a.validSubscriptionModelBinding(req) {
 		return subscriptionDispatch{}, errors.New("subscription request model or digest mismatch")
 	}
-	return subscriptionDispatch{SchemaVersion: schemaVersion, AllowanceID: a.allowanceID, AgentID: agentID, Subject: subject,
+	return subscriptionDispatch{SchemaVersion: schemaVersion, AllowanceID: m["subscription_allowance_id"], AgentID: agentID, Subject: subject,
 		RequestID: m["request_id"], RequestDigest: req.AuthorityRequestDigest, ContextDigest: m["company_execution_context_digest"],
 		Provider: provider.Name(), Model: req.EffectiveModel, CatalogDigest: a.catalogDigest}, nil
 }
 
 func (a *SubscriptionAdmission) validSubscriptionIdentity(metadata map[string]string, agentID uint64) bool {
 	return agentID > 0 && agentID <= 65535 &&
-		metadata["subscription_allowance_id"] == a.allowanceID &&
-		metadata["reservation_id"] == a.allowanceID
+		subscriptionIdentifier.MatchString(metadata["subscription_allowance_id"]) &&
+		metadata["reservation_id"] == metadata["subscription_allowance_id"]
 }
 
 func (a *SubscriptionAdmission) validSubscriptionRequestID(metadata map[string]string, schemaVersion int) bool {

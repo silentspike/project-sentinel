@@ -2064,6 +2064,8 @@ impl WorkflowApi {
             return Err("project planning rationale response is invalid");
         };
         let planned_project = self.assign_ready_model_work(planner, *next, request_id)?;
+        let planned_project =
+            self.grant_initial_model_work(planner, planned_project, &call.grant, request_id)?;
         let response_digest = format!("{:x}", Sha256::digest(completion.content.as_bytes()));
         self.store
             .complete_project_planning_call(
@@ -2123,6 +2125,88 @@ impl WorkflowApi {
             project = *next;
         }
         Ok(project)
+    }
+
+    pub(super) fn grant_initial_model_work(
+        &self,
+        planner: &AuthenticatedCompanyPrincipalV1,
+        project: sentinel_workflow::ProjectV1,
+        planning: &sentinel_workflow::ProjectPlanningGrantV1,
+        cause: &str,
+    ) -> Result<sentinel_workflow::ProjectV1, &'static str> {
+        let current = self
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .map_err(|_| "model-planned project unavailable")?
+            .ok_or("model-planned project missing")?;
+        if current.subscription_call.is_some() {
+            return Ok(current);
+        }
+        let mut eligible = current
+            .work_items
+            .values()
+            .filter(|work| {
+                work.state == sentinel_workflow::CompanyWorkStateV1::Assigned
+                    && matches!(
+                        work.spec.required_role,
+                        CompanyRoleV1::Designer | CompanyRoleV1::Developer
+                    )
+            })
+            .filter_map(|work| {
+                let mut active = work
+                    .assignments
+                    .iter()
+                    .filter(|assignment| assignment.active);
+                let assignment = active.next()?;
+                active.next().is_none().then_some((work, assignment))
+            })
+            .collect::<Vec<_>>();
+        eligible.sort_by(|(left, _), (right, _)| {
+            left.spec.work_item_id.0.cmp(&right.spec.work_item_id.0)
+        });
+        let Some((work, assignment)) = eligible.first() else {
+            return Ok(current);
+        };
+        let operation_id = stable_operation_id(
+            "sentinel.workflow.grant-model-plan-work.v1",
+            &format!("{cause}:{}", work.spec.work_item_id.0),
+            assignment.assignment_version,
+        );
+        let now_ms = now_unix_ms();
+        let outcome = self
+            .core
+            .apply_company_command(
+                planner,
+                operation_id,
+                &CompanyWorkflowCommandV1::GrantSubscriptionCall {
+                    project_id: current.project_id.clone(),
+                    expected_version: current.version,
+                    grant: sentinel_workflow::SubscriptionCallGrantV1 {
+                        schema_version: 1,
+                        work_item_id: work.spec.work_item_id.clone(),
+                        assignment_id: assignment.assignment_id.clone(),
+                        assignment_version: assignment.assignment_version,
+                        agent_id: assignment.agent_id,
+                        provider: planning.provider.clone(),
+                        model: planning.model.clone(),
+                        catalog_digest: planning.catalog_digest.clone(),
+                        max_calls: 1,
+                        max_concurrent: 1,
+                        max_duration_ms: 120_000,
+                        token_policy:
+                            sentinel_workflow::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+                        expires_at_unix_ms: now_ms
+                            .checked_add(300_000)
+                            .ok_or("model work grant clock overflow")?,
+                    },
+                },
+                now_ms,
+            )
+            .map_err(|error| error.message)?;
+        let CompanyWorkflowResponseV1::Project(next) = outcome.response else {
+            return Err("model-planned work grant response is invalid");
+        };
+        Ok(*next)
     }
 
     pub(crate) fn requeue_request_sales_schema_mismatch(&self) -> Result<bool, &'static str> {

@@ -3682,17 +3682,12 @@ impl WorkflowApi {
         agent_id: AgentId,
     ) -> Result<Option<ProviderUsageBinding>, &'static str> {
         let binding = self.selected_provider_usage_binding_for_agent(agent_id)?;
-        if let Some(allowance_id) = &self.subscription_allowance_id {
-            if !binding.as_ref().is_some_and(|binding| {
-                &binding.reservation_id == allowance_id && binding.subscription_grant.is_some()
-            }) {
-                return Err("only the configured subscription work allowance may dispatch");
-            }
-        } else if binding
-            .as_ref()
-            .is_some_and(|binding| binding.subscription_grant.is_some())
+        if self.subscription_allowance_id.is_some()
+            && !binding
+                .as_ref()
+                .is_some_and(|binding| binding.subscription_grant.is_some())
         {
-            return Err("subscription work allowance is not enabled");
+            return Err("agent has no project subscription work authority");
         }
         Ok(binding)
     }
@@ -3708,11 +3703,16 @@ impl WorkflowApi {
             .store
             .company_projects()
             .map_err(|_| "company provider authority could not be read")?;
-        select_provider_usage_binding(
-            &projects,
-            agent_id,
-            self.subscription_allowance_id.as_deref(),
-        )
+        let mut project_allowances = projects
+            .iter()
+            .filter_map(|project| project.subscription_call.as_ref())
+            .filter(|allowance| allowance.grant.agent_id == agent_id)
+            .map(|allowance| allowance.allowance_id.as_str());
+        let selected_allowance = project_allowances.next();
+        if project_allowances.next().is_some() {
+            return Err("agent has ambiguous subscription work authority");
+        }
+        select_provider_usage_binding(&projects, agent_id, selected_allowance)
     }
 
     fn agent_command(&self, principal: &BoundPrincipal, body: &[u8]) -> WorkflowHttpResponse {
@@ -4448,6 +4448,23 @@ impl WorkflowApi {
             {
                 self.ensure_project_planning_call(&project)
                     .map_err(|_| workflow_unavailable())?;
+            } else if project.lifecycle_state == sentinel_workflow::ProjectLifecycleStateV1::Active
+                && project.subscription_call.is_none()
+            {
+                let Some(call) = self
+                    .store
+                    .project_planning_call(&project.tenant_id, &project.project_id)?
+                    .filter(|call| call.planned_project.is_some())
+                else {
+                    continue;
+                };
+                self.grant_initial_model_work(
+                    &call.grant.planner_principal,
+                    project,
+                    &call.grant,
+                    &call.allowance_id,
+                )
+                .map_err(|_| workflow_unavailable())?;
             }
         }
         for pending in self.store.pending_executions(MAX_RECONCILE_BATCH)? {
