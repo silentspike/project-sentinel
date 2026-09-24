@@ -440,6 +440,7 @@ fn is_project_event_type(value: &str) -> bool {
             | "project_cost_reserved"
             | "project_subscription_call_granted"
             | "project_subscription_call_claimed"
+            | "project_work_correction_requested"
             | "project_cost_committed"
             | "project_cost_released"
             | "project_room_created"
@@ -7600,6 +7601,7 @@ mod tests {
         assert!(is_project_event_type(
             "project_collaboration_admission_recorded"
         ));
+        assert!(is_project_event_type("project_work_correction_requested"));
         for unknown in [
             "project_collaboration_admission_recorded_v2",
             "project_collaboration_admission_unknown",
