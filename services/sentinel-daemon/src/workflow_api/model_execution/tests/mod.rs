@@ -98,6 +98,89 @@ fn dispatch(api: &WorkflowApi, context: &RequestSalesContext) -> serde_json::Val
     request
 }
 
+fn planning_fixture(path: &Path) -> (WorkflowApi, ProjectPlanningContext) {
+    let (api, sales_context) = fixture(path);
+    let request = dispatch(&api, &sales_context);
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+            .status,
+        200
+    );
+    let id = request["request_id"].as_str().unwrap();
+    let digest = request["request_digest"].as_str().unwrap();
+    let completion = ModelExecutionCompletion {
+        context: ModelExecutionContext::RequestSales(Box::new(sales_context.clone())),
+        content: r#"{"schema_version":1,"kind":"propose_offer","scope":"Design and implement the requested three-page website.","deliverables":["design specification","validated source tree","delivery preview"],"exclusions":["external hosting","production DNS"],"acceptance_criteria":["keyboard-accessible pages","independent QA pass"],"assumptions":["no external media is required"]}"#.into(),
+        admissible: true,
+    };
+    let usage = serde_json::json!({"type":"AgentLlmUsage", "agent_id":3,
+        "tenant_id":"tenant-m0", "reservation_id":sales_context.binding.allowance_id,
+        "project_id":null,"work_item_id":null,"assignment_id":null,"assignment_version":null,
+        "provider":"codex-cli","caller_role":"agent_runtime","effective_model":"model-test",
+        "requested_model":"model-test","tier":"mid","hierarchy_tier":2,"cost_source":"provider_reported",
+        "input_tokens":5,"output_tokens":5,"cache_read":0,"cache_creation":0,"cost_usd":0.0});
+    let event = DomainEvent::new(
+        "agent_llm_usage",
+        &AgentId(3).to_string(),
+        &usage.to_string(),
+        id,
+        1,
+    )
+    .with_operation_id(&format!("llm_usage_{id}"))
+    .with_schema_version(4);
+    let event_store = api.event_store.as_ref().unwrap();
+    event_store
+        .enqueue_llm_completion(
+            id,
+            digest,
+            &serde_json::to_string(&serde_json::json!({
+                "version": 2, "request_id": id, "request_digest": digest,
+                "usage_event": event, "actions": [], "tokens_used": 10, "model_work": completion
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    event_store
+        .persist_llm_completion_usage(id, digest, &event)
+        .unwrap();
+    api.accept_request_sales(&completion, &sales_context, id, digest)
+        .unwrap();
+    let proposal = api
+        .request_sales_call()
+        .unwrap()
+        .unwrap()
+        .proposal_response
+        .unwrap()
+        .proposal;
+    let customer = api.principals.principal("customer").unwrap();
+    let outcome = api
+        .store
+        .apply_company_command(
+            &customer.principal,
+            Uuid::from_u128(91),
+            &CompanyWorkflowCommandV1::AcceptProposal {
+                request_id: proposal.request_id.clone(),
+                expected_version: 3,
+                proposal_id: proposal.proposal_id,
+                proposal_digest: proposal.proposal_digest,
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::AgreementProject { project, .. } = outcome.response else {
+        panic!("agreement")
+    };
+    let call = api.ensure_project_planning_call(&project).unwrap();
+    let context = api
+        .prepare_project_planning(&ProjectPlanningAuthority {
+            schema_version: 4,
+            allowance_id: call.allowance_id,
+            grant: call.grant,
+        })
+        .unwrap();
+    (api, context)
+}
+
 #[test]
 fn sales_abandonment_requires_exact_persisted_resolution_before_new_authority() {
     let temp = tempfile::tempdir().unwrap();
@@ -193,7 +276,10 @@ fn sales_dispatch_requires_exact_subject_current_roster_and_one_durable_claim() 
         403
     );
     health.write().unwrap().agents[0].projection_present = true;
-    assert!(api.resolve_provider_usage_authority(AgentId(6)).is_err());
+    assert!(api
+        .resolve_provider_usage_authority(AgentId(6))
+        .unwrap()
+        .is_none());
     assert_eq!(
         api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
             .status,
@@ -388,6 +474,249 @@ fn sales_parser_does_not_accept_answers_approvals_or_legacy_tools() {
         .into_action(),
         SalesAction::ProposeOffer { .. }
     ));
+}
+
+#[test]
+fn project_plan_is_strict_acyclic_and_server_binds_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
+    let decision: ProjectPlanningDecision = serde_json::from_str(
+        r#"{"schema_version":1,"rationale":"Design precedes implementation.","tasks":[{"key":"design","title":"Create design","objective":"Specify the accessible interface.","role":"designer","depends_on":[]},{"key":"implement","title":"Implement site","objective":"Build and validate the accepted site.","role":"developer","depends_on":["design"]}]}"#,
+    )
+    .unwrap();
+    let items = api.bind_project_plan(&context, &decision).unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].owner, AgentId(4));
+    assert_eq!(items[1].owner, AgentId(6));
+    assert_eq!(items[0].budget_micros, 1_000_000);
+    assert_eq!(items[1].budget_micros, 1_000_000);
+    assert_eq!(items[1].dependency_ids.len(), 1);
+    assert_eq!(items[1].inputs.len(), 1);
+    assert_eq!(
+        items[1].inputs[0].expected_contract_digest,
+        items[0].outputs[0].contract_digest
+    );
+    assert_ne!(items[0].work_item_id.0, "design");
+
+    for invalid in [
+        r#"{"schema_version":1,"rationale":"No implementation.","tasks":[{"key":"design","title":"Design","objective":"Design only.","role":"designer","depends_on":[]}]}"#,
+        r#"{"schema_version":1,"rationale":"Duplicate.","tasks":[{"key":"build","title":"One","objective":"One.","role":"developer","depends_on":[]},{"key":"build","title":"Two","objective":"Two.","role":"developer","depends_on":[]}]}"#,
+        r#"{"schema_version":1,"rationale":"Unknown dependency.","tasks":[{"key":"build","title":"Build","objective":"Build.","role":"developer","depends_on":["missing"]}]}"#,
+        r#"{"schema_version":1,"rationale":"Forward dependency.","tasks":[{"key":"build","title":"Build","objective":"Build.","role":"developer","depends_on":["later"]},{"key":"later","title":"Later","objective":"Later.","role":"developer","depends_on":[]}]}"#,
+    ] {
+        let decision: ProjectPlanningDecision = serde_json::from_str(invalid).unwrap();
+        assert!(api.bind_project_plan(&context, &decision).is_err());
+    }
+    assert!(serde_json::from_str::<ProjectPlanningDecision>(
+        r#"{"schema_version":1,"rationale":"Extra authority.","tasks":[{"key":"build","title":"Build","objective":"Build.","role":"developer","depends_on":[],"agent_id":99}]}"#
+    )
+    .is_err());
+}
+
+#[test]
+fn project_planning_dispatch_claims_the_exact_durable_subject_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
+    let binding = ProviderExecutionAuthority::ProjectPlanning(Box::new(context.binding.clone()));
+    let request_id = binding.request_id();
+    let request_digest = "d".repeat(64);
+    let context_digest = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&ModelExecutionContext::ProjectPlanning(Box::new(
+                context.clone()
+            )))
+            .unwrap()
+        )
+    );
+    api.event_store
+        .as_ref()
+        .unwrap()
+        .reserve_llm_request(
+            &request_id,
+            &request_digest,
+            &context
+                .binding
+                .grant
+                .planner_principal
+                .agent_id
+                .unwrap()
+                .to_string(),
+        )
+        .unwrap();
+    let request = serde_json::json!({
+        "schema_version": 4,
+        "allowance_id": context.binding.allowance_id,
+        "agent_id": context.binding.grant.planner_principal.agent_id.unwrap().0,
+        "request_id": request_id,
+        "request_digest": request_digest,
+        "context_digest": context_digest,
+        "provider": context.binding.grant.provider,
+        "model": context.binding.grant.model,
+        "catalog_digest": context.binding.grant.catalog_digest,
+        "subject": {"kind":"project_planning","project_id":context.source_project.project_id,
+            "project_version":context.source_project.version}
+    });
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+            .status,
+        200
+    );
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+            .status,
+        403
+    );
+}
+
+#[test]
+fn project_planning_adoption_resumes_after_the_first_durable_workflow_step() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
+    let binding = ProviderExecutionAuthority::ProjectPlanning(Box::new(context.binding.clone()));
+    let request_id = binding.request_id();
+    let request_digest = "d".repeat(64);
+    let context_digest = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&ModelExecutionContext::ProjectPlanning(Box::new(
+                context.clone()
+            )))
+            .unwrap()
+        )
+    );
+    let event_store = api.event_store.as_ref().unwrap();
+    event_store
+        .reserve_llm_request(
+            &request_id,
+            &request_digest,
+            &context
+                .binding
+                .grant
+                .planner_principal
+                .agent_id
+                .unwrap()
+                .to_string(),
+        )
+        .unwrap();
+    let request = serde_json::json!({
+        "schema_version": 4,
+        "allowance_id": context.binding.allowance_id,
+        "agent_id": context.binding.grant.planner_principal.agent_id.unwrap().0,
+        "request_id": request_id,
+        "request_digest": request_digest,
+        "context_digest": context_digest,
+        "provider": context.binding.grant.provider,
+        "model": context.binding.grant.model,
+        "catalog_digest": context.binding.grant.catalog_digest,
+        "subject": {"kind":"project_planning","project_id":context.source_project.project_id,
+            "project_version":context.source_project.version}
+    });
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+            .status,
+        200
+    );
+
+    let content = r#"{"schema_version":1,"rationale":"Implement the accepted site directly.","tasks":[{"key":"implement","title":"Implement site","objective":"Build and validate the accepted site.","role":"developer","depends_on":[]}]}"#;
+    let completion = ModelExecutionCompletion {
+        context: ModelExecutionContext::ProjectPlanning(Box::new(context.clone())),
+        content: content.to_owned(),
+        admissible: true,
+    };
+    let planner_agent = context.binding.grant.planner_principal.agent_id.unwrap();
+    let usage = serde_json::json!({"type":"AgentLlmUsage", "agent_id":planner_agent.0,
+        "tenant_id":context.binding.grant.planner_principal.tenant_id.0,
+        "reservation_id":context.binding.allowance_id,
+        "project_id":context.binding.grant.project_id.0,"work_item_id":null,
+        "assignment_id":null,"assignment_version":null,"provider":context.binding.grant.provider,
+        "caller_role":"agent_runtime","effective_model":context.binding.grant.model,
+        "requested_model":context.binding.grant.model,"tier":"mid","hierarchy_tier":2,
+        "cost_source":"provider_reported","input_tokens":5,"output_tokens":5,
+        "cache_read":0,"cache_creation":0,"cost_usd":0.0});
+    let event = DomainEvent::new(
+        "agent_llm_usage",
+        &planner_agent.to_string(),
+        &usage.to_string(),
+        &request_id,
+        1,
+    )
+    .with_operation_id(&format!("llm_usage_{request_id}"))
+    .with_schema_version(5);
+    event_store
+        .enqueue_llm_completion(
+            &request_id,
+            &request_digest,
+            &serde_json::to_string(&serde_json::json!({
+                "version":2,"request_id":request_id,"request_digest":request_digest,
+                "usage_event":event,"actions":[],"tokens_used":10,"model_work":completion
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    event_store
+        .persist_llm_completion_usage(&request_id, &request_digest, &event)
+        .unwrap();
+
+    let decision: ProjectPlanningDecision = serde_json::from_str(content).unwrap();
+    let items = api.bind_project_plan(&context, &decision).unwrap();
+    let plan_operation =
+        stable_operation_id("sentinel.workflow.adopt-project-plan.v1", &request_id, 1);
+    api.core
+        .apply_company_command(
+            &context.binding.grant.planner_principal,
+            plan_operation,
+            &CompanyWorkflowCommandV1::PlanWorkGraph {
+                project_id: context.source_project.project_id.clone(),
+                expected_version: context.source_project.version,
+                items,
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+
+    api.accept_project_planning(&completion, &context, &request_id, &request_digest)
+        .unwrap();
+    api.accept_project_planning(&completion, &context, &request_id, &request_digest)
+        .unwrap();
+    let call = api
+        .store
+        .project_planning_call(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .unwrap();
+    let project = call.planned_project.unwrap();
+    assert_eq!(
+        project.lifecycle_state,
+        sentinel_workflow::ProjectLifecycleStateV1::Active
+    );
+    assert_eq!(project.work_items.len(), 1);
+    assert_eq!(
+        project
+            .work_items
+            .values()
+            .next()
+            .unwrap()
+            .assignments
+            .len(),
+        1
+    );
+    let mut substituted = project;
+    substituted.version += 1;
+    assert!(api
+        .store
+        .complete_project_planning_call(
+            &context.binding.grant.planner_principal,
+            &context.binding.grant.project_id,
+            &context.binding.allowance_id,
+            &request_digest,
+            &format!("{:x}", Sha256::digest(content.as_bytes())),
+            &substituted,
+            now_unix_ms(),
+        )
+        .is_err());
 }
 
 #[test]

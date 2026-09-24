@@ -29,6 +29,10 @@ enum RequestSubject {
         effect_id: Uuid,
         session_version: u64,
     },
+    ProjectPlanning {
+        project_id: ProjectId,
+        project_version: u64,
+    },
 }
 
 impl WorkflowApi {
@@ -67,7 +71,7 @@ impl WorkflowApi {
         let now_ms = now_unix_ms();
         if !self.enabled
             || !self.model_work_enabled
-            || !matches!(request.schema_version, 1..=3)
+            || !matches!(request.schema_version, 1..=4)
             || self.subscription_allowance_id.as_deref() != Some(request.allowance_id.as_str())
         {
             return Err("subscription mode unavailable");
@@ -77,6 +81,9 @@ impl WorkflowApi {
         }
         if request.schema_version == 3 {
             return self.claim_adaptive_dispatch(request, now_ms);
+        }
+        if request.schema_version == 4 {
+            return self.claim_project_planning_dispatch(request, now_ms);
         }
         if request.subject.is_some() || self.request_sales_tenant.is_some() {
             return Err("subscription subject mismatch");
@@ -152,6 +159,102 @@ impl WorkflowApi {
         Ok(grant
             .expires_at_unix_ms
             .min(now_ms.saturating_add(grant.max_duration_ms)))
+    }
+
+    fn claim_project_planning_dispatch(
+        &self,
+        request: &DispatchRequest,
+        now_ms: u64,
+    ) -> Result<u64, &'static str> {
+        use super::model_execution::{
+            ModelExecutionContext, ProjectPlanningAuthority, ProviderExecutionAuthority,
+        };
+
+        let Some(RequestSubject::ProjectPlanning {
+            project_id,
+            project_version,
+        }) = &request.subject
+        else {
+            return Err("project planning subject missing");
+        };
+        let call = self
+            .store
+            .project_planning_call(
+                &self
+                    .request_sales_tenant
+                    .clone()
+                    .ok_or("project planning tenant unavailable")?,
+                project_id,
+            )
+            .map_err(|_| "project planning store unavailable")?
+            .ok_or("project planning allowance unavailable")?;
+        let grant = &call.grant;
+        let dispatch_deadline = grant
+            .expires_at_unix_ms
+            .min(now_ms.saturating_add(grant.max_duration_ms));
+        let binding = ProjectPlanningAuthority {
+            schema_version: 4,
+            allowance_id: call.allowance_id.clone(),
+            grant: grant.clone(),
+        };
+        if project_id != &grant.project_id
+            || *project_version != grant.expected_version
+            || grant.planner_principal.agent_id != Some(AgentId(request.agent_id))
+            || request.allowance_id != call.allowance_id
+            || request.provider != grant.provider
+            || request.model != grant.model
+            || request.catalog_digest != grant.catalog_digest
+            || request.request_id
+                != ProviderExecutionAuthority::ProjectPlanning(Box::new(binding.clone()))
+                    .request_id()
+        {
+            return Err("project planning dispatch binding mismatch");
+        }
+        let context = ModelExecutionContext::ProjectPlanning(Box::new(
+            self.prepare_project_planning(&binding)?,
+        ));
+        context.validate_dispatch(now_ms)?;
+        if format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&context).map_err(|_| "project planning context invalid")?
+            )
+        ) != request.context_digest
+        {
+            return Err("project planning dispatch context mismatch");
+        }
+        let pending = self
+            .event_store
+            .as_ref()
+            .ok_or("project planning EventStore unavailable")?
+            .get_llm_completion(&request.request_id)
+            .map_err(|_| "project planning reservation unavailable")?
+            .ok_or("project planning request not reserved")?;
+        if pending.request_digest != request.request_digest
+            || pending.status != "provider_in_flight"
+            || !pending.payload.is_empty()
+            || pending.owner_scope
+                != sentinel_common::StateTransferScope::for_agent(
+                    AgentId(request.agent_id).to_string(),
+                )
+        {
+            return Err("project planning reservation mismatch");
+        }
+        context.validate_dispatch(now_unix_ms())?;
+        self.store
+            .claim_project_planning_call(
+                &grant.planner_principal,
+                &sentinel_workflow::ClaimProjectPlanningCallV1 {
+                    allowance_id: call.allowance_id.clone(),
+                    project_id: project_id.clone(),
+                    request_id: request.request_id.clone(),
+                    request_digest: request.request_digest.clone(),
+                    context_digest: request.context_digest.clone(),
+                },
+                now_unix_ms(),
+            )
+            .map_err(|_| "project planning dispatch already consumed or denied")?;
+        Ok(dispatch_deadline)
     }
 
     fn claim_adaptive_dispatch(

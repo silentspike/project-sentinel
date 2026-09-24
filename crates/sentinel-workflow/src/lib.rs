@@ -14,6 +14,7 @@ mod engine;
 mod error;
 mod model;
 mod port;
+mod project_planning;
 mod request_provider;
 mod store;
 
@@ -26,6 +27,7 @@ pub use engine::WorkflowCore;
 pub use error::{WorkflowError, WorkflowErrorCode};
 pub use model::*;
 pub use port::*;
+pub use project_planning::*;
 pub use request_provider::*;
 pub use sentinel_common::AgentId;
 pub use store::{ExecutionRevisionV1, WorkflowStore, WORKFLOW_STORE_SCHEMA_VERSION};

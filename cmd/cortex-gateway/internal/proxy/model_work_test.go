@@ -46,6 +46,48 @@ func adaptiveRequestMetadata() map[string]string {
 	return metadata
 }
 
+func projectPlanningMetadata() map[string]string {
+	metadata := modelWorkMetadata()
+	for _, key := range []string{"work_item_id", "assignment_id", "assignment_version"} {
+		delete(metadata, key)
+	}
+	metadata["company_execution_schema"] = "4"
+	metadata["company_execution_subject"] = "project_planning"
+	metadata["project_version"] = "1"
+	metadata["request_id"] = "company-planning-" + metadata["reservation_id"] + "-" + metadata["project_id"]
+	return metadata
+}
+
+func TestProjectPlanningRequiresCanonicalDisjointSubject(t *testing.T) {
+	valid := projectPlanningMetadata()
+	req := LLMRequest{RequestClass: RequestClassAgentRuntime, MaxTokens: 1024, Metadata: valid}
+	if admitted, err := classifyModelWorkRequest(&req, valid["request_id"]); err != nil || !admitted {
+		t.Fatalf("valid project planning request rejected: %v", err)
+	}
+	mutations := map[string]func(map[string]string){
+		"wrong_subject":        func(m map[string]string) { m["company_execution_subject"] = "customer_request" },
+		"missing_project":      func(m map[string]string) { delete(m, "project_id") },
+		"invalid_project":      func(m map[string]string) { m["project_id"] = "../project" },
+		"missing_version":      func(m map[string]string) { delete(m, "project_version") },
+		"zero_version":         func(m map[string]string) { m["project_version"] = "0" },
+		"noncanonical_version": func(m map[string]string) { m["project_version"] = "01" },
+		"wrong_request":        func(m map[string]string) { m["request_id"] = "company-provider-" + m["reservation_id"] },
+		"customer_request":     func(m map[string]string) { m["customer_request_id"] = "request-test" },
+		"work_item":            func(m map[string]string) { m["work_item_id"] = "work-test" },
+		"assignment":           func(m map[string]string) { m["assignment_id"] = "assignment-test" },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			metadata := projectPlanningMetadata()
+			mutate(metadata)
+			request := LLMRequest{RequestClass: RequestClassAgentRuntime, MaxTokens: 1024, Metadata: metadata}
+			if admitted, err := classifyModelWorkRequest(&request, metadata["request_id"]); err == nil || admitted {
+				t.Fatal("invalid project planning request admitted")
+			}
+		})
+	}
+}
+
 func TestCustomerRequestModelWorkRejectsMixedOrNoncanonicalSubjects(t *testing.T) {
 	mutations := map[string]func(map[string]string){
 		"missing_schema":       func(m map[string]string) { delete(m, "company_execution_schema") },
