@@ -1,5 +1,9 @@
 # Changelog
 
+- Recognize governed work-correction snapshots in project event feeds and
+  projection rebuilds instead of rejecting valid historical correction records
+  (#856).
+
 - Keep autonomous project-planning authority events out of the ProjectV1
   snapshot feed, while retaining fail-closed rejection for unknown project
   event types. Accept schema-v5 planning usage in the hierarchy projection
