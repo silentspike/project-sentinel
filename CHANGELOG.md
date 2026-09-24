@@ -1,5 +1,11 @@
 # Changelog
 
+- Grant the first ready Designer or Developer one bounded provider call after
+  model-authored planning, and recover the same transition for already planned
+  projects after restart. Carry the durable project allowance through Gateway
+  and Daemon authority checks without replacing the separate Sales/planning
+  bootstrap pin or permitting ambiguous agent authority (#856).
+
 - Recognize governed work-correction snapshots in project event feeds and
   projection rebuilds instead of rejecting valid historical correction records
   (#856).

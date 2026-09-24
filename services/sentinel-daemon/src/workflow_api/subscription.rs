@@ -72,7 +72,8 @@ impl WorkflowApi {
         if !self.enabled
             || !self.model_work_enabled
             || !matches!(request.schema_version, 1..=4)
-            || self.subscription_allowance_id.as_deref() != Some(request.allowance_id.as_str())
+            || (matches!(request.schema_version, 2 | 4)
+                && self.subscription_allowance_id.as_deref() != Some(request.allowance_id.as_str()))
         {
             return Err("subscription mode unavailable");
         }
