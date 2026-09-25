@@ -4449,7 +4449,7 @@ impl WorkflowApi {
                 self.ensure_project_planning_call(&project)
                     .map_err(|_| workflow_unavailable())?;
             } else if project.lifecycle_state == sentinel_workflow::ProjectLifecycleStateV1::Active
-                && project.subscription_call.is_none()
+                && Self::model_work_grant_due(&project, now_unix_ms())
             {
                 let Some(call) = self
                     .store
