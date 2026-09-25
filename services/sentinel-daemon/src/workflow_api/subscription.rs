@@ -96,12 +96,23 @@ impl WorkflowApi {
         if request.schema_version == 4 {
             return self.claim_project_planning_dispatch(request, now_ms);
         }
-        if request.subject.is_some() || self.request_sales_tenant.is_some() {
+        if request.subject.is_some() {
             return Err("subscription subject mismatch");
         }
-        let binding = <Self as crate::llm_bridge::bridge::ProviderUsageAuthorityResolver>::resolve_provider_usage_authority(self, AgentId(request.agent_id))?
-            .ok_or("subscription binding unavailable")?;
-        let binding = binding.project().ok_or("project binding unavailable")?;
+        let binding = self
+            .provider_usage_binding_for_agent(AgentId(request.agent_id))?
+            .ok_or("project binding unavailable")?;
+        let binding = crate::llm_bridge::bridge::ProviderUsageAuthority {
+            tenant_id: binding.tenant_id,
+            project_id: binding.project_id,
+            work_item_id: binding.work_item_id,
+            reservation_id: binding.reservation_id,
+            assignment_id: binding.assignment_id,
+            assignment_version: binding.assignment_version,
+            agent_id: binding.agent_id,
+            provider: binding.provider,
+            subscription_grant: binding.subscription_grant,
+        };
         let grant = binding
             .subscription_grant
             .as_ref()
@@ -115,7 +126,7 @@ impl WorkflowApi {
             return Err("subscription binding changed");
         }
         let context = self
-            .prepare_model_work(binding)?
+            .prepare_model_work(&binding)?
             .ok_or("model context unavailable")?;
         context.validate_dispatch(now_ms)?;
         let context_bytes = serde_json::to_vec(&context).map_err(|_| "model context invalid")?;
