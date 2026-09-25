@@ -71,6 +71,17 @@ pub mod bridge {
             Ok(None)
         }
 
+        /// Returns true only when durable workflow authority proves that the
+        /// provider dispatch for this exact request was never committed.
+        fn provider_dispatch_is_definitively_absent(
+            &self,
+            _authority: &ProviderExecutionAuthority,
+            _request_id: &str,
+            _request_digest: &str,
+        ) -> Result<bool, &'static str> {
+            Ok(false)
+        }
+
         fn admit_model_work(
             &self,
             _completion: &ModelWorkCompletion,
@@ -390,6 +401,66 @@ pub mod bridge {
             }
             Err(release_error) => {
                 error!(request_id, error = %release_error, "Undispatched LLM reservation release failed closed");
+                false
+            }
+        }
+    }
+
+    fn release_pre_provider_rejection<S: CompletionStore>(
+        store: &S,
+        request_id: &str,
+        request_digest: &str,
+        provider_io: Option<&str>,
+    ) -> bool {
+        if provider_io != Some("not-started") {
+            return false;
+        }
+        match store.release_undispatched_request(request_id, request_digest) {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!(request_id, "Pre-provider LLM reservation was not released");
+                false
+            }
+            Err(release_error) => {
+                error!(request_id, error = %release_error, "Pre-provider LLM reservation release failed closed");
+                false
+            }
+        }
+    }
+
+    fn release_stale_undispatched_subscription<S: CompletionStore>(
+        store: &S,
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
+        authority: Option<&ProviderExecutionAuthority>,
+        entry: &LlmCompletionEntry,
+        now_ms: u64,
+        request_timeout: Duration,
+    ) -> bool {
+        const PRE_PROVIDER_GRACE_MS: u64 = 10_000;
+        let request_timeout_ms = request_timeout.as_millis().try_into().unwrap_or(u64::MAX);
+        let recovery_age_ms = request_timeout_ms.saturating_add(PRE_PROVIDER_GRACE_MS);
+        if entry.status != "provider_in_flight"
+            || now_ms < entry.created_at.saturating_add(recovery_age_ms)
+        {
+            return false;
+        }
+        let (Some(resolver), Some(authority)) = (resolver, authority) else {
+            return false;
+        };
+        match resolver.provider_dispatch_is_definitively_absent(
+            authority,
+            &entry.request_id,
+            &entry.request_digest,
+        ) {
+            Ok(true) => release_pre_provider_rejection(
+                store,
+                &entry.request_id,
+                &entry.request_digest,
+                Some("not-started"),
+            ),
+            Ok(false) => false,
+            Err(reason) => {
+                warn!(request_id = %entry.request_id, reason, "Undispatched provider recovery proof unavailable");
                 false
             }
         }
@@ -1321,6 +1392,23 @@ pub mod bridge {
                         if entry.request_digest == request_digest
                             && entry.status == "provider_in_flight" =>
                     {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX);
+                        if release_stale_undispatched_subscription(
+                            event_store.as_ref(),
+                            config.provider_usage_authority.as_deref(),
+                            usage_authority.as_ref(),
+                            &entry,
+                            now_ms,
+                            config.request_timeout,
+                        ) {
+                            info!(request_id = %request_id, "Definitively undispatched provider reservation released for retry");
+                            continue;
+                        }
                         warn!(request_id = %request_id, "Ambiguous prior provider execution remains fail-closed");
                         continue;
                     }
@@ -1514,7 +1602,17 @@ pub mod bridge {
                                         }
                                     }
                                 } else {
-                                    warn!(agent = %agent_id, status = status.as_u16(), "Gateway HTTP Fehler");
+                                    let provider_io = response
+                                        .headers()
+                                        .get("x-sentinel-provider-io")
+                                        .and_then(|value| value.to_str().ok());
+                                    let reservation_released = release_pre_provider_rejection(
+                                        bridge_event_store.as_ref(),
+                                        &request_id,
+                                        &request_digest,
+                                        provider_io,
+                                    );
+                                    warn!(agent = %agent_id, status = status.as_u16(), reservation_released, "Gateway HTTP Fehler");
                                     telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                     cb.lock().unwrap().record_failure();
                                 }
@@ -1643,7 +1741,17 @@ pub mod bridge {
                                         }
                                     }
                                 } else {
-                                    warn!(agent = %agent_id, status = status.as_u16(), "Gateway HTTP Fehler");
+                                    let provider_io = response
+                                        .headers()
+                                        .get("x-sentinel-provider-io")
+                                        .and_then(|value| value.to_str().ok());
+                                    let reservation_released = release_pre_provider_rejection(
+                                        bridge_event_store.as_ref(),
+                                        &request_id,
+                                        &request_digest,
+                                        provider_io,
+                                    );
+                                    warn!(agent = %agent_id, status = status.as_u16(), reservation_released, "Gateway HTTP Fehler");
                                     telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                     cb.lock().unwrap().record_failure();
                                 }
@@ -2640,6 +2748,11 @@ pub mod bridge {
             authority: ProviderUsageAuthority,
         }
 
+        struct DispatchProofResolver {
+            authority: ProviderUsageAuthority,
+            absent: bool,
+        }
+
         impl ProviderUsageAuthorityResolver for StaticProviderUsageAuthority {
             fn resolve_provider_usage_authority(
                 &self,
@@ -2647,6 +2760,164 @@ pub mod bridge {
             ) -> Result<Option<ProviderExecutionAuthority>, &'static str> {
                 Ok((self.authority.agent_id == agent_id).then(|| self.authority.clone().into()))
             }
+        }
+
+        impl ProviderUsageAuthorityResolver for DispatchProofResolver {
+            fn resolve_provider_usage_authority(
+                &self,
+                agent_id: AgentId,
+            ) -> Result<Option<ProviderExecutionAuthority>, &'static str> {
+                Ok((self.authority.agent_id == agent_id).then(|| self.authority.clone().into()))
+            }
+
+            fn provider_dispatch_is_definitively_absent(
+                &self,
+                authority: &ProviderExecutionAuthority,
+                request_id: &str,
+                request_digest: &str,
+            ) -> Result<bool, &'static str> {
+                if authority != &self.authority.clone().into()
+                    || request_id != format!("company-provider-{}", self.authority.reservation_id)
+                    || request_digest.len() != 64
+                {
+                    return Err("provider dispatch proof identity changed");
+                }
+                Ok(self.absent)
+            }
+        }
+
+        #[test]
+        fn provider_admission_recovery_releases_only_an_explicit_not_started_reservation() {
+            let store = EventStore::open(":memory:").unwrap();
+            let request_id = "company-provider-reservation-release";
+            let request_digest = "a".repeat(64);
+            assert!(store
+                .reserve_request(request_id, &request_digest, "AGENT-03")
+                .unwrap());
+
+            assert!(!release_pre_provider_rejection(
+                &store,
+                request_id,
+                &request_digest,
+                None,
+            ));
+            assert!(!release_pre_provider_rejection(
+                &store,
+                request_id,
+                &request_digest,
+                Some("ambiguous"),
+            ));
+            assert!(store.get_completion(request_id).unwrap().is_some());
+            assert!(release_pre_provider_rejection(
+                &store,
+                request_id,
+                &request_digest,
+                Some("not-started"),
+            ));
+            assert!(store.get_completion(request_id).unwrap().is_none());
+        }
+
+        #[test]
+        fn provider_admission_recovery_requires_grace_and_durable_absence_proof() {
+            let store = EventStore::open(":memory:").unwrap();
+            let request_id = "company-provider-reservation-recovery";
+            let request_digest = "b".repeat(64);
+            let authority = ProviderUsageAuthority {
+                tenant_id: "tenant-m0".to_owned(),
+                project_id: "project-m0".to_owned(),
+                work_item_id: "design-site".to_owned(),
+                reservation_id: "reservation-recovery".to_owned(),
+                assignment_id: "assignment-m0".to_owned(),
+                assignment_version: 1,
+                agent_id: AgentId(3),
+                provider: "codex-cli".to_owned(),
+                subscription_grant: None,
+            };
+            let execution_authority: ProviderExecutionAuthority = authority.clone().into();
+            assert!(store
+                .reserve_request(request_id, &request_digest, "AGENT-03")
+                .unwrap());
+            let entry = store.get_completion(request_id).unwrap().unwrap();
+            let unavailable = DispatchProofResolver {
+                authority: authority.clone(),
+                absent: false,
+            };
+            let absent = DispatchProofResolver {
+                authority,
+                absent: true,
+            };
+
+            assert!(!release_stale_undispatched_subscription(
+                &store,
+                Some(&absent),
+                Some(&execution_authority),
+                &entry,
+                entry.created_at + 9_999,
+                Duration::ZERO,
+            ));
+            assert!(!release_stale_undispatched_subscription(
+                &store,
+                Some(&unavailable),
+                Some(&execution_authority),
+                &entry,
+                entry.created_at + 10_000,
+                Duration::ZERO,
+            ));
+            assert!(store.get_completion(request_id).unwrap().is_some());
+            assert!(release_stale_undispatched_subscription(
+                &store,
+                Some(&absent),
+                Some(&execution_authority),
+                &entry,
+                entry.created_at + 10_000,
+                Duration::ZERO,
+            ));
+            assert!(store.get_completion(request_id).unwrap().is_none());
+        }
+
+        #[test]
+        fn provider_admission_recovery_waits_for_request_timeout_plus_grace() {
+            let store = EventStore::open(":memory:").unwrap();
+            let request_id = "company-provider-reservation-timeout";
+            let request_digest = "c".repeat(64);
+            let authority = ProviderUsageAuthority {
+                tenant_id: "tenant-m0".to_owned(),
+                project_id: "project-m0".to_owned(),
+                work_item_id: "design-site".to_owned(),
+                reservation_id: "reservation-timeout".to_owned(),
+                assignment_id: "assignment-m0".to_owned(),
+                assignment_version: 1,
+                agent_id: AgentId(3),
+                provider: "codex-cli".to_owned(),
+                subscription_grant: None,
+            };
+            let execution_authority: ProviderExecutionAuthority = authority.clone().into();
+            let resolver = DispatchProofResolver {
+                authority,
+                absent: true,
+            };
+            assert!(store
+                .reserve_request(request_id, &request_digest, "AGENT-03")
+                .unwrap());
+            let entry = store.get_completion(request_id).unwrap().unwrap();
+
+            assert!(!release_stale_undispatched_subscription(
+                &store,
+                Some(&resolver),
+                Some(&execution_authority),
+                &entry,
+                entry.created_at + 44_999,
+                Duration::from_secs(35),
+            ));
+            assert!(release_stale_undispatched_subscription(
+                &store,
+                Some(&resolver),
+                Some(&execution_authority),
+                &entry,
+                entry.created_at + 45_000,
+                Duration::from_secs(35),
+            ));
+            assert!(store.get_completion(request_id).unwrap().is_none());
         }
 
         #[test]

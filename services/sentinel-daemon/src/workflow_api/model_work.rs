@@ -1005,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn subscription_dispatch_consumes_once_across_restart_without_changing_context() {
+    fn provider_admission_recovery_dispatch_persists_across_restart() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("company.sqlite");
         let events_path = temp.path().join("events.sqlite");
@@ -1027,6 +1027,14 @@ mod tests {
             "provider": "codex-cli", "model": "gpt-5.4", "catalog_digest": "c".repeat(64),
         });
         let bytes = serde_json::to_vec(&request).unwrap();
+        let execution_authority = context.binding.clone().into();
+        assert!(crate::llm_bridge::bridge::ProviderUsageAuthorityResolver::provider_dispatch_is_definitively_absent(
+            &api,
+            &execution_authority,
+            &id,
+            &digest,
+        )
+        .unwrap());
         let principal = api.principals.principal("developer-6").unwrap();
         let command = serde_json::to_vec(&serde_json::json!({"operation_id": Uuid::new_v4(), "command": {
             "command": "claim_subscription_call", "project_id": binding.project_id, "expected_version": 5,
@@ -1065,6 +1073,13 @@ mod tests {
             );
         }
         assert_eq!(api.subscription_dispatch(&bytes).status, 200);
+        assert!(!crate::llm_bridge::bridge::ProviderUsageAuthorityResolver::provider_dispatch_is_definitively_absent(
+            &api,
+            &execution_authority,
+            &id,
+            &digest,
+        )
+        .unwrap());
         assert_eq!(api.prepare_model_work(&binding).unwrap().unwrap(), context);
         assert_eq!(
             api.subscription_dispatch(&bytes).status,
@@ -1080,6 +1095,13 @@ mod tests {
         api.subscription_allowance_id = Some(binding.reservation_id.clone());
         api.event_store =
             Some(sentinel_limbo::EventStore::open(events_path.to_str().unwrap()).unwrap());
+        assert!(!crate::llm_bridge::bridge::ProviderUsageAuthorityResolver::provider_dispatch_is_definitively_absent(
+            &api,
+            &execution_authority,
+            &id,
+            &digest,
+        )
+        .unwrap());
         assert_eq!(
             api.subscription_dispatch(&bytes).status,
             403,

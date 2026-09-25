@@ -54,12 +54,22 @@ impl WorkflowApi {
                     "deadline_unix_ms": deadline,
                 }),
             ),
-            Err(_) => json_error(
-                403,
-                "subscription_dispatch_denied",
-                "subscription dispatch authority unavailable or consumed",
-                false,
-            ),
+            Err(reason) => {
+                warn!(
+                    allowance_id = %request.allowance_id,
+                    request_id = %request.request_id,
+                    agent_id = %request.agent_id,
+                    schema_version = request.schema_version,
+                    reason,
+                    "Subscription dispatch denied before provider I/O"
+                );
+                json_error(
+                    403,
+                    "subscription_dispatch_denied",
+                    "subscription dispatch authority unavailable or consumed",
+                    false,
+                )
+            }
         }
     }
 

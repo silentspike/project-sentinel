@@ -4823,6 +4823,56 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         }
     }
 
+    fn provider_dispatch_is_definitively_absent(
+        &self,
+        authority: &model_execution::ProviderExecutionAuthority,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<bool, &'static str> {
+        let model_execution::ProviderExecutionAuthority::Project(binding) = authority else {
+            return Ok(false);
+        };
+        let Some(grant) = &binding.subscription_grant else {
+            return Ok(false);
+        };
+        if request_id != format!("company-provider-{}", binding.reservation_id)
+            || request_digest.len() != 64
+            || !request_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("provider request identity changed");
+        }
+        self.prepare_model_work(binding)?
+            .ok_or("model work context unavailable")?;
+        let tenant =
+            TenantId::parse(&binding.tenant_id).map_err(|_| "invalid model work tenant")?;
+        let project_id =
+            ProjectId::parse(&binding.project_id).map_err(|_| "invalid model work project")?;
+        let project = self
+            .store
+            .company_project(&tenant, &project_id)
+            .map_err(|_| "subscription project unavailable")?
+            .ok_or("subscription project missing")?;
+        let allowance = project
+            .subscription_call
+            .as_ref()
+            .ok_or("subscription allowance missing")?;
+        if allowance.allowance_id != binding.reservation_id || &allowance.grant != grant {
+            return Err("subscription allowance changed");
+        }
+        match &allowance.dispatch {
+            None => Ok(true),
+            Some(dispatch)
+                if dispatch.request_id == request_id
+                    && dispatch.request_digest == request_digest =>
+            {
+                Ok(false)
+            }
+            Some(_) => Err("subscription dispatch identity changed"),
+        }
+    }
+
     fn admit_model_work(
         &self,
         completion: &model_execution::ModelExecutionCompletion,
