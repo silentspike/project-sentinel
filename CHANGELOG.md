@@ -1,5 +1,10 @@
 # Changelog
 
+- Let completed project work autonomously enter one independent model source
+  review and advance the existing delivery pipeline through immutable customer
+  preview. Keep customer acceptance and company closeout exclusively explicit,
+  while making every internal stage replay-safe and role-bound (#856).
+
 - Route dynamic project-work dispatch independently from the static Sales and
   planning bootstrap allowance. A configured Sales tenant can no longer mask
   an exact current project grant, while project requests carrying a Sales

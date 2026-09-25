@@ -1,11 +1,345 @@
 //! A model source review is not an execution/test attestation or release approval.
 use super::*;
+use sentinel_workflow::{CompanyWorkStateV1, ProjectLifecycleStateV1};
 
 pub(super) const PROFILE_ID: &str = "web-review-v1";
 pub(super) const MEDIA_TYPE: &str = "application/vnd.sentinel.qa-report+json";
 const REPORT_PATH: &str = "review.json";
 const MAX_REPORT_BYTES: usize = 32 * 1024;
 const MAX_FINDINGS: usize = 16;
+
+pub(super) fn setup_due(project: &sentinel_workflow::ProjectV1) -> bool {
+    let predecessor_ready = project.subscription_call.as_ref().is_some_and(|allowance| {
+        allowance.dispatch.is_some()
+            && project
+                .work_items
+                .get(&allowance.grant.work_item_id)
+                .is_some_and(|work| work.state == CompanyWorkStateV1::Done)
+    });
+    if !predecessor_ready {
+        return false;
+    }
+    let reviews = project
+        .work_items
+        .values()
+        .filter(|work| work.spec.required_role == CompanyRoleV1::Qa)
+        .map(|work| work.state)
+        .collect::<Vec<_>>();
+    setup_required(
+        project.source_review_previous_call.is_some(),
+        predecessor_ready,
+        project.lifecycle_state,
+        &reviews,
+    )
+}
+
+pub(super) fn delivery_due(project: &sentinel_workflow::ProjectV1) -> bool {
+    let current_review_done = project.subscription_call.as_ref().is_some_and(|allowance| {
+        project
+            .work_items
+            .get(&allowance.grant.work_item_id)
+            .is_some_and(|work| {
+                work.spec.required_role == CompanyRoleV1::Qa
+                    && work.state == CompanyWorkStateV1::Done
+            })
+    });
+    delivery_ready(
+        project.lifecycle_state,
+        project.source_review_previous_call.is_some(),
+        current_review_done,
+    )
+}
+
+fn setup_required(
+    has_previous_review_call: bool,
+    predecessor_ready: bool,
+    lifecycle: ProjectLifecycleStateV1,
+    review_states: &[CompanyWorkStateV1],
+) -> bool {
+    if has_previous_review_call || !predecessor_ready {
+        return false;
+    }
+    (lifecycle == ProjectLifecycleStateV1::DeliveryCandidate && review_states.is_empty())
+        || (lifecycle == ProjectLifecycleStateV1::Active
+            && matches!(
+                review_states,
+                [CompanyWorkStateV1::Ready | CompanyWorkStateV1::Assigned]
+            ))
+}
+
+fn delivery_ready(
+    lifecycle: ProjectLifecycleStateV1,
+    has_previous_review_call: bool,
+    current_review_done: bool,
+) -> bool {
+    lifecycle == ProjectLifecycleStateV1::DeliveryCandidate
+        && has_previous_review_call
+        && current_review_done
+}
+
+impl WorkflowApi {
+    pub(super) fn ensure_source_review(
+        &self,
+        project: sentinel_workflow::ProjectV1,
+    ) -> Result<(), &'static str> {
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or("source-review authority unavailable")?;
+        let (review_profile, review_profile_digest) = authority
+            .review_profile
+            .as_ref()
+            .ok_or("source-review profile unavailable")?;
+        if review_profile.id != PROFILE_ID {
+            return Err("source-review profile changed");
+        }
+        let leader = project
+            .governance
+            .participants
+            .iter()
+            .filter(|participant| {
+                matches!(
+                    participant.role,
+                    CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+                )
+            })
+            .find_map(|participant| {
+                self.principals
+                    .principal(&participant.principal_id)
+                    .filter(|bound| {
+                        bound.principal.tenant_id == project.tenant_id
+                            && bound.principal.agent_id == Some(participant.agent_id)
+                            && bound.principal.role == participant.role
+                    })
+            })
+            .ok_or("source-review leadership unavailable")?;
+        let qa = project
+            .governance
+            .participants
+            .iter()
+            .find(|participant| participant.role == CompanyRoleV1::Qa)
+            .and_then(|participant| {
+                self.principals
+                    .principal(&participant.principal_id)
+                    .filter(|bound| {
+                        bound.principal.tenant_id == project.tenant_id
+                            && bound.principal.agent_id == Some(participant.agent_id)
+                            && bound.principal.role == CompanyRoleV1::Qa
+                    })
+                    .map(|bound| (participant.clone(), bound))
+            })
+            .ok_or("source-review QA authority unavailable")?;
+        let previous = project
+            .subscription_call
+            .clone()
+            .ok_or("source-review predecessor unavailable")?;
+        self.validate_model_work_result(
+            &leader.principal,
+            &project.project_id,
+            &previous.grant.work_item_id,
+            None,
+        )?;
+        let delivery = self
+            .delivery
+            .as_ref()
+            .ok_or("source-review delivery exclusion unavailable")?;
+        if delivery
+            .contains_project(&project.tenant_id.0, &project.project_id.0)
+            .map_err(|_| "source-review delivery exclusion unavailable")?
+        {
+            return Err("delivery already exists");
+        }
+
+        let review_id = source_review_id(&project, &previous.allowance_id)?;
+        let append_operation = stable_operation_id(
+            "sentinel.workflow.append-autonomous-source-review.v1",
+            &review_id.0,
+            1,
+        );
+        let mut current = project;
+        if !current.work_items.contains_key(&review_id) {
+            let item = source_review_spec(&current, review_id.clone(), &qa.0, authority)?;
+            let outcome = self
+                .core
+                .apply_company_command(
+                    &leader.principal,
+                    append_operation,
+                    &CompanyWorkflowCommandV1::AppendSourceReview {
+                        project_id: current.project_id.clone(),
+                        expected_version: current.version,
+                        item,
+                    },
+                    now_unix_ms(),
+                )
+                .map_err(|error| error.message)?;
+            let CompanyWorkflowResponseV1::Project(next) = outcome.response else {
+                return Err("source-review append response is invalid");
+            };
+            current = *next;
+        }
+
+        let work = current
+            .work_items
+            .get(&review_id)
+            .ok_or("source-review work is unavailable")?;
+        if work.assignments.is_empty() {
+            let assign_operation = stable_operation_id(
+                "sentinel.workflow.assign-autonomous-source-review.v1",
+                &review_id.0,
+                1,
+            );
+            let outcome = self
+                .core
+                .apply_company_command(
+                    &leader.principal,
+                    assign_operation,
+                    &CompanyWorkflowCommandV1::AssignSourceReview {
+                        project_id: current.project_id.clone(),
+                        expected_version: current.version,
+                        work_item_id: review_id.clone(),
+                        agent_id: qa.0.agent_id,
+                        organization_generation: leader.principal.authority_generation,
+                        organization_digest: leader.principal.authority_digest.clone(),
+                        reason_ref: "source-review-profile".to_owned(),
+                        profile: sentinel_workflow::WorkProfileBindingV1 {
+                            profile_id: review_profile.id.clone(),
+                            generation: PROFILE_GENERATION,
+                            digest: review_profile_digest.clone(),
+                        },
+                    },
+                    now_unix_ms(),
+                )
+                .map_err(|error| error.message)?;
+            let CompanyWorkflowResponseV1::Project(next) = outcome.response else {
+                return Err("source-review assignment response is invalid");
+            };
+            current = *next;
+        }
+
+        if current.source_review_previous_call.is_none() {
+            let assignment = current
+                .work_items
+                .get(&review_id)
+                .and_then(|work| work.assignments.iter().find(|assignment| assignment.active))
+                .ok_or("source-review assignment is unavailable")?;
+            let handoff_operation = stable_operation_id(
+                "sentinel.workflow.grant-autonomous-source-review.v1",
+                &review_id.0,
+                1,
+            );
+            let mut grant = previous.grant.clone();
+            grant.work_item_id = review_id;
+            grant.assignment_id = assignment.assignment_id.clone();
+            grant.assignment_version = assignment.assignment_version;
+            grant.agent_id = assignment.agent_id;
+            grant.expires_at_unix_ms = now_unix_ms()
+                .checked_add(300_000)
+                .ok_or("source-review grant clock overflow")?;
+            let outcome = self
+                .core
+                .apply_company_command(
+                    &leader.principal,
+                    handoff_operation,
+                    &CompanyWorkflowCommandV1::GrantSourceReviewCall {
+                        project_id: current.project_id.clone(),
+                        expected_version: current.version,
+                        previous_allowance_id: previous.allowance_id.clone(),
+                        grant,
+                    },
+                    now_unix_ms(),
+                )
+                .map_err(|error| error.message)?;
+            if !matches!(outcome.response, CompanyWorkflowResponseV1::Project(_)) {
+                return Err("source-review grant response is invalid");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn source_review_id(
+    project: &sentinel_workflow::ProjectV1,
+    predecessor: &str,
+) -> Result<WorkItemId, &'static str> {
+    let digest = hex_sha256(
+        format!(
+            "sentinel.workflow.autonomous-source-review.v1:{}:{predecessor}",
+            project.project_id.0
+        )
+        .as_bytes(),
+    );
+    WorkItemId::parse(format!("source-review-{}", &digest[..24]))
+        .map_err(|_| "source-review identity is invalid")
+}
+
+fn source_review_spec(
+    project: &sentinel_workflow::ProjectV1,
+    work_item_id: WorkItemId,
+    qa: &sentinel_workflow::ParticipantBindingV1,
+    authority: &CompanyAuthority,
+) -> Result<sentinel_workflow::CompanyWorkItemSpecV1, &'static str> {
+    let mut sources = project
+        .work_items
+        .values()
+        .filter(|work| {
+            matches!(
+                work.spec.required_role,
+                CompanyRoleV1::Designer | CompanyRoleV1::Developer
+            )
+        })
+        .collect::<Vec<_>>();
+    sources.sort_by(|left, right| left.spec.work_item_id.0.cmp(&right.spec.work_item_id.0));
+    if sources.is_empty() {
+        return Err("source-review candidate is empty");
+    }
+    let dependency_ids = sources
+        .iter()
+        .map(|work| work.spec.work_item_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut inputs = Vec::new();
+    for work in sources {
+        for output in &work.spec.outputs {
+            inputs.push(sentinel_workflow::WorkInputContractV1 {
+                name: format!("candidate-source-{}", inputs.len() + 1),
+                producer_work_item_id: work.spec.work_item_id.clone(),
+                producer_output_name: output.name.clone(),
+                expected_contract_generation: output.contract_generation,
+                expected_contract_digest: output.contract_digest.clone(),
+            });
+        }
+    }
+    let output_digest = hex_sha256(
+        format!(
+            "sentinel.workflow.source-review-output.v1:{}:{}",
+            project.project_id.0, work_item_id.0
+        )
+        .as_bytes(),
+    );
+    Ok(sentinel_workflow::CompanyWorkItemSpecV1 {
+        work_item_id,
+        title: "Independent source review".to_owned(),
+        objective: "Review the complete immutable Designer and Developer candidate and publish a bound QA report".to_owned(),
+        required_role: CompanyRoleV1::Qa,
+        required_specialties: qa.specialties.clone(),
+        dependency_ids,
+        owner: qa.agent_id,
+        inputs,
+        outputs: vec![sentinel_workflow::WorkOutputContractV1 {
+            name: "qa-report".to_owned(),
+            media_type: MEDIA_TYPE.to_owned(),
+            digest_algorithm: "sha256".to_owned(),
+            contract_generation: 1,
+            contract_digest: output_digest,
+        }],
+        quality_gate: sentinel_workflow::QualityGateBindingV1 {
+            gate_id: "web-work-item-qa-v1".to_owned(),
+            generation: PROFILE_GENERATION,
+            digest: authority.qa_profile_digest.clone(),
+        },
+        budget_micros: 0,
+        rework: None,
+    })
+}
 
 impl WorkflowApi {
     pub(super) fn append_source_review(
@@ -613,6 +947,70 @@ fn verified_report_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autonomous_source_review_runs_once_and_only_after_completed_predecessor() {
+        assert!(setup_required(
+            false,
+            true,
+            ProjectLifecycleStateV1::DeliveryCandidate,
+            &[],
+        ));
+        for state in [CompanyWorkStateV1::Ready, CompanyWorkStateV1::Assigned] {
+            assert!(setup_required(
+                false,
+                true,
+                ProjectLifecycleStateV1::Active,
+                &[state],
+            ));
+        }
+        assert!(!setup_required(
+            true,
+            true,
+            ProjectLifecycleStateV1::DeliveryCandidate,
+            &[],
+        ));
+        assert!(!setup_required(
+            false,
+            false,
+            ProjectLifecycleStateV1::DeliveryCandidate,
+            &[],
+        ));
+        for states in [
+            vec![CompanyWorkStateV1::InProgress],
+            vec![CompanyWorkStateV1::InReview],
+            vec![CompanyWorkStateV1::Done],
+            vec![CompanyWorkStateV1::Ready, CompanyWorkStateV1::Assigned],
+        ] {
+            assert!(!setup_required(
+                false,
+                true,
+                ProjectLifecycleStateV1::Active,
+                &states,
+            ));
+        }
+    }
+
+    #[test]
+    fn autonomous_delivery_waits_for_exact_completed_independent_review() {
+        assert!(delivery_ready(
+            ProjectLifecycleStateV1::DeliveryCandidate,
+            true,
+            true,
+        ));
+        assert!(!delivery_ready(ProjectLifecycleStateV1::Active, true, true,));
+        assert!(!delivery_ready(
+            ProjectLifecycleStateV1::DeliveryCandidate,
+            false,
+            true,
+        ));
+        assert!(!delivery_ready(
+            ProjectLifecycleStateV1::DeliveryCandidate,
+            true,
+            false,
+        ));
+    }
+
     fn source() -> Vec<SourceFile> {
         vec![SourceFile {
             path: "app.js".into(),
