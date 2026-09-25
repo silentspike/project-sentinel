@@ -18,8 +18,23 @@ pub struct ModelWorkContext {
     pub deadline_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correction: Option<ModelWorkCorrection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_customer_contract: Option<AcceptedCustomerContract>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) artifact_inputs: Vec<ModelArtifactInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedCustomerContract {
+    pub agreement_id: String,
+    pub proposal_id: String,
+    pub proposal_digest: String,
+    pub scope: String,
+    pub deliverables: Vec<String>,
+    pub exclusions: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub assumptions: Vec<String>,
 }
 
 /// Prior model-authored tools are untrusted context, never replay instructions.
@@ -52,7 +67,23 @@ impl ModelWorkContext {
         }
         self.validate_artifact_inputs()?;
         if self.task.required_role == CompanyRoleV1::Qa {
+            let contract = self
+                .accepted_customer_contract
+                .as_ref()
+                .ok_or("accepted customer contract is unavailable")?;
+            if contract.agreement_id.trim().is_empty()
+                || contract.proposal_id.trim().is_empty()
+                || contract.proposal_digest.len() != 64
+                || !contract
+                    .proposal_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err("accepted customer contract is invalid");
+            }
             super::model_review::source_inventory(self)?;
+        } else if self.accepted_customer_contract.is_some() {
+            return Err("customer contract is only available to independent QA");
         }
         Ok(())
     }
@@ -254,10 +285,50 @@ impl WorkflowApi {
             task: work.spec.clone(),
             deadline_unix_ms,
             correction: self.model_work_correction(&project, &work_id)?,
+            accepted_customer_contract: if work.spec.required_role == CompanyRoleV1::Qa {
+                Some(self.accepted_customer_contract(&project)?)
+            } else {
+                None
+            },
             artifact_inputs: self.model_artifact_inputs(&project, &work.spec)?,
         };
         context.prompt()?;
         Ok(Some(context))
+    }
+
+    fn accepted_customer_contract(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+    ) -> Result<AcceptedCustomerContract, &'static str> {
+        let agreement = self
+            .store
+            .company_agreement(&project.tenant_id, &project.agreement_id)
+            .map_err(|_| "accepted agreement unavailable")?
+            .ok_or("accepted agreement missing")?;
+        let proposal = self
+            .store
+            .company_proposal(&project.tenant_id, &agreement.proposal_id)
+            .map_err(|_| "accepted proposal unavailable")?
+            .ok_or("accepted proposal missing")?;
+        if agreement.agreement_id != project.agreement_id
+            || agreement.proposal_digest != project.agreement_digest
+            || proposal.proposal_id != agreement.proposal_id
+            || proposal.proposal_digest != agreement.proposal_digest
+            || proposal.request_id != agreement.request_id
+        {
+            return Err("accepted customer contract changed");
+        }
+        let binding = proposal.binding;
+        Ok(AcceptedCustomerContract {
+            agreement_id: agreement.agreement_id,
+            proposal_id: proposal.proposal_id,
+            proposal_digest: proposal.proposal_digest,
+            scope: binding.scope,
+            deliverables: binding.deliverables,
+            exclusions: binding.exclusions,
+            acceptance_criteria: binding.acceptance_criteria,
+            assumptions: binding.assumptions,
+        })
     }
 
     fn model_work_correction(
@@ -535,6 +606,7 @@ pub(crate) fn test_context() -> ModelWorkContext {
         authority,
         deadline_unix_ms: u64::MAX,
         correction: None,
+        accepted_customer_contract: None,
         artifact_inputs: Vec::new(),
     }
 }
