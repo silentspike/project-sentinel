@@ -1,5 +1,11 @@
 # Changelog
 
+- Preserve pre-cutover project subscriptions in legacy Sales accounting while
+  separating new accepted-project execution from the customer-consultation
+  call budget. This prevents an exhausted Sales campaign from blocking the
+  first assigned Designer or Developer without resetting historical usage
+  (#856).
+
 - Grant the first ready Designer or Developer one bounded provider call after
   model-authored planning, and recover the same transition for already planned
   projects after restart. Carry the durable project allowance through Gateway

@@ -158,7 +158,6 @@ pub(super) fn request(
     project.work_corrections.push(correction);
     refresh_project_lifecycle(project);
     if let Some(grant) = next_subscription_grant {
-        request_provider::ensure_legacy_grant_allowed(connection)?;
         subscription::renew_for_correction(project, principal, operation_id, grant, now_ms)?;
     }
     Ok(())
