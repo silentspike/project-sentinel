@@ -1412,6 +1412,7 @@ fn apply_company_command(
                 approvals: Vec::new(),
                 reservations: Vec::new(),
                 subscription_call: None,
+                abandoned_subscription_calls: Vec::new(),
                 source_review_previous_call: None,
                 work_corrections: Vec::new(),
                 rooms: Vec::new(),
@@ -2627,6 +2628,23 @@ fn mutate_project(
         }
         CompanyWorkflowCommandV1::GrantSubscriptionCall { grant, .. } => {
             subscription::grant(&mut project, principal, operation_id, grant, now_ms)?;
+        }
+        CompanyWorkflowCommandV1::AbandonSubscriptionCall {
+            allowance_id,
+            request_digest,
+            resolution_event_id,
+            abandoned_by,
+            ..
+        } => {
+            subscription::abandon(
+                &mut project,
+                principal,
+                allowance_id,
+                request_digest,
+                resolution_event_id,
+                abandoned_by,
+                now_ms,
+            )?;
         }
         CompanyWorkflowCommandV1::GrantSourceReviewCall {
             previous_allowance_id,
@@ -5213,6 +5231,11 @@ fn project_target(command: &CompanyWorkflowCommandV1) -> Option<(&ProjectId, u64
             expected_version,
             ..
         }
+        | CompanyWorkflowCommandV1::AbandonSubscriptionCall {
+            project_id,
+            expected_version,
+            ..
+        }
         | CompanyWorkflowCommandV1::GrantSourceReviewCall {
             project_id,
             expected_version,
@@ -5368,6 +5391,9 @@ fn project_event_type(command: &CompanyWorkflowCommandV1) -> Result<&'static str
         CompanyWorkflowCommandV1::GrantSubscriptionCall { .. }
         | CompanyWorkflowCommandV1::GrantSourceReviewCall { .. } => {
             Ok("project_subscription_call_granted")
+        }
+        CompanyWorkflowCommandV1::AbandonSubscriptionCall { .. } => {
+            Ok("project_subscription_call_abandoned")
         }
         CompanyWorkflowCommandV1::ClaimSubscriptionCall { .. } => {
             Ok("project_subscription_call_claimed")

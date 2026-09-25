@@ -77,6 +77,7 @@ pub const CUSTOMER_PREVIEW_PATH: &str = "/customer/workflow/preview";
 pub const OPERATOR_COMMAND_PATH: &str = "/operator/workflow/commands";
 pub const REQUEST_PROVIDER_PATH: &str = "/operator/workflow/request-provider";
 pub const REQUEST_PROVIDER_ABANDON_PATH: &str = "/operator/workflow/request-provider/abandon";
+pub const PROJECT_PROVIDER_ABANDON_PATH: &str = "/operator/workflow/project-provider/abandon";
 pub const AGENT_COMMAND_PATH: &str = "/agent/workflow/commands";
 pub const WORK_CORRECTION_PATH: &str = "/agent/workflow/corrections";
 pub const SOURCE_REVIEW_PATH: &str = "/agent/workflow/source-reviews";
@@ -3098,6 +3099,9 @@ impl WorkflowApi {
             #[cfg(feature = "llm")]
             ("POST", REQUEST_PROVIDER_PATH) => self.authorize_sales_request(&principal, body),
             ("POST", REQUEST_PROVIDER_ABANDON_PATH) => self.abandon_sales_request(&principal, body),
+            ("POST", PROJECT_PROVIDER_ABANDON_PATH) => {
+                self.abandon_project_provider_call(&principal, body)
+            }
             ("POST", AGENT_COMMAND_PATH) => self.agent_command(&principal, body),
             ("POST", WORK_CORRECTION_PATH) => self.correct_model_work(&principal, body),
             ("POST", SOURCE_REVIEW_PATH) => self.append_source_review(&principal, body),
@@ -5230,6 +5234,7 @@ fn is_workflow_path(path: &str) -> bool {
             | WORK_CORRECTION_PATH
             | SOURCE_REVIEW_PATH
             | REQUEST_PROVIDER_ABANDON_PATH
+            | PROJECT_PROVIDER_ABANDON_PATH
             | AGENT_COMMAND_PATH
             | OPERATOR_PROJECT_PATH
             | OPERATOR_WORK_ITEM_PATH
@@ -5348,6 +5353,7 @@ fn is_internal_company_command(command: &CompanyWorkflowCommandV1) -> bool {
             | CompanyWorkflowCommandV1::AssignSourceReview { .. }
             | CompanyWorkflowCommandV1::GrantSourceReviewCall { .. }
             | CompanyWorkflowCommandV1::ClaimSubscriptionCall { .. }
+            | CompanyWorkflowCommandV1::AbandonSubscriptionCall { .. }
             | CompanyWorkflowCommandV1::CreateGovernedRework { .. }
             | CompanyWorkflowCommandV1::AdmitCollaboration { .. }
             | CompanyWorkflowCommandV1::ProgressCollaborationAdmission { .. }
@@ -5811,6 +5817,7 @@ mod tests {
             blockers: Vec::new(),
             approvals: Vec::new(),
             subscription_call: None,
+            abandoned_subscription_calls: Vec::new(),
             source_review_previous_call: None,
             work_corrections: Vec::new(),
             reservations: vec![sentinel_workflow::CostReservationV1 {
