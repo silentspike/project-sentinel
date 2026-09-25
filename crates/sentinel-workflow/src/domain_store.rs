@@ -2626,7 +2626,6 @@ fn mutate_project(
             });
         }
         CompanyWorkflowCommandV1::GrantSubscriptionCall { grant, .. } => {
-            request_provider::ensure_legacy_grant_allowed(transaction)?;
             subscription::grant(&mut project, principal, operation_id, grant, now_ms)?;
         }
         CompanyWorkflowCommandV1::GrantSourceReviewCall {
@@ -2634,7 +2633,6 @@ fn mutate_project(
             grant,
             ..
         } => {
-            request_provider::ensure_legacy_grant_allowed(transaction)?;
             subscription::handoff_to_review(
                 &mut project,
                 principal,
