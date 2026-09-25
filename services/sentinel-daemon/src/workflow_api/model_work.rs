@@ -1005,6 +1005,48 @@ mod tests {
     }
 
     #[test]
+    fn subscription_selection_ignores_expired_unknown_dispatch_but_prioritizes_local_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = configured_test_api(&temp.path().join("company.sqlite"));
+        let old = assign_test_work_from(&api, Some(1), 0);
+        let current = assign_test_work_from(&api, Some(1), 100);
+        let now = now_unix_ms();
+        let mut projects = api.store.company_projects().unwrap();
+
+        assert_eq!(
+            select_actionable_subscription_allowance_id(&projects, AgentId(6), now, |_| Ok(false),),
+            Err("agent has ambiguous subscription work authority")
+        );
+
+        let old_project = projects
+            .iter_mut()
+            .find(|project| project.project_id.0 == old.project_id)
+            .unwrap();
+        let old_allowance = old_project.subscription_call.as_mut().unwrap();
+        old_allowance.grant.expires_at_unix_ms = now.saturating_sub(1);
+        let old_request_id = format!("company-provider-{}", old_allowance.allowance_id);
+        old_allowance.dispatch = Some(sentinel_workflow::SubscriptionCallDispatchV1 {
+            request_id: old_request_id.clone(),
+            request_digest: "d".repeat(64),
+            dispatched_at_unix_ms: now.saturating_sub(10_000),
+        });
+
+        assert_eq!(
+            select_actionable_subscription_allowance_id(&projects, AgentId(6), now, |_| Ok(false),)
+                .unwrap(),
+            Some(current.reservation_id.as_str())
+        );
+        assert_eq!(
+            select_actionable_subscription_allowance_id(&projects, AgentId(6), now, |request_id| {
+                Ok(request_id == old_request_id)
+            },)
+            .unwrap(),
+            Some(old.reservation_id.as_str()),
+            "a locally persisted completion must be adopted before new provider I/O"
+        );
+    }
+
+    #[test]
     fn provider_admission_recovery_dispatch_persists_across_restart() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("company.sqlite");
