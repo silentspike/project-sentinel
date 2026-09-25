@@ -76,6 +76,38 @@ pub(super) fn reconcile_internal(
     let run_id = run_id(&material);
     let delivery_id = format!("delivery-{candidate_id}");
     let aggregate = delivery.aggregate(&project.tenant_id.0, &project.project_id.0)?;
+    #[cfg(feature = "llm")]
+    if api.model_work_enabled {
+        let qa = current_principal(api, &material.project, CompanyRoleV1::Qa)?;
+        let artifacts = material
+            .candidate
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.digest.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let review = super::model_review::validated_project_review(
+            api,
+            &material.project,
+            &qa.principal_id,
+            &artifacts,
+        )
+        .map_err(|reason| DeliveryError::MissingEvidence(reason.to_owned()))?;
+        if review.report.verdict == super::model_review::Verdict::ChangesRequested {
+            if let Some(current) = aggregate.as_ref() {
+                supersede_pending_review(
+                    delivery,
+                    &material,
+                    current,
+                    qa,
+                    &run_id,
+                    &review.report_digest,
+                )?;
+            }
+            super::model_review::request_review_correction(api, &material.project, &review)
+                .map_err(|reason| DeliveryError::MissingEvidence(reason.to_owned()))?;
+            return Ok(true);
+        }
+    }
     let candidate_registered = aggregate
         .as_ref()
         .is_some_and(|value| value.candidates.contains_key(&candidate_id));
@@ -172,6 +204,68 @@ pub(super) fn reconcile_internal(
         | DeliveryIntentV1::Closeout { .. } => unreachable!("filtered above"),
     }
     Ok(true)
+}
+
+#[cfg(feature = "llm")]
+fn supersede_pending_review(
+    delivery: &super::ProductDeliveryCore,
+    material: &ProjectMaterial,
+    aggregate: &crate::delivery::DeliveryAggregateV1,
+    qa: PrincipalV1,
+    run_id: &str,
+    report_digest: &str,
+) -> Result<(), DeliveryError> {
+    let candidate = aggregate
+        .candidates
+        .get(&material.candidate.candidate_id)
+        .ok_or_else(|| {
+            DeliveryError::Conflict(
+                "source-review correction found a delivery aggregate without its candidate"
+                    .to_owned(),
+            )
+        })?;
+    let run = aggregate.qa_runs.get(run_id).ok_or_else(|| {
+        DeliveryError::Conflict(
+            "source-review correction found a candidate without its planned QA run".to_owned(),
+        )
+    })?;
+    if !aggregate.workbench_receipts.is_empty()
+        || !aggregate.evidence_graphs.is_empty()
+        || !aggregate.reviews.is_empty()
+        || !aggregate.gates.is_empty()
+        || !aggregate.releases.is_empty()
+        || !aggregate.deliveries.is_empty()
+        || !matches!(
+            candidate.state,
+            CandidateState::QaAssigned | CandidateState::Superseded
+        )
+        || !matches!(run.state, QaRunState::Planned | QaRunState::Superseded)
+    {
+        return Err(DeliveryError::Conflict(
+            "source-review correction cannot supersede consumed delivery evidence".to_owned(),
+        ));
+    }
+    if run.state == QaRunState::Superseded {
+        return Ok(());
+    }
+    let operation_id = super::stable_operation_id(
+        "sentinel.workflow.supersede-negative-source-review.v1",
+        report_digest,
+        material.candidate.generation,
+    );
+    delivery.transition_qa(
+        &context(
+            qa,
+            operation_id,
+            "qa-source-review-superseded",
+            super::now_unix_ms(),
+        ),
+        &material.project.tenant_id.0,
+        &material.project.project_id.0,
+        run_id,
+        QaRunState::Superseded,
+    )?;
+    Ok(())
 }
 
 fn next_internal_intent(
@@ -1282,15 +1376,19 @@ fn execute_qa(
                 .iter()
                 .map(|artifact| artifact.digest.as_str().to_owned())
                 .collect::<BTreeSet<_>>();
-            Some(
-                super::model_review::validated_project_review(
-                    api,
-                    &material.project,
-                    &caller.principal_id,
-                    &artifacts,
-                )
-                .map_err(|reason| DeliveryError::MissingEvidence(reason.to_owned()))?,
+            let review = super::model_review::validated_project_review(
+                api,
+                &material.project,
+                &caller.principal_id,
+                &artifacts,
             )
+            .map_err(|reason| DeliveryError::MissingEvidence(reason.to_owned()))?;
+            if review.report.verdict != super::model_review::Verdict::Pass {
+                return Err(DeliveryError::MissingEvidence(
+                    "model source review requests changes".to_owned(),
+                ));
+            }
+            Some(review.report_digest)
         }
         #[cfg(not(feature = "llm"))]
         {

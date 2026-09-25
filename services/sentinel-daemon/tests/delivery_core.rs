@@ -1260,6 +1260,68 @@ fn running_qa_core(
     (core, candidate, plan, qa)
 }
 
+#[test]
+fn superseding_planned_qa_atomically_supersedes_its_candidate() {
+    let temp = TempDir::new().unwrap();
+    let core = DeliveryCore::new_test_only(store(&temp), FakeIntegration::new().0, FakeEffects);
+    let candidate = candidate(5, &["developer"]);
+    core.register_candidate(
+        &context(
+            "developer",
+            AuthorityRole::Developer,
+            "register-supersede",
+            100,
+        ),
+        candidate.clone(),
+    )
+    .unwrap();
+    let plan = plan(&candidate);
+    core.assign_qa(
+        &context(
+            "release-manager",
+            AuthorityRole::ReleaseManager,
+            "assign-supersede",
+            110,
+        ),
+        "tenant-a",
+        "project-1",
+        &candidate.candidate_id,
+        plan.clone(),
+        run(&plan, principal("qa-1", AuthorityRole::Qa)),
+    )
+    .unwrap();
+
+    let command = context("qa-1", AuthorityRole::Qa, "supersede-negative-review", 120);
+    let receipt = core
+        .transition_qa(
+            &command,
+            "tenant-a",
+            "project-1",
+            "run-1",
+            QaRunState::Superseded,
+        )
+        .unwrap();
+    assert!(!receipt.duplicate);
+    let aggregate = core.load("tenant-a", "project-1").unwrap().unwrap();
+    assert_eq!(aggregate.qa_runs["run-1"].state, QaRunState::Superseded);
+    assert_eq!(
+        aggregate.candidates[&candidate.candidate_id].state,
+        CandidateState::Superseded
+    );
+
+    let duplicate = core
+        .transition_qa(
+            &command,
+            "tenant-a",
+            "project-1",
+            "run-1",
+            QaRunState::Superseded,
+        )
+        .unwrap();
+    assert!(duplicate.duplicate);
+    assert_eq!(duplicate.project_revision, receipt.project_revision);
+}
+
 fn core_with_seeded_aggregate(
     temp: &TempDir,
     aggregate: DeliveryAggregateV1,
