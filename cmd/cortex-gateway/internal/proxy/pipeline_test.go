@@ -161,6 +161,32 @@ func TestPipelineBlocksProviderSendWhenActivationGateIsNotSatisfied(t *testing.T
 	}
 }
 
+func TestPipelineMarksAdmissionFailureAsPreProvider(t *testing.T) {
+	registry := NewRegistry()
+	provider := &pipelineMockProvider{
+		name: "mock",
+		err:  providerAdmissionError(errors.New("subscription claim rejected")),
+	}
+	registry.Register("mock", provider)
+	handler := newTestPipelineHandler(registry, nil)
+	req := newAgentRuntimeTestRequest(t,
+		`{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"3","hierarchy_tier":"2"}}`,
+	)
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("X-Sentinel-Provider-Io"); got != "not-started" {
+		t.Fatalf("X-Sentinel-Provider-Io=%q, want not-started", got)
+	}
+	if !strings.Contains(recorder.Body.String(), "provider admission rejected") {
+		t.Fatalf("body=%s", recorder.Body.String())
+	}
+}
+
 func TestPipelineFullFlow(t *testing.T) {
 	reg := NewRegistry()
 	mock := &pipelineMockProvider{

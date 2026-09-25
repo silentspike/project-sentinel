@@ -1,5 +1,10 @@
 # Changelog
 
+- Distinguish Gateway admission rejection from ambiguous provider I/O and
+  release only exact, definitively undispatched project reservations. Recover
+  stale pre-provider reservations from durable workflow dispatch state while
+  retaining fail-closed behavior for every committed or unknown effect (#856).
+
 - Preserve pre-cutover project subscriptions in legacy Sales accounting while
   separating new accepted-project execution from the customer-consultation
   call budget. This prevents an exhausted Sales campaign from blocking the
