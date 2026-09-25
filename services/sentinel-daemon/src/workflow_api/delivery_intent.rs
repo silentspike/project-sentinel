@@ -33,7 +33,7 @@ pub(super) struct DeliveryIntentEnvelope {
     intent: DeliveryIntentV1,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum DeliveryIntentV1 {
     PrepareCandidate {
@@ -59,6 +59,160 @@ enum DeliveryIntentV1 {
     Closeout {
         project_id: ProjectId,
     },
+}
+
+pub(super) fn reconcile_internal(
+    api: &WorkflowApi,
+    project: &sentinel_workflow::ProjectV1,
+) -> Result<bool, DeliveryError> {
+    let Some(delivery) = api.delivery.as_ref() else {
+        return Err(DeliveryError::AdapterUnavailable {
+            dependency: "delivery",
+            reason: "delivery authority is unavailable".to_owned(),
+        });
+    };
+    let material = load_material(api, &project.tenant_id, &project.project_id)?;
+    let candidate_id = material.candidate.candidate_id.clone();
+    let run_id = run_id(&material);
+    let delivery_id = format!("delivery-{candidate_id}");
+    let aggregate = delivery.aggregate(&project.tenant_id.0, &project.project_id.0)?;
+    let candidate_registered = aggregate
+        .as_ref()
+        .is_some_and(|value| value.candidates.contains_key(&candidate_id));
+    let qa_state = aggregate
+        .as_ref()
+        .and_then(|value| value.qa_runs.get(&run_id))
+        .map(|run| run.state);
+    let delivery_exists = aggregate
+        .as_ref()
+        .is_some_and(|value| value.deliveries.contains_key(&delivery_id));
+    let Some(intent) = next_internal_intent(
+        project.project_id.clone(),
+        candidate_registered,
+        qa_state,
+        delivery_exists,
+    )?
+    else {
+        return Ok(false);
+    };
+    let caller = current_principal(api, project, autonomous_role(&intent)?)?;
+    let intent_digest = ContentDigest::of_domain(
+        "m0-delivery-intent",
+        DELIVERY_SCHEMA_V1,
+        &(
+            &caller.tenant_id,
+            &caller.principal_id,
+            caller.authority_generation,
+            &intent,
+        ),
+    )?;
+    let operation_id = super::stable_operation_id(
+        "sentinel.workflow.autonomous-delivery-stage.v1",
+        &format!("{}:{intent_digest}", project.project_id.0),
+        material.candidate.generation,
+    );
+    let operation_namespace = format!(
+        "delivery-intent-v1:{}:{}:{}",
+        caller.tenant_id, caller.principal_id, caller.authority_generation
+    );
+    let observed_now_ms = super::now_unix_ms();
+    let (_, effective_now_ms) = api
+        .store
+        .reserve_operation_timestamp(
+            &operation_namespace,
+            operation_id,
+            intent_digest.as_str(),
+            observed_now_ms,
+        )
+        .map_err(workflow_delivery_error)?;
+    match &intent {
+        DeliveryIntentV1::PrepareCandidate { project_id } => {
+            prepare_candidate(
+                api,
+                delivery,
+                &caller,
+                operation_id,
+                effective_now_ms,
+                project_id,
+            )?;
+        }
+        DeliveryIntentV1::AssignQa { project_id } => {
+            assign_qa(
+                api,
+                delivery,
+                &caller,
+                operation_id,
+                effective_now_ms,
+                project_id,
+            )?;
+        }
+        DeliveryIntentV1::ExecuteQa { project_id } => {
+            execute_qa(
+                api,
+                delivery,
+                &caller,
+                operation_id,
+                effective_now_ms,
+                project_id,
+            )?;
+        }
+        DeliveryIntentV1::Release { project_id } => {
+            release(
+                api,
+                delivery,
+                &caller,
+                operation_id,
+                effective_now_ms,
+                observed_now_ms,
+                project_id,
+            )?;
+        }
+        DeliveryIntentV1::Accept { .. }
+        | DeliveryIntentV1::ConfirmDelivery { .. }
+        | DeliveryIntentV1::Closeout { .. } => unreachable!("filtered above"),
+    }
+    Ok(true)
+}
+
+fn next_internal_intent(
+    project_id: ProjectId,
+    candidate_registered: bool,
+    qa_state: Option<QaRunState>,
+    delivery_exists: bool,
+) -> Result<Option<DeliveryIntentV1>, DeliveryError> {
+    if !candidate_registered {
+        return Ok(Some(DeliveryIntentV1::PrepareCandidate { project_id }));
+    }
+    let Some(qa_state) = qa_state else {
+        return Ok(Some(DeliveryIntentV1::AssignQa { project_id }));
+    };
+    if delivery_exists {
+        return Ok(None);
+    }
+    match qa_state {
+        QaRunState::Planned | QaRunState::Admitted | QaRunState::Running => {
+            Ok(Some(DeliveryIntentV1::ExecuteQa { project_id }))
+        }
+        QaRunState::CompletedPass => Ok(Some(DeliveryIntentV1::Release { project_id })),
+        _ => Err(DeliveryError::MissingEvidence(
+            "terminal QA did not authorize release".to_owned(),
+        )),
+    }
+}
+
+fn autonomous_role(intent: &DeliveryIntentV1) -> Result<CompanyRoleV1, DeliveryError> {
+    match intent {
+        DeliveryIntentV1::PrepareCandidate { .. } => Ok(CompanyRoleV1::Developer),
+        DeliveryIntentV1::AssignQa { .. } | DeliveryIntentV1::Release { .. } => {
+            Ok(CompanyRoleV1::ReleaseManager)
+        }
+        DeliveryIntentV1::ExecuteQa { .. } => Ok(CompanyRoleV1::Qa),
+        DeliveryIntentV1::Accept { .. }
+        | DeliveryIntentV1::ConfirmDelivery { .. }
+        | DeliveryIntentV1::Closeout { .. } => Err(DeliveryError::AuthorityDenied(
+            "customer acceptance and closeout are never autonomous".to_owned(),
+        )),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1751,6 +1905,75 @@ mod tests {
             principal_id: "principal-m0".to_string(),
             authority_generation: 1,
             roles: BTreeSet::from([role]),
+        }
+    }
+
+    #[test]
+    fn autonomous_delivery_progresses_only_to_customer_preview() {
+        let project_id = ProjectId::parse("project-m0").unwrap();
+        assert!(matches!(
+            next_internal_intent(project_id.clone(), false, None, false).unwrap(),
+            Some(DeliveryIntentV1::PrepareCandidate { .. })
+        ));
+        assert!(matches!(
+            next_internal_intent(project_id.clone(), true, None, false).unwrap(),
+            Some(DeliveryIntentV1::AssignQa { .. })
+        ));
+        for state in [
+            QaRunState::Planned,
+            QaRunState::Admitted,
+            QaRunState::Running,
+        ] {
+            assert!(matches!(
+                next_internal_intent(project_id.clone(), true, Some(state), false).unwrap(),
+                Some(DeliveryIntentV1::ExecuteQa { .. })
+            ));
+        }
+        assert!(matches!(
+            next_internal_intent(
+                project_id.clone(),
+                true,
+                Some(QaRunState::CompletedPass),
+                false,
+            )
+            .unwrap(),
+            Some(DeliveryIntentV1::Release { .. })
+        ));
+        assert_eq!(
+            next_internal_intent(
+                project_id.clone(),
+                true,
+                Some(QaRunState::CompletedPass),
+                true,
+            )
+            .unwrap(),
+            None
+        );
+        for state in [
+            QaRunState::CompletedFail,
+            QaRunState::NeedsHumanReview,
+            QaRunState::HarnessError,
+        ] {
+            assert!(next_internal_intent(project_id.clone(), true, Some(state), false).is_err());
+        }
+
+        let reference = VersionedRefV1 {
+            id: "delivery-m0".to_owned(),
+            generation: 1,
+            digest: ContentDigest::zero(),
+        };
+        for forbidden in [
+            DeliveryIntentV1::Accept {
+                project_id: project_id.clone(),
+            },
+            DeliveryIntentV1::ConfirmDelivery {
+                project_id: project_id.clone(),
+                delivery: reference.clone(),
+                release: reference,
+            },
+            DeliveryIntentV1::Closeout { project_id },
+        ] {
+            assert!(autonomous_role(&forbidden).is_err());
         }
     }
 

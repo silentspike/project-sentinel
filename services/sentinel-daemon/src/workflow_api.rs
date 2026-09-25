@@ -4499,6 +4499,16 @@ impl WorkflowApi {
         self.publish_collaboration_backlog()
             .map_err(|_| workflow_unavailable())?;
         for project in self.store.company_projects()? {
+            if model_review::setup_due(&project) {
+                self.ensure_source_review(project)
+                    .map_err(|_| workflow_unavailable())?;
+                continue;
+            }
+            if model_review::delivery_due(&project) {
+                delivery_intent::reconcile_internal(self, &project)
+                    .map_err(delivery_workflow_error)?;
+                continue;
+            }
             if project.lifecycle_state == sentinel_workflow::ProjectLifecycleStateV1::Planning
                 && project.work_items.is_empty()
             {
