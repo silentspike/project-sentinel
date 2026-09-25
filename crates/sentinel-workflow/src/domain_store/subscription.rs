@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 const MAX_GRANT_WINDOW_MS: u64 = 300_000;
 
@@ -129,6 +130,53 @@ pub(super) fn grant(
     Ok(())
 }
 
+pub(super) fn abandon(
+    project: &mut ProjectV1,
+    principal: &AuthenticatedCompanyPrincipalV1,
+    allowance_id: &str,
+    request_digest: &str,
+    resolution_event_id: &str,
+    abandoned_by: &str,
+    now_ms: u64,
+) -> Result<(), WorkflowError> {
+    require_role(
+        principal,
+        &[CompanyRoleV1::ProjectManager, CompanyRoleV1::TechnicalLead],
+    )?;
+    validate_identifier(allowance_id)?;
+    validate_digest(request_digest)?;
+    validate_identifier(abandoned_by)?;
+    Uuid::parse_str(resolution_event_id)
+        .map_err(|_| invalid("invalid provider resolution event"))?;
+    if project.lifecycle_state != ProjectLifecycleStateV1::Active
+        || project.abandoned_subscription_calls.len() >= MAX_AGGREGATE_ITEMS
+    {
+        return Err(unauthorized());
+    }
+    let current = project.subscription_call.as_ref().ok_or_else(not_found)?;
+    let dispatch = current.dispatch.as_ref().ok_or_else(transition)?;
+    if current.allowance_id != allowance_id
+        || dispatch.request_digest != request_digest
+        || now_ms < dispatch.dispatched_at_unix_ms
+        || project
+            .abandoned_subscription_calls
+            .iter()
+            .any(|entry| entry.resolution_event_id == resolution_event_id)
+    {
+        return Err(invalid("subscription call resolution changed"));
+    }
+    let abandoned = project.subscription_call.take().ok_or_else(not_found)?;
+    project
+        .abandoned_subscription_calls
+        .push(AbandonedSubscriptionCallV1 {
+            allowance: abandoned,
+            resolution_event_id: resolution_event_id.to_owned(),
+            abandoned_by: abandoned_by.to_owned(),
+            abandoned_at_unix_ms: now_ms,
+        });
+    Ok(())
+}
+
 pub(super) fn claim(
     project: &mut ProjectV1,
     principal: &AuthenticatedCompanyPrincipalV1,
@@ -176,6 +224,28 @@ pub(super) fn claim(
 }
 
 pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
+    let mut abandoned_allowance_ids = BTreeSet::new();
+    let mut resolution_event_ids = BTreeSet::new();
+    for entry in &project.abandoned_subscription_calls {
+        validate_allowance(project, &entry.allowance)?;
+        validate_identifier(&entry.abandoned_by).map_err(|_| corrupt())?;
+        Uuid::parse_str(&entry.resolution_event_id).map_err(|_| corrupt())?;
+        let dispatch = entry.allowance.dispatch.as_ref().ok_or_else(corrupt)?;
+        if !abandoned_allowance_ids.insert(entry.allowance.allowance_id.as_str())
+            || !resolution_event_ids.insert(entry.resolution_event_id.as_str())
+            || entry.abandoned_at_unix_ms < dispatch.dispatched_at_unix_ms
+            || entry.abandoned_at_unix_ms > project.updated_at_unix_ms
+        {
+            return Err(corrupt());
+        }
+    }
+    if project
+        .subscription_call
+        .as_ref()
+        .is_some_and(|current| abandoned_allowance_ids.contains(current.allowance_id.as_str()))
+    {
+        return Err(corrupt());
+    }
     if let Some(previous) = &project.source_review_previous_call {
         validate_allowance(project, previous)?;
         let current = project.subscription_call.as_ref().ok_or_else(corrupt)?;

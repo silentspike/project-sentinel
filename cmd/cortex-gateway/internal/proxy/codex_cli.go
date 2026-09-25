@@ -193,7 +193,7 @@ func (p *CodexCLIProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespo
 		return nil, fmt.Errorf("codex-cli start: %w", err)
 	}
 
-	response, parseErr := p.parseOutputStream(stdout, responseByteLimit(req.MaxTokens))
+	response, parseErr := p.parseOutputStream(stdout, codexCLIResponseByteLimit(req))
 	if parseErr != nil {
 		cancelRun()
 	}
@@ -501,6 +501,22 @@ func responseByteLimit(maxTokens int) int {
 		return codexCLIMaxResponseBytes
 	}
 	return maxTokens * 8
+}
+
+func codexCLIResponseByteLimit(req *LLMRequest) int {
+	if req == nil {
+		return codexCLIMaxResponseBytes
+	}
+	switch req.Metadata["company_execution_schema"] {
+	case "1", "2", "3", "4":
+		// Company execution returns a bounded structured tool proposal. The
+		// native subscription transport does not guarantee the requested
+		// generation-token hint, so its byte guard must use the independently
+		// validated model-work contract rather than max_tokens * 8.
+		return maxModelWorkResponseBytes
+	default:
+		return responseByteLimit(req.MaxTokens)
+	}
 }
 
 func codexTokenCount(name string, value int64) (int, error) {
