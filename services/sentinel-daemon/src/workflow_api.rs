@@ -2508,6 +2508,48 @@ fn select_provider_usage_binding(
     Ok(selected)
 }
 
+fn select_actionable_subscription_allowance_id<F>(
+    projects: &[sentinel_workflow::ProjectV1],
+    agent_id: AgentId,
+    now_ms: u64,
+    mut locally_recoverable: F,
+) -> Result<Option<&str>, &'static str>
+where
+    F: FnMut(&str) -> Result<bool, &'static str>,
+{
+    let mut recovery = None;
+    let mut dispatchable = None;
+    for project in projects {
+        let Some(allowance) = project
+            .subscription_call
+            .as_ref()
+            .filter(|allowance| allowance.grant.agent_id == agent_id)
+        else {
+            continue;
+        };
+        if select_provider_usage_binding(projects, agent_id, Some(&allowance.allowance_id))?
+            .is_none()
+        {
+            continue;
+        }
+        let has_local_completion = match &allowance.dispatch {
+            Some(dispatch) => locally_recoverable(&dispatch.request_id)?,
+            None => false,
+        };
+        let selected = if has_local_completion {
+            &mut recovery
+        } else if now_ms < allowance.grant.expires_at_unix_ms {
+            &mut dispatchable
+        } else {
+            continue;
+        };
+        if selected.replace(allowance.allowance_id.as_str()).is_some() {
+            return Err("agent has ambiguous subscription work authority");
+        }
+    }
+    Ok(recovery.or(dispatchable))
+}
+
 fn validate_provider_usage_event(
     event: &DomainEvent,
     usage_operation_id: &str,
@@ -3703,14 +3745,24 @@ impl WorkflowApi {
             .store
             .company_projects()
             .map_err(|_| "company provider authority could not be read")?;
-        let mut project_allowances = projects
-            .iter()
-            .filter_map(|project| project.subscription_call.as_ref())
-            .filter(|allowance| allowance.grant.agent_id == agent_id)
-            .map(|allowance| allowance.allowance_id.as_str());
-        let selected_allowance = project_allowances.next();
-        if project_allowances.next().is_some() {
-            return Err("agent has ambiguous subscription work authority");
+        let selected_allowance = select_actionable_subscription_allowance_id(
+            &projects,
+            agent_id,
+            now_unix_ms(),
+            |request_id| {
+                let Some(store) = self.event_store.as_ref() else {
+                    return Ok(false);
+                };
+                let completion = store
+                    .get_llm_completion(request_id)
+                    .map_err(|_| "company provider completion could not be read")?;
+                Ok(completion.is_some_and(|entry| {
+                    matches!(entry.status.as_str(), "pending_usage" | "ready_for_action")
+                }))
+            },
+        )?;
+        if self.subscription_allowance_id.is_some() && selected_allowance.is_none() {
+            return Ok(None);
         }
         select_provider_usage_binding(&projects, agent_id, selected_allowance)
     }
