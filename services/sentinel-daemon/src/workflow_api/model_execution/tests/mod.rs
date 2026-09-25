@@ -872,6 +872,10 @@ fn project_planning_reconcile_grants_existing_assigned_project_once() {
         .unwrap()
         .unwrap();
     let allowance = granted.subscription_call.clone().unwrap();
+    assert!(!WorkflowApi::model_work_grant_due(
+        &granted,
+        allowance.created_at_unix_ms,
+    ));
     api.reconcile_pending();
     let replayed = api
         .store
@@ -883,6 +887,60 @@ fn project_planning_reconcile_grants_existing_assigned_project_once() {
         .unwrap();
     assert_eq!(replayed.subscription_call.as_ref(), Some(&allowance));
     assert_eq!(replayed.version, granted.version);
+
+    let renewal_time = allowance.grant.expires_at_unix_ms + 1;
+    assert!(WorkflowApi::model_work_grant_due(&granted, renewal_time,));
+    let mut changed_grant = allowance.grant.clone();
+    changed_grant.model = "different-model".to_owned();
+    changed_grant.expires_at_unix_ms = renewal_time + 300_000;
+    assert!(api
+        .core
+        .apply_company_command(
+            &context.binding.grant.planner_principal,
+            stable_operation_id(
+                "sentinel.workflow.reject-changed-expired-model-work.v1",
+                &allowance.allowance_id,
+                allowance.grant.expires_at_unix_ms,
+            ),
+            &CompanyWorkflowCommandV1::GrantSubscriptionCall {
+                project_id: granted.project_id.clone(),
+                expected_version: granted.version,
+                grant: changed_grant,
+            },
+            renewal_time,
+        )
+        .is_err());
+
+    let renewed = api
+        .grant_model_work_at(
+            &context.binding.grant.planner_principal,
+            granted.clone(),
+            &context.binding.grant,
+            &request_id,
+            renewal_time,
+        )
+        .unwrap();
+    let renewed_allowance = renewed.subscription_call.as_ref().unwrap();
+    let mut expected_grant = allowance.grant.clone();
+    expected_grant.expires_at_unix_ms = renewal_time + 300_000;
+    assert_eq!(renewed_allowance.grant, expected_grant);
+    assert_ne!(renewed_allowance.allowance_id, allowance.allowance_id);
+    assert_eq!(renewed.version, granted.version + 1);
+    assert!(!WorkflowApi::model_work_grant_due(
+        &renewed,
+        renewal_time + 1,
+    ));
+
+    let replayed_renewal = api
+        .grant_model_work_at(
+            &context.binding.grant.planner_principal,
+            renewed.clone(),
+            &context.binding.grant,
+            &request_id,
+            renewal_time + 1,
+        )
+        .unwrap();
+    assert_eq!(replayed_renewal, renewed);
 }
 
 #[test]

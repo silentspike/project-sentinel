@@ -1,5 +1,11 @@
 # Changelog
 
+- Renew an expired project-model allowance only when its exact assignment,
+  agent, provider, model, catalog and policy remain active and no dispatch was
+  ever committed. The periodic workflow reconciler can now resume an
+  undispatched autonomous employee call without changing authority or
+  duplicating an ambiguous provider effect (#856).
+
 - Distinguish Gateway admission rejection from ambiguous provider I/O and
   release only exact, definitively undispatched project reservations. Recover
   stale pre-provider reservations from durable workflow dispatch state while

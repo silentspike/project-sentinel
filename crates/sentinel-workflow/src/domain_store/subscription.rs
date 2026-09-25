@@ -59,6 +59,22 @@ fn active_assignment_matches(project: &ProjectV1, grant: &SubscriptionCallGrantV
         })
 }
 
+fn expired_undispatched_grant_matches(
+    project: &ProjectV1,
+    principal: &AuthenticatedCompanyPrincipalV1,
+    current: &SubscriptionCallAllowanceV1,
+    next: &SubscriptionCallGrantV1,
+    now_ms: u64,
+) -> bool {
+    let mut expected = current.grant.clone();
+    expected.expires_at_unix_ms = next.expires_at_unix_ms;
+    current.dispatch.is_none()
+        && now_ms >= current.grant.expires_at_unix_ms
+        && current.created_by == principal.principal_id
+        && expected == *next
+        && active_assignment_matches(project, &current.grant)
+}
+
 pub(super) fn grant(
     project: &mut ProjectV1,
     principal: &AuthenticatedCompanyPrincipalV1,
@@ -72,7 +88,6 @@ pub(super) fn grant(
     )?;
     validate_grant(grant, now_ms)?;
     if project.lifecycle_state != ProjectLifecycleStateV1::Active
-        || project.subscription_call.is_some()
         || !active_assignment_matches(project, grant)
         || project
             .reservations
@@ -80,6 +95,12 @@ pub(super) fn grant(
             .any(|reservation| reservation.work_item_id.as_ref() == Some(&grant.work_item_id))
     {
         return Err(invalid("subscription call authority unavailable"));
+    }
+    if let Some(current) = project.subscription_call.as_ref() {
+        if !expired_undispatched_grant_matches(project, principal, current, grant, now_ms) {
+            return Err(invalid("subscription call authority unavailable"));
+        }
+        project.subscription_call = None;
     }
     project.subscription_call = Some(SubscriptionCallAllowanceV1 {
         allowance_id: stable_domain_id("subscription", &principal.tenant_id, operation_id)?,
