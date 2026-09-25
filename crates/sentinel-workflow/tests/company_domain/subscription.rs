@@ -169,6 +169,122 @@ fn request_provider_accounting_preserves_legacy_grants_and_unknown_dispatches() 
     }
 }
 
+#[test]
+fn request_provider_cutover_separates_sales_and_project_call_budgets() {
+    let (state, project, grant) = assigned();
+    let (operator, sales) = request_provider_principals(&state);
+
+    let first = request_provider_grant(&state, &sales, 50, 1);
+    state
+        .store
+        .authorize_request_provider_call(&operator, Uuid::from_u128(51), &first, 51)
+        .unwrap();
+
+    // Exhausting Sales consultation authority must not block execution of an
+    // already accepted project under its own assignment and project budget.
+    let project = project_command(
+        &state.store,
+        &state.pm,
+        52,
+        grant_command(&project, grant),
+        52,
+    );
+    assert!(project.subscription_call.is_some());
+}
+
+#[test]
+fn post_cutover_project_calls_do_not_consume_later_sales_allowance() {
+    let (state, project, grant) = assigned();
+    let (operator, sales) = request_provider_principals(&state);
+
+    for index in 0_u128..10 {
+        let request_operation = 100 + index * 10;
+        let request_grant = request_provider_grant(&state, &sales, request_operation, 10);
+        state
+            .store
+            .authorize_request_provider_call(
+                &operator,
+                Uuid::from_u128(request_operation + 1),
+                &request_grant,
+                u64::try_from(request_operation + 1).unwrap(),
+            )
+            .unwrap();
+        if index == 0 {
+            project_command(
+                &state.store,
+                &state.pm,
+                request_operation + 2,
+                grant_command(&project, grant.clone()),
+                u64::try_from(request_operation + 2).unwrap(),
+            );
+        }
+    }
+
+    let exhausted = request_provider_grant(&state, &sales, 300, 10);
+    assert!(state
+        .store
+        .authorize_request_provider_call(&operator, Uuid::from_u128(301), &exhausted, 301)
+        .is_err());
+}
+
+fn request_provider_principals(
+    state: &Journey,
+) -> (
+    AuthenticatedCompanyPrincipalV1,
+    AuthenticatedCompanyPrincipalV1,
+) {
+    let operator = AuthenticatedCompanyPrincipalV1 {
+        principal_id: "operator-test".into(),
+        kind: CompanyPrincipalKindV1::Operator,
+        agent_id: None,
+        ..state.pm.clone()
+    };
+    let sales = principal(
+        "tenant-a",
+        "sales-test",
+        CompanyPrincipalKindV1::Agent,
+        CompanyRoleV1::Sales,
+        None,
+        Some(10),
+    );
+    (operator, sales)
+}
+
+fn request_provider_grant(
+    state: &Journey,
+    sales: &AuthenticatedCompanyPrincipalV1,
+    operation: u128,
+    total_call_limit: u16,
+) -> sentinel_workflow::RequestProviderGrantV1 {
+    let CompanyWorkflowResponseV1::CustomerRequest(request) = command(
+        &state.store,
+        &state.customer,
+        operation,
+        CompanyWorkflowCommandV1::SubmitCustomerRequest {
+            summary_ref: "New website".into(),
+            desired_outcome: "Three pages".into(),
+            constraints: vec![],
+        },
+        u64::try_from(operation).unwrap(),
+    ) else {
+        panic!()
+    };
+    sentinel_workflow::RequestProviderGrantV1 {
+        schema_version: 1,
+        request_id: request.request_id,
+        expected_version: request.version,
+        sales_principal: sales.clone(),
+        provider: "codex-cli".into(),
+        model: "model-test".into(),
+        catalog_digest: DIGEST.into(),
+        total_call_limit,
+        concurrent_call_limit: 1,
+        max_duration_ms: 120_000,
+        token_policy: SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+        expires_at_unix_ms: 300_000,
+    }
+}
+
 pub(super) fn assigned() -> (Journey, ProjectV1, SubscriptionCallGrantV1) {
     let state = journey();
     let project = project_command(

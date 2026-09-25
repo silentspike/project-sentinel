@@ -217,12 +217,14 @@ fn all_calls(connection: &Connection) -> Result<Vec<RequestProviderCallV1>, Work
         .collect()
 }
 
-// Legacy grants are never reset or inferred successful. Every grant consumes
-// total allowance. Only the current dispatched grant can occupy concurrency;
-// archived grants have already crossed a validated handoff/correction, while a
-// current grant releases its slot only after durable work completion. Missing
-// work remains active so corrupted or incomplete state fails closed.
-fn legacy_usage(connection: &Connection) -> Result<(usize, usize), WorkflowError> {
+// Legacy grants are never reset or inferred successful. Every legacy grant
+// consumes total Sales allowance. Only a current dispatched legacy grant can
+// occupy Sales concurrency; archived grants have crossed a validated handoff
+// or correction, while missing work remains fail-closed.
+fn legacy_usage(
+    connection: &Connection,
+    request_calls: &[RequestProviderCallV1],
+) -> Result<(usize, usize), WorkflowError> {
     // Inspect the validated aggregate, not a JSON filter that could hide a
     // corrupted allowance before its row digest is checked.
     let mut statement = connection.prepare("SELECT tenant_id,entity_id FROM company_entities WHERE entity_kind='project' ORDER BY tenant_id,entity_id LIMIT 4097")?;
@@ -234,6 +236,13 @@ fn legacy_usage(connection: &Connection) -> Result<(usize, usize), WorkflowError
     if keys.len() > 4096 {
         return Err(corrupt());
     }
+    // The first fully validated request-bound call is the cutover from the old
+    // shared authority. A same-millisecond project grant stays legacy, which is
+    // conservative under the store's millisecond clock.
+    let cutover_ms = request_calls
+        .iter()
+        .map(|call| call.created_at_unix_ms)
+        .min();
     let mut total = 0;
     let mut dispatched = 0;
     for (tenant, id) in &keys {
@@ -251,6 +260,9 @@ fn legacy_usage(connection: &Connection) -> Result<(usize, usize), WorkflowError
                     .filter_map(|record| record.previous_subscription_call.as_ref()),
             )
         {
+            if cutover_ms.is_some_and(|cutover| allowance.created_at_unix_ms > cutover) {
+                continue;
+            }
             if let Some(previous) = allowances.insert(&allowance.allowance_id, allowance) {
                 if previous != allowance {
                     return Err(corrupt());
@@ -272,16 +284,6 @@ fn legacy_usage(connection: &Connection) -> Result<(usize, usize), WorkflowError
         }
     }
     Ok((total, dispatched))
-}
-
-pub(super) fn ensure_legacy_grant_allowed(connection: &Connection) -> Result<(), WorkflowError> {
-    let calls = all_calls(connection)?;
-    if let Some(limit) = calls.iter().map(|call| call.grant.total_call_limit).max() {
-        if calls.len() + legacy_usage(connection)?.0 >= usize::from(limit) {
-            return Err(invalid("provider campaign allowance exhausted"));
-        }
-    }
-    Ok(())
 }
 
 pub(super) fn ensure_legacy_dispatch_allowed(connection: &Connection) -> Result<(), WorkflowError> {
@@ -405,7 +407,7 @@ impl WorkflowStore {
         .ok_or_else(not_found)?;
         require_version(source_request.version, grant.expected_version)?;
         let calls = all_calls(&transaction)?;
-        let (legacy_total, _) = legacy_usage(&transaction)?;
+        let (legacy_total, _) = legacy_usage(&transaction, &calls)?;
         if calls.len() + legacy_total >= usize::from(grant.total_call_limit)
             || calls.iter().any(|call| {
                 call.granted_by.tenant_id == principal.tenant_id
@@ -476,7 +478,8 @@ impl WorkflowStore {
             return Err(unauthorized());
         }
         current_request_matches(&transaction, &call)?;
-        let active = all_calls(&transaction)?
+        let calls = all_calls(&transaction)?;
+        let active = calls
             .iter()
             .filter(|call| {
                 call.dispatch.is_some()
@@ -485,7 +488,7 @@ impl WorkflowStore {
                     && call.abandonment_event_id.is_none()
             })
             .count()
-            + legacy_usage(&transaction)?.1;
+            + legacy_usage(&transaction, &calls)?.1;
         if active >= usize::from(call.grant.concurrent_call_limit) {
             return Err(invalid("request provider concurrency exhausted"));
         }
