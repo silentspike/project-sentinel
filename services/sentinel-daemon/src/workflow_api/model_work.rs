@@ -1126,6 +1126,65 @@ mod tests {
     }
 
     #[test]
+    fn project_dispatch_coexists_with_sales_bootstrap_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut api = configured_test_api(&temp.path().join("company.sqlite"));
+        let binding = assign_test_work_mode(&api, true);
+        api.subscription_allowance_id = Some("subscription-sales-bootstrap".into());
+        api.request_sales_tenant = Some(TenantId::parse("tenant-m0").unwrap());
+        api.event_store = Some(
+            sentinel_limbo::EventStore::open(temp.path().join("events.sqlite").to_str().unwrap())
+                .unwrap(),
+        );
+        let context = api.prepare_model_work(&binding).unwrap().unwrap();
+        let request_id = format!("company-provider-{}", binding.reservation_id);
+        let request_digest = "d".repeat(64);
+        let context_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&context).unwrap())
+        );
+        api.event_store
+            .as_ref()
+            .unwrap()
+            .reserve_llm_request(&request_id, &request_digest, &AgentId(6).to_string())
+            .unwrap();
+        let mut request = serde_json::json!({
+            "schema_version": 1,
+            "allowance_id": binding.reservation_id,
+            "agent_id": 6,
+            "request_id": request_id,
+            "request_digest": request_digest,
+            "context_digest": context_digest,
+            "provider": "codex-cli",
+            "model": "gpt-5.4",
+            "catalog_digest": "c".repeat(64),
+        });
+
+        request["subject"] = serde_json::json!({
+            "kind": "customer_request",
+            "request_id": "request-foreign",
+            "request_version": 1,
+        });
+        assert_eq!(
+            api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+                .status,
+            403,
+            "project dispatch cannot carry a Sales subject"
+        );
+        request.as_object_mut().unwrap().remove("subject");
+        assert_eq!(
+            api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+                .status,
+            200,
+            "the static Sales bootstrap allowance must not mask dynamic project authority"
+        );
+        assert_eq!(
+            api.subscription_allowance_id.as_deref(),
+            Some("subscription-sales-bootstrap")
+        );
+    }
+
+    #[test]
     fn adaptive_dispatch_claim_is_a_permanent_provider_call_tombstone() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("company.sqlite");

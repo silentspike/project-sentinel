@@ -1,5 +1,10 @@
 # Changelog
 
+- Route dynamic project-work dispatch independently from the static Sales and
+  planning bootstrap allowance. A configured Sales tenant can no longer mask
+  an exact current project grant, while project requests carrying a Sales
+  subject still fail before provider I/O (#856).
+
 - Renew an expired project-model allowance only when its exact assignment,
   agent, provider, model, catalog and policy remain active and no dispatch was
   ever committed. The periodic workflow reconciler can now resume an
