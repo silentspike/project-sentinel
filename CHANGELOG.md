@@ -1,5 +1,11 @@
 # Changelog
 
+- Bind independent model QA to the server-resolved accepted customer scope and
+  treat internal design/source artifacts as untrusted context. A valid negative
+  review now supersedes only an unconsumed planned delivery review and opens a
+  durable, bounded correction of the same QA work; it cannot authorize release,
+  delivery, or customer acceptance (#856).
+
 - Let completed project work autonomously enter one independent model source
   review and advance the existing delivery pipeline through immutable customer
   preview. Keep customer acceptance and company closeout exclusively explicit,
