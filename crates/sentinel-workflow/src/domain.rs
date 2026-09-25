@@ -757,6 +757,17 @@ pub struct SubscriptionCallAllowanceV1 {
     pub dispatch: Option<SubscriptionCallDispatchV1>,
 }
 
+/// A consumed provider authority that an operator explicitly abandoned after
+/// the provider outcome could no longer be recovered safely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbandonedSubscriptionCallV1 {
+    pub allowance: SubscriptionCallAllowanceV1,
+    pub resolution_event_id: String,
+    pub abandoned_by: String,
+    pub abandoned_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubscriptionCallDispatchV1 {
@@ -832,6 +843,8 @@ pub struct ProjectV1 {
     pub reservations: Vec<CostReservationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_call: Option<SubscriptionCallAllowanceV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub abandoned_subscription_calls: Vec<AbandonedSubscriptionCallV1>,
     /// Consumed developer authority retained by the one-time source-review handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_review_previous_call: Option<SubscriptionCallAllowanceV1>,
@@ -1116,6 +1129,15 @@ pub enum CompanyWorkflowCommandV1 {
         project_id: ProjectId,
         expected_version: u64,
         grant: SubscriptionCallGrantV1,
+    },
+    /// Internal operator recovery after an exact EventStore resolution.
+    AbandonSubscriptionCall {
+        project_id: ProjectId,
+        expected_version: u64,
+        allowance_id: String,
+        request_digest: String,
+        resolution_event_id: String,
+        abandoned_by: String,
     },
     /// Internal: requires canonical completed-model evidence in the service.
     GrantSourceReviewCall {
