@@ -889,10 +889,7 @@ fn project_planning_reconcile_grants_existing_assigned_project_once() {
     assert_eq!(replayed.version, granted.version);
 
     let renewal_time = allowance.grant.expires_at_unix_ms + 1;
-    assert!(WorkflowApi::model_work_grant_due(
-        &granted,
-        renewal_time,
-    ));
+    assert!(WorkflowApi::model_work_grant_due(&granted, renewal_time,));
     let mut changed_grant = allowance.grant.clone();
     changed_grant.model = "different-model".to_owned();
     changed_grant.expires_at_unix_ms = renewal_time + 300_000;
