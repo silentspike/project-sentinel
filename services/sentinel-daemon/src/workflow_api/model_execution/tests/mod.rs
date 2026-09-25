@@ -520,6 +520,18 @@ fn project_plan_is_strict_acyclic_and_server_binds_authority() {
 fn project_planning_dispatch_claims_the_exact_durable_subject_once() {
     let temp = tempfile::tempdir().unwrap();
     let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
+    let request = dispatch_project_planning(&api, &context);
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+            .status,
+        403
+    );
+}
+
+fn dispatch_project_planning(
+    api: &WorkflowApi,
+    context: &ProjectPlanningContext,
+) -> serde_json::Value {
     let binding = ProviderExecutionAuthority::ProjectPlanning(Box::new(context.binding.clone()));
     let request_id = binding.request_id();
     let request_digest = "d".repeat(64);
@@ -565,11 +577,208 @@ fn project_planning_dispatch_claims_the_exact_durable_subject_once() {
             .status,
         200
     );
+    request
+}
+
+fn dispatch_project_model_work(
+    api: &WorkflowApi,
+    context: &ProjectPlanningContext,
+) -> (String, String, String) {
+    let planning_request = dispatch_project_planning(api, context);
+    let planning_request_id = planning_request["request_id"].as_str().unwrap();
+    let planning_request_digest = planning_request["request_digest"].as_str().unwrap();
+    let content = r#"{"schema_version":1,"rationale":"Implement the accepted site directly.","tasks":[{"key":"implement","title":"Implement site","objective":"Build and validate the accepted site.","role":"developer","depends_on":[]}]}"#;
+    let decision: ProjectPlanningDecision = serde_json::from_str(content).unwrap();
+    let items = api.bind_project_plan(context, &decision).unwrap();
+    let outcome = api
+        .core
+        .apply_company_command(
+            &context.binding.grant.planner_principal,
+            stable_operation_id(
+                "sentinel.workflow.test-adopt-project-plan.v1",
+                planning_request_id,
+                1,
+            ),
+            &CompanyWorkflowCommandV1::PlanWorkGraph {
+                project_id: context.source_project.project_id.clone(),
+                expected_version: context.source_project.version,
+                items,
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::Project(planned) = outcome.response else {
+        panic!("planned project")
+    };
+    let outcome = api
+        .core
+        .apply_company_command(
+            &context.binding.grant.planner_principal,
+            stable_operation_id(
+                "sentinel.workflow.test-activate-project-plan.v1",
+                planning_request_id,
+                2,
+            ),
+            &CompanyWorkflowCommandV1::ActivateProject {
+                project_id: planned.project_id.clone(),
+                expected_version: planned.version,
+                reason_ref: "accepted-model-authored-plan".to_owned(),
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::Project(project) = outcome.response else {
+        panic!("activated project")
+    };
+    let assigned = api
+        .assign_ready_model_work(
+            &context.binding.grant.planner_principal,
+            *project,
+            planning_request_id,
+        )
+        .unwrap();
+    api.store
+        .complete_project_planning_call(
+            &context.binding.grant.planner_principal,
+            &context.binding.grant.project_id,
+            &context.binding.allowance_id,
+            planning_request_digest,
+            &format!("{:x}", Sha256::digest(content.as_bytes())),
+            &assigned,
+            now_unix_ms(),
+        )
+        .unwrap();
+    api.reconcile_pending();
+
+    let project = api
+        .store
+        .company_project(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .unwrap();
+    let allowance = project.subscription_call.as_ref().unwrap();
+    let source = api
+        .provider_usage_binding_for_agent(allowance.grant.agent_id)
+        .unwrap()
+        .unwrap();
+    let binding = ProviderUsageAuthority {
+        tenant_id: source.tenant_id,
+        project_id: source.project_id,
+        work_item_id: source.work_item_id,
+        reservation_id: source.reservation_id,
+        assignment_id: source.assignment_id,
+        assignment_version: source.assignment_version,
+        agent_id: source.agent_id,
+        provider: source.provider,
+        subscription_grant: source.subscription_grant,
+    };
+    let model_context =
+        ModelExecutionContext::from(api.prepare_model_work(&binding).unwrap().unwrap());
+    let request_id = format!("company-provider-{}", allowance.allowance_id);
+    let request_digest = "e".repeat(64);
+    api.event_store
+        .as_ref()
+        .unwrap()
+        .reserve_llm_request(
+            &request_id,
+            &request_digest,
+            &allowance.grant.agent_id.to_string(),
+        )
+        .unwrap();
+    let request = serde_json::json!({
+        "schema_version": 1,
+        "allowance_id": allowance.allowance_id,
+        "agent_id": allowance.grant.agent_id.0,
+        "request_id": request_id,
+        "request_digest": request_digest,
+        "context_digest": format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&model_context).unwrap())
+        ),
+        "provider": allowance.grant.provider,
+        "model": allowance.grant.model,
+        "catalog_digest": allowance.grant.catalog_digest,
+    });
     assert_eq!(
         api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
             .status,
+        200
+    );
+    (allowance.allowance_id.clone(), request_id, request_digest)
+}
+
+#[test]
+fn project_provider_abandonment_requires_resolution_and_regrants_autonomously() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
+    let (allowance_id, request_id, request_digest) = dispatch_project_model_work(&api, &context);
+    let operator = api.principals.principal("operator").unwrap();
+    let customer = api.principals.principal("customer").unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "project_id": context.source_project.project_id,
+        "allowance_id": allowance_id,
+    }))
+    .unwrap();
+
+    assert_eq!(
+        api.abandon_project_provider_call(&operator, &body).status,
         403
     );
+    api.event_store
+        .as_ref()
+        .unwrap()
+        .resolve_llm_completion_terminal(
+            &request_id,
+            &request_digest,
+            "test operator abandoned terminal project inference",
+        )
+        .unwrap();
+    assert_eq!(
+        api.abandon_project_provider_call(&customer, &body).status,
+        403
+    );
+    assert_eq!(
+        api.abandon_project_provider_call(&operator, &body).status,
+        200
+    );
+    assert_eq!(
+        api.abandon_project_provider_call(&operator, &body).status,
+        200
+    );
+
+    let archived = api
+        .store
+        .company_project(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(archived.subscription_call.is_none());
+    assert_eq!(archived.abandoned_subscription_calls.len(), 1);
+    assert_eq!(
+        archived.abandoned_subscription_calls[0]
+            .allowance
+            .allowance_id,
+        allowance_id
+    );
+
+    api.reconcile_pending();
+    let renewed = api
+        .store
+        .company_project(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        renewed.subscription_call.as_ref().unwrap().allowance_id,
+        allowance_id
+    );
+    assert_eq!(renewed.abandoned_subscription_calls.len(), 1);
 }
 
 #[test]

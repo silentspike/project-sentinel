@@ -369,6 +369,68 @@ fn claim_command(project: &ProjectV1) -> CompanyWorkflowCommandV1 {
 }
 
 #[test]
+fn operator_resolution_archives_consumed_authority_before_regrant() {
+    let (state, project, grant) = assigned();
+    let project = project_command(
+        &state.store,
+        &state.pm,
+        43,
+        grant_command(&project, grant.clone()),
+        43,
+    );
+    let claimed = project_command(
+        &state.store,
+        &state.developer,
+        44,
+        claim_command(&project),
+        44,
+    );
+    let allowance = claimed.subscription_call.as_ref().unwrap().clone();
+    let resolution_event_id = Uuid::from_u128(45).to_string();
+    let abandon = CompanyWorkflowCommandV1::AbandonSubscriptionCall {
+        project_id: claimed.project_id.clone(),
+        expected_version: claimed.version,
+        allowance_id: allowance.allowance_id.clone(),
+        request_digest: DIGEST.into(),
+        resolution_event_id: resolution_event_id.clone(),
+        abandoned_by: "operator-test".into(),
+    };
+    assert!(state
+        .store
+        .apply_company_command(&state.developer, Uuid::from_u128(45), &abandon, 45)
+        .is_err());
+
+    let abandoned = project_command(&state.store, &state.pm, 45, abandon, 45);
+    assert!(abandoned.subscription_call.is_none());
+    assert_eq!(abandoned.abandoned_subscription_calls.len(), 1);
+    assert_eq!(
+        abandoned.abandoned_subscription_calls[0].allowance,
+        allowance
+    );
+    assert_eq!(
+        abandoned.abandoned_subscription_calls[0].resolution_event_id,
+        resolution_event_id
+    );
+    assert_eq!(
+        abandoned.abandoned_subscription_calls[0].abandoned_by,
+        "operator-test"
+    );
+
+    let renewed = project_command(
+        &state.store,
+        &state.pm,
+        46,
+        grant_command(&abandoned, grant),
+        46,
+    );
+    assert_ne!(
+        renewed.subscription_call.as_ref().unwrap().allowance_id,
+        allowance.allowance_id
+    );
+    assert_eq!(renewed.abandoned_subscription_calls.len(), 1);
+}
+
+#[test]
 fn subscription_claim_is_durable_once_and_separate_from_money() {
     let (state, project, grant) = assigned();
     let project = project_command(

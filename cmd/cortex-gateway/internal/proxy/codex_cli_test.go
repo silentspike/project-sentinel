@@ -486,6 +486,22 @@ esac
 	}
 }
 
+func TestCodexCLIModelWorkUsesIndependentStructuredResponseLimit(t *testing.T) {
+	modelWork := &LLMRequest{
+		MaxTokens: 1024,
+		Metadata: map[string]string{
+			"company_execution_schema": "1",
+		},
+	}
+	if got := codexCLIResponseByteLimit(modelWork); got != maxModelWorkResponseBytes {
+		t.Fatalf("model-work limit=%d, want %d", got, maxModelWorkResponseBytes)
+	}
+	regular := &LLMRequest{MaxTokens: 1024, Metadata: map[string]string{}}
+	if got := codexCLIResponseByteLimit(regular); got != 8192 {
+		t.Fatalf("regular limit=%d, want 8192", got)
+	}
+}
+
 func TestCodexCLIReadinessRejectsWrongVersionAndMisleadingLoginText(t *testing.T) {
 	workdir := t.TempDir()
 	if err := os.Chmod(workdir, 0o700); err != nil { //nolint:gosec // test models the private production workdir

@@ -1221,6 +1221,159 @@ struct SalesAuthorization {
 }
 
 impl WorkflowApi {
+    pub(super) fn abandon_project_provider_call(
+        &self,
+        principal: &BoundPrincipal,
+        body: &[u8],
+    ) -> WorkflowHttpResponse {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            project_id: String,
+            allowance_id: String,
+        }
+        #[derive(Serialize)]
+        struct Response {
+            project_id: String,
+            allowance_id: String,
+            resolution_event_id: String,
+            archived: bool,
+        }
+        let request: Request = match decode_body(body) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let result = (|| {
+            let _guard = self
+                .mutation_fence
+                .read()
+                .map_err(|_| workflow_unavailable())?;
+            if !self.enabled
+                || !self.model_work_enabled
+                || principal.principal.kind != CompanyPrincipalKindV1::Operator
+                || !matches!(
+                    principal.principal.role,
+                    CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+                )
+            {
+                return Err(principal_unavailable());
+            }
+            let project_id =
+                ProjectId::parse(request.project_id).map_err(|_| principal_unavailable())?;
+            let project = self
+                .store
+                .company_project(&principal.principal.tenant_id, &project_id)?
+                .ok_or_else(principal_unavailable)?;
+            let (allowance, already_archived) = if let Some(current) = project
+                .subscription_call
+                .as_ref()
+                .filter(|allowance| allowance.allowance_id == request.allowance_id)
+            {
+                (current, None)
+            } else {
+                let archived = project
+                    .abandoned_subscription_calls
+                    .iter()
+                    .find(|entry| entry.allowance.allowance_id == request.allowance_id)
+                    .ok_or_else(principal_unavailable)?;
+                (&archived.allowance, Some(archived))
+            };
+            let dispatch = allowance
+                .dispatch
+                .as_ref()
+                .ok_or_else(principal_unavailable)?;
+            let store = self.event_store.as_ref().ok_or_else(workflow_unavailable)?;
+            let event = store
+                .event_by_operation_id(&format!("llm_resolution_{}", dispatch.request_id))
+                .map_err(|_| workflow_unavailable())?
+                .ok_or_else(principal_unavailable)?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&event.payload).map_err(|_| workflow_unavailable())?;
+            if event.event_type != "llm_completion_resolved"
+                || event.schema_version != 1
+                || event.correlation_id != dispatch.request_id
+                || event.aggregate_id != allowance.grant.agent_id.to_string()
+                || event.timestamp_ms > now_unix_ms()
+                || event.timestamp_ms < dispatch.dispatched_at_unix_ms
+                || payload.get("resolution").and_then(|value| value.as_str())
+                    != Some("operator_abandoned")
+                || payload.get("request_id").and_then(|value| value.as_str())
+                    != Some(dispatch.request_id.as_str())
+                || payload
+                    .get("request_digest")
+                    .and_then(|value| value.as_str())
+                    != Some(dispatch.request_digest.as_str())
+                || store
+                    .get_llm_completion(&dispatch.request_id)
+                    .map_err(|_| workflow_unavailable())?
+                    .is_some()
+            {
+                return Err(principal_unavailable());
+            }
+            if let Some(archived) = already_archived {
+                if archived.resolution_event_id != event.event_id {
+                    return Err(principal_unavailable());
+                }
+                return Ok(Response {
+                    project_id: project.project_id.to_string(),
+                    allowance_id: allowance.allowance_id.clone(),
+                    resolution_event_id: event.event_id,
+                    archived: true,
+                });
+            }
+            let project_actor = project
+                .governance
+                .participants
+                .iter()
+                .find(|participant| {
+                    participant.principal_id == allowance.created_by
+                        && matches!(
+                            participant.role,
+                            CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+                        )
+                })
+                .and_then(|participant| {
+                    self.principals
+                        .principal(&participant.principal_id)
+                        .filter(|bound| {
+                            bound.principal.tenant_id == project.tenant_id
+                                && bound.principal.kind == CompanyPrincipalKindV1::Agent
+                                && bound.principal.agent_id == Some(participant.agent_id)
+                                && bound.principal.role == participant.role
+                        })
+                })
+                .ok_or_else(principal_unavailable)?;
+            let operation_id = stable_operation_id(
+                "sentinel.workflow.abandon-project-provider.v1",
+                &event.event_id,
+                project.version,
+            );
+            self.core.apply_company_command(
+                &project_actor.principal,
+                operation_id,
+                &CompanyWorkflowCommandV1::AbandonSubscriptionCall {
+                    project_id: project_id.clone(),
+                    expected_version: project.version,
+                    allowance_id: allowance.allowance_id.clone(),
+                    request_digest: dispatch.request_digest.clone(),
+                    resolution_event_id: event.event_id.clone(),
+                    abandoned_by: principal.principal.principal_id.clone(),
+                },
+                now_unix_ms(),
+            )?;
+            Ok(Response {
+                project_id: project_id.to_string(),
+                allowance_id: allowance.allowance_id.clone(),
+                resolution_event_id: event.event_id,
+                archived: true,
+            })
+        })();
+        match result {
+            Ok(outcome) => json(200, &outcome),
+            Err(error) => workflow_error(error),
+        }
+    }
+
     pub(super) fn abandon_sales_request(
         &self,
         principal: &BoundPrincipal,
@@ -2233,6 +2386,15 @@ impl WorkflowApi {
                 "sentinel.workflow.renew-expired-model-work.v1",
                 &allowance.allowance_id,
                 allowance.grant.expires_at_unix_ms,
+            )
+        } else if let Some(abandoned) = current.abandoned_subscription_calls.last() {
+            stable_operation_id(
+                "sentinel.workflow.grant-model-plan-work-after-resolution.v1",
+                &format!(
+                    "{cause}:{}:{}",
+                    work.spec.work_item_id.0, abandoned.resolution_event_id
+                ),
+                assignment.assignment_version,
             )
         } else {
             stable_operation_id(
