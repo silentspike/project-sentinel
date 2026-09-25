@@ -1044,6 +1044,21 @@ mod tests {
             Some(old.reservation_id.as_str()),
             "a locally persisted completion must be adopted before new provider I/O"
         );
+
+        projects
+            .iter_mut()
+            .find(|project| project.project_id.0 == current.project_id)
+            .unwrap()
+            .subscription_call
+            .as_mut()
+            .unwrap()
+            .grant
+            .expires_at_unix_ms = now.saturating_sub(1);
+        assert_eq!(
+            select_actionable_subscription_allowance_id(&projects, AgentId(6), now, |_| Ok(false),),
+            Ok(None),
+            "expired subscription work must not fall back to unbounded selection"
+        );
     }
 
     #[test]

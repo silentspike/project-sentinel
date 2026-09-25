@@ -3761,6 +3761,9 @@ impl WorkflowApi {
                 }))
             },
         )?;
+        if self.subscription_allowance_id.is_some() && selected_allowance.is_none() {
+            return Ok(None);
+        }
         select_provider_usage_binding(&projects, agent_id, selected_allowance)
     }
 
