@@ -876,6 +876,33 @@ fn project_planning_reconcile_grants_existing_assigned_project_once() {
         &granted,
         allowance.created_at_unix_ms,
     ));
+    let mut sequential = granted.clone();
+    sequential
+        .work_items
+        .get_mut(&allowance.grant.work_item_id)
+        .unwrap()
+        .state = CompanyWorkStateV1::Done;
+    let mut next = sequential.work_items[&allowance.grant.work_item_id].clone();
+    next.spec.work_item_id = WorkItemId::parse("next-model-work").unwrap();
+    next.state = CompanyWorkStateV1::Assigned;
+    sequential
+        .work_items
+        .insert(next.spec.work_item_id.clone(), next);
+    sequential.subscription_call.as_mut().unwrap().dispatch =
+        Some(sentinel_workflow::SubscriptionCallDispatchV1 {
+            request_id: format!("company-provider-{}", allowance.allowance_id),
+            request_digest: "a".repeat(64),
+            dispatched_at_unix_ms: allowance.created_at_unix_ms + 1,
+        });
+    assert!(WorkflowApi::model_work_grant_due(
+        &sequential,
+        allowance.created_at_unix_ms + 2,
+    ));
+    sequential.source_review_previous_call = Some(allowance.clone());
+    assert!(!WorkflowApi::model_work_grant_due(
+        &sequential,
+        allowance.created_at_unix_ms + 2,
+    ));
     api.reconcile_pending();
     let replayed = api
         .store

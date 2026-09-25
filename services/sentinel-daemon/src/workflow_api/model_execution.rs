@@ -7,7 +7,8 @@ use super::*;
 use crate::llm_bridge::bridge::ProviderUsageAuthority;
 use sentinel_common::WorkbenchPrivateObservation;
 use sentinel_workflow::{
-    AdaptiveModelDecisionV1, CustomerRequestV1, RequestProviderCallV1, RequestProviderGrantV1,
+    AdaptiveModelDecisionV1, CompanyWorkStateV1, CustomerRequestV1, RequestProviderCallV1,
+    RequestProviderGrantV1,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -2141,9 +2142,31 @@ impl WorkflowApi {
         project: &sentinel_workflow::ProjectV1,
         now_ms: u64,
     ) -> bool {
-        project.subscription_call.as_ref().is_none_or(|allowance| {
-            allowance.dispatch.is_none() && now_ms >= allowance.grant.expires_at_unix_ms
-        })
+        let Some(allowance) = project.subscription_call.as_ref() else {
+            return true;
+        };
+        if allowance.dispatch.is_none() {
+            return now_ms >= allowance.grant.expires_at_unix_ms;
+        }
+        project.source_review_previous_call.is_none()
+            && project
+                .work_items
+                .get(&allowance.grant.work_item_id)
+                .is_some_and(|work| work.state == CompanyWorkStateV1::Done)
+            && project.work_items.values().any(|work| {
+                work.spec.work_item_id != allowance.grant.work_item_id
+                    && work.state == CompanyWorkStateV1::Assigned
+                    && matches!(
+                        work.spec.required_role,
+                        CompanyRoleV1::Designer | CompanyRoleV1::Developer
+                    )
+                    && work
+                        .assignments
+                        .iter()
+                        .filter(|assignment| assignment.active)
+                        .count()
+                        == 1
+            })
     }
 
     fn grant_model_work_at(
@@ -2163,7 +2186,15 @@ impl WorkflowApi {
             (allowance.dispatch.is_none() && now_ms >= allowance.grant.expires_at_unix_ms)
                 .then(|| allowance.clone())
         });
-        if current.subscription_call.is_some() && renewal.is_none() {
+        let completed = current.subscription_call.as_ref().filter(|allowance| {
+            allowance.dispatch.is_some()
+                && current.source_review_previous_call.is_none()
+                && current
+                    .work_items
+                    .get(&allowance.grant.work_item_id)
+                    .is_some_and(|work| work.state == CompanyWorkStateV1::Done)
+        });
+        if current.subscription_call.is_some() && renewal.is_none() && completed.is_none() {
             return Ok(current);
         }
         let mut eligible = current
@@ -2177,6 +2208,9 @@ impl WorkflowApi {
                     )
                     && renewal.as_ref().is_none_or(|allowance| {
                         allowance.grant.work_item_id == work.spec.work_item_id
+                    })
+                    && completed.is_none_or(|allowance| {
+                        allowance.grant.work_item_id != work.spec.work_item_id
                     })
             })
             .filter_map(|work| {
