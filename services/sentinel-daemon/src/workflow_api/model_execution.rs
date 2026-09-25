@@ -2134,12 +2134,36 @@ impl WorkflowApi {
         planning: &sentinel_workflow::ProjectPlanningGrantV1,
         cause: &str,
     ) -> Result<sentinel_workflow::ProjectV1, &'static str> {
+        self.grant_model_work_at(planner, project, planning, cause, now_unix_ms())
+    }
+
+    pub(super) fn model_work_grant_due(
+        project: &sentinel_workflow::ProjectV1,
+        now_ms: u64,
+    ) -> bool {
+        project.subscription_call.as_ref().is_none_or(|allowance| {
+            allowance.dispatch.is_none() && now_ms >= allowance.grant.expires_at_unix_ms
+        })
+    }
+
+    fn grant_model_work_at(
+        &self,
+        planner: &AuthenticatedCompanyPrincipalV1,
+        project: sentinel_workflow::ProjectV1,
+        planning: &sentinel_workflow::ProjectPlanningGrantV1,
+        cause: &str,
+        now_ms: u64,
+    ) -> Result<sentinel_workflow::ProjectV1, &'static str> {
         let current = self
             .store
             .company_project(&project.tenant_id, &project.project_id)
             .map_err(|_| "model-planned project unavailable")?
             .ok_or("model-planned project missing")?;
-        if current.subscription_call.is_some() {
+        let renewal = current.subscription_call.as_ref().and_then(|allowance| {
+            (allowance.dispatch.is_none() && now_ms >= allowance.grant.expires_at_unix_ms)
+                .then(|| allowance.clone())
+        });
+        if current.subscription_call.is_some() && renewal.is_none() {
             return Ok(current);
         }
         let mut eligible = current
@@ -2151,6 +2175,9 @@ impl WorkflowApi {
                         work.spec.required_role,
                         CompanyRoleV1::Designer | CompanyRoleV1::Developer
                     )
+                    && renewal.as_ref().is_none_or(|allowance| {
+                        allowance.grant.work_item_id == work.spec.work_item_id
+                    })
             })
             .filter_map(|work| {
                 let mut active = work
@@ -2167,12 +2194,44 @@ impl WorkflowApi {
         let Some((work, assignment)) = eligible.first() else {
             return Ok(current);
         };
-        let operation_id = stable_operation_id(
-            "sentinel.workflow.grant-model-plan-work.v1",
-            &format!("{cause}:{}", work.spec.work_item_id.0),
-            assignment.assignment_version,
-        );
-        let now_ms = now_unix_ms();
+        let operation_id = if let Some(allowance) = &renewal {
+            stable_operation_id(
+                "sentinel.workflow.renew-expired-model-work.v1",
+                &allowance.allowance_id,
+                allowance.grant.expires_at_unix_ms,
+            )
+        } else {
+            stable_operation_id(
+                "sentinel.workflow.grant-model-plan-work.v1",
+                &format!("{cause}:{}", work.spec.work_item_id.0),
+                assignment.assignment_version,
+            )
+        };
+        let expires_at_unix_ms = now_ms
+            .checked_add(300_000)
+            .ok_or("model work grant clock overflow")?;
+        let grant = if let Some(allowance) = renewal {
+            let mut grant = allowance.grant;
+            grant.expires_at_unix_ms = expires_at_unix_ms;
+            grant
+        } else {
+            sentinel_workflow::SubscriptionCallGrantV1 {
+                schema_version: 1,
+                work_item_id: work.spec.work_item_id.clone(),
+                assignment_id: assignment.assignment_id.clone(),
+                assignment_version: assignment.assignment_version,
+                agent_id: assignment.agent_id,
+                provider: planning.provider.clone(),
+                model: planning.model.clone(),
+                catalog_digest: planning.catalog_digest.clone(),
+                max_calls: 1,
+                max_concurrent: 1,
+                max_duration_ms: 120_000,
+                token_policy:
+                    sentinel_workflow::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+                expires_at_unix_ms,
+            }
+        };
         let outcome = self
             .core
             .apply_company_command(
@@ -2181,24 +2240,7 @@ impl WorkflowApi {
                 &CompanyWorkflowCommandV1::GrantSubscriptionCall {
                     project_id: current.project_id.clone(),
                     expected_version: current.version,
-                    grant: sentinel_workflow::SubscriptionCallGrantV1 {
-                        schema_version: 1,
-                        work_item_id: work.spec.work_item_id.clone(),
-                        assignment_id: assignment.assignment_id.clone(),
-                        assignment_version: assignment.assignment_version,
-                        agent_id: assignment.agent_id,
-                        provider: planning.provider.clone(),
-                        model: planning.model.clone(),
-                        catalog_digest: planning.catalog_digest.clone(),
-                        max_calls: 1,
-                        max_concurrent: 1,
-                        max_duration_ms: 120_000,
-                        token_policy:
-                            sentinel_workflow::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
-                        expires_at_unix_ms: now_ms
-                            .checked_add(300_000)
-                            .ok_or("model work grant clock overflow")?,
-                    },
+                    grant,
                 },
                 now_ms,
             )
