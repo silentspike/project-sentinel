@@ -2508,12 +2508,12 @@ fn select_provider_usage_binding(
     Ok(selected)
 }
 
-fn select_actionable_subscription_allowance_id<'a, F>(
-    projects: &'a [sentinel_workflow::ProjectV1],
+fn select_actionable_subscription_allowance_id<F>(
+    projects: &[sentinel_workflow::ProjectV1],
     agent_id: AgentId,
     now_ms: u64,
     mut locally_recoverable: F,
-) -> Result<Option<&'a str>, &'static str>
+) -> Result<Option<&str>, &'static str>
 where
     F: FnMut(&str) -> Result<bool, &'static str>,
 {
