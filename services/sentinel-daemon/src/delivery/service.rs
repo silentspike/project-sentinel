@@ -584,6 +584,14 @@ where
             if next == QaRunState::Running && candidate.state == CandidateState::QaAssigned {
                 transition_candidate(candidate.state, CandidateState::QaRunning)?;
                 candidate.state = CandidateState::QaRunning;
+            } else if next == QaRunState::Superseded
+                && matches!(
+                    candidate.state,
+                    CandidateState::QaAssigned | CandidateState::QaRunning
+                )
+            {
+                transition_candidate(candidate.state, CandidateState::Superseded)?;
+                candidate.state = CandidateState::Superseded;
             }
         }
         let expected_revision = aggregate.revision;
