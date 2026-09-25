@@ -742,6 +742,15 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		)
 		statusCode := http.StatusBadGateway
 		errMsg := "provider request failed"
+		var admissionErr *ProviderAdmissionError
+		if errors.As(err, &admissionErr) {
+			// This marker is emitted only by wrappers that failed before calling
+			// the actual provider. The daemon can therefore release its exact
+			// durable reservation without risking a duplicate paid effect.
+			w.Header().Set("X-Sentinel-Provider-Io", "not-started")
+			statusCode = http.StatusConflict
+			errMsg = "provider admission rejected"
+		}
 		var provErr *ProviderError
 		if errors.As(err, &provErr) {
 			if provErr.StatusCode > 0 {
