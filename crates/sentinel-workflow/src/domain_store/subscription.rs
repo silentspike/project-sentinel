@@ -75,6 +75,21 @@ fn expired_undispatched_grant_matches(
         && active_assignment_matches(project, &current.grant)
 }
 
+fn completed_dispatched_grant_can_advance(
+    project: &ProjectV1,
+    current: &SubscriptionCallAllowanceV1,
+    next: &SubscriptionCallGrantV1,
+) -> bool {
+    current.dispatch.is_some()
+        && current.grant.work_item_id != next.work_item_id
+        && project.source_review_previous_call.is_none()
+        && project
+            .work_items
+            .get(&current.grant.work_item_id)
+            .is_some_and(|work| work.state == CompanyWorkStateV1::Done)
+        && active_assignment_matches(project, next)
+}
+
 pub(super) fn grant(
     project: &mut ProjectV1,
     principal: &AuthenticatedCompanyPrincipalV1,
@@ -97,7 +112,9 @@ pub(super) fn grant(
         return Err(invalid("subscription call authority unavailable"));
     }
     if let Some(current) = project.subscription_call.as_ref() {
-        if !expired_undispatched_grant_matches(project, principal, current, grant, now_ms) {
+        if !expired_undispatched_grant_matches(project, principal, current, grant, now_ms)
+            && !completed_dispatched_grant_can_advance(project, current, grant)
+        {
             return Err(invalid("subscription call authority unavailable"));
         }
         project.subscription_call = None;

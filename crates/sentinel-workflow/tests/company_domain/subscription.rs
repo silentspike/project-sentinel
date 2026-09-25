@@ -432,6 +432,198 @@ fn subscription_claim_is_durable_once_and_separate_from_money() {
 }
 
 #[test]
+fn completed_dispatched_subscription_rotates_to_the_next_assigned_work_only() {
+    let state = journey();
+    let mut build_work = work("build-work", CompanyRoleV1::Developer, &["rust"], &[], 100);
+    build_work.owner = AgentId(4);
+    let project = project_command(
+        &state.store,
+        &state.pm,
+        140,
+        CompanyWorkflowCommandV1::PlanWorkGraph {
+            project_id: state.project_id.clone(),
+            expected_version: 1,
+            items: vec![
+                work("design-work", CompanyRoleV1::Developer, &["web"], &[], 100),
+                build_work,
+            ],
+        },
+        140,
+    );
+    let project = project_command(
+        &state.store,
+        &state.pm,
+        141,
+        CompanyWorkflowCommandV1::ActivateProject {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            reason_ref: "approved".into(),
+        },
+        141,
+    );
+    let project = project_command(
+        &state.store,
+        &state.pm,
+        142,
+        CompanyWorkflowCommandV1::AssignWork {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: WorkItemId::parse("design-work").unwrap(),
+            agent_id: AgentId(2),
+            organization_generation: 1,
+            organization_digest: DIGEST.into(),
+            reason_ref: "assigned".into(),
+        },
+        142,
+    );
+    let project = project_command(
+        &state.store,
+        &state.pm,
+        143,
+        CompanyWorkflowCommandV1::AssignWork {
+            project_id: state.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: WorkItemId::parse("build-work").unwrap(),
+            agent_id: AgentId(4),
+            organization_generation: 1,
+            organization_digest: DIGEST.into(),
+            reason_ref: "assigned".into(),
+        },
+        143,
+    );
+    let first_assignment =
+        &project.work_items[&WorkItemId::parse("design-work").unwrap()].assignments[0];
+    let first_grant = SubscriptionCallGrantV1 {
+        schema_version: 1,
+        work_item_id: WorkItemId::parse("design-work").unwrap(),
+        assignment_id: first_assignment.assignment_id.clone(),
+        assignment_version: first_assignment.assignment_version,
+        agent_id: AgentId(2),
+        provider: "codex-cli".into(),
+        model: "gpt-5.4".into(),
+        catalog_digest: DIGEST.into(),
+        max_calls: 1,
+        max_concurrent: 1,
+        max_duration_ms: 120_000,
+        token_policy: SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+        expires_at_unix_ms: 300_000,
+    };
+    let project = project_command(
+        &state.store,
+        &state.pm,
+        144,
+        grant_command(&project, first_grant),
+        144,
+    );
+    let project = project_command(
+        &state.store,
+        &state.developer,
+        145,
+        claim_command(&project),
+        145,
+    );
+    let first_allowance = project.subscription_call.clone().unwrap();
+    let next_assignment =
+        &project.work_items[&WorkItemId::parse("build-work").unwrap()].assignments[0];
+    let next_grant = SubscriptionCallGrantV1 {
+        schema_version: 1,
+        work_item_id: WorkItemId::parse("build-work").unwrap(),
+        assignment_id: next_assignment.assignment_id.clone(),
+        assignment_version: next_assignment.assignment_version,
+        agent_id: AgentId(4),
+        provider: "codex-cli".into(),
+        model: "gpt-5.4".into(),
+        catalog_digest: DIGEST.into(),
+        max_calls: 1,
+        max_concurrent: 1,
+        max_duration_ms: 120_000,
+        token_policy: SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+        expires_at_unix_ms: 300_146,
+    };
+    assert!(state
+        .store
+        .apply_company_command(
+            &state.pm,
+            Uuid::from_u128(146),
+            &grant_command(&project, next_grant.clone()),
+            146,
+        )
+        .is_err());
+
+    let project = project_command(
+        &state.store,
+        &state.developer,
+        147,
+        transition(
+            &state.project_id,
+            project.version,
+            "design-work",
+            2,
+            1,
+            CompanyWorkStateV1::Assigned,
+            CompanyWorkStateV1::InProgress,
+            Vec::new(),
+            None,
+            147,
+        ),
+        147,
+    );
+    let project = project_command(
+        &state.store,
+        &state.developer,
+        148,
+        transition(
+            &state.project_id,
+            project.version,
+            "design-work",
+            3,
+            1,
+            CompanyWorkStateV1::InProgress,
+            CompanyWorkStateV1::InReview,
+            output_receipt(),
+            None,
+            148,
+        ),
+        148,
+    );
+    let project = project_command(
+        &state.store,
+        &state.qa,
+        149,
+        transition(
+            &state.project_id,
+            project.version,
+            "design-work",
+            4,
+            1,
+            CompanyWorkStateV1::InReview,
+            CompanyWorkStateV1::Done,
+            output_receipt(),
+            Some(QualityGateReceiptBindingV1 {
+                gate_id: "web-work-item-qa-v1".into(),
+                generation: 1,
+                gate_digest: DIGEST.into(),
+                subject_digest: OTHER_DIGEST.into(),
+                passed: true,
+            }),
+            149,
+        ),
+        149,
+    );
+    let advanced = project_command(
+        &state.store,
+        &state.pm,
+        150,
+        grant_command(&project, next_grant.clone()),
+        150,
+    );
+    let next = advanced.subscription_call.as_ref().unwrap();
+    assert_ne!(next.allowance_id, first_allowance.allowance_id);
+    assert_eq!(next.grant, next_grant);
+    assert!(next.dispatch.is_none());
+}
+
+#[test]
 fn subscription_grant_accepts_a_bounded_adaptive_campaign() {
     let (state, project, mut grant) = assigned();
     grant.max_calls = 8;
