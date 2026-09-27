@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::digest::{canonical_sha256, validate_sha256};
-use crate::{RuntimeAuthoritySnapshotV1, WorkflowError, WorkflowErrorCode};
+use crate::{CompanyRoleV1, RuntimeAuthoritySnapshotV1, WorkflowError, WorkflowErrorCode};
 
 pub const ADAPTIVE_SESSION_MAX_CALLS: u16 = 64;
 pub const ADAPTIVE_TOOL_MAX_BYTES: usize = 256 * 1024;
@@ -87,6 +87,9 @@ pub enum AdaptiveModelDecisionV1 {
         tool: WorkbenchTool,
         tool_digest: String,
     },
+    Collaborate {
+        action: AdaptiveCollaborationActionV1,
+    },
     ProposeCompletion {
         artifact_digest: String,
     },
@@ -118,6 +121,10 @@ pub enum AdaptiveCursorV1 {
         effect: AdaptiveEffectV1,
         tool: WorkbenchTool,
         tool_digest: String,
+    },
+    CollaborationProposed {
+        effect: AdaptiveEffectV1,
+        action: AdaptiveCollaborationActionV1,
     },
     CompletionProposed {
         artifact_digest: String,
@@ -161,6 +168,10 @@ pub enum AdaptiveTransitionV1 {
     },
     ObserveTool {
         observation: AdaptiveObservationRefV1,
+    },
+    CommitCollaboration {
+        effect: AdaptiveEffectV1,
+        action_digest: String,
     },
     MarkUnknown {
         effect: AdaptiveEffectV1,
@@ -291,6 +302,14 @@ impl AdaptiveSessionV1 {
                             reason_code: reason_code.clone(),
                         }
                     }
+                    AdaptiveModelDecisionV1::Collaborate { action }
+                        if validate_collaboration_action(action).is_ok() =>
+                    {
+                        Cursor::CollaborationProposed {
+                            effect: effect.clone(),
+                            action: action.clone(),
+                        }
+                    }
                     _ => return Err(invalid()),
                 }
             }
@@ -322,6 +341,17 @@ impl AdaptiveSessionV1 {
                 }
                 // A failed command's confirmed output is feedback, not a failed work item.
                 next.last_observation = Some(observation.clone());
+                Cursor::ReadyForModel
+            }
+            (
+                Cursor::CollaborationProposed { effect, action },
+                Command::CommitCollaboration {
+                    effect: committed,
+                    action_digest,
+                },
+            ) if effect == committed
+                && adaptive_collaboration_digest(action).as_ref() == Ok(action_digest) =>
+            {
                 Cursor::ReadyForModel
             }
             (Cursor::ModelPending { effect }, Command::MarkUnknown { effect: unknown })
@@ -371,6 +401,62 @@ pub fn adaptive_tool_digest(tool: &WorkbenchTool) -> Result<String, WorkflowErro
         return Err(invalid());
     }
     canonical_sha256("sentinel.workflow.adaptive-tool.v1", tool)
+}
+
+/// A model may request durable collaboration, but it can only name a role and
+/// content. The daemon resolves the role to a current organization participant
+/// and validates all referenced artifacts before applying the command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AdaptiveCollaborationActionV1 {
+    AskQuestion {
+        question_ref: String,
+    },
+    OfferHandoff {
+        consumer_role: CompanyRoleV1,
+        artifact_digests: BTreeSet<String>,
+        reason_ref: String,
+    },
+}
+
+pub fn adaptive_collaboration_digest(
+    action: &AdaptiveCollaborationActionV1,
+) -> Result<String, WorkflowError> {
+    validate_collaboration_action(action)?;
+    canonical_sha256("sentinel.workflow.adaptive-collaboration.v1", action)
+}
+
+fn validate_collaboration_action(
+    action: &AdaptiveCollaborationActionV1,
+) -> Result<(), WorkflowError> {
+    match action {
+        AdaptiveCollaborationActionV1::AskQuestion { question_ref }
+            if valid_text(question_ref, 4096) =>
+        {
+            Ok(())
+        }
+        AdaptiveCollaborationActionV1::OfferHandoff {
+            consumer_role,
+            artifact_digests,
+            reason_ref,
+        } if !matches!(
+            consumer_role,
+            CompanyRoleV1::Customer | CompanyRoleV1::Sales | CompanyRoleV1::Gaia
+        ) && !artifact_digests.is_empty()
+            && artifact_digests.len() <= 64
+            && artifact_digests
+                .iter()
+                .all(|digest| validate_sha256(digest))
+            && valid_text(reason_ref, 4096) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn valid_text(value: &str, max_bytes: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= max_bytes && !value.bytes().any(|byte| byte == 0)
 }
 
 fn valid_reason(value: &str) -> bool {

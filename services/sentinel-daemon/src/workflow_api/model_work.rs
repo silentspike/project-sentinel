@@ -4,6 +4,7 @@ use super::*;
 use crate::llm_bridge::bridge::ProviderUsageAuthority;
 
 mod inputs;
+pub(crate) use inputs::validate_model_artifact_inputs;
 pub(crate) use inputs::ModelArtifactInput;
 
 const MODEL_WORK_WINDOW_MS: u64 = 300_000;
@@ -55,16 +56,7 @@ impl ModelWorkContext {
             .accepted_customer_contract
             .as_ref()
             .ok_or("accepted customer contract is unavailable")?;
-        if contract.agreement_id.trim().is_empty()
-            || contract.proposal_id.trim().is_empty()
-            || contract.proposal_digest.len() != 64
-            || !contract
-                .proposal_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            return Err("accepted customer contract is invalid");
-        }
+        contract.validate()?;
         Ok(contract)
     }
 
@@ -157,6 +149,22 @@ impl ModelWorkContext {
             return Err("model work context exceeds its bound");
         }
         Ok(prompt)
+    }
+}
+
+impl AcceptedCustomerContract {
+    pub(super) fn validate(&self) -> Result<(), &'static str> {
+        if self.agreement_id.trim().is_empty()
+            || self.proposal_id.trim().is_empty()
+            || self.proposal_digest.len() != 64
+            || !self
+                .proposal_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("accepted customer contract is invalid");
+        }
+        Ok(())
     }
 }
 
@@ -314,7 +322,7 @@ impl WorkflowApi {
         Ok(Some(context))
     }
 
-    fn accepted_customer_contract(
+    pub(super) fn accepted_customer_contract(
         &self,
         project: &sentinel_workflow::ProjectV1,
     ) -> Result<AcceptedCustomerContract, &'static str> {
@@ -349,7 +357,7 @@ impl WorkflowApi {
         })
     }
 
-    fn model_work_correction(
+    pub(super) fn model_work_correction(
         &self,
         project: &sentinel_workflow::ProjectV1,
         work_id: &WorkItemId,
