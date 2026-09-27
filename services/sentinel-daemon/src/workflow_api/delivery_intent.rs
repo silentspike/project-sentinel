@@ -94,16 +94,9 @@ pub(super) fn reconcile_internal(
         .map_err(|reason| DeliveryError::MissingEvidence(reason.to_owned()))?;
         if review.report.verdict == super::model_review::Verdict::ChangesRequested {
             if let Some(current) = aggregate.as_ref() {
-                supersede_pending_review(
-                    delivery,
-                    &material,
-                    current,
-                    qa,
-                    &run_id,
-                    &review.report_digest,
-                )?;
+                supersede_pending_review(delivery, &material, current, qa, &review.report_digest)?;
             }
-            super::model_review::request_review_correction(api, &material.project, &review)
+            super::model_review::raise_source_review_blocker(api, &material.project, &review)
                 .map_err(|reason| DeliveryError::MissingEvidence(reason.to_owned()))?;
             return Ok(true);
         }
@@ -212,59 +205,55 @@ fn supersede_pending_review(
     material: &ProjectMaterial,
     aggregate: &crate::delivery::DeliveryAggregateV1,
     qa: PrincipalV1,
-    run_id: &str,
     report_digest: &str,
 ) -> Result<(), DeliveryError> {
-    let candidate = aggregate
-        .candidates
-        .get(&material.candidate.candidate_id)
-        .ok_or_else(|| {
-            DeliveryError::Conflict(
-                "source-review correction found a delivery aggregate without its candidate"
-                    .to_owned(),
-            )
-        })?;
-    let run = aggregate.qa_runs.get(run_id).ok_or_else(|| {
-        DeliveryError::Conflict(
-            "source-review correction found a candidate without its planned QA run".to_owned(),
-        )
-    })?;
     if !aggregate.workbench_receipts.is_empty()
         || !aggregate.evidence_graphs.is_empty()
         || !aggregate.reviews.is_empty()
         || !aggregate.gates.is_empty()
         || !aggregate.releases.is_empty()
         || !aggregate.deliveries.is_empty()
-        || !matches!(
-            candidate.state,
-            CandidateState::QaAssigned | CandidateState::Superseded
-        )
-        || !matches!(run.state, QaRunState::Planned | QaRunState::Superseded)
     {
         return Err(DeliveryError::Conflict(
             "source-review correction cannot supersede consumed delivery evidence".to_owned(),
         ));
     }
-    if run.state == QaRunState::Superseded {
-        return Ok(());
+    for (run_id, run) in &aggregate.qa_runs {
+        if run.state == QaRunState::Superseded {
+            continue;
+        }
+        let plan = aggregate.qa_plans.get(&run.plan.id).ok_or_else(|| {
+            DeliveryError::CorruptStore("source-review QA plan is missing".to_owned())
+        })?;
+        let candidate = aggregate
+            .candidates
+            .get(&plan.candidate.id)
+            .ok_or_else(|| {
+                DeliveryError::CorruptStore("source-review candidate is missing".to_owned())
+            })?;
+        if run.state != QaRunState::Planned || candidate.state != CandidateState::QaAssigned {
+            return Err(DeliveryError::Conflict(
+                "source-review correction cannot supersede an active QA effect".to_owned(),
+            ));
+        }
+        let operation_id = super::stable_operation_id(
+            "sentinel.workflow.supersede-negative-source-review.v1",
+            &format!("{report_digest}:{run_id}"),
+            run.generation,
+        );
+        delivery.transition_qa(
+            &context(
+                qa.clone(),
+                operation_id,
+                "qa-source-review-superseded",
+                super::now_unix_ms(),
+            ),
+            &material.project.tenant_id.0,
+            &material.project.project_id.0,
+            run_id,
+            QaRunState::Superseded,
+        )?;
     }
-    let operation_id = super::stable_operation_id(
-        "sentinel.workflow.supersede-negative-source-review.v1",
-        report_digest,
-        material.candidate.generation,
-    );
-    delivery.transition_qa(
-        &context(
-            qa,
-            operation_id,
-            "qa-source-review-superseded",
-            super::now_unix_ms(),
-        ),
-        &material.project.tenant_id.0,
-        &material.project.project_id.0,
-        run_id,
-        QaRunState::Superseded,
-    )?;
     Ok(())
 }
 

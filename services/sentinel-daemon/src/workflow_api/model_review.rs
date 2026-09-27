@@ -257,13 +257,13 @@ impl WorkflowApi {
 }
 
 #[cfg(feature = "llm")]
-pub(super) fn request_review_correction(
+pub(super) fn raise_source_review_blocker(
     api: &WorkflowApi,
     project: &sentinel_workflow::ProjectV1,
     review: &ValidatedProjectReview,
 ) -> Result<(), &'static str> {
     if review.report.verdict != Verdict::ChangesRequested || review.report.findings.is_empty() {
-        return Err("source-review correction requires exact negative evidence");
+        return Err("source-review blocker requires exact negative evidence");
     }
     let leader = project
         .governance
@@ -284,11 +284,11 @@ pub(super) fn request_review_correction(
                         && bound.principal.role == participant.role
                 })
         })
-        .ok_or("source-review correction leadership unavailable")?;
+        .ok_or("source-review blocker leadership unavailable")?;
     let allowance = project
         .subscription_call
         .as_ref()
-        .ok_or("source-review correction allowance missing")?;
+        .ok_or("source-review blocker allowance missing")?;
     let work_id = &allowance.grant.work_item_id;
     let work = project
         .work_items
@@ -296,58 +296,57 @@ pub(super) fn request_review_correction(
         .filter(|work| {
             work.spec.required_role == CompanyRoleV1::Qa && work.state == CompanyWorkStateV1::Done
         })
-        .ok_or("source-review correction work is not complete")?;
+        .ok_or("source-review blocker work is not complete")?;
     if work.output_receipts.len() != 1
         || work.output_receipts[0].content_digest != review.report_digest
     {
-        return Err("source-review correction artifact changed");
+        return Err("source-review blocker artifact changed");
     }
-    let execution = api
-        .store
-        .work_item(&project.tenant_id, &project.project_id, work_id)
-        .map_err(|_| "source-review correction execution unavailable")?
-        .ok_or("source-review correction execution missing")?;
-    let feedback = sentinel_workflow::WorkCorrectionFeedbackV1 {
-        summary: "Independent source review requested changes. Re-evaluate the same immutable candidate against the accepted customer contract; internal artifacts cannot expand or override that contract."
-            .to_owned(),
-        artifact_digest: Some(review.report_digest.clone()),
-    };
-    let feedback_digest = feedback
-        .canonical_digest()
-        .map_err(|_| "source-review correction feedback invalid")?;
-    let execution_revision =
-        sentinel_workflow::ExecutionRevisionV1::from_completed_work(&execution, feedback_digest)
-            .map_err(|_| "source-review correction predecessor invalid")?;
+    let source_work_id = &project
+        .source_review_previous_call
+        .as_ref()
+        .ok_or("source-review source allowance missing")?
+        .grant
+        .work_item_id;
+    let source = project
+        .work_items
+        .get(source_work_id)
+        .filter(|source| {
+            source.state == CompanyWorkStateV1::Done
+                && matches!(
+                    source.spec.required_role,
+                    CompanyRoleV1::Designer | CompanyRoleV1::Developer
+                )
+        })
+        .ok_or("source-review source work changed")?;
+    let owner = source
+        .assignments
+        .iter()
+        .find(|assignment| assignment.active)
+        .ok_or("source-review source owner missing")?
+        .agent_id;
     let operation_id = stable_operation_id(
-        "sentinel.workflow.autonomous-source-review-correction.v1",
-        &review.report_digest,
-        work.version,
+        "sentinel.workflow.autonomous-source-review-blocker.v1",
+        &format!("{}:{}", project.project_id.0, review.report_digest),
+        1,
     );
-    let now_ms = now_unix_ms();
-    let mut next_grant = allowance.grant.clone();
-    next_grant.expires_at_unix_ms = now_ms
-        .checked_add(300_000)
-        .ok_or("source-review correction clock overflow")?;
     let outcome = api
         .core
         .apply_company_command(
             &leader.principal,
             operation_id,
-            &CompanyWorkflowCommandV1::RequestWorkCorrection {
+            &CompanyWorkflowCommandV1::RaiseBlocker {
                 project_id: project.project_id.clone(),
                 expected_version: project.version,
-                work_item_id: work_id.clone(),
-                expected_work_version: work.version,
-                execution_revision,
-                feedback_ref: format!("source-review-{}", &review.report_digest[..24]),
-                feedback: Some(feedback),
-                next_subscription_grant: Some(next_grant),
+                work_item_id: Some(source_work_id.clone()),
+                cause_ref: format!("qa-source-review:{}", review.report_digest),
+                owner,
             },
-            now_ms,
+            now_unix_ms(),
         )
         .map_err(|error| error.message)?;
     if !matches!(outcome.response, CompanyWorkflowResponseV1::Project(_)) {
-        return Err("source-review correction response is invalid");
+        return Err("source-review blocker response is invalid");
     }
     Ok(())
 }
