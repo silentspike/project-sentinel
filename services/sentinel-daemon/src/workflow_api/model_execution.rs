@@ -2322,6 +2322,59 @@ impl WorkflowApi {
             })
     }
 
+    fn recoverable_qa_allowance(
+        project: &sentinel_workflow::ProjectV1,
+        now_ms: u64,
+    ) -> Option<&sentinel_workflow::SubscriptionCallAllowanceV1> {
+        project.source_review_previous_call.as_ref()?;
+        let allowance = if let Some(current) = project.subscription_call.as_ref() {
+            (current.dispatch.is_none() && now_ms >= current.grant.expires_at_unix_ms)
+                .then_some(current)?
+        } else {
+            let abandoned = project.abandoned_subscription_calls.last()?;
+            abandoned.allowance.dispatch.as_ref()?;
+            &abandoned.allowance
+        };
+        let work = project.work_items.get(&allowance.grant.work_item_id)?;
+        if work.state != CompanyWorkStateV1::Assigned
+            || work.spec.required_role != CompanyRoleV1::Qa
+        {
+            return None;
+        }
+        let mut active = work
+            .assignments
+            .iter()
+            .filter(|assignment| assignment.active);
+        let assignment = active.next()?;
+        if active.next().is_some()
+            || assignment.role != CompanyRoleV1::Qa
+            || assignment.assignment_id != allowance.grant.assignment_id
+            || assignment.assignment_version != allowance.grant.assignment_version
+            || assignment.agent_id != allowance.grant.agent_id
+        {
+            return None;
+        }
+        Some(allowance)
+    }
+
+    fn qa_recovery_issuer_matches(
+        project: &sentinel_workflow::ProjectV1,
+        allowance: &sentinel_workflow::SubscriptionCallAllowanceV1,
+        principal: &AuthenticatedCompanyPrincipalV1,
+    ) -> bool {
+        allowance.created_by == principal.principal_id
+            && principal.tenant_id == project.tenant_id
+            && matches!(
+                principal.role,
+                CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+            )
+            && project.governance.participants.iter().any(|participant| {
+                participant.principal_id == principal.principal_id
+                    && Some(participant.agent_id) == principal.agent_id
+                    && participant.role == principal.role
+            })
+    }
+
     fn grant_model_work_at(
         &self,
         planner: &AuthenticatedCompanyPrincipalV1,
@@ -2350,15 +2403,45 @@ impl WorkflowApi {
         if current.subscription_call.is_some() && renewal.is_none() && completed.is_none() {
             return Ok(current);
         }
+        let qa_recovery = Self::recoverable_qa_allowance(&current, now_ms);
+        let qa_issuer = qa_recovery.and_then(|allowance| {
+            self.principals
+                .principal(&allowance.created_by)
+                .filter(|bound| {
+                    Self::qa_recovery_issuer_matches(&current, allowance, &bound.principal)
+                })
+        });
+        if qa_recovery.is_some() && qa_issuer.is_none() {
+            return Err("model QA recovery issuer unavailable");
+        }
+        if current.subscription_call.is_none()
+            && current
+                .abandoned_subscription_calls
+                .last()
+                .is_some_and(|abandoned| {
+                    current
+                        .work_items
+                        .get(&abandoned.allowance.grant.work_item_id)
+                        .is_some_and(|work| work.spec.required_role == CompanyRoleV1::Qa)
+                })
+            && qa_recovery.is_none()
+        {
+            return Err("model QA recovery assignment unavailable");
+        }
         let mut eligible = current
             .work_items
             .values()
             .filter(|work| {
-                work.state == sentinel_workflow::CompanyWorkStateV1::Assigned
-                    && matches!(
+                let eligible_work = if let Some(allowance) = qa_recovery {
+                    allowance.grant.work_item_id == work.spec.work_item_id
+                } else {
+                    matches!(
                         work.spec.required_role,
                         CompanyRoleV1::Designer | CompanyRoleV1::Developer
                     )
+                };
+                work.state == sentinel_workflow::CompanyWorkStateV1::Assigned
+                    && eligible_work
                     && renewal.as_ref().is_none_or(|allowance| {
                         allowance.grant.work_item_id == work.spec.work_item_id
                     })
@@ -2406,8 +2489,8 @@ impl WorkflowApi {
         let expires_at_unix_ms = now_ms
             .checked_add(300_000)
             .ok_or("model work grant clock overflow")?;
-        let grant = if let Some(allowance) = renewal {
-            let mut grant = allowance.grant;
+        let grant = if let Some(allowance) = renewal.as_ref().or(qa_recovery) {
+            let mut grant = allowance.grant.clone();
             grant.expires_at_unix_ms = expires_at_unix_ms;
             grant
         } else {
@@ -2431,7 +2514,10 @@ impl WorkflowApi {
         let outcome = self
             .core
             .apply_company_command(
-                planner,
+                qa_issuer
+                    .as_ref()
+                    .map(|bound| &bound.principal)
+                    .unwrap_or(planner),
                 operation_id,
                 &CompanyWorkflowCommandV1::GrantSubscriptionCall {
                     project_id: current.project_id.clone(),
