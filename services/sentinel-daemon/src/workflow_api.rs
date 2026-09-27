@@ -17,6 +17,8 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "llm")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -4507,8 +4509,16 @@ impl WorkflowApi {
                         && blocker.cause_ref.starts_with("qa-source-review:")
                 })
             {
-                model_review::restart_source_after_negative_review(self, &project)
-                    .map_err(|_| workflow_unavailable())?;
+                if let Err(reason) =
+                    model_review::restart_source_after_negative_review(self, &project)
+                {
+                    static LAST_LOGGED_MINUTE: AtomicU64 = AtomicU64::new(0);
+                    let minute = now_unix_ms() / 60_000;
+                    if LAST_LOGGED_MINUTE.swap(minute, Ordering::AcqRel) != minute {
+                        warn!(project_id = %project.project_id.0, reason, "autonomous QA source rework is blocked");
+                    }
+                    return Err(workflow_unavailable());
+                }
                 continue;
             }
             if model_review::setup_due(&project) {
