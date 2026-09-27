@@ -185,6 +185,103 @@ fn planning_fixture(path: &Path) -> (WorkflowApi, ProjectPlanningContext) {
 }
 
 #[test]
+fn project_planning_uses_project_agreement_not_global_sales_proposal() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, first_context) = planning_fixture(&temp.path().join("company.sqlite"));
+    let customer = api.principals.principal("customer").unwrap();
+    let sales = api.principals.principal("sales").unwrap();
+    let first_agreement = api
+        .store
+        .company_agreement(
+            &first_context.source_project.tenant_id,
+            &first_context.source_project.agreement_id,
+        )
+        .unwrap()
+        .unwrap();
+    let first_proposal = api
+        .store
+        .company_proposal(&first_agreement.tenant_id, &first_agreement.proposal_id)
+        .unwrap()
+        .unwrap();
+    let mut second_binding = first_proposal.binding.clone();
+    second_binding.scope = "Second accepted project with an independent plan".into();
+
+    let response = api
+        .store
+        .apply_company_command(
+            &customer.principal,
+            Uuid::from_u128(201),
+            &CompanyWorkflowCommandV1::SubmitCustomerRequest {
+                summary_ref: "Second project".into(),
+                desired_outcome: "A separately planned deliverable".into(),
+                constraints: vec![],
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::CustomerRequest(second_request) = response.response else {
+        panic!("second request")
+    };
+    let response = api
+        .store
+        .apply_company_command(
+            &sales.principal,
+            Uuid::from_u128(202),
+            &CompanyWorkflowCommandV1::QualifyCustomerRequest {
+                request_id: second_request.request_id.clone(),
+                expected_version: second_request.version,
+                reason_ref: "second project is within scope".into(),
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::CustomerRequest(second_request) = response.response else {
+        panic!("qualified second request")
+    };
+    let response = api
+        .store
+        .apply_company_command(
+            &sales.principal,
+            Uuid::from_u128(203),
+            &CompanyWorkflowCommandV1::CreateProposal {
+                request_id: second_request.request_id.clone(),
+                expected_version: second_request.version,
+                binding: second_binding,
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::Proposal(second_proposal) = response.response else {
+        panic!("second proposal")
+    };
+    let response = api
+        .store
+        .apply_company_command(
+            &customer.principal,
+            Uuid::from_u128(204),
+            &CompanyWorkflowCommandV1::AcceptProposal {
+                request_id: second_request.request_id,
+                expected_version: 3,
+                proposal_id: second_proposal.proposal_id,
+                proposal_digest: second_proposal.proposal_digest,
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::AgreementProject { project, .. } = response.response else {
+        panic!("second agreement")
+    };
+
+    let planning_call = api.ensure_project_planning_call(&project).unwrap();
+    assert_eq!(planning_call.grant.project_id, project.project_id);
+    assert_eq!(
+        planning_call.grant.provider,
+        first_context.binding.grant.provider
+    );
+    assert_eq!(planning_call.grant.model, first_context.binding.grant.model);
+}
+
+#[test]
 fn sales_abandonment_requires_exact_persisted_resolution_before_new_authority() {
     let temp = tempfile::tempdir().unwrap();
     let (api, context) = fixture(&temp.path().join("workflow.sqlite"));
