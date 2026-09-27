@@ -1,5 +1,10 @@
 # Changelog
 
+- Read valid project subscription-abandonment snapshots in the authenticated
+  project event feed. The read contract now accepts the event emitted by the
+  existing operator resolution path while preserving integrity validation
+  for its project snapshot and operation (#856).
+
 - Bind independent model QA to the server-resolved accepted customer scope and
   treat internal design/source artifacts as untrusted context. A valid negative
   review now supersedes only an unconsumed planned delivery review and opens a
