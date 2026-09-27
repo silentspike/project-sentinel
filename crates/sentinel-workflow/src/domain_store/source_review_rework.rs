@@ -128,6 +128,15 @@ pub(super) fn restart(
         return Err(invalid("QA rework grant or feedback changed"));
     }
 
+    let review_corrections = project
+        .work_corrections
+        .iter()
+        .filter(|record| record.previous.spec.work_item_id == *review_work_item_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    project
+        .work_corrections
+        .retain(|record| record.previous.spec.work_item_id != *review_work_item_id);
     project.work_items.remove(review_work_item_id);
     project.source_review_previous_call = None;
     project.subscription_call = Some(prior_source.clone());
@@ -135,6 +144,7 @@ pub(super) fn restart(
         .archived_source_reviews
         .push(ArchivedSourceReviewV1 {
             review_work: review,
+            review_corrections,
             source_work: source,
             review_allowance: prior_review,
             source_allowance: prior_source,
@@ -186,6 +196,7 @@ pub(super) fn restart(
 pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
     let mut reports = BTreeSet::new();
     let mut reviews = BTreeSet::new();
+    let mut correction_ids = BTreeSet::new();
     for entry in &project.archived_source_reviews {
         validate_digest(&entry.report_digest).map_err(|_| corrupt())?;
         validate_identifier(&entry.blocker_id).map_err(|_| corrupt())?;
@@ -196,6 +207,14 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
             || project.work_items.contains_key(review_id)
             || entry.review_work.state != CompanyWorkStateV1::Done
             || entry.review_work.spec.required_role != CompanyRoleV1::Qa
+            || entry.review_corrections.iter().any(|record| {
+                record.previous.spec.work_item_id != *review_id
+                    || !correction_ids.insert(record.correction_id.clone())
+            })
+            || project.work_corrections.iter().any(|record| {
+                record.previous.spec.work_item_id == *review_id
+                    || correction_ids.contains(&record.correction_id)
+            })
             || !entry.review_work.spec.dependency_ids.contains(source_id)
             || entry.review_work.output_receipts.len() != 1
             || entry.review_work.output_receipts[0].content_digest != entry.report_digest
@@ -242,6 +261,10 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
         historical
             .work_items
             .insert(review_id.clone(), entry.review_work.clone());
+        historical
+            .work_corrections
+            .extend(entry.review_corrections.iter().cloned());
+        work_corrections::validate(&historical)?;
         subscription::validate_allowance(&historical, &entry.review_allowance)?;
         subscription::validate_allowance(project, &entry.source_allowance)?;
     }

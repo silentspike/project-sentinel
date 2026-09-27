@@ -1,5 +1,10 @@
 # Changelog
 
+- Archive earlier corrections of a completed source QA task together with that
+  QA task before restarting the Developer source work. Preserve and validate
+  the correction history across SQLite reopen instead of leaving a live
+  correction pointing at an archived task (#856).
+
 - After a sealed negative source QA review, restart the same Developer work
   within its existing project budget. Archive the consumed QA and source
   allowances, retain the original artifacts and review history, and require a
