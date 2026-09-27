@@ -61,6 +61,67 @@ func TestCodexCLIReasoningAndPrivateErrorClassification(t *testing.T) {
 	}
 }
 
+func TestCodexCLIProjectWorkUsesStructuredFinalResponse(t *testing.T) {
+	workdir := t.TempDir()
+	if err := os.Chmod(workdir, 0o700); err != nil { //nolint:gosec // private provider workdir fixture
+		t.Fatal(err)
+	}
+	artifacts := t.TempDir()
+	argsPath := filepath.Join(artifacts, "args")
+	schemaPath := filepath.Join(artifacts, "schema")
+	scriptPath := filepath.Join(artifacts, "codex")
+	script := fmt.Sprintf(`#!/bin/sh
+set -eu
+printf '%%s\n' "$@" > %q
+schema=''
+previous=''
+for arg do
+  if [ "$previous" = '--output-schema' ]; then schema="$arg"; fi
+  previous="$arg"
+done
+if [ -n "$schema" ]; then cp "$schema" %q; fi
+cat >/dev/null
+printf '%%s\n' '{"type":"thread.started","thread_id":"thread-1"}'
+printf '%%s\n' '{"type":"turn.started"}'
+printf '%%s\n' '{"type":"item.completed","item":{"id":"message-1","type":"agent_message","text":"Pong"}}'
+printf '%%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}'
+`, argsPath, schemaPath)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil { //nolint:gosec // executable test fixture
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_CLI_WORKDIR", workdir)
+	provider := NewCodexCLIProvider(ProviderConfig{Name: CodexCLIProviderName, BaseURL: scriptPath}, nil)
+	request := &LLMRequest{
+		Messages:  []Message{{Role: "user", Content: "Return a project tool plan."}},
+		MaxTokens: 64,
+		Metadata:  map[string]string{"company_execution_schema": "1"},
+	}
+	if _, err := provider.Send(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Fields(readTestFile(t, argsPath))
+	if !slices.Contains(args, "--output-schema") {
+		t.Fatalf("project work omitted output schema: %v", args)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal([]byte(readTestFile(t, schemaPath)), &schema); err != nil {
+		t.Fatal(err)
+	}
+	if schema["type"] != "object" {
+		t.Fatalf("unexpected project work schema: %v", schema["type"])
+	}
+	if files, err := filepath.Glob(filepath.Join(workdir, ".codex-work-schema-*.json")); err != nil || len(files) != 0 {
+		t.Fatalf("schema files retained: %v, %v", files, err)
+	}
+	request.Metadata = nil
+	if _, err := provider.Send(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if args := strings.Fields(readTestFile(t, argsPath)); slices.Contains(args, "--output-schema") {
+		t.Fatalf("ordinary request inherited project work schema: %v", args)
+	}
+}
+
 func TestCodexCLIProviderParsesCompletedInference(t *testing.T) {
 	stream := strings.Join([]string{
 		`{"type":"thread.started","thread_id":"thread-1"}`,
