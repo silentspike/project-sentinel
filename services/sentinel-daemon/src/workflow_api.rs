@@ -4509,6 +4509,14 @@ impl WorkflowApi {
                         && blocker.cause_ref.starts_with("qa-source-review:")
                 })
             {
+                if model_review::rework_limit_reached(&project) {
+                    static LAST_ESCALATED_MINUTE: AtomicU64 = AtomicU64::new(0);
+                    let minute = now_unix_ms() / 60_000;
+                    if LAST_ESCALATED_MINUTE.swap(minute, Ordering::AcqRel) != minute {
+                        warn!(project_id = %project.project_id.0, "autonomous QA rework limit reached; operator action required");
+                    }
+                    continue;
+                }
                 if let Err(reason) =
                     model_review::restart_source_after_negative_review(self, &project)
                 {
@@ -5910,6 +5918,56 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 3,
         }
+    }
+
+    #[test]
+    fn autonomous_source_rework_limit_is_scoped_to_the_same_work_item() {
+        let mut project = project_with_provider_authority();
+        let source = project.work_items.values().next().unwrap().clone();
+        let allowance = sentinel_workflow::SubscriptionCallAllowanceV1 {
+            allowance_id: "source-allowance".into(),
+            grant: sentinel_workflow::SubscriptionCallGrantV1 {
+                schema_version: 1,
+                work_item_id: source.spec.work_item_id.clone(),
+                assignment_id: "assignment-m0".into(),
+                assignment_version: 1,
+                agent_id: AgentId(6),
+                provider: "codex-cli".into(),
+                model: "test-model".into(),
+                catalog_digest: "a".repeat(64),
+                max_calls: 1,
+                max_concurrent: 1,
+                max_duration_ms: 60_000,
+                token_policy:
+                    sentinel_workflow::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+                expires_at_unix_ms: 60_000,
+            },
+            created_by: "pm-1".into(),
+            created_at_unix_ms: 3,
+            dispatch: None,
+        };
+        project.source_review_previous_call = Some(allowance.clone());
+        let archive = sentinel_workflow::ArchivedSourceReviewV1 {
+            review_work: source.clone(),
+            review_corrections: Vec::new(),
+            review_abandoned_calls: Vec::new(),
+            source_work: source,
+            review_allowance: allowance.clone(),
+            source_allowance: allowance,
+            report_digest: "a".repeat(64),
+            blocker_id: "source-blocker".into(),
+            archived_at_unix_ms: 3,
+        };
+        let mut foreign = archive.clone();
+        foreign.source_work.spec.work_item_id = WorkItemId::parse("foreign-source").unwrap();
+        project.archived_source_reviews.push(foreign);
+        assert!(!model_review::rework_limit_reached(&project));
+        project
+            .archived_source_reviews
+            .extend([archive.clone(), archive.clone()]);
+        assert!(!model_review::rework_limit_reached(&project));
+        project.archived_source_reviews.push(archive);
+        assert!(model_review::rework_limit_reached(&project));
     }
 
     #[test]

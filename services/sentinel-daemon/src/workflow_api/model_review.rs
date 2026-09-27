@@ -6,6 +6,23 @@ pub(super) const MEDIA_TYPE: &str = "application/vnd.sentinel.qa-report+json";
 const REPORT_PATH: &str = "review.json";
 const MAX_REPORT_BYTES: usize = 32 * 1024;
 const MAX_FINDINGS: usize = 16;
+const MAX_AUTONOMOUS_SOURCE_REWORKS: usize = 3;
+
+pub(super) fn rework_limit_reached(project: &sentinel_workflow::ProjectV1) -> bool {
+    let Some(source_id) = project
+        .source_review_previous_call
+        .as_ref()
+        .map(|allowance| &allowance.grant.work_item_id)
+    else {
+        return false;
+    };
+    project
+        .archived_source_reviews
+        .iter()
+        .filter(|entry| &entry.source_work.spec.work_item_id == source_id)
+        .count()
+        >= MAX_AUTONOMOUS_SOURCE_REWORKS
+}
 
 pub(super) fn setup_due(project: &sentinel_workflow::ProjectV1) -> bool {
     let predecessor_ready = project.subscription_call.as_ref().is_some_and(|allowance| {

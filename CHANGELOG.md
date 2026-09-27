@@ -1,5 +1,11 @@
 # Changelog
 
+- Give assigned Designer and Developer model workers the same server-bound
+  accepted customer contract used by independent QA, so full scope and
+  exclusions guide initial work and corrections. Escalate after three
+  negative autonomous source reviews instead of starting an unbounded
+  provider/rework loop; keep the project blocker for operator action (#856).
+
 - Archive abandoned QA provider calls with their completed source review before
   restarting Developer work. Their immutable authority remains validated after
   SQLite reopen, without leaving active references to the archived QA task (#856).
