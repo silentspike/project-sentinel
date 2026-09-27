@@ -1,5 +1,10 @@
 # Changelog
 
+- Regrant an already assigned model QA correction only after its exact
+  dispatched allowance has been operator-resolved and archived. Preserve the
+  original PM or Technical Lead, assignment, provider and model authority; reject changed
+  bindings instead of starting a different work item (#856).
+
 - Read valid project subscription-abandonment snapshots in the authenticated
   project event feed. The read contract now accepts the event emitted by the
   existing operator resolution path while preserving integrity validation
