@@ -155,7 +155,15 @@ fn correction_fixture_with_subscription(
     observation: WorkExecutionObservation,
     subscription: bool,
 ) -> (Journey, ProjectV1, CompanyWorkflowCommandV1) {
-    let (state, mut project, grant) = super::subscription::assigned();
+    correction_fixture_with_journey(observation, subscription, journey())
+}
+
+fn correction_fixture_with_journey(
+    observation: WorkExecutionObservation,
+    subscription: bool,
+    journey: Journey,
+) -> (Journey, ProjectV1, CompanyWorkflowCommandV1) {
+    let (state, mut project, grant) = super::subscription::assigned_with_journey(journey);
     if subscription {
         let command = CompanyWorkflowCommandV1::GrantSubscriptionCall {
             project_id: project.project_id.clone(),
@@ -828,6 +836,259 @@ fn negative_source_review_blocks_delivery_without_discarding_completed_work() {
             .company_project(&state.pm.tenant_id, &blocked.project_id)
             .unwrap(),
         Some(blocked)
+    );
+}
+
+#[test]
+fn negative_qa_restarts_same_source_work_without_new_budget_or_lost_history() {
+    let mut proposal = binding();
+    proposal.governance.participants.push(participant(
+        5,
+        CompanyRoleV1::ReleaseManager,
+        &["release"],
+        Some(1),
+        "release-v1",
+    ));
+    let (state, before, source_command) = correction_fixture_with_journey(
+        WorkExecutionObservation::Succeeded,
+        true,
+        journey_with_binding(proposal),
+    );
+    let source_id = WorkItemId::parse("build-work").unwrap();
+    let review_id = WorkItemId::parse("source-review").unwrap();
+    let mut review = work(
+        "source-review",
+        CompanyRoleV1::Qa,
+        &["qa"],
+        &["build-work"],
+        0,
+    );
+    review.outputs[0].media_type = "application/vnd.sentinel.qa-report+json".into();
+    let appended = project_command(
+        &state.store,
+        &state.pm,
+        950,
+        CompanyWorkflowCommandV1::AppendSourceReview {
+            project_id: before.project_id.clone(),
+            expected_version: before.version,
+            item: review,
+        },
+        60,
+    );
+    let assigned = project_command(
+        &state.store,
+        &state.pm,
+        951,
+        CompanyWorkflowCommandV1::AssignSourceReview {
+            project_id: appended.project_id.clone(),
+            expected_version: appended.version,
+            work_item_id: review_id.clone(),
+            agent_id: AgentId(3),
+            organization_generation: 1,
+            organization_digest: DIGEST.into(),
+            reason_ref: "source-review-profile".into(),
+            profile: profile("web-review-v1"),
+        },
+        61,
+    );
+    let source_allowance = assigned.subscription_call.as_ref().unwrap().clone();
+    let assignment = &assigned.work_items[&review_id].assignments[0];
+    let mut review_grant = source_allowance.grant.clone();
+    review_grant.work_item_id = review_id.clone();
+    review_grant.assignment_id = assignment.assignment_id.clone();
+    review_grant.assignment_version = assignment.assignment_version;
+    review_grant.agent_id = assignment.agent_id;
+    let handed = project_command(
+        &state.store,
+        &state.pm,
+        952,
+        CompanyWorkflowCommandV1::GrantSourceReviewCall {
+            project_id: assigned.project_id.clone(),
+            expected_version: assigned.version,
+            previous_allowance_id: source_allowance.allowance_id.clone(),
+            grant: review_grant,
+        },
+        62,
+    );
+    let review_allowance = handed.subscription_call.as_ref().unwrap().clone();
+    let mut project = project_command(
+        &state.store,
+        &state.qa,
+        953,
+        CompanyWorkflowCommandV1::ClaimSubscriptionCall {
+            project_id: handed.project_id.clone(),
+            expected_version: handed.version,
+            allowance_id: review_allowance.allowance_id.clone(),
+            request_id: format!("company-provider-{}", review_allowance.allowance_id),
+            request_digest: DIGEST.into(),
+        },
+        63,
+    );
+    let claimed_review_allowance = project.subscription_call.as_ref().unwrap().clone();
+    let report = vec![WorkOutputReceiptV1 {
+        content_digest: DIGEST.into(),
+        ..output_receipt().remove(0)
+    }];
+    for (index, (from, to)) in [
+        (CompanyWorkStateV1::Assigned, CompanyWorkStateV1::InProgress),
+        (CompanyWorkStateV1::InProgress, CompanyWorkStateV1::InReview),
+        (CompanyWorkStateV1::InReview, CompanyWorkStateV1::Done),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let now = 64 + index as u64;
+        let review_work = &project.work_items[&review_id];
+        let done = to == CompanyWorkStateV1::Done;
+        project = project_command(
+            &state.store,
+            if done { &state.release } else { &state.qa },
+            954 + index as u128,
+            transition(
+                &project.project_id,
+                project.version,
+                "source-review",
+                review_work.version,
+                1,
+                from,
+                to,
+                if to == CompanyWorkStateV1::InProgress {
+                    vec![]
+                } else {
+                    report.clone()
+                },
+                done.then(|| QualityGateReceiptBindingV1 {
+                    gate_id: "web-work-item-qa-v1".into(),
+                    generation: 1,
+                    gate_digest: DIGEST.into(),
+                    subject_digest: DIGEST.into(),
+                    passed: true,
+                }),
+                now,
+            ),
+            now,
+        );
+    }
+    let blocked = project_command(
+        &state.store,
+        &state.pm,
+        957,
+        CompanyWorkflowCommandV1::RaiseBlocker {
+            project_id: project.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: Some(source_id.clone()),
+            cause_ref: format!("qa-source-review:{DIGEST}"),
+            owner: AgentId(2),
+        },
+        67,
+    );
+    let feedback = WorkCorrectionFeedbackV1 {
+        summary: "QA found missing contracted service and unmarked example copy".into(),
+        artifact_digest: Some(OTHER_DIGEST.into()),
+    };
+    let CompanyWorkflowCommandV1::RequestWorkCorrection {
+        mut execution_revision,
+        ..
+    } = source_command
+    else {
+        panic!("source fixture did not produce a correction revision")
+    };
+    execution_revision.feedback_digest = feedback.canonical_digest().unwrap();
+    let restart = CompanyWorkflowCommandV1::RestartSourceAfterQa {
+        project_id: blocked.project_id.clone(),
+        expected_version: blocked.version,
+        review_work_item_id: review_id.clone(),
+        source_work_item_id: source_id.clone(),
+        blocker_id: blocked.blockers[0].blocker_id.clone(),
+        report_digest: DIGEST.into(),
+        expected_source_work_version: blocked.work_items[&source_id].version,
+        source_execution_revision: execution_revision,
+        feedback,
+        next_subscription_grant: source_allowance.grant.clone(),
+    };
+    for variant in 0..5_u128 {
+        let mut invalid = restart.clone();
+        if let CompanyWorkflowCommandV1::RestartSourceAfterQa {
+            report_digest,
+            blocker_id,
+            expected_source_work_version,
+            feedback,
+            next_subscription_grant,
+            ..
+        } = &mut invalid
+        {
+            match variant {
+                0 => *report_digest = OTHER_DIGEST.into(),
+                1 => *blocker_id = "foreign-blocker".into(),
+                2 => *expected_source_work_version += 1,
+                3 => feedback.artifact_digest = Some(DIGEST.into()),
+                _ => next_subscription_grant.agent_id = AgentId(4),
+            }
+        }
+        assert!(state
+            .store
+            .apply_company_command(&state.pm, Uuid::from_u128(980 + variant), &invalid, 68)
+            .is_err());
+        assert_eq!(
+            state
+                .store
+                .company_project(&state.pm.tenant_id, &blocked.project_id)
+                .unwrap(),
+            Some(blocked.clone())
+        );
+    }
+    let corrected = project_command(&state.store, &state.pm, 958, restart.clone(), 68);
+    assert_eq!(corrected.lifecycle_state, ProjectLifecycleStateV1::Active);
+    assert!(!corrected.work_items.contains_key(&review_id));
+    assert_eq!(corrected.archived_source_reviews.len(), 1);
+    assert_eq!(corrected.work_corrections.len(), 1);
+    assert_eq!(
+        corrected.work_items[&source_id].state,
+        CompanyWorkStateV1::Assigned
+    );
+    assert!(corrected.work_items[&source_id].output_receipts.is_empty());
+    assert_eq!(corrected.blockers[0].state, BlockerStateV1::Resolved);
+    assert_eq!(corrected.cost_ceiling_micros, before.cost_ceiling_micros);
+    assert_eq!(
+        corrected
+            .work_items
+            .values()
+            .map(|work| work.spec.budget_micros)
+            .sum::<u64>(),
+        before
+            .work_items
+            .values()
+            .map(|work| work.spec.budget_micros)
+            .sum::<u64>()
+    );
+    assert_eq!(
+        corrected.archived_source_reviews[0].source_allowance,
+        source_allowance
+    );
+    assert_eq!(
+        corrected.archived_source_reviews[0].review_allowance,
+        claimed_review_allowance
+    );
+    assert_ne!(
+        corrected.subscription_call.as_ref().unwrap().allowance_id,
+        source_allowance.allowance_id
+    );
+    assert!(state
+        .store
+        .apply_company_command(&state.pm, Uuid::from_u128(985), &restart, 69)
+        .is_err());
+    let reopened = WorkflowStore::open(state._temp.path().join("workflow.sqlite")).unwrap();
+    assert!(
+        reopened
+            .apply_company_command(&state.pm, Uuid::from_u128(958), &restart, 69)
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(
+        reopened
+            .company_project(&state.pm.tenant_id, &corrected.project_id)
+            .unwrap(),
+        Some(corrected)
     );
 }
 

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 mod project_planning;
 mod request_provider;
+mod source_review_rework;
 mod subscription;
 mod work_corrections;
 
@@ -1416,6 +1417,7 @@ fn apply_company_command(
                 abandoned_subscription_calls: Vec::new(),
                 source_review_previous_call: None,
                 work_corrections: Vec::new(),
+                archived_source_reviews: Vec::new(),
                 rooms: Vec::new(),
                 questions: Vec::new(),
                 actions: Vec::new(),
@@ -1933,6 +1935,16 @@ fn mutate_project(
     require_version(project.version, expected_version)?;
     let actor_id = authorize_project_actor(&project, principal)?;
     match command {
+        CompanyWorkflowCommandV1::RestartSourceAfterQa { .. } => {
+            source_review_rework::restart(
+                transaction,
+                &mut project,
+                principal,
+                operation_id,
+                command,
+                now_ms,
+            )?;
+        }
         CompanyWorkflowCommandV1::RequestWorkCorrection { .. } => {
             work_corrections::request(
                 transaction,
@@ -5192,6 +5204,11 @@ fn project_target(command: &CompanyWorkflowCommandV1) -> Option<(&ProjectId, u64
             expected_version,
             ..
         }
+        | CompanyWorkflowCommandV1::RestartSourceAfterQa {
+            project_id,
+            expected_version,
+            ..
+        }
         | CompanyWorkflowCommandV1::RecordDecision {
             project_id,
             expected_version,
@@ -5380,6 +5397,9 @@ fn project_event_type(command: &CompanyWorkflowCommandV1) -> Result<&'static str
         }
         CompanyWorkflowCommandV1::RequestWorkCorrection { .. } => {
             Ok("project_work_correction_requested")
+        }
+        CompanyWorkflowCommandV1::RestartSourceAfterQa { .. } => {
+            Ok("project_source_review_rework_started")
         }
         CompanyWorkflowCommandV1::RecordDecision { .. } => Ok("project_decision_recorded"),
         CompanyWorkflowCommandV1::CreateHandoff { .. } => Ok("project_handoff_created"),
@@ -6458,6 +6478,7 @@ fn validate_work_graph_if_present(
 fn validate_project_collections(project: &ProjectV1) -> Result<(), WorkflowError> {
     subscription::validate(project)?;
     work_corrections::validate(project)?;
+    source_review_rework::validate(project)?;
     let participant = |agent_id: crate::AgentId| {
         project
             .governance
@@ -6662,6 +6683,9 @@ fn validate_project_collections(project: &ProjectV1) -> Result<(), WorkflowError
                 ("Open", "Resolved") | ("Escalated", "Resolved") => {
                     audit.actor_agent_id == blocker.owner
                         || blocker.escalation_target == Some(audit.actor_agent_id)
+                        || source_review_rework::authorizes_blocker_resolution(
+                            project, blocker, audit, actor,
+                        )
                         || blocker.blocker_kind == BlockerKindV1::BudgetExhausted
                             && matches!(
                                 actor.role,

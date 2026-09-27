@@ -105,29 +105,83 @@ impl WorkflowApi {
         work_id: &WorkItemId,
         revision: Option<&sentinel_workflow::ExecutionRevisionV1>,
     ) -> Result<(), &'static str> {
-        let tenant = &principal.tenant_id;
         let project = self
             .store
-            .company_project(tenant, project_id)
+            .company_project(&principal.tenant_id, project_id)
             .map_err(|_| "correction project unavailable")?
             .ok_or("correction project missing")?;
-        if governed_project_participant(&project, principal).is_none() {
+        let allowance = project
+            .subscription_call
+            .as_ref()
+            .ok_or("prior provider allowance missing")?;
+        self.validate_bound_model_work_result(
+            principal, &project, work_id, revision, allowance, false,
+        )
+    }
+
+    pub(super) fn validate_model_work_for_source_review(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        project: &sentinel_workflow::ProjectV1,
+        work_id: &WorkItemId,
+    ) -> Result<(), &'static str> {
+        let allowance = project
+            .subscription_call
+            .as_ref()
+            .ok_or("source-review provider allowance missing")?;
+        self.validate_bound_model_work_result(principal, project, work_id, None, allowance, true)
+    }
+
+    pub(super) fn validate_source_review_predecessor(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        project: &sentinel_workflow::ProjectV1,
+        work_id: &WorkItemId,
+        revision: &sentinel_workflow::ExecutionRevisionV1,
+    ) -> Result<(), &'static str> {
+        let allowance = project
+            .source_review_previous_call
+            .as_ref()
+            .ok_or("prior source provider allowance missing")?;
+        self.validate_bound_model_work_result(
+            principal,
+            project,
+            work_id,
+            Some(revision),
+            allowance,
+            true,
+        )
+    }
+
+    fn validate_bound_model_work_result(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        project: &sentinel_workflow::ProjectV1,
+        work_id: &WorkItemId,
+        revision: Option<&sentinel_workflow::ExecutionRevisionV1>,
+        allowance: &sentinel_workflow::SubscriptionCallAllowanceV1,
+        allow_superseded_candidate: bool,
+    ) -> Result<(), &'static str> {
+        let tenant = &principal.tenant_id;
+        let project_id = &project.project_id;
+        if governed_project_participant(project, principal).is_none() {
             return Err("project leadership binding unavailable");
         }
         let delivery = self
             .delivery
             .as_ref()
             .ok_or("delivery exclusion authority unavailable")?;
-        if delivery
-            .contains_project(&tenant.0, &project_id.0)
-            .map_err(|_| "delivery exclusion read failed")?
-        {
+        let delivery_allowed = if allow_superseded_candidate {
+            delivery.permits_new_source_review(&tenant.0, &project_id.0)
+        } else {
+            delivery
+                .contains_project(&tenant.0, &project_id.0)
+                .map(|exists| !exists)
+        }
+        .map_err(|_| "delivery exclusion read failed")?;
+        if !delivery_allowed {
             return Err("delivery already consumes this project");
         }
-        let allowance = project
-            .subscription_call
-            .as_ref()
-            .ok_or("prior provider allowance missing")?;
         let dispatch = allowance
             .dispatch
             .as_ref()
