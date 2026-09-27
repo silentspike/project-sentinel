@@ -1,5 +1,10 @@
 # Changelog
 
+- Bind assigned Designer and Developer turns to the accepted customer contract,
+  verified upstream artifacts, correction feedback, and private Workbench
+  observations. Allow bounded adaptive tool turns and admit only an observed,
+  digest-bound final package into the ordinary QA and delivery path (#856).
+
 - Require the pinned Codex CLI to return a schema-constrained tool plan for
   authorized project work, while leaving Sales, planning, adaptive and ordinary
   inference responses unchanged. This prevents narrative replies from being

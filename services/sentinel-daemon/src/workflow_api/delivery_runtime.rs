@@ -2116,6 +2116,7 @@ mod tests {
             tool_class: "test.run_profile".to_string(),
             package_artifact_kind: None,
             package_media_type: None,
+            package_paths: Vec::new(),
             capabilities: workbench_request.capabilities.clone(),
             output_artifact_kinds: BTreeSet::new(),
             attempt: 1,

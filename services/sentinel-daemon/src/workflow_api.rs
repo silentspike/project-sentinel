@@ -1849,6 +1849,40 @@ impl WorkbenchExecutionAdapter {
             .ok_or(WorkflowPortError::Rejected)
     }
 
+    pub(super) fn adaptive_package_tool(
+        &self,
+        session: &AdaptiveSessionV1,
+        effect: &AdaptiveEffectV1,
+        artifact_digest: &str,
+        expected_kind: &str,
+        expected_media_type: &str,
+    ) -> Result<WorkbenchTool, WorkflowPortError> {
+        let record = self.terminal_record(effect.id)?;
+        let [artifact] = record.artifacts.as_slice() else {
+            return Err(WorkflowPortError::Rejected);
+        };
+        if artifact.sha256 != artifact_digest
+            || artifact.artifact_kind != expected_kind
+            || artifact.media_type != expected_media_type
+            || record.package_artifact_kind.as_deref() != Some(expected_kind)
+            || record.package_media_type.as_deref() != Some(expected_media_type)
+            || record.package_paths.is_empty()
+        {
+            return Err(WorkflowPortError::AuthorityConflict);
+        }
+        let tool = WorkbenchTool::PackageArtifact {
+            artifact_kind: expected_kind.to_owned(),
+            media_type: expected_media_type.to_owned(),
+            paths: record.package_paths,
+        };
+        sentinel_workflow::adaptive_tool_digest(&tool).map_err(|_| WorkflowPortError::Rejected)?;
+        let request = self.build_adaptive_request(session, effect, &tool)?;
+        if request.input_digest != effect.request_digest {
+            return Err(WorkflowPortError::AuthorityConflict);
+        }
+        Ok(tool)
+    }
+
     fn private_observation(
         &self,
         invocation_id: Uuid,
