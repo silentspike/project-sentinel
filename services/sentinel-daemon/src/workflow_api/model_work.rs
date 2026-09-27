@@ -50,6 +50,24 @@ pub struct ModelWorkCorrection {
 }
 
 impl ModelWorkContext {
+    fn customer_contract(&self) -> Result<&AcceptedCustomerContract, &'static str> {
+        let contract = self
+            .accepted_customer_contract
+            .as_ref()
+            .ok_or("accepted customer contract is unavailable")?;
+        if contract.agreement_id.trim().is_empty()
+            || contract.proposal_id.trim().is_empty()
+            || contract.proposal_digest.len() != 64
+            || !contract
+                .proposal_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("accepted customer contract is invalid");
+        }
+        Ok(contract)
+    }
+
     pub fn validate_dispatch(&self, now_ms: u64) -> Result<(), &'static str> {
         self.authority
             .validate()
@@ -66,24 +84,16 @@ impl ModelWorkContext {
             return Err("model work context is stale or unsupported");
         }
         self.validate_artifact_inputs()?;
-        if self.task.required_role == CompanyRoleV1::Qa {
-            let contract = self
-                .accepted_customer_contract
-                .as_ref()
-                .ok_or("accepted customer contract is unavailable")?;
-            if contract.agreement_id.trim().is_empty()
-                || contract.proposal_id.trim().is_empty()
-                || contract.proposal_digest.len() != 64
-                || !contract
-                    .proposal_digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            {
-                return Err("accepted customer contract is invalid");
+        if matches!(
+            self.task.required_role,
+            CompanyRoleV1::Designer | CompanyRoleV1::Developer | CompanyRoleV1::Qa
+        ) {
+            self.customer_contract()?;
+            if self.task.required_role == CompanyRoleV1::Qa {
+                super::model_review::source_inventory(self)?;
             }
-            super::model_review::source_inventory(self)?;
         } else if self.accepted_customer_contract.is_some() {
-            return Err("customer contract is only available to independent QA");
+            return Err("customer contract is only available to assigned model workers");
         }
         Ok(())
     }
@@ -93,6 +103,8 @@ impl ModelWorkContext {
         if self.task.required_role == CompanyRoleV1::Qa {
             return super::model_review::prompt(self);
         }
+        let contract = serde_json::to_string(self.customer_contract()?)
+            .map_err(|_| "customer contract encoding failed")?;
         let artifact_kind = artifact_kind(self.task.required_role)?;
         let output = self
             .task
@@ -113,7 +125,10 @@ impl ModelWorkContext {
              package_artifact of kind {artifact_kind}, media type {media_type}. The server \
              independently validates every capability, command and output. You cannot select \
              project IDs, agent IDs, credentials, budgets, deadlines or generations. \
-             Task data: {task}",
+             The accepted customer contract is the sole product-scope authority. Satisfy all of its \
+             deliverables and acceptance criteria, and do not implement its exclusions. Recheck the \
+             whole deliverable against that contract when correcting prior work, not only the latest \
+             feedback. Accepted customer contract: {contract}. Task data: {task}",
             media_type = output.media_type,
         );
         if !self.artifact_inputs.is_empty() {
@@ -285,7 +300,10 @@ impl WorkflowApi {
             task: work.spec.clone(),
             deadline_unix_ms,
             correction: self.model_work_correction(&project, &work_id)?,
-            accepted_customer_contract: if work.spec.required_role == CompanyRoleV1::Qa {
+            accepted_customer_contract: if matches!(
+                work.spec.required_role,
+                CompanyRoleV1::Designer | CompanyRoleV1::Developer | CompanyRoleV1::Qa
+            ) {
                 Some(self.accepted_customer_contract(&project)?)
             } else {
                 None
@@ -606,7 +624,16 @@ pub(crate) fn test_context() -> ModelWorkContext {
         authority,
         deadline_unix_ms: u64::MAX,
         correction: None,
-        accepted_customer_contract: None,
+        accepted_customer_contract: Some(AcceptedCustomerContract {
+            agreement_id: "agreement-m0".into(),
+            proposal_id: "proposal-m0".into(),
+            proposal_digest: "9".repeat(64),
+            scope: "A static customer website".into(),
+            deliverables: vec!["Static website".into()],
+            exclusions: vec!["Contact form".into()],
+            acceptance_criteria: vec!["All pages use the approved wordmark".into()],
+            assumptions: vec![],
+        }),
         artifact_inputs: Vec::new(),
     }
 }
@@ -2079,6 +2106,38 @@ mod tests {
         changed = original;
         changed.task.required_role = CompanyRoleV1::Sales;
         assert!(changed.prompt().is_err());
+    }
+
+    #[test]
+    fn assigned_developer_receives_exact_accepted_contract_and_exclusions() {
+        let original = test_context();
+        let prompt = original.prompt().unwrap();
+        assert!(prompt.contains("All pages use the approved wordmark"));
+        assert!(prompt.contains("Contact form"));
+        assert!(prompt.contains("do not implement its exclusions"));
+        assert_eq!(original.validate_dispatch(1), Ok(()));
+
+        let mut missing = original.clone();
+        missing.accepted_customer_contract = None;
+        assert_eq!(
+            missing.prompt(),
+            Err("accepted customer contract is unavailable")
+        );
+        assert_eq!(
+            missing.validate_dispatch(1),
+            Err("accepted customer contract is unavailable")
+        );
+
+        let mut invalid = original;
+        invalid
+            .accepted_customer_contract
+            .as_mut()
+            .unwrap()
+            .proposal_digest = "changed".into();
+        assert_eq!(
+            invalid.validate_dispatch(1),
+            Err("accepted customer contract is invalid")
+        );
     }
 
     #[test]
