@@ -1,5 +1,11 @@
 # Changelog
 
+- Preserve the Developer-to-QA source-review handoff while an operator-resolved
+  QA provider call is archived and its exact replacement has not yet been
+  granted. Validate that brief recovery state against the archived QA
+  allowance, then allow the same assigned reviewer to resume after restart
+  (#856).
+
 - Regrant an already assigned model QA correction only after its exact
   dispatched allowance has been operator-resolved and archived. Preserve the
   original PM or Technical Lead, assignment, provider and model authority; reject changed

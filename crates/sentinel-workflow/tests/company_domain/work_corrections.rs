@@ -654,6 +654,143 @@ fn source_review_append_preserves_completed_work_and_replays_after_restart() {
 }
 
 #[test]
+fn abandoned_source_review_call_preserves_handoff_for_exact_qa_regrant() {
+    let (state, before, _) =
+        correction_fixture_with_subscription(WorkExecutionObservation::Succeeded, true);
+    let mut review = work(
+        "source-review",
+        CompanyRoleV1::Qa,
+        &["qa"],
+        &["build-work"],
+        100,
+    );
+    review.outputs[0].media_type = "application/vnd.sentinel.qa-report+json".into();
+    review.budget_micros = 0;
+    let appended = project_command(
+        &state.store,
+        &state.pm,
+        710,
+        CompanyWorkflowCommandV1::AppendSourceReview {
+            project_id: before.project_id.clone(),
+            expected_version: before.version,
+            item: review.clone(),
+        },
+        60,
+    );
+    let assigned = project_command(
+        &state.store,
+        &state.pm,
+        730,
+        CompanyWorkflowCommandV1::AssignSourceReview {
+            project_id: appended.project_id.clone(),
+            expected_version: appended.version,
+            work_item_id: review.work_item_id.clone(),
+            agent_id: AgentId(3),
+            organization_generation: 1,
+            organization_digest: DIGEST.into(),
+            reason_ref: "source-review-profile".into(),
+            profile: profile("web-review-v1"),
+        },
+        62,
+    );
+    let previous = assigned.subscription_call.as_ref().unwrap().clone();
+    let assignment = &assigned.work_items[&review.work_item_id].assignments[0];
+    let mut qa_grant = previous.grant.clone();
+    qa_grant.work_item_id = review.work_item_id.clone();
+    qa_grant.assignment_id = assignment.assignment_id.clone();
+    qa_grant.assignment_version = assignment.assignment_version;
+    qa_grant.agent_id = assignment.agent_id;
+    let handed = project_command(
+        &state.store,
+        &state.pm,
+        860,
+        CompanyWorkflowCommandV1::GrantSourceReviewCall {
+            project_id: assigned.project_id.clone(),
+            expected_version: assigned.version,
+            previous_allowance_id: previous.allowance_id.clone(),
+            grant: qa_grant.clone(),
+        },
+        64,
+    );
+    let qa_allowance = handed.subscription_call.as_ref().unwrap().clone();
+    let claimed = project_command(
+        &state.store,
+        &state.qa,
+        861,
+        CompanyWorkflowCommandV1::ClaimSubscriptionCall {
+            project_id: handed.project_id.clone(),
+            expected_version: handed.version,
+            allowance_id: qa_allowance.allowance_id.clone(),
+            request_id: format!("company-provider-{}", qa_allowance.allowance_id),
+            request_digest: DIGEST.into(),
+        },
+        65,
+    );
+    let resolution_event_id = Uuid::from_u128(862).to_string();
+    let abandoned = project_command(
+        &state.store,
+        &state.pm,
+        862,
+        CompanyWorkflowCommandV1::AbandonSubscriptionCall {
+            project_id: claimed.project_id.clone(),
+            expected_version: claimed.version,
+            allowance_id: qa_allowance.allowance_id.clone(),
+            request_digest: DIGEST.into(),
+            resolution_event_id: resolution_event_id.clone(),
+            abandoned_by: "operator-test".into(),
+        },
+        66,
+    );
+    assert_eq!(
+        abandoned.source_review_previous_call,
+        Some(previous.clone())
+    );
+    assert!(abandoned.subscription_call.is_none());
+    assert_eq!(abandoned.abandoned_subscription_calls.len(), 1);
+    assert_eq!(
+        abandoned.abandoned_subscription_calls[0]
+            .allowance
+            .allowance_id,
+        qa_allowance.allowance_id
+    );
+    assert_eq!(
+        abandoned.abandoned_subscription_calls[0].resolution_event_id,
+        resolution_event_id
+    );
+
+    let reopened = WorkflowStore::open(state._temp.path().join("workflow.sqlite")).unwrap();
+    assert_eq!(
+        reopened
+            .company_project(&state.pm.tenant_id, &abandoned.project_id)
+            .unwrap()
+            .unwrap(),
+        abandoned
+    );
+    let events = reopened
+        .company_project_events_since(&state.pm.tenant_id, 0, 100)
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.event_type == "project_subscription_call_abandoned" && event.project == abandoned
+    }));
+    let renewed = project_command(
+        &reopened,
+        &state.pm,
+        863,
+        CompanyWorkflowCommandV1::GrantSubscriptionCall {
+            project_id: abandoned.project_id.clone(),
+            expected_version: abandoned.version,
+            grant: qa_grant,
+        },
+        67,
+    );
+    assert_eq!(renewed.source_review_previous_call, Some(previous));
+    assert_ne!(
+        renewed.subscription_call.unwrap().allowance_id,
+        qa_allowance.allowance_id
+    );
+}
+
+#[test]
 fn company_correction_feedback_is_bound_to_artifact_and_survives_restart() {
     let (state, previous, mut command) = correction_fixture(WorkExecutionObservation::Succeeded);
     let work_id = WorkItemId::parse("build-work").unwrap();
