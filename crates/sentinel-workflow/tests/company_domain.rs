@@ -235,6 +235,7 @@ struct Journey {
     developer: AuthenticatedCompanyPrincipalV1,
     junior_developer: AuthenticatedCompanyPrincipalV1,
     qa: AuthenticatedCompanyPrincipalV1,
+    release: AuthenticatedCompanyPrincipalV1,
     request_id: String,
     proposal_id: String,
     proposal_digest: String,
@@ -284,6 +285,7 @@ fn participant(
             2 => "developer-a",
             3 => "qa-a",
             4 => "developer-b",
+            5 => "release-a",
             value => panic!("missing principal fixture for agent {value}"),
         }
         .to_owned(),
@@ -406,6 +408,10 @@ fn customer_inbox_and_proposal_reads_preserve_tenant_and_customer_binding() {
 }
 
 fn journey() -> Journey {
+    journey_with_binding(binding())
+}
+
+fn journey_with_binding(proposal_binding: ProposalBindingV1) -> Journey {
     let temp = TempDir::new().unwrap();
     let store = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();
     let customer = principal(
@@ -456,6 +462,14 @@ fn journey() -> Journey {
         None,
         Some(3),
     );
+    let release = principal(
+        "tenant-a",
+        "release-a",
+        CompanyPrincipalKindV1::Agent,
+        CompanyRoleV1::ReleaseManager,
+        None,
+        Some(5),
+    );
     let request = command(
         &store,
         &customer,
@@ -501,7 +515,7 @@ fn journey() -> Journey {
         CompanyWorkflowCommandV1::CreateProposal {
             request_id: request_id.clone(),
             expected_version: 3,
-            binding: binding(),
+            binding: proposal_binding,
         },
         4,
     );
@@ -533,6 +547,7 @@ fn journey() -> Journey {
         developer,
         junior_developer,
         qa,
+        release,
         request_id,
         proposal_id,
         proposal_digest,

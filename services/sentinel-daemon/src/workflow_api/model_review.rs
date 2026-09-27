@@ -132,21 +132,20 @@ impl WorkflowApi {
             .subscription_call
             .clone()
             .ok_or("source-review predecessor unavailable")?;
-        self.validate_model_work_result(
+        self.validate_model_work_for_source_review(
             &leader.principal,
-            &project.project_id,
+            &project,
             &previous.grant.work_item_id,
-            None,
         )?;
         let delivery = self
             .delivery
             .as_ref()
             .ok_or("source-review delivery exclusion unavailable")?;
-        if delivery
-            .contains_project(&project.tenant_id.0, &project.project_id.0)
+        if !delivery
+            .permits_new_source_review(&project.tenant_id.0, &project.project_id.0)
             .map_err(|_| "source-review delivery exclusion unavailable")?
         {
-            return Err("delivery already exists");
+            return Err("delivery already consumes this project");
         }
 
         let review_id = source_review_id(&project, &previous.allowance_id)?;
@@ -347,6 +346,155 @@ pub(super) fn raise_source_review_blocker(
         .map_err(|error| error.message)?;
     if !matches!(outcome.response, CompanyWorkflowResponseV1::Project(_)) {
         return Err("source-review blocker response is invalid");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "llm")]
+pub(super) fn restart_source_after_negative_review(
+    api: &WorkflowApi,
+    project: &sentinel_workflow::ProjectV1,
+) -> Result<(), &'static str> {
+    let open = project
+        .blockers
+        .iter()
+        .filter(|value| value.state != sentinel_workflow::BlockerStateV1::Resolved)
+        .collect::<Vec<_>>();
+    let [blocker] = open.as_slice() else {
+        return Err("source-review rework requires one blocker");
+    };
+    let source_allowance = project
+        .source_review_previous_call
+        .as_ref()
+        .ok_or("source-review predecessor missing")?;
+    let review_allowance = project
+        .subscription_call
+        .as_ref()
+        .ok_or("source-review allowance missing")?;
+    let source_id = &source_allowance.grant.work_item_id;
+    let review_id = &review_allowance.grant.work_item_id;
+    let source = project
+        .work_items
+        .get(source_id)
+        .ok_or("source-review source missing")?;
+    let review_work = project
+        .work_items
+        .get(review_id)
+        .ok_or("source-review work missing")?;
+    if blocker.work_item_id.as_ref() != Some(source_id)
+        || source.spec.required_role != CompanyRoleV1::Developer
+        || review_work.spec.required_role != CompanyRoleV1::Qa
+        || source.output_receipts.len() != 1
+        || !blocker.cause_ref.starts_with("qa-source-review:")
+    {
+        return Err("source-review rework subject changed");
+    }
+    let leader = project
+        .governance
+        .participants
+        .iter()
+        .filter(|participant| {
+            matches!(
+                participant.role,
+                CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+            )
+        })
+        .find_map(|participant| {
+            api.principals
+                .principal(&participant.principal_id)
+                .filter(|bound| {
+                    bound.principal.tenant_id == project.tenant_id
+                        && bound.principal.agent_id == Some(participant.agent_id)
+                        && bound.principal.role == participant.role
+                })
+        })
+        .ok_or("source-review leadership unavailable")?;
+    let qa = project
+        .governance
+        .participants
+        .iter()
+        .find(|participant| participant.role == CompanyRoleV1::Qa)
+        .ok_or("source-review QA missing")?;
+    let artifacts = api
+        .model_artifact_inputs(project, &review_work.spec)?
+        .iter()
+        .map(|input| input.manifest_digest.clone())
+        .collect::<BTreeSet<_>>();
+    let validated = validated_project_review(api, project, &qa.principal_id, &artifacts)?;
+    if validated.report.verdict != Verdict::ChangesRequested
+        || validated.report.findings.is_empty()
+        || blocker.cause_ref != format!("qa-source-review:{}", validated.report_digest)
+        || review_work.output_receipts[0].content_digest != validated.report_digest
+    {
+        return Err("source-review negative evidence changed");
+    }
+    let delivery = api
+        .delivery
+        .as_ref()
+        .ok_or("source-review delivery unavailable")?;
+    if !delivery
+        .permits_new_source_review(&project.tenant_id.0, &project.project_id.0)
+        .map_err(|_| "source-review delivery exclusion unavailable")?
+    {
+        return Err("source-review candidate was consumed");
+    }
+    let findings = serde_json::to_string(&validated.report.findings)
+        .map_err(|_| "source-review findings unavailable")?;
+    let summary = format!(
+        "Correct the source against the accepted customer contract. Sealed QA report {} requested these bounded changes: {findings}",
+        validated.report_digest
+    );
+    if summary.len() > 4_096 {
+        return Err("source-review findings exceed correction bound");
+    }
+    let feedback = sentinel_workflow::WorkCorrectionFeedbackV1 {
+        summary,
+        artifact_digest: Some(source.output_receipts[0].content_digest.clone()),
+    };
+    let execution = api
+        .store
+        .work_item(&project.tenant_id, &project.project_id, source_id)
+        .map_err(|_| "source-review predecessor unavailable")?
+        .ok_or("source-review predecessor missing")?;
+    let revision = sentinel_workflow::ExecutionRevisionV1::from_completed_work(
+        &execution,
+        feedback
+            .canonical_digest()
+            .map_err(|_| "source-review correction feedback invalid")?,
+    )
+    .map_err(|_| "source-review predecessor invalid")?;
+    api.validate_source_review_predecessor(&leader.principal, project, source_id, &revision)?;
+    let mut next_grant = source_allowance.grant.clone();
+    next_grant.expires_at_unix_ms = now_unix_ms()
+        .checked_add(300_000)
+        .ok_or("source-review correction clock overflow")?;
+    let operation_id = stable_operation_id(
+        "sentinel.workflow.autonomous-qa-source-rework.v1",
+        &format!("{}:{}", project.project_id.0, validated.report_digest),
+        1,
+    );
+    let outcome = api
+        .core
+        .apply_company_command(
+            &leader.principal,
+            operation_id,
+            &CompanyWorkflowCommandV1::RestartSourceAfterQa {
+                project_id: project.project_id.clone(),
+                expected_version: project.version,
+                review_work_item_id: review_id.clone(),
+                source_work_item_id: source_id.clone(),
+                blocker_id: blocker.blocker_id.clone(),
+                report_digest: validated.report_digest,
+                expected_source_work_version: source.version,
+                source_execution_revision: revision,
+                feedback,
+                next_subscription_grant: next_grant,
+            },
+            now_unix_ms(),
+        )
+        .map_err(|error| error.message)?;
+    if !matches!(outcome.response, CompanyWorkflowResponseV1::Project(_)) {
+        return Err("source-review rework response is invalid");
     }
     Ok(())
 }
