@@ -556,6 +556,8 @@ pub struct WorkCorrectionV1 {
 #[serde(deny_unknown_fields)]
 pub struct ArchivedSourceReviewV1 {
     pub review_work: CompanyWorkItemV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_corrections: Vec<WorkCorrectionV1>,
     pub source_work: CompanyWorkItemV1,
     pub review_allowance: SubscriptionCallAllowanceV1,
     pub source_allowance: SubscriptionCallAllowanceV1,
