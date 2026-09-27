@@ -782,6 +782,98 @@ fn project_provider_abandonment_requires_resolution_and_regrants_autonomously() 
 }
 
 #[test]
+fn qa_regrant_requires_the_archived_exact_assignment_and_original_issuer() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
+    dispatch_project_model_work(&api, &context);
+    let mut project = api
+        .store
+        .company_project(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .unwrap();
+    let allowance = project.subscription_call.take().unwrap();
+    let work = project
+        .work_items
+        .get_mut(&allowance.grant.work_item_id)
+        .unwrap();
+    work.spec.required_role = CompanyRoleV1::Qa;
+    work.assignments[0].role = CompanyRoleV1::Qa;
+    project.source_review_previous_call = Some(allowance.clone());
+    project
+        .abandoned_subscription_calls
+        .push(sentinel_workflow::AbandonedSubscriptionCallV1 {
+            allowance: allowance.clone(),
+            resolution_event_id: Uuid::from_u128(85602).to_string(),
+            abandoned_by: "operator-test".into(),
+            abandoned_at_unix_ms: allowance.created_at_unix_ms + 1,
+        });
+    let planner = &context.binding.grant.planner_principal;
+    let now_ms = allowance.created_at_unix_ms + 2;
+    assert_eq!(
+        WorkflowApi::recoverable_qa_allowance(&project, now_ms),
+        Some(&allowance)
+    );
+    assert!(WorkflowApi::qa_recovery_issuer_matches(
+        &project, &allowance, planner
+    ));
+
+    let mut wrong_planner = planner.clone();
+    wrong_planner.principal_id = "different-planner".into();
+    assert!(!WorkflowApi::qa_recovery_issuer_matches(
+        &project,
+        &allowance,
+        &wrong_planner
+    ));
+
+    let technical_lead = api
+        .principals
+        .principal("technical-lead")
+        .unwrap()
+        .principal;
+    let mut lead_allowance = allowance.clone();
+    lead_allowance.created_by = technical_lead.principal_id.clone();
+    assert!(WorkflowApi::qa_recovery_issuer_matches(
+        &project,
+        &lead_allowance,
+        &technical_lead
+    ));
+    assert!(!WorkflowApi::qa_recovery_issuer_matches(
+        &project,
+        &lead_allowance,
+        planner
+    ));
+
+    let mut changed = project.clone();
+    changed
+        .work_items
+        .get_mut(&allowance.grant.work_item_id)
+        .unwrap()
+        .assignments[0]
+        .assignment_version += 1;
+    assert!(WorkflowApi::recoverable_qa_allowance(&changed, now_ms).is_none());
+
+    changed = project.clone();
+    changed.source_review_previous_call = None;
+    assert!(WorkflowApi::recoverable_qa_allowance(&changed, now_ms).is_none());
+
+    changed = project.clone();
+    changed.abandoned_subscription_calls[0].allowance.dispatch = None;
+    assert!(WorkflowApi::recoverable_qa_allowance(&changed, now_ms).is_none());
+
+    changed = project.clone();
+    changed.subscription_call = Some(allowance.clone());
+    assert!(WorkflowApi::recoverable_qa_allowance(&changed, now_ms).is_none());
+    let current = changed.subscription_call.as_mut().unwrap();
+    current.dispatch = None;
+    let expires_at_unix_ms = current.grant.expires_at_unix_ms;
+    assert!(WorkflowApi::recoverable_qa_allowance(&changed, expires_at_unix_ms - 1).is_none());
+    assert!(WorkflowApi::recoverable_qa_allowance(&changed, expires_at_unix_ms + 1).is_some());
+}
+
+#[test]
 fn project_planning_adoption_resumes_after_the_first_durable_workflow_step() {
     let temp = tempfile::tempdir().unwrap();
     let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
