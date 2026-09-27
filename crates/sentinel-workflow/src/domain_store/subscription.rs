@@ -248,10 +248,19 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
     }
     if let Some(previous) = &project.source_review_previous_call {
         validate_allowance(project, previous)?;
-        let current = project.subscription_call.as_ref().ok_or_else(corrupt)?;
-        if !review_handoff_matches(project, previous, &current.grant)
-            || previous.allowance_id == current.allowance_id
-            || previous.created_at_unix_ms > current.created_at_unix_ms
+        let review = project
+            .subscription_call
+            .as_ref()
+            .or_else(|| {
+                project
+                    .abandoned_subscription_calls
+                    .last()
+                    .map(|entry| &entry.allowance)
+            })
+            .ok_or_else(corrupt)?;
+        if !review_handoff_matches(project, previous, &review.grant)
+            || previous.allowance_id == review.allowance_id
+            || previous.created_at_unix_ms > review.created_at_unix_ms
         {
             return Err(corrupt());
         }
