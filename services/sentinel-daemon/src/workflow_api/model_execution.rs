@@ -2173,17 +2173,36 @@ impl WorkflowApi {
             .subscription_allowance_id
             .as_deref()
             .ok_or("planning allowance is not configured")?;
-        let sales = self
-            .request_sales_call()?
-            .ok_or("source Sales call is unavailable")?;
-        let proposal = sales
-            .proposal_response
-            .as_ref()
-            .map(|response| &response.proposal)
-            .ok_or("source Sales proposal is unavailable")?;
-        if proposal.proposal_digest != project.agreement_digest {
+        // Planning belongs to the accepted project, not to the process-global
+        // Sales allowance. The latter may still point at an older request after
+        // another customer has been accepted, so resolve the immutable
+        // agreement/proposal lineage from the project itself.
+        let agreement = self
+            .store
+            .company_agreement(&project.tenant_id, &project.agreement_id)
+            .map_err(|_| "source agreement is unavailable")?
+            .ok_or("source agreement is unavailable")?;
+        let proposal = self
+            .store
+            .company_proposal(&project.tenant_id, &agreement.proposal_id)
+            .map_err(|_| "source proposal is unavailable")?
+            .ok_or("source proposal is unavailable")?;
+        if agreement.proposal_digest != project.agreement_digest
+            || proposal.proposal_digest != project.agreement_digest
+            || proposal.request_id != agreement.request_id
+            || proposal.binding.governance != project.governance
+            || proposal.binding.cost_ceiling_micros != project.cost_ceiling_micros
+            || proposal.binding.provider_cost_ceilings_micros
+                != project.provider_cost_ceilings_micros
+        {
             return Err("accepted proposal changed before planning");
         }
+        // Provider/catalog selection remains the already configured, bounded
+        // campaign authority. It is deliberately used only as metadata here;
+        // it must not provide the business lineage for this project.
+        let sales = self
+            .request_sales_call()?
+            .ok_or("planning provider allowance is unavailable")?;
         let participant = project
             .governance
             .participants
