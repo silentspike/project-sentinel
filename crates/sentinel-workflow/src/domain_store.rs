@@ -440,6 +440,7 @@ fn is_project_event_type(value: &str) -> bool {
             | "project_cost_reserved"
             | "project_subscription_call_granted"
             | "project_subscription_call_claimed"
+            | "project_subscription_call_abandoned"
             | "project_work_correction_requested"
             | "project_cost_committed"
             | "project_cost_released"

@@ -415,6 +415,15 @@ fn operator_resolution_archives_consumed_authority_before_regrant() {
         abandoned.abandoned_subscription_calls[0].abandoned_by,
         "operator-test"
     );
+    let events = state
+        .store
+        .company_project_events_since(&state.pm.tenant_id, 0, 100)
+        .unwrap();
+    let abandoned_event = events
+        .iter()
+        .find(|event| event.event_type == "project_subscription_call_abandoned")
+        .unwrap();
+    assert_eq!(abandoned_event.project, abandoned);
 
     let renewed = project_command(
         &state.store,
