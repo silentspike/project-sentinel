@@ -137,6 +137,15 @@ pub(super) fn restart(
     project
         .work_corrections
         .retain(|record| record.previous.spec.work_item_id != *review_work_item_id);
+    let review_abandoned_calls = project
+        .abandoned_subscription_calls
+        .iter()
+        .filter(|entry| entry.allowance.grant.work_item_id == *review_work_item_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    project
+        .abandoned_subscription_calls
+        .retain(|entry| entry.allowance.grant.work_item_id != *review_work_item_id);
     project.work_items.remove(review_work_item_id);
     project.source_review_previous_call = None;
     project.subscription_call = Some(prior_source.clone());
@@ -145,6 +154,7 @@ pub(super) fn restart(
         .push(ArchivedSourceReviewV1 {
             review_work: review,
             review_corrections,
+            review_abandoned_calls,
             source_work: source,
             review_allowance: prior_review,
             source_allowance: prior_source,
@@ -197,6 +207,16 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
     let mut reports = BTreeSet::new();
     let mut reviews = BTreeSet::new();
     let mut correction_ids = BTreeSet::new();
+    let mut abandoned_allowance_ids = project
+        .abandoned_subscription_calls
+        .iter()
+        .map(|entry| entry.allowance.allowance_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut resolution_event_ids = project
+        .abandoned_subscription_calls
+        .iter()
+        .map(|entry| entry.resolution_event_id.as_str())
+        .collect::<BTreeSet<_>>();
     for entry in &project.archived_source_reviews {
         validate_digest(&entry.report_digest).map_err(|_| corrupt())?;
         validate_identifier(&entry.blocker_id).map_err(|_| corrupt())?;
@@ -211,6 +231,16 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
                 record.previous.spec.work_item_id != *review_id
                     || !correction_ids.insert(record.correction_id.clone())
             })
+            || entry.review_abandoned_calls.iter().any(|call| {
+                call.allowance.grant.work_item_id != *review_id
+                    || call.allowance.allowance_id == entry.review_allowance.allowance_id
+                    || !abandoned_allowance_ids.insert(&call.allowance.allowance_id)
+                    || !resolution_event_ids.insert(&call.resolution_event_id)
+            })
+            || project
+                .abandoned_subscription_calls
+                .iter()
+                .any(|call| call.allowance.grant.work_item_id == *review_id)
             || project.work_corrections.iter().any(|record| {
                 record.previous.spec.work_item_id == *review_id
                     || correction_ids.contains(&record.correction_id)
@@ -264,7 +294,11 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
         historical
             .work_corrections
             .extend(entry.review_corrections.iter().cloned());
+        historical
+            .abandoned_subscription_calls
+            .extend(entry.review_abandoned_calls.iter().cloned());
         work_corrections::validate(&historical)?;
+        subscription::validate(&historical)?;
         subscription::validate_allowance(&historical, &entry.review_allowance)?;
         subscription::validate_allowance(project, &entry.source_allowance)?;
     }
