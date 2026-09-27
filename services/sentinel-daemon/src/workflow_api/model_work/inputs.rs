@@ -20,53 +20,57 @@ pub(crate) struct ModelArtifactInput {
 
 impl ModelWorkContext {
     pub(super) fn validate_artifact_inputs(&self) -> Result<(), &'static str> {
-        if self.task.inputs.len() != self.artifact_inputs.len()
-            || self.artifact_inputs.len() > MAX_INPUT_ARTIFACTS
-        {
-            return Err("model input contract inventory mismatch");
-        }
-        let mut total = 0usize;
-        let mut count = 0usize;
-        for (contract, input) in self.task.inputs.iter().zip(&self.artifact_inputs) {
-            if contract != &input.contract
-                || !self
-                    .task
-                    .dependency_ids
-                    .contains(&contract.producer_work_item_id)
-                || contract.producer_work_item_id == self.task.work_item_id
-                || input.producer_agent.0 == 0
-                || !lower_digest(&input.manifest_digest)
-                || input.artifact_kind.is_empty()
-                || input.media_type.is_empty()
-                || input.files.is_empty()
-            {
-                return Err("model input binding is invalid");
-            }
-            let mut previous: Option<&str> = None;
-            for file in &input.files {
-                if !crate::workbench::is_canonical_relative_path(&file.path)
-                    || previous.is_some_and(|path| path >= file.path.as_str())
-                    || !lower_digest(&file.sha256)
-                    || format!("{:x}", Sha256::digest(file.content.as_bytes())) != file.sha256
-                    || file
-                        .content
-                        .chars()
-                        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
-                {
-                    return Err("model source file is invalid");
-                }
-                previous = Some(&file.path);
-                total = total
-                    .checked_add(file.content.len())
-                    .ok_or("model input bound overflow")?;
-                count = count.checked_add(1).ok_or("model input bound overflow")?;
-                if total > MAX_INPUT_BYTES || count > MAX_INPUT_FILES {
-                    return Err("model input exceeds its bound");
-                }
-            }
-        }
-        Ok(())
+        validate_model_artifact_inputs(&self.task, &self.artifact_inputs)
     }
+}
+
+pub(crate) fn validate_model_artifact_inputs(
+    task: &CompanyWorkItemSpecV1,
+    artifact_inputs: &[ModelArtifactInput],
+) -> Result<(), &'static str> {
+    if task.inputs.len() != artifact_inputs.len() || artifact_inputs.len() > MAX_INPUT_ARTIFACTS {
+        return Err("model input contract inventory mismatch");
+    }
+    let mut total = 0usize;
+    let mut count = 0usize;
+    for (contract, input) in task.inputs.iter().zip(artifact_inputs) {
+        if contract != &input.contract
+            || !task
+                .dependency_ids
+                .contains(&contract.producer_work_item_id)
+            || contract.producer_work_item_id == task.work_item_id
+            || input.producer_agent.0 == 0
+            || !lower_digest(&input.manifest_digest)
+            || input.artifact_kind.is_empty()
+            || input.media_type.is_empty()
+            || input.files.is_empty()
+        {
+            return Err("model input binding is invalid");
+        }
+        let mut previous: Option<&str> = None;
+        for file in &input.files {
+            if !crate::workbench::is_canonical_relative_path(&file.path)
+                || previous.is_some_and(|path| path >= file.path.as_str())
+                || !lower_digest(&file.sha256)
+                || format!("{:x}", Sha256::digest(file.content.as_bytes())) != file.sha256
+                || file
+                    .content
+                    .chars()
+                    .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+            {
+                return Err("model source file is invalid");
+            }
+            previous = Some(&file.path);
+            total = total
+                .checked_add(file.content.len())
+                .ok_or("model input bound overflow")?;
+            count = count.checked_add(1).ok_or("model input bound overflow")?;
+            if total > MAX_INPUT_BYTES || count > MAX_INPUT_FILES {
+                return Err("model input exceeds its bound");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn lower_digest(value: &str) -> bool {

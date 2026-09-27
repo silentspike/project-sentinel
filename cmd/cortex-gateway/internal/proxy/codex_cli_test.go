@@ -61,7 +61,15 @@ func TestCodexCLIReasoningAndPrivateErrorClassification(t *testing.T) {
 	}
 }
 
-func TestCodexCLIProjectWorkUsesStructuredFinalResponse(t *testing.T) {
+type structuredCodexFixture struct {
+	provider   *CodexCLIProvider
+	request    *LLMRequest
+	workdir    string
+	argsPath   string
+	schemaPath string
+}
+
+func newStructuredCodexFixture(t *testing.T) structuredCodexFixture {
 	workdir := t.TempDir()
 	if err := os.Chmod(workdir, 0o700); err != nil { //nolint:gosec // private provider workdir fixture
 		t.Fatal(err)
@@ -96,28 +104,70 @@ printf '%%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input
 		MaxTokens: 64,
 		Metadata:  map[string]string{"company_execution_schema": "1"},
 	}
-	if _, err := provider.Send(context.Background(), request); err != nil {
-		t.Fatal(err)
+	return structuredCodexFixture{
+		provider:   provider,
+		request:    request,
+		workdir:    workdir,
+		argsPath:   argsPath,
+		schemaPath: schemaPath,
 	}
-	args := strings.Fields(readTestFile(t, argsPath))
-	if !slices.Contains(args, "--output-schema") {
-		t.Fatalf("project work omitted output schema: %v", args)
+}
+
+func (f structuredCodexFixture) send(t *testing.T, outputKind string) map[string]any {
+	t.Helper()
+	if outputKind == "" {
+		delete(f.request.Metadata, "company_execution_output_kind")
+	} else {
+		f.request.Metadata["company_execution_output_kind"] = outputKind
+	}
+	if _, err := f.provider.Send(context.Background(), f.request); err != nil {
+		t.Fatal(err)
 	}
 	var schema map[string]any
-	if err := json.Unmarshal([]byte(readTestFile(t, schemaPath)), &schema); err != nil {
+	if err := json.Unmarshal([]byte(readTestFile(t, f.schemaPath)), &schema); err != nil {
 		t.Fatal(err)
 	}
-	if schema["type"] != "object" {
-		t.Fatalf("unexpected project work schema: %v", schema["type"])
+	return schema
+}
+
+func TestCodexCLIProjectWorkUsesStructuredFinalResponse(t *testing.T) {
+	fixture := newStructuredCodexFixture(t)
+	schema := fixture.send(t, "")
+	args := strings.Fields(readTestFile(t, fixture.argsPath))
+	if schema["type"] != "object" || !slices.Contains(args, "--output-schema") {
+		t.Fatalf("project work did not receive its output schema: %v", args)
 	}
-	if files, err := filepath.Glob(filepath.Join(workdir, ".codex-work-schema-*.json")); err != nil || len(files) != 0 {
+
+	if files, err := filepath.Glob(filepath.Join(fixture.workdir, ".codex-work-schema-*.json")); err != nil || len(files) != 0 {
 		t.Fatalf("schema files retained: %v, %v", files, err)
 	}
-	request.Metadata = nil
-	if _, err := provider.Send(context.Background(), request); err != nil {
-		t.Fatal(err)
+
+	schema = fixture.send(t, "source_review")
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok || properties["verdict"] == nil || properties["source_files"] == nil || properties["tools"] != nil {
+		t.Fatalf("QA received the wrong output contract: %v", properties)
 	}
-	if args := strings.Fields(readTestFile(t, argsPath)); slices.Contains(args, "--output-schema") {
+
+	fixture.request.Metadata["company_execution_output_kind"] = "unexpected"
+	if _, err := fixture.provider.Send(context.Background(), fixture.request); err == nil {
+		t.Fatal("unknown company output contract accepted")
+	}
+
+	fixture.request.Metadata["company_execution_schema"] = "3"
+	schema = fixture.send(t, "adaptive_decision")
+	properties, ok = schema["properties"].(map[string]any)
+	if !ok || properties["decision"] == nil || properties["tools"] != nil || properties["verdict"] != nil {
+		t.Fatalf("adaptive turn received the wrong output contract: %v", properties)
+	}
+
+	fixture.request.Metadata["company_execution_output_kind"] = "source_review"
+	if _, err := fixture.provider.Send(context.Background(), fixture.request); err == nil {
+		t.Fatal("QA output contract accepted for an adaptive turn")
+	}
+	fixture.request.Metadata = nil
+	fixture.send(t, "")
+	args = strings.Fields(readTestFile(t, fixture.argsPath))
+	if slices.Contains(args, "--output-schema") {
 		t.Fatalf("ordinary request inherited project work schema: %v", args)
 	}
 }

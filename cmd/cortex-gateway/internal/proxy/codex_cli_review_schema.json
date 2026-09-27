@@ -1,0 +1,34 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "integer", "enum": [1] },
+    "source_files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "sha256": { "type": "string" }
+        },
+        "required": ["path", "sha256"],
+        "additionalProperties": false
+      }
+    },
+    "verdict": { "type": "string", "enum": ["pass", "changes_requested"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "line": { "type": "integer" },
+          "reason": { "type": "string" }
+        },
+        "required": ["path", "line", "reason"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schema_version", "source_files", "verdict", "findings"],
+  "additionalProperties": false
+}

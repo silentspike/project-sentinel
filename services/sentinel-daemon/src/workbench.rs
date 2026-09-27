@@ -594,6 +594,11 @@ pub struct WorkbenchInvocationRecord {
     pub package_artifact_kind: Option<String>,
     #[serde(default)]
     pub package_media_type: Option<String>,
+    /// The exact relative paths used by a package invocation. Keeping these
+    /// paths in the durable public-safe record lets the company workflow
+    /// attest an adaptive package result without replaying prior mutations.
+    #[serde(default)]
+    pub package_paths: Vec<String>,
     pub capabilities: BTreeSet<String>,
     pub output_artifact_kinds: BTreeSet<String>,
     pub attempt: u32,
@@ -655,6 +660,10 @@ impl WorkbenchInvocationRecord {
                     Some(media_type.clone())
                 }
                 _ => None,
+            },
+            package_paths: match &request.tool {
+                sentinel_common::WorkbenchTool::PackageArtifact { paths, .. } => paths.clone(),
+                _ => Vec::new(),
             },
             capabilities: request.capabilities.clone(),
             output_artifact_kinds: request.output_artifact_kinds.clone(),
@@ -4247,6 +4256,14 @@ mod tests {
         request.capabilities = BTreeSet::from(["artifact.commit".to_string()]);
         request.output_artifact_kinds = BTreeSet::from(["source_tree".to_string()]);
         request.input_digest = request.canonical_digest().unwrap();
+        let reserved = WorkbenchInvocationRecord::reserved(&request, 1_900_000_000_000);
+        assert_eq!(reserved.package_paths, vec!["src"]);
+        assert_eq!(
+            decode_record(&encode_record(&reserved).unwrap())
+                .unwrap()
+                .package_paths,
+            vec!["src"]
+        );
         fs::write(directory.path().join(".nano-runtime"), "AGENT-07").unwrap();
         let store = WorkbenchInvocationStore::open_with_artifact_roots(
             directory.path().join("workbench.redb"),

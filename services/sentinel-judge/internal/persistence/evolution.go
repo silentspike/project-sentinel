@@ -35,6 +35,7 @@ type EvolutionStore struct {
 	db                         *sql.DB
 	mu                         sync.Mutex
 	writesSinceGlobalRetention int
+	agentFieldCounts           map[string]int
 }
 
 // OpenEvolution opens or creates the evolution database.
@@ -57,7 +58,7 @@ func OpenEvolution(path string) (*EvolutionStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("evolution create indices: %w", err)
 	}
-	return &EvolutionStore{db: db}, nil
+	return &EvolutionStore{db: db, agentFieldCounts: make(map[string]int)}, nil
 }
 
 // Write inserts a personality evolution entry.
@@ -106,6 +107,22 @@ func (s *EvolutionStore) Write(entry EvolutionEntry) error {
 }
 
 func (s *EvolutionStore) enforceAgentFieldRetentionTx(tx *sql.Tx, agentID, field string, keep int) error {
+	key := agentID + "\x00" + field
+	count, cached := s.agentFieldCounts[key]
+	if !cached {
+		if err := tx.QueryRow(`SELECT COUNT(*)
+			FROM personality_evolution
+			WHERE agent_id = ? AND field = ?`, agentID, field).Scan(&count); err != nil {
+			return fmt.Errorf("evolution agent-field retention count: %w", err)
+		}
+	} else {
+		count++
+	}
+	s.agentFieldCounts[key] = count
+	if count <= keep {
+		return nil
+	}
+
 	_, err := tx.Exec(`DELETE FROM personality_evolution
 		WHERE agent_id = ?
 		  AND field = ?
@@ -121,6 +138,7 @@ func (s *EvolutionStore) enforceAgentFieldRetentionTx(tx *sql.Tx, agentID, field
 	if err != nil {
 		return fmt.Errorf("evolution agent-field retention: %w", err)
 	}
+	s.agentFieldCounts[key] = keep
 	return nil
 }
 

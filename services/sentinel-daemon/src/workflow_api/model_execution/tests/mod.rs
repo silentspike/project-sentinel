@@ -1017,7 +1017,7 @@ fn project_planning_adoption_resumes_after_the_first_durable_workflow_step() {
         allowance.grant.assignment_version,
         assignment.assignment_version
     );
-    assert_eq!(allowance.grant.max_calls, 1);
+    assert_eq!(allowance.grant.max_calls, 16);
     assert_eq!(allowance.grant.provider, context.binding.grant.provider);
     assert_ne!(allowance.allowance_id, context.binding.allowance_id);
     let mut substituted = project;
@@ -1374,6 +1374,25 @@ fn adaptive_parser_accepts_one_typed_decision_and_rejects_ambiguous_output() {
         .unwrap(),
         AdaptiveModelDecisionV1::Blocked { .. }
     ));
+    assert!(matches!(
+        parse_adaptive_decision(
+            r#"{"schema_version":1,"decision":{"kind":"collaborate","action":{"kind":"ask_question","question_ref":"question-42"}}}"#
+        )
+        .unwrap(),
+        AdaptiveModelDecisionV1::Collaborate {
+            action: AdaptiveCollaborationActionV1::AskQuestion { .. }
+        }
+    ));
+    assert!(matches!(
+        parse_adaptive_decision(&format!(
+            r#"{{"schema_version":1,"decision":{{"kind":"collaborate","action":{{"kind":"offer_handoff","consumer_role":"qa","artifact_digests":["{}"],"reason_ref":"needs-independent-review"}}}}}}"#,
+            "b".repeat(64)
+        ))
+        .unwrap(),
+        AdaptiveModelDecisionV1::Collaborate {
+            action: AdaptiveCollaborationActionV1::OfferHandoff { .. }
+        }
+    ));
     for invalid in [
         r#"{"schema_version":2,"decision":{"kind":"blocked","reason_code":"blocked"}}"#,
         r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"../blocked"}}"#,
@@ -1381,6 +1400,8 @@ fn adaptive_parser_accepts_one_typed_decision_and_rejects_ambiguous_output() {
         r#"{"schema_version":1,"decision":{"kind":"tool","tool":{"tool":"inspect_file","path":"../secret","max_bytes":4096}}}"#,
         r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"blocked"},"extra":true}"#,
         r#"{"schema_version":1,"decision":{"kind":"propose_completion","artifact_digest":"ABC"}}"#,
+        r#"{"schema_version":1,"decision":{"kind":"collaborate","action":{"kind":"offer_handoff","consumer_role":"customer","artifact_digests":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"reason_ref":"invalid"}}}"#,
+        r#"{"schema_version":1,"decision":{"kind":"collaborate","action":{"kind":"offer_handoff","consumer_role":"qa","artifact_digests":["not-a-digest"],"reason_ref":"invalid"}}}"#,
     ] {
         assert!(parse_adaptive_decision(invalid).is_err(), "{invalid}");
     }

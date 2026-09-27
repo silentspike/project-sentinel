@@ -1,0 +1,150 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "integer", "enum": [1] },
+    "decision": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "type": "string", "enum": ["tool"] },
+            "tool": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "tool": { "type": "string", "enum": ["inspect_file"] },
+                    "path": { "type": "string" },
+                    "max_bytes": { "type": "integer" }
+                  },
+                  "required": ["tool", "path", "max_bytes"],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "tool": { "type": "string", "enum": ["write_file"] },
+                    "path": { "type": "string" },
+                    "content": { "type": "string" },
+                    "expected_sha256": { "type": ["string", "null"] }
+                  },
+                  "required": ["tool", "path", "content", "expected_sha256"],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "tool": { "type": "string", "enum": ["apply_patch"] },
+                    "path": { "type": "string" },
+                    "expected_sha256": { "type": "string" },
+                    "replacements": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "old": { "type": "string" },
+                          "new": { "type": "string" },
+                          "expected_occurrences": { "type": "integer" }
+                        },
+                        "required": ["old", "new", "expected_occurrences"],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": ["tool", "path", "expected_sha256", "replacements"],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "tool": { "type": "string", "enum": ["run_command"] },
+                    "program": { "type": "string" },
+                    "args": { "type": "array", "items": { "type": "string" } }
+                  },
+                  "required": ["tool", "program", "args"],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "tool": { "type": "string", "enum": ["run_tests"] },
+                    "suite_id": { "type": "string" },
+                    "program": { "type": "string" },
+                    "args": { "type": "array", "items": { "type": "string" } }
+                  },
+                  "required": ["tool", "suite_id", "program", "args"],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "tool": { "type": "string", "enum": ["package_artifact"] },
+                    "artifact_kind": { "type": "string" },
+                    "media_type": { "type": "string" },
+                    "paths": { "type": "array", "items": { "type": "string" } }
+                  },
+                  "required": ["tool", "artifact_kind", "media_type", "paths"],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "required": ["kind", "tool"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "type": "string", "enum": ["propose_completion"] },
+            "artifact_digest": { "type": "string" }
+          },
+          "required": ["kind", "artifact_digest"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "type": "string", "enum": ["collaborate"] },
+            "action": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": { "type": "string", "enum": ["ask_question"] },
+                    "question_ref": { "type": "string" }
+                  },
+                  "required": ["kind", "question_ref"],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": { "type": "string", "enum": ["offer_handoff"] },
+                    "consumer_role": { "type": "string" },
+                    "artifact_digests": { "type": "array", "items": { "type": "string" } },
+                    "reason_ref": { "type": "string" }
+                  },
+                  "required": ["kind", "consumer_role", "artifact_digests", "reason_ref"],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "required": ["kind", "action"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "type": "string", "enum": ["blocked"] },
+            "reason_code": { "type": "string" }
+          },
+          "required": ["kind", "reason_code"],
+          "additionalProperties": false
+        }
+      ]
+    }
+  },
+  "required": ["schema_version", "decision"],
+  "additionalProperties": false
+}
