@@ -286,7 +286,12 @@ fn request_provider_grant(
 }
 
 pub(super) fn assigned() -> (Journey, ProjectV1, SubscriptionCallGrantV1) {
-    let state = journey();
+    assigned_with_journey(journey())
+}
+
+pub(super) fn assigned_with_journey(
+    state: Journey,
+) -> (Journey, ProjectV1, SubscriptionCallGrantV1) {
     let project = project_command(
         &state.store,
         &state.pm,
