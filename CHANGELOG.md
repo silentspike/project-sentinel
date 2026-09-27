@@ -1,5 +1,9 @@
 # Changelog
 
+- Archive abandoned QA provider calls with their completed source review before
+  restarting Developer work. Their immutable authority remains validated after
+  SQLite reopen, without leaving active references to the archived QA task (#856).
+
 - Archive earlier corrections of a completed source QA task together with that
   QA task before restarting the Developer source work. Preserve and validate
   the correction history across SQLite reopen instead of leaving a live
