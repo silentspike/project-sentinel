@@ -1044,15 +1044,20 @@ fn negative_source_review_blocks_delivery_without_discarding_completed_work() {
 
 #[test]
 fn negative_qa_restarts_same_source_work_without_new_budget_or_lost_history() {
-    assert_negative_qa_rework(false);
+    assert_negative_qa_rework(false, false);
 }
 
 #[test]
 fn negative_qa_archives_prior_qa_correction_before_restarting_source() {
-    assert_negative_qa_rework(true);
+    assert_negative_qa_rework(true, false);
 }
 
-fn assert_negative_qa_rework(prior_qa_correction: bool) {
+#[test]
+fn negative_qa_archives_abandoned_qa_call_and_prior_correction() {
+    assert_negative_qa_rework(true, true);
+}
+
+fn assert_negative_qa_rework(prior_qa_correction: bool, abandoned_qa_call: bool) {
     let mut proposal = binding();
     proposal.governance.participants.push(participant(
         5,
@@ -1173,11 +1178,72 @@ fn assert_negative_qa_rework(prior_qa_correction: bool) {
             72,
         );
         claimed_review_allowance = project.subscription_call.as_ref().unwrap().clone();
-        let second_execution =
-            complete_review_execution(&state, &project, &review_id, 410, 73, Some(&revision));
-        project = finish_review_work(&state, project, &review_id, &second_execution, 974, 77);
+        if abandoned_qa_call {
+            project = project_command(
+                &state.store,
+                &state.pm,
+                986,
+                CompanyWorkflowCommandV1::AbandonSubscriptionCall {
+                    project_id: project.project_id.clone(),
+                    expected_version: project.version,
+                    allowance_id: claimed_review_allowance.allowance_id.clone(),
+                    request_digest: OTHER_DIGEST.into(),
+                    resolution_event_id: Uuid::from_u128(986).to_string(),
+                    abandoned_by: "operator-test".into(),
+                },
+                73,
+            );
+            project = project_command(
+                &state.store,
+                &state.pm,
+                987,
+                CompanyWorkflowCommandV1::GrantSubscriptionCall {
+                    project_id: project.project_id.clone(),
+                    expected_version: project.version,
+                    grant: claimed_review_allowance.grant.clone(),
+                },
+                74,
+            );
+            let renewed = project.subscription_call.as_ref().unwrap().clone();
+            project = project_command(
+                &state.store,
+                &state.qa,
+                988,
+                CompanyWorkflowCommandV1::ClaimSubscriptionCall {
+                    project_id: project.project_id.clone(),
+                    expected_version: project.version,
+                    allowance_id: renewed.allowance_id.clone(),
+                    request_id: format!("company-provider-{}", renewed.allowance_id),
+                    request_digest: OTHER_DIGEST.into(),
+                },
+                75,
+            );
+            claimed_review_allowance = project.subscription_call.as_ref().unwrap().clone();
+        }
+        let second_execution = complete_review_execution(
+            &state,
+            &project,
+            &review_id,
+            410,
+            if abandoned_qa_call { 76 } else { 73 },
+            Some(&revision),
+        );
+        project = finish_review_work(
+            &state,
+            project,
+            &review_id,
+            &second_execution,
+            974,
+            if abandoned_qa_call { 80 } else { 77 },
+        );
     }
-    let blocked_at = if prior_qa_correction { 80 } else { 71 };
+    let blocked_at = if abandoned_qa_call {
+        83
+    } else if prior_qa_correction {
+        80
+    } else {
+        71
+    };
     let blocked = project_command(
         &state.store,
         &state.pm,
@@ -1261,6 +1327,13 @@ fn assert_negative_qa_rework(prior_qa_correction: bool) {
     assert_eq!(corrected.lifecycle_state, ProjectLifecycleStateV1::Active);
     assert!(!corrected.work_items.contains_key(&review_id));
     assert_eq!(corrected.archived_source_reviews.len(), 1);
+    assert_eq!(corrected.abandoned_subscription_calls.len(), 0);
+    assert_eq!(
+        corrected.archived_source_reviews[0]
+            .review_abandoned_calls
+            .len(),
+        usize::from(abandoned_qa_call)
+    );
     assert_eq!(corrected.work_corrections.len(), 1);
     assert_eq!(
         corrected.archived_source_reviews[0]
