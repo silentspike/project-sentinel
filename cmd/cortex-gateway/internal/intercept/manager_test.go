@@ -66,8 +66,15 @@ func TestPendingSortedByCreatedAt(t *testing.T) {
 		})
 	}()
 
-	time.Sleep(20 * time.Millisecond)
-	pending := mgr.Pending()
+	deadline := time.Now().Add(time.Second)
+	var pending []PendingRequest
+	for {
+		pending = mgr.Pending()
+		if len(pending) == 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if len(pending) != 2 {
 		t.Fatalf("pending len = %d, want 2", len(pending))
 	}

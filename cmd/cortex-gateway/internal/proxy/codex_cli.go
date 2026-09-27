@@ -63,6 +63,12 @@ var codexCLIDisabledFeatures = []string{
 //go:embed codex_cli_work_schema.json
 var codexCLIWorkSchema []byte
 
+//go:embed codex_cli_review_schema.json
+var codexCLIReviewSchema []byte
+
+//go:embed codex_cli_adaptive_schema.json
+var codexCLIAdaptiveSchema []byte
+
 type codexCLIUsage struct {
 	InputTokens           int64 `json:"input_tokens"`
 	CachedInputTokens     int64 `json:"cached_input_tokens"`
@@ -250,15 +256,29 @@ func (p *CodexCLIProvider) cleanupOutputSchema(path string) {
 }
 
 func (p *CodexCLIProvider) outputSchemaPath(req *LLMRequest) (string, error) {
-	if req.Metadata["company_execution_schema"] != "1" {
+	executionSchema := req.Metadata["company_execution_schema"]
+	if executionSchema != "1" && executionSchema != "3" {
 		return "", nil
+	}
+	selected := codexCLIAdaptiveSchema
+	if executionSchema == "1" {
+		selected = codexCLIWorkSchema
+		switch req.Metadata["company_execution_output_kind"] {
+		case "", "tool_plan": // Empty preserves already-reserved legacy requests.
+		case "source_review":
+			selected = codexCLIReviewSchema
+		default:
+			return "", fmt.Errorf("codex-cli company output kind is invalid")
+		}
+	} else if req.Metadata["company_execution_output_kind"] != "" && req.Metadata["company_execution_output_kind"] != "adaptive_decision" {
+		return "", fmt.Errorf("codex-cli adaptive output kind is invalid")
 	}
 	schema, err := os.CreateTemp(p.workdir, ".codex-work-schema-*.json")
 	if err != nil {
 		return "", fmt.Errorf("codex-cli work schema: %w", err)
 	}
 	path := schema.Name()
-	if _, err := schema.Write(codexCLIWorkSchema); err != nil {
+	if _, err := schema.Write(selected); err != nil {
 		closeErr := schema.Close()
 		removeErr := os.Remove(path) //nolint:gosec // path came from CreateTemp in the validated private workdir
 		return "", errors.Join(fmt.Errorf("codex-cli write work schema: %w", err), closeErr, removeErr)
