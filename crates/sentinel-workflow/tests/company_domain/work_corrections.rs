@@ -791,6 +791,47 @@ fn abandoned_source_review_call_preserves_handoff_for_exact_qa_regrant() {
 }
 
 #[test]
+fn negative_source_review_blocks_delivery_without_discarding_completed_work() {
+    let (state, before, _) =
+        correction_fixture_with_subscription(WorkExecutionObservation::Succeeded, true);
+    assert_eq!(
+        before.lifecycle_state,
+        ProjectLifecycleStateV1::DeliveryCandidate
+    );
+    let work_id = WorkItemId::parse("build-work").unwrap();
+    let prior_allowance = before.subscription_call.clone();
+    let blocked = project_command(
+        &state.store,
+        &state.pm,
+        875,
+        CompanyWorkflowCommandV1::RaiseBlocker {
+            project_id: before.project_id.clone(),
+            expected_version: before.version,
+            work_item_id: Some(work_id.clone()),
+            cause_ref: format!("qa-source-review:{}", DIGEST),
+            owner: state.developer.agent_id.unwrap(),
+        },
+        60,
+    );
+    assert_eq!(blocked.lifecycle_state, ProjectLifecycleStateV1::Blocked);
+    assert_eq!(blocked.work_items[&work_id], before.work_items[&work_id]);
+    assert_eq!(blocked.subscription_call, prior_allowance);
+    assert_eq!(blocked.blockers.len(), 1);
+    assert_eq!(blocked.blockers[0].work_item_id, Some(work_id));
+    assert_eq!(
+        blocked.blockers[0].cause_ref,
+        format!("qa-source-review:{}", DIGEST)
+    );
+    let reopened = WorkflowStore::open(state._temp.path().join("workflow.sqlite")).unwrap();
+    assert_eq!(
+        reopened
+            .company_project(&state.pm.tenant_id, &blocked.project_id)
+            .unwrap(),
+        Some(blocked)
+    );
+}
+
+#[test]
 fn company_correction_feedback_is_bound_to_artifact_and_survives_restart() {
     let (state, previous, mut command) = correction_fixture(WorkExecutionObservation::Succeeded);
     let work_id = WorkItemId::parse("build-work").unwrap();
