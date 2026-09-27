@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,6 +59,9 @@ var codexCLIDisabledFeatures = []string{
 	"view_image",
 	"workspace_dependencies",
 }
+
+//go:embed codex_cli_work_schema.json
+var codexCLIWorkSchema []byte
 
 type codexCLIUsage struct {
 	InputTokens           int64 `json:"input_tokens"`
@@ -176,10 +180,15 @@ func (p *CodexCLIProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespo
 	if strings.TrimSpace(req.Model) != "" {
 		model = strings.TrimSpace(req.Model)
 	}
+	schemaPath, err := p.outputSchemaPath(req)
+	if err != nil {
+		return nil, err
+	}
+	defer p.cleanupOutputSchema(schemaPath)
 
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
-	cmd := exec.CommandContext(runCtx, p.binary, p.commandArgs(model)...) //nolint:gosec // pinned binary path from trusted deployment config
+	cmd := exec.CommandContext(runCtx, p.binary, p.commandArgsWithSchema(model, schemaPath)...) //nolint:gosec // pinned binary path from trusted deployment config
 	cmd.Dir = p.workdir
 	cmd.Env = p.commandEnv()
 	cmd.Stdin = strings.NewReader(prompt)
@@ -231,7 +240,41 @@ func (p *CodexCLIProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespo
 	return response, nil
 }
 
+func (p *CodexCLIProvider) cleanupOutputSchema(path string) {
+	if path == "" {
+		return
+	}
+	if err := os.Remove(path); err != nil { //nolint:gosec // path came from CreateTemp in the validated private workdir
+		p.logger.Warn("codex-cli work schema cleanup failed", "error", err)
+	}
+}
+
+func (p *CodexCLIProvider) outputSchemaPath(req *LLMRequest) (string, error) {
+	if req.Metadata["company_execution_schema"] != "1" {
+		return "", nil
+	}
+	schema, err := os.CreateTemp(p.workdir, ".codex-work-schema-*.json")
+	if err != nil {
+		return "", fmt.Errorf("codex-cli work schema: %w", err)
+	}
+	path := schema.Name()
+	if _, err := schema.Write(codexCLIWorkSchema); err != nil {
+		closeErr := schema.Close()
+		removeErr := os.Remove(path) //nolint:gosec // path came from CreateTemp in the validated private workdir
+		return "", errors.Join(fmt.Errorf("codex-cli write work schema: %w", err), closeErr, removeErr)
+	}
+	if err := schema.Close(); err != nil {
+		removeErr := os.Remove(path) //nolint:gosec // path came from CreateTemp in the validated private workdir
+		return "", errors.Join(fmt.Errorf("codex-cli close work schema: %w", err), removeErr)
+	}
+	return path, nil
+}
+
 func (p *CodexCLIProvider) commandArgs(model string) []string {
+	return p.commandArgsWithSchema(model, "")
+}
+
+func (p *CodexCLIProvider) commandArgsWithSchema(model, schemaPath string) []string {
 	args := []string{
 		"exec",
 		"--json",
@@ -256,6 +299,9 @@ func (p *CodexCLIProvider) commandArgs(model string) []string {
 	}
 	for _, feature := range codexCLIDisabledFeatures {
 		args = append(args, "--disable", feature)
+	}
+	if schemaPath != "" {
+		args = append(args, "--output-schema", schemaPath)
 	}
 	return append(args, "-")
 }

@@ -1,0 +1,47 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "integer", "enum": [1] },
+    "tools": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "type": "string", "enum": ["write_file"] },
+              "path": { "type": "string" },
+              "content": { "type": "string" },
+              "expected_sha256": { "type": ["string", "null"] }
+            },
+            "required": ["kind", "path", "content", "expected_sha256"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "type": "string", "enum": ["run_command"] },
+              "program": { "type": "string" },
+              "args": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["kind", "program", "args"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "type": "string", "enum": ["package_artifact"] },
+              "artifact_kind": { "type": "string" },
+              "media_type": { "type": "string" },
+              "paths": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["kind", "artifact_kind", "media_type", "paths"],
+            "additionalProperties": false
+          }
+        ]
+      }
+    }
+  },
+  "required": ["schema_version", "tools"],
+  "additionalProperties": false
+}

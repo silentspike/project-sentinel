@@ -1,5 +1,10 @@
 # Changelog
 
+- Require the pinned Codex CLI to return a schema-constrained tool plan for
+  authorized project work, while leaving Sales, planning, adaptive and ordinary
+  inference responses unchanged. This prevents narrative replies from being
+  mistaken for executable Developer or QA proposals (#856).
+
 - Give assigned Designer and Developer model workers the same server-bound
   accepted customer contract used by independent QA, so full scope and
   exclusions guide initial work and corrections. Escalate after three
