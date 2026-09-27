@@ -1,5 +1,10 @@
 # Changelog
 
+- Stop autonomous release progression when independent source QA finds a
+  customer-contract defect. Archive only unconsumed delivery QA planning,
+  persist a digest-bound Developer blocker, and retain completed work and
+  provider history instead of rerunning QA against unchanged source (#856).
+
 - Preserve the Developer-to-QA source-review handoff while an operator-resolved
   QA provider call is archived and its exact replacement has not yet been
   granted. Validate that brief recovery state against the archived QA
