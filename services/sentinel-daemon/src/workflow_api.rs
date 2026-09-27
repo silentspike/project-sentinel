@@ -4499,6 +4499,18 @@ impl WorkflowApi {
         self.publish_collaboration_backlog()
             .map_err(|_| workflow_unavailable())?;
         for project in self.store.company_projects()? {
+            #[cfg(feature = "llm")]
+            if project.lifecycle_state == sentinel_workflow::ProjectLifecycleStateV1::Blocked
+                && project.source_review_previous_call.is_some()
+                && project.blockers.iter().any(|blocker| {
+                    blocker.state != sentinel_workflow::BlockerStateV1::Resolved
+                        && blocker.cause_ref.starts_with("qa-source-review:")
+                })
+            {
+                model_review::restart_source_after_negative_review(self, &project)
+                    .map_err(|_| workflow_unavailable())?;
+                continue;
+            }
             if model_review::setup_due(&project) {
                 self.ensure_source_review(project)
                     .map_err(|_| workflow_unavailable())?;
@@ -4608,6 +4620,34 @@ impl WorkflowApi {
                 .ok_or_else(|| {
                     WorkflowError::new(WorkflowErrorCode::NotFound, false, "project not found")
                 })?;
+            if project.archived_source_reviews.iter().any(|archive| {
+                archive.review_work.spec.work_item_id == execution.work_item_id
+                    && archive
+                        .review_allowance
+                        .dispatch
+                        .as_ref()
+                        .is_some_and(|dispatch| {
+                            execution.plan.plan_id
+                                == stable_operation_id(
+                                    "sentinel.model-work.v1",
+                                    &format!("{}:{}", dispatch.request_id, dispatch.request_digest),
+                                    1,
+                                )
+                        })
+                    && execution.state == sentinel_workflow::WorkItemState::Done
+                    && execution.terminal_execution_evidence.is_some()
+                    && execution.gate_evidence.as_ref().is_some_and(|gate| {
+                        archive
+                            .review_work
+                            .gate_receipt
+                            .as_ref()
+                            .is_some_and(|receipt| {
+                                receipt.passed && receipt.subject_digest == gate.subject_digest
+                            })
+                    })
+            }) {
+                return Ok(());
+            }
             // A correction is pending until its new plan exists. Old completion
             // replay must not close it again during periodic reconciliation.
             if project.work_corrections.iter().any(|correction| {
@@ -5359,6 +5399,7 @@ fn is_internal_company_command(command: &CompanyWorkflowCommandV1) -> bool {
         command,
         CompanyWorkflowCommandV1::ApplyWorkTransition { .. }
             | CompanyWorkflowCommandV1::RequestWorkCorrection { .. }
+            | CompanyWorkflowCommandV1::RestartSourceAfterQa { .. }
             | CompanyWorkflowCommandV1::AppendSourceReview { .. }
             | CompanyWorkflowCommandV1::AssignSourceReview { .. }
             | CompanyWorkflowCommandV1::GrantSourceReviewCall { .. }
@@ -5830,6 +5871,7 @@ mod tests {
             abandoned_subscription_calls: Vec::new(),
             source_review_previous_call: None,
             work_corrections: Vec::new(),
+            archived_source_reviews: Vec::new(),
             reservations: vec![sentinel_workflow::CostReservationV1 {
                 reservation_id: "reservation-m0".to_owned(),
                 work_item_id: Some(work_item_id),

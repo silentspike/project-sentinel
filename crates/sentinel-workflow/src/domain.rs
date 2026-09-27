@@ -551,6 +551,19 @@ pub struct WorkCorrectionV1 {
     pub previous_subscription_call: Option<SubscriptionCallAllowanceV1>,
 }
 
+/// An independent negative review remains immutable when its source is revised.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchivedSourceReviewV1 {
+    pub review_work: CompanyWorkItemV1,
+    pub source_work: CompanyWorkItemV1,
+    pub review_allowance: SubscriptionCallAllowanceV1,
+    pub source_allowance: SubscriptionCallAllowanceV1,
+    pub report_digest: String,
+    pub blocker_id: String,
+    pub archived_at_unix_ms: u64,
+}
+
 /// Leadership-authored observations, not independent QA or tool authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -850,6 +863,8 @@ pub struct ProjectV1 {
     pub source_review_previous_call: Option<SubscriptionCallAllowanceV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub work_corrections: Vec<WorkCorrectionV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archived_source_reviews: Vec<ArchivedSourceReviewV1>,
     pub rooms: Vec<ProjectRoomV1>,
     pub questions: Vec<ProjectQuestionV1>,
     pub actions: Vec<ProjectActionV1>,
@@ -1075,6 +1090,19 @@ pub enum CompanyWorkflowCommandV1 {
         feedback: Option<WorkCorrectionFeedbackV1>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next_subscription_grant: Option<SubscriptionCallGrantV1>,
+    },
+    /// Internal: the service proves the sealed negative QA result and excludes delivery.
+    RestartSourceAfterQa {
+        project_id: ProjectId,
+        expected_version: u64,
+        review_work_item_id: WorkItemId,
+        source_work_item_id: WorkItemId,
+        blocker_id: String,
+        report_digest: String,
+        expected_source_work_version: u64,
+        source_execution_revision: crate::ExecutionRevisionV1,
+        feedback: WorkCorrectionFeedbackV1,
+        next_subscription_grant: SubscriptionCallGrantV1,
     },
     RecordDecision {
         project_id: ProjectId,

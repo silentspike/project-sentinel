@@ -1,5 +1,10 @@
 # Changelog
 
+- After a sealed negative source QA review, restart the same Developer work
+  within its existing project budget. Archive the consumed QA and source
+  allowances, retain the original artifacts and review history, and require a
+  fresh independent review before delivery can resume (#856).
+
 - Stop autonomous release progression when independent source QA finds a
   customer-contract defect. Archive only unconsumed delivery QA planning,
   persist a digest-bound Developer blocker, and retain completed work and

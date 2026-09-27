@@ -2349,6 +2349,40 @@ where
         Ok(self.core.load(tenant_id, project_id)?.is_some())
     }
 
+    /// A superseded candidate is historical evidence, not a consumed release.
+    pub(crate) fn permits_new_source_review(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Result<bool, DeliveryError> {
+        let Some(aggregate) = self.core.load(tenant_id, project_id)? else {
+            return Ok(true);
+        };
+        Ok(aggregate.active_release_id.is_none()
+            && aggregate.releases.is_empty()
+            && aggregate.deliveries.is_empty()
+            && aggregate.workbench_receipts.is_empty()
+            && aggregate.evidence_graphs.is_empty()
+            && aggregate.reviews.is_empty()
+            && aggregate.test_runs.is_empty()
+            && aggregate.findings.is_empty()
+            && aggregate.approvals.is_empty()
+            && aggregate.gates.is_empty()
+            && aggregate.manifests.is_empty()
+            && aggregate.feedback.is_empty()
+            && aggregate.acceptances.is_empty()
+            && aggregate.rollbacks.is_empty()
+            && aggregate.closeouts.is_empty()
+            && aggregate
+                .candidates
+                .values()
+                .all(|candidate| candidate.state == CandidateState::Superseded)
+            && aggregate
+                .qa_runs
+                .values()
+                .all(|run| run.state == QaRunState::Superseded))
+    }
+
     /// Read-only lineage needs the verified local authority plus the exact
     /// workflow/authentication integration contract. Workbench execution,
     /// delivery effects, and event publication are independent capabilities
