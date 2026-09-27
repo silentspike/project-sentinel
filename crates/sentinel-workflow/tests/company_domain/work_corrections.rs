@@ -6,7 +6,7 @@ use sentinel_workflow::{
     PendingExecutionV1, PendingGateEvidenceV1, PrincipalAuthorityV1, ProjectV1,
     RuntimeAuthoritySnapshotV1, SealedArtifactEvidenceV1, SealedOutputEvidenceV1,
     TerminalExecutionEvidence, WorkCorrectionFeedbackV1, WorkExecutionObservation,
-    WorkExecutionPort, WorkflowCore, WorkflowPortError,
+    WorkExecutionPort, WorkItemExecutionV1, WorkflowCore, WorkflowPortError,
 };
 
 struct Organization(RuntimeAuthoritySnapshotV1);
@@ -94,6 +94,29 @@ impl CompletionEvidencePort for Evidence {
             kind: "source_tree".into(),
             digest_algorithm: "sha256".into(),
             digest: OTHER_DIGEST.into(),
+        }];
+        let digest = sentinel_workflow::sealed_output_bundle_digest(&outputs, &[]).unwrap();
+        Ok(Box::new(Completion {
+            request: request.clone(),
+            outputs,
+            digest,
+        }))
+    }
+}
+struct ReviewEvidence;
+impl CompletionEvidencePort for ReviewEvidence {
+    fn readiness(&self) -> DependencyReadiness {
+        DependencyReadiness::Ready
+    }
+    fn terminal_evidence(
+        &self,
+        request: &PendingCompletionEvidenceV1,
+    ) -> Result<Box<dyn TerminalExecutionEvidence>, WorkflowPortError> {
+        let outputs = vec![SealedOutputEvidenceV1 {
+            name: "qa-report".into(),
+            kind: "qa_report".into(),
+            digest_algorithm: "sha256".into(),
+            digest: DIGEST.into(),
         }];
         let digest = sentinel_workflow::sealed_output_bundle_digest(&outputs, &[]).unwrap();
         Ok(Box::new(Completion {
@@ -371,6 +394,186 @@ fn correction_fixture_with_journey(
         next_subscription_grant: None,
     };
     (state, project, command)
+}
+
+fn complete_review_execution(
+    state: &Journey,
+    project: &ProjectV1,
+    review_id: &WorkItemId,
+    plan_id: u128,
+    now: u64,
+    revision: Option<&ExecutionRevisionV1>,
+) -> WorkItemExecutionV1 {
+    let assignment = &project.work_items[review_id].assignments[0];
+    let authority = RuntimeAuthoritySnapshotV1 {
+        schema_version: 1,
+        tenant_id: project.tenant_id.clone(),
+        project_id: project.project_id.clone(),
+        work_item_id: review_id.clone(),
+        agent_id: assignment.agent_id,
+        assignment_version: assignment.assignment_version,
+        assignment_digest: assignment.canonical_digest().unwrap(),
+        organization_generation: assignment.organization_generation,
+        organization_digest: assignment.organization_digest.clone(),
+        principal: PrincipalAuthorityV1::derive(&state.qa.principal_id, 1, &[0x5a; 32]).unwrap(),
+        profile_id: assignment.profile.profile_id.clone(),
+        profile_generation: assignment.profile.generation,
+        profile_digest: assignment.profile.digest.clone(),
+        runtime_key: "bwrap-test".into(),
+        runtime_generation: 1,
+        runtime_digest: DIGEST.into(),
+        policy_generation: 1,
+        policy_digest: DIGEST.into(),
+        active: true,
+        capabilities: BTreeSet::from(["file.write".to_owned()]),
+    };
+    let workspace = format!("{}:{}", project.project_id.0, review_id.0);
+    let plan = ExecutionPlanV1 {
+        schema_version: 1,
+        plan_id: Uuid::from_u128(plan_id),
+        tenant_id: authority.tenant_id.clone(),
+        project_id: authority.project_id.clone(),
+        work_item_id: review_id.clone(),
+        agent_id: authority.agent_id,
+        workspace_id: workspace.clone(),
+        assignment_version: authority.assignment_version,
+        assignment_digest: authority.assignment_digest.clone(),
+        organization_generation: authority.organization_generation,
+        organization_digest: authority.organization_digest.clone(),
+        principal: authority.principal.clone(),
+        profile_id: authority.profile_id.clone(),
+        profile_generation: authority.profile_generation,
+        profile_digest: authority.profile_digest.clone(),
+        runtime_key: authority.runtime_key.clone(),
+        runtime_generation: authority.runtime_generation,
+        runtime_digest: authority.runtime_digest.clone(),
+        policy_generation: authority.policy_generation,
+        policy_digest: authority.policy_digest.clone(),
+        created_at_unix_ms: now,
+        deadline_unix_ms: 10_000,
+        request_digest: String::new(),
+        steps: vec![ExecutionStepV1 {
+            step_id: Uuid::from_u128(plan_id + 1),
+            invocation_id: Uuid::from_u128(plan_id + 2),
+            ordinal: 0,
+            workspace_id: workspace,
+            capabilities: authority.capabilities.clone(),
+            inputs: vec![],
+            command_policy: vec![],
+            tool: ExecutionToolV1::WriteFile {
+                path: "review.json".into(),
+                content: "{}".into(),
+                expected_sha256: None,
+            },
+            outputs: vec![sentinel_workflow::OutputExpectationV1 {
+                name: "qa-report".into(),
+                kind: "qa_report".into(),
+                required: true,
+                digest_algorithm: "sha256".into(),
+            }],
+            artifacts: vec![],
+            gate_expectation: GateExpectationV1 {
+                profile_id: "web-work-item-qa-v1".into(),
+                profile_generation: 1,
+                profile_digest: DIGEST.into(),
+                required_checks: BTreeSet::from(["check".to_owned()]),
+            },
+            resource_bounds: ExecutionResourceBoundsV1 {
+                wall_time_ms: 1000,
+                cpu_time_ms: 1000,
+                memory_bytes: 1024 * 1024,
+                process_count: 1,
+                file_bytes: 1024,
+                stdout_bytes: 1024,
+                stderr_bytes: 1024,
+            },
+            deadline_unix_ms: 10_000,
+        }],
+    }
+    .bind_digest()
+    .unwrap();
+    let core = WorkflowCore::new(
+        WorkflowStore::open(state._temp.path().join("workflow.sqlite")).unwrap(),
+        Organization(authority),
+        Execution(WorkExecutionObservation::Succeeded),
+        ReviewEvidence,
+        Evidence,
+    );
+    if let Some(revision) = revision {
+        core.admit_revision_plan(&plan, revision, now).unwrap();
+    } else {
+        core.admit_plan(&plan, now).unwrap();
+    }
+    let pending = core.store().pending_executions(1).unwrap().remove(0);
+    core.reconcile_execution(&pending, now + 1).unwrap();
+    let completion = core
+        .store()
+        .pending_completion_evidence(1)
+        .unwrap()
+        .remove(0);
+    core.reconcile_completion_evidence(&completion, now + 2)
+        .unwrap();
+    let gate = core.store().pending_gate_evidence(1).unwrap().remove(0);
+    core.reconcile_gate_evidence(&gate, now + 3).unwrap()
+}
+
+fn finish_review_work(
+    state: &Journey,
+    mut project: ProjectV1,
+    review_id: &WorkItemId,
+    execution: &WorkItemExecutionV1,
+    first_operation: u128,
+    first_time: u64,
+) -> ProjectV1 {
+    let report = vec![WorkOutputReceiptV1 {
+        content_digest: DIGEST.into(),
+        ..output_receipt().remove(0)
+    }];
+    for (index, (from, to)) in [
+        (CompanyWorkStateV1::Assigned, CompanyWorkStateV1::InProgress),
+        (CompanyWorkStateV1::InProgress, CompanyWorkStateV1::InReview),
+        (CompanyWorkStateV1::InReview, CompanyWorkStateV1::Done),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let now = first_time + index as u64;
+        let done = to == CompanyWorkStateV1::Done;
+        project = project_command(
+            &state.store,
+            if done { &state.release } else { &state.qa },
+            first_operation + index as u128,
+            transition(
+                &project.project_id,
+                project.version,
+                &review_id.0,
+                project.work_items[review_id].version,
+                1,
+                from,
+                to,
+                if to == CompanyWorkStateV1::InProgress {
+                    vec![]
+                } else {
+                    report.clone()
+                },
+                done.then(|| QualityGateReceiptBindingV1 {
+                    gate_id: "web-work-item-qa-v1".into(),
+                    generation: 1,
+                    gate_digest: DIGEST.into(),
+                    subject_digest: execution
+                        .gate_evidence
+                        .as_ref()
+                        .unwrap()
+                        .subject_digest
+                        .clone(),
+                    passed: true,
+                }),
+                now,
+            ),
+            now,
+        );
+    }
+    project
 }
 
 #[test]
@@ -841,6 +1044,15 @@ fn negative_source_review_blocks_delivery_without_discarding_completed_work() {
 
 #[test]
 fn negative_qa_restarts_same_source_work_without_new_budget_or_lost_history() {
+    assert_negative_qa_rework(false);
+}
+
+#[test]
+fn negative_qa_archives_prior_qa_correction_before_restarting_source() {
+    assert_negative_qa_rework(true);
+}
+
+fn assert_negative_qa_rework(prior_qa_correction: bool) {
     let mut proposal = binding();
     proposal.governance.participants.push(participant(
         5,
@@ -924,51 +1136,48 @@ fn negative_qa_restarts_same_source_work_without_new_budget_or_lost_history() {
         },
         63,
     );
-    let claimed_review_allowance = project.subscription_call.as_ref().unwrap().clone();
-    let report = vec![WorkOutputReceiptV1 {
-        content_digest: DIGEST.into(),
-        ..output_receipt().remove(0)
-    }];
-    for (index, (from, to)) in [
-        (CompanyWorkStateV1::Assigned, CompanyWorkStateV1::InProgress),
-        (CompanyWorkStateV1::InProgress, CompanyWorkStateV1::InReview),
-        (CompanyWorkStateV1::InReview, CompanyWorkStateV1::Done),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let now = 64 + index as u64;
-        let review_work = &project.work_items[&review_id];
-        let done = to == CompanyWorkStateV1::Done;
+    let mut claimed_review_allowance = project.subscription_call.as_ref().unwrap().clone();
+    let first_execution = complete_review_execution(&state, &project, &review_id, 400, 64, None);
+    project = finish_review_work(&state, project, &review_id, &first_execution, 954, 68);
+    if prior_qa_correction {
+        let revision =
+            ExecutionRevisionV1::from_completed_work(&first_execution, DIGEST.into()).unwrap();
         project = project_command(
             &state.store,
-            if done { &state.release } else { &state.qa },
-            954 + index as u128,
-            transition(
-                &project.project_id,
-                project.version,
-                "source-review",
-                review_work.version,
-                1,
-                from,
-                to,
-                if to == CompanyWorkStateV1::InProgress {
-                    vec![]
-                } else {
-                    report.clone()
-                },
-                done.then(|| QualityGateReceiptBindingV1 {
-                    gate_id: "web-work-item-qa-v1".into(),
-                    generation: 1,
-                    gate_digest: DIGEST.into(),
-                    subject_digest: DIGEST.into(),
-                    passed: true,
-                }),
-                now,
-            ),
-            now,
+            &state.pm,
+            970,
+            CompanyWorkflowCommandV1::RequestWorkCorrection {
+                project_id: project.project_id.clone(),
+                expected_version: project.version,
+                work_item_id: review_id.clone(),
+                expected_work_version: project.work_items[&review_id].version,
+                execution_revision: revision.clone(),
+                feedback_ref: "qa-report-retry".into(),
+                feedback: None,
+                next_subscription_grant: Some(claimed_review_allowance.grant.clone()),
+            },
+            71,
         );
+        claimed_review_allowance = project.subscription_call.as_ref().unwrap().clone();
+        project = project_command(
+            &state.store,
+            &state.qa,
+            971,
+            CompanyWorkflowCommandV1::ClaimSubscriptionCall {
+                project_id: project.project_id.clone(),
+                expected_version: project.version,
+                allowance_id: claimed_review_allowance.allowance_id.clone(),
+                request_id: format!("company-provider-{}", claimed_review_allowance.allowance_id),
+                request_digest: OTHER_DIGEST.into(),
+            },
+            72,
+        );
+        claimed_review_allowance = project.subscription_call.as_ref().unwrap().clone();
+        let second_execution =
+            complete_review_execution(&state, &project, &review_id, 410, 73, Some(&revision));
+        project = finish_review_work(&state, project, &review_id, &second_execution, 974, 77);
     }
+    let blocked_at = if prior_qa_correction { 80 } else { 71 };
     let blocked = project_command(
         &state.store,
         &state.pm,
@@ -980,7 +1189,7 @@ fn negative_qa_restarts_same_source_work_without_new_budget_or_lost_history() {
             cause_ref: format!("qa-source-review:{DIGEST}"),
             owner: AgentId(2),
         },
-        67,
+        blocked_at,
     );
     let feedback = WorkCorrectionFeedbackV1 {
         summary: "QA found missing contracted service and unmarked example copy".into(),
@@ -1027,7 +1236,12 @@ fn negative_qa_restarts_same_source_work_without_new_budget_or_lost_history() {
         }
         assert!(state
             .store
-            .apply_company_command(&state.pm, Uuid::from_u128(980 + variant), &invalid, 68)
+            .apply_company_command(
+                &state.pm,
+                Uuid::from_u128(980 + variant),
+                &invalid,
+                blocked_at + 1,
+            )
             .is_err());
         assert_eq!(
             state
@@ -1037,11 +1251,23 @@ fn negative_qa_restarts_same_source_work_without_new_budget_or_lost_history() {
             Some(blocked.clone())
         );
     }
-    let corrected = project_command(&state.store, &state.pm, 958, restart.clone(), 68);
+    let corrected = project_command(
+        &state.store,
+        &state.pm,
+        958,
+        restart.clone(),
+        blocked_at + 1,
+    );
     assert_eq!(corrected.lifecycle_state, ProjectLifecycleStateV1::Active);
     assert!(!corrected.work_items.contains_key(&review_id));
     assert_eq!(corrected.archived_source_reviews.len(), 1);
     assert_eq!(corrected.work_corrections.len(), 1);
+    assert_eq!(
+        corrected.archived_source_reviews[0]
+            .review_corrections
+            .len(),
+        usize::from(prior_qa_correction)
+    );
     assert_eq!(
         corrected.work_items[&source_id].state,
         CompanyWorkStateV1::Assigned
@@ -1075,12 +1301,12 @@ fn negative_qa_restarts_same_source_work_without_new_budget_or_lost_history() {
     );
     assert!(state
         .store
-        .apply_company_command(&state.pm, Uuid::from_u128(985), &restart, 69)
+        .apply_company_command(&state.pm, Uuid::from_u128(985), &restart, blocked_at + 2)
         .is_err());
     let reopened = WorkflowStore::open(state._temp.path().join("workflow.sqlite")).unwrap();
     assert!(
         reopened
-            .apply_company_command(&state.pm, Uuid::from_u128(958), &restart, 69)
+            .apply_company_command(&state.pm, Uuid::from_u128(958), &restart, blocked_at + 2)
             .unwrap()
             .replayed
     );
