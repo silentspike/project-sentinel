@@ -780,7 +780,9 @@ impl LayerManager {
     pub fn snapshot_metadata(&self) -> anyhow::Result<FsMetadataDump> {
         let mut state = self.lock()?;
         self.sync_workspaces_locked(&mut state)?;
-        self.meta.dump_all_tables()
+        let dump = self.meta.dump_all_tables()?;
+        crate::metadata::validate_workspace_metadata_dump(&dump)?;
+        Ok(dump)
     }
 
     /// Fail closed rather than letting live FDs refer into a restored namespace.

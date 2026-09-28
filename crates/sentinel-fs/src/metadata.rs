@@ -125,6 +125,21 @@ pub fn referenced_workspace_content(dump: &FsMetadataDump) -> Vec<WorkspaceConte
     bindings.into_values().collect()
 }
 
+/// Side-effect-free validation before reference extraction or any restore mutation.
+/// Legacy SFI1/JSON retain their exact decoding rules; SFI2 additionally checks
+/// binding hash/size/kind coherence and rejects trailing or truncated payloads.
+pub fn validate_workspace_metadata_dump(dump: &FsMetadataDump) -> anyhow::Result<()> {
+    for (agent, inode, bytes) in &dump.inodes {
+        if *inode == 0 {
+            anyhow::ensure!(bytes.len() == 8, "Invalid inode allocation counter for {agent}");
+        } else {
+            WorkspaceInode::deserialize(bytes)
+                .map_err(|error| error.context(format!("Invalid inode encoding/binding for {agent}:{inode}")))?;
+        }
+    }
+    Ok(())
+}
+
 // --- Types ---
 
 /// File type in the virtual filesystem.
@@ -795,6 +810,7 @@ impl MetadataStore {
     }
 
     pub(crate) fn restore_workspace_tables(&self, dump: &FsMetadataDump, guard: &OwnerWriteGuard) -> anyhow::Result<()> {
+        validate_workspace_metadata_dump(dump)?;
         anyhow::ensure!(guard.scope() == &StateTransferScope::World, "Restore requires World scope");
         let current = self.dump_all_tables()?;
         let mut write_txn = self.begin_fenced_write(guard)?;
@@ -1331,6 +1347,32 @@ mod tests {
             OwnerRegistry::global().this_node(), 0);
         assert!(store.commit_namespace("agent", &stale, &[(2, row)], &[], true).is_err());
         assert!(store.get_inode("agent", 2).unwrap().is_none());
+    }
+
+    #[test]
+    fn dump_validation_rejects_malformed_or_incoherent_sfi2_before_restore_mutates() {
+        let (store, _dir) = temp_meta();
+        store.set_inode("agent", 2, &InodeData::regular([0x11; 32], 4, 0o644)).unwrap();
+        let original = store.dump_all_tables().unwrap();
+        validate_workspace_metadata_dump(&original).unwrap();
+        let mut malformed = original.clone();
+        malformed.inodes[0].2 = b"SFI2bad".to_vec();
+        assert!(validate_workspace_metadata_dump(&malformed).is_err());
+        assert!(store.restore_all_tables(&malformed).is_err());
+        assert_eq!(store.get_inode("agent", 2).unwrap().unwrap().hash, [0x11; 32]);
+
+        let invalid = WorkspaceInode { data: InodeData::regular([0x22; 32], 4, 0o644),
+            generation: 1, content: Some(WorkspaceContentRef {
+                object_id: 1, size: 4, sha256: [0x33; 32],
+            }), inherited: false };
+        let mut bytes = INODE_DATA_BINCODE_V2.to_vec();
+        bytes.extend(bincode::serde::encode_to_vec(&invalid, bincode::config::standard()).unwrap());
+        malformed.inodes[0].2 = bytes;
+        assert!(validate_workspace_metadata_dump(&malformed).is_err());
+        assert!(store.restore_all_tables(&malformed).is_err());
+        assert_eq!(store.get_inode("agent", 2).unwrap().unwrap().hash, [0x11; 32]);
+        malformed.inodes = vec![("agent".to_string(), 0, vec![0; 7])];
+        assert!(validate_workspace_metadata_dump(&malformed).is_err());
     }
 
     #[test]
