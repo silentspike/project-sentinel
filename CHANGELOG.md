@@ -1,5 +1,11 @@
 # Changelog
 
+- Recover prepared workspace imports from verified durable namespace content
+  when native sources disappear across reboot. Reject inadmissible restore
+  budgets before publishing rollback snapshots or retention pins. Preserve
+  inode allocation identity across restore, account for live directory handles,
+  and keep open writable descriptors usable after unlink or chmod (#856).
+
 - Publish agent workspace updates as durable immutable chunk extents, deduplicate
   shared bytes before storage, and retain content through explicit lifetime roots.
   Add the writable POSIX adapter, exact per-agent inode mapping and shared

@@ -275,9 +275,13 @@ mod inner {
         fn directory_entries(
             &self,
             inode: INodeNo,
+            handle: FileHandle,
         ) -> anyhow::Result<Vec<(u64, FileType, String)>> {
             let current = u64::from(inode);
             if current == 1 {
+                if handle.0 != 0 {
+                    return Err(io_error(libc::EBADF));
+                }
                 let agents = self.agents.lock().map_err(|_| io_error(libc::EIO))?;
                 let mut children: Vec<_> = agents
                     .roots
@@ -302,7 +306,7 @@ mod inner {
                 (current, FileType::Directory, ".".into()),
                 (parent, FileType::Directory, "..".into()),
             ];
-            let mut children = self.layer.readdir(&agent, real)?;
+            let mut children = self.layer.readdir_handle(&agent, real, handle.0)?;
             children.sort_by(|a, b| a.0.cmp(&b.0));
             for (name, child, kind) in children {
                 entries.push((self.map(&agent, child)?, Self::kind(kind), name));
@@ -390,24 +394,35 @@ mod inner {
                     return Err(io_error(libc::EOPNOTSUPP));
                 }
                 let (agent, real) = self.resolve(inode)?;
-                if let Some(size) = size {
-                    self.layer.truncate_file(&agent, real, size)?;
-                }
-                self.layer.set_file_attributes(
-                    &agent,
-                    real,
-                    mode,
-                    uid,
-                    gid,
-                    atime.map(timestamp),
-                    mtime.map(timestamp),
-                )?;
                 if let Some(handle) = handle {
+                    self.layer.set_handle_attributes(
+                        &agent,
+                        real,
+                        handle.0,
+                        size,
+                        mode,
+                        uid,
+                        gid,
+                        atime.map(timestamp),
+                        mtime.map(timestamp),
+                    )?;
                     Ok(Self::attr(
                         &self.layer.getattr_handle(&agent, handle.0)?,
                         u64::from(inode),
                     ))
                 } else {
+                    if let Some(size) = size {
+                        self.layer.truncate_file(&agent, real, size)?;
+                    }
+                    self.layer.set_file_attributes(
+                        &agent,
+                        real,
+                        mode,
+                        uid,
+                        gid,
+                        atime.map(timestamp),
+                        mtime.map(timestamp),
+                    )?;
                     self.inode_attr(&agent, real)
                 }
             })();
@@ -421,11 +436,11 @@ mod inner {
             &self,
             _req: &Request,
             inode: INodeNo,
-            _handle: FileHandle,
+            handle: FileHandle,
             offset: u64,
             mut reply: ReplyDirectory,
         ) {
-            match self.directory_entries(inode) {
+            match self.directory_entries(inode, handle) {
                 Ok(entries) => {
                     for (index, (inode, kind, name)) in entries.iter().enumerate() {
                         if (index as u64) < offset {
@@ -442,8 +457,35 @@ mod inner {
         }
 
         fn opendir(&self, _req: &Request, inode: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-            match self.directory_entries(inode) {
-                Ok(_) => reply.opened(FileHandle(0), FopenFlags::empty()),
+            let result = if u64::from(inode) == 1 {
+                Ok(0)
+            } else {
+                self.resolve(inode)
+                    .and_then(|(agent, inode)| self.layer.open_directory(&agent, inode))
+            };
+            match result {
+                Ok(handle) => reply.opened(FileHandle(handle), FopenFlags::empty()),
+                Err(e) => reply.error(errno(e)),
+            }
+        }
+
+        fn releasedir(
+            &self,
+            _req: &Request,
+            inode: INodeNo,
+            handle: FileHandle,
+            _flags: OpenFlags,
+            reply: ReplyEmpty,
+        ) {
+            let result = if u64::from(inode) == 1 && handle.0 == 0 {
+                Ok(())
+            } else {
+                self.resolve(inode).and_then(|(agent, inode)| {
+                    self.layer.release_directory(&agent, inode, handle.0)
+                })
+            };
+            match result {
+                Ok(()) => reply.ok(),
                 Err(e) => reply.error(errno(e)),
             }
         }
@@ -670,13 +712,13 @@ mod inner {
             &self,
             _req: &Request,
             inode: INodeNo,
-            _handle: FileHandle,
+            handle: FileHandle,
             _datasync: bool,
             reply: ReplyEmpty,
         ) {
-            let result = self
-                .resolve(inode)
-                .and_then(|(agent, inode)| self.layer.sync_directory(&agent, inode));
+            let result = self.resolve(inode).and_then(|(agent, inode)| {
+                self.layer.sync_directory_handle(&agent, inode, handle.0)
+            });
             match result {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(errno(e)),
@@ -821,7 +863,7 @@ mod inner {
 
     pub fn start_fuse(data_dir: &Path, mountpoint: &Path) -> anyhow::Result<()> {
         let cas = CasStore::open(data_dir)?;
-        let meta = MetadataStore::open(&data_dir.join("metadata.redb"))?;
+        let meta = MetadataStore::open(data_dir.join("metadata.redb"))?;
         let plane = Arc::new(ArtifactPlane::open(data_dir.join("home.redb"))?);
         let layer = LayerManager::with_artifact_plane(cas, meta, plane);
         layer.init_base_root()?;

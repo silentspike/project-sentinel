@@ -30,6 +30,17 @@ if (require(target)(41) !== 42) throw new Error('module execution mismatch');
 fs.copyFileSync(target, path.join(root, 'node-copy.js'), fs.constants.COPYFILE_EXCL);
 if (fs.readFileSync(target, 'utf8') !== fs.readFileSync(path.join(root, 'node-copy.js'), 'utf8'))
   throw new Error('copy mismatch');
+const detached = path.join(root, 'node-detached');
+fs.writeFileSync(detached, 'original');
+const detachedFd = fs.openSync(detached, 'r+');
+try {
+  fs.chmodSync(detached, 0o444);
+  fs.ftruncateSync(detachedFd, 4);
+  fs.unlinkSync(detached);
+  fs.ftruncateSync(detachedFd, 2);
+  fs.fsyncSync(detachedFd);
+  if (fs.fstatSync(detachedFd).size !== 2) throw new Error('descriptor truncate mismatch');
+} finally { fs.closeSync(detachedFd); }
 const stats = fs.statfsSync(root);
 if (stats.bsize <= 0 || stats.blocks <= 0) throw new Error('invalid statfs');
 console.log(JSON.stringify({node_file_operations: 'pass'}));
@@ -80,6 +91,8 @@ def probe(root):
         require(os.pwrite(descriptor, b"ok", 0) == 2, "open-unlink write failed")
         os.fsync(descriptor)
         require(os.pread(descriptor, 4, 0) == b"okXY", "open-unlink write was not visible")
+        os.ftruncate(descriptor, 2)
+        require(os.pread(descriptor, 4, 0) == b"ok", "open-unlink truncate failed")
     finally:
         os.close(descriptor)
 
@@ -95,13 +108,28 @@ def probe(root):
     require(os.readlink(symlink) == source.name, "readlink changed target")
     source.chmod(0o640)
     require(source.stat().st_mode & 0o777 == 0o640, "chmod was not applied")
+    descriptor = os.open(source, os.O_RDWR)
+    try:
+        source.chmod(0o444)
+        os.ftruncate(descriptor, 4)
+        require(os.pread(descriptor, 8, 0) == b"same", "chmod revoked an open writable descriptor")
+    finally:
+        os.close(descriptor)
+        source.chmod(0o640)
+    source.write_bytes(b"same object")
 
     destination = directory / "replace.bin"
     destination.write_bytes(b"old")
     staging = directory / "staged.bin"
     staging.write_bytes(b"new")
-    os.replace(staging, destination)
-    require(destination.read_bytes() == b"new" and not staging.exists(), "atomic replacement failed")
+    descriptor = os.open(destination, os.O_RDWR)
+    try:
+        os.replace(staging, destination)
+        os.ftruncate(descriptor, 1)
+        require(os.pread(descriptor, 3, 0) == b"o", "replacement lost the old writable descriptor")
+        require(destination.read_bytes() == b"new" and not staging.exists(), "atomic replacement failed")
+    finally:
+        os.close(descriptor)
     try:
         with source.open("xb"):
             pass

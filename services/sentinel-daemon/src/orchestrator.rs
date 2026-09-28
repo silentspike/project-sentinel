@@ -6545,6 +6545,41 @@ fn execute_world_restore_transfer(
     current_shift: &mut u8,
 ) -> Result<()> {
     let started = Instant::now();
+    // Reject inadmissible targets before publishing rollback content or pins.
+    // Commit-time validation remains mandatory after this read-only preflight.
+    let snapshots = event_store
+        .list_world_snapshots()
+        .context("Snapshot-Liste fuer Restore-Resolution")?;
+    let resolution = resolve_restore_target(restore_cmd, event_store.as_ref(), &snapshots)?;
+    let bytes = event_store
+        .load_world_snapshot(&resolution.anchor_snapshot_id)
+        .with_context(|| format!("Snapshot laden: {}", resolution.anchor_snapshot_id))?
+        .ok_or_else(|| anyhow!("Snapshot nicht gefunden: {}", resolution.anchor_snapshot_id))?;
+    let snapshot = sentinel_common::decode_world_snapshot(&bytes)
+        .with_context(|| format!("Snapshot dekodieren: {}", resolution.anchor_snapshot_id))?;
+    if snapshot.schema_version >= 4 {
+        let target_agent_ids = snapshot
+            .ecs
+            .identities
+            .iter()
+            .map(|(id, _)| AgentId(*id))
+            .collect::<Vec<_>>();
+        validate_nano_runtime_snapshot_set(
+            &snapshot.nano_runtime_snapshots,
+            &target_agent_ids,
+            all_agents,
+        )
+        .context("Restore NanoRuntime snapshot set is invalid")?;
+    }
+    if let Some(fs_metadata) = &snapshot.fs_metadata {
+        let layer = fs_layer.ok_or_else(|| {
+            anyhow!("sentinel-fs Restore angefordert, aber Layer nicht initialisiert")
+        })?;
+        validate_fs_metadata_blobs(data_dir, fs_metadata)?;
+        validate_fs_workspace_content(layer, fs_metadata)?;
+    }
+    validate_projection_restore_schema(projection_db_path)?;
+
     let pre_restore_nano_snapshots = nano_runtimes
         .snapshot_all()
         .context("Pre-Restore NanoRuntime snapshots failed")?;
@@ -6570,45 +6605,6 @@ fn execute_world_restore_transfer(
         )
         .context("Pre-Restore Snapshot fatal fehlgeschlagen")?;
     info!(snapshot_id = %pre_snapshot_id, "Pre-Restore Snapshot erstellt (Rollback-Punkt)");
-
-    // #491 (TM-3): Ziel aufloesen (Anchor-Snapshot + optionaler Replay-Cursor).
-    let snapshots = event_store
-        .list_world_snapshots()
-        .context("Snapshot-Liste fuer Restore-Resolution")?;
-    let resolution = resolve_restore_target(restore_cmd, event_store.as_ref(), &snapshots)?;
-
-    let bytes = event_store
-        .load_world_snapshot(&resolution.anchor_snapshot_id)
-        .with_context(|| format!("Snapshot laden: {}", resolution.anchor_snapshot_id))?
-        .ok_or_else(|| anyhow!("Snapshot nicht gefunden: {}", resolution.anchor_snapshot_id))?;
-    let snapshot = sentinel_common::decode_world_snapshot(&bytes)
-        .with_context(|| format!("Snapshot dekodieren: {}", resolution.anchor_snapshot_id))?;
-
-    if snapshot.schema_version >= 4 {
-        let target_agent_ids = snapshot
-            .ecs
-            .identities
-            .iter()
-            .map(|(id, _)| AgentId(*id))
-            .collect::<Vec<_>>();
-        validate_nano_runtime_snapshot_set(
-            &snapshot.nano_runtime_snapshots,
-            &target_agent_ids,
-            all_agents,
-        )
-        .context("Restore NanoRuntime snapshot set is invalid")?;
-    }
-
-    if let Some(fs_metadata) = &snapshot.fs_metadata {
-        if fs_layer.is_none() {
-            return Err(anyhow!(
-                "sentinel-fs Restore angefordert, aber Layer nicht initialisiert"
-            ));
-        }
-        validate_fs_metadata_blobs(data_dir, fs_metadata)?;
-        validate_fs_workspace_content(fs_layer.expect("checked above"), fs_metadata)?;
-    }
-    validate_projection_restore_schema(projection_db_path)?;
 
     // #491: Replay-Plan bilden — Legacy-Gate (Anchor muss v3 sein) + Sanity-Cap + Branch-Check
     // (keine `snapshot_restored`-Events in der Range). Jeder Fall, der kein exaktes Replay erlaubt,
@@ -15162,6 +15158,60 @@ mod tests {
             b"newer chunk work"
         );
         assert!(!source.join("main.py").exists());
+    }
+
+    #[test]
+    fn restore_workspace_budget_rejection_does_not_publish_dirty_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let layer = sentinel_fs::layer::LayerManager::with_artifact_plane(
+            sentinel_fs::cas::CasStore::open(directory.path()).unwrap(),
+            sentinel_fs::metadata::MetadataStore::open(directory.path().join("namespace.redb"))
+                .unwrap(),
+            Arc::new(
+                sentinel_fs::artifact::ArtifactPlane::open(directory.path().join("content.redb"))
+                    .unwrap(),
+            ),
+        );
+        layer.init_base_root().unwrap();
+        let inode = layer
+            .write_file("AGENT-01", 1, "source.py", b"12345678", 0o600)
+            .unwrap();
+        let target = layer.snapshot_metadata().unwrap();
+        layer.truncate_file("AGENT-01", inode, 1).unwrap();
+        layer.set_workspace_budget("AGENT-01", 4).unwrap();
+        let rejection = validate_fs_workspace_content(&layer, &target).unwrap_err();
+        assert_eq!(
+            rejection
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(122)
+        );
+        let handle = layer
+            .open_file("AGENT-01", inode, true, false, false)
+            .unwrap();
+        layer.write_handle("AGENT-01", handle, 0, b"abc").unwrap();
+        let before = serde_json::to_value(layer.meta().dump_all_tables().unwrap()).unwrap();
+        assert!(validate_fs_workspace_content(&layer, &target).is_err());
+        assert_eq!(
+            serde_json::to_value(layer.meta().dump_all_tables().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(layer.read_handle("AGENT-01", handle, 0, 8).unwrap(), b"abc");
+        layer.release_handle("AGENT-01", handle).unwrap();
+    }
+
+    #[test]
+    fn restore_target_admission_precedes_rollback_snapshot_publication() {
+        // Pin the productive callsite ordering, not merely the validator helper.
+        let source = include_str!("orchestrator.rs");
+        let body = source
+            .split_once("fn execute_world_restore_transfer(")
+            .unwrap()
+            .1;
+        let admission = body.find("validate_fs_workspace_content(").unwrap();
+        let runtime_snapshot = body.find(".snapshot_all()").unwrap();
+        let rollback_publication = body.find(".create_and_store(").unwrap();
+        assert!(admission < runtime_snapshot && runtime_snapshot < rollback_publication);
     }
 
     #[test]

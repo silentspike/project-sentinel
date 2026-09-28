@@ -558,6 +558,63 @@ fn installed_retry_after_tmpfs_loss_or_recreation_keeps_newer_namespace_work() {
 }
 
 #[test]
+fn prepared_reboot_recovers_durable_stage_or_destination_without_original_source() {
+    for staged in [false, true] {
+        for recreated in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = source(dir.path());
+            fs::write(source.join("main.js"), b"durable checkpoint").unwrap();
+            let plane = dir.path().join("plane");
+            let layer = manager(&plane);
+            let first = import_native_workspace(&layer, "alice", &source).unwrap();
+            let marker = prepared_receipt(&layer);
+            if staged {
+                layer
+                    .rename(
+                        "alice",
+                        1,
+                        "workspaces",
+                        1,
+                        marker["stage_name"].as_str().unwrap(),
+                        1,
+                    )
+                    .unwrap();
+                layer.sync_directory("alice", 1).unwrap();
+            }
+            drop(layer);
+            // Keep the old inode allocated so recreation cannot reuse it.
+            let old_source = source.with_file_name("prior-source");
+            fs::rename(&source, &old_source).unwrap();
+            if recreated {
+                fs::create_dir(&source).unwrap();
+                fs::write(source.join("main.js"), b"new native work").unwrap();
+            }
+            let layer = manager(&plane);
+            let recovered = import_native_workspace(&layer, "alice", &source).unwrap();
+            assert_eq!(recovered.disposition, WorkspaceImportDisposition::Recovered);
+            assert_eq!(recovered.workspace_inode, first.workspace_inode);
+            assert_eq!(
+                layer
+                    .read_file("alice", lookup(&layer, first.workspace_inode, "main.js"))
+                    .unwrap(),
+                b"durable checkpoint"
+            );
+            assert_eq!(receipt(&layer)["state"], "installed");
+            assert_eq!(
+                fs::read(old_source.join("main.js")).unwrap(),
+                b"durable checkpoint"
+            );
+            if recreated {
+                assert_eq!(
+                    fs::read(source.join("main.js")).unwrap(),
+                    b"new native work"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn marker_write_crash_after_rename_adopts_only_exact_verified_target() {
     let dir = tempfile::tempdir().unwrap();
     let source = source(dir.path());
