@@ -1,7 +1,8 @@
 # Changelog
 
 - Keep the legacy trash diagnostic separate from retained workspace versions;
-  reject a probe over an existing employee file rather than replacing it (#856).
+  reject a probe over an existing employee file or private whiteout rather than
+  replacing it or exposing a previously renamed base file (#856).
 
 - Bind general Python and Node workbench profiles to the canonical release and
   deployment preflight. Missing or altered profile artifacts fail closed while

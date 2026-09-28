@@ -915,7 +915,9 @@ impl LayerManager {
         let guard = self.meta.namespace_guard(agent)?;
         self.ensure_root(agent)?;
         self.parent(&state, agent, parent, true)?;
-        if self.dirent(agent, parent, name)?.is_some() {
+        if self.meta.get_dirent(agent, parent, name)?.is_some()
+            || self.dirent(agent, parent, name)?.is_some()
+        {
             return Err(errno(17));
         }
         OwnerRegistry::global().validate(&guard)?;
@@ -1966,6 +1968,40 @@ mod tests {
             .get_dirent(SHARED_BASE_LAYER_ID, 1, "deleteme.txt")
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn legacy_trash_fixture_preserves_renamed_base_whiteout() {
+        let (lm, _dir) = temp_layer();
+        let inode = lm
+            .populate_base_file(1, "original.py", b"employee source", 0o644)
+            .unwrap();
+        lm.rename("AGENT-01", 1, "original.py", 1, "renamed.py", 0)
+            .unwrap();
+        let before = lm.lookup_inode("AGENT-01", inode).unwrap().unwrap();
+        assert!(lm
+            .create_legacy_trash_fixture("AGENT-01", 1, "original.py", b"diagnostic")
+            .is_err());
+        assert_eq!(
+            lm.meta().get_dirent("AGENT-01", 1, "original.py").unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            lm.lookup_dirent("AGENT-01", 1, "original.py").unwrap(),
+            None
+        );
+        assert_eq!(
+            lm.lookup_dirent("AGENT-01", 1, "renamed.py").unwrap(),
+            Some(inode)
+        );
+        let after = lm.lookup_inode("AGENT-01", inode).unwrap().unwrap();
+        assert_eq!(after.hash, before.hash);
+        assert_eq!(after.nlinks, before.nlinks);
+        assert_eq!(lm.read_file("AGENT-01", inode).unwrap(), b"employee source");
+        assert_eq!(
+            lm.lookup_dirent("AGENT-02", 1, "original.py").unwrap(),
+            Some(inode)
+        );
     }
 
     #[test]
