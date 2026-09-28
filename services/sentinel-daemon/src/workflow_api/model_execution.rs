@@ -13,6 +13,9 @@ use sentinel_workflow::{
 use std::collections::{BTreeMap, BTreeSet};
 
 const ADAPTIVE_MODEL_WORK_MAX_CALLS: u16 = 16;
+const QA_SCHEMA_ERROR: &str = "source review is not strict JSON";
+const QA_SCHEMA_RECOVERY_REASON: &str = "strict-json-correction";
+const QA_SCHEMA_MAX_CORRECTIONS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2763,6 +2766,241 @@ impl WorkflowApi {
             })
     }
 
+    /// Convert one failed QA admission into a new, independently bound model
+    /// turn. The provider effect is never replayed: the old dispatched grant
+    /// is archived only after its durable usage event and failed completion
+    /// are present, then a fresh grant is issued by the normal QA recovery
+    /// path.
+    pub(super) fn recover_failed_qa_schema_call(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+    ) -> Result<bool, &'static str> {
+        let Some(allowance) = project.subscription_call.as_ref().filter(|allowance| {
+            allowance.dispatch.as_ref().is_some_and(|_| {
+                project
+                    .work_items
+                    .get(&allowance.grant.work_item_id)
+                    .is_some_and(|work| {
+                        work.state == CompanyWorkStateV1::Assigned
+                            && work.spec.required_role == CompanyRoleV1::Qa
+                            && work.assignments.iter().filter(|a| a.active).count() == 1
+                            && work.assignments.iter().any(|a| {
+                                a.active
+                                    && a.role == CompanyRoleV1::Qa
+                                    && a.assignment_id == allowance.grant.assignment_id
+                                    && a.assignment_version == allowance.grant.assignment_version
+                                    && a.agent_id == allowance.grant.agent_id
+                            })
+                    })
+            })
+        }) else {
+            return Ok(false);
+        };
+        let Some(dispatch) = allowance.dispatch.as_ref() else {
+            return Ok(false);
+        };
+        let Some(event_store) = self.event_store.as_ref() else {
+            return Err("QA schema recovery EventStore unavailable");
+        };
+        let resolution = self.qa_schema_resolution_event(allowance)?;
+        let entry = event_store
+            .get_llm_completion(&dispatch.request_id)
+            .map_err(|_| "QA schema recovery completion unavailable")?;
+        if resolution.is_none() {
+            let Some(entry) = entry else {
+                return Ok(false);
+            };
+            if entry.request_digest != dispatch.request_digest
+                || entry.status != "failed"
+                || entry.last_error.as_deref() != Some(QA_SCHEMA_ERROR)
+            {
+                return Ok(false);
+            }
+            if self.qa_schema_correction_count(project, &allowance.grant)?
+                >= QA_SCHEMA_MAX_CORRECTIONS
+            {
+                return Err("QA schema correction limit reached; leadership action required");
+            }
+        } else if entry.is_some() {
+            return Err("QA schema recovery has conflicting completion state");
+        }
+        let usage = event_store
+            .event_by_operation_id(&format!("llm_usage_{}", dispatch.request_id))
+            .map_err(|_| "QA schema recovery usage evidence unavailable")?
+            .ok_or("QA schema recovery requires durable usage evidence")?;
+        if usage.event_type != "agent_llm_usage"
+            || usage.aggregate_id != allowance.grant.agent_id.to_string()
+        {
+            return Err("QA schema recovery usage authority changed");
+        }
+        let issuer = self
+            .principals
+            .principal(&allowance.created_by)
+            .filter(|bound| Self::qa_recovery_issuer_matches(project, allowance, &bound.principal))
+            .ok_or("QA schema recovery issuer unavailable")?;
+        let resolution_event_id = event_store
+            .resolve_failed_llm_completion_for_model_retry(
+                &dispatch.request_id,
+                &dispatch.request_digest,
+                QA_SCHEMA_ERROR,
+                QA_SCHEMA_RECOVERY_REASON,
+            )
+            .map_err(|_| "QA schema recovery resolution failed")?
+            .ok_or("QA schema recovery completion disappeared")?;
+        let operation_id = stable_operation_id(
+            "sentinel.workflow.recover-failed-qa-schema.v1",
+            &format!("{}:{}", project.project_id.0, resolution_event_id),
+            project.version,
+        );
+        self.core
+            .apply_company_command(
+                &issuer.principal,
+                operation_id,
+                &CompanyWorkflowCommandV1::AbandonSubscriptionCall {
+                    project_id: project.project_id.clone(),
+                    expected_version: project.version,
+                    allowance_id: allowance.allowance_id.clone(),
+                    request_digest: dispatch.request_digest.clone(),
+                    resolution_event_id,
+                    abandoned_by: issuer.principal.principal_id.clone(),
+                },
+                now_unix_ms(),
+            )
+            .map_err(|_| "QA schema recovery archive rejected")?;
+        let recovered = self
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .map_err(|_| "QA schema recovery project unavailable")?
+            .ok_or("QA schema recovery project missing")?;
+        let planning = self
+            .store
+            .project_planning_call(&project.tenant_id, &project.project_id)
+            .map_err(|_| "QA schema recovery planning authority unavailable")?
+            .ok_or("QA schema recovery planning authority missing")?;
+        self.grant_model_work_at(
+            &issuer.principal,
+            recovered,
+            &planning.grant,
+            "qa-schema-recovery",
+            now_unix_ms(),
+        )?;
+        Ok(true)
+    }
+
+    fn qa_schema_resolution_event(
+        &self,
+        allowance: &sentinel_workflow::SubscriptionCallAllowanceV1,
+    ) -> Result<Option<String>, &'static str> {
+        let Some(dispatch) = allowance.dispatch.as_ref() else {
+            return Ok(None);
+        };
+        let Some(store) = self.event_store.as_ref() else {
+            return Err("QA schema resolution EventStore unavailable");
+        };
+        let Some(event) = store
+            .event_by_operation_id(&format!("llm_resolution_{}", dispatch.request_id))
+            .map_err(|_| "QA schema resolution unavailable")?
+        else {
+            return Ok(None);
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&event.payload).map_err(|_| "QA schema resolution invalid")?;
+        if payload
+            .get("resolution")
+            .and_then(serde_json::Value::as_str)
+            != Some("model_schema_correction")
+        {
+            return Ok(None);
+        }
+        if event.event_type != "llm_completion_resolved"
+            || event.schema_version != 1
+            || event.aggregate_id != allowance.grant.agent_id.to_string()
+            || event.correlation_id != dispatch.request_id
+            || event.timestamp_ms < dispatch.dispatched_at_unix_ms
+            || event.timestamp_ms > now_unix_ms()
+            || payload
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(dispatch.request_id.as_str())
+            || payload
+                .get("request_digest")
+                .and_then(serde_json::Value::as_str)
+                != Some(dispatch.request_digest.as_str())
+            || payload
+                .get("terminal_status")
+                .and_then(serde_json::Value::as_str)
+                != Some("failed")
+            || payload
+                .get("prior_error")
+                .and_then(serde_json::Value::as_str)
+                != Some(QA_SCHEMA_ERROR)
+            || payload.get("reason").and_then(serde_json::Value::as_str)
+                != Some(QA_SCHEMA_RECOVERY_REASON)
+        {
+            return Err("QA schema resolution authority changed");
+        }
+        Ok(Some(event.event_id))
+    }
+
+    fn qa_schema_correction_count(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        grant: &sentinel_workflow::SubscriptionCallGrantV1,
+    ) -> Result<usize, &'static str> {
+        let mut count = 0;
+        for archived in &project.abandoned_subscription_calls {
+            let previous = &archived.allowance;
+            if previous.grant.work_item_id == grant.work_item_id
+                && previous.grant.assignment_id == grant.assignment_id
+                && previous.grant.assignment_version == grant.assignment_version
+                && previous.grant.agent_id == grant.agent_id
+                && previous.grant.provider == grant.provider
+            {
+                if let Some(event_id) = self.qa_schema_resolution_event(previous)? {
+                    if event_id != archived.resolution_event_id {
+                        return Err("QA schema archive authority changed");
+                    }
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    pub(super) fn qa_schema_retry_feedback(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        work_item_id: &sentinel_workflow::WorkItemId,
+        provider: &str,
+    ) -> Result<Option<String>, &'static str> {
+        let Some(archived) = project.abandoned_subscription_calls.last() else {
+            return Ok(None);
+        };
+        let previous = &archived.allowance;
+        if previous.grant.work_item_id != *work_item_id
+            || previous.grant.provider != provider
+            || !project.work_items.get(work_item_id).is_some_and(|work| {
+                work.assignments.iter().filter(|a| a.active).count() == 1
+                    && work.assignments.iter().any(|a| {
+                        a.active
+                            && a.assignment_id == previous.grant.assignment_id
+                            && a.assignment_version == previous.grant.assignment_version
+                            && a.agent_id == previous.grant.agent_id
+                    })
+            })
+        {
+            return Ok(None);
+        }
+        match self.qa_schema_resolution_event(previous)? {
+            Some(event_id) if event_id == archived.resolution_event_id => Ok(Some(
+                "The previous QA response was rejected as non-strict JSON; emit the complete source-review report directly as raw JSON."
+                    .to_owned(),
+            )),
+            Some(_) => Err("QA schema feedback archive changed"),
+            None => Ok(None),
+        }
+    }
+
     fn recoverable_qa_allowance(
         project: &sentinel_workflow::ProjectV1,
         now_ms: u64,
@@ -2805,6 +3043,7 @@ impl WorkflowApi {
     ) -> bool {
         allowance.created_by == principal.principal_id
             && principal.tenant_id == project.tenant_id
+            && principal.kind == CompanyPrincipalKindV1::Agent
             && matches!(
                 principal.role,
                 CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
