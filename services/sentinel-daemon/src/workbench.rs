@@ -2659,7 +2659,8 @@ impl WorkbenchProfileRegistry {
             let path = base.join(format!("{}.toml", id.as_str()));
             match fs::symlink_metadata(&path) {
                 Ok(_) => registry.insert(id, WorkbenchProfile::load(path)?)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound && !id.is_required() => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && !id.is_required() => {
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -3978,7 +3979,8 @@ mod tests {
         let config = secure_test_profile_config(&WorkbenchProfileId::ALL);
         let registry = WorkbenchProfileRegistry::load(config.path()).unwrap();
         assert_eq!(registry.profiles.len(), WorkbenchProfileId::ALL.len());
-        let (profile, profile_digest) = registry.profiles[&WorkbenchProfileId::WebAuthoring].clone();
+        let (profile, profile_digest) =
+            registry.profiles[&WorkbenchProfileId::WebAuthoring].clone();
         let (qa_profile, qa_profile_digest) = registry.profiles[&WorkbenchProfileId::WebQa].clone();
         let review_profile = registry
             .profiles
