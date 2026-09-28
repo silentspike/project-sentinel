@@ -590,6 +590,29 @@ The separate independent model review determines whether the declared cases
 cover the accepted requirements; a behavioral pass alone is not that judgment
 or a security assessment of arbitrary code.
 
+Each workbench has a private cgroup namespace rooted at its cumulative agent
+parent. The host captures that namespace while the cumulative
+agent parent is empty, before delegating its controllers. A trusted helper is
+reaped before delegation; the bwrap child joins the runtime leaf first and then
+the pinned namespace. Runtime and command leaves are therefore reachable within
+the same restricted hierarchy. The host-root cgroup namespace is never used as
+the product workaround, and existing controllers are never disabled.
+
+Before releasing the bwrap startup barrier, the host pins the owned init's PID
+and mount namespaces and installs a second, private procfs at
+`/run/sentinel-command-proc`. It contains only this agent's PID namespace, not
+host processes. The trusted broker needs this full procfs to create nested PID
+namespaces: bubblewrap's masked `/proc` alone cannot authorize a nested procfs
+mount. Controller Landlock grants no access to the private mount, and command
+mount construction never imports it. No extra capability is granted to employee
+or candidate code. The privileged setup uses immutable `util-linux` helpers,
+fixed argv, pinned namespace/root descriptors and a bounded startup deadline.
+The private mount stays writable for kernel nested-proc mount eligibility;
+this is not a controller or candidate write grant. After a terminal invocation,
+the owned runtime is reaped and its complete cgroup tree is removed before a
+replacement captures a fresh namespace; the workload identity and terminal
+receipt remain retained.
+
 The runtime starts one constrained namespace launcher inside its outer
 bubblewrap sandbox before applying irreversible controller Landlock. Landlock
 does not permit a restricted process to construct new mounts, so the evaluator

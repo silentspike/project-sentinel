@@ -294,6 +294,18 @@ mod tests {
         assert!(!workbench
             .write_paths
             .contains(&PathBuf::from("/sys/fs/cgroup")));
+        let private_proc = PathBuf::from("/run/sentinel-command-proc");
+        for allowed in workbench
+            .read_paths
+            .iter()
+            .chain(&workbench.write_paths)
+            .chain(&workbench.exec_paths)
+        {
+            assert!(
+                !private_proc.starts_with(allowed),
+                "private broker proc must not be accessible to the controller"
+            );
+        }
     }
     use super::*;
 
