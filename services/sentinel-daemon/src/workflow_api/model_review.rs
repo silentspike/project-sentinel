@@ -531,12 +531,27 @@ fn source_review_id(
         .map_err(|_| "source-review identity is invalid")
 }
 
-fn source_review_spec(
+pub(super) fn source_review_spec(
     project: &sentinel_workflow::ProjectV1,
     work_item_id: WorkItemId,
     qa: &sentinel_workflow::ParticipantBindingV1,
     authority: &CompanyAuthority,
 ) -> Result<sentinel_workflow::CompanyWorkItemSpecV1, &'static str> {
+    let family =
+        super::model_execution::accepted_project_family(&project.governance.project_profile)?;
+    if authority
+        .project_profile_binding(family)
+        .map_err(|_| "source-review project family unavailable")?
+        != project.governance.project_profile
+    {
+        return Err("source-review project family profile changed");
+    }
+    let qa_profile = authority
+        .participant_profile_for_family_role(family, CompanyRoleV1::Qa)
+        .map_err(|_| "source-review technical QA profile unavailable")?;
+    if qa_profile != qa.profile {
+        return Err("source-review technical QA profile changed");
+    }
     let mut sources = project
         .work_items
         .values()
@@ -591,9 +606,9 @@ fn source_review_spec(
             contract_digest: output_digest,
         }],
         quality_gate: sentinel_workflow::QualityGateBindingV1 {
-            gate_id: "web-work-item-qa-v1".to_owned(),
-            generation: PROFILE_GENERATION,
-            digest: authority.qa_profile_digest.clone(),
+            gate_id: super::model_execution::family_work_item_gate(family)?.to_owned(),
+            generation: qa_profile.generation,
+            digest: qa_profile.digest,
         },
         budget_micros: 0,
         rework: None,
