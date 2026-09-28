@@ -1,5 +1,15 @@
 # Changelog
 
+- Accept network-free email and telephone anchor actions in static QA without
+  admitting remote resources, unknown schemes or control characters. Keep
+  optional workflow history optional in public lineage, and drain committed
+  delivery publications even when the next project action is blocked (#856).
+
+- Pin technical QA plans and invocation identities to the deployed evaluator
+  bytes. A changed evaluator may schedule a distinct QA run after an exact
+  cleaned failure, preserving the failed run and evidence; active, ambiguous,
+  passing or unchanged-evaluator runs never reopen (#856).
+
 - Recover reserved employee model effects before building a request from the
   next simulation tick. Use the original durable digest and completion, retain
   ambiguous dispatches, and require exact owner and no-dispatch proof before

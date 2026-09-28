@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlsplit
 MAX_FILES = 1024
 MAX_FILE_BYTES = 8 * 1024 * 1024
 HTML_SUFFIXES = {".html", ".htm"}
-FORBIDDEN_SCHEMES = {"data", "file", "ftp", "http", "https", "javascript"}
+CONTACT_SCHEMES = {"mailto", "tel"}
 
 
 class CandidateParser(html.parser.HTMLParser):
@@ -25,7 +25,7 @@ class CandidateParser(html.parser.HTMLParser):
         self.has_head = False
         self.has_body = False
         self.has_title = False
-        self.references: list[str] = []
+        self.references: list[tuple[str, bool]] = []
         self.inline_scripts = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -40,12 +40,12 @@ class CandidateParser(html.parser.HTMLParser):
                 self.inline_scripts += 1
         for key, value in attrs:
             if key.casefold() in {"href", "src"} and value:
-                self.references.append(value)
+                self.references.append((value, lowered == "a" and key.casefold() == "href"))
 
 
 def canonical_relative(value: str) -> PurePosixPath | None:
     parsed = urlsplit(value)
-    if parsed.scheme.casefold() in FORBIDDEN_SCHEMES or parsed.netloc:
+    if parsed.scheme or parsed.netloc:
         return None
     decoded = unquote(parsed.path)
     if not decoded or decoded.startswith("/"):
@@ -54,6 +54,17 @@ def canonical_relative(value: str) -> PurePosixPath | None:
     if any(part in {"", ".", ".."} for part in path.parts):
         return None
     return path
+
+
+def contact_action(value: str, anchor: bool) -> bool:
+    parsed = urlsplit(value)
+    return (
+        anchor
+        and parsed.scheme.casefold() in CONTACT_SCHEMES
+        and not parsed.netloc
+        and bool(parsed.path)
+        and not any(ord(char) < 32 or ord(char) == 127 for char in unquote(value))
+    )
 
 
 def fail(code: str, detail: str) -> None:
@@ -102,15 +113,21 @@ def main() -> None:
         try:
             parser.feed(path.read_text(encoding="utf-8"))
             parser.close()
-        except (UnicodeDecodeError, html.parser.HTMLParseError) as error:
+        except (UnicodeDecodeError, ValueError) as error:
             fail("html_invalid", f"{path}:{error.__class__.__name__}")
         if not all((parser.has_html, parser.has_head, parser.has_title, parser.has_body)):
             fail("html_structure", str(path))
         if parser.inline_scripts:
             fail("inline_script_denied", str(path))
         base = PurePosixPath(path.relative_to(root).parent.as_posix())
-        for reference in parser.references:
-            target = canonical_relative(reference)
+        for reference, anchor in parser.references:
+            try:
+                if contact_action(reference, anchor):
+                    references += 1
+                    continue
+                target = canonical_relative(reference)
+            except ValueError:
+                fail("external_or_unsafe_reference", reference)
             if target is None:
                 fail("external_or_unsafe_reference", reference)
             if target == PurePosixPath("."):
