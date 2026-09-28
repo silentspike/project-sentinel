@@ -1513,6 +1513,408 @@ fn delivery_preview_ttl_is_server_timed_versioned_and_hard_bounded() {
     assert_eq!(after.revision, 2);
 }
 
+fn preview_renewal_fixture(
+    temp: &TempDir,
+) -> (
+    DeliveryCore<FakeIntegration, DeliveryStore, FakeEffects>,
+    VersionedRefV1,
+    VersionedRefV1,
+) {
+    let (mut aggregate, release) = active_release_aggregate();
+    let manifest = &aggregate.manifests[&release.manifest.id];
+    let mut receipt = preview_receipt("delivery-preview", &release, 100, 200);
+    receipt.state = DeliveryState::Delivered;
+    receipt.preview_digest =
+        ContentDigest::of_domain("m0-preview", DELIVERY_SCHEMA_V1, &manifest.source_digest)
+            .unwrap();
+    receipt = receipt.seal().unwrap();
+    let delivery = VersionedRefV1 {
+        id: receipt.delivery_id.clone(),
+        generation: receipt.generation,
+        digest: receipt.receipt_digest.clone(),
+    };
+    aggregate
+        .deliveries
+        .insert(receipt.delivery_id.clone(), receipt);
+    (
+        core_with_seeded_aggregate(temp, aggregate),
+        delivery,
+        versioned_release(&release),
+    )
+}
+
+#[test]
+fn preview_renewal_preserves_receipt_and_replays_without_extending_after_reopen() {
+    let temp = TempDir::new().unwrap();
+    let (core, delivery, release) = preview_renewal_fixture(&temp);
+    let caller = principal("customer-1", AuthorityRole::Customer);
+    let before = core.load("tenant-a", "project-1").unwrap().unwrap();
+    assert!(authorize_delivery_preview(&before, &caller, &delivery, &release, None, 300).is_err());
+    let command = context("customer-1", AuthorityRole::Customer, "renew-first", 300);
+    core.renew_preview_access(&command, "tenant-a", "project-1", &delivery, &release, 300)
+        .unwrap();
+    let after = core.load("tenant-a", "project-1").unwrap().unwrap();
+    assert_eq!(before.deliveries, after.deliveries);
+    assert_eq!(before.releases, after.releases);
+    assert!(after.acceptances.is_empty());
+    let grant = after.preview_access[&delivery.id].clone();
+    assert_eq!(grant.expires_at_ms, 300 + DELIVERY_PREVIEW_MAX_TTL_MS);
+    assert!(authorize_delivery_preview(
+        &after,
+        &caller,
+        &delivery,
+        &release,
+        Some(&grant.reference()),
+        400
+    )
+    .is_ok());
+    for now in [299, grant.expires_at_ms, grant.expires_at_ms + 1] {
+        assert!(authorize_delivery_preview(
+            &after,
+            &caller,
+            &delivery,
+            &release,
+            Some(&grant.reference()),
+            now
+        )
+        .is_err());
+    }
+    assert!(authorize_delivery_preview(&after, &caller, &delivery, &release, None, 400).is_err());
+    drop(core);
+    let reopened = DeliveryCore::new_test_only(store(&temp), FakeIntegration::new().0, FakeEffects);
+    // The API reserves the original operation timestamp before dispatch; only
+    // the separately observed request time advances after a lost response.
+    assert!(
+        reopened
+            .renew_preview_access(
+                &command,
+                "tenant-a",
+                "project-1",
+                &delivery,
+                &release,
+                grant.expires_at_ms + 1
+            )
+            .unwrap()
+            .duplicate
+    );
+    assert_eq!(
+        reopened.load("tenant-a", "project-1").unwrap().unwrap(),
+        after
+    );
+    assert_eq!(
+        reopened
+            .store()
+            .journal("tenant-a", "project-1")
+            .unwrap()
+            .len(),
+        2
+    );
+    reopened.store().health().unwrap();
+}
+
+#[test]
+fn preview_renewal_retires_old_grants_and_refuses_foreign_or_inactive_targets() {
+    let temp = TempDir::new().unwrap();
+    let (core, delivery, release) = preview_renewal_fixture(&temp);
+    for (index, caller) in [
+        context("customer-other", AuthorityRole::Customer, "foreign", 300),
+        context("developer", AuthorityRole::Developer, "developer", 300),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            core.renew_preview_access(&caller, "tenant-a", "project-1", &delivery, &release, 300)
+                .is_err(),
+            "case {index}"
+        );
+    }
+    let caller = principal("customer-1", AuthorityRole::Customer);
+    let mut wrong_release = release.clone();
+    wrong_release.generation += 1;
+    assert!(core
+        .renew_preview_access(
+            &context("customer-1", AuthorityRole::Customer, "stale", 300),
+            "tenant-a",
+            "project-1",
+            &delivery,
+            &wrong_release,
+            300
+        )
+        .is_err());
+    core.renew_preview_access(
+        &context("customer-1", AuthorityRole::Customer, "first", 300),
+        "tenant-a",
+        "project-1",
+        &delivery,
+        &release,
+        300,
+    )
+    .unwrap();
+    let old = core
+        .load("tenant-a", "project-1")
+        .unwrap()
+        .unwrap()
+        .preview_access[&delivery.id]
+        .reference();
+    core.renew_preview_access(
+        &context("customer-1", AuthorityRole::Customer, "second", 400),
+        "tenant-a",
+        "project-1",
+        &delivery,
+        &release,
+        400,
+    )
+    .unwrap();
+    let aggregate = core.load("tenant-a", "project-1").unwrap().unwrap();
+    let latest = aggregate.preview_access[&delivery.id].reference();
+    assert_eq!(aggregate.preview_access.len(), 1);
+    assert!(
+        authorize_delivery_preview(&aggregate, &caller, &delivery, &release, Some(&old), 500)
+            .is_err()
+    );
+    assert!(authorize_delivery_preview(
+        &aggregate,
+        &caller,
+        &delivery,
+        &release,
+        Some(&latest),
+        500
+    )
+    .is_ok());
+    let mut revoked = caller.clone();
+    revoked.authority_generation += 1;
+    assert!(authorize_delivery_preview(
+        &aggregate,
+        &revoked,
+        &delivery,
+        &release,
+        Some(&latest),
+        500
+    )
+    .is_err());
+    let mut foreign = caller.clone();
+    foreign.tenant_id = "foreign".into();
+    assert!(authorize_delivery_preview(
+        &aggregate,
+        &foreign,
+        &delivery,
+        &release,
+        Some(&latest),
+        500
+    )
+    .is_err());
+    for terminal in [
+        DeliveryState::Rejected,
+        DeliveryState::ChangesRequested,
+        DeliveryState::Expired,
+    ] {
+        let mut changed = aggregate.clone();
+        changed.deliveries.get_mut(&delivery.id).unwrap().state = terminal;
+        assert!(authorize_delivery_preview(
+            &changed,
+            &caller,
+            &delivery,
+            &release,
+            Some(&latest),
+            500
+        )
+        .is_err());
+    }
+    let mut inactive = aggregate.clone();
+    inactive.releases.get_mut(&release.id).unwrap().state = ReleaseState::RolledBack;
+    assert!(authorize_delivery_preview(
+        &inactive,
+        &caller,
+        &delivery,
+        &release,
+        Some(&latest),
+        500
+    )
+    .is_err());
+    let mut changed = aggregate;
+    changed.active_release_id = None;
+    assert!(
+        authorize_delivery_preview(&changed, &caller, &delivery, &release, Some(&latest), 500)
+            .is_err()
+    );
+}
+
+#[test]
+fn preview_renewal_clock_and_corruption_fail_closed_without_commit() {
+    let temp = TempDir::new().unwrap();
+    let (core, delivery, release) = preview_renewal_fixture(&temp);
+    for (index, issued, observed) in [
+        (0, 99, 300),
+        (1, 300, 299),
+        (2, 300, 300 + DELIVERY_PREVIEW_MAX_TTL_MS),
+        (3, u64::MAX, u64::MAX),
+    ] {
+        let command = context(
+            "customer-1",
+            AuthorityRole::Customer,
+            &format!("bad-clock-{index}"),
+            issued,
+        );
+        assert!(core
+            .renew_preview_access(
+                &command,
+                "tenant-a",
+                "project-1",
+                &delivery,
+                &release,
+                observed
+            )
+            .is_err());
+    }
+    assert!(core
+        .load("tenant-a", "project-1")
+        .unwrap()
+        .unwrap()
+        .preview_access
+        .is_empty());
+    core.renew_preview_access(
+        &context("customer-1", AuthorityRole::Customer, "first", 300),
+        "tenant-a",
+        "project-1",
+        &delivery,
+        &release,
+        300,
+    )
+    .unwrap();
+    let aggregate = core.load("tenant-a", "project-1").unwrap().unwrap();
+    for index in 0..7 {
+        let mut changed = aggregate.clone();
+        let access = changed.preview_access.get_mut(&delivery.id).unwrap();
+        match index {
+            0 => access.delivery.digest = digest("foreign"),
+            1 => access.manifest.generation += 1,
+            2 => access.customer.principal_id = "foreign".into(),
+            3 => access.expires_at_ms += DELIVERY_PREVIEW_MAX_TTL_MS,
+            4 => access.project_id = "foreign".into(),
+            5 => access.generation = changed.revision + 1,
+            _ => access.preview_digest = digest("foreign"),
+        }
+        *access = access.clone().seal().unwrap();
+        assert!(
+            validate_delivery_aggregate_references(&changed).is_err(),
+            "case {index}"
+        );
+    }
+    let legacy = serde_json::to_value(DeliveryAggregateV1::new("tenant-a", "project-1")).unwrap();
+    assert!(legacy.get("preview_access").is_none());
+    assert_eq!(
+        serde_json::to_value(
+            serde_json::from_value::<DeliveryAggregateV1>(legacy.clone()).unwrap()
+        )
+        .unwrap(),
+        legacy
+    );
+}
+
+#[test]
+fn preview_renewal_allows_only_explicit_fresh_consent_and_preserves_exact_replay() {
+    let temp = TempDir::new().unwrap();
+    let (core, delivery, release) = preview_renewal_fixture(&temp);
+    core.renew_preview_access(
+        &context("customer-1", AuthorityRole::Customer, "renew", 300),
+        "tenant-a",
+        "project-1",
+        &delivery,
+        &release,
+        300,
+    )
+    .unwrap();
+    let grant = core
+        .load("tenant-a", "project-1")
+        .unwrap()
+        .unwrap()
+        .preview_access[&delivery.id]
+        .reference();
+    let customer = principal("customer-1", AuthorityRole::Customer);
+    let feedback = CustomerFeedbackV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        feedback_id: "explicit-feedback".into(),
+        generation: 1,
+        delivery: delivery.clone(),
+        customer: customer.clone(),
+        action: CustomerAction::Accept,
+        feedback_digest: ContentDigest::zero(),
+        requested_work_item_refs: vec![],
+        created_at_ms: 400,
+    }
+    .seal()
+    .unwrap();
+    let acceptance = AcceptanceV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        acceptance_id: "explicit-acceptance".into(),
+        generation: 1,
+        delivery: delivery.clone(),
+        release,
+        customer,
+        acceptance_digest: ContentDigest::zero(),
+        accepted_at_ms: 400,
+    }
+    .seal()
+    .unwrap();
+    let command = context(
+        "customer-1",
+        AuthorityRole::Customer,
+        "explicit-accept",
+        400,
+    );
+    assert!(core
+        .customer_action(
+            &command,
+            "tenant-a",
+            "project-1",
+            feedback.clone(),
+            Some(acceptance.clone())
+        )
+        .is_err());
+    assert!(core
+        .customer_action_with_preview(
+            &command,
+            "tenant-a",
+            "project-1",
+            feedback.clone(),
+            Some(acceptance.clone()),
+            Some(&grant),
+            300 + DELIVERY_PREVIEW_MAX_TTL_MS
+        )
+        .is_err());
+    core.customer_action_with_preview(
+        &command,
+        "tenant-a",
+        "project-1",
+        feedback.clone(),
+        Some(acceptance.clone()),
+        Some(&grant),
+        400,
+    )
+    .unwrap();
+    assert!(
+        core.customer_action_with_preview(
+            &command,
+            "tenant-a",
+            "project-1",
+            feedback,
+            Some(acceptance),
+            Some(&grant),
+            u64::MAX
+        )
+        .unwrap()
+        .duplicate
+    );
+    let after = core.load("tenant-a", "project-1").unwrap().unwrap();
+    assert_eq!(after.acceptances.len(), 1);
+    assert_eq!(
+        after.deliveries[&delivery.id].state,
+        DeliveryState::Accepted
+    );
+    assert_eq!(after.deliveries[&delivery.id].expires_at_ms, 200);
+}
+
 #[test]
 fn customer_action_rejects_local_conflicts_before_any_external_effect() {
     let temp = TempDir::new().unwrap();

@@ -74,6 +74,12 @@ pub fn validate_delivery_aggregate_references(
             return Err(corrupt("delivery receipt self-digest is invalid"));
         }
     }
+    for (delivery_id, access) in &aggregate.preview_access {
+        if delivery_id != &access.delivery.id {
+            return Err(corrupt("preview access map key is invalid"));
+        }
+        super::preview::validate_preview_access(aggregate, access)?;
+    }
     for feedback in aggregate.feedback.values() {
         if feedback.feedback_digest != feedback.computed_digest()? {
             return Err(corrupt("customer feedback self-digest is invalid"));

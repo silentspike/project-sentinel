@@ -1,7 +1,68 @@
 import { expect, test } from "@playwright/test";
+import type { CustomerDelivery } from "../src/customer/api";
 
 const identity = { schema_version: 1, principal_id: "customer-one", tenant_id: "tenant-one", customer_id: "customer-one" };
 const request = { request_id: "request-one", summary_ref: "Studio website", desired_outcome: "Three accessible pages", constraints: ["No tracking"], state: "submitted", version: 1, proposal_ids: [], clarifications: [], feedback: [] };
+
+test("expired preview renewal replays one intent and opens the exact grant without customer acceptance", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const delivery: CustomerDelivery = {
+    delivery: { id: "delivery-one", generation: 1, digest: "a".repeat(64) },
+    release: { id: "release-one", generation: 2, digest: "b".repeat(64) },
+    state: "delivered", release_state: "active", issued_at_ms: Date.now() - 120_000,
+    expires_at_ms: Date.now() - 60_000, preview_digest: "c".repeat(64),
+  };
+  const originalExpires = delivery.expires_at_ms;
+  const writes: unknown[] = [], reads: unknown[] = [];
+  const access = { id: "preview-one", generation: 3, digest: "e".repeat(64) };
+  await page.route("**/api/customer/**", async route => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("status")) return route.fulfill({ json: { authenticated: true, identity } });
+    if (path.endsWith("overview")) return route.fulfill({ json: { requests: [request], proposals: [], projects: [{
+      project_id: "project-one", request_id: request.request_id, state: "delivery_candidate", version: 2, work_items: [], deliveries: [delivery],
+    }] } });
+    const body = route.request().postDataJSON();
+    if (path.endsWith("delivery")) {
+      writes.push(body);
+      expect(body.intent).toEqual({ action: "renew_preview", project_id: "project-one", delivery: delivery.delivery, release: delivery.release });
+      if (writes.length === 1) {
+        delivery.preview_access = { access, issued_at_ms: Date.now(), expires_at_ms: Date.now() + 60_000 };
+        return route.abort("failed");
+      }
+      return route.fulfill({ json: { replayed: true, action: "renew_preview" } });
+    }
+    expect(path).toBe("/api/customer/preview"); reads.push(body);
+    const binding = { project_id: "project-one", delivery: delivery.delivery, release: delivery.release, preview_access: access };
+    expect(body).toEqual({ ...binding, ...(body.file ? { file: { artifact_id: "source_tree", path: body.file.path } } : {}) });
+    if (!body.file) return route.fulfill({ json: { ...binding, manifest_digest: "f".repeat(64), artifacts: [{ artifact_id: "source_tree", digest: "d".repeat(64), media_type: "application/json" }] } });
+    expect(["index.html", "style.css"]).toContain(body.file.path);
+    const bytes = new TextEncoder().encode(body.file.path === "style.css" ? "body{color:rgb(10,20,30)}" : '<!doctype html><link rel="stylesheet" href="style.css"><h1>Renewed delivery</h1>');
+    return route.fulfill({ json: { ...binding, manifest_digest: "f".repeat(64), artifact_id: "source_tree", path: body.file.path,
+      encoding: "base64", size_bytes: bytes.length, content: btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join("")) } });
+  });
+  await page.goto("/?view=customer");
+  await expect(page.getByRole("button", { name: "Vorschau oeffnen" })).toBeDisabled();
+  await page.getByRole("button", { name: "Vorschau erneuern" }).click();
+  await expect(page.getByRole("button", { name: "Gleiche Anfrage erneut pruefen" })).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "Gleiche Anfrage erneut pruefen" }).click();
+  await expect(page.getByRole("button", { name: "Gleiche Anfrage erneut pruefen" })).toHaveCount(0);
+  expect(writes).toHaveLength(2); expect(writes[1]).toEqual(writes[0]);
+  await page.getByRole("button", { name: "Vorschau oeffnen" }).click();
+  await expect(page.getByLabel("Artefakt")).toHaveValue("source_tree");
+  await page.getByRole("button", { name: "Vorschau laden" }).click();
+  const inner = page.frameLocator('iframe[title="Isolierte Lieferungsvorschau"]').frameLocator('iframe[title="Gelieferte Webseite"]');
+  await expect(inner.getByRole("heading", { name: "Renewed delivery" })).toBeVisible();
+  await expect(inner.locator("body")).toHaveCSS("color", "rgb(10, 20, 30)");
+  expect(reads).toHaveLength(3);
+  expect(delivery.state).toBe("delivered"); expect(delivery.expires_at_ms).toBe(originalExpires);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(1440);
+  await page.screenshot({ path: testInfo.outputPath("renewed-customer-preview.png"), fullPage: true });
+  delivery.preview_access!.expires_at_ms = Date.now() - 1;
+  await expect(page.locator('iframe[title="Isolierte Lieferungsvorschau"]')).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Lieferung abnehmen" })).toBeDisabled();
+  expect(writes).toHaveLength(2);
+});
 
 test("customer replies to the exact Sales question with durable retry", async ({ page }) => {
   const consultation = [{ message_id: "question-one", in_reply_to: null as string | null, content: "Which audience should the website address?", role: "sales" }];
