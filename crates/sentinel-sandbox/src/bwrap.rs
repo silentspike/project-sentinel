@@ -2,10 +2,12 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -13,6 +15,8 @@ use tracing::{debug, info, warn};
 
 /// File descriptor bwrap writes its sandbox info JSON to (`--info-fd`).
 const INFO_FD: RawFd = 3;
+const WORKBENCH_BLOCK_FD: RawFd = 4;
+const COMMAND_PROC: &str = "/run/sentinel-command-proc";
 
 /// Total deadline for the accumulating `--info-fd` read loop, so a stuck bwrap
 /// cannot block the daemon's spawn path indefinitely. Generous on purpose: the
@@ -87,6 +91,9 @@ pub struct BwrapConfig {
     pub clear_environment: bool,
     /// Trusted command-controller bind, never supplied by an employee request.
     pub command_boundary: Option<(String, u64)>,
+    /// Agent-parent cgroup namespace and pinned runtime membership control.
+    /// Created before controller delegation; never derived from tool input.
+    workbench_namespace: Option<Arc<(File, File)>>,
     /// Missing host binds are fatal for profiles whose isolation contract is
     /// defined by those exact paths (the agent workbench).
     pub require_all_binds: bool,
@@ -138,6 +145,7 @@ impl BwrapConfig {
             die_with_parent: true,
             clear_environment: false,
             command_boundary: None,
+            workbench_namespace: None,
             require_all_binds: false,
             // TOGAF: --proc /proc
             proc_mount: Some("/proc".to_string()),
@@ -226,6 +234,11 @@ impl BwrapConfig {
         self
     }
 
+    pub fn with_workbench_namespace(mut self, namespace: File, membership: File) -> Self {
+        self.workbench_namespace = Some(Arc::new((namespace, membership)));
+        self
+    }
+
     /// Removes broad host-data binds that are not part of the workbench profile.
     pub fn for_workbench(mut self) -> Self {
         self.readonly_binds
@@ -268,7 +281,21 @@ impl BwrapConfig {
     /// command child live in the sandbox namespaces.
     pub fn spawn(&self, command: &[String]) -> Result<SpawnedSandbox> {
         let config = self.with_existing_host_binds()?;
+        anyhow::ensure!(
+            config.command_boundary.is_none() || config.workbench_namespace.is_some(),
+            "native commands require an agent-parent cgroup namespace"
+        );
         let mut args = config.to_args();
+        let startup_barrier = if config.workbench_namespace.is_some() {
+            let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+                .context("Failed to create native namespace startup barrier")?;
+            Some((reserve_above_protocol_fds(read, WORKBENCH_BLOCK_FD)?, write))
+        } else {
+            None
+        };
+        if startup_barrier.is_some() {
+            args.extend(["--block-fd".to_owned(), WORKBENCH_BLOCK_FD.to_string()]);
+        }
         // bwrap writes `{"child-pid": N, ...}` to --info-fd once the sandbox is
         // set up. Options must precede the command.
         args.push("--info-fd".to_string());
@@ -280,15 +307,14 @@ impl BwrapConfig {
         // Pipe for bwrap's --info-fd. Both ends CLOEXEC; the write end is
         // re-published at INFO_FD in the child via pre_exec (clearing CLOEXEC
         // on that descriptor only).
-        let mut fds: [libc::c_int; 2] = [0; 2];
-        // SAFETY: `fds` is a valid 2-element array that pipe2 fills.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("Failed to create bwrap --info-fd pipe");
-        }
-        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let (info_read, info_write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .context("Failed to create bwrap --info-fd pipe")?;
+        let info_write = reserve_above_protocol_fds(info_write, WORKBENCH_BLOCK_FD)?;
+        let write_fd = info_write.as_raw_fd();
 
         let mut cmd = Command::new("bwrap");
+        let workbench_namespace = config.workbench_namespace.clone();
+        let barrier_read = startup_barrier.as_ref().map(|(read, _)| read.as_raw_fd());
         if config.clear_environment {
             cmd.env_clear().envs(WORKBENCH_ENVIRONMENT);
             if let Some((root, budget)) = &config.command_boundary {
@@ -303,9 +329,20 @@ impl BwrapConfig {
             // Inheriting child stderr would bypass that redaction boundary.
             .stderr(std::process::Stdio::null());
         // SAFETY: the closure runs in the forked child before exec and only
-        // calls async-signal-safe setpgid/fcntl/dup2 operations.
+        // calls setns/write/setpgid/fcntl/dup2 on already-pinned descriptors.
         unsafe {
             cmd.pre_exec(move || {
+                if let Some(ownership) = &workbench_namespace {
+                    // The namespace must cover runtime AND sibling command
+                    // leaves. Move while source and destination are visible in
+                    // the host namespace, then enter the narrower agent namespace.
+                    if libc::write(ownership.1.as_raw_fd(), b"0".as_ptr().cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::setns(ownership.0.as_raw_fd(), libc::CLONE_NEWCGROUP) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -319,26 +356,45 @@ impl BwrapConfig {
                 } else if libc::dup2(write_fd, INFO_FD) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                if let Some(read) = barrier_read {
+                    if read == WORKBENCH_BLOCK_FD {
+                        let flags = libc::fcntl(read, libc::F_GETFD);
+                        if flags < 0
+                            || libc::fcntl(read, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    } else if libc::dup2(read, WORKBENCH_BLOCK_FD) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 Ok(())
             });
         }
 
         let spawn_result = cmd.spawn();
         // Parent never writes to the info pipe.
-        // SAFETY: write_fd is a valid fd owned by this function until here.
-        unsafe { libc::close(write_fd) };
-
-        let child = match spawn_result {
-            Ok(child) => child,
-            Err(e) => {
-                // SAFETY: read_fd is still open and owned here.
-                unsafe { libc::close(read_fd) };
-                return Err(e).context("Failed to spawn bwrap process");
-            }
-        };
+        drop(info_write);
+        let mut child = spawn_result.context("Failed to spawn bwrap process")?;
 
         // Takes ownership of read_fd and closes it.
-        let child_pid = read_child_pid_from_info_fd(read_fd, INFO_FD_TIMEOUT_MS);
+        let child_pid = read_child_pid_from_info_fd(info_read.into_raw_fd(), INFO_FD_TIMEOUT_MS);
+        if let Some((read, write)) = startup_barrier {
+            drop(read);
+            let setup = child_pid
+                .context("Native sandbox init identity was not reported")
+                .and_then(|pid| install_private_command_proc(&mut child, pid))
+                .and_then(|_| {
+                    nix::unistd::write(&write, b"1")
+                        .map(|_| ())
+                        .map_err(Into::into)
+                });
+            drop(write);
+            if let Err(error) = setup {
+                terminate_sandbox_process(&mut child);
+                return Err(error).context("Native command namespace preparation failed");
+            }
+        }
         if child_pid.is_none() {
             warn!(
                 "bwrap did not report its sandbox init PID via --info-fd; \
@@ -403,9 +459,25 @@ impl BwrapConfig {
 
     /// Generiert bwrap CLI-Argumente.
     pub fn to_args(&self) -> Vec<String> {
-        let mut args = vec!["--unshare-all".to_string()];
+        let mut args = if self.workbench_namespace.is_some() {
+            // Cgroup isolation already uses the pinned agent-parent namespace.
+            // Re-unsharing from runtime would hide the sibling command leaves.
+            [
+                "--unshare-user",
+                "--unshare-ipc",
+                "--unshare-pid",
+                "--unshare-uts",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        } else {
+            vec!["--unshare-all".to_string()]
+        };
 
-        if self.share_net {
+        if self.workbench_namespace.is_some() && !self.share_net {
+            args.push("--unshare-net".to_owned());
+        } else if self.share_net && self.workbench_namespace.is_none() {
             args.push("--share-net".to_string());
         }
 
@@ -415,6 +487,9 @@ impl BwrapConfig {
 
         args.push("--hostname".to_string());
         args.push(self.hostname.clone());
+        if self.workbench_namespace.is_some() {
+            args.extend(["--dir".to_owned(), COMMAND_PROC.to_owned()]);
+        }
 
         // readonly binds
         for (host, guest) in &self.readonly_binds {
@@ -457,6 +532,297 @@ impl BwrapConfig {
 
         args
     }
+}
+
+fn reserve_above_protocol_fds(mut descriptor: OwnedFd, highest: RawFd) -> Result<OwnedFd> {
+    // Publishing --info-fd must not overwrite the startup barrier's source.
+    // Keep lower slots occupied until dup allocates a collision-free source.
+    let mut reserved = Vec::new();
+    while descriptor.as_raw_fd() <= highest {
+        let duplicate = descriptor
+            .try_clone()
+            .context("Failed to reserve startup barrier descriptor")?;
+        reserved.push(descriptor);
+        descriptor = duplicate;
+    }
+    nix::fcntl::fcntl(
+        &descriptor,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )
+    .context("Failed to close startup barrier source on exec")?;
+    Ok(descriptor)
+}
+
+fn install_private_command_proc(supervisor: &mut Child, init_pid: u32) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    anyhow::ensure!(
+        nix::unistd::geteuid().is_root(),
+        "Native mount preparation requires the privileged host enforcer"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let init = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(format!("/proc/{init_pid}"))?;
+    let init_path = format!("/proc/{}/fd/{}", std::process::id(), init.as_raw_fd());
+    let root_path = format!("{init_path}/root");
+    loop {
+        anyhow::ensure!(
+            supervisor.try_wait()?.is_none(),
+            "Native sandbox exited before mount preparation"
+        );
+        verify_owned_init_parent(&init_path, supervisor.id())?;
+        if Path::new(&root_path)
+            .join(COMMAND_PROC.trim_start_matches('/'))
+            .is_dir()
+        {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "Native sandbox mount root was not ready"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Pin the owned init's mount/PID namespaces and pivoted root. Never pass
+    // mutable workload paths or host /proc into the employee sandbox.
+    let mount_namespace = File::open(format!("{init_path}/ns/mnt"))?;
+    let pid_namespace = File::open(format!("{init_path}/ns/pid"))?;
+    let root = File::open(&root_path)?;
+    for (file, own) in [
+        (&mount_namespace, "/proc/self/ns/mnt"),
+        (&pid_namespace, "/proc/self/ns/pid"),
+    ] {
+        anyhow::ensure!(
+            file.metadata()?.ino() != std::fs::metadata(own)?.ino(),
+            "Native namespace was not isolated"
+        );
+    }
+    for program in ["/usr/bin/nsenter", "/usr/bin/mount"] {
+        let metadata = std::fs::symlink_metadata(program)?;
+        anyhow::ensure!(
+            metadata.is_file()
+                && metadata.uid() == 0
+                // The packaged mount binary may be setuid root. This helper
+                // already runs as host root; never grant it to candidate code.
+                && metadata.mode() & 0o3022 == 0
+                && metadata.mode() & 0o111 != 0,
+            "Trusted namespace setup executable is unavailable"
+        );
+    }
+    let parent = std::process::id();
+    let pinned = |file: &File| format!("/proc/{parent}/fd/{}", file.as_raw_fd());
+    let child = Command::new("/usr/bin/nsenter")
+        .arg(format!("--mount={}", pinned(&mount_namespace)))
+        .arg(format!("--pid={}", pinned(&pid_namespace)))
+        .arg(format!("--root={}", pinned(&root)))
+        .args([
+            "--wdns=/",
+            "--",
+            "/usr/bin/mount",
+            "--internal-only",
+            "-t",
+            "proc",
+            "-o",
+            "nosuid,nodev,noexec",
+            "proc",
+            COMMAND_PROC,
+        ])
+        .env_clear()
+        .envs(WORKBENCH_ENVIRONMENT)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .context("Failed to start private proc setup")?;
+    let mut helper = OwnedProcSetup(Some(child));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
+        let child = helper
+            .0
+            .as_ref()
+            .context("Private proc setup ownership was lost")?;
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id())?);
+        let status = waitid(
+            Id::Pid(pid),
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+        )
+        .context("Private proc setup could not be observed")?;
+        match status {
+            WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => {
+                let status = helper.finish()?;
+                anyhow::ensure!(status.success(), "Private command proc mount failed");
+                anyhow::ensure!(
+                    supervisor.try_wait()?.is_none(),
+                    "Native sandbox exited during mount preparation"
+                );
+                verify_owned_init_parent(&init_path, supervisor.id())?;
+                return verify_private_command_proc(&root, &pid_namespace);
+            }
+            WaitStatus::StillAlive if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            _ => {
+                helper.finish()?;
+                anyhow::bail!("Private command proc setup timed out");
+            }
+        }
+    }
+}
+
+fn verify_owned_init_parent(init_path: &str, supervisor: u32) -> Result<()> {
+    let identity = std::fs::read_to_string(format!("{init_path}/stat"))?;
+    let parent = identity
+        .rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_whitespace().nth(1))
+        .and_then(|pid| pid.parse::<u32>().ok());
+    anyhow::ensure!(
+        parent == Some(supervisor),
+        "Native sandbox init is not the owned supervisor child"
+    );
+    Ok(())
+}
+
+struct OwnedProcSetup(Option<Child>);
+
+impl OwnedProcSetup {
+    fn finish(&mut self) -> Result<std::process::ExitStatus> {
+        self.finish_with_inspection(setup_group_has_live_members)
+    }
+
+    fn finish_with_inspection(
+        &mut self,
+        mut inspect: impl FnMut(i32, Instant) -> Result<bool>,
+    ) -> Result<std::process::ExitStatus> {
+        let child = self
+            .0
+            .as_mut()
+            .context("Private proc setup ownership was lost")?;
+        let group = i32::try_from(child.id()).context("Private proc setup PID exceeds pid_t")?;
+        // waitid(WNOWAIT) retains the leader, so this group ID cannot be reused.
+        match nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(group),
+            nix::sys::signal::Signal::SIGKILL,
+        ) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => {
+                return Err(error).context("Private proc setup group could not be stopped")
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let quiescence = (|| -> Result<()> {
+            while inspect(group, deadline)? {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "Private proc setup group did not quiesce"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        })();
+        // Even failed inspection must reap the killed leader. Its error remains
+        // fatal; the caller then tears down the owned sandbox PID namespace.
+        let status = child
+            .wait()
+            .context("Private proc setup leader could not be reaped")?;
+        self.0.take();
+        quiescence?;
+        Ok(status)
+    }
+}
+
+impl Drop for OwnedProcSetup {
+    fn drop(&mut self) {
+        if self.0.is_none() {
+            return;
+        }
+        if let Err(error) = self.finish() {
+            warn!(%error, "Owned private proc setup cleanup remains incomplete");
+        }
+    }
+}
+
+fn setup_group_has_live_members(group: i32, deadline: Instant) -> Result<bool> {
+    anyhow::ensure!(
+        Instant::now() < deadline,
+        "Private proc setup inspection timed out"
+    );
+    for (index, entry) in std::fs::read_dir("/proc")?.enumerate() {
+        anyhow::ensure!(
+            index < 65536 && Instant::now() < deadline,
+            "Private proc setup inspection exceeded its bound"
+        );
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        let identity = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(identity) => identity,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue
+            }
+            Err(error) => {
+                return Err(error).context("Private proc setup group could not be inspected")
+            }
+        };
+        let fields: Vec<_> = identity
+            .rsplit_once(") ")
+            .context("Private proc setup process identity was malformed")?
+            .1
+            .split_whitespace()
+            .collect();
+        let actual = fields
+            .get(2)
+            .and_then(|value| value.parse::<i32>().ok())
+            .context("Private proc setup process group was malformed")?;
+        if actual == group
+            && !fields
+                .first()
+                .is_some_and(|state| matches!(*state, "Z" | "X"))
+        {
+            return Ok(true);
+        }
+    }
+    anyhow::ensure!(
+        Instant::now() < deadline,
+        "Private proc setup inspection timed out"
+    );
+    Ok(false)
+}
+
+fn verify_private_command_proc(root: &File, pid_namespace: &File) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = format!(
+        "/proc/{}/fd/{}{COMMAND_PROC}",
+        std::process::id(),
+        root.as_raw_fd()
+    );
+    let procfs = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .context("Private command procfs was not mounted")?;
+    anyhow::ensure!(
+        nix::sys::statfs::fstatfs(&procfs)?.filesystem_type() == nix::sys::statfs::PROC_SUPER_MAGIC,
+        "Private command proc mount is not procfs"
+    );
+    let visible_init = std::fs::metadata(format!("{path}/1/ns/pid"))?;
+    let expected = pid_namespace.metadata()?;
+    anyhow::ensure!(
+        visible_init.dev() == expected.dev() && visible_init.ino() == expected.ino(),
+        "Private procfs does not expose the exact owned agent PID namespace"
+    );
+    Ok(())
 }
 
 fn log_bwrap_spawn(argument_count: usize) {
@@ -828,6 +1194,213 @@ mod tests {
     }
 
     #[test]
+    fn startup_barrier_source_cannot_be_overwritten_by_protocol_descriptors() {
+        let source = File::open("/dev/null").unwrap();
+        let identity = source.metadata().unwrap();
+        let highest = source.as_raw_fd() + 3;
+        let pinned = reserve_above_protocol_fds(source.into(), highest).unwrap();
+        assert!(pinned.as_raw_fd() > highest);
+        let pinned = File::from(pinned);
+        assert_eq!(pinned.metadata().unwrap().dev(), identity.dev());
+        assert_eq!(pinned.metadata().unwrap().ino(), identity.ino());
+        assert!(nix::fcntl::fcntl(&pinned, nix::fcntl::FcntlArg::F_GETFD)
+            .map(|flags| nix::fcntl::FdFlag::from_bits_retain(flags)
+                .contains(nix::fcntl::FdFlag::FD_CLOEXEC))
+            .unwrap());
+    }
+
+    #[test]
+    fn private_command_proc_requires_a_real_mount_not_an_ordinary_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = File::open(directory.path()).unwrap();
+        let namespace = File::open("/proc/self/ns/pid").unwrap();
+        assert!(verify_private_command_proc(&root, &namespace).is_err());
+        std::fs::create_dir_all(directory.path().join(COMMAND_PROC.trim_start_matches('/')))
+            .unwrap();
+        let error = verify_private_command_proc(&root, &namespace).unwrap_err();
+        assert!(error.to_string().contains("not procfs"));
+    }
+
+    #[test]
+    fn private_proc_setup_cleanup_stops_descendants_before_reaping_its_leader() {
+        use std::io::BufRead;
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .process_group(0)
+            .env_clear()
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let leader = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let descendant = line.trim().parse::<u32>().unwrap();
+        let mut helper = OwnedProcSetup(Some(child));
+        assert!(!helper.finish().unwrap().success());
+        assert!(helper.0.is_none());
+        assert_eq!(
+            nix::sys::wait::waitpid(leader, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
+        );
+        if let Ok(identity) = std::fs::read_to_string(format!("/proc/{descendant}/stat")) {
+            let state = identity
+                .rsplit_once(") ")
+                .unwrap()
+                .1
+                .split_whitespace()
+                .next()
+                .unwrap();
+            assert!(matches!(state, "Z" | "X"), "setup descendant remains live");
+        }
+    }
+
+    #[test]
+    fn private_proc_setup_observation_retains_the_leader_until_group_cleanup() {
+        use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
+        let child = Command::new("/bin/true").process_group(0).spawn().unwrap();
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
+        let mut helper = OwnedProcSetup(Some(child));
+        assert_eq!(
+            waitid(Id::Pid(pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT).unwrap(),
+            WaitStatus::Exited(pid, 0)
+        );
+        assert!(helper.finish().unwrap().success());
+        assert!(helper.0.is_none());
+    }
+
+    #[test]
+    fn private_proc_setup_inspection_failure_still_reaps_the_owned_leader() {
+        use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
+        let child = Command::new("/bin/true").process_group(0).spawn().unwrap();
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
+        let mut helper = OwnedProcSetup(Some(child));
+        assert_eq!(
+            waitid(Id::Pid(pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT).unwrap(),
+            WaitStatus::Exited(pid, 0)
+        );
+        let error = helper
+            .finish_with_inspection(|_, _| anyhow::bail!("injected inspection failure"))
+            .unwrap_err();
+        assert!(error.to_string().contains("injected inspection failure"));
+        assert!(helper.0.is_none());
+        assert_eq!(
+            nix::sys::wait::waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
+        );
+        assert!(setup_group_has_live_members(
+            pid.as_raw(),
+            Instant::now() - Duration::from_millis(1)
+        )
+        .is_err());
+    }
+
+    #[test]
+    #[ignore = "Requires root, writable sentinel cgroups and built immutable wrapper/runtime paths in SENTINEL_TEST_NAMESPACE_WRAPPER/SENTINEL_TEST_AGENT_RUNTIME"]
+    fn kernel_workbench_bootstrap_and_replacement_preserve_private_namespaces() {
+        use crate::cgroups::{self, CgroupLimits};
+        use std::io::Write;
+        let wrapper = std::path::PathBuf::from(
+            std::env::var_os("SENTINEL_TEST_NAMESPACE_WRAPPER")
+                .expect("Set SENTINEL_TEST_NAMESPACE_WRAPPER"),
+        );
+        let runtime = std::path::PathBuf::from(
+            std::env::var_os("SENTINEL_TEST_AGENT_RUNTIME")
+                .expect("Set SENTINEL_TEST_AGENT_RUNTIME"),
+        );
+        let name = format!("bootstrap-test-{}", uuid::Uuid::new_v4());
+        assert!(!Path::new(&cgroups::cgroup_path(&name)).exists());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = cgroups::remove_cgroup(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(name.clone());
+        let root = tempfile::tempdir().unwrap();
+        for entry in ["workspaces", "inputs", "artifacts"] {
+            std::fs::create_dir(root.path().join(entry)).unwrap();
+        }
+        // This covers real namespace/broker bootstrap and full-tree replacement,
+        // not company authority, invocation effects or FUSE acceptance.
+        for _ in 0..2 {
+            cgroups::create_cgroup(&name, &CgroupLimits::default()).unwrap();
+            let namespace = cgroups::prepare_workbench_namespace(&name, &wrapper).unwrap();
+            let commands = cgroups::prepare_workbench_cgroup(&name).unwrap();
+            let membership = cgroups::open_workbench_runtime_membership(&name).unwrap();
+            let mut config = BwrapConfig::for_agent(&name)
+                .for_workbench()
+                .with_workbench_roots(root.path())
+                .with_command_boundary(&commands, 64 * 1024 * 1024)
+                .with_workbench_namespace(namespace, membership);
+            config.readonly_binds.push((
+                wrapper.to_string_lossy().into_owned(),
+                "/landlock-wrapper".into(),
+            ));
+            config.readonly_binds.push((
+                runtime.to_string_lossy().into_owned(),
+                "/usr/bin/agent-runtime".into(),
+            ));
+            let command = vec![
+                "/landlock-wrapper".into(),
+                "--attest-v1".into(),
+                uuid::Uuid::new_v4().to_string(),
+                crate::landlock::LANDLOCK_RULESET_ABI.to_string(),
+                name.clone(),
+                "--".into(),
+                "/usr/bin/agent-runtime".into(),
+            ];
+            let mut sandbox = config.spawn(&command).unwrap();
+            let init = sandbox.child_pid.unwrap();
+            assert_ne!(
+                std::fs::metadata(format!("/proc/{init}/ns/cgroup"))
+                    .unwrap()
+                    .ino(),
+                std::fs::metadata("/proc/self/ns/cgroup").unwrap().ino()
+            );
+            sandbox.child.stdin.as_mut().unwrap().write_all(
+                b"{\"kind\":\"health\",\"schema_version\":1,\"request_id\":\"bootstrap-probe\"}\n"
+            ).unwrap();
+            drop(sandbox.child.stdin.take());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = sandbox.child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    sandbox.terminate();
+                    panic!("compiled workbench bootstrap did not finish");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(
+                status.success(),
+                "compiled workbench bootstrap failed: {status}"
+            );
+            let mut output = String::new();
+            sandbox
+                .child
+                .stdout
+                .take()
+                .unwrap()
+                .take(65536)
+                .read_to_string(&mut output)
+                .unwrap();
+            assert!(
+                output
+                    .lines()
+                    .any(|line| serde_json::from_str::<serde_json::Value>(line)
+                        .is_ok_and(|frame| frame["kind"] == "health" && frame["healthy"] == true)),
+                "compiled runtime did not answer the health frame"
+            );
+            drop(config);
+            cgroups::remove_cgroup(&name).unwrap();
+            assert!(!Path::new(&cgroups::cgroup_path(&name)).exists());
+        }
+    }
+
+    #[test]
     fn agent_default_is_full_cage() {
         // #75: agents make no network calls; the default is a full network cage
         // (own netns, loopback only) — NO --share-net.
@@ -839,6 +1412,42 @@ mod tests {
             "agents must not get --share-net, args: {args:?}"
         );
         assert!(args.contains(&"--unshare-all".to_string()));
+    }
+
+    #[test]
+    fn workbench_preserves_pinned_cgroup_namespace_and_all_other_cages() {
+        // Descriptor validity is enforced by setns/write at spawn. This test
+        // checks argv only; it does not claim kernel namespace enforcement.
+        let config = BwrapConfig::for_agent("test")
+            .for_workbench()
+            .with_workbench_namespace(
+                File::open("/dev/null").unwrap(),
+                File::open("/dev/null").unwrap(),
+            );
+        let args = config.to_args();
+        for required in [
+            "--unshare-user",
+            "--unshare-ipc",
+            "--unshare-pid",
+            "--unshare-uts",
+            "--unshare-net",
+            "--die-with-parent",
+        ] {
+            assert!(args.iter().any(|arg| arg == required));
+        }
+        for forbidden in ["--unshare-all", "--unshare-cgroup", "--share-net"] {
+            assert!(!args.iter().any(|arg| arg == forbidden));
+        }
+        assert!(!config
+            .writable_binds
+            .iter()
+            .any(|(_, guest)| guest == "/sys/fs/cgroup"));
+        assert!(args.windows(2).any(|pair| pair == ["--dir", COMMAND_PROC]));
+        assert!(!config
+            .readonly_binds
+            .iter()
+            .chain(&config.writable_binds)
+            .any(|(_, guest)| guest == COMMAND_PROC));
     }
 
     #[test]

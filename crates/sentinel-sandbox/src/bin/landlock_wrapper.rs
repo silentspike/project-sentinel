@@ -132,6 +132,23 @@ fn start_command_broker(nonce: &str, command: &[String]) -> io::Result<CommandBr
 fn main() {
     let args: Vec<String> = env::args().collect();
 
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--prepare-workbench-cgroup-namespace-v1")
+    {
+        if args.len() != 3 {
+            eprintln!("Invalid cgroup namespace helper arguments");
+            process::exit(2);
+        }
+        if let Err(error) =
+            sentinel_sandbox::cgroups::run_workbench_namespace_helper(Path::new(&args[2]))
+        {
+            eprintln!("[landlock-wrapper] Cgroup namespace bootstrap failed: {error}");
+            process::exit(126);
+        }
+        return;
+    }
+
     // Parse either the general-agent form or the workbench attestation form:
     // landlock-wrapper <agent-name> -- <command> [args...]
     // landlock-wrapper --attest-v1 <nonce> <abi> <agent-name> -- <command> [args...]
