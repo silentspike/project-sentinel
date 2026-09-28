@@ -88,7 +88,7 @@ jobs:
       - name: Audit
         working-directory: console
         run: |
-          if bun pm audit; then
+          if bun audit; then
             echo "Console audit completed successfully."
           else
             STATUS=$?
