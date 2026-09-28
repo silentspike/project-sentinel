@@ -1,5 +1,10 @@
 # Changelog
 
+- Validate archived source reviews against their own source/reviewer provider
+  authority, not a newer live QA grant. Preserve historical retries while a
+  post-rework QA schema correction archives and regrants its exact assignment,
+  including the SQLite reopen boundary (#856).
+
 - Recover a completed QA call rejected for non-strict JSON with a separately
   authorized, bounded correction turn. Retain consumed usage and the exact
   reviewer assignment, resume across archive/regrant restarts, and bind schema

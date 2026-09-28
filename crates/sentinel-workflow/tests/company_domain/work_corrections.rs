@@ -103,8 +103,10 @@ impl CompletionEvidencePort for Evidence {
         }))
     }
 }
-struct ReviewEvidence;
-impl CompletionEvidencePort for ReviewEvidence {
+struct WorkEvidence {
+    review: bool,
+}
+impl CompletionEvidencePort for WorkEvidence {
     fn readiness(&self) -> DependencyReadiness {
         DependencyReadiness::Ready
     }
@@ -113,10 +115,15 @@ impl CompletionEvidencePort for ReviewEvidence {
         request: &PendingCompletionEvidenceV1,
     ) -> Result<Box<dyn TerminalExecutionEvidence>, WorkflowPortError> {
         let outputs = vec![SealedOutputEvidenceV1 {
-            name: "qa-report".into(),
-            kind: "qa_report".into(),
+            name: if self.review { "qa-report" } else { "source" }.into(),
+            kind: if self.review {
+                "qa_report"
+            } else {
+                "source_tree"
+            }
+            .into(),
             digest_algorithm: "sha256".into(),
-            digest: DIGEST.into(),
+            digest: if self.review { DIGEST } else { OTHER_DIGEST }.into(),
         }];
         let digest = sentinel_workflow::sealed_output_bundle_digest(&outputs, &[]).unwrap();
         Ok(Box::new(Completion {
@@ -404,6 +411,7 @@ fn complete_review_execution(
     now: u64,
     revision: Option<&ExecutionRevisionV1>,
 ) -> WorkItemExecutionV1 {
+    let review = project.work_items[review_id].spec.required_role == CompanyRoleV1::Qa;
     let assignment = &project.work_items[review_id].assignments[0];
     let authority = RuntimeAuthoritySnapshotV1 {
         schema_version: 1,
@@ -415,7 +423,16 @@ fn complete_review_execution(
         assignment_digest: assignment.canonical_digest().unwrap(),
         organization_generation: assignment.organization_generation,
         organization_digest: assignment.organization_digest.clone(),
-        principal: PrincipalAuthorityV1::derive(&state.qa.principal_id, 1, &[0x5a; 32]).unwrap(),
+        principal: PrincipalAuthorityV1::derive(
+            if review {
+                &state.qa.principal_id
+            } else {
+                &state.developer.principal_id
+            },
+            1,
+            &[0x5a; 32],
+        )
+        .unwrap(),
         profile_id: assignment.profile.profile_id.clone(),
         profile_generation: assignment.profile.generation,
         profile_digest: assignment.profile.digest.clone(),
@@ -466,8 +483,8 @@ fn complete_review_execution(
                 expected_sha256: None,
             },
             outputs: vec![sentinel_workflow::OutputExpectationV1 {
-                name: "qa-report".into(),
-                kind: "qa_report".into(),
+                name: if review { "qa-report" } else { "source" }.into(),
+                kind: if review { "qa_report" } else { "source_tree" }.into(),
                 required: true,
                 digest_algorithm: "sha256".into(),
             }],
@@ -496,7 +513,7 @@ fn complete_review_execution(
         WorkflowStore::open(state._temp.path().join("workflow.sqlite")).unwrap(),
         Organization(authority),
         Execution(WorkExecutionObservation::Succeeded),
-        ReviewEvidence,
+        WorkEvidence { review },
         Evidence,
     );
     if let Some(revision) = revision {
@@ -525,8 +542,9 @@ fn finish_review_work(
     first_operation: u128,
     first_time: u64,
 ) -> ProjectV1 {
+    let review = project.work_items[review_id].spec.required_role == CompanyRoleV1::Qa;
     let report = vec![WorkOutputReceiptV1 {
-        content_digest: DIGEST.into(),
+        content_digest: if review { DIGEST } else { OTHER_DIGEST }.into(),
         ..output_receipt().remove(0)
     }];
     for (index, (from, to)) in [
@@ -541,7 +559,17 @@ fn finish_review_work(
         let done = to == CompanyWorkStateV1::Done;
         project = project_command(
             &state.store,
-            if done { &state.release } else { &state.qa },
+            if done {
+                if review {
+                    &state.release
+                } else {
+                    &state.qa
+                }
+            } else if review {
+                &state.qa
+            } else {
+                &state.developer
+            },
             first_operation + index as u128,
             transition(
                 &project.project_id,
@@ -1057,7 +1085,10 @@ fn negative_qa_archives_abandoned_qa_call_and_prior_correction() {
     assert_negative_qa_rework(true, true);
 }
 
-fn assert_negative_qa_rework(prior_qa_correction: bool, abandoned_qa_call: bool) {
+fn assert_negative_qa_rework(
+    prior_qa_correction: bool,
+    abandoned_qa_call: bool,
+) -> (Journey, ProjectV1) {
     let mut proposal = binding();
     proposal.governance.participants.push(participant(
         5,
@@ -1387,7 +1418,193 @@ fn assert_negative_qa_rework(prior_qa_correction: bool, abandoned_qa_call: bool)
         reopened
             .company_project(&state.pm.tenant_id, &corrected.project_id)
             .unwrap(),
-        Some(corrected)
+        Some(corrected.clone())
+    );
+    (state, corrected)
+}
+
+#[test]
+fn qa_schema_archive_after_source_rework_preserves_historical_and_current_authority() {
+    let (state, mut project) = assert_negative_qa_rework(true, true);
+    let source_id = WorkItemId::parse("build-work").unwrap();
+    let source_allowance = project.subscription_call.as_ref().unwrap().clone();
+    project = project_command(
+        &state.store,
+        &state.developer,
+        1100,
+        CompanyWorkflowCommandV1::ClaimSubscriptionCall {
+            project_id: project.project_id.clone(),
+            expected_version: project.version,
+            allowance_id: source_allowance.allowance_id.clone(),
+            request_id: format!("company-provider-{}", source_allowance.allowance_id),
+            request_digest: OTHER_DIGEST.into(),
+        },
+        90,
+    );
+    let revision = project
+        .work_corrections
+        .last()
+        .unwrap()
+        .execution_revision
+        .clone();
+    let execution =
+        complete_review_execution(&state, &project, &source_id, 1200, 91, Some(&revision));
+    project = finish_review_work(&state, project, &source_id, &execution, 1300, 95);
+    let review_id = WorkItemId::parse("source-review-after-rework").unwrap();
+    let mut review = work(&review_id.0, CompanyRoleV1::Qa, &["qa"], &["build-work"], 0);
+    review.outputs[0].media_type = "application/vnd.sentinel.qa-report+json".into();
+    project = project_command(
+        &state.store,
+        &state.pm,
+        1400,
+        CompanyWorkflowCommandV1::AppendSourceReview {
+            project_id: project.project_id.clone(),
+            expected_version: project.version,
+            item: review,
+        },
+        98,
+    );
+    project = project_command(
+        &state.store,
+        &state.pm,
+        1401,
+        CompanyWorkflowCommandV1::AssignSourceReview {
+            project_id: project.project_id.clone(),
+            expected_version: project.version,
+            work_item_id: review_id.clone(),
+            agent_id: AgentId(3),
+            organization_generation: 1,
+            organization_digest: DIGEST.into(),
+            reason_ref: "source-review-profile".into(),
+            profile: profile("web-review-v1"),
+        },
+        99,
+    );
+    let assignment = &project.work_items[&review_id].assignments[0];
+    let mut qa_grant = source_allowance.grant.clone();
+    qa_grant.work_item_id = review_id.clone();
+    qa_grant.assignment_id = assignment.assignment_id.clone();
+    qa_grant.assignment_version = assignment.assignment_version;
+    qa_grant.agent_id = assignment.agent_id;
+    project = project_command(
+        &state.store,
+        &state.pm,
+        1402,
+        CompanyWorkflowCommandV1::GrantSourceReviewCall {
+            project_id: project.project_id.clone(),
+            expected_version: project.version,
+            previous_allowance_id: source_allowance.allowance_id.clone(),
+            grant: qa_grant.clone(),
+        },
+        100,
+    );
+    let historical = project.archived_source_reviews.clone();
+    for correction in 0..2_u64 {
+        let allowance = project.subscription_call.as_ref().unwrap().clone();
+        let now = 101 + correction * 4;
+        project = project_command(
+            &state.store,
+            &state.qa,
+            u128::from(1500 + correction * 4),
+            CompanyWorkflowCommandV1::ClaimSubscriptionCall {
+                project_id: project.project_id.clone(),
+                expected_version: project.version,
+                allowance_id: allowance.allowance_id.clone(),
+                request_id: format!("company-provider-{}", allowance.allowance_id),
+                request_digest: OTHER_DIGEST.into(),
+            },
+            now,
+        );
+        let abandoned = project_command(
+            &state.store,
+            &state.pm,
+            u128::from(1501 + correction * 4),
+            CompanyWorkflowCommandV1::AbandonSubscriptionCall {
+                project_id: project.project_id.clone(),
+                expected_version: project.version,
+                allowance_id: allowance.allowance_id.clone(),
+                request_digest: OTHER_DIGEST.into(),
+                resolution_event_id: Uuid::from_u128(u128::from(1600 + correction)).to_string(),
+                abandoned_by: state.pm.principal_id.clone(),
+            },
+            now + 1,
+        );
+        assert!(abandoned.subscription_call.is_none());
+        assert_eq!(abandoned.archived_source_reviews, historical);
+        assert_eq!(
+            abandoned.abandoned_subscription_calls.len(),
+            correction as usize + 1
+        );
+        let reopened = WorkflowStore::open(state._temp.path().join("workflow.sqlite")).unwrap();
+        assert_eq!(
+            reopened
+                .company_project(&state.pm.tenant_id, &abandoned.project_id)
+                .unwrap(),
+            Some(abandoned.clone())
+        );
+        project = project_command(
+            &reopened,
+            &state.pm,
+            u128::from(1502 + correction * 4),
+            CompanyWorkflowCommandV1::GrantSubscriptionCall {
+                project_id: abandoned.project_id.clone(),
+                expected_version: abandoned.version,
+                grant: qa_grant.clone(),
+            },
+            now + 2,
+        );
+        assert_eq!(
+            project
+                .source_review_previous_call
+                .as_ref()
+                .unwrap()
+                .allowance_id,
+            source_allowance.allowance_id
+        );
+        assert_ne!(
+            project.subscription_call.as_ref().unwrap().allowance_id,
+            allowance.allowance_id
+        );
+    }
+    let db = rusqlite::Connection::open(state._temp.path().join("workflow.sqlite")).unwrap();
+    for variant in 0..4 {
+        let mut corrupted = project.clone();
+        let archived = &mut corrupted.archived_source_reviews[0];
+        match variant {
+            0 => {
+                archived.source_allowance.created_at_unix_ms =
+                    archived.review_allowance.created_at_unix_ms + 1
+            }
+            1 => {
+                archived.review_allowance.grant.agent_id = archived.source_allowance.grant.agent_id
+            }
+            2 => archived.review_abandoned_calls[0].resolution_event_id = "not-a-uuid".into(),
+            _ => archived.review_allowance.grant.assignment_id = "foreign-assignment".into(),
+        }
+        assert_eq!(db.execute(
+            "UPDATE company_entities SET payload=?1 WHERE entity_kind='project' AND entity_id=?2",
+            rusqlite::params![serde_json::to_vec(&corrupted).unwrap(), project.project_id.0],
+        ).unwrap(), 1);
+        assert_eq!(
+            state
+                .store
+                .company_project(&state.pm.tenant_id, &project.project_id)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
+    }
+    db.execute(
+        "UPDATE company_entities SET payload=?1 WHERE entity_kind='project' AND entity_id=?2",
+        rusqlite::params![serde_json::to_vec(&project).unwrap(), project.project_id.0],
+    )
+    .unwrap();
+    assert_eq!(
+        state
+            .store
+            .company_project(&state.pm.tenant_id, &project.project_id)
+            .unwrap(),
+        Some(project)
     );
 }
 
