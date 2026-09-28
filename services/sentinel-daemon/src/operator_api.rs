@@ -6045,7 +6045,9 @@ mod tests {
         let layer = attach_test_fs_layer(&mut state);
         let agent = fs_agent_dir_for_name(&state, "Test Agent").unwrap();
         let (parent, name) = fs_parent_and_name(&layer, &agent, "existing.txt").unwrap();
-        let inode = layer.write_file(&agent, parent, &name, b"employee work", 0o644).unwrap();
+        let inode = layer
+            .write_file(&agent, parent, &name, b"employee work", 0o644)
+            .unwrap();
         let before = layer.lookup_inode(&agent, inode).unwrap().unwrap();
         let response = handle_http_request(
             test_request(
@@ -6059,9 +6061,18 @@ mod tests {
             &state,
         );
         assert_eq!(response.status, 503);
-        assert_eq!(layer.lookup_dirent(&agent, parent, &name).unwrap(), Some(inode));
-        assert_eq!(layer.lookup_inode(&agent, inode).unwrap().unwrap().hash, before.hash);
-        assert_eq!(layer.meta().get_trash_timestamp(&before.hash).unwrap(), None);
+        assert_eq!(
+            layer.lookup_dirent(&agent, parent, &name).unwrap(),
+            Some(inode)
+        );
+        assert_eq!(
+            layer.lookup_inode(&agent, inode).unwrap().unwrap().hash,
+            before.hash
+        );
+        assert_eq!(
+            layer.meta().get_trash_timestamp(&before.hash).unwrap(),
+            None
+        );
     }
 
     #[test]
