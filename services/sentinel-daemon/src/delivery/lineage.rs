@@ -752,6 +752,11 @@ impl PublicDeliveryLineageDtoV1 {
             lookup.insert(format!("manifest:{}", manifest.manifest_id), id);
         }
 
+        let superseded_qa_runs = aggregate
+            .qa_runs
+            .values()
+            .filter_map(|run| run.supersedes.as_ref().map(|previous| previous.id.as_str()))
+            .collect::<BTreeSet<_>>();
         for run in aggregate.qa_runs.values() {
             let key = format!("qa-run:{}", run.run_id);
             let digest = ContentDigest::of_domain("qa-run-lineage", DELIVERY_SCHEMA_V1, run)?;
@@ -767,13 +772,15 @@ impl PublicDeliveryLineageDtoV1 {
                 None,
             )?;
             lookup.insert(key, id);
-            if matches!(
-                run.state,
-                QaRunState::CompletedFail
-                    | QaRunState::HarnessError
-                    | QaRunState::NeedsHumanReview
-                    | QaRunState::Quarantined
-            ) {
+            if !superseded_qa_runs.contains(run.run_id.as_str())
+                && matches!(
+                    run.state,
+                    QaRunState::CompletedFail
+                        | QaRunState::HarnessError
+                        | QaRunState::NeedsHumanReview
+                        | QaRunState::Quarantined
+                )
+            {
                 blockers.insert("Independent QA has no promotable result".to_string());
             }
         }
