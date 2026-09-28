@@ -210,7 +210,14 @@ sudo install -o root -g root -m 0644 \
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
   "bubblewrap=${bwrap_version}" \
-  libcap2-bin
+  libcap2-bin util-linux
+
+for helper in /usr/bin/nsenter /usr/bin/mount; do
+  if [ ! -f "${helper}" ] || [ -L "${helper}" ] || [ ! -x "${helper}" ]; then
+    echo "ERROR: required native namespace helper is unavailable" >&2
+    exit 1
+  fi
+done
 
 installed_version="$(dpkg-query -W -f='${Version}' bubblewrap)"
 if [ "${installed_version}" != "${bwrap_version}" ]; then
