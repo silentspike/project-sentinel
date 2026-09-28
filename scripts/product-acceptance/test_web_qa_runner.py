@@ -25,14 +25,17 @@ def load_runner():
 
 
 class WebQaRunnerTests(unittest.TestCase):
-    def run_candidate(self, files: dict[str, str]) -> tuple[int, dict[str, object]]:
+    def run_candidate(self, files: dict[str, str | bytes]) -> tuple[int, dict[str, object]]:
         module = load_runner()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for relative, content in files.items():
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
+                if isinstance(content, bytes):
+                    path.write_bytes(content)
+                else:
+                    path.write_text(content, encoding="utf-8")
             previous_argv = sys.argv
             output = io.StringIO()
             try:
@@ -86,6 +89,45 @@ class WebQaRunnerTests(unittest.TestCase):
         })
         self.assertEqual(code, 1)
         self.assertEqual(result["code"], "local_reference_missing")
+
+    def test_contact_actions_are_anchor_only_and_do_not_require_local_files(self) -> None:
+        code, result = self.run_candidate({
+            "index.html": (
+                "<html><head><title>Contact</title></head><body>"
+                '<a href="mailto:office@example.invalid?subject=Question">Email</a>'
+                '<a href="TEL:+49123456789">Phone</a></body></html>'
+            )
+        })
+        self.assertEqual(code, 0)
+        self.assertEqual(result["references"], 2)
+
+    def test_contact_resources_unknown_schemes_and_unsafe_actions_stay_denied(self) -> None:
+        for element in [
+            '<img src="mailto:office@example.invalid">',
+            '<link href="tel:+49123456789">',
+            '<a src="mailto:office@example.invalid">Email</a>',
+            '<a href="custom:local.txt">Custom</a>',
+            '<a href="mailto:">Empty</a>',
+            '<a href="tel://example.invalid/123">Remote</a>',
+            '<a href="mailto:office@example.invalid%0d%0aBCC:other@example.invalid">Email</a>',
+            '<a href="http://[invalid">Invalid</a>',
+            '<a href="javascript:alert(1)">Script</a>',
+            '<a href="//example.invalid/tracker">Network</a>',
+            '<a href="file:/private">File</a>',
+        ]:
+            with self.subTest(element=element):
+                code, result = self.run_candidate({
+                    "index.html": f"<html><head><title>Contact</title></head><body>{element}</body></html>"
+                })
+                self.assertEqual(code, 1)
+                self.assertEqual(result["code"], "external_or_unsafe_reference")
+                self.assertNotIn("example.invalid", json.dumps(result))
+
+    def test_invalid_utf8_is_reported_without_parser_exception_or_content(self) -> None:
+        code, result = self.run_candidate({"index.html": b"<html>\xffprivate</html>"})
+        self.assertEqual(code, 1)
+        self.assertEqual(result["code"], "html_invalid")
+        self.assertNotIn("private", json.dumps(result))
 
 
 class WorkItemGateRunnerTests(unittest.TestCase):
