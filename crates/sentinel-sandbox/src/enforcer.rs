@@ -1420,20 +1420,30 @@ impl SandboxEnforcer {
     pub fn start_workbench_process(
         &self,
         name: &str,
-        _fs_host_agent_dir: Option<&str>,
+        fs_host_agent_dir: Option<&str>,
         command: &[String],
     ) -> Result<AgentProcess> {
         if !self.bwrap_available {
             anyhow::bail!("bwrap not available — cannot start workbench process");
         }
-        // sentinel-fs is the normal agent-home view, but its POSIX surface does
-        // not own mutable workbench directories. Keep those roots on the
-        // persistent, agent-private host backing that setup_agent() creates.
+        // Receipts and input authority stay outside the writable employee view.
         let host_agent_root = workbench_host_agent_root(name);
         prepare_workbench_roots(&host_agent_root)?;
-        let config = BwrapConfig::for_agent(name)
+        let mut config = BwrapConfig::for_agent(name)
             .for_workbench()
             .with_workbench_roots(&host_agent_root);
+        if let Some(mount) = &self.fs_mount {
+            let agent_dir = fs_host_agent_dir.ok_or_else(|| {
+                anyhow!("chunk-backed workbench requires its exact agent namespace")
+            })?;
+            let workspace = prepare_chunk_workspace(Path::new(mount), agent_dir)?;
+            config = config.with_workbench_workspace(&workspace);
+            let commands = cgroups::prepare_workbench_cgroup(name)?;
+            config = config.with_command_boundary(
+                &commands,
+                sentinel_fs::layer::DEFAULT_WORKSPACE_BUDGET_BYTES,
+            );
+        }
         self.start_process_with_config(name, config, command, true)
     }
 
@@ -1950,6 +1960,44 @@ fn expire_protocol_cancel_if_due(
 /// Returns the expected path for the landlock-wrapper binary.
 ///
 /// Checks (in order): next to current executable, /opt/sentinel/bin/, /usr/local/bin/.
+fn prepare_chunk_workspace(mount: &Path, agent_dir: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        agent_dir.starts_with("AGENT-")
+            && !agent_dir[6..].is_empty()
+            && agent_dir[6..].bytes().all(|byte| byte.is_ascii_digit()),
+        "invalid chunk-backed agent namespace"
+    );
+    let mount = std::fs::canonicalize(mount).context("canonicalize chunk-backed mount")?;
+    let root = mount.join(agent_dir);
+    let metadata = std::fs::symlink_metadata(&root).context("inspect chunk-backed agent root")?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "agent namespace must be a real directory"
+    );
+    anyhow::ensure!(
+        std::fs::canonicalize(&root)?.parent() == Some(mount.as_path()),
+        "agent namespace escaped mount"
+    );
+    let workspace = root.join("workspaces");
+    match std::fs::symlink_metadata(&workspace) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "workspace must be a real directory"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&workspace)?
+        }
+        Err(error) => return Err(error).context("inspect chunk-backed workspace"),
+    }
+    anyhow::ensure!(
+        std::fs::canonicalize(&workspace)?.parent() == Some(root.as_path()),
+        "workspace escaped agent namespace"
+    );
+    std::fs::File::open(&workspace)?.sync_all()?;
+    std::fs::File::open(&root)?.sync_all()?;
+    Ok(workspace)
+}
+
 fn prepare_workbench_roots(host_agent_root: &Path) -> Result<()> {
     let parent = host_agent_root
         .parent()
@@ -2511,6 +2559,19 @@ mod tests {
                 "cgroup-only retry must not signal a reused numeric process target"
             );
         }
+    }
+
+    #[test]
+    fn chunk_workspace_is_agent_scoped_and_rejects_replaced_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("AGENT-01");
+        std::fs::create_dir(&root).unwrap();
+        let workspace = prepare_chunk_workspace(directory.path(), "AGENT-01").unwrap();
+        assert_eq!(workspace, root.join("workspaces"));
+        assert!(prepare_chunk_workspace(directory.path(), "AGENT-../foreign").is_err());
+        std::fs::remove_dir(&workspace).unwrap();
+        std::os::unix::fs::symlink(directory.path(), &workspace).unwrap();
+        assert!(prepare_chunk_workspace(directory.path(), "AGENT-01").is_err());
     }
 
     #[test]

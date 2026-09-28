@@ -851,6 +851,7 @@ pub struct BwrapNanoRuntime {
     /// constructor stays infallible and does no I/O (daemon/registry callers that
     /// never snapshot are unaffected).
     cas_dir: PathBuf,
+    shared_plane: Option<std::sync::Arc<ArtifactPlane>>,
     agent_home_root: PathBuf,
     fs_mount: Option<PathBuf>,
     workloads: HashMap<String, BwrapWorkloadState>,
@@ -872,6 +873,7 @@ impl BwrapNanoRuntime {
         Self {
             enforcer,
             cas_dir: cas_dir.into(),
+            shared_plane: None,
             agent_home_root: PathBuf::from(DEFAULT_AGENT_HOME_ROOT),
             fs_mount: None,
             workloads: HashMap::new(),
@@ -898,6 +900,11 @@ impl BwrapNanoRuntime {
         self.enforcer.set_fs_mount(mount);
     }
 
+    /// Share the daemon's content database instead of opening the same redb file twice.
+    pub fn set_artifact_plane(&mut self, plane: std::sync::Arc<ArtifactPlane>) {
+        self.shared_plane = Some(plane);
+    }
+
     #[cfg(test)]
     fn with_test_dirs(cas_dir: impl Into<PathBuf>, agent_home_root: impl Into<PathBuf>) -> Self {
         let mut runtime = Self::with_cas_dir(cas_dir);
@@ -908,10 +915,13 @@ impl BwrapNanoRuntime {
 
     /// Open (or create) the home-content `ArtifactPlane`. Called only on the
     /// snapshot/restore paths, so the constructor stays I/O-free.
-    fn open_plane(&self) -> Result<ArtifactPlane> {
+    fn open_plane(&self) -> Result<std::sync::Arc<ArtifactPlane>> {
+        if let Some(plane) = &self.shared_plane {
+            return Ok(std::sync::Arc::clone(plane));
+        }
         std::fs::create_dir_all(&self.cas_dir)
             .with_context(|| format!("create home CAS dir {}", self.cas_dir.display()))?;
-        ArtifactPlane::open(self.cas_dir.join("home.redb"))
+        ArtifactPlane::open(self.cas_dir.join("home.redb")).map(std::sync::Arc::new)
     }
 
     fn command_for(workload: &NanoWorkloadSpec) -> Vec<String> {
@@ -1341,6 +1351,7 @@ impl BwrapNanoRuntime {
                 // netns and post-Landlock exec evidence have all succeeded.
                 handle.landlock_applied = true;
                 handle.network_isolated = true;
+                handle.cgroup_id = cgroups::runtime_cgroup_id(&agent_name).or(handle.cgroup_id);
             }
             handle.bwrap_pid = Some(pid);
             transaction.process = Some(process);
@@ -1545,6 +1556,7 @@ impl BwrapNanoRuntime {
                 );
                 handle.landlock_applied = true;
                 handle.network_isolated = true;
+                handle.cgroup_id = cgroups::runtime_cgroup_id(agent_name).or(handle.cgroup_id);
                 Ok((handle, process))
             },
         )

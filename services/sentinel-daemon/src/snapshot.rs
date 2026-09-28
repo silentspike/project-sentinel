@@ -153,7 +153,7 @@ impl SnapshotManager {
         let fs_metadata = if fs_mount.is_some() {
             let layer =
                 fs_layer.ok_or_else(|| anyhow::anyhow!("sentinel-fs Layer nicht initialisiert"))?;
-            Some(layer.meta().dump_all_tables()?)
+            Some(layer.snapshot_metadata()?)
         } else {
             None
         };
@@ -186,6 +186,25 @@ impl SnapshotManager {
             nano_runtime_snapshots,
         };
 
+        // Pin physical reachability before the snapshot becomes a durable fact.
+        // Failed publication retains conservative orphan pins, never loses bytes.
+        if let (Some(layer), Some(dump)) = (fs_layer, snapshot.fs_metadata.as_ref()) {
+            let hashes = sentinel_fs::metadata::referenced_blob_hashes(dump);
+            layer.meta().pin_snapshot_blobs(&snapshot_id, &hashes)?;
+            let contents = sentinel_fs::metadata::referenced_workspace_content(dump);
+            if !contents.is_empty() {
+                let plane = layer.artifact_plane().ok_or_else(|| {
+                    anyhow::anyhow!("chunk-backed snapshot requires its content plane")
+                })?;
+                for content in contents {
+                    plane.retain_workspace(
+                        &workspace_snapshot_root(&snapshot_id, content.object_id),
+                        content,
+                    )?;
+                }
+            }
+        }
+
         // 6. Snapshot serialisieren + in Limbo speichern
         let bytes = encode_world_snapshot(&snapshot)?;
         let size = bytes.len();
@@ -197,13 +216,6 @@ impl SnapshotManager {
             last_event_id,
             &bytes,
         )?;
-
-        // #492: pin the CAS blobs this snapshot's FS metadata references, so Trash GC cannot delete
-        // them while the snapshot is retained (pointer manifest from inode hashes, not a blob copy).
-        if let (Some(layer), Some(dump)) = (fs_layer, snapshot.fs_metadata.as_ref()) {
-            let hashes = sentinel_fs::metadata::referenced_blob_hashes(dump);
-            layer.meta().pin_snapshot_blobs(&snapshot_id, &hashes)?;
-        }
 
         self.last_snapshot_tick = tick;
         // #529: erzwungener Shift-Anker erledigt — Flag zuruecksetzen (Intervall ab hier ab tick).
@@ -457,6 +469,18 @@ fn delete_redundant(
         );
         return Ok(());
     }
+    let workspace_refs = if fs_layer.is_some() {
+        let bytes = event_store.load_world_snapshot(&snap.id)?;
+        bytes
+            .as_deref()
+            .map(sentinel_common::decode_world_snapshot)
+            .transpose()?
+            .and_then(|snapshot| snapshot.fs_metadata)
+            .map(|dump| sentinel_fs::metadata::referenced_workspace_content(&dump))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     match event_store.delete_world_snapshot(&snap.id) {
         Ok(true) => {
             report.deleted += 1;
@@ -466,6 +490,16 @@ fn delete_redundant(
             if let Some(layer) = fs_layer {
                 if let Err(e) = layer.meta().unpin_snapshot_blobs(&snap.id) {
                     debug!(id = %snap.id, error = %e, "unpin_snapshot_blobs fehlgeschlagen");
+                }
+                if let Some(plane) = layer.artifact_plane() {
+                    for content in workspace_refs {
+                        if let Err(error) = plane.release_workspace(&workspace_snapshot_root(
+                            &snap.id,
+                            content.object_id,
+                        )) {
+                            debug!(id = %snap.id, %error, "workspace snapshot pin cleanup deferred");
+                        }
+                    }
                 }
             }
         }
@@ -478,6 +512,10 @@ fn delete_redundant(
         Err(e) => return Err(e),
     }
     Ok(())
+}
+
+fn workspace_snapshot_root(snapshot: &str, object: u64) -> String {
+    format!("world-snapshot/{snapshot}/workspace/{object}")
 }
 
 /// Ergebnis einer Maintenance-Operation.

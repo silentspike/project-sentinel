@@ -11,7 +11,7 @@ on:
       - '**/bun.lock'
       - 'rust-toolchain.toml'
   schedule:
-    - cron: '0 7 * * 1'  # Montag 07:00 UTC (nach Renovate um 06:00)
+    - cron: '17 7 * * *'  # Daily, after the Renovate inspection window.
   workflow_dispatch: {}
 
 concurrency:
@@ -75,15 +75,24 @@ jobs:
           test "$ACTUAL" = "$EXPECT" || { echo "::error::rustc $ACTUAL != $EXPECT"; exit 1; }
 
       - name: Install cargo-outdated
-        run: cargo install cargo-outdated --locked 2>/dev/null || true
+        run: cargo install cargo-outdated --locked
 
       - name: Check outdated dependencies
         run: |
           echo "## Rust Dependencies" >> "$GITHUB_STEP_SUMMARY"
-          OUTPUT=$(cargo outdated --root-deps-only --depth 1 2>&1) || true
+          if OUTPUT=$(cargo outdated --root-deps-only --depth 1 2>&1); then
+            STATUS=0
+          else
+            STATUS=$?
+          fi
+          printf '%s\n' "$OUTPUT"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Rust freshness inspection failed with exit code $STATUS."
+            exit "$STATUS"
+          fi
 
           # Fail nur bei MAJOR version gaps (semver-inkompatibel)
           MAJOR_OUTDATED=$(echo "$OUTPUT" | grep -E '^\S' | grep -v '^Name' | grep -v '^---' | awk '{
@@ -104,23 +113,48 @@ jobs:
           fi
 
   go-deps:
-    name: Go Dependencies
+    name: Go Dependencies (${{ matrix.module }})
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - cmd/cortex-gateway
+          - pkg/sentinel-go
+          - services/sentinel-judge
+          - services/sentinel-nats-bridge
     runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
         with:
-          go-version-file: cmd/cortex-gateway/go.mod
-          cache-dependency-path: cmd/cortex-gateway/go.sum
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: |
+            cmd/cortex-gateway/go.sum
+            pkg/sentinel-go/go.sum
+            services/sentinel-judge/go.sum
+            services/sentinel-nats-bridge/go.sum
 
       - name: Check outdated Go modules
+        working-directory: ${{ matrix.module }}
+        env:
+          GO_MODULE: ${{ matrix.module }}
         run: |
-          echo "## Go Dependencies" >> "$GITHUB_STEP_SUMMARY"
-          cd cmd/cortex-gateway
-          OUTPUT=$(go list -m -u all 2>&1 | grep '\[' || echo "Alle Go-Module aktuell.") || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if OUTPUT=$(go list -m -u all 2>&1); then
+            STATUS=0
+          else
+            STATUS=$?
+          fi
+          printf '%s\n' "$OUTPUT"
+          {
+            echo "## Go Dependencies ($GO_MODULE)"
+            echo '```'
+            printf '%s\n' "$OUTPUT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Go freshness check failed for $GO_MODULE with exit code $STATUS."
+          fi
+          exit "$STATUS"
 
   bun-deps:
     name: Console Dependencies
@@ -137,7 +171,16 @@ jobs:
         run: |
           echo "## Console Dependencies" >> "$GITHUB_STEP_SUMMARY"
           bun install --frozen-lockfile
-          OUTPUT=$(bun outdated 2>&1 || echo "Alle Packages aktuell.") || true
+          if OUTPUT=$(bun outdated 2>&1); then
+            STATUS=0
+          else
+            STATUS=$?
+          fi
+          printf '%s\n' "$OUTPUT"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Console freshness inspection failed with exit code $STATUS."
+            exit "$STATUS"
+          fi

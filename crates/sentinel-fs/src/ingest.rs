@@ -16,19 +16,13 @@
 //! ```
 
 use crate::artifact::{
-    ArtifactPlane, ChunkHash, IngestSessionState, ObjectMetadata, FS_CHUNKS, FS_CHUNK_REFCOUNT,
+    ArtifactPlane, IngestSessionState, ObjectMetadata, FS_CHUNKS, FS_CHUNK_REFCOUNT,
     FS_INGEST_SESSIONS, FS_MANIFESTS, FS_OBJECTS,
 };
 use crate::chunker::chunk_data;
-use crate::segment::ChunkLocation;
-use rayon::prelude::*;
-use redb::{ReadableDatabase, ReadableTable};
+use redb::ReadableTable;
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
-
-/// Minimum number of new (non-dedup) chunks to justify rayon parallel compression.
-/// Below this threshold, serial compression is faster due to thread-pool overhead.
-const PARALLEL_COMPRESS_THRESHOLD: usize = 32;
 
 /// zstd compression level for chunk storage.
 const ZSTD_LEVEL: i32 = 3;
@@ -112,108 +106,31 @@ pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
         object_id,
         ..
     } = session;
-
-    // Chunk the data
-    let chunks: Vec<_> = chunk_data(&buffer).collect();
-    let total_size = buffer.len() as u64;
-    let chunk_count = chunks.len() as u32;
-
-    // Pre-check which chunks already exist (read-only transaction, no fsync).
-    // This avoids expensive zstd compression for chunks that are already stored.
-    let existing_chunks = {
-        let rtxn = plane.db.begin_read()?;
-        let chunks_table = rtxn.open_table(FS_CHUNKS)?;
-        let mut set = std::collections::HashSet::with_capacity(chunks.len());
-        for chunk in &chunks {
-            if chunks_table.get(&chunk.hash)?.is_some() {
-                set.insert(chunk.hash);
-            }
-        }
-        set
-    };
-
-    // Compress new chunks — parallel if enough work to justify thread-pool overhead
-    let chunk_entries = compress_chunks_adaptive(&chunks, &existing_chunks);
-    let manifest: Vec<ChunkHash> = chunk_entries.iter().map(|(h, _)| *h).collect();
-    let manifest_bytes =
-        serde_json::to_vec(&manifest).map_err(|e| anyhow::anyhow!("manifest serialize: {e}"))?;
-
-    // SHA-256 of the original source data (pre-chunking)
-    let sha256: [u8; 32] = Sha256::digest(&buffer).into();
-    let meta = ObjectMetadata::new(total_size, &mime, chunk_count, sha256);
-    let meta_bytes = meta.serialize()?;
-
-    // Phase 1: Append new chunks to segment store (outside redb txn).
-    // If we crash here, dead bytes in the segment file — GC reclaims them.
-    let mut chunk_locations: Vec<(ChunkHash, Option<ChunkLocation>)> =
-        Vec::with_capacity(chunk_entries.len());
-    {
-        let mut segments = plane
-            .segments
-            .lock()
-            .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        for (hash, compressed) in &chunk_entries {
-            if let Some(data) = compressed {
-                let loc = segments.append(data)?;
-                chunk_locations.push((*hash, Some(loc)));
-            } else {
-                chunk_locations.push((*hash, None)); // already exists (dedup)
-            }
-        }
-    }
-
-    // Phase 2: Atomic redb transaction: index entries + manifest + metadata + session cleanup
-    let wtxn = plane.begin_write()?;
-    {
-        let mut chunks_table = wtxn.open_table(FS_CHUNKS)?;
-        let mut refcount_table = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
-        let mut manifests_table = wtxn.open_table(FS_MANIFESTS)?;
-        let mut objects_table = wtxn.open_table(FS_OBJECTS)?;
-        let mut sessions_table = wtxn.open_table(FS_INGEST_SESSIONS)?;
-
-        // 1. Store new chunk index entries + 2. Increment refcounts for all
-        for (hash, loc) in &chunk_locations {
-            if let Some(loc) = loc {
-                let loc_bytes = loc.to_bytes();
-                chunks_table.insert(hash, loc_bytes.as_slice())?;
-            }
-            let current = refcount_table.get(hash)?.map(|g| g.value()).unwrap_or(0);
-            refcount_table.insert(hash, current + 1)?;
-        }
-
-        // 3. Write manifest
-        manifests_table.insert(object_id, manifest_bytes.as_slice())?;
-
-        // 4. Write object metadata
-        objects_table.insert(object_id, meta_bytes.as_slice())?;
-
-        // 5. Remove session entry (no longer .part, now fully committed)
-        sessions_table.remove(object_id)?;
-    }
-    wtxn.commit()?;
-
+    anyhow::ensure!(object_id != 0, "ingest session id allocation failed");
+    let txn = plane.begin_write()?;
+    store_object(plane, &txn, object_id, &buffer, &mime)?;
+    txn.open_table(FS_INGEST_SESSIONS)?.remove(object_id)?;
+    plane
+        .segments
+        .lock()
+        .map_err(|e| anyhow::anyhow!("segment lock: {e}"))?
+        .sync()?;
+    txn.commit()?;
     Ok(object_id)
 }
 
-/// Abort the session. Removes the FS_INGEST_SESSIONS entry and drops buffered data.
-/// The .part file disappears from the FUSE layer.
+/// Abort the session and remove its .part entry.
 pub fn abort_ingest(session: IngestSession<'_>) {
     let _ = session.plane.remove_session(session.object_id);
-    // Buffer is dropped automatically — no chunk data was written to DB.
 }
 
-/// Prepared data for one object in a batch (post-chunking, pre-commit).
 struct PreparedIngest {
-    chunk_entries: Vec<(ChunkHash, Option<Vec<u8>>)>,
-    manifest_bytes: Vec<u8>,
-    meta_bytes: Vec<u8>,
+    data: Vec<u8>,
+    mime: String,
 }
 
-/// Batch ingest: accumulate multiple objects, commit all in one transaction.
-///
-/// This amortizes the fsync cost across N objects: instead of N separate
-/// write transactions (each with its own fsync), we do chunking + compression
-/// up front, then write everything in a single atomic transaction.
+/// Batch ingest: chunk and compress under the publication transaction so both
+/// intra-batch and concurrent dedup happen before compression or chunk copies.
 pub struct BatchIngest<'a> {
     plane: &'a ArtifactPlane,
     prepared: Vec<PreparedIngest>,
@@ -227,155 +144,90 @@ impl<'a> BatchIngest<'a> {
         }
     }
 
-    /// Add data to the batch. Chunking and compression happen immediately;
-    /// the DB write is deferred until `commit()`.
+    /// Retain input for deferred publication. Chunk bytes are borrowed at commit.
     pub fn add(&mut self, data: &[u8], mime: impl Into<String>) -> anyhow::Result<()> {
-        let mime = mime.into();
-        let chunks: Vec<_> = chunk_data(data).collect();
-        let total_size = data.len() as u64;
-        let chunk_count = chunks.len() as u32;
-
-        // Pre-check existing chunks
-        let existing_chunks = {
-            let rtxn = self.plane.db.begin_read()?;
-            let chunks_table = rtxn.open_table(FS_CHUNKS)?;
-            let mut set = std::collections::HashSet::with_capacity(chunks.len());
-            for chunk in &chunks {
-                if chunks_table.get(&chunk.hash)?.is_some() {
-                    set.insert(chunk.hash);
-                }
-            }
-            set
-        };
-
-        let chunk_entries = compress_chunks_adaptive(&chunks, &existing_chunks);
-
-        let manifest: Vec<ChunkHash> = chunk_entries.iter().map(|(h, _)| *h).collect();
-        let manifest_bytes = serde_json::to_vec(&manifest)
-            .map_err(|e| anyhow::anyhow!("manifest serialize: {e}"))?;
-
-        let sha256: [u8; 32] = Sha256::digest(data).into();
-        let meta = ObjectMetadata::new(total_size, &mime, chunk_count, sha256);
-        let meta_bytes = meta.serialize()?;
-
         self.prepared.push(PreparedIngest {
-            chunk_entries,
-            manifest_bytes,
-            meta_bytes,
+            data: data.to_vec(),
+            mime: mime.into(),
         });
         Ok(())
     }
 
-    /// Commit all prepared objects in a single write transaction (one fsync).
-    /// Returns the ObjectIds in the same order as `add()` calls.
+    /// Commit all objects in one transaction, syncing segment bytes first.
     pub fn commit(self) -> anyhow::Result<Vec<u64>> {
         if self.prepared.is_empty() {
             return Ok(Vec::new());
         }
-
-        // Allocate all ObjectIds first
-        let mut object_ids = Vec::with_capacity(self.prepared.len());
+        let mut ids = Vec::with_capacity(self.prepared.len());
         for _ in &self.prepared {
-            object_ids.push(self.plane.next_object_id()?);
+            ids.push(self.plane.next_object_id()?);
         }
-
-        // Phase 1: Append new chunks to segment store
-        let mut all_locations: Vec<Vec<(ChunkHash, Option<ChunkLocation>)>> =
-            Vec::with_capacity(self.prepared.len());
-        {
-            let mut segments = self
-                .plane
-                .segments
-                .lock()
-                .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-            for prep in &self.prepared {
-                let mut locs = Vec::with_capacity(prep.chunk_entries.len());
-                for (hash, compressed) in &prep.chunk_entries {
-                    if let Some(data) = compressed {
-                        let loc = segments.append(data)?;
-                        locs.push((*hash, Some(loc)));
-                    } else {
-                        locs.push((*hash, None));
-                    }
-                }
-                all_locations.push(locs);
-            }
+        let txn = self.plane.begin_write()?;
+        for (id, prepared) in ids.iter().zip(&self.prepared) {
+            store_object(self.plane, &txn, *id, &prepared.data, &prepared.mime)?;
         }
-
-        // Phase 2: Single redb write transaction for index + metadata
-        let wtxn = self.plane.begin_write()?;
-        {
-            let mut chunks_table = wtxn.open_table(FS_CHUNKS)?;
-            let mut refcount_table = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
-            let mut manifests_table = wtxn.open_table(FS_MANIFESTS)?;
-            let mut objects_table = wtxn.open_table(FS_OBJECTS)?;
-
-            for (i, locs) in all_locations.iter().enumerate() {
-                let oid = object_ids[i];
-
-                for (hash, loc) in locs {
-                    if let Some(loc) = loc {
-                        let loc_bytes = loc.to_bytes();
-                        chunks_table.insert(hash, loc_bytes.as_slice())?;
-                    }
-                    let current = refcount_table.get(hash)?.map(|g| g.value()).unwrap_or(0);
-                    refcount_table.insert(hash, current + 1)?;
-                }
-
-                manifests_table.insert(oid, self.prepared[i].manifest_bytes.as_slice())?;
-                objects_table.insert(oid, self.prepared[i].meta_bytes.as_slice())?;
-            }
-        }
-        wtxn.commit()?;
-
-        Ok(object_ids)
+        self.plane
+            .segments
+            .lock()
+            .map_err(|e| anyhow::anyhow!("segment lock: {e}"))?
+            .sync()?;
+        txn.commit()?;
+        Ok(ids)
     }
 }
 
-/// Compress chunks adaptively: parallel via rayon if enough new chunks, serial otherwise.
-///
-/// For small files (< 32 new chunks), the rayon thread-pool overhead exceeds
-/// the compression time. For large files (hundreds of chunks), parallel zstd
-/// on multiple cores gives significant speedup.
-fn compress_chunks_adaptive(
-    chunks: &[crate::chunker::Chunk],
-    existing: &std::collections::HashSet<ChunkHash>,
-) -> Vec<(ChunkHash, Option<Vec<u8>>)> {
-    // Count how many chunks actually need compression
-    let new_count = chunks
-        .iter()
-        .filter(|c| !existing.contains(&c.hash))
-        .count();
-
-    if new_count >= PARALLEL_COMPRESS_THRESHOLD {
-        // Parallel: enough work to justify rayon overhead
-        chunks
-            .par_iter()
-            .map(|chunk| {
-                if existing.contains(&chunk.hash) {
-                    (chunk.hash, None)
-                } else {
-                    (chunk.hash, Some(compress_chunk(&chunk.data)))
-                }
-            })
-            .collect()
-    } else {
-        // Serial: fast path for small files or mostly-dedup
-        chunks
-            .iter()
-            .map(|chunk| {
-                if existing.contains(&chunk.hash) {
-                    (chunk.hash, None)
-                } else {
-                    (chunk.hash, Some(compress_chunk(&chunk.data)))
-                }
-            })
-            .collect()
+/// Database transaction precedes the segment lock on every publication path.
+/// Inserting each index entry immediately also dedups repeated chunks in a file.
+fn store_object(
+    plane: &ArtifactPlane,
+    txn: &redb::WriteTransaction,
+    object_id: u64,
+    data: &[u8],
+    mime: &str,
+) -> anyhow::Result<()> {
+    let mut manifest = Vec::new();
+    {
+        let mut chunks = txn.open_table(FS_CHUNKS)?;
+        let mut counts = txn.open_table(FS_CHUNK_REFCOUNT)?;
+        let mut trash = txn.open_table(crate::artifact::FS_TRASH_QUEUE)?;
+        let mut iter = chunk_data(data);
+        while let Some(chunk) = iter.next_borrowed() {
+            if chunks.get(&chunk.hash)?.is_none() {
+                let compressed = compress_chunk(chunk.data);
+                let loc = plane
+                    .segments
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("segment lock: {e}"))?
+                    .append(&compressed)?;
+                chunks.insert(&chunk.hash, loc.to_bytes().as_slice())?;
+            }
+            let count = counts.get(&chunk.hash)?.map(|g| g.value()).unwrap_or(0);
+            counts.insert(
+                &chunk.hash,
+                count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("chunk refcount overflow"))?,
+            )?;
+            trash.remove(&chunk.hash)?;
+            manifest.push(chunk.hash);
+        }
     }
+    let sha256: [u8; 32] = Sha256::digest(data).into();
+    let meta = ObjectMetadata::new(
+        data.len() as u64,
+        mime,
+        u32::try_from(manifest.len())?,
+        sha256,
+    );
+    txn.open_table(FS_MANIFESTS)?
+        .insert(object_id, serde_json::to_vec(&manifest)?.as_slice())?;
+    txn.open_table(FS_OBJECTS)?
+        .insert(object_id, meta.serialize()?.as_slice())?;
+    Ok(())
 }
 
 /// Compress a chunk with zstd, falling back to raw if compression doesn't help.
-fn compress_chunk(data: &[u8]) -> Vec<u8> {
+pub(crate) fn compress_chunk(data: &[u8]) -> Vec<u8> {
     if data.len() >= MIN_COMPRESS_BYTES {
         if let Ok(compressed) = zstd::encode_all(Cursor::new(data), ZSTD_LEVEL) {
             if compressed.len() < data.len() {

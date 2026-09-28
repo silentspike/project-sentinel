@@ -1,5 +1,64 @@
 # Changelog
 
+- Inspect dependency freshness and proposed updates daily, including Actions
+  and transitive lockfile maintenance; retain existing CI and review gates.
+
+- Bind accepted Python and Node project families through Sales, planning,
+  assignment, model tool turns and delivery to exact released profiles. Keep
+  website compatibility and independent reviewers; native QA stages declared
+  read-only inputs and requires parent-observed behavioral assertions, not
+  syntax-only success or candidate-reported passing-test counters
+  (#856).
+
+- Construct native command namespaces through a bounded pre-Landlock launcher;
+  retain mandatory child Landlock and disabled user namespaces. Bind read-only
+  QA children to the evaluator's private token and cumulative cgroup limits,
+  and persist observed QA-stage results without exposing candidate output
+  (#856).
+
+- Bind observed QA inventories to reserved inputs through terminal adoption,
+  replay and delivery evidence; never signal a cached sandbox-init PID during
+  helper teardown (#856).
+
+- Keep the legacy trash diagnostic separate from retained workspace versions;
+  reject a probe over an existing employee file or private whiteout rather than
+  replacing it or exposing a previously renamed base file (#856).
+
+- Bind general Python and Node workbench profiles to the canonical release and
+  deployment preflight. Missing or altered profile artifacts fail closed while
+  existing customer profile bindings remain unchanged (#856).
+
+- Repair scheduled dependency automation, audit all Go modules and both Rust
+  locks, and propagate audit/freshness failures. Update Go crypto and Console
+  test/build dependencies; keep native-kernel acceptance separate from hosted
+  protocol and receipt tests (#856).
+
+- Update Rustls to the corrected TLS handshake implementation and Serde With
+  to its current patched release. Retain only the exact new syn macro-version
+  exception with a dated convergence review; advisory enforcement stays enabled.
+
+- Distinguish aggregate workspace quota rejection from per-file command limits
+  in deployment-kernel acceptance; use the actual mounted shell path and keep
+  command isolation clean under the pinned compiler's strict Clippy (#856).
+
+- Recover prepared workspace imports from verified durable namespace content
+  when native sources disappear across reboot. Reject inadmissible restore
+  budgets before publishing rollback snapshots or retention pins. Preserve
+  inode allocation identity across restore, account for live directory handles,
+  and keep open writable descriptors usable after unlink or chmod (#856).
+
+- Publish agent workspace updates as durable immutable chunk extents, deduplicate
+  shared bytes before storage, and retain content through explicit lifetime roots.
+  Add the writable POSIX adapter, exact per-agent inode mapping and shared
+  daemon/runtime content database. Native tools use the same private workspace;
+  trusted input and completion authorities remain separate (#856).
+
+- Run project commands through an additional irreversible child sandbox. Keep
+  writable assignment files separate from trusted completion receipts, exact
+  read-only inputs and other employees; fence parent signals and memory, clear
+  the environment and preserve actual interpreter failures for adaptive work
+  (#856).
+
 - Renew customer preview access through a short-lived, principal-bound durable
   grant to the same release and manifest. Preserve the original delivery receipt,
   exact retries and independent explicit customer acceptance (#856).

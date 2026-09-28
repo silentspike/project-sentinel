@@ -113,6 +113,9 @@ fn spawn_attested_runtime(
         Command::new(env!("CARGO_BIN_EXE_agent-runtime"))
             .env("SENTINEL_WORKSPACE_ROOT", workspace)
             .env("SENTINEL_ARTIFACT_ROOT", artifacts)
+            .env("SENTINEL_INPUT_ROOT", workspace.join(".inputs"))
+            .env_remove("SENTINEL_COMMAND_CGROUP_ROOT")
+            .env_remove("SENTINEL_WORKSPACE_BUDGET_BYTES")
             .env("SENTINEL_WORKBENCH_ATTESTATION_NONCE", &nonce)
             .env("SENTINEL_WORKBENCH_WRAPPER_VERSION", wrapper_version)
             .env(
@@ -256,7 +259,7 @@ fn write_request() -> WorkbenchRequest {
     .unwrap()
 }
 
-fn cancellable_command_request() -> WorkbenchRequest {
+fn unisolated_command_request() -> WorkbenchRequest {
     let mut request = write_request();
     request.invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2902".to_string();
     request.capabilities = BTreeSet::from(["command.run_allowlisted".to_string()]);
@@ -271,6 +274,70 @@ fn cancellable_command_request() -> WorkbenchRequest {
     };
     request.input_digest = request.canonical_digest().unwrap();
     request
+}
+
+#[test]
+fn production_executor_commands_fail_closed_without_outer_boundary_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let executor = WorkbenchExecutor::new(
+        directory.path().join("workspace"),
+        directory.path().join("artifacts"),
+    )
+    .with_command_runner(PathBuf::from(env!("CARGO_BIN_EXE_agent-runtime")));
+    let result = executor.execute(
+        unisolated_command_request(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    match result {
+        WorkbenchMessage::Result {
+            outcome,
+            error,
+            output,
+            ..
+        } => {
+            assert_eq!(outcome, WorkbenchOutcome::Failed);
+            assert_eq!(error.unwrap().code, "command_isolation_unavailable");
+            assert!(!output.contains_key("exit_code"));
+        }
+        other => panic!("expected fail-closed command result: {other:?}"),
+    }
+}
+
+#[test]
+fn startup_rejects_incomplete_command_boundary_before_readiness() {
+    let directory = tempfile::tempdir().unwrap();
+    for budget in [None, Some("0"), Some("not-a-number")] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-runtime"));
+        command
+            .env(
+                "SENTINEL_WORKBENCH_ATTESTATION_NONCE",
+                next_attestation_nonce(),
+            )
+            .env(
+                "SENTINEL_WORKSPACE_ROOT",
+                directory.path().join("workspace"),
+            )
+            .env("SENTINEL_ARTIFACT_ROOT", directory.path().join("artifacts"))
+            .env(
+                "SENTINEL_COMMAND_CGROUP_ROOT",
+                directory.path().join("not-a-cgroup"),
+            )
+            .env_remove("SENTINEL_WORKSPACE_BUDGET_BYTES")
+            .stdin(Stdio::null());
+        if let Some(budget) = budget {
+            command.env("SENTINEL_WORKSPACE_BUDGET_BYTES", budget);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(126));
+        assert!(
+            output.stdout.is_empty(),
+            "startup must not emit protocol readiness"
+        );
+        assert!(
+            !directory.path().join("artifacts").exists(),
+            "invalid boundary must not publish receipts"
+        );
+    }
 }
 
 fn prepare_completion_receipt_crash_state(
@@ -295,100 +362,174 @@ fn prepare_completion_receipt_crash_state(
     (request, receipt, temporary)
 }
 
-#[test]
-fn private_observation_protocol_restart_replays_failed_command_without_executing_it_again() {
-    let directory = tempfile::tempdir().unwrap();
-    let workspace = directory.path().join("workspace");
-    let artifacts = directory.path().join("artifacts");
-    let mut request = write_request();
-    request.capabilities = BTreeSet::from([
-        "command.run_allowlisted".into(),
-        sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into(),
-    ]);
-    request.command_policy = vec![sentinel_common::CommandRule {
-        program: "ls".into(),
-        required_arg_prefix: vec!["missing-directory".into()],
-        max_args: 1,
-    }];
-    request.tool = WorkbenchTool::RunCommand {
-        program: "ls".into(),
-        args: vec!["missing-directory".into()],
-    };
-    request.input_digest = request.canonical_digest().unwrap();
-    let (mut child, mut input, mut output) = spawn_attested_runtime(&workspace, &artifacts);
-    writeln!(
-        input,
-        "{}",
-        serde_json::to_string(&WorkbenchCommand::Execute {
-            request: Box::new(request.clone())
-        })
-        .unwrap()
-    )
-    .unwrap();
+fn send_runtime_command(input: &mut ChildStdin, command: &WorkbenchCommand) {
+    writeln!(input, "{}", serde_json::to_string(command).unwrap()).unwrap();
     input.flush().unwrap();
-    let mut original = None;
+}
+
+fn read_completed_result(
+    child: &mut Child,
+    output: &mut BufReader<ChildStdout>,
+    request: &WorkbenchRequest,
+) -> WorkbenchMessage {
+    let mut terminal = None;
     loop {
         let mut line = String::new();
-        read_runtime_line(&mut child, &mut output, &mut line);
+        read_runtime_line(child, output, &mut line);
         match serde_json::from_str::<WorkbenchMessage>(&line).unwrap() {
-            result @ WorkbenchMessage::Result { .. } => original = Some(result),
+            result @ WorkbenchMessage::Result { .. } => {
+                let WorkbenchMessage::Result {
+                    invocation_id,
+                    input_digest,
+                    ..
+                } = &result
+                else {
+                    unreachable!();
+                };
+                assert_eq!(invocation_id, &request.invocation_id);
+                assert_eq!(input_digest, &request.input_digest);
+                assert!(
+                    terminal.replace(result).is_none(),
+                    "duplicate terminal result"
+                );
+            }
             WorkbenchMessage::Progress {
+                invocation_id,
                 stage: sentinel_common::WorkbenchProgressStage::Completed,
                 ..
-            } => break,
+            } => {
+                assert_eq!(invocation_id, request.invocation_id);
+                return terminal.expect("Completed must follow the receipted result");
+            }
             WorkbenchMessage::Error { error, .. } => {
                 panic!("unexpected protocol failure: {}", error.code)
             }
-            _ => {}
-        }
-    }
-    drop(input);
-    assert!(child.wait().unwrap().success());
-    let original = original.unwrap();
-    let WorkbenchMessage::Result {
-        outcome,
-        output: feedback,
-        ..
-    } = &original
-    else {
-        unreachable!()
-    };
-    assert_eq!(*outcome, WorkbenchOutcome::Failed);
-    assert!(!feedback.get("stderr").unwrap().is_empty());
-    // A second execution would now succeed, but recovery must retain the first failure.
-    fs::create_dir_all(workspace.join("project-01/work-04/missing-directory")).unwrap();
-    let (mut child, mut input, mut output) = spawn_attested_runtime(&workspace, &artifacts);
-    writeln!(
-        input,
-        "{}",
-        serde_json::to_string(&WorkbenchCommand::Recover {
-            schema_version: WORKBENCH_SCHEMA_VERSION,
-            invocation_id: request.invocation_id,
-            input_digest: request.input_digest
-        })
-        .unwrap()
-    )
-    .unwrap();
-    input.flush().unwrap();
-    let mut recovered = None;
-    loop {
-        let mut line = String::new();
-        read_runtime_line(&mut child, &mut output, &mut line);
-        match serde_json::from_str::<WorkbenchMessage>(&line).unwrap() {
-            result @ WorkbenchMessage::Result { .. } => recovered = Some(result),
-            WorkbenchMessage::Progress {
-                stage: sentinel_common::WorkbenchProgressStage::Completed,
-                ..
-            } => break,
-            WorkbenchMessage::Error { error, .. } => {
-                panic!("unexpected recovery failure: {}", error.code)
+            WorkbenchMessage::Cancelled { .. } => {
+                panic!("cancellation must not acknowledge before the receipted result")
             }
             _ => {}
         }
     }
+}
+
+fn assert_private_observation_restart_replay(
+    workspace: &Path,
+    artifacts: &Path,
+    request: &WorkbenchRequest,
+    change_workspace: impl FnOnce(),
+) -> WorkbenchMessage {
+    let (child, mut input, mut output) = spawn_attested_runtime(workspace, artifacts);
+    let mut child = ChildCleanup::new(child);
+    send_runtime_command(
+        &mut input,
+        &WorkbenchCommand::Execute {
+            request: Box::new(request.clone()),
+        },
+    );
+    let original = read_completed_result(&mut child, &mut output, request);
+    let receipt_path = artifacts
+        .join(".workbench-receipts")
+        .join(format!("{}.json", request.invocation_id));
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["schema_version"], 3);
+    let observation: sentinel_common::WorkbenchPrivateObservation =
+        serde_json::from_value(receipt["observation"].clone()).unwrap();
+    observation.validate_result(&original).unwrap();
     drop(input);
     assert!(child.wait().unwrap().success());
-    assert_eq!(recovered, Some(original));
+    change_workspace();
+    let (child, mut input, mut output) = spawn_attested_runtime(workspace, artifacts);
+    let mut child = ChildCleanup::new(child);
+    send_runtime_command(
+        &mut input,
+        &WorkbenchCommand::Recover {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+        },
+    );
+    let recovered = read_completed_result(&mut child, &mut output, request);
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(recovered, original);
+    original
+}
+
+#[test]
+fn private_observation_protocol_restart_replays_fail_closed_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let artifacts = directory.path().join("artifacts");
+    let mut request = unisolated_command_request();
+    request
+        .capabilities
+        .insert(sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into());
+    request.input_digest = request.canonical_digest().unwrap();
+    let result =
+        assert_private_observation_restart_replay(&workspace, &artifacts, &request, || {
+            fs::remove_dir_all(&workspace).unwrap();
+        });
+    let WorkbenchMessage::Result {
+        outcome,
+        output,
+        error: Some(error),
+        ..
+    } = result
+    else {
+        panic!("expected a receipted fail-closed command result");
+    };
+    assert_eq!(outcome, WorkbenchOutcome::Failed);
+    assert_eq!(error.code, "command_isolation_unavailable");
+    assert!(
+        output.is_empty(),
+        "no exec means no fabricated command feedback"
+    );
+    assert!(
+        !workspace.exists(),
+        "Recover must not execute or recreate the workspace"
+    );
+}
+
+#[test]
+fn private_observation_protocol_restart_replays_inspect_without_reading_changed_content() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let artifacts = directory.path().join("artifacts");
+    let scoped = workspace.join("project-01/work-04");
+    fs::create_dir_all(&scoped).unwrap();
+    let file = scoped.join("input.txt");
+    fs::write(&file, "original private content").unwrap();
+    let mut request = write_request();
+    request.capabilities = BTreeSet::from([
+        "file.inspect".into(),
+        sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into(),
+    ]);
+    request.tool = WorkbenchTool::InspectFile {
+        path: "input.txt".into(),
+        max_bytes: 1024,
+    };
+    request.input_digest = request.canonical_digest().unwrap();
+    let result =
+        assert_private_observation_restart_replay(&workspace, &artifacts, &request, || {
+            fs::write(&file, "changed after execution").unwrap();
+        });
+    let WorkbenchMessage::Result {
+        outcome,
+        output,
+        error,
+        ..
+    } = result
+    else {
+        panic!("expected a receipted file inspection result");
+    };
+    assert_eq!(outcome, WorkbenchOutcome::Succeeded);
+    assert!(error.is_none());
+    assert_eq!(
+        output.get("content").map(String::as_str),
+        Some("original private content")
+    );
+    assert_eq!(fs::read_to_string(file).unwrap(), "changed after execution");
 }
 
 #[test]
@@ -724,134 +865,82 @@ fn jsonl_process_handles_health_rejection_and_execution() {
     assert!(!diagnostics.contains("<!doctype html>"));
 }
 
-#[test]
-fn cancel_waits_for_the_receipted_result_instead_of_acknowledging_early() {
+fn assert_late_cancel_preserves_fail_closed_receipt(reason: &str) {
     let directory = tempfile::tempdir().unwrap();
-    let (mut child, mut input, mut output) = spawn_attested_runtime(
+    let (child, mut input, mut output) = spawn_attested_runtime(
         &directory.path().join("workspace"),
         &directory.path().join("artifacts"),
     );
-    let request = cancellable_command_request();
-    writeln!(
-        input,
-        "{}",
-        serde_json::to_string(&WorkbenchCommand::Execute {
+    let mut child = ChildCleanup::new(child);
+    let request = unisolated_command_request();
+    send_runtime_command(
+        &mut input,
+        &WorkbenchCommand::Execute {
             request: Box::new(request.clone()),
-        })
-        .unwrap()
-    )
-    .unwrap();
-    input.flush().unwrap();
-
-    let mut cancel_sent = false;
-    let mut cancelled_result = false;
-    let mut completed = false;
-    while !completed {
-        let mut line = String::new();
-        read_runtime_line(&mut child, &mut output, &mut line);
-        match serde_json::from_str::<WorkbenchMessage>(&line).unwrap() {
-            WorkbenchMessage::Progress {
-                stage: sentinel_common::WorkbenchProgressStage::Executing,
-                ..
-            } if !cancel_sent => {
-                writeln!(
-                    input,
-                    "{}",
-                    serde_json::to_string(&WorkbenchCommand::Cancel {
-                        schema_version: WORKBENCH_SCHEMA_VERSION,
-                        invocation_id: request.invocation_id.clone(),
-                        reason: "test_cancel".to_string(),
-                    })
-                    .unwrap()
-                )
-                .unwrap();
-                input.flush().unwrap();
-                cancel_sent = true;
-            }
-            WorkbenchMessage::Result {
-                outcome: WorkbenchOutcome::Cancelled,
-                ..
-            } => cancelled_result = true,
-            WorkbenchMessage::Progress {
-                stage: sentinel_common::WorkbenchProgressStage::Completed,
-                ..
-            } => completed = true,
-            WorkbenchMessage::Cancelled { .. } => {
-                panic!("cancel must not acknowledge before the receipted result")
-            }
-            _ => {}
-        }
+        },
+    );
+    let original = read_completed_result(&mut child, &mut output, &request);
+    assert!(matches!(
+        &original,
+        WorkbenchMessage::Result { outcome: WorkbenchOutcome::Failed, error: Some(error), output, .. }
+            if error.code == "command_isolation_unavailable" && output.is_empty()
+    ));
+    let receipt = directory
+        .path()
+        .join("artifacts/.workbench-receipts")
+        .join(format!("{}.json", request.invocation_id));
+    let original_receipt = fs::read(&receipt).unwrap();
+    send_runtime_command(
+        &mut input,
+        &WorkbenchCommand::Cancel {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            reason: reason.into(),
+        },
+    );
+    // FIFO Health is a barrier proving Cancel was processed, not a timing guess.
+    send_runtime_command(
+        &mut input,
+        &WorkbenchCommand::Health {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            request_id: "after-late-cancel".into(),
+        },
+    );
+    let mut line = String::new();
+    read_runtime_line(&mut child, &mut output, &mut line);
+    match serde_json::from_str::<WorkbenchMessage>(&line).unwrap() {
+        WorkbenchMessage::Health {
+            request_id,
+            healthy: true,
+            ..
+        } if request_id == "after-late-cancel" => {}
+        other => panic!("late Cancel must not emit another terminal message: {other:?}"),
     }
-    assert!(cancel_sent && cancelled_result);
+    send_runtime_command(
+        &mut input,
+        &WorkbenchCommand::Recover {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+        },
+    );
+    assert_eq!(
+        read_completed_result(&mut child, &mut output, &request),
+        original
+    );
+    assert_eq!(fs::read(receipt).unwrap(), original_receipt);
     drop(input);
     assert!(child.wait().unwrap().success());
 }
 
 #[test]
-fn adapter_deadline_cancel_is_receipted_as_timed_out() {
-    let directory = tempfile::tempdir().unwrap();
-    let (mut child, mut input, mut output) = spawn_attested_runtime(
-        &directory.path().join("workspace"),
-        &directory.path().join("artifacts"),
-    );
-    let request = cancellable_command_request();
-    writeln!(
-        input,
-        "{}",
-        serde_json::to_string(&WorkbenchCommand::Execute {
-            request: Box::new(request.clone()),
-        })
-        .unwrap()
-    )
-    .unwrap();
-    input.flush().unwrap();
+fn late_cancel_preserves_receipted_command_isolation_failure() {
+    assert_late_cancel_preserves_fail_closed_receipt("test_cancel");
+}
 
-    let mut cancel_sent = false;
-    let mut timed_out = false;
-    let mut completed = false;
-    while !completed {
-        let mut line = String::new();
-        read_runtime_line(&mut child, &mut output, &mut line);
-        match serde_json::from_str::<WorkbenchMessage>(&line).unwrap() {
-            WorkbenchMessage::Progress {
-                stage: sentinel_common::WorkbenchProgressStage::Executing,
-                ..
-            } if !cancel_sent => {
-                writeln!(
-                    input,
-                    "{}",
-                    serde_json::to_string(&WorkbenchCommand::Cancel {
-                        schema_version: WORKBENCH_SCHEMA_VERSION,
-                        invocation_id: request.invocation_id.clone(),
-                        reason: "deadline_expired".to_string(),
-                    })
-                    .unwrap()
-                )
-                .unwrap();
-                input.flush().unwrap();
-                cancel_sent = true;
-            }
-            WorkbenchMessage::Result {
-                outcome: WorkbenchOutcome::TimedOut,
-                error: Some(error),
-                ..
-            } => {
-                assert_eq!(error.code, "deadline_expired");
-                timed_out = true;
-            }
-            WorkbenchMessage::Progress {
-                stage: sentinel_common::WorkbenchProgressStage::Completed,
-                ..
-            } => completed = true,
-            WorkbenchMessage::Cancelled { .. } => {
-                panic!("deadline cancel must be acknowledged by its receipted result")
-            }
-            _ => {}
-        }
-    }
-    assert!(cancel_sent && timed_out);
-    drop(input);
-    assert!(child.wait().unwrap().success());
+#[test]
+fn late_adapter_deadline_cancel_preserves_receipted_command_isolation_failure() {
+    assert_late_cancel_preserves_fail_closed_receipt("deadline_expired");
 }
 
 #[test]

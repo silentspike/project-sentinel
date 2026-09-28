@@ -5,7 +5,7 @@ use std::io::Read;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -40,50 +40,36 @@ pub struct SpawnedSandbox {
 }
 
 impl SpawnedSandbox {
-    /// Terminates both the sandboxed process and its bwrap supervisor.
+    /// Reaps the owned supervisor; --die-with-parent terminates its namespace.
     pub fn terminate(&mut self) {
-        terminate_sandbox_process(&mut self.child, self.child_pid);
+        terminate_sandbox_process(&mut self.child);
     }
 }
 
-pub(crate) fn terminate_sandbox_process(child: &mut Child, child_pid: Option<u32>) {
-    if let Some(pid) = child_pid {
-        signal_pid(pid, "TERM");
-    }
-
+pub(crate) fn terminate_sandbox_process(child: &mut Child) {
     match child.try_wait() {
         Ok(Some(_status)) => {}
         Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        Err(_) => {}
-    }
-
-    if let Some(pid) = child_pid {
-        for _ in 0..20 {
-            if !Path::new(&format!("/proc/{pid}")).exists() {
-                return;
+            // The unreaped supervisor owns this group ID. Never signal the
+            // cached init PID: it may already identify an unrelated process.
+            let group = match i32::try_from(child.id()) {
+                Ok(pid) => nix::unistd::Pid::from_raw(pid),
+                Err(_) => {
+                    warn!("sandbox supervisor PID exceeds pid_t");
+                    return;
+                }
+            };
+            match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => {
+                    if let Err(error) = child.wait() {
+                        warn!(%error, "sandbox supervisor could not be reaped");
+                    }
+                }
+                Err(error) => warn!(%error, "owned sandbox group could not be terminated"),
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
-        signal_pid(pid, "KILL");
-        for _ in 0..20 {
-            if !Path::new(&format!("/proc/{pid}")).exists() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        warn!(pid, "sandboxed child remained visible after SIGKILL");
+        Err(error) => warn!(%error, "sandbox supervisor state could not be queried"),
     }
-}
-
-fn signal_pid(pid: u32, signal: &str) {
-    let _ = Command::new("kill")
-        .args([format!("-{signal}"), pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 /// Bubblewrap sandbox configuration fuer einen einzelnen Agenten.
@@ -99,6 +85,8 @@ pub struct BwrapConfig {
     pub die_with_parent: bool,
     /// Clear the parent daemon environment before starting the sandbox.
     pub clear_environment: bool,
+    /// Trusted command-controller bind, never supplied by an employee request.
+    pub command_boundary: Option<(String, u64)>,
     /// Missing host binds are fatal for profiles whose isolation contract is
     /// defined by those exact paths (the agent workbench).
     pub require_all_binds: bool,
@@ -149,6 +137,7 @@ impl BwrapConfig {
             share_net: false,
             die_with_parent: true,
             clear_environment: false,
+            command_boundary: None,
             require_all_binds: false,
             // TOGAF: --proc /proc
             proc_mount: Some("/proc".to_string()),
@@ -199,6 +188,41 @@ impl BwrapConfig {
                 .into_owned(),
             "/artifacts".to_string(),
         ));
+        self
+    }
+
+    /// Route native tools and direct file tools through the same private FUSE workspace.
+    /// Inputs and trusted completion artifacts retain their separate host boundaries.
+    pub fn with_workbench_workspace(mut self, workspace: &Path) -> Self {
+        self.writable_binds
+            .retain(|(_, guest)| guest != "/workspace");
+        self.writable_binds.push((
+            workspace.to_string_lossy().into_owned(),
+            "/workspace".to_string(),
+        ));
+        self
+    }
+
+    pub fn with_command_boundary(mut self, commands: &Path, budget_bytes: u64) -> Self {
+        self.writable_binds.push((
+            commands.to_string_lossy().into_owned(),
+            "/run/sentinel-command-cgroups".to_owned(),
+        ));
+        if let Some(agent) = commands
+            .parent()
+            .filter(|_| commands.file_name() == Some(std::ffi::OsStr::new("commands")))
+        {
+            // Join before spawning the namespace broker so every trusted
+            // descendant starts inside the cumulative agent runtime leaf.
+            self.writable_binds.push((
+                agent
+                    .join("runtime/cgroup.procs")
+                    .to_string_lossy()
+                    .into_owned(),
+                "/run/sentinel-runtime-cgroup.procs".to_owned(),
+            ));
+        }
+        self.command_boundary = Some(("/run/sentinel-command-cgroups".to_owned(), budget_bytes));
         self
     }
 
@@ -267,6 +291,10 @@ impl BwrapConfig {
         let mut cmd = Command::new("bwrap");
         if config.clear_environment {
             cmd.env_clear().envs(WORKBENCH_ENVIRONMENT);
+            if let Some((root, budget)) = &config.command_boundary {
+                cmd.env("SENTINEL_COMMAND_CGROUP_ROOT", root)
+                    .env("SENTINEL_WORKSPACE_BUDGET_BYTES", budget.to_string());
+            }
         }
         cmd.args(&args)
             .stdin(std::process::Stdio::piped())
@@ -620,6 +648,49 @@ mod tests {
     }
 
     #[test]
+    fn termination_never_signals_a_cached_foreign_init_pid() {
+        let mut foreign = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+        let child = Command::new("/usr/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut spawned = SpawnedSandbox {
+            child,
+            child_pid: Some(foreign.id()),
+        };
+        spawned.terminate();
+        assert!(spawned.child.try_wait().unwrap().is_some());
+        spawned.terminate();
+        let foreign_status = foreign.try_wait().unwrap();
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        assert!(
+            foreign_status.is_none(),
+            "saved numeric PID must not be signaled"
+        );
+    }
+
+    #[test]
+    fn reaped_supervisor_never_authorizes_a_later_group_signal() {
+        let mut foreign = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+        let mut child = Command::new("/usr/bin/true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+        let mut spawned = SpawnedSandbox {
+            child,
+            child_pid: Some(foreign.id()),
+        };
+        spawned.terminate();
+        let foreign_status = foreign.try_wait().unwrap();
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        assert!(foreign_status.is_none());
+    }
+
+    #[test]
     fn togaf_readonly_binds() {
         // TOGAF: --ro-bind /work/company /company + System-Binaries
         let config = BwrapConfig::for_agent("test");
@@ -644,6 +715,29 @@ mod tests {
         assert!(args.contains(&"--bind".to_string()));
         assert!(args.contains(&"/ram/agents/test".to_string()));
         assert!(args.contains(&"/home/test".to_string()));
+    }
+
+    #[test]
+    fn chunk_workspace_replaces_only_the_writable_workspace_bind() {
+        let config = BwrapConfig::for_agent("test")
+            .for_workbench()
+            .with_workbench_roots(Path::new("/ram/agents/test"))
+            .with_workbench_workspace(Path::new("/sentinel-fs/AGENT-01/workspaces"));
+        let workspaces: Vec<_> = config
+            .writable_binds
+            .iter()
+            .filter(|(_, guest)| guest == "/workspace")
+            .collect();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].0, "/sentinel-fs/AGENT-01/workspaces");
+        assert!(config.writable_binds.contains(&(
+            "/ram/agents/test/artifacts".to_owned(),
+            "/artifacts".to_owned(),
+        )));
+        assert!(config.readonly_overlay_binds.contains(&(
+            "/ram/agents/test/inputs".to_owned(),
+            "/workspace/.inputs".to_owned(),
+        )));
     }
 
     #[test]
@@ -703,6 +797,34 @@ mod tests {
             workspace < inputs,
             "read-only input overlay must be mounted last"
         );
+    }
+
+    #[test]
+    fn command_controller_is_separate_from_employee_workspace_and_receipts() {
+        let config = BwrapConfig::for_agent("test")
+            .for_workbench()
+            .with_workbench_roots(Path::new("/ram/agents/test"))
+            .with_command_boundary(
+                Path::new("/sys/fs/cgroup/sentinel/test/commands"),
+                64 * 1024 * 1024,
+            );
+        assert_eq!(
+            config.command_boundary,
+            Some(("/run/sentinel-command-cgroups".into(), 64 * 1024 * 1024))
+        );
+        assert!(config.writable_binds.contains(&(
+            "/sys/fs/cgroup/sentinel/test/commands".into(),
+            "/run/sentinel-command-cgroups".into(),
+        )));
+        assert!(config.writable_binds.contains(&(
+            "/sys/fs/cgroup/sentinel/test/runtime/cgroup.procs".into(),
+            "/run/sentinel-runtime-cgroup.procs".into(),
+        )));
+        assert!(!config
+            .writable_binds
+            .iter()
+            .any(|(_, guest)| guest == "/sys/fs/cgroup"));
+        assert!(config.clear_environment);
     }
 
     #[test]
