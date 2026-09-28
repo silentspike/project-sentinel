@@ -79,6 +79,26 @@ enum BoundedJsonlRecord {
 }
 
 fn main() {
+    let hidden = env::args_os().nth(1);
+    let broker_result = match hidden.as_deref().and_then(std::ffi::OsStr::to_str) {
+        Some(agent_runtime::command_broker::BROKER_MODE) => Some(
+            agent_runtime::command_broker::run_broker(env::args_os().skip(2)),
+        ),
+        Some(agent_runtime::command_broker::CLIENT_MODE) => Some(
+            agent_runtime::command_broker::run_client(env::args_os().skip(2)),
+        ),
+        Some(agent_runtime::command_sandbox::QA_CHILD_MODE) => Some(
+            agent_runtime::command_sandbox::run_qa_child(env::args_os().skip(2)),
+        ),
+        _ => None,
+    };
+    if let Some(result) = broker_result {
+        if result.is_err() {
+            eprintln!("agent-runtime: namespace broker setup or protocol failed");
+            std::process::exit(126);
+        }
+        return;
+    }
     if env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(
             agent_runtime::command_sandbox::GATE_MODE,

@@ -35,12 +35,15 @@ use crate::workbench::{
     WorkbenchInvocationState, WorkbenchProfile,
 };
 
+use super::project_profiles::{ProjectFamily, ProjectProfileCatalog};
 use super::PrincipalAuthenticator;
 
 const DELIVERY_AUTHORITY_GENERATION: u64 = 1;
 const DELIVERY_EVENT_TOPIC: &str = "sentinel.delivery.events";
 const WEB_QA_PROGRAM: &str = "sentinel-web-qa";
 const WEB_QA_SOURCE: &[u8] = include_bytes!("../../../../deploy/scripts/web-qa-v1.py");
+const CODING_QA_PROGRAM: &str = "sentinel-coding-qa";
+const CODING_QA_SOURCE: &[u8] = include_bytes!("../../../../deploy/scripts/coding-qa-v1.py");
 const WORK_ITEM_GATE_PROGRAM: &str = "sentinel-work-item-gate";
 
 type M0QaEvidenceComponents = (
@@ -51,6 +54,22 @@ type M0QaEvidenceComponents = (
 
 pub(super) fn web_qa_runner_version() -> String {
     format!("{:x}", Sha256::digest(WEB_QA_SOURCE))
+}
+
+pub(super) fn qa_runner_version(family: ProjectFamily) -> String {
+    if family == ProjectFamily::Web {
+        web_qa_runner_version()
+    } else {
+        format!("{:x}", Sha256::digest(CODING_QA_SOURCE))
+    }
+}
+
+fn qa_suite_id(family: ProjectFamily) -> &'static str {
+    match family {
+        ProjectFamily::Web => "web-qa-v1",
+        ProjectFamily::Python => "python-qa-v1",
+        ProjectFamily::Node => "node-qa-v1",
+    }
 }
 
 fn verify_web_qa_runner(bytes: &[u8]) -> Result<(), DeliveryError> {
@@ -168,6 +187,8 @@ pub(super) struct WorkflowDeliveryIntegration {
     principals: Arc<PrincipalAuthenticator>,
     qa_profile: WorkbenchProfile,
     qa_profile_digest: String,
+    coding_qa_profile: Option<(WorkbenchProfile, String)>,
+    project_profiles: ProjectProfileCatalog,
     agent_capabilities: Arc<HashMap<AgentId, BTreeSet<String>>>,
     artifact_roots: Arc<HashMap<AgentId, PathBuf>>,
 }
@@ -180,15 +201,42 @@ impl WorkflowDeliveryIntegration {
         qa_profile_digest: String,
         agent_capabilities: Arc<HashMap<AgentId, BTreeSet<String>>>,
         artifact_roots: Arc<HashMap<AgentId, PathBuf>>,
+        coding_qa_profile: Option<(WorkbenchProfile, String)>,
+        project_profiles: ProjectProfileCatalog,
     ) -> Self {
         Self {
             workflow,
             principals,
             qa_profile,
             qa_profile_digest,
+            coding_qa_profile,
+            project_profiles,
             agent_capabilities,
             artifact_roots,
         }
+    }
+
+    fn qa_for_project(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+    ) -> anyhow::Result<(&WorkbenchProfile, &str, ProjectFamily)> {
+        let family = self
+            .project_profiles
+            .family(&project.governance.project_profile)
+            .map_err(|_| anyhow::anyhow!("QA project profile authority changed"))?;
+        let (profile, digest) = if family == ProjectFamily::Web {
+            (&self.qa_profile, self.qa_profile_digest.as_str())
+        } else {
+            self.coding_qa_profile
+                .as_ref()
+                .map(|(profile, digest)| (profile, digest.as_str()))
+                .ok_or_else(|| anyhow::anyhow!("native QA profile is unavailable"))?
+        };
+        anyhow::ensure!(
+            profile.id == family.technical_qa_profile(),
+            "QA profile family mismatch"
+        );
+        Ok((profile, digest, family))
     }
 
     fn qa_snapshot(
@@ -225,13 +273,16 @@ impl WorkflowDeliveryIntegration {
                     && value.principal.role == CompanyRoleV1::Qa
             })
             .ok_or_else(|| anyhow::anyhow!("QA principal is not current"))?;
+        let (qa_profile, qa_digest, _) = self.qa_for_project(&project)?;
         if participant.principal_id != principal.principal.principal_id
             || project.lifecycle_state != ProjectLifecycleStateV1::DeliveryCandidate
             || project
                 .work_items
                 .values()
                 .any(|work| work.state != CompanyWorkStateV1::Done)
-            || project.governance.project_profile.profile_id != "web-project-v1"
+            || participant.profile.profile_id != qa_profile.id
+            || participant.profile.digest != qa_digest
+            || participant.profile.generation != DELIVERY_AUTHORITY_GENERATION
         {
             anyhow::bail!("QA project authority is not current");
         }
@@ -240,7 +291,7 @@ impl WorkflowDeliveryIntegration {
             .get(&agent_id)
             .cloned()
             .unwrap_or_default()
-            .intersection(&self.qa_profile.capabilities)
+            .intersection(&qa_profile.capabilities)
             .cloned()
             .collect::<BTreeSet<_>>();
         if !capabilities.contains("test.run_profile") {
@@ -255,15 +306,15 @@ impl WorkflowDeliveryIntegration {
             assignment_version: project.version,
             credential_generation: principal.execution_authority.principal_generation,
             policy_digest: project.governance.project_profile.digest,
-            tool_profile: self.qa_profile.id.clone(),
-            tool_profile_digest: self.qa_profile_digest.clone(),
+            tool_profile: qa_profile.id.clone(),
+            tool_profile_digest: qa_digest.to_owned(),
             runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
             assignment_active: true,
             agent_capabilities: capabilities.clone(),
-            role_capabilities: self.qa_profile.capabilities.clone(),
+            role_capabilities: qa_profile.capabilities.clone(),
             assignment_capabilities: capabilities.clone(),
             project_capabilities: capabilities.clone(),
-            profile_capabilities: self.qa_profile.capabilities.clone(),
+            profile_capabilities: qa_profile.capabilities.clone(),
         })
     }
 
@@ -783,13 +834,27 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
         let qa_agent = qa.principal.agent_id.ok_or_else(|| {
             DeliveryError::AuthorityDenied("assigned QA has no runtime agent".to_string())
         })?;
-        let runner = std::fs::read("/usr/bin/sentinel-web-qa").map_err(|_| {
+        let (qa_profile, qa_digest, family) =
+            self.qa_for_project(&project).map_err(storage_error)?;
+        let program = if family == ProjectFamily::Web {
+            WEB_QA_PROGRAM
+        } else {
+            CODING_QA_PROGRAM
+        };
+        let runner = std::fs::read(format!("/usr/bin/{program}")).map_err(|_| {
             DeliveryError::AdapterUnavailable {
                 dependency: "qa_runner",
                 reason: "pinned QA runner is unavailable".to_string(),
             }
         })?;
-        verify_web_qa_runner(&runner)?;
+        if family == ProjectFamily::Web {
+            verify_web_qa_runner(&runner)?;
+        } else if runner != CODING_QA_SOURCE {
+            return Err(DeliveryError::AdapterUnavailable {
+                dependency: "qa_runner",
+                reason: "installed native QA runner differs from the pinned evaluator".to_owned(),
+            });
+        }
         let work_item_id = qa_work_item_id(&request.invocation.id).map_err(storage_error)?;
         let mut inputs = Vec::new();
         for artifact in &request.candidate_artifacts {
@@ -846,15 +911,28 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
             .map_err(storage_error)?;
         let deadline_unix_ms = request
             .started_at_ms
-            .checked_add(self.qa_profile.resource_ceilings.wall_time_ms)
+            .checked_add(qa_profile.resource_ceilings.wall_time_ms)
             .ok_or_else(|| {
                 DeliveryError::Validation("QA workbench deadline overflow".to_string())
             })?;
-        let input_paths = inputs
+        let mut input_paths = inputs
             .iter()
             .map(|input| input.mount_path.clone())
             .collect::<Vec<_>>();
-        let command_policy = vec![web_qa_command_rule(&input_paths)?];
+        if family != ProjectFamily::Web {
+            input_paths.insert(0, family.id().to_owned());
+        }
+        let command_policy = if family == ProjectFamily::Web {
+            vec![web_qa_command_rule(&input_paths)?]
+        } else {
+            vec![CommandRule {
+                program: program.to_owned(),
+                required_arg_prefix: input_paths.clone(),
+                max_args: u16::try_from(input_paths.len()).map_err(|_| {
+                    DeliveryError::Validation("native QA inventory exceeds its policy".to_owned())
+                })?,
+            }]
+        };
         let mut workbench_request = WorkbenchRequest {
             schema_version: WORKBENCH_SCHEMA_VERSION,
             invocation_id: request.invocation.id.clone(),
@@ -867,27 +945,27 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
             assignment_version: authority_snapshot.assignment_version,
             credential_generation: authority_snapshot.credential_generation,
             policy_digest: authority_snapshot.policy_digest.clone(),
-            tool_profile: self.qa_profile.id.clone(),
-            tool_profile_digest: self.qa_profile_digest.clone(),
+            tool_profile: qa_profile.id.clone(),
+            tool_profile_digest: qa_digest.to_owned(),
             runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
             capabilities: BTreeSet::from(["test.run_profile".to_string()]),
             output_artifact_kinds: BTreeSet::new(),
             inputs,
             command_policy,
             resource_limits: WorkbenchResourceLimits {
-                wall_time_ms: self.qa_profile.resource_ceilings.wall_time_ms,
-                cpu_time_ms: self.qa_profile.resource_ceilings.cpu_time_ms,
-                memory_bytes: self.qa_profile.resource_ceilings.memory_bytes,
-                process_count: self.qa_profile.resource_ceilings.process_count,
-                file_bytes: self.qa_profile.resource_ceilings.file_bytes,
-                stdout_bytes: self.qa_profile.resource_ceilings.stdout_bytes,
-                stderr_bytes: self.qa_profile.resource_ceilings.stderr_bytes,
+                wall_time_ms: qa_profile.resource_ceilings.wall_time_ms,
+                cpu_time_ms: qa_profile.resource_ceilings.cpu_time_ms,
+                memory_bytes: qa_profile.resource_ceilings.memory_bytes,
+                process_count: qa_profile.resource_ceilings.process_count,
+                file_bytes: qa_profile.resource_ceilings.file_bytes,
+                stdout_bytes: qa_profile.resource_ceilings.stdout_bytes,
+                stderr_bytes: qa_profile.resource_ceilings.stderr_bytes,
             },
             deadline_unix_ms,
             attempt: 1,
             tool: WorkbenchTool::RunTests {
-                suite_id: "web-qa-v1".to_string(),
-                program: WEB_QA_PROGRAM.to_string(),
+                suite_id: qa_suite_id(family).to_string(),
+                program: program.to_string(),
                 args: input_paths,
             },
             input_digest: String::new(),
@@ -977,74 +1055,84 @@ fn m0_qa_data_control() -> Result<DataControlV1, DeliveryError> {
     })
 }
 
-pub(super) fn m0_qa_fixture_cases() -> Result<Vec<QaDatasetCaseV1>, DeliveryError> {
+pub(super) fn qa_fixture_cases(
+    family: ProjectFamily,
+) -> Result<Vec<QaDatasetCaseV1>, DeliveryError> {
+    let suite_id = qa_suite_id(family);
     let source = SourceTupleV1 {
         owner: "project-sentinel".to_string(),
         source_type: "repository_fixture".to_string(),
-        id: "web-qa-v1".to_string(),
+        id: suite_id.to_string(),
         generation: 1,
-        digest: m0_qa_digest("web-qa-v1-source")?,
+        digest: m0_qa_digest(&format!("{suite_id}-source"))?,
     };
-    [
-        ("web-security", true, "security"),
-        ("web-structure", true, "structure"),
-        ("web-visual", false, "visual"),
-    ]
-    .into_iter()
-    .map(|(case_id, required, surface)| {
-        Ok(QaDatasetCaseV1 {
-            schema_version: DELIVERY_SCHEMA_V1,
-            case_id: case_id.to_string(),
-            generation: 1,
-            split: DatasetSplit::HiddenHoldout,
-            required,
-            required_class: if required {
-                "deterministic".to_string()
-            } else {
-                "optional".to_string()
-            },
-            slices: BTreeMap::from([("surface".to_string(), surface.to_string())]),
-            input_digest: m0_qa_digest(&format!("{case_id}-input"))?,
-            oracle_digest: m0_qa_digest(&format!("{case_id}-oracle"))?,
-            provenance: vec![source.clone()],
-            license: "project-sentinel-internal".to_string(),
-            access_policy_digest: m0_qa_digest("fixture-access-policy")?,
-            contamination_policy_digest: m0_qa_digest("fixture-contamination-policy")?,
-            retired_at_ms: None,
-            superseded_by: None,
-            data_control: m0_qa_data_control()?,
+    let cases = if family == ProjectFamily::Web {
+        [
+            ("web-security", true, "security"),
+            ("web-structure", true, "structure"),
+            ("web-visual", false, "visual"),
+        ]
+    } else {
+        [
+            ("coding-input-integrity", true, "inventory"),
+            ("coding-syntax", true, "syntax"),
+            ("coding-tests", true, "tests"),
+        ]
+    };
+    cases
+        .into_iter()
+        .map(|(case_id, required, surface)| {
+            Ok(QaDatasetCaseV1 {
+                schema_version: DELIVERY_SCHEMA_V1,
+                case_id: case_id.to_string(),
+                generation: 1,
+                split: DatasetSplit::HiddenHoldout,
+                required,
+                required_class: if required {
+                    "deterministic".to_string()
+                } else {
+                    "optional".to_string()
+                },
+                slices: BTreeMap::from([("surface".to_string(), surface.to_string())]),
+                input_digest: m0_qa_digest(&format!("{case_id}-input"))?,
+                oracle_digest: m0_qa_digest(&format!("{case_id}-oracle"))?,
+                provenance: vec![source.clone()],
+                license: "project-sentinel-internal".to_string(),
+                access_policy_digest: m0_qa_digest("fixture-access-policy")?,
+                contamination_policy_digest: m0_qa_digest("fixture-contamination-policy")?,
+                retired_at_ms: None,
+                superseded_by: None,
+                data_control: m0_qa_data_control()?,
+            })
         })
-    })
-    .collect()
+        .collect()
 }
 
 fn m0_qa_evidence_components(
+    family: ProjectFamily,
     run: &VersionedRefV1,
     plan_digest: &ContentDigest,
     harness_outcome: QaHarnessOutcome,
     output_digest: &ContentDigest,
     logs_digest: &ContentDigest,
+    native_outcomes: Option<[QaCaseOutcome; 3]>,
 ) -> Result<M0QaEvidenceComponents, DeliveryError> {
-    let cases = m0_qa_fixture_cases()?;
+    let cases = qa_fixture_cases(family)?;
     let outcome = match harness_outcome {
         QaHarnessOutcome::Pass => QaCaseOutcome::Pass,
         QaHarnessOutcome::Fail => QaCaseOutcome::Fail,
         QaHarnessOutcome::Error => QaCaseOutcome::Error,
     };
-    let reason_code = match outcome {
-        QaCaseOutcome::Pass => QaCaseReasonCode::Verified,
-        QaCaseOutcome::Fail => QaCaseReasonCode::AssertionFailed,
-        QaCaseOutcome::Error => QaCaseReasonCode::HarnessError,
-        _ => {
-            return Err(DeliveryError::Validation(
-                "M0 QA produced an unsupported outcome".to_string(),
-            ))
-        }
-    };
+    let outcomes = native_outcomes.unwrap_or([outcome; 3]);
     let deterministic_results = cases
         .iter()
         .filter(|case| case.required)
-        .map(|case| {
+        .zip(outcomes)
+        .filter(|(_, outcome)| {
+            native_outcomes.is_none()
+                || matches!(outcome, QaCaseOutcome::Pass | QaCaseOutcome::Fail)
+        })
+        .map(|(case, outcome)| {
             let case_digest =
                 ContentDigest::of_domain("qa-dataset-case", DELIVERY_SCHEMA_V1, case)?;
             Ok(QaDeterministicAssertionResultV1 {
@@ -1073,22 +1161,39 @@ fn m0_qa_evidence_components(
     let case_results = cases
         .iter()
         .filter(|case| case.required)
-        .zip(&deterministic_results)
-        .map(|(case, assertion)| {
+        .zip(outcomes)
+        .map(|(case, outcome)| {
+            let reason_code = match outcome {
+                QaCaseOutcome::Pass => QaCaseReasonCode::Verified,
+                QaCaseOutcome::Fail => QaCaseReasonCode::AssertionFailed,
+                QaCaseOutcome::Error => QaCaseReasonCode::HarnessError,
+                QaCaseOutcome::Unscored => QaCaseReasonCode::NeedsHumanReview,
+                _ => {
+                    return Err(DeliveryError::Validation(
+                        "unsupported native QA outcome".into(),
+                    ))
+                }
+            };
             let case_ref = VersionedRefV1 {
                 id: case.case_id.clone(),
                 generation: case.generation,
                 digest: ContentDigest::of_domain("qa-dataset-case", DELIVERY_SCHEMA_V1, case)?,
             };
-            let assertion_ref = VersionedRefV1 {
-                id: assertion.assertion_id.clone(),
-                generation: assertion.generation,
-                digest: ContentDigest::of_domain(
-                    "qa-deterministic-result",
-                    DELIVERY_SCHEMA_V1,
-                    assertion,
-                )?,
-            };
+            let assertion_refs = deterministic_results
+                .iter()
+                .filter(|assertion| assertion.assertion_id == format!("assertion-{}", case.case_id))
+                .map(|assertion| {
+                    Ok(VersionedRefV1 {
+                        id: assertion.assertion_id.clone(),
+                        generation: assertion.generation,
+                        digest: ContentDigest::of_domain(
+                            "qa-deterministic-result",
+                            DELIVERY_SCHEMA_V1,
+                            assertion,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, DeliveryError>>()?;
             let attempt = QaCaseAttemptEvidenceV1 {
                 schema_version: DELIVERY_SCHEMA_V1,
                 attempt_id: format!("attempt-{}-1", case.case_id),
@@ -1098,7 +1203,7 @@ fn m0_qa_evidence_components(
                 case_ref: case_ref.clone(),
                 outcome,
                 reason_code,
-                assertion_refs: vec![assertion_ref.clone()],
+                assertion_refs: assertion_refs.clone(),
                 attempt_digest: ContentDigest::zero(),
             }
             .seal()?;
@@ -1112,7 +1217,7 @@ fn m0_qa_evidence_components(
                 required: true,
                 reason_code,
                 sources: case.provenance.clone(),
-                assertion_refs: vec![assertion_ref],
+                assertion_refs,
                 grader_refs: vec![],
                 slices: case.slices.clone(),
                 attempts: 1,
@@ -1124,17 +1229,72 @@ fn m0_qa_evidence_components(
     Ok((cases, case_results, deterministic_results))
 }
 
-pub(super) fn m0_qa_evidence_graph(
+pub(super) fn qa_evidence_graph(
+    family: ProjectFamily,
     run: &VersionedRefV1,
     plan_digest: &ContentDigest,
     receipt: &WorkbenchEvidenceReceiptV1,
 ) -> Result<QaEvidenceGraphV1, DeliveryError> {
+    let native_outcomes = if family == ProjectFamily::Web {
+        None
+    } else {
+        // The existing receipt binds the complete inventory by digest. Recover
+        // only one of 64 bounded stage inventories, never infer all-ran from an
+        // aggregate exit status or mutate the shared delivery receipt schema.
+        let mut matched = None;
+        let choices = [
+            QaCaseOutcome::Pass,
+            QaCaseOutcome::Fail,
+            QaCaseOutcome::Error,
+            QaCaseOutcome::Unscored,
+        ];
+        for inventory in choices {
+            for syntax in choices {
+                for tests in choices {
+                    let outcomes = [inventory, syntax, tests];
+                    let (dataset_cases, case_results, deterministic_results) =
+                        m0_qa_evidence_components(
+                            family,
+                            run,
+                            plan_digest,
+                            receipt.harness_outcome,
+                            &receipt.output_digest,
+                            &receipt.logs_digest,
+                            Some(outcomes),
+                        )?;
+                    let inventory_digest = qa_evidence_inventory_digest(&QaEvidenceGraphV1 {
+                        schema_version: DELIVERY_SCHEMA_V1,
+                        run: run.clone(),
+                        workbench_receipt: VersionedRefV1 {
+                            id: receipt.invocation.id.clone(),
+                            generation: receipt.invocation.generation,
+                            digest: ContentDigest::zero(),
+                        },
+                        dataset_cases,
+                        case_results,
+                        deterministic_results,
+                        model_results: vec![],
+                        flake_dispositions: vec![],
+                        graph_digest: ContentDigest::zero(),
+                    })?;
+                    if inventory_digest == receipt.result_inventory_digest {
+                        matched = Some(outcomes);
+                    }
+                }
+            }
+        }
+        Some(matched.ok_or_else(|| {
+            DeliveryError::StaleEvidence("native QA result inventory is not bound".into())
+        })?)
+    };
     let (dataset_cases, case_results, deterministic_results) = m0_qa_evidence_components(
+        family,
         run,
         plan_digest,
         receipt.harness_outcome,
         &receipt.output_digest,
         &receipt.logs_digest,
+        native_outcomes,
     )?;
     QaEvidenceGraphV1 {
         schema_version: DELIVERY_SCHEMA_V1,
@@ -1154,11 +1314,21 @@ pub(super) fn m0_qa_evidence_graph(
     .seal()
 }
 
+#[cfg(test)]
+fn m0_qa_evidence_graph(
+    run: &VersionedRefV1,
+    plan_digest: &ContentDigest,
+    receipt: &WorkbenchEvidenceReceiptV1,
+) -> Result<QaEvidenceGraphV1, DeliveryError> {
+    qa_evidence_graph(ProjectFamily::Web, run, plan_digest, receipt)
+}
+
 fn qa_receipt(
     request: &WorkbenchEvidenceRequestV1,
     workbench_request: &WorkbenchRequest,
     record: &WorkbenchInvocationRecord,
 ) -> Result<WorkbenchEvidenceReceiptV1, DeliveryError> {
+    let family = qa_request_family(workbench_request)?;
     if record.invocation_id != workbench_request.invocation_id
         || record.request_digest != workbench_request.input_digest
         || record.agent_id != workbench_request.agent_id
@@ -1181,16 +1351,106 @@ fn qa_receipt(
             &(&record.state, &record.error),
         )?,
     };
-    let harness_outcome = match record.state {
-        WorkbenchInvocationState::Succeeded => crate::delivery::QaHarnessOutcome::Pass,
-        WorkbenchInvocationState::Failed => crate::delivery::QaHarnessOutcome::Fail,
-        WorkbenchInvocationState::Cancelled
-        | WorkbenchInvocationState::TimedOut
-        | WorkbenchInvocationState::UnknownOutcome => crate::delivery::QaHarnessOutcome::Error,
-        WorkbenchInvocationState::Reserved | WorkbenchInvocationState::Executing => {
-            return Err(DeliveryError::Storage(
-                "QA invocation is not terminal".to_string(),
-            ))
+    let native = if family == ProjectFamily::Web {
+        None
+    } else {
+        record.native_qa_status.as_ref()
+    };
+    if let Some(native) = native {
+        let expected_inputs =
+            sentinel_common::NativeQaInputBinding::from_request(workbench_request)
+                .map_err(|error| DeliveryError::StaleEvidence(error.into()))?;
+        if record.native_qa_inputs.as_ref() != Some(&expected_inputs) {
+            return Err(DeliveryError::StaleEvidence(
+                "native QA reserved input authority changed".into(),
+            ));
+        }
+        native
+            .validate_inputs(&expected_inputs)
+            .map_err(|error| DeliveryError::StaleEvidence(error.into()))?;
+        let outcome = match record.state {
+            WorkbenchInvocationState::Succeeded => sentinel_common::WorkbenchOutcome::Succeeded,
+            WorkbenchInvocationState::Failed => sentinel_common::WorkbenchOutcome::Failed,
+            _ => {
+                return Err(DeliveryError::StaleEvidence(
+                    "native QA terminal status changed".into(),
+                ))
+            }
+        };
+        let command = record
+            .command_status
+            .as_ref()
+            .ok_or_else(|| DeliveryError::MissingEvidence("native QA exit status".into()))?;
+        native
+            .validate_command(command)
+            .map_err(|error| DeliveryError::StaleEvidence(error.into()))?;
+        native
+            .validate(
+                &record.invocation_id,
+                &record.request_digest,
+                outcome,
+                command.exit_code,
+            )
+            .map_err(|error| DeliveryError::StaleEvidence(error.into()))?;
+        if native.progress.family != family.id()
+            || record.native_qa_suite.as_deref() != Some(qa_suite_id(family))
+        {
+            return Err(DeliveryError::StaleEvidence(
+                "native QA suite changed".into(),
+            ));
+        }
+    }
+    let required_cases_complete = if family == ProjectFamily::Web {
+        matches!(
+            record.state,
+            WorkbenchInvocationState::Succeeded | WorkbenchInvocationState::Failed
+        )
+    } else {
+        native.is_some_and(|status| status.complete())
+    };
+    let native_outcomes = if family == ProjectFamily::Web {
+        None
+    } else {
+        Some(
+            native
+                .map(|status| {
+                    [
+                        &status.progress.inventory,
+                        &status.progress.syntax,
+                        &status.progress.tests,
+                    ]
+                    .map(|stage| match stage.outcome {
+                        sentinel_common::NativeQaOutcome::Pass => QaCaseOutcome::Pass,
+                        sentinel_common::NativeQaOutcome::Fail => QaCaseOutcome::Fail,
+                        sentinel_common::NativeQaOutcome::Error => QaCaseOutcome::Error,
+                        sentinel_common::NativeQaOutcome::NotRun => QaCaseOutcome::Unscored,
+                    })
+                })
+                .unwrap_or([QaCaseOutcome::Error; 3]),
+        )
+    };
+    let harness_outcome = if family != ProjectFamily::Web {
+        match native.map(|status| status.progress.outcome) {
+            Some(sentinel_common::NativeQaOutcome::Pass) if required_cases_complete => {
+                QaHarnessOutcome::Pass
+            }
+            Some(sentinel_common::NativeQaOutcome::Fail) if required_cases_complete => {
+                QaHarnessOutcome::Fail
+            }
+            _ => QaHarnessOutcome::Error,
+        }
+    } else {
+        match record.state {
+            WorkbenchInvocationState::Succeeded => crate::delivery::QaHarnessOutcome::Pass,
+            WorkbenchInvocationState::Failed => crate::delivery::QaHarnessOutcome::Fail,
+            WorkbenchInvocationState::Cancelled
+            | WorkbenchInvocationState::TimedOut
+            | WorkbenchInvocationState::UnknownOutcome => crate::delivery::QaHarnessOutcome::Error,
+            WorkbenchInvocationState::Reserved | WorkbenchInvocationState::Executing => {
+                return Err(DeliveryError::Storage(
+                    "QA invocation is not terminal".to_string(),
+                ))
+            }
         }
     };
     let cleanup_receipt = VersionedRefV1 {
@@ -1207,17 +1467,32 @@ fn qa_receipt(
             ),
         )?,
     };
-    let logs_digest = ContentDigest::of_domain(
-        "qa-safe-log-summary",
-        DELIVERY_SCHEMA_V1,
-        &(&record.state, &record.error, &record.resources),
-    )?;
+    let logs_digest = if family == ProjectFamily::Web {
+        ContentDigest::of_domain(
+            "qa-safe-log-summary",
+            DELIVERY_SCHEMA_V1,
+            &(&record.state, &record.error, &record.resources),
+        )?
+    } else {
+        ContentDigest::of_domain(
+            "qa-safe-log-summary",
+            DELIVERY_SCHEMA_V1,
+            &(
+                &record.state,
+                &record.error,
+                &record.resources,
+                &record.native_qa_status,
+            ),
+        )?
+    };
     let (dataset_cases, case_results, deterministic_results) = m0_qa_evidence_components(
+        family,
         &request.qa_run,
         &request.qa_plan.digest,
         harness_outcome,
         &output_digest,
         &logs_digest,
+        native_outcomes,
     )?;
     let result_inventory_digest = qa_evidence_inventory_digest(&QaEvidenceGraphV1 {
         schema_version: DELIVERY_SCHEMA_V1,
@@ -1263,10 +1538,7 @@ fn qa_receipt(
             &(&record.state, &record.error),
         )?,
         harness_outcome,
-        required_cases_complete: matches!(
-            record.state,
-            WorkbenchInvocationState::Succeeded | WorkbenchInvocationState::Failed
-        ),
+        required_cases_complete,
         contaminated: false,
         needs_human_review: false,
         flaky_unresolved: false,
@@ -1274,6 +1546,40 @@ fn qa_receipt(
         receipt_digest: ContentDigest::zero(),
     }
     .seal()
+}
+
+fn qa_request_family(request: &WorkbenchRequest) -> Result<ProjectFamily, DeliveryError> {
+    let WorkbenchTool::RunTests {
+        suite_id,
+        program,
+        args,
+    } = &request.tool
+    else {
+        return Err(DeliveryError::Validation(
+            "QA request is not a declared suite".to_owned(),
+        ));
+    };
+    for family in [
+        ProjectFamily::Web,
+        ProjectFamily::Python,
+        ProjectFamily::Node,
+    ] {
+        let expected_program = if family == ProjectFamily::Web {
+            WEB_QA_PROGRAM
+        } else {
+            CODING_QA_PROGRAM
+        };
+        if suite_id == qa_suite_id(family)
+            && program == expected_program
+            && request.tool_profile == family.technical_qa_profile()
+            && (family == ProjectFamily::Web || args.first().is_some_and(|arg| arg == family.id()))
+        {
+            return Ok(family);
+        }
+    }
+    Err(DeliveryError::Validation(
+        "QA request family, profile and runner differ".to_owned(),
+    ))
 }
 
 #[derive(Clone)]
@@ -1337,6 +1643,14 @@ impl GateWorkbenchAuthority {
             anyhow::bail!("work-item gate QA authority is unavailable");
         }
         let principal = principal.expect("principal was checked above");
+        let (qa_profile, qa_digest, _) = self.gate.integration.qa_for_project(&project)?;
+        let participant = participant.expect("participant was checked above");
+        anyhow::ensure!(
+            participant.profile.profile_id == qa_profile.id
+                && participant.profile.digest == qa_digest
+                && participant.profile.generation == DELIVERY_AUTHORITY_GENERATION,
+            "work-item gate QA profile authority changed"
+        );
         let capabilities = self
             .gate
             .integration
@@ -1344,7 +1658,7 @@ impl GateWorkbenchAuthority {
             .get(&self.qa_agent)
             .cloned()
             .unwrap_or_default()
-            .intersection(&self.gate.integration.qa_profile.capabilities)
+            .intersection(&qa_profile.capabilities)
             .cloned()
             .collect::<BTreeSet<_>>();
         if !capabilities.contains("test.run_profile") {
@@ -1359,15 +1673,15 @@ impl GateWorkbenchAuthority {
             assignment_version: work.version,
             credential_generation: principal.execution_authority.principal_generation,
             policy_digest: project.governance.project_profile.digest,
-            tool_profile: self.gate.integration.qa_profile.id.clone(),
-            tool_profile_digest: self.gate.integration.qa_profile_digest.clone(),
+            tool_profile: qa_profile.id.clone(),
+            tool_profile_digest: qa_digest.to_owned(),
             runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
             assignment_active: true,
             agent_capabilities: capabilities.clone(),
-            role_capabilities: self.gate.integration.qa_profile.capabilities.clone(),
+            role_capabilities: qa_profile.capabilities.clone(),
             assignment_capabilities: capabilities.clone(),
             project_capabilities: capabilities,
-            profile_capabilities: self.gate.integration.qa_profile.capabilities.clone(),
+            profile_capabilities: qa_profile.capabilities.clone(),
         })
     }
 }
@@ -1430,6 +1744,10 @@ impl GateEvidencePort for WorkflowWorkItemGate {
             .company_project(&work.tenant_id, &work.project_id)
             .map_err(|_| WorkflowPortError::AuthorityConflict)?
             .ok_or(WorkflowPortError::AuthorityConflict)?;
+        let (qa_profile, qa_digest, family) = self
+            .integration
+            .qa_for_project(&project)
+            .map_err(|_| WorkflowPortError::AuthorityConflict)?;
         let qa_bindings = project
             .governance
             .participants
@@ -1511,32 +1829,48 @@ impl GateEvidencePort for WorkflowWorkItemGate {
             assignment_version: snapshot.assignment_version,
             credential_generation: snapshot.credential_generation,
             policy_digest: snapshot.policy_digest,
-            tool_profile: self.integration.qa_profile.id.clone(),
-            tool_profile_digest: self.integration.qa_profile_digest.clone(),
+            tool_profile: qa_profile.id.clone(),
+            tool_profile_digest: qa_digest.to_owned(),
             runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
             capabilities: BTreeSet::from(["test.run_profile".to_string()]),
             output_artifact_kinds: BTreeSet::new(),
             inputs,
             command_policy: Vec::new(),
-            resource_limits: self.integration.qa_profile.resource_ceilings.clone(),
+            resource_limits: qa_profile.resource_ceilings.clone(),
             deadline_unix_ms: deadline,
             attempt: 1,
             tool: WorkbenchTool::RunTests {
                 suite_id: "web-work-item-qa-v1".to_string(),
-                program: WORK_ITEM_GATE_PROGRAM.to_string(),
+                program: if family == ProjectFamily::Web {
+                    WORK_ITEM_GATE_PROGRAM
+                } else {
+                    CODING_QA_PROGRAM
+                }
+                .to_owned(),
                 args: Vec::new(),
             },
             input_digest: String::new(),
         };
-        let paths: Vec<String> = workbench
+        let mut paths: Vec<String> = workbench
             .inputs
             .iter()
             .map(|input| input.mount_path.clone())
             .collect();
+        if family != ProjectFamily::Web {
+            paths.insert(0, "--inventory-only".to_owned());
+        }
         if let WorkbenchTool::RunTests { args, .. } = &mut workbench.tool {
             *args = paths.clone();
         }
-        workbench.command_policy = vec![work_item_gate_command_rule(&paths)?];
+        workbench.command_policy = if family == ProjectFamily::Web {
+            vec![work_item_gate_command_rule(&paths)?]
+        } else {
+            vec![CommandRule {
+                program: CODING_QA_PROGRAM.to_owned(),
+                required_arg_prefix: paths.clone(),
+                max_args: u16::try_from(paths.len()).map_err(|_| WorkflowPortError::Rejected)?,
+            }]
+        };
         workbench.input_digest = workbench
             .canonical_digest()
             .map_err(|_| WorkflowPortError::Rejected)?;
@@ -2162,6 +2496,9 @@ mod tests {
             resources: None,
             result_digest: Some(digest("qa-result").as_str().to_string()),
             command_status: None,
+            native_qa_status: None,
+            native_qa_suite: None,
+            native_qa_inputs: None,
             observation_digest: None,
             artifacts: Vec::new(),
             error: None,
@@ -2176,6 +2513,205 @@ mod tests {
             qa_evidence_inventory_digest(&graph).unwrap()
         );
         assert_eq!(receipt.harness_outcome, QaHarnessOutcome::Pass);
+
+        for family in [ProjectFamily::Python, ProjectFamily::Node] {
+            let mut native = workbench_request.clone();
+            native.tool_profile = "coding-qa-v1".to_owned();
+            native.inputs = vec![sentinel_common::WorkbenchInputRef {
+                artifact_id: format!("sha256:{}", "d".repeat(64)),
+                sha256: "d".repeat(64),
+                mount_path: "test.py".into(),
+                media_type: "text/plain".into(),
+            }];
+            native.tool = WorkbenchTool::RunTests {
+                suite_id: qa_suite_id(family).to_owned(),
+                program: CODING_QA_PROGRAM.to_owned(),
+                args: vec![
+                    family.id().to_owned(),
+                    "/inputs/artifact-a/test.py".to_owned(),
+                ],
+            };
+            assert_eq!(qa_request_family(&native).unwrap(), family);
+            assert!(
+                qa_evidence_graph(family, &request.qa_run, &request.qa_plan.digest, &receipt)
+                    .is_err()
+            );
+            let mut native_record = record.clone();
+            native_record.store_schema_version = 3;
+            native_record.tool_profile = native.tool_profile.clone();
+            native_record.native_qa_suite = Some(qa_suite_id(family).into());
+            native_record.native_qa_inputs =
+                Some(sentinel_common::NativeQaInputBinding::from_request(&native).unwrap());
+            native_record.command_status = Some(sentinel_common::WorkbenchCommandStatus {
+                exit_code: 0,
+                stdout_bytes: 512,
+                stderr_bytes: 0,
+            });
+            let pass = sentinel_common::NativeQaStage {
+                outcome: sentinel_common::NativeQaOutcome::Pass,
+                planned: 1,
+                completed: 1,
+            };
+            native_record.native_qa_status = Some(sentinel_common::WorkbenchNativeQaStatus {
+                invocation_id: native.invocation_id.clone(),
+                input_digest: native.input_digest.clone(),
+                inventory_digest: Some("a".repeat(64)),
+                input_inventory_digest: Some(
+                    sentinel_common::WorkbenchNativeQaStatus::expected_input_inventory_digest(
+                        &native,
+                    )
+                    .unwrap(),
+                ),
+                code: "checks_passed".into(),
+                progress: sentinel_common::NativeQaProgress {
+                    schema_version: 1,
+                    family: family.id().into(),
+                    suite_id: qa_suite_id(family).into(),
+                    outcome: sentinel_common::NativeQaOutcome::Pass,
+                    inventory: pass.clone(),
+                    syntax: pass.clone(),
+                    tests: pass,
+                },
+            });
+            let native_receipt = qa_receipt(&request, &native, &native_record).unwrap();
+            let mut foreign_inputs = native.clone();
+            foreign_inputs.inputs[0].sha256 = "e".repeat(64);
+            assert!(qa_receipt(&request, &foreign_inputs, &native_record).is_err());
+            assert_eq!(native_receipt.harness_outcome, QaHarnessOutcome::Pass);
+            assert!(native_receipt.required_cases_complete);
+            let native_graph = qa_evidence_graph(
+                family,
+                &request.qa_run,
+                &request.qa_plan.digest,
+                &native_receipt,
+            )
+            .unwrap();
+            assert_ne!(native_graph.graph_digest, graph.graph_digest);
+            assert_eq!(native_graph.dataset_cases.len(), 3);
+            assert!(native_graph.dataset_cases.iter().all(|case| case.required));
+            assert!(native_graph
+                .dataset_cases
+                .iter()
+                .any(|case| case.case_id == "coding-tests"));
+            assert!(native_graph.dataset_cases.iter().all(|case| case
+                .provenance
+                .iter()
+                .all(|source| source.id == qa_suite_id(family))));
+            // Syntax failures leave tests unrun; preflight errors leave syntax
+            // unrun; timeouts retain no completed behavioral assertion.
+            for scenario in [
+                "behavioral-fail",
+                "syntax-fail",
+                "plan-error",
+                "timeout",
+                "missing-summary",
+            ] {
+                let mut partial = native_record.clone();
+                partial.state = WorkbenchInvocationState::Failed;
+                partial.command_status.as_mut().unwrap().exit_code =
+                    if scenario.ends_with("fail") { 1 } else { 2 };
+                let status = partial.native_qa_status.as_mut().unwrap();
+                status.progress.outcome = if scenario.ends_with("fail") {
+                    sentinel_common::NativeQaOutcome::Fail
+                } else {
+                    sentinel_common::NativeQaOutcome::Error
+                };
+                match scenario {
+                    "behavioral-fail" => {
+                        status.code = "behavioral_assertion_failed".into();
+                        status.progress.tests.outcome = sentinel_common::NativeQaOutcome::Fail;
+                    }
+                    "syntax-fail" => {
+                        status.code = if family == ProjectFamily::Python {
+                            "python_compile_failed"
+                        } else {
+                            "node_syntax_failed"
+                        }
+                        .into();
+                        status.progress.syntax.outcome = sentinel_common::NativeQaOutcome::Fail;
+                        status.progress.syntax.completed = 0;
+                        status.progress.tests = sentinel_common::NativeQaStage {
+                            outcome: sentinel_common::NativeQaOutcome::NotRun,
+                            planned: 0,
+                            completed: 0,
+                        };
+                    }
+                    "plan-error" => {
+                        status.code = "test_plan_invalid".into();
+                        status.progress.syntax = sentinel_common::NativeQaStage {
+                            outcome: sentinel_common::NativeQaOutcome::NotRun,
+                            planned: 0,
+                            completed: 0,
+                        };
+                        status.progress.tests = sentinel_common::NativeQaStage {
+                            outcome: sentinel_common::NativeQaOutcome::Error,
+                            planned: 0,
+                            completed: 0,
+                        };
+                    }
+                    "timeout" => {
+                        status.code = "tool_timeout".into();
+                        status.progress.tests.outcome = sentinel_common::NativeQaOutcome::Error;
+                        status.progress.tests.completed = 0;
+                    }
+                    _ => partial.native_qa_status = None,
+                }
+                let receipt = qa_receipt(&request, &native, &partial).unwrap();
+                let graph =
+                    qa_evidence_graph(family, &request.qa_run, &request.qa_plan.digest, &receipt)
+                        .unwrap();
+                assert_eq!(
+                    receipt.required_cases_complete,
+                    scenario == "behavioral-fail"
+                );
+                assert_eq!(
+                    receipt.harness_outcome,
+                    if scenario == "behavioral-fail" {
+                        QaHarnessOutcome::Fail
+                    } else {
+                        QaHarnessOutcome::Error
+                    }
+                );
+                let tests = graph
+                    .case_results
+                    .iter()
+                    .find(|result| result.case_ref.id == "coding-tests")
+                    .unwrap();
+                if scenario != "behavioral-fail" {
+                    assert_eq!(
+                        tests.outcome,
+                        if scenario == "syntax-fail" {
+                            QaCaseOutcome::Unscored
+                        } else {
+                            QaCaseOutcome::Error
+                        }
+                    );
+                    assert!(tests.assertion_refs.is_empty());
+                    assert!(graph
+                        .deterministic_results
+                        .iter()
+                        .all(|result| result.assertion_id != "assertion-coding-tests"));
+                } else {
+                    assert_eq!(tests.outcome, QaCaseOutcome::Fail);
+                }
+                let mut tampered = receipt;
+                tampered.result_inventory_digest = digest("tampered-native-inventory");
+                assert!(qa_evidence_graph(
+                    family,
+                    &request.qa_run,
+                    &request.qa_plan.digest,
+                    &tampered
+                )
+                .is_err());
+            }
+            native.tool_profile = "web-qa-v1".to_owned();
+            assert!(qa_request_family(&native).is_err());
+            native.tool_profile = "coding-qa-v1".to_owned();
+            if let WorkbenchTool::RunTests { args, .. } = &mut native.tool {
+                args[0] = ProjectFamily::Web.id().to_owned();
+            }
+            assert!(qa_request_family(&native).is_err());
+        }
     }
 
     #[test]

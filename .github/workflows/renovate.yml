@@ -1,9 +1,9 @@
 name: Renovate
 
 on:
-  # Montags 06:00 UTC (07:00 CET / 08:00 CEST)
+  # Daily; repository update windows must not suppress security/lock maintenance.
   schedule:
-    - cron: '0 6 * * 1'
+    - cron: '17 6 * * *'
   # Manuell auslösbar
   workflow_dispatch: {}
 

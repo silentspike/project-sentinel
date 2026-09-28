@@ -6,9 +6,13 @@
     ":semanticCommits"
   ],
   "labels": ["type:deps"],
-  "schedule": ["before 8am on monday"],
+  "schedule": ["* * * * *"],
   "timezone": "Europe/Berlin",
   "platformCommit": "enabled",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["* * * * *"]
+  },
   "packageRules": [
     {
       "description": "Rust minor/patch updates grouped",
@@ -51,8 +55,7 @@
       "description": "GitHub Actions updates",
       "matchManagers": ["github-actions"],
       "commitMessagePrefix": "ci:",
-      "automerge": true,
-      "schedule": ["before 8am on the first day of the month"]
+      "automerge": true
     }
   ],
   "prConcurrentLimit": 10,
