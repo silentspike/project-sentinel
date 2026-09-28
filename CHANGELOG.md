@@ -1,5 +1,9 @@
 # Changelog
 
+- Preserve customer preview frames across overview polling and load bounded
+  local artifact stylesheets through the authenticated delivery-bound API.
+  Keep artifact scripts, navigation and external networking disabled (#856).
+
 - Accept network-free email and telephone anchor actions in static QA without
   admitting remote resources, unknown schemes or control characters. Keep
   optional workflow history optional in public lineage, and drain committed

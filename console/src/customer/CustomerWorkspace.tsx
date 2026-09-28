@@ -1,4 +1,5 @@
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { batch, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createStore, reconcile } from "solid-js/store";
 import { customerFetch, CustomerApiError, dispatchReserved, pendingKey, readPending, reserveCommand, sendCustomerCommand,
   type CustomerIdentity, type Overview, type PendingCommand } from "./api";
 import "./customer.css";
@@ -10,7 +11,14 @@ export function CustomerWorkspace() {
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
   const [key, setKey] = createSignal("");
-  const [data, setData] = createSignal<Overview>({ requests: [], proposals: [] });
+  const [overview, updateOverview] = createStore<Overview>({ requests: [], proposals: [], projects: [] });
+  const data = () => overview;
+  // Replacing keyed rows moves adjacent DOM nodes and restarts opaque iframes.
+  const setData = (value: Overview) => batch(() => {
+    updateOverview("requests", reconcile(value.requests, { key: "request_id" }));
+    updateOverview("proposals", reconcile(value.proposals, { key: "proposal_id" }));
+    updateOverview("projects", reconcile(value.projects ?? [], { key: "project_id" }));
+  });
   const [selected, setSelected] = createSignal("");
   const [summary, setSummary] = createSignal("");
   const [outcome, setOutcome] = createSignal("");
