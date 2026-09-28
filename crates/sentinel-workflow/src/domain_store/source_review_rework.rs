@@ -294,12 +294,16 @@ pub(super) fn validate(project: &ProjectV1) -> Result<(), WorkflowError> {
         historical
             .work_corrections
             .extend(entry.review_corrections.iter().cloned());
-        historical
-            .abandoned_subscription_calls
-            .extend(entry.review_abandoned_calls.iter().cloned());
         work_corrections::validate(&historical)?;
+        // Validate this archived handoff against its own consumed authority,
+        // never a later QA call or the live archive/regrant gap.
+        historical
+            .work_items
+            .insert(source_id.clone(), entry.source_work.clone());
+        historical.subscription_call = Some(entry.review_allowance.clone());
+        historical.source_review_previous_call = Some(entry.source_allowance.clone());
+        historical.abandoned_subscription_calls = entry.review_abandoned_calls.clone();
         subscription::validate(&historical)?;
-        subscription::validate_allowance(&historical, &entry.review_allowance)?;
         subscription::validate_allowance(project, &entry.source_allowance)?;
     }
     Ok(())
