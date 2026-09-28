@@ -124,16 +124,16 @@ jobs:
 
       - name: Virtual-company M0 product contract (#693)
         env:
-          RUNNER_TEMP: /work/tmp/sentinel-ci-product-acceptance
+          SENTINEL_CI_SCRATCH: /work/tmp/sentinel-ci-product-acceptance
         run: |
           if [[ ! -d /work/tmp ]]; then sudo install -d -m 0755 /work/tmp; fi
-          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$RUNNER_TEMP"
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$SENTINEL_CI_SCRATCH"
           sudo apt-get update -qq
           sudo apt-get install -y -qq bubblewrap
           sudo sysctl --load deploy/vm-config/99-sentinel-bwrap.conf
           command -v node
           python3 scripts/product-acceptance/check_contract.py --check
-          python3 -m unittest discover -s scripts/product-acceptance -p 'test_*.py'
+          env RUNNER_TEMP="$SENTINEL_CI_SCRATCH" python3 -m unittest discover -s scripts/product-acceptance -p 'test_*.py'
 
       - name: Validate TOML configs
         run: |
