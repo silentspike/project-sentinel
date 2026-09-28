@@ -1438,11 +1438,15 @@ impl SandboxEnforcer {
             })?;
             let workspace = prepare_chunk_workspace(Path::new(mount), agent_dir)?;
             config = config.with_workbench_workspace(&workspace);
+            let namespace = cgroups::prepare_workbench_namespace(name, &landlock_wrapper_path())?;
             let commands = cgroups::prepare_workbench_cgroup(name)?;
-            config = config.with_command_boundary(
-                &commands,
-                sentinel_fs::layer::DEFAULT_WORKSPACE_BUDGET_BYTES,
-            );
+            let membership = cgroups::open_workbench_runtime_membership(name)?;
+            config = config
+                .with_command_boundary(
+                    &commands,
+                    sentinel_fs::layer::DEFAULT_WORKSPACE_BUDGET_BYTES,
+                )
+                .with_workbench_namespace(namespace, membership);
         }
         self.start_process_with_config(name, config, command, true)
     }

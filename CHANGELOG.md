@@ -1,5 +1,11 @@
 # Changelog
 
+- Bootstrap native commands in a pinned, agent-parent cgroup namespace before
+  controller delegation. Prepare a private agent-PID procfs behind the startup
+  barrier for nested command namespaces without exposing host processes or
+  granting employee capabilities; retain bounded setup and owned cleanup
+  (#856).
+
 - Inspect dependency freshness and proposed updates daily, including Actions
   and transitive lockfile maintenance; retain existing CI and review gates.
 

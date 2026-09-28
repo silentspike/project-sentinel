@@ -3,9 +3,11 @@
 use anyhow::{Context, Result};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 // PsiMetrics and parse_psi live in sentinel-common for cross-crate reuse.
@@ -23,6 +25,9 @@ const MAX_CGROUP_DIRS: usize = 256;
 const MAX_CGROUP_ENTRIES: usize = 32_768;
 const MAX_CONTROL_BYTES: u64 = 1_048_576;
 const MAX_CGROUP_PIDS: usize = 131_072;
+const NAMESPACE_HELPER_MODE: &str = "--prepare-workbench-cgroup-namespace-v1";
+const NAMESPACE_READY: u8 = b'R';
+const NAMESPACE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Ressourcen-Profil fuer dynamische cgroup-Limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -145,6 +150,291 @@ pub fn runtime_cgroup_id(name: &str) -> Option<u64> {
 /// The pinned agent directory must reside on a cgroup v2 filesystem.
 pub fn prepare_workbench_cgroup(name: &str) -> Result<PathBuf> {
     prepare_kernel_workbench_cgroup_at(Path::new(CGROUP_ROOT), name)
+}
+
+/// Pins the prepared runtime membership control for the trusted pre-exec join.
+/// Write `0` to this file BEFORE setns into the pinned agent cgroup namespace;
+/// the original source cgroup can lie outside that namespace's visible root.
+pub fn open_workbench_runtime_membership(name: &str) -> Result<File> {
+    let agent =
+        open_agent_at(Path::new(CGROUP_ROOT), name)?.context("Agent cgroup does not exist")?;
+    require_cgroup_v2(&agent)?;
+    require_trusted_metadata(&agent, true)?;
+    let runtime = prepared_runtime(&agent)?.context("Workbench cgroup is not prepared")?;
+    require_trusted_metadata(&runtime, true)?;
+    let membership = open_control(&runtime, "cgroup.procs", true)?;
+    require_trusted_metadata(&membership, false)?;
+    require_cgroup_v2(&membership)?;
+    Ok(membership)
+}
+
+/// Pins a new cgroup namespace rooted at the cumulative agent parent.
+/// Call before `prepare_workbench_cgroup`, while the bounded tree is empty and
+/// the parent has no subtree controllers. Never changes controllers or limits.
+/// The caller must serialize preparation/teardown for this agent. Dropping the
+/// returned file releases the namespace pin.
+pub fn prepare_workbench_namespace(name: &str, wrapper: &Path) -> Result<File> {
+    let agent = open_namespace_agent(name)?;
+    require_namespace_preconditions(&agent)?;
+    let executable = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(wrapper)
+        .context("Failed to pin namespace helper executable")?;
+    require_trusted_executable(&executable)?;
+    let membership = open_control(&agent, "cgroup.procs", true)?;
+    require_trusted_metadata(&membership, false)?;
+    require_cgroup_v2(&membership)?;
+    let parent = std::process::id();
+    // Both arguments refer to live parent-owned descriptors, not mutable paths.
+    let child = Command::new(format!("/proc/{parent}/fd/{}", executable.as_raw_fd()))
+        .arg(NAMESPACE_HELPER_MODE)
+        .arg(format!("/proc/{parent}/fd/{}", membership.as_raw_fd()))
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to spawn namespace helper")?;
+    let mut helper = OwnedNamespaceHelper(Some(child));
+    let result = (|| {
+        let child = helper.0.as_mut().context("Missing namespace helper")?;
+        let stdout = child
+            .stdout
+            .as_mut()
+            .context("Missing helper readiness pipe")?;
+        read_protocol_byte(stdout, NAMESPACE_READY, NAMESPACE_TIMEOUT)?;
+        anyhow::ensure!(
+            child.try_wait()?.is_none(),
+            "Namespace helper exited before capture"
+        );
+        require_no_subtree_controllers(&agent)?;
+        anyhow::ensure!(
+            read_members(&agent)? == vec![child.id()],
+            "Namespace helper is not the sole agent parent member"
+        );
+        let namespace = File::open(format!("/proc/{}/ns/cgroup", child.id()))
+            .context("Failed to capture owned helper cgroup namespace")?;
+        let own = File::open("/proc/self/ns/cgroup")?;
+        require_distinct_namespace(&namespace, &own)?;
+        Ok(namespace)
+    })();
+    // Do not close stdin before capture: the live child owns the namespace.
+    let cleanup = helper.reap();
+    let empty = require_namespace_preconditions(&agent);
+    cleanup?;
+    empty?;
+    result
+}
+
+struct OwnedNamespaceHelper(Option<Child>);
+
+impl OwnedNamespaceHelper {
+    fn reap(&mut self) -> Result<()> {
+        let Some(child) = self.0.as_mut() else {
+            return Ok(());
+        };
+        let kill = child.kill();
+        // Always wait, including a failed kill or a helper that already exited.
+        let wait = child.wait();
+        wait.context("Failed to reap namespace helper")?;
+        // Retain ownership on wait errors so the Drop fallback can retry.
+        self.0.take();
+        if let Err(error) = kill {
+            anyhow::ensure!(
+                error.kind() == std::io::ErrorKind::InvalidInput,
+                "Failed to kill namespace helper: {error}"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OwnedNamespaceHelper {
+    fn drop(&mut self) {
+        let _ = self.reap();
+    }
+}
+
+fn require_trusted_metadata(file: &File, directory: bool) -> Result<()> {
+    let metadata = file.metadata()?;
+    let correct_type = if directory {
+        metadata.is_dir()
+    } else {
+        metadata.is_file()
+    };
+    anyhow::ensure!(
+        metadata.uid() == 0 && metadata.mode() & 0o7022 == 0 && correct_type,
+        "Namespace bootstrap requires a root-owned object not writable by group/other"
+    );
+    Ok(())
+}
+
+fn require_trusted_executable(file: &File) -> Result<()> {
+    require_trusted_metadata(file, false)?;
+    anyhow::ensure!(
+        file.metadata()?.mode() & 0o111 != 0,
+        "Namespace helper is not executable"
+    );
+    Ok(())
+}
+
+fn require_no_subtree_controllers(agent: &File) -> Result<()> {
+    anyhow::ensure!(
+        read_control(agent, "cgroup.subtree_control")?
+            .trim()
+            .is_empty(),
+        "Already-delegated agent parent: namespace bootstrap requires empty subtree_control"
+    );
+    Ok(())
+}
+
+fn require_namespace_preconditions(agent: &File) -> Result<()> {
+    require_trusted_metadata(agent, true)?;
+    let tree = require_namespace_empty_tree(agent)?;
+    for node in tree {
+        require_trusted_metadata(&node.dir, true)?;
+    }
+    Ok(())
+}
+
+fn require_namespace_empty_tree(agent: &File) -> Result<Vec<CgroupNode>> {
+    require_no_subtree_controllers(agent)?;
+    let tree = inspect_cgroup_tree(agent)?;
+    for node in &tree {
+        require_empty(&node.dir)?;
+    }
+    Ok(tree)
+}
+
+fn open_namespace_agent(name: &str) -> Result<File> {
+    validate_cgroup_name(name)?;
+    let root = open_root(Path::new(CGROUP_ROOT))?;
+    require_cgroup_v2(&root)?;
+    require_trusted_metadata(&root, true)?;
+    let agent = open_optional_child(&root, name)?.context("Agent cgroup does not exist")?;
+    require_cgroup_v2(&agent)?;
+    require_trusted_metadata(&agent, true)?;
+    Ok(agent)
+}
+
+fn require_distinct_namespace(namespace: &File, own: &File) -> Result<()> {
+    let namespace = namespace.metadata()?;
+    let own = own.metadata()?;
+    anyhow::ensure!(
+        namespace.dev() == own.dev() && namespace.ino() != own.ino(),
+        "Helper did not create a distinct cgroup namespace"
+    );
+    Ok(())
+}
+
+fn read_protocol_byte(
+    reader: &mut (impl Read + AsFd),
+    expected: u8,
+    timeout: Duration,
+) -> Result<()> {
+    use nix::poll::{poll, PollFd, PollFlags};
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "Namespace helper protocol timed out");
+        let millis = u16::try_from(remaining.as_millis().max(1)).unwrap_or(u16::MAX);
+        let mut descriptors = [PollFd::new(reader.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut descriptors, millis) {
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => return Err(error).context("Namespace helper protocol poll failed"),
+            Ok(0) => continue,
+            Ok(_) => {
+                let events = descriptors[0].revents().unwrap_or(PollFlags::empty());
+                anyhow::ensure!(
+                    events.contains(PollFlags::POLLIN),
+                    "Namespace helper protocol closed"
+                );
+                let mut byte = [0];
+                reader
+                    .read_exact(&mut byte)
+                    .context("Namespace helper protocol EOF")?;
+                anyhow::ensure!(
+                    byte[0] == expected,
+                    "Invalid namespace helper protocol byte"
+                );
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn validate_membership_descriptor_path(path: &Path, parent: u32) -> Result<()> {
+    let path = path.to_str().context("Non-UTF-8 helper membership path")?;
+    let prefix = format!("/proc/{parent}/fd/");
+    let descriptor = path
+        .strip_prefix(&prefix)
+        .context("Helper membership is not pinned by its parent")?;
+    let fd = descriptor
+        .parse::<i32>()
+        .context("Invalid helper membership descriptor")?;
+    anyhow::ensure!(
+        fd >= 0 && descriptor == fd.to_string(),
+        "Invalid helper membership descriptor"
+    );
+    Ok(())
+}
+
+/// Internal host-side wrapper mode; no Landlock or workload code runs here.
+#[doc(hidden)]
+pub fn run_workbench_namespace_helper(path: &Path) -> Result<()> {
+    let parent = nix::unistd::getppid().as_raw() as u32;
+    validate_membership_descriptor_path(path, parent)?;
+    anyhow::ensure!(
+        std::fs::metadata(format!("/proc/{parent}"))?.uid() == 0,
+        "Helper parent is not root"
+    );
+    let executable = File::open("/proc/self/exe")?;
+    require_trusted_executable(&executable)?;
+    // Resolve the proc magic link only to identify the canonical owned agent.
+    // Attest the opened descriptor against a separately pinned canonical control.
+    let target = std::fs::read_link(path)?;
+    let relative = target
+        .strip_prefix(CGROUP_ROOT)
+        .context("Helper target is outside sentinel")?;
+    let parts: Vec<_> = relative.components().collect();
+    anyhow::ensure!(
+        parts.len() == 2 && parts[1].as_os_str() == "cgroup.procs",
+        "Invalid helper membership target"
+    );
+    let name = parts[0]
+        .as_os_str()
+        .to_str()
+        .context("Invalid helper agent name")?;
+    let agent = open_namespace_agent(name)?;
+    require_namespace_preconditions(&agent)?;
+    let canonical = open_control(&agent, "cgroup.procs", true)?;
+    let mut membership = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(path)?;
+    require_cgroup_v2(&membership)?;
+    require_trusted_metadata(&membership, false)?;
+    let actual = membership.metadata()?;
+    let expected = canonical.metadata()?;
+    anyhow::ensure!(
+        actual.dev() == expected.dev() && actual.ino() == expected.ino(),
+        "Pinned helper membership identity mismatch"
+    );
+    membership.write_all(b"0")?;
+    require_no_subtree_controllers(&agent)?;
+    anyhow::ensure!(
+        read_members(&agent)? == vec![std::process::id()],
+        "Helper parent membership changed"
+    );
+    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWCGROUP)
+        .context("Failed to unshare agent-rooted cgroup namespace")?;
+    let mut stdout = std::io::stdout();
+    stdout.write_all(&[NAMESPACE_READY])?;
+    stdout.flush()?;
+    // A second deadline bounds lifetime even if the parent stops responding.
+    // The parent normally captures the namespace then kills/reaps this helper.
+    read_protocol_byte(&mut std::io::stdin(), b'Q', NAMESPACE_TIMEOUT)
 }
 
 fn prepare_kernel_workbench_cgroup_at(root: &Path, name: &str) -> Result<PathBuf> {
@@ -1041,6 +1331,167 @@ mod tests {
     fn fixture_agent(root: &Path) -> File {
         fixture_cgroup(&root.join("agent"), "");
         open_agent_at(root, "agent").unwrap().unwrap()
+    }
+
+    #[test]
+    fn namespace_preconditions_reject_delegation_and_populated_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = fixture_agent(root.path());
+        let subtree = root.path().join("agent/cgroup.subtree_control");
+        let error = require_namespace_empty_tree(&agent).err().unwrap();
+        assert!(error.to_string().contains("Already-delegated"));
+        assert_eq!(
+            std::fs::read_to_string(&subtree).unwrap(),
+            "cpu memory pids io\n"
+        );
+        std::fs::write(&subtree, "\n").unwrap();
+        fixture_cgroup(&root.path().join("agent/child"), "123\n");
+        assert!(require_namespace_empty_tree(&agent).is_err());
+        std::fs::write(root.path().join("agent/child/cgroup.procs"), "").unwrap();
+        assert_eq!(require_namespace_empty_tree(&agent).unwrap().len(), 2);
+        std::fs::write(root.path().join("agent/cgroup.procs"), "123\n").unwrap();
+        assert!(require_namespace_empty_tree(&agent).is_err());
+    }
+
+    #[test]
+    fn namespace_membership_path_requires_exact_parent_descriptor() {
+        assert!(validate_membership_descriptor_path(Path::new("/proc/42/fd/7"), 42).is_ok());
+        for path in [
+            "/proc/self/fd/7",
+            "/proc/43/fd/7",
+            "/proc/42/fd/-1",
+            "/proc/42/fd/+7",
+            "/proc/42/fd/07",
+            "/proc/42/fd/7/../8",
+            "/proc/42/fd/7/cgroup.procs",
+            "/sys/fs/cgroup/cgroup.procs",
+            "/sys/fs/cgroup/sentinel/agent/cgroup.procs",
+        ] {
+            assert!(
+                validate_membership_descriptor_path(Path::new(path), 42).is_err(),
+                "accepted {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_protocol_ready_invalid_eof_and_timeout() {
+        use std::os::unix::net::UnixStream;
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(&[NAMESPACE_READY]).unwrap();
+        read_protocol_byte(&mut reader, NAMESPACE_READY, Duration::from_millis(50)).unwrap();
+        writer.write_all(b"X").unwrap();
+        assert!(
+            read_protocol_byte(&mut reader, NAMESPACE_READY, Duration::from_millis(50)).is_err()
+        );
+        let started = Instant::now();
+        let error = read_protocol_byte(&mut reader, NAMESPACE_READY, Duration::from_millis(20))
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(writer);
+        assert!(
+            read_protocol_byte(&mut reader, NAMESPACE_READY, Duration::from_millis(50)).is_err()
+        );
+    }
+
+    #[test]
+    fn namespace_attestation_rejects_ordinary_files_and_own_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = fixture_agent(root.path());
+        assert!(require_cgroup_v2(&agent).is_err());
+        let own = File::open("/proc/self/ns/cgroup").unwrap();
+        assert!(require_distinct_namespace(&own, &own).is_err());
+        let writable = root.path().join("writable");
+        std::fs::write(&writable, "not a trusted executable").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(require_trusted_executable(&File::open(&writable).unwrap()).is_err());
+        assert!(require_trusted_executable(&agent).is_err());
+    }
+
+    #[test]
+    fn namespace_helper_guard_kills_and_reaps_on_error() {
+        use nix::sys::wait::{waitpid, WaitPidFlag};
+        use nix::unistd::Pid;
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .env_clear()
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_raw(child.id() as i32);
+        let started = Instant::now();
+        drop(OwnedNamespaceHelper(Some(child)));
+        assert_eq!(
+            waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    #[ignore = "Requires root, writable cgroup v2 sentinel delegation, and SENTINEL_TEST_NAMESPACE_WRAPPER pointing to a built root-owned wrapper"]
+    fn kernel_workbench_namespace_bootstrap_preserves_limits_and_quiesces() {
+        let wrapper = PathBuf::from(
+            std::env::var_os("SENTINEL_TEST_NAMESPACE_WRAPPER")
+                .expect("Set SENTINEL_TEST_NAMESPACE_WRAPPER to the built root-owned wrapper"),
+        );
+        let name = format!("namespace-test-{}", uuid::Uuid::new_v4());
+        assert!(open_agent_at(Path::new(CGROUP_ROOT), &name)
+            .unwrap()
+            .is_none());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = remove_cgroup(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(name.clone());
+        create_cgroup(&name, &CgroupLimits::default()).unwrap();
+        let agent = open_namespace_agent(&name).unwrap();
+        let controls = ["cpu.max", "memory.max", "pids.max", "io.max"];
+        let before: Vec<_> = controls
+            .iter()
+            .map(|control| read_control(&agent, control).unwrap())
+            .collect();
+        let own = File::open("/proc/self/ns/cgroup").unwrap();
+        let namespace = prepare_workbench_namespace(&name, &wrapper).unwrap();
+        require_distinct_namespace(&namespace, &own).unwrap();
+        require_namespace_preconditions(&agent).unwrap();
+        assert_eq!(
+            File::open("/proc/self/ns/cgroup")
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .ino(),
+            own.metadata().unwrap().ino()
+        );
+        prepare_workbench_cgroup(&name).unwrap();
+        let membership = open_workbench_runtime_membership(&name).unwrap();
+        require_cgroup_v2(&membership).unwrap();
+        let runtime = prepared_runtime(&agent).unwrap().unwrap();
+        assert_eq!(
+            membership.metadata().unwrap().ino(),
+            open_control(&runtime, "cgroup.procs", true)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .ino()
+        );
+        assert!(prepare_workbench_namespace(&name, &wrapper)
+            .unwrap_err()
+            .to_string()
+            .contains("Already-delegated"));
+        for (control, expected) in controls.iter().zip(before) {
+            assert_eq!(read_control(&agent, control).unwrap(), expected);
+        }
+        assert!(list_members(&agent).unwrap().is_empty());
+        drop(membership);
+        drop(namespace);
+        remove_cgroup(&name).unwrap();
+        assert!(open_agent_at(Path::new(CGROUP_ROOT), &name)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
