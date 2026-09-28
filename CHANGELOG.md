@@ -1,5 +1,10 @@
 # Changelog
 
+- Recover a completed QA call rejected for non-strict JSON with a separately
+  authorized, bounded correction turn. Retain consumed usage and the exact
+  reviewer assignment, resume across archive/regrant restarts, and bind schema
+  feedback to its immutable resolution instead of arbitrary abandonment (#856).
+
 - Bind assigned Designer and Developer turns to the accepted customer contract,
   verified upstream artifacts, correction feedback, and private Workbench
   observations. Allow bounded adaptive tool turns and admit only an observed,

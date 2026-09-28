@@ -1638,6 +1638,18 @@ mod tests {
 
     #[cfg(feature = "llm")]
     #[test]
+    fn source_review_prompt_includes_schema_retry_feedback() {
+        let mut context = review_context();
+        context.schema_retry_feedback =
+            Some("The previous response was rejected; emit one raw JSON object.".to_owned());
+        let prompt = context.prompt().unwrap();
+        assert!(prompt.contains("fresh QA correction turn"));
+        assert!(prompt.contains("one raw JSON object"));
+        assert!(prompt.contains("The previous response was rejected"));
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
     fn source_review_model_to_confined_plan_preserves_real_report() {
         let mut context = review_context();
         context.validate_dispatch(1).unwrap();
