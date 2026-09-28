@@ -43,6 +43,12 @@ STOPPED_UNITS = (
     | {PREFLIGHT.AUTH_INIT_UNIT, PREFLIGHT.TARGET_UNIT}
 )
 SOURCE_MODES = {"binary": 0o700, "script": 0o700, "config": 0o600, "systemd": 0o600}
+NATIVE_SOURCES = (
+    "config/work-profiles/python-project-v1.toml",
+    "config/work-profiles/node-project-v1.toml",
+    "config/workbench-profiles/coding-qa-v1.toml",
+    "deploy/scripts/coding-qa-v1.py",
+)
 GIT_ENV = {
     "PATH": os.environ.get("PATH", ""),
     "HOME": "/nonexistent",
@@ -208,6 +214,17 @@ class ReleasePackageTests(unittest.TestCase):
         manifest = json.loads(manifest_raw)
         self.assertEqual(manifest_raw, canonical(manifest))
         self.assertEqual(len(manifest["artifacts"]), expected_count)
+        self.assertEqual(
+            {row["path"]: (row["source"], row["type"]) for row in manifest["artifacts"]},
+            AUTHORITY,
+        )
+        self.assertEqual(PACKAGE.load_tool_inventory(), AUTHORITY)
+        for source in NATIVE_SOURCES:
+            row = next(item for item in manifest["artifacts"] if item["source"] == source)
+            self.assertEqual(
+                stat.S_IMODE((self.fixture.package / source).stat().st_mode),
+                PACKAGE.FILE_MODES[row["type"]],
+            )
         self.assertEqual(manifest["git_sha"], self.fixture.git_sha)
         readiness_destination = "/opt/sentinel/scripts/m0-readiness.py"
         readiness_source = "scripts/product-acceptance/m0-readiness/readiness.py"
@@ -240,6 +257,89 @@ class ReleasePackageTests(unittest.TestCase):
         installed_manifest = self.fixture.target / "opt/sentinel/release-manifest.json"
         self.assertEqual(installed_manifest.read_bytes(), manifest_raw)
         self.assertEqual(stat.S_IMODE(installed_manifest.stat().st_mode), 0o644)
+        for source in NATIVE_SOURCES:
+            row = next(item for item in manifest["artifacts"] if item["source"] == source)
+            installed = self.fixture.target / row["path"].lstrip("/")
+            self.assertEqual(hashlib.sha256(installed.read_bytes()).hexdigest(), row["sha256"])
+            self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o755 if row["type"] == "script" else 0o644)
+
+    def test_missing_native_release_inputs_do_not_publish_a_package(self) -> None:
+        for source in NATIVE_SOURCES:
+            with self.subTest(source=source):
+                fixture = Fixture(self.case / f"missing-{uuid.uuid4()}")
+                (fixture.source / source).unlink()
+                fixture.assert_git("add", "-u")
+                fixture.assert_git("commit", "--quiet", "-m", "test: missing native input")
+                fixture.git_sha = fixture.assert_git("rev-parse", "HEAD").stdout.strip()
+                self.assert_error("source_missing_or_unsafe", fixture.build)
+                self.assertFalse(fixture.package.exists())
+
+    def test_native_package_missing_tampered_or_unsafe_artifacts_fail_closed(self) -> None:
+        for source in NATIVE_SOURCES:
+            for attack, reason in (
+                ("missing", "package_artifact_missing_or_unsafe"),
+                ("tampered", "package_artifact_digest_mismatch"),
+                ("mode", "package_artifact_authority_invalid"),
+                ("symlink", "package_symlink"),
+                ("hardlink", "package_artifact_authority_invalid"),
+            ):
+                with self.subTest(source=source, attack=attack):
+                    fixture = Fixture(self.case / f"native-{uuid.uuid4()}")
+                    fixture.build()
+                    path = fixture.package / source
+                    if attack in {"missing", "symlink"}:
+                        path.parent.chmod(0o700)
+                        path.unlink()
+                        if attack == "symlink":
+                            path.symlink_to(fixture.package / "config/daemon.toml")
+                        path.parent.chmod(0o500)
+                    elif attack == "tampered":
+                        mode = stat.S_IMODE(path.stat().st_mode)
+                        path.chmod(0o600)
+                        path.write_bytes(b"tampered-native-package\n")
+                        path.chmod(mode)
+                    elif attack == "hardlink":
+                        os.link(path, fixture.root / "artifact-alias")
+                    else:
+                        path.chmod(0o777)
+                    self.assert_error(reason, PACKAGE.verify_package, fixture.package, fixture.git_sha)
+                    rejected = fixture.provision()
+                    self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+                    self.assertEqual(list(fixture.target.iterdir()), [])
+                    self.assertFalse((fixture.provision_stage / "provision-receipt.json").exists())
+
+    def test_generator_binds_native_fixture_digests_and_rejects_missing_inputs(self) -> None:
+        generator = self.fixture.source / "deploy/generate-manifest.sh"
+        shutil.copyfile(REPO_ROOT / "deploy/generate-manifest.sh", generator)
+        nats = self.fixture.source / "external/nats-server"
+        nats.parent.mkdir(mode=0o700)
+        shutil.copyfile(self.fixture.nats, nats)
+        manifest = self.fixture.source / "deploy/release-manifest.json"
+
+        def generate() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["bash", str(generator)], cwd=self.fixture.source,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=30, check=False, env=GIT_ENV,
+            )
+
+        result = generate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(manifest.read_bytes())["artifacts"]
+        self.assertEqual(len(rows), len(AUTHORITY))
+        self.assertEqual({row["path"]: (row["source"], row["type"]) for row in rows}, AUTHORITY)
+        for source in NATIVE_SOURCES:
+            with self.subTest(source=source):
+                path = self.fixture.source / source
+                data = path.read_bytes()
+                row = next(item for item in rows if item["source"] == source)
+                self.assertEqual(row["sha256"], hashlib.sha256(data).hexdigest())
+                path.unlink()
+                result = generate()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"MISSING: {source}", result.stderr)
+                self.assertEqual(len(json.loads(manifest.read_bytes())["artifacts"]), len(AUTHORITY) - 1)
+                path.write_bytes(data)
 
     def test_retry_reuses_identical_immutable_package(self) -> None:
         first = self.fixture.build()
