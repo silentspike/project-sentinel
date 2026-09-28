@@ -1966,6 +1966,22 @@ impl WorkflowApi {
             .ok_or("Sales allowance missing")
     }
 
+    pub(crate) fn fresh_request_sales_call(
+        &self,
+        agent_id: AgentId,
+        now_ms: u64,
+    ) -> Result<Option<RequestProviderCallV1>, &'static str> {
+        Ok(self.request_sales_call()?.filter(|call| {
+            call.grant.sales_principal.agent_id == Some(agent_id)
+                && call.question_response.is_none()
+                && call.proposal_response.is_none()
+                && call.abandonment_event_id.is_none()
+                && call.dispatch.is_none()
+                && now_ms >= call.created_at_unix_ms
+                && now_ms < call.grant.expires_at_unix_ms
+        }))
+    }
+
     fn validate_sales_principal(
         &self,
         expected: &AuthenticatedCompanyPrincipalV1,
@@ -2281,6 +2297,8 @@ impl WorkflowApi {
 
     pub(crate) fn project_planning_call(
         &self,
+        agent_id: AgentId,
+        now_ms: u64,
     ) -> Result<Option<sentinel_workflow::ProjectPlanningCallV1>, &'static str> {
         let Some(tenant) = self.request_sales_tenant.as_ref() else {
             return Ok(None);
@@ -2304,7 +2322,16 @@ impl WorkflowApi {
                 .project_planning_call(tenant, &project.project_id)
                 .map_err(|_| "project planning store unavailable")?
             {
-                return Ok(Some(call));
+                // A consumed or expired planner belongs to durable recovery,
+                // not fresh inference. It must not mask another employee's work.
+                if call.grant.planner_principal.agent_id == Some(agent_id)
+                    && call.planned_project.is_none()
+                    && call.dispatch.is_none()
+                    && now_ms >= call.grant_issued_at_unix_ms
+                    && now_ms < call.grant.expires_at_unix_ms
+                {
+                    return Ok(Some(call));
+                }
             }
         }
         Ok(None)

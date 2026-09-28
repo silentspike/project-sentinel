@@ -4941,18 +4941,17 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         if self.request_sales_tenant.is_none() {
             return Ok(true);
         }
-        if let Some(call) = self.request_sales_call()? {
-            if call.question_response.is_none()
-                && call.proposal_response.is_none()
-                && call.abandonment_event_id.is_none()
-            {
-                return Ok(call.grant.sales_principal.agent_id == Some(agent_id));
-            }
+        if self
+            .fresh_request_sales_call(agent_id, now_unix_ms())?
+            .is_some()
+        {
+            return Ok(true);
         }
-        if let Some(call) = self.project_planning_call()? {
-            if call.planned_project.is_none() {
-                return Ok(call.grant.planner_principal.agent_id == Some(agent_id));
-            }
+        if self
+            .project_planning_call(agent_id, now_unix_ms())?
+            .is_some()
+        {
+            return Ok(true);
         }
         Ok(self
             .selected_provider_usage_binding_for_agent(agent_id)?
@@ -5073,40 +5072,27 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         &self,
         agent_id: AgentId,
     ) -> Result<Option<model_execution::ProviderExecutionAuthority>, &'static str> {
-        if let Some(call) = self.request_sales_call()? {
-            if call.question_response.is_none()
-                && call.proposal_response.is_none()
-                && call.abandonment_event_id.is_none()
-            {
-                if call.grant.sales_principal.agent_id != Some(agent_id) {
-                    return Ok(None);
-                }
-                let binding = model_execution::RequestSalesAuthority {
-                    schema_version: 2,
-                    allowance_id: call.allowance_id,
-                    grant: call.grant,
-                };
-                self.prepare_request_sales(&binding)?;
-                return Ok(Some(
-                    model_execution::ProviderExecutionAuthority::RequestSales(Box::new(binding)),
-                ));
-            }
+        if let Some(call) = self.fresh_request_sales_call(agent_id, now_unix_ms())? {
+            let binding = model_execution::RequestSalesAuthority {
+                schema_version: 2,
+                allowance_id: call.allowance_id,
+                grant: call.grant,
+            };
+            self.prepare_request_sales(&binding)?;
+            return Ok(Some(
+                model_execution::ProviderExecutionAuthority::RequestSales(Box::new(binding)),
+            ));
         }
-        if let Some(call) = self.project_planning_call()? {
-            if call.planned_project.is_none() {
-                if call.grant.planner_principal.agent_id != Some(agent_id) {
-                    return Ok(None);
-                }
-                let binding = model_execution::ProjectPlanningAuthority {
-                    schema_version: 4,
-                    allowance_id: call.allowance_id,
-                    grant: call.grant,
-                };
-                self.prepare_project_planning(&binding)?;
-                return Ok(Some(
-                    model_execution::ProviderExecutionAuthority::ProjectPlanning(Box::new(binding)),
-                ));
-            }
+        if let Some(call) = self.project_planning_call(agent_id, now_unix_ms())? {
+            let binding = model_execution::ProjectPlanningAuthority {
+                schema_version: 4,
+                allowance_id: call.allowance_id,
+                grant: call.grant,
+            };
+            self.prepare_project_planning(&binding)?;
+            return Ok(Some(
+                model_execution::ProviderExecutionAuthority::ProjectPlanning(Box::new(binding)),
+            ));
         }
         if let Some(binding) = self.adaptive_provider_authority(agent_id)? {
             return Ok(Some(model_execution::ProviderExecutionAuthority::Adaptive(

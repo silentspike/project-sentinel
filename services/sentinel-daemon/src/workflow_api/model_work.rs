@@ -677,7 +677,7 @@ pub(crate) fn test_context() -> ModelWorkContext {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{configured_adaptive_test_api, configured_test_api};
+pub(crate) use tests::{assign_test_work_from, configured_adaptive_test_api, configured_test_api};
 
 #[cfg(test)]
 mod tests {
@@ -848,7 +848,7 @@ mod tests {
         assign_test_work_from(api, subscription.then_some(1), 0)
     }
 
-    fn assign_test_work_from(
+    pub(crate) fn assign_test_work_from(
         api: &WorkflowApi,
         subscription_calls: Option<u16>,
         mut operation: u128,
