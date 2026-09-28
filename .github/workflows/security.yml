@@ -25,6 +25,12 @@ concurrency:
 
 jobs:
   rust-audit:
+    strategy:
+      fail-fast: false
+      matrix:
+        lockfile:
+          - Cargo.lock
+          - deploy/bench/stack-harness/Cargo.lock
     runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -40,18 +46,30 @@ jobs:
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit
         # Keep this aligned with deny.toml: rsa is transitive via zenoh and has no fixed release.
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        run: cargo audit --file "${{ matrix.lockfile }}" --ignore RUSTSEC-2023-0071
 
   go-vuln:
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - cmd/cortex-gateway
+          - pkg/sentinel-go
+          - services/sentinel-judge
+          - services/sentinel-nats-bridge
     runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
         with:
-          go-version-file: cmd/cortex-gateway/go.mod
-          cache-dependency-path: cmd/cortex-gateway/go.sum
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: |
+            cmd/cortex-gateway/go.sum
+            pkg/sentinel-go/go.sum
+            services/sentinel-judge/go.sum
+            services/sentinel-nats-bridge/go.sum
       - name: govulncheck
-        working-directory: cmd/cortex-gateway
+        working-directory: ${{ matrix.module }}
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
@@ -69,4 +87,11 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Audit
         working-directory: console
-        run: bun pm audit 2>/dev/null || echo "Audit completed"
+        run: |
+          if bun pm audit; then
+            echo "Console audit completed successfully."
+          else
+            STATUS=$?
+            echo "::error::Console audit failed with exit code $STATUS; see audit output above."
+            exit "$STATUS"
+          fi
