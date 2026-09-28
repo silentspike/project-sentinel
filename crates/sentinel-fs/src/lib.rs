@@ -22,6 +22,7 @@ pub mod layer;
 pub mod metadata;
 pub mod read_planner;
 pub mod segment;
+pub mod workspace_import;
 
 /// Stable metadata namespace for the shared read-only filesystem layer.
 ///

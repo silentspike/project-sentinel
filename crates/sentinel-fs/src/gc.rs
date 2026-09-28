@@ -5,8 +5,8 @@
 //! This integrates with the existing CasStore GC pattern.
 
 use crate::artifact::{
-    ArtifactPlane, FS_CHUNKS, FS_CHUNK_REFCOUNT, FS_TRASH_QUEUE, FS_WORKSPACE_EXTENTS,
-    FS_WORKSPACE_ROOTS,
+    ArtifactPlane, FS_CHUNKS, FS_CHUNK_REFCOUNT, FS_OBJECT_REFS, FS_TRASH_QUEUE,
+    FS_WORKSPACE_EXTENTS, FS_WORKSPACE_ROOTS,
 };
 use crate::cas::ChunkGcStats;
 use crate::segment::ChunkLocation;
@@ -153,6 +153,14 @@ pub(crate) fn release_object_in_transaction(
     {
         let roots = wtxn.open_table(FS_WORKSPACE_ROOTS)?;
         for entry in roots.iter()? {
+            if entry?.1.value() == object_id {
+                return Ok(());
+            }
+        }
+    }
+    {
+        let named_refs = wtxn.open_table(FS_OBJECT_REFS)?;
+        for entry in named_refs.iter()? {
             if entry?.1.value() == object_id {
                 return Ok(());
             }

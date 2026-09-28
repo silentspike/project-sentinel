@@ -23,13 +23,43 @@ const MAX_FILE_SIZE: u64 = 1 << 40;
 const MAX_LEGACY_SIZE: u64 = 64 * 1024 * 1024;
 const PATCH_CHARGE: usize = std::mem::size_of::<WorkspacePatch>();
 
-fn errno(code: i32) -> anyhow::Error { std::io::Error::from_raw_os_error(code).into() }
-fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
+/// Aggregate logical inode budget, independent of RLIMIT_FSIZE/per-file limits.
+pub const DEFAULT_WORKSPACE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+/// Trusted configuration remains bounded even when raised above the default.
+pub const MAX_WORKSPACE_BUDGET_BYTES: u64 = MAX_FILE_SIZE;
+
+/// Manager-enforced logical accounting, not host allocation or block-I/O bytes.
+/// Live base identities count unless shadowed by an agent inode. Hardlink names
+/// never add charges; unlinked files count while handles or dirty state retain them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceBudget {
+    pub agent_id: String,
+    pub limit_bytes: u64,
+    pub used_bytes: u64,
+    pub remaining_bytes: u64,
+    pub regular_inode_count: u64,
+    pub unlinked_live_bytes: u64,
+    pub unlinked_live_inode_count: u64,
+    pub over_limit: bool,
+    pub explicitly_configured: bool,
+}
+
+fn errno(code: i32) -> anyhow::Error {
+    std::io::Error::from_raw_os_error(code).into()
+}
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 fn validate_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(errno(22));
     }
-    if name.len() > 255 { return Err(errno(36)); }
+    if name.len() > 255 {
+        return Err(errno(36));
+    }
     Ok(())
 }
 fn is_whiteout(data: &InodeData) -> bool {
@@ -47,7 +77,11 @@ struct OpenInode {
     dirty_guard: Option<OwnerWriteGuard>,
     opens: usize,
 }
-struct Handle { key: InodeKey, writable: bool, append: bool }
+struct Handle {
+    key: InodeKey,
+    writable: bool,
+    append: bool,
+}
 #[derive(Default)]
 struct State {
     next_handle: u64,
@@ -55,6 +89,7 @@ struct State {
     inodes: HashMap<InodeKey, OpenInode>,
     dirty_bytes: usize,
     invalidations: Vec<InodeKey>,
+    workspace_limits: HashMap<String, u64>,
 }
 
 impl State {
@@ -74,20 +109,29 @@ struct StateGuard<'a> {
 
 impl Deref for StateGuard<'_> {
     type Target = State;
-    fn deref(&self) -> &State { self.state.as_deref().expect("live state guard") }
+    fn deref(&self) -> &State {
+        self.state.as_deref().expect("live state guard")
+    }
 }
 
 impl DerefMut for StateGuard<'_> {
-    fn deref_mut(&mut self) -> &mut State { self.state.as_deref_mut().expect("live state guard") }
+    fn deref_mut(&mut self) -> &mut State {
+        self.state.as_deref_mut().expect("live state guard")
+    }
 }
 
 impl Drop for StateGuard<'_> {
     fn drop(&mut self) {
-        let pending = self.state.as_deref_mut()
-            .map(|state| std::mem::take(&mut state.invalidations)).unwrap_or_default();
+        let pending = self
+            .state
+            .as_deref_mut()
+            .map(|state| std::mem::take(&mut state.invalidations))
+            .unwrap_or_default();
         drop(self.state.take());
         if let Some(hook) = &self.hook {
-            for (agent, inode) in pending { hook(&agent, inode); }
+            for (agent, inode) in pending {
+                hook(&agent, inode);
+            }
         }
     }
 }
@@ -98,28 +142,240 @@ pub struct LayerManager {
     state: Mutex<State>,
     invalidation_hook: Mutex<Option<InvalidationHook>>,
 }
-/// Legacy CAS statistics; chunk-backed storage is accounted by ArtifactPlane.
+/// Physical storage and logical inode counters. Consult `accounting_basis` before
+/// interpreting the legacy field names or displaying a savings estimate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayerStorageStats {
+    /// Legacy mode: blob count. Chunk mode: unique chunks plus legacy blobs,
+    /// including retained/trash units in the entire shared ArtifactPlane.
     pub cas_blob_count: u64,
+    /// Chunk mode includes all segment file bytes plus legacy CAS file bytes;
+    /// compression, retained history and trash are included, not just live content.
     pub cas_bytes_on_disk: u64,
     pub regular_file_count: u64,
     pub logical_regular_file_bytes: u64,
     pub dedup_savings_bytes: u64,
     pub dedup_ratio_percent: f64,
     pub unreadable_inode_rows: u64,
+    /// `legacy_cas_compressed_storage` preserves the historical legacy calculation.
+    /// `chunk_segments_including_retention_and_legacy_cas` includes physical
+    /// compression and retained/trash history, versus committed live inode rows.
+    pub accounting_basis: &'static str,
+    /// False means savings/ratio are neutral placeholders, not measured zeros.
+    pub dedup_metrics_available: bool,
 }
 
 impl LayerManager {
     pub fn new(cas: CasStore, meta: MetadataStore) -> Self {
-        Self { cas, meta, plane: None, state: Mutex::new(State::default()), invalidation_hook: Mutex::new(None) }
+        Self {
+            cas,
+            meta,
+            plane: None,
+            state: Mutex::new(State::default()),
+            invalidation_hook: Mutex::new(None),
+        }
     }
-    pub fn with_artifact_plane(cas: CasStore, meta: MetadataStore, plane: Arc<ArtifactPlane>) -> Self {
-        Self { cas, meta, plane: Some(plane), state: Mutex::new(State::default()), invalidation_hook: Mutex::new(None) }
+    pub fn with_artifact_plane(
+        cas: CasStore,
+        meta: MetadataStore,
+        plane: Arc<ArtifactPlane>,
+    ) -> Self {
+        Self {
+            cas,
+            meta,
+            plane: Some(plane),
+            state: Mutex::new(State::default()),
+            invalidation_hook: Mutex::new(None),
+        }
     }
-    pub fn cas(&self) -> &CasStore { &self.cas }
-    pub fn meta(&self) -> &MetadataStore { &self.meta }
-    pub fn artifact_plane(&self) -> Option<Arc<ArtifactPlane>> { self.plane.clone() }
+    pub fn cas(&self) -> &CasStore {
+        &self.cas
+    }
+    pub fn meta(&self) -> &MetadataStore {
+        &self.meta
+    }
+    pub fn artifact_plane(&self) -> Option<Arc<ArtifactPlane>> {
+        self.plane.clone()
+    }
+
+    /// Trusted mount/runtime configuration. Settings are manager-local, survive
+    /// metadata restore, and must be reapplied by the trusted caller after reopen.
+    pub fn set_workspace_budget(
+        &self,
+        agent: &str,
+        limit_bytes: u64,
+    ) -> anyhow::Result<WorkspaceBudget> {
+        if agent.is_empty() || agent.len() > 255 || limit_bytes > MAX_WORKSPACE_BUDGET_BYTES {
+            return Err(errno(22));
+        }
+        let mut state = self.lock()?;
+        let guard = self.meta.namespace_guard(agent)?;
+        let current = self.budget_locked(&state, agent)?;
+        if limit_bytes < current.used_bytes {
+            return Err(errno(22));
+        }
+        if !state.workspace_limits.contains_key(agent)
+            && state.workspace_limits.len() >= MAX_HANDLES
+        {
+            return Err(errno(28));
+        }
+        OwnerRegistry::global().validate(&guard)?;
+        state
+            .workspace_limits
+            .insert(agent.to_string(), limit_bytes);
+        Ok(WorkspaceBudget {
+            limit_bytes,
+            remaining_bytes: limit_bytes - current.used_bytes,
+            over_limit: false,
+            explicitly_configured: true,
+            ..current
+        })
+    }
+
+    pub fn workspace_budget(&self, agent: &str) -> anyhow::Result<WorkspaceBudget> {
+        self.budget_locked(&*self.lock()?, agent)
+    }
+
+    fn logical_overrides(state: &State, agent: &str) -> HashMap<u64, u64> {
+        state
+            .inodes
+            .iter()
+            .filter(|((scope, _), open)| {
+                scope.as_str() == agent
+                    && open.record.data.kind == FileKind::Regular
+                    && (open.opens > 0 || open.dirty)
+            })
+            .map(|((_, inode), open)| (*inode, open.record.data.size))
+            .collect()
+    }
+
+    fn budget_locked(&self, state: &State, agent: &str) -> anyhow::Result<WorkspaceBudget> {
+        let overrides = Self::logical_overrides(state, agent);
+        let usage = self.meta.workspace_usage(agent, &overrides)?;
+        let limit_bytes = state
+            .workspace_limits
+            .get(agent)
+            .copied()
+            .unwrap_or(DEFAULT_WORKSPACE_BUDGET_BYTES);
+        let mut unlinked_live_bytes = 0u64;
+        let mut unlinked_live_inode_count = 0;
+        for ((scope, _), open) in &state.inodes {
+            if scope.as_str() == agent
+                && open.record.data.kind == FileKind::Regular
+                && open.record.data.nlinks == 0
+                && (open.opens > 0 || open.dirty)
+            {
+                unlinked_live_bytes = unlinked_live_bytes
+                    .checked_add(open.record.data.size)
+                    .ok_or_else(|| errno(75))?;
+                unlinked_live_inode_count += 1;
+            }
+        }
+        Ok(WorkspaceBudget {
+            agent_id: agent.to_string(),
+            limit_bytes,
+            used_bytes: usage.bytes,
+            remaining_bytes: limit_bytes.saturating_sub(usage.bytes),
+            regular_inode_count: usage.regular_inodes,
+            unlinked_live_bytes,
+            unlinked_live_inode_count,
+            over_limit: usage.bytes > limit_bytes,
+            explicitly_configured: state.workspace_limits.contains_key(agent),
+        })
+    }
+
+    fn preflight_size(
+        &self,
+        state: &State,
+        agent: &str,
+        inode: Option<u64>,
+        size: u64,
+    ) -> anyhow::Result<()> {
+        if size > MAX_FILE_SIZE || (self.plane.is_none() && size > MAX_LEGACY_SIZE) {
+            return Err(errno(27));
+        }
+        let current = self.budget_locked(state, agent)?;
+        let projected = if let Some(inode) = inode {
+            let mut overrides = Self::logical_overrides(state, agent);
+            overrides.insert(inode, size);
+            self.meta.workspace_usage(agent, &overrides)?.bytes
+        } else {
+            current
+                .used_bytes
+                .checked_add(size)
+                .ok_or_else(|| errno(75))?
+        };
+        // Preserve existing over-default data: allow shrink/overwrite, never further growth.
+        if projected > current.limit_bytes && projected > current.used_bytes {
+            return Err(errno(122));
+        }
+        if agent == SHARED_BASE_LAYER_ID {
+            let mut agents: HashSet<String> = self.meta.workspace_agents()?.into_iter().collect();
+            agents.extend(state.workspace_limits.keys().cloned());
+            agents.extend(state.inodes.keys().map(|(scope, _)| scope.clone()));
+            for scope in agents {
+                if scope == SHARED_BASE_LAYER_ID {
+                    continue;
+                }
+                let current = self.budget_locked(state, &scope)?;
+                let projected = if let Some(inode) = inode {
+                    let changes = HashMap::from([(inode, size)]);
+                    self.meta
+                        .workspace_usage_with_base(
+                            &scope,
+                            &Self::logical_overrides(state, &scope),
+                            &changes,
+                        )?
+                        .bytes
+                } else {
+                    current
+                        .used_bytes
+                        .checked_add(size)
+                        .ok_or_else(|| errno(75))?
+                };
+                if projected > current.limit_bytes && projected > current.used_bytes {
+                    return Err(errno(122));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_budget_locked(
+        &self,
+        state: &State,
+        current: &FsMetadataDump,
+        candidate: &FsMetadataDump,
+    ) -> anyhow::Result<()> {
+        crate::metadata::validate_workspace_metadata_dump(candidate)?;
+        let mut agents: HashSet<&str> = state.workspace_limits.keys().map(String::as_str).collect();
+        agents.insert(SHARED_BASE_LAYER_ID);
+        for (agent, _, _) in current.inodes.iter().chain(&candidate.inodes) {
+            agents.insert(agent);
+        }
+        for agent in agents {
+            let usage = crate::metadata::workspace_dump_usage(candidate, agent)?.bytes;
+            let previous = crate::metadata::workspace_dump_usage(current, agent)?.bytes;
+            let limit = state
+                .workspace_limits
+                .get(agent)
+                .copied()
+                .unwrap_or(DEFAULT_WORKSPACE_BUDGET_BYTES);
+            if usage > limit && usage > previous {
+                return Err(errno(122));
+            }
+        }
+        Ok(())
+    }
+
+    /// Side-effect-free budget preflight before external restore content adoption.
+    pub fn validate_workspace_restore_budget(&self, dump: &FsMetadataDump) -> anyhow::Result<()> {
+        let state = self.lock()?;
+        if !state.handles.is_empty() || state.inodes.values().any(|open| open.dirty) {
+            return Err(errno(16));
+        }
+        self.restore_budget_locked(&state, &self.meta.dump_all_tables()?, dump)
+    }
     /// Retained historical/orphan publications need snapshot-aware reconciliation.
     pub fn workspace_retention_cleanup_pending(&self) -> bool {
         self.plane.is_some() || self.meta.workspace_has_retired_inodes().unwrap_or(true)
@@ -133,23 +389,51 @@ impl LayerManager {
     fn lock(&self) -> anyhow::Result<StateGuard<'_>> {
         let hook = self.invalidation_hook.lock().map_err(|_| errno(5))?.clone();
         let state = self.state.lock().map_err(|_| errno(5))?;
-        Ok(StateGuard { state: Some(state), hook })
+        Ok(StateGuard {
+            state: Some(state),
+            hook,
+        })
     }
     pub fn storage_stats(&self) -> anyhow::Result<LayerStorageStats> {
-        if self.plane.is_some() {
-            return Err(errno(95).context("Chunk-backed workspace accounting must use ArtifactPlane, not legacy CAS dedup ratios"));
-        }
+        let _state = self.lock()?;
         let cas = self.cas.stats()?;
+        if let Some(plane) = &self.plane {
+            let (chunks, segment_bytes) = plane.physical_storage_stats()?;
+            let meta = self.meta.live_workspace_storage_stats()?;
+            return Ok(LayerStorageStats {
+                cas_blob_count: chunks
+                    .checked_add(cas.blob_count)
+                    .ok_or_else(|| errno(75))?,
+                cas_bytes_on_disk: segment_bytes
+                    .checked_add(cas.total_bytes_on_disk)
+                    .ok_or_else(|| errno(75))?,
+                regular_file_count: meta.regular_file_count,
+                logical_regular_file_bytes: meta.logical_regular_file_bytes,
+                dedup_savings_bytes: 0,
+                dedup_ratio_percent: 0.0,
+                unreadable_inode_rows: meta.unreadable_inode_rows,
+                accounting_basis: "chunk_segments_including_retention_and_legacy_cas",
+                dedup_metrics_available: false,
+            });
+        }
         let meta = self.meta.storage_stats()?;
-        let savings = meta.logical_regular_file_bytes.saturating_sub(cas.total_bytes_on_disk);
+        let savings = meta
+            .logical_regular_file_bytes
+            .saturating_sub(cas.total_bytes_on_disk);
         Ok(LayerStorageStats {
-            cas_blob_count: cas.blob_count, cas_bytes_on_disk: cas.total_bytes_on_disk,
+            cas_blob_count: cas.blob_count,
+            cas_bytes_on_disk: cas.total_bytes_on_disk,
             regular_file_count: meta.regular_file_count,
             logical_regular_file_bytes: meta.logical_regular_file_bytes,
             dedup_savings_bytes: savings,
-            dedup_ratio_percent: if meta.logical_regular_file_bytes == 0 { 0.0 }
-                else { savings as f64 * 100.0 / meta.logical_regular_file_bytes as f64 },
+            dedup_ratio_percent: if meta.logical_regular_file_bytes == 0 {
+                0.0
+            } else {
+                savings as f64 * 100.0 / meta.logical_regular_file_bytes as f64
+            },
             unreadable_inode_rows: meta.unreadable_inode_rows,
+            accounting_basis: "legacy_cas_compressed_storage",
+            dedup_metrics_available: true,
         })
     }
     pub fn init_base_root(&self) -> anyhow::Result<()> {
@@ -162,32 +446,51 @@ impl LayerManager {
     }
     fn ensure_root(&self, agent: &str) -> anyhow::Result<()> {
         if self.meta.get_inode(agent, 1)?.is_none() {
-            let root = self.meta.get_inode(SHARED_BASE_LAYER_ID, 1)?
+            let root = self
+                .meta
+                .get_inode(SHARED_BASE_LAYER_ID, 1)?
                 .unwrap_or_else(|| InodeData::directory(0o755));
             self.meta.set_inode(agent, 1, &root)?;
         }
         Ok(())
     }
-    fn record(&self, state: &State, agent: &str, inode: u64) -> anyhow::Result<Option<WorkspaceInode>> {
-        if inode == 0 { return Ok(None); }
+    fn record(
+        &self,
+        state: &State,
+        agent: &str,
+        inode: u64,
+    ) -> anyhow::Result<Option<WorkspaceInode>> {
+        if inode == 0 {
+            return Ok(None);
+        }
         if let Some(open) = state.inodes.get(&(agent.to_string(), inode)) {
             return Ok((open.record.data.nlinks > 0).then(|| open.record.clone()));
         }
         if let Some(record) = self.meta.workspace_inode(agent, inode)? {
-            if !is_whiteout(&record.data) && record.data.nlinks > 0 && inode != 1
-                && agent != SHARED_BASE_LAYER_ID && !record.inherited
-                && self.meta.workspace_inode(SHARED_BASE_LAYER_ID, inode)?.is_some() {
+            if !is_whiteout(&record.data)
+                && record.data.nlinks > 0
+                && inode != 1
+                && agent != SHARED_BASE_LAYER_ID
+                && !record.inherited
+                && self
+                    .meta
+                    .workspace_inode(SHARED_BASE_LAYER_ID, inode)?
+                    .is_some()
+            {
                 // Old per-layer counters could alias unrelated base and private rows.
                 // Fail closed: a migration must assign disjoint identities before use.
                 return Err(errno(116));
             }
             return Ok((!is_whiteout(&record.data) && record.data.nlinks > 0).then_some(record));
         }
-        Ok(self.meta.workspace_inode(SHARED_BASE_LAYER_ID, inode)?
-            .filter(|record| !is_whiteout(&record.data) && record.data.nlinks > 0).map(|mut record| {
-            record.inherited = true;
-            record
-        }))
+        Ok(self
+            .meta
+            .workspace_inode(SHARED_BASE_LAYER_ID, inode)?
+            .filter(|record| !is_whiteout(&record.data) && record.data.nlinks > 0)
+            .map(|mut record| {
+                record.inherited = true;
+                record
+            }))
     }
     fn required(&self, state: &State, agent: &str, inode: u64) -> anyhow::Result<WorkspaceInode> {
         self.record(state, agent, inode)?.ok_or_else(|| errno(2))
@@ -197,33 +500,69 @@ impl LayerManager {
     }
     fn dirent(&self, agent: &str, parent: u64, name: &str) -> anyhow::Result<Option<u64>> {
         if let Some(inode) = self.meta.get_dirent(agent, parent, name)? {
-            if inode == 0 { return Ok(None); }
-            if self.meta.get_inode(agent, inode)?.as_ref().is_some_and(is_whiteout) { return Ok(None); }
+            if inode == 0 {
+                return Ok(None);
+            }
+            if self
+                .meta
+                .get_inode(agent, inode)?
+                .as_ref()
+                .is_some_and(is_whiteout)
+            {
+                return Ok(None);
+            }
             return Ok(Some(inode));
         }
-        Ok(self.meta.get_dirent(SHARED_BASE_LAYER_ID, parent, name)?.filter(|inode| *inode != 0))
+        Ok(self
+            .meta
+            .get_dirent(SHARED_BASE_LAYER_ID, parent, name)?
+            .filter(|inode| *inode != 0))
     }
-    pub fn lookup_dirent(&self, agent: &str, parent: u64, name: &str) -> anyhow::Result<Option<u64>> {
+    pub fn lookup_dirent(
+        &self,
+        agent: &str,
+        parent: u64,
+        name: &str,
+    ) -> anyhow::Result<Option<u64>> {
         validate_name(name)?;
         let state = self.lock()?;
         self.parent(&state, agent, parent, false)?;
         self.dirent(agent, parent, name)
     }
-    fn parent(&self, state: &State, agent: &str, inode: u64, write: bool) -> anyhow::Result<WorkspaceInode> {
+    fn parent(
+        &self,
+        state: &State,
+        agent: &str,
+        inode: u64,
+        write: bool,
+    ) -> anyhow::Result<WorkspaceInode> {
         let record = self.required(state, agent, inode)?;
-        if record.data.kind != FileKind::Directory { return Err(errno(20)); }
+        if record.data.kind != FileKind::Directory {
+            return Err(errno(20));
+        }
         // Caller credentials are checked in the kernel adapter; mode intent is enforced here.
-        if write && record.data.mode & 0o222 == 0 { return Err(errno(13)); }
-        if record.data.mode & 0o111 == 0 { return Err(errno(13)); }
+        if write && record.data.mode & 0o222 == 0 {
+            return Err(errno(13));
+        }
+        if record.data.mode & 0o111 == 0 {
+            return Err(errno(13));
+        }
         Ok(record)
     }
-    fn entries(&self, state: &State, agent: &str, parent: u64) -> anyhow::Result<Vec<(String, u64, FileKind)>> {
+    fn entries(
+        &self,
+        state: &State,
+        agent: &str,
+        parent: u64,
+    ) -> anyhow::Result<Vec<(String, u64, FileKind)>> {
         self.parent(state, agent, parent, false)?;
         let mut seen = HashSet::new();
         let mut entries = Vec::new();
         for layer in [agent, SHARED_BASE_LAYER_ID] {
             for (name, inode) in self.meta.list_dirents(layer, parent)? {
-                if !seen.insert(name.clone()) || inode == 0 { continue; }
+                if !seen.insert(name.clone()) || inode == 0 {
+                    continue;
+                }
                 if let Some(record) = self.record(state, agent, inode)? {
                     entries.push((name, inode, record.data.kind));
                 }
@@ -232,34 +571,55 @@ impl LayerManager {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(entries)
     }
-    pub fn readdir(&self, agent: &str, parent: u64) -> anyhow::Result<Vec<(String, u64, FileKind)>> {
+    pub fn readdir(
+        &self,
+        agent: &str,
+        parent: u64,
+    ) -> anyhow::Result<Vec<(String, u64, FileKind)>> {
         self.entries(&*self.lock()?, agent, parent)
     }
-    fn adoption(&self, state: &mut State, agent: &str, guard: &OwnerWriteGuard,
-        rows: &[(u64, WorkspaceInode)], names: &[(u64, String, Option<u64>)], durable: bool) -> anyhow::Result<()> {
+    fn adoption(
+        &self,
+        state: &mut State,
+        agent: &str,
+        guard: &OwnerWriteGuard,
+        rows: &[(u64, WorkspaceInode)],
+        names: &[(u64, String, Option<u64>)],
+        durable: bool,
+    ) -> anyhow::Result<()> {
         let mut persisted = rows.to_vec();
         for (inode, record) in &mut persisted {
             if let Some(open) = state.inodes.get(&(agent.to_string(), *inode)) {
                 if let Some(dirty_guard) = &open.dirty_guard {
                     OwnerRegistry::global().validate(dirty_guard)?;
                 }
-                if open.dirty && record.generation == open.record.generation
-                    && record.content == open.record.content {
+                if open.dirty
+                    && record.generation == open.record.generation
+                    && record.content == open.record.content
+                {
                     record.data.size = open.published_size;
                 }
             }
         }
-        self.meta.commit_namespace(agent, guard, &persisted, names, durable)?;
+        self.meta
+            .commit_namespace(agent, guard, &persisted, names, durable)?;
         for (inode, record) in rows {
             state.invalidate(agent, *inode);
             if let Some(open) = state.inodes.get_mut(&(agent.to_string(), *inode)) {
                 open.record = record.clone();
             }
         }
-        for (parent, _, _) in names { state.invalidate(agent, *parent); }
+        for (parent, _, _) in names {
+            state.invalidate(agent, *parent);
+        }
         Ok(())
     }
-    fn touch_parent(rows: &mut Vec<(u64, WorkspaceInode)>, inode: u64, mut record: WorkspaceInode, delta: i32) {
+    fn touch_parent(
+        rows: &mut Vec<(u64, WorkspaceInode)>,
+        inode: u64,
+        mut record: WorkspaceInode,
+        delta: i32,
+    ) {
         record.data.nlinks = record.data.nlinks.saturating_add_signed(delta);
         record.data.mtime = now();
         record.data.ctime = record.data.mtime;
@@ -268,11 +628,24 @@ impl LayerManager {
     fn retain(&self, agent: &str, inode: u64, content: WorkspaceContentRef) -> anyhow::Result<()> {
         let plane = self.plane.as_ref().ok_or_else(|| errno(5))?;
         // Object identity prevents replacing roots required by historical snapshots.
-        let root = format!("workspace:{}:{}:{}:{}", agent.len(), agent, inode, content.object_id);
+        let root = format!(
+            "workspace:{}:{}:{}:{}",
+            agent.len(),
+            agent,
+            inode,
+            content.object_id
+        );
         plane.retain_workspace(&root, content)
     }
-    fn publish(&self, agent: &str, inode: u64, guard: &OwnerWriteGuard,
-        base: Option<WorkspaceContentRef>, size: u64, patches: &[WorkspacePatch]) -> anyhow::Result<WorkspaceContentRef> {
+    fn publish(
+        &self,
+        agent: &str,
+        inode: u64,
+        guard: &OwnerWriteGuard,
+        base: Option<WorkspaceContentRef>,
+        size: u64,
+        patches: &[WorkspacePatch],
+    ) -> anyhow::Result<WorkspaceContentRef> {
         OwnerRegistry::global().validate(guard)?;
         let plane = self.plane.as_ref().ok_or_else(|| errno(5))?;
         let content = plane.publish_workspace(base, size, patches)?;
@@ -281,18 +654,40 @@ impl LayerManager {
         OwnerRegistry::global().validate(guard)?;
         Ok(content)
     }
-    fn create(&self, state: &mut State, agent: &str, parent: u64, name: &str,
-        mut record: WorkspaceInode, bytes: Option<&[u8]>) -> anyhow::Result<u64> {
+    fn create(
+        &self,
+        state: &mut State,
+        agent: &str,
+        parent: u64,
+        name: &str,
+        mut record: WorkspaceInode,
+        bytes: Option<&[u8]>,
+    ) -> anyhow::Result<u64> {
         validate_name(name)?;
         let guard = self.meta.namespace_guard(agent)?;
+        if record.data.kind == FileKind::Regular {
+            self.preflight_size(state, agent, None, record.data.size)?;
+        }
+        OwnerRegistry::global().validate(&guard)?;
         self.ensure_root(agent)?;
         let parent_record = self.parent(state, agent, parent, true)?;
-        if self.dirent(agent, parent, name)?.is_some() { return Err(errno(17)); }
+        if self.dirent(agent, parent, name)?.is_some() {
+            return Err(errno(17));
+        }
         let inode = self.meta.workspace_next_inode(agent)?;
         if let Some(bytes) = bytes {
             if self.plane.is_some() {
-                let content = self.publish(agent, inode, &guard, None, bytes.len() as u64,
-                    &[WorkspacePatch { offset: 0, data: bytes.to_vec() }])?;
+                let content = self.publish(
+                    agent,
+                    inode,
+                    &guard,
+                    None,
+                    bytes.len() as u64,
+                    &[WorkspacePatch {
+                        offset: 0,
+                        data: bytes.to_vec(),
+                    }],
+                )?;
                 record.data.hash = content.sha256;
                 record.content = Some(content);
                 record.generation = 1;
@@ -301,31 +696,71 @@ impl LayerManager {
                 record.data.hash = self.cas.store(bytes)?.0;
             }
         }
-        let delta = if record.data.kind == FileKind::Directory { 1 } else { 0 };
+        let delta = if record.data.kind == FileKind::Directory {
+            1
+        } else {
+            0
+        };
         let mut rows = vec![(inode, record)];
         Self::touch_parent(&mut rows, parent, parent_record, delta);
-        self.adoption(state, agent, &guard, &rows, &[(parent, name.to_string(), Some(inode))], false)?;
+        self.adoption(
+            state,
+            agent,
+            &guard,
+            &rows,
+            &[(parent, name.to_string(), Some(inode))],
+            false,
+        )?;
         Ok(inode)
     }
-    pub fn populate_base_file(&self, parent: u64, name: &str, bytes: &[u8], mode: u32) -> anyhow::Result<u64> {
+    pub fn populate_base_file(
+        &self,
+        parent: u64,
+        name: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) -> anyhow::Result<u64> {
         self.write_file(SHARED_BASE_LAYER_ID, parent, name, bytes, mode)
     }
     pub fn populate_base_dir(&self, parent: u64, name: &str, mode: u32) -> anyhow::Result<u64> {
         self.mkdir(SHARED_BASE_LAYER_ID, parent, name, mode)
     }
-    pub fn write_file(&self, agent: &str, parent: u64, name: &str, bytes: &[u8], mode: u32) -> anyhow::Result<u64> {
-        if bytes.len() > MAX_DIRTY_FILE { return Err(errno(27)); }
+    pub fn write_file(
+        &self,
+        agent: &str,
+        parent: u64,
+        name: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) -> anyhow::Result<u64> {
+        if bytes.len() > MAX_DIRTY_FILE {
+            return Err(errno(27));
+        }
         validate_name(name)?;
         let mut state = self.lock()?;
         self.meta.validate_layer_write_authority(agent)?;
+        let existing = self.dirent(agent, parent, name)?;
+        if let Some(inode) = existing {
+            if self.required(&state, agent, inode)?.data.kind != FileKind::Regular {
+                return Err(errno(21));
+            }
+        }
+        self.preflight_size(&state, agent, existing, bytes.len() as u64)?;
         self.ensure_root(agent)?;
         self.parent(&state, agent, parent, true)?;
         if let Some(inode) = self.dirent(agent, parent, name)? {
-            if self.required(&state, agent, inode)?.data.mode & 0o222 == 0 { return Err(errno(13)); }
+            if self.required(&state, agent, inode)?.data.mode & 0o222 == 0 {
+                return Err(errno(13));
+            }
             self.open_state(&mut state, agent, inode)?;
-            let old = state.inodes.get(&(agent.to_string(), inode)).ok_or_else(|| errno(5))?;
+            let old = state
+                .inodes
+                .get(&(agent.to_string(), inode))
+                .ok_or_else(|| errno(5))?;
             let old_dirty = old.dirty_bytes + old.patches.len() * PATCH_CHARGE;
-            if bytes.len() + PATCH_CHARGE > MAX_DIRTY_GLOBAL.saturating_sub(state.dirty_bytes - old_dirty) {
+            if bytes.len() + PATCH_CHARGE
+                > MAX_DIRTY_GLOBAL.saturating_sub(state.dirty_bytes - old_dirty)
+            {
                 return Err(errno(28));
             }
             self.truncate_state(&mut state, agent, inode, 0)?;
@@ -334,56 +769,127 @@ impl LayerManager {
             self.drop_idle(&mut state, agent, inode);
             return Ok(inode);
         }
-        self.create(&mut state, agent, parent, name,
-            WorkspaceInode::legacy(InodeData::regular([0; 32], bytes.len() as u64, mode & 0o7777)), Some(bytes))
+        self.create(
+            &mut state,
+            agent,
+            parent,
+            name,
+            WorkspaceInode::legacy(InodeData::regular(
+                [0; 32],
+                bytes.len() as u64,
+                mode & 0o7777,
+            )),
+            Some(bytes),
+        )
     }
     pub fn mkdir(&self, agent: &str, parent: u64, name: &str, mode: u32) -> anyhow::Result<u64> {
-        self.create(&mut *self.lock()?, agent, parent, name,
-            WorkspaceInode::legacy(InodeData::directory(mode & 0o7777)), None)
+        self.create(
+            &mut *self.lock()?,
+            agent,
+            parent,
+            name,
+            WorkspaceInode::legacy(InodeData::directory(mode & 0o7777)),
+            None,
+        )
     }
-    pub fn symlink(&self, agent: &str, parent: u64, name: &str, target: &str) -> anyhow::Result<u64> {
-        if target.is_empty() || target.contains('\0') { return Err(errno(22)); }
-        if target.len() > 4096 { return Err(errno(36)); }
+    pub fn symlink(
+        &self,
+        agent: &str,
+        parent: u64,
+        name: &str,
+        target: &str,
+    ) -> anyhow::Result<u64> {
+        if target.is_empty() || target.contains('\0') {
+            return Err(errno(22));
+        }
+        if target.len() > 4096 {
+            return Err(errno(36));
+        }
         let mut data = InodeData::regular([0; 32], target.len() as u64, 0o777);
         data.kind = FileKind::Symlink;
         data.symlink_target = target.to_string();
-        self.create(&mut *self.lock()?, agent, parent, name, WorkspaceInode::legacy(data), None)
+        self.create(
+            &mut *self.lock()?,
+            agent,
+            parent,
+            name,
+            WorkspaceInode::legacy(data),
+            None,
+        )
     }
     pub fn link(&self, agent: &str, inode: u64, parent: u64, name: &str) -> anyhow::Result<u64> {
         validate_name(name)?;
         let mut state = self.lock()?;
         let guard = self.meta.namespace_guard(agent)?;
         let mut record = self.required(&state, agent, inode)?;
-        if record.data.kind == FileKind::Directory { return Err(errno(1)); }
+        if record.data.kind == FileKind::Directory {
+            return Err(errno(1));
+        }
         let parent_record = self.parent(&state, agent, parent, true)?;
-        if self.dirent(agent, parent, name)?.is_some() { return Err(errno(17)); }
+        if self.dirent(agent, parent, name)?.is_some() {
+            return Err(errno(17));
+        }
         record.data.nlinks = record.data.nlinks.checked_add(1).ok_or_else(|| errno(31))?;
         record.data.ctime = now();
         let mut rows = vec![(inode, record)];
         Self::touch_parent(&mut rows, parent, parent_record, 0);
-        self.adoption(&mut state, agent, &guard, &rows, &[(parent, name.to_string(), Some(inode))], false)?;
+        self.adoption(
+            &mut state,
+            agent,
+            &guard,
+            &rows,
+            &[(parent, name.to_string(), Some(inode))],
+            false,
+        )?;
         Ok(inode)
     }
-    fn remove(&self, state: &mut State, agent: &str, parent: u64, name: &str,
-        expected: Option<u64>, directory: bool) -> anyhow::Result<()> {
+    fn remove(
+        &self,
+        state: &mut State,
+        agent: &str,
+        parent: u64,
+        name: &str,
+        expected: Option<u64>,
+        directory: bool,
+    ) -> anyhow::Result<()> {
         validate_name(name)?;
         let guard = self.meta.namespace_guard(agent)?;
         let parent_record = self.parent(state, agent, parent, true)?;
         let inode = self.dirent(agent, parent, name)?.ok_or_else(|| errno(2))?;
-        if expected.is_some_and(|e| e != inode) { return Err(errno(2)); }
+        if expected.is_some_and(|e| e != inode) {
+            return Err(errno(2));
+        }
         let mut record = self.required(state, agent, inode)?;
         if directory {
-            if record.data.kind != FileKind::Directory { return Err(errno(20)); }
-            if !self.entries(state, agent, inode)?.is_empty() { return Err(errno(39)); }
+            if record.data.kind != FileKind::Directory {
+                return Err(errno(20));
+            }
+            if !self.entries(state, agent, inode)?.is_empty() {
+                return Err(errno(39));
+            }
             record.data.nlinks = 0;
         } else {
-            if record.data.kind == FileKind::Directory { return Err(errno(21)); }
+            if record.data.kind == FileKind::Directory {
+                return Err(errno(21));
+            }
             record.data.nlinks = record.data.nlinks.saturating_sub(1);
         }
         record.data.ctime = now();
         let mut rows = vec![(inode, record)];
-        Self::touch_parent(&mut rows, parent, parent_record, if directory { -1 } else { 0 });
-        self.adoption(state, agent, &guard, &rows, &[(parent, name.to_string(), Some(0))], false)
+        Self::touch_parent(
+            &mut rows,
+            parent,
+            parent_record,
+            if directory { -1 } else { 0 },
+        );
+        self.adoption(
+            state,
+            agent,
+            &guard,
+            &rows,
+            &[(parent, name.to_string(), Some(0))],
+            false,
+        )
     }
     pub fn unlink(&self, agent: &str, parent: u64, name: &str, inode: u64) -> anyhow::Result<()> {
         self.remove(&mut *self.lock()?, agent, parent, name, Some(inode), false)
@@ -391,31 +897,56 @@ impl LayerManager {
     pub fn rmdir(&self, agent: &str, parent: u64, name: &str) -> anyhow::Result<()> {
         self.remove(&mut *self.lock()?, agent, parent, name, None, true)
     }
-    pub fn rename(&self, agent: &str, old_parent: u64, old_name: &str,
-        new_parent: u64, new_name: &str, flags: u32) -> anyhow::Result<()> {
+    pub fn rename(
+        &self,
+        agent: &str,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        flags: u32,
+    ) -> anyhow::Result<()> {
         validate_name(old_name)?;
         validate_name(new_name)?;
         // RENAME_NOREPLACE only; exchange/whiteout need a separately agreed contract.
-        if flags & !1 != 0 { return Err(errno(22)); }
+        if flags & !1 != 0 {
+            return Err(errno(22));
+        }
         let mut state = self.lock()?;
         let guard = self.meta.namespace_guard(agent)?;
         let old_dir = self.parent(&state, agent, old_parent, true)?;
         let new_dir = self.parent(&state, agent, new_parent, true)?;
-        let inode = self.dirent(agent, old_parent, old_name)?.ok_or_else(|| errno(2))?;
-        if old_parent == new_parent && old_name == new_name { return Ok(()); }
+        let inode = self
+            .dirent(agent, old_parent, old_name)?
+            .ok_or_else(|| errno(2))?;
+        if old_parent == new_parent && old_name == new_name {
+            return Ok(());
+        }
         let mut record = self.required(&state, agent, inode)?;
         let destination = self.dirent(agent, new_parent, new_name)?;
-        if flags == 1 && destination.is_some() { return Err(errno(17)); }
-        if destination == Some(inode) { return Ok(()); }
+        if flags == 1 && destination.is_some() {
+            return Err(errno(17));
+        }
+        if destination == Some(inode) {
+            return Ok(());
+        }
         if record.data.kind == FileKind::Directory {
             let mut pending = vec![inode];
             let mut seen = HashSet::new();
             while let Some(dir) = pending.pop() {
-                if seen.len() >= 65536 || pending.len() >= 65536 { return Err(errno(12)); }
-                if dir == new_parent { return Err(errno(22)); }
-                if !seen.insert(dir) { return Err(errno(5)); }
+                if seen.len() >= 65536 || pending.len() >= 65536 {
+                    return Err(errno(12));
+                }
+                if dir == new_parent {
+                    return Err(errno(22));
+                }
+                if !seen.insert(dir) {
+                    return Err(errno(5));
+                }
                 for (_, child, kind) in self.entries(&state, agent, dir)? {
-                    if kind == FileKind::Directory { pending.push(child); }
+                    if kind == FileKind::Directory {
+                        pending.push(child);
+                    }
                 }
             }
         }
@@ -423,11 +954,21 @@ impl LayerManager {
         let mut replaced_directory = false;
         if let Some(target) = destination {
             let mut victim = self.required(&state, agent, target)?;
-            if record.data.kind == FileKind::Directory && victim.data.kind != FileKind::Directory { return Err(errno(20)); }
-            if record.data.kind != FileKind::Directory && victim.data.kind == FileKind::Directory { return Err(errno(21)); }
+            if record.data.kind == FileKind::Directory && victim.data.kind != FileKind::Directory {
+                return Err(errno(20));
+            }
+            if record.data.kind != FileKind::Directory && victim.data.kind == FileKind::Directory {
+                return Err(errno(21));
+            }
             replaced_directory = victim.data.kind == FileKind::Directory;
-            if replaced_directory && !self.entries(&state, agent, target)?.is_empty() { return Err(errno(39)); }
-            victim.data.nlinks = if replaced_directory { 0 } else { victim.data.nlinks.saturating_sub(1) };
+            if replaced_directory && !self.entries(&state, agent, target)?.is_empty() {
+                return Err(errno(39));
+            }
+            victim.data.nlinks = if replaced_directory {
+                0
+            } else {
+                victim.data.nlinks.saturating_sub(1)
+            };
             victim.data.ctime = now();
             rows.push((target, victim));
         }
@@ -435,79 +976,190 @@ impl LayerManager {
         let moving_directory = record.data.kind == FileKind::Directory;
         rows.push((inode, record));
         if old_parent == new_parent {
-            Self::touch_parent(&mut rows, old_parent, old_dir, if replaced_directory { -1 } else { 0 });
+            Self::touch_parent(
+                &mut rows,
+                old_parent,
+                old_dir,
+                if replaced_directory { -1 } else { 0 },
+            );
         } else {
-            Self::touch_parent(&mut rows, old_parent, old_dir, if moving_directory { -1 } else { 0 });
-            Self::touch_parent(&mut rows, new_parent, new_dir,
-                i32::from(moving_directory) - i32::from(replaced_directory));
+            Self::touch_parent(
+                &mut rows,
+                old_parent,
+                old_dir,
+                if moving_directory { -1 } else { 0 },
+            );
+            Self::touch_parent(
+                &mut rows,
+                new_parent,
+                new_dir,
+                i32::from(moving_directory) - i32::from(replaced_directory),
+            );
         }
-        self.adoption(&mut state, agent, &guard, &rows, &[
-            (old_parent, old_name.to_string(), Some(0)), (new_parent, new_name.to_string(), Some(inode))], false)
+        self.adoption(
+            &mut state,
+            agent,
+            &guard,
+            &rows,
+            &[
+                (old_parent, old_name.to_string(), Some(0)),
+                (new_parent, new_name.to_string(), Some(inode)),
+            ],
+            false,
+        )
     }
     fn open_state(&self, state: &mut State, agent: &str, inode: u64) -> anyhow::Result<()> {
         let key = (agent.to_string(), inode);
-        if state.inodes.contains_key(&key) { return Ok(()); }
-        if state.inodes.len() >= MAX_HANDLES { return Err(errno(24)); }
+        if state.inodes.contains_key(&key) {
+            return Ok(());
+        }
+        if state.inodes.len() >= MAX_HANDLES {
+            return Err(errno(24));
+        }
         let record = self.required(state, agent, inode)?;
         if record.data.kind != FileKind::Regular {
-            return Err(errno(if record.data.kind == FileKind::Directory { 21 } else { 40 }));
+            return Err(errno(if record.data.kind == FileKind::Directory {
+                21
+            } else {
+                40
+            }));
         }
         let size = record.data.size;
-        state.inodes.insert(key, OpenInode { record, published_size: size, base_limit: size,
-            patches: Vec::new(), dirty_bytes: 0, dirty: false, dirty_guard: None, opens: 0 });
+        state.inodes.insert(
+            key,
+            OpenInode {
+                record,
+                published_size: size,
+                base_limit: size,
+                patches: Vec::new(),
+                dirty_bytes: 0,
+                dirty: false,
+                dirty_guard: None,
+                opens: 0,
+            },
+        );
         Ok(())
     }
-    pub fn open_file(&self, agent: &str, inode: u64, writable: bool, append: bool, truncate: bool) -> anyhow::Result<u64> {
-        if truncate && !writable { return Err(errno(13)); }
+    pub fn open_file(
+        &self,
+        agent: &str,
+        inode: u64,
+        writable: bool,
+        append: bool,
+        truncate: bool,
+    ) -> anyhow::Result<u64> {
+        if truncate && !writable {
+            return Err(errno(13));
+        }
         let mut state = self.lock()?;
-        if writable { self.meta.validate_layer_write_authority(agent)?; }
-        if state.handles.len() >= MAX_HANDLES { return Err(errno(24)); }
+        if writable {
+            self.meta.validate_layer_write_authority(agent)?;
+        }
+        if state.handles.len() >= MAX_HANDLES {
+            return Err(errno(24));
+        }
         let data = self.required(&state, agent, inode)?.data;
-        if data.mode & (if writable { 0o222 } else { 0o444 }) == 0 { return Err(errno(13)); }
+        if data.mode & (if writable { 0o222 } else { 0o444 }) == 0 {
+            return Err(errno(13));
+        }
         let handle = state.next_handle.checked_add(1).ok_or_else(|| errno(24))?;
         self.open_state(&mut state, agent, inode)?;
-        if truncate { self.truncate_state(&mut state, agent, inode, 0)?; }
+        if truncate {
+            self.truncate_state(&mut state, agent, inode, 0)?;
+        }
         let key = (agent.to_string(), inode);
         state.inodes.get_mut(&key).ok_or_else(|| errno(5))?.opens += 1;
         state.next_handle = handle;
-        state.handles.insert(handle, Handle { key, writable, append });
+        state.handles.insert(
+            handle,
+            Handle {
+                key,
+                writable,
+                append,
+            },
+        );
         Ok(handle)
     }
     fn handle<'a>(state: &'a State, agent: &str, handle: u64) -> anyhow::Result<&'a Handle> {
         let h = state.handles.get(&handle).ok_or_else(|| errno(9))?;
-        if h.key.0 != agent { return Err(errno(9)); }
+        if h.key.0 != agent {
+            return Err(errno(9));
+        }
         Ok(h)
     }
     pub fn getattr_handle(&self, agent: &str, handle: u64) -> anyhow::Result<InodeData> {
         let state = self.lock()?;
         let h = Self::handle(&state, agent, handle)?;
-        Ok(state.inodes.get(&h.key).ok_or_else(|| errno(9))?.record.data.clone())
+        Ok(state
+            .inodes
+            .get(&h.key)
+            .ok_or_else(|| errno(9))?
+            .record
+            .data
+            .clone())
     }
-    fn read_record(&self, record: &WorkspaceInode, offset: u64, length: usize) -> anyhow::Result<Vec<u8>> {
-        let length = length.min(record.data.size.saturating_sub(offset).min(usize::MAX as u64) as usize);
-        if length == 0 { return Ok(Vec::new()); }
-        if length > MAX_DIRTY_FILE { return Err(errno(22)); }
+    fn read_record(
+        &self,
+        record: &WorkspaceInode,
+        offset: u64,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        let length = length.min(
+            record
+                .data
+                .size
+                .saturating_sub(offset)
+                .min(usize::MAX as u64) as usize,
+        );
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        if length > MAX_DIRTY_FILE {
+            return Err(errno(22));
+        }
         if let Some(content) = record.content {
-            return self.plane.as_ref().ok_or_else(|| errno(5))?.read_workspace_range(content, offset, length);
+            return self
+                .plane
+                .as_ref()
+                .ok_or_else(|| errno(5))?
+                .read_workspace_range(content, offset, length);
         }
         // Explicit legacy reads/migration, never fallback after a content-plane error.
-        if record.data.size > MAX_LEGACY_SIZE { return Err(errno(27)); }
+        if record.data.size > MAX_LEGACY_SIZE {
+            return Err(errno(27));
+        }
         let bytes = self.cas.read(&record.data.hash)?;
-        if CasStore::hash(&bytes) != record.data.hash { return Err(errno(5)); }
+        if CasStore::hash(&bytes) != record.data.hash {
+            return Err(errno(5));
+        }
         let start = usize::try_from(offset).map_err(|_| errno(27))?;
         let end = start.checked_add(length).ok_or_else(|| errno(27))?;
         Ok(bytes.get(start..end).ok_or_else(|| errno(5))?.to_vec())
     }
     fn read_open(&self, open: &OpenInode, offset: u64, length: usize) -> anyhow::Result<Vec<u8>> {
-        let length = length.min(open.record.data.size.saturating_sub(offset).min(usize::MAX as u64) as usize);
-        if length > MAX_DIRTY_FILE { return Err(errno(22)); }
+        let length = length.min(
+            open.record
+                .data
+                .size
+                .saturating_sub(offset)
+                .min(usize::MAX as u64) as usize,
+        );
+        if length > MAX_DIRTY_FILE {
+            return Err(errno(22));
+        }
         let mut result = vec![0; length];
-        let base_length = length.min(open.base_limit.saturating_sub(offset).min(usize::MAX as u64) as usize);
+        let base_length = length.min(
+            open.base_limit
+                .saturating_sub(offset)
+                .min(usize::MAX as u64) as usize,
+        );
         if base_length > 0 {
             let mut base = open.record.clone();
             base.data.size = open.base_limit;
             let bytes = self.read_record(&base, offset, base_length)?;
-            if bytes.len() != base_length { return Err(errno(5)); }
+            if bytes.len() != base_length {
+                return Err(errno(5));
+            }
             result[..base_length].copy_from_slice(&bytes);
         }
         let end = offset.checked_add(length as u64).ok_or_else(|| errno(27))?;
@@ -515,52 +1167,118 @@ impl LayerManager {
             let start = offset.max(patch.offset);
             let stop = end.min(patch.offset + patch.data.len() as u64);
             if start < stop {
-                result[(start - offset) as usize..(stop - offset) as usize]
-                    .copy_from_slice(&patch.data[(start - patch.offset) as usize..(stop - patch.offset) as usize]);
+                result[(start - offset) as usize..(stop - offset) as usize].copy_from_slice(
+                    &patch.data[(start - patch.offset) as usize..(stop - patch.offset) as usize],
+                );
             }
         }
         Ok(result)
     }
-    pub fn read_handle(&self, agent: &str, handle: u64, offset: u64, length: usize) -> anyhow::Result<Vec<u8>> {
+    pub fn read_handle(
+        &self,
+        agent: &str,
+        handle: u64,
+        offset: u64,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
         let state = self.lock()?;
         let h = Self::handle(&state, agent, handle)?;
-        self.read_open(state.inodes.get(&h.key).ok_or_else(|| errno(9))?, offset, length)
+        self.read_open(
+            state.inodes.get(&h.key).ok_or_else(|| errno(9))?,
+            offset,
+            length,
+        )
     }
-    pub fn read_file_range(&self, agent: &str, inode: u64, offset: u64, length: usize) -> anyhow::Result<Vec<u8>> {
+    pub fn read_file_range(
+        &self,
+        agent: &str,
+        inode: u64,
+        offset: u64,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
         let state = self.lock()?;
         if let Some(open) = state.inodes.get(&(agent.to_string(), inode)) {
-            if open.record.data.nlinks == 0 { return Err(errno(2)); }
+            if open.record.data.nlinks == 0 {
+                return Err(errno(2));
+            }
             return self.read_open(open, offset, length);
         }
         let record = self.required(&state, agent, inode)?;
-        if record.data.kind != FileKind::Regular { return Err(errno(21)); }
+        if record.data.kind != FileKind::Regular {
+            return Err(errno(21));
+        }
         self.read_record(&record, offset, length)
     }
     pub fn read_file(&self, agent: &str, inode: u64) -> anyhow::Result<Vec<u8>> {
         let data = self.lookup_inode(agent, inode)?.ok_or_else(|| errno(2))?;
-        if data.kind != FileKind::Regular { return Err(errno(21)); }
+        if data.kind != FileKind::Regular {
+            return Err(errno(21));
+        }
         let size = data.size;
-        if size > MAX_LEGACY_SIZE { return Err(errno(27)); }
+        if size > MAX_LEGACY_SIZE {
+            return Err(errno(27));
+        }
         let mut bytes = Vec::with_capacity(size as usize);
         while bytes.len() < size as usize {
-            let chunk = self.read_file_range(agent, inode, bytes.len() as u64,
-                MAX_DIRTY_FILE.min(size as usize - bytes.len()))?;
-            if chunk.is_empty() { return Err(errno(5)); }
+            let chunk = self.read_file_range(
+                agent,
+                inode,
+                bytes.len() as u64,
+                MAX_DIRTY_FILE.min(size as usize - bytes.len()),
+            )?;
+            if chunk.is_empty() {
+                return Err(errno(5));
+            }
             bytes.extend(chunk);
         }
         Ok(bytes)
     }
-    fn write_state(&self, state: &mut State, agent: &str, inode: u64, offset: u64, bytes: &[u8]) -> anyhow::Result<usize> {
+    fn write_state(
+        &self,
+        state: &mut State,
+        agent: &str,
+        inode: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> anyhow::Result<usize> {
         let guard = self.meta.namespace_guard(agent)?;
-        if bytes.is_empty() { return Ok(0); }
-        let end = offset.checked_add(bytes.len() as u64).ok_or_else(|| errno(27))?;
-        let open = state.inodes.get_mut(&(agent.to_string(), inode)).ok_or_else(|| errno(9))?;
-        if let Some(dirty_guard) = &open.dirty_guard { OwnerRegistry::global().validate(dirty_guard)?; }
-        if end > MAX_FILE_SIZE || (self.plane.is_none() && end > MAX_LEGACY_SIZE) { return Err(errno(27)); }
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| errno(27))?;
+        let new_size = state
+            .inodes
+            .get(&(agent.to_string(), inode))
+            .ok_or_else(|| errno(9))?
+            .record
+            .data
+            .size
+            .max(end);
+        self.preflight_size(state, agent, Some(inode), new_size)?;
+        let open = state
+            .inodes
+            .get_mut(&(agent.to_string(), inode))
+            .ok_or_else(|| errno(9))?;
+        if let Some(dirty_guard) = &open.dirty_guard {
+            OwnerRegistry::global().validate(dirty_guard)?;
+        }
+        if end > MAX_FILE_SIZE || (self.plane.is_none() && end > MAX_LEGACY_SIZE) {
+            return Err(errno(27));
+        }
         if bytes.len() > MAX_DIRTY_FILE.saturating_sub(open.dirty_bytes)
-            || bytes.len().saturating_add(PATCH_CHARGE) > MAX_DIRTY_GLOBAL.saturating_sub(state.dirty_bytes)
-            || open.patches.len() >= MAX_PATCHES { return Err(errno(28)); }
-        open.patches.push(WorkspacePatch { offset, data: bytes.to_vec() });
+            || bytes.len().saturating_add(PATCH_CHARGE)
+                > MAX_DIRTY_GLOBAL.saturating_sub(state.dirty_bytes)
+            || open.patches.len() >= MAX_PATCHES
+        {
+            return Err(errno(28));
+        }
+        OwnerRegistry::global().validate(&guard)?;
+        open.patches.push(WorkspacePatch {
+            offset,
+            data: bytes.to_vec(),
+        });
         open.dirty_bytes += bytes.len();
         state.dirty_bytes += bytes.len() + PATCH_CHARGE;
         open.record.data.size = open.record.data.size.max(end);
@@ -571,23 +1289,58 @@ impl LayerManager {
         state.invalidate(agent, inode);
         Ok(bytes.len())
     }
-    pub fn write_handle(&self, agent: &str, handle: u64, offset: u64, bytes: &[u8]) -> anyhow::Result<usize> {
+    pub fn write_handle(
+        &self,
+        agent: &str,
+        handle: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> anyhow::Result<usize> {
         let mut state = self.lock()?;
         let h = Self::handle(&state, agent, handle)?;
-        if !h.writable { return Err(errno(9)); }
+        if !h.writable {
+            return Err(errno(9));
+        }
         let inode = h.key.1;
-        let offset = if h.append { state.inodes.get(&h.key).ok_or_else(|| errno(9))?.record.data.size } else { offset };
+        let offset = if h.append {
+            state
+                .inodes
+                .get(&h.key)
+                .ok_or_else(|| errno(9))?
+                .record
+                .data
+                .size
+        } else {
+            offset
+        };
         self.write_state(&mut state, agent, inode, offset, bytes)
     }
-    fn truncate_state(&self, state: &mut State, agent: &str, inode: u64, size: u64) -> anyhow::Result<()> {
+    fn truncate_state(
+        &self,
+        state: &mut State,
+        agent: &str,
+        inode: u64,
+        size: u64,
+    ) -> anyhow::Result<()> {
         let guard = self.meta.namespace_guard(agent)?;
-        if size > MAX_FILE_SIZE || (self.plane.is_none() && size > MAX_LEGACY_SIZE) { return Err(errno(27)); }
-        let open = state.inodes.get_mut(&(agent.to_string(), inode)).ok_or_else(|| errno(9))?;
-        if let Some(dirty_guard) = &open.dirty_guard { OwnerRegistry::global().validate(dirty_guard)?; }
+        if size > MAX_FILE_SIZE || (self.plane.is_none() && size > MAX_LEGACY_SIZE) {
+            return Err(errno(27));
+        }
+        self.preflight_size(state, agent, Some(inode), size)?;
+        let open = state
+            .inodes
+            .get_mut(&(agent.to_string(), inode))
+            .ok_or_else(|| errno(9))?;
+        if let Some(dirty_guard) = &open.dirty_guard {
+            OwnerRegistry::global().validate(dirty_guard)?;
+        }
+        OwnerRegistry::global().validate(&guard)?;
         open.base_limit = open.base_limit.min(size);
         let old_patch_count = open.patches.len();
         for patch in &mut open.patches {
-            let keep = size.saturating_sub(patch.offset).min(patch.data.len() as u64) as usize;
+            let keep = size
+                .saturating_sub(patch.offset)
+                .min(patch.data.len() as u64) as usize;
             let removed = patch.data.len() - keep;
             patch.data.truncate(keep);
             patch.data.shrink_to_fit();
@@ -605,43 +1358,71 @@ impl LayerManager {
         state.invalidate(agent, inode);
         Ok(())
     }
-    fn flush(&self, state: &mut State, agent: &str, inode: u64, durable: bool) -> anyhow::Result<()> {
+    fn flush(
+        &self,
+        state: &mut State,
+        agent: &str,
+        inode: u64,
+        durable: bool,
+    ) -> anyhow::Result<()> {
         let key = (agent.to_string(), inode);
         let open = state.inodes.get(&key).ok_or_else(|| errno(9))?;
         let guard = match &open.dirty_guard {
-            Some(guard) => { OwnerRegistry::global().validate(guard)?; guard.clone() }
+            Some(guard) => {
+                OwnerRegistry::global().validate(guard)?;
+                guard.clone()
+            }
             None => self.meta.namespace_guard(agent)?,
         };
         let mut record = open.record.clone();
+        if agent == SHARED_BASE_LAYER_ID {
+            self.preflight_size(state, agent, Some(inode), record.data.size)?;
+        }
         if open.dirty {
             if self.plane.is_some() {
                 let mut base = record.content;
                 // Shrink then extension must not resurrect the old tail.
                 if let Some(content) = base {
                     if open.base_limit < content.size {
-                        base = Some(self.publish(agent, inode, &guard, base, open.base_limit, &[])?);
+                        base =
+                            Some(self.publish(agent, inode, &guard, base, open.base_limit, &[])?);
                     }
                 } else if open.base_limit > 0 {
-                    if open.base_limit > MAX_LEGACY_SIZE { return Err(errno(27)); }
+                    if open.base_limit > MAX_LEGACY_SIZE {
+                        return Err(errno(27));
+                    }
                     let mut legacy = record.clone();
                     legacy.data.size = open.published_size;
                     let mut offset = 0;
                     while offset < open.base_limit {
                         let length = (open.base_limit - offset).min(MAX_DIRTY_FILE as u64) as usize;
                         let bytes = self.read_record(&legacy, offset, length)?;
-                        base = Some(self.publish(agent, inode, &guard, base, offset + length as u64,
-                            &[WorkspacePatch { offset, data: bytes }])?);
+                        base = Some(self.publish(
+                            agent,
+                            inode,
+                            &guard,
+                            base,
+                            offset + length as u64,
+                            &[WorkspacePatch {
+                                offset,
+                                data: bytes,
+                            }],
+                        )?);
                         offset += length as u64;
                     }
                 }
-                let content = self.publish(agent, inode, &guard, base, record.data.size, &open.patches)?;
+                let content =
+                    self.publish(agent, inode, &guard, base, record.data.size, &open.patches)?;
                 record.content = Some(content);
                 record.data.hash = content.sha256;
             } else {
                 let mut bytes = Vec::with_capacity(record.data.size as usize);
                 while bytes.len() < record.data.size as usize {
-                    bytes.extend(self.read_open(open, bytes.len() as u64,
-                        MAX_DIRTY_FILE.min(record.data.size as usize - bytes.len()))?);
+                    bytes.extend(self.read_open(
+                        open,
+                        bytes.len() as u64,
+                        MAX_DIRTY_FILE.min(record.data.size as usize - bytes.len()),
+                    )?);
                 }
                 OwnerRegistry::global().validate(&guard)?;
                 record.data.hash = self.cas.store(&bytes)?.0;
@@ -655,7 +1436,14 @@ impl LayerManager {
             std::fs::File::open(&directory)?.sync_all()?;
             std::fs::File::open(self.cas.cas_dir())?.sync_all()?;
         }
-        self.adoption(state, agent, &guard, &[(inode, record.clone())], &[], durable)?;
+        self.adoption(
+            state,
+            agent,
+            &guard,
+            &[(inode, record.clone())],
+            &[],
+            durable,
+        )?;
         let open = state.inodes.get_mut(&key).ok_or_else(|| errno(9))?;
         state.dirty_bytes -= open.dirty_bytes + open.patches.len() * PATCH_CHARGE;
         open.dirty_bytes = 0;
@@ -669,7 +1457,11 @@ impl LayerManager {
     }
     fn drop_idle(&self, state: &mut State, agent: &str, inode: u64) {
         let key = (agent.to_string(), inode);
-        if state.inodes.get(&key).is_some_and(|o| o.opens == 0 && !o.dirty) {
+        if state
+            .inodes
+            .get(&key)
+            .is_some_and(|o| o.opens == 0 && !o.dirty)
+        {
             state.inodes.remove(&key);
         }
     }
@@ -684,13 +1476,20 @@ impl LayerManager {
         // Failure leaves the handle and dirty state available for retry.
         self.flush(&mut state, agent, inode, false)?;
         state.handles.remove(&handle);
-        state.inodes.get_mut(&(agent.to_string(), inode)).ok_or_else(|| errno(9))?.opens -= 1;
+        state
+            .inodes
+            .get_mut(&(agent.to_string(), inode))
+            .ok_or_else(|| errno(9))?
+            .opens -= 1;
         self.drop_idle(&mut state, agent, inode);
         Ok(())
     }
     pub fn truncate_file(&self, agent: &str, inode: u64, size: u64) -> anyhow::Result<()> {
         let mut state = self.lock()?;
-        if self.required(&state, agent, inode)?.data.mode & 0o222 == 0 { return Err(errno(13)); }
+        if self.required(&state, agent, inode)?.data.mode & 0o222 == 0 {
+            return Err(errno(13));
+        }
+        self.preflight_size(&state, agent, Some(inode), size)?;
         self.open_state(&mut state, agent, inode)?;
         self.truncate_state(&mut state, agent, inode, size)?;
         self.flush(&mut state, agent, inode, false)?;
@@ -698,16 +1497,34 @@ impl LayerManager {
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn set_file_attributes(&self, agent: &str, inode: u64, mode: Option<u32>,
-        uid: Option<u32>, gid: Option<u32>, atime: Option<u64>, mtime: Option<u64>) -> anyhow::Result<()> {
+    pub fn set_file_attributes(
+        &self,
+        agent: &str,
+        inode: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> anyhow::Result<()> {
         let mut state = self.lock()?;
         let guard = self.meta.namespace_guard(agent)?;
         let mut record = self.required(&state, agent, inode)?;
-        if let Some(mode) = mode { record.data.mode = mode & 0o7777; }
-        if let Some(uid) = uid { record.data.uid = uid; }
-        if let Some(gid) = gid { record.data.gid = gid; }
-        if let Some(atime) = atime { record.data.atime = atime; }
-        if let Some(mtime) = mtime { record.data.mtime = mtime; }
+        if let Some(mode) = mode {
+            record.data.mode = mode & 0o7777;
+        }
+        if let Some(uid) = uid {
+            record.data.uid = uid;
+        }
+        if let Some(gid) = gid {
+            record.data.gid = gid;
+        }
+        if let Some(atime) = atime {
+            record.data.atime = atime;
+        }
+        if let Some(mtime) = mtime {
+            record.data.mtime = mtime;
+        }
         record.data.ctime = now();
         self.adoption(&mut state, agent, &guard, &[(inode, record)], &[], false)
     }
@@ -720,40 +1537,71 @@ impl LayerManager {
     }
 
     /// Atomic O_CREAT lookup/create, without O_TRUNC semantics.
-    pub fn create_file(&self, agent: &str, parent: u64, name: &str, mode: u32, exclusive: bool) -> anyhow::Result<u64> {
+    pub fn create_file(
+        &self,
+        agent: &str,
+        parent: u64,
+        name: &str,
+        mode: u32,
+        exclusive: bool,
+    ) -> anyhow::Result<u64> {
         self.create_file_owned(agent, parent, name, mode, exclusive, 0, 0)
     }
 
     /// Assign ownership inside initial namespace adoption, never chown an existing file.
     #[allow(clippy::too_many_arguments)]
-    pub fn create_file_owned(&self, agent: &str, parent: u64, name: &str, mode: u32,
-        exclusive: bool, uid: u32, gid: u32) -> anyhow::Result<u64> {
+    pub fn create_file_owned(
+        &self,
+        agent: &str,
+        parent: u64,
+        name: &str,
+        mode: u32,
+        exclusive: bool,
+        uid: u32,
+        gid: u32,
+    ) -> anyhow::Result<u64> {
         validate_name(name)?;
         let mut state = self.lock()?;
         self.meta.validate_layer_write_authority(agent)?;
         self.ensure_root(agent)?;
         self.parent(&state, agent, parent, false)?;
         if let Some(inode) = self.dirent(agent, parent, name)? {
-            if exclusive { return Err(errno(17)); }
+            if exclusive {
+                return Err(errno(17));
+            }
             let record = self.required(&state, agent, inode)?;
             if record.data.kind != FileKind::Regular {
-                return Err(errno(if record.data.kind == FileKind::Directory { 21 } else { 40 }));
+                return Err(errno(if record.data.kind == FileKind::Directory {
+                    21
+                } else {
+                    40
+                }));
             }
             return Ok(inode);
         }
         let mut data = InodeData::regular([0; 32], 0, mode & 0o7777);
         data.uid = uid;
         data.gid = gid;
-        self.create(&mut state, agent, parent, name, WorkspaceInode::legacy(data), Some(&[]))
+        self.create(
+            &mut state,
+            agent,
+            parent,
+            name,
+            WorkspaceInode::legacy(data),
+            Some(&[]),
+        )
     }
 
     pub fn parent_inode(&self, agent: &str, inode: u64) -> anyhow::Result<u64> {
         let state = self.lock()?;
         self.parent(&state, agent, inode, false)?;
-        if inode == 1 { return Ok(1); }
+        if inode == 1 {
+            return Ok(1);
+        }
         for (parent, name) in self.meta.workspace_parent_candidates(agent, inode)? {
             if self.record(&state, agent, parent)?.is_some()
-                && self.dirent(agent, parent, &name)? == Some(inode) {
+                && self.dirent(agent, parent, &name)? == Some(inode)
+            {
                 return Ok(parent);
             }
         }
@@ -769,10 +1617,17 @@ impl LayerManager {
 
     fn sync_workspaces_locked(&self, state: &mut State) -> anyhow::Result<()> {
         let guard = self.meta.namespace_guard(SHARED_BASE_LAYER_ID)?;
-        let keys: Vec<_> = state.inodes.iter().filter(|(_, open)| open.dirty)
-            .map(|(key, _)| key.clone()).collect();
-        for (agent, inode) in keys { self.flush(state, &agent, inode, true)?; }
-        self.meta.commit_namespace(SHARED_BASE_LAYER_ID, &guard, &[], &[], true)
+        let keys: Vec<_> = state
+            .inodes
+            .iter()
+            .filter(|(_, open)| open.dirty)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (agent, inode) in keys {
+            self.flush(state, &agent, inode, true)?;
+        }
+        self.meta
+            .commit_namespace(SHARED_BASE_LAYER_ID, &guard, &[], &[], true)
     }
 
     /// Atomic manager-level snapshot cut: no namespace/handle mutation can enter
@@ -794,16 +1649,24 @@ impl LayerManager {
         }
         let guard = self.meta.namespace_guard(SHARED_BASE_LAYER_ID)?;
         let previous = self.meta.dump_all_tables()?;
+        self.restore_budget_locked(&state, &previous, dump)?;
         self.meta.restore_workspace_tables(dump, &guard)?;
         let next_handle = state.next_handle;
-        *state = State { next_handle, ..State::default() };
+        let workspace_limits = std::mem::take(&mut state.workspace_limits);
+        *state = State {
+            next_handle,
+            workspace_limits,
+            ..State::default()
+        };
         let hook = state.hook.clone();
         drop(state);
         // Stream existing snapshot vectors instead of growing a notification queue.
         // Duplicates are coalesced by the adapter's bounded observer queue.
         if let Some(hook) = hook {
             for (agent, inode, _) in previous.inodes.iter().chain(&dump.inodes) {
-                if *inode != 0 { hook(agent, *inode); }
+                if *inode != 0 {
+                    hook(agent, *inode);
+                }
             }
         }
         Ok(())

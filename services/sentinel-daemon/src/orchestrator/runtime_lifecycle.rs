@@ -20,10 +20,17 @@ pub(super) struct RuntimeAdapterOwner {
 }
 
 impl RuntimeAdapterOwner {
-    pub(super) fn production(max_agents: usize, fs_mount: Option<&str>) -> Result<Self> {
+    pub(super) fn production(
+        max_agents: usize,
+        fs_mount: Option<&str>,
+        artifact_plane: Option<std::sync::Arc<sentinel_fs::artifact::ArtifactPlane>>,
+    ) -> Result<Self> {
         let mut registry = NanoRuntimeRegistry::new(Some(RUNTIME_BWRAP_LANDLOCK.to_string()));
         registry.register(EcsNativeRuntime::external_lifecycle(max_agents))?;
         let mut bwrap = BwrapNanoRuntime::detect();
+        if let Some(plane) = artifact_plane {
+            bwrap.set_artifact_plane(plane);
+        }
         if let Some(fs_mount) = fs_mount {
             bwrap.set_fs_mount(fs_mount);
         }

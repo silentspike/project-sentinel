@@ -62,7 +62,12 @@ fn main() {
 
     // Apply Landlock (irreversible)
     let rules =
-        sentinel_sandbox::LandlockRuleset::for_agent(agent_name).with_entrypoint_exec(&command[0]);
+        if attestation.is_some() && std::env::var_os("SENTINEL_COMMAND_CGROUP_ROOT").is_some() {
+            sentinel_sandbox::LandlockRuleset::for_workbench(agent_name)
+        } else {
+            sentinel_sandbox::LandlockRuleset::for_agent(agent_name)
+        }
+        .with_entrypoint_exec(&command[0]);
     let enforcement = match if attestation.is_some() {
         rules.apply_required_status()
     } else {

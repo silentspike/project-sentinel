@@ -299,9 +299,18 @@ struct DaemonNanoRuntimeRegistry {
 }
 
 impl DaemonNanoRuntimeRegistry {
+    #[cfg(test)]
     fn production(max_agents: usize, fs_mount: Option<&str>) -> Result<Self> {
+        Self::with_artifact_plane(max_agents, fs_mount, None)
+    }
+
+    fn with_artifact_plane(
+        max_agents: usize,
+        fs_mount: Option<&str>,
+        artifact_plane: Option<Arc<sentinel_fs::artifact::ArtifactPlane>>,
+    ) -> Result<Self> {
         Ok(Self {
-            adapter_owner: RuntimeAdapterOwner::production(max_agents, fs_mount)?,
+            adapter_owner: RuntimeAdapterOwner::production(max_agents, fs_mount, artifact_plane)?,
             handles: HashMap::new(),
             recovery_blocked_agents: HashSet::new(),
         })
@@ -2583,10 +2592,18 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             ?metadata_durability,
             "sentinel-fs Metadata-Durability konfiguriert"
         );
-        let layer = Arc::new(sentinel_fs::layer::LayerManager::new(cas, meta));
+        let plane = Arc::new(
+            sentinel_fs::artifact::ArtifactPlane::open(data_dir.join("home.redb"))
+                .context("sentinel-fs Content-Plane oeffnen")?,
+        );
+        let layer = Arc::new(sentinel_fs::layer::LayerManager::with_artifact_plane(
+            cas, meta, plane,
+        ));
         layer
             .init_base_root()
             .context("sentinel-fs Base-Root initialisieren")?;
+        import_agent_workspaces(&layer, &all_agents, std::path::Path::new("/ram/agents"))
+            .context("preserve native workspaces before enabling the chunk-backed mount")?;
         Some(layer)
     } else {
         None
@@ -2686,9 +2703,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                     info!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount aktiv");
                     active_mount = Some(fs_mount.clone());
                 } else {
-                    warn!(
-                        mountpoint = %mountpoint_check.display(),
-                        "sentinel-fs FUSE-Mount nicht aktiv, fallback auf /ram/agents"
+                    anyhow::bail!(
+                        "configured chunk-backed filesystem did not mount at {}; refusing mutable backing fallback",
+                        mountpoint_check.display()
                     );
                 }
             }
@@ -2696,6 +2713,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         }
         #[cfg(not(feature = "fuse"))]
         {
+            anyhow::ensure!(
+                config.fs_mount.is_none(),
+                "configured agent filesystem requires the fuse feature"
+            );
             None
         }
     };
@@ -2759,7 +2780,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // A config transition marker is written before the first runtime stop. It
     // must be reconciled before any API, readiness surface, ECS entity, or
     // NanoRuntime spawn can become serving after a process restart.
-    let startup_config_apply = reconcile_runtime_config_apply_recovery_marker(
+    let startup_config_apply = reconcile_runtime_config_apply_recovery_marker_with_plane(
         event_store.as_ref(),
         &RuntimeConfigApplyStartupReconcileContext {
             config_dir: &config.config_dir,
@@ -2770,6 +2791,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             #[cfg(test)]
             abandoned_reconcile_observer: None,
         },
+        fs_layer.as_ref().and_then(|layer| layer.artifact_plane()),
     )
     .context("startup blocked by unresolved config apply recovery")?;
     fence_owner_readiness_for_startup_config_apply(
@@ -2787,6 +2809,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         config.max_agents,
         active_fs_mount.as_deref(),
         &config.agent_command,
+        fs_layer.as_ref().and_then(|layer| layer.artifact_plane()),
     )
     .context("startup blocked by unresolved runtime config recovery")?;
     if recovered_runtime_configs > 0 {
@@ -5568,6 +5591,103 @@ fn validate_fs_metadata_blobs(
     }
 }
 
+fn ensure_native_workspace_source(
+    native_root: &std::path::Path,
+    agent_name: &str,
+) -> Result<std::path::PathBuf> {
+    use rustix::fs::{mkdirat, openat, openat2, Mode, OFlags, ResolveFlags};
+    anyhow::ensure!(
+        !agent_name.is_empty()
+            && agent_name.len() <= 255
+            && agent_name != "."
+            && agent_name != ".."
+            && !agent_name.contains('/')
+            && !agent_name.chars().any(char::is_control),
+        "invalid native workspace employee name"
+    );
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let root = openat2(
+        rustix::fs::CWD,
+        native_root,
+        flags,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .context("open trusted native agent root without following symlinks")?;
+    // Create only immediate directories relative to pinned parents. Never follow
+    // a substituted employee/source path or overwrite any existing work.
+    match mkdirat(&root, agent_name, Mode::RWXU) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let agent = openat(&root, agent_name, flags, Mode::empty())?;
+    match mkdirat(&agent, "workspaces", Mode::RWXU) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let _workspace = openat(&agent, "workspaces", flags, Mode::empty())?;
+    Ok(native_root.join(agent_name).join("workspaces"))
+}
+
+fn import_agent_workspaces(
+    layer: &sentinel_fs::layer::LayerManager,
+    agents: &[AgentConfig],
+    native_root: &std::path::Path,
+) -> Result<()> {
+    for agent in agents {
+        let namespace = AgentId(agent.identity.id).to_string();
+        let scope = sentinel_common::StateTransferScope::for_agent(namespace.clone());
+        if !matches!(
+            sentinel_common::OwnerRegistry::global().local_residency(&scope),
+            Ok(sentinel_common::LocalResidency::Active)
+        ) {
+            continue;
+        }
+        let source = ensure_native_workspace_source(native_root, &agent.identity.name)?;
+        let imported =
+            sentinel_fs::workspace_import::import_native_workspace(layer, &namespace, &source)
+                .with_context(|| format!("import private workspace for {namespace}"))?;
+        info!(agent = %namespace, disposition = ?imported.disposition,
+            imported_bytes = imported.imported_bytes, "private workspace import reconciled");
+    }
+    Ok(())
+}
+
+fn validate_fs_workspace_content(
+    layer: &sentinel_fs::layer::LayerManager,
+    fs_metadata: &sentinel_common::FsMetadataDump,
+) -> Result<()> {
+    sentinel_fs::metadata::validate_workspace_metadata_dump(fs_metadata)?;
+    layer.validate_workspace_restore_budget(fs_metadata)?;
+    let contents = sentinel_fs::metadata::referenced_workspace_content(fs_metadata);
+    if contents.is_empty() {
+        return Ok(());
+    }
+    let plane = layer
+        .artifact_plane()
+        .ok_or_else(|| anyhow!("chunk-backed restore requires the original content plane"))?;
+    for content in contents {
+        // Validate the exact binding even for empty files, then independently
+        // prove every reachable extent without materializing the whole object.
+        plane.read_workspace_range(content, 0, 0)?;
+        let mut size = 0u64;
+        let mut digest = Sha256::new();
+        for bytes in sentinel_fs::read_planner::read_object_streaming(&plane, content.object_id)? {
+            let bytes = bytes?;
+            size = size
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| anyhow!("workspace restore size overflow"))?;
+            digest.update(&bytes);
+        }
+        let digest: [u8; 32] = digest.finalize().into();
+        anyhow::ensure!(
+            size == content.size && digest == content.sha256,
+            "workspace restore binding or content digest mismatch"
+        );
+    }
+    Ok(())
+}
+
 fn seed_projection_from_world_snapshot(
     projection_db_path: &str,
     snapshot: &sentinel_common::WorldSnapshot,
@@ -6140,8 +6260,7 @@ fn commit_world_restore_stores(
     if let Some(fs_metadata) = &snapshot.fs_metadata {
         let layer = fs_layer.expect("validated above");
         layer
-            .meta()
-            .restore_all_tables(fs_metadata)
+            .restore_metadata(fs_metadata)
             .context("sentinel-fs Restore fehlgeschlagen")?;
         failure_point.fail_if(RestoreCommitFailurePoint::AfterFs)?;
     }
@@ -6309,6 +6428,10 @@ fn restore_world_snapshot_stores(
     let snapshot = load_bound_world_snapshot(snapshot_id, expected_digest, event_store)?;
     if let Some(fs_metadata) = &snapshot.fs_metadata {
         validate_fs_metadata_blobs(data_dir, fs_metadata)?;
+        validate_fs_workspace_content(
+            fs_layer.ok_or_else(|| anyhow!("chunk-backed restore layer is unavailable"))?,
+            fs_metadata,
+        )?;
     }
     state_store
         .restore_all_tables(&snapshot.redb)
@@ -6317,8 +6440,7 @@ fn restore_world_snapshot_stores(
         let layer = fs_layer
             .ok_or_else(|| anyhow!("Rollback braucht sentinel-fs Layer, aber keiner ist aktiv"))?;
         layer
-            .meta()
-            .restore_all_tables(fs_metadata)
+            .restore_metadata(fs_metadata)
             .context("Rollback sentinel-fs Restore fehlgeschlagen")?;
     }
     sentinel_ecs::restore_ecs_state(world, &snapshot.ecs);
@@ -6484,6 +6606,7 @@ fn execute_world_restore_transfer(
             ));
         }
         validate_fs_metadata_blobs(data_dir, fs_metadata)?;
+        validate_fs_workspace_content(fs_layer.expect("checked above"), fs_metadata)?;
     }
     validate_projection_restore_schema(projection_db_path)?;
 
@@ -6895,8 +7018,13 @@ fn reconcile_runtime_config_recovery_markers(
     max_agents: usize,
     fs_mount: Option<&str>,
     agent_command: &[String],
+    artifact_plane: Option<Arc<sentinel_fs::artifact::ArtifactPlane>>,
 ) -> Result<usize> {
-    let mut runtimes = DaemonNanoRuntimeRegistry::production(max_agents.max(1), fs_mount)?;
+    let mut runtimes = DaemonNanoRuntimeRegistry::with_artifact_plane(
+        max_agents.max(1),
+        fs_mount,
+        artifact_plane,
+    )?;
     reconcile_runtime_config_recovery_markers_with(event_store, |marker| {
         runtimes.reconcile_abandoned_config(&marker.old_config, agent_command)?;
         if DaemonNanoRuntimeRegistry::workload_affecting_change(
@@ -6970,9 +7098,18 @@ struct RuntimeConfigApplyStartupReconcileContext<'a> {
     abandoned_reconcile_observer: Option<&'a AtomicUsize>,
 }
 
+#[cfg(test)]
 fn reconcile_runtime_config_apply_recovery_marker(
     event_store: &EventStore,
     context: &RuntimeConfigApplyStartupReconcileContext<'_>,
+) -> Result<Option<sentinel_limbo::RuntimeConfigApplyRecoveryMarker>> {
+    reconcile_runtime_config_apply_recovery_marker_with_plane(event_store, context, None)
+}
+
+fn reconcile_runtime_config_apply_recovery_marker_with_plane(
+    event_store: &EventStore,
+    context: &RuntimeConfigApplyStartupReconcileContext<'_>,
+    artifact_plane: Option<Arc<sentinel_fs::artifact::ArtifactPlane>>,
 ) -> Result<Option<sentinel_limbo::RuntimeConfigApplyRecoveryMarker>> {
     let RuntimeConfigApplyStartupReconcileContext {
         config_dir,
@@ -7046,7 +7183,11 @@ fn reconcile_runtime_config_apply_recovery_marker(
         rematerialize_participant()?;
     }
 
-    let mut runtimes = DaemonNanoRuntimeRegistry::production((*max_agents).max(1), *fs_mount)?;
+    let mut runtimes = DaemonNanoRuntimeRegistry::with_artifact_plane(
+        (*max_agents).max(1),
+        *fs_mount,
+        artifact_plane,
+    )?;
     let mut workloads = marker.old_agents.clone();
     workloads.extend(marker.staged_agents.clone());
     workloads.sort_by_key(|config| config.identity.id);
@@ -8272,8 +8413,11 @@ fn ecs_tick_loop(
     };
 
     // -- Production NanoRuntime selection (DEV-007: explicit bwrap fallback) --
-    let mut nano_runtimes =
-        DaemonNanoRuntimeRegistry::production(all_agents.len().max(1), fs_mount.as_deref())?;
+    let mut nano_runtimes = DaemonNanoRuntimeRegistry::with_artifact_plane(
+        all_agents.len().max(1),
+        fs_mount.as_deref(),
+        fs_layer.as_ref().and_then(|layer| layer.artifact_plane()),
+    )?;
     info!(
         runtimes = ?nano_runtimes.adapter_owner.keys(),
         fallback = RUNTIME_BWRAP_LANDLOCK,
@@ -14943,6 +15087,119 @@ mod tests {
         assert!(should_run_periodic_runtime_reconcile_unfenced(
             &config, 60, &fence
         ));
+    }
+
+    #[test]
+    fn native_workspace_startup_uses_exact_names_and_rejects_symlink_or_escape() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let name = "Katharina \"Kathi\" Wiegand";
+        let source = ensure_native_workspace_source(directory.path(), name).unwrap();
+        assert_eq!(source, directory.path().join(name).join("workspaces"));
+        std::fs::write(source.join("kept.py"), b"accepted native work").unwrap();
+        assert_eq!(
+            ensure_native_workspace_source(directory.path(), name).unwrap(),
+            source
+        );
+        assert_eq!(
+            std::fs::read(source.join("kept.py")).unwrap(),
+            b"accepted native work"
+        );
+        for invalid in ["", ".", "..", "../outside", "agent/child", "agent\n"] {
+            assert!(ensure_native_workspace_source(directory.path(), invalid).is_err());
+        }
+        let foreign = tempfile::tempdir().unwrap();
+        symlink(foreign.path(), directory.path().join("linked agent")).unwrap();
+        assert!(ensure_native_workspace_source(directory.path(), "linked agent").is_err());
+        assert!(!foreign.path().join("workspaces").exists());
+        let ordinary = directory.path().join("ordinary agent");
+        std::fs::create_dir(&ordinary).unwrap();
+        symlink(foreign.path(), ordinary.join("workspaces")).unwrap();
+        assert!(ensure_native_workspace_source(directory.path(), "ordinary agent").is_err());
+        assert!(std::fs::read_dir(foreign.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn native_workspace_startup_import_preserves_prior_work_across_tmpfs_recreation() {
+        let directory = tempfile::tempdir().unwrap();
+        let native = directory.path().join("agents");
+        std::fs::create_dir(&native).unwrap();
+        let agent = test_ecs_agent_config(7, "Fresh Employee", "Developer", 1);
+        let source = ensure_native_workspace_source(&native, &agent.identity.name).unwrap();
+        std::fs::write(source.join("main.py"), b"native accepted work").unwrap();
+        let layer = sentinel_fs::layer::LayerManager::with_artifact_plane(
+            sentinel_fs::cas::CasStore::open(directory.path()).unwrap(),
+            sentinel_fs::metadata::MetadataStore::open(directory.path().join("namespace.redb"))
+                .unwrap(),
+            Arc::new(
+                sentinel_fs::artifact::ArtifactPlane::open(directory.path().join("home.redb"))
+                    .unwrap(),
+            ),
+        );
+        layer.init_base_root().unwrap();
+        import_agent_workspaces(&layer, std::slice::from_ref(&agent), &native).unwrap();
+        let workspace = layer
+            .lookup_dirent("AGENT-07", 1, "workspaces")
+            .unwrap()
+            .unwrap();
+        let file = layer
+            .lookup_dirent("AGENT-07", workspace, "main.py")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            layer.read_file("AGENT-07", file).unwrap(),
+            b"native accepted work"
+        );
+        layer
+            .write_file("AGENT-07", workspace, "main.py", b"newer chunk work", 0o600)
+            .unwrap();
+        layer.sync_directory("AGENT-07", workspace).unwrap();
+        std::fs::remove_dir_all(&native).unwrap();
+        std::fs::create_dir(&native).unwrap();
+        import_agent_workspaces(&layer, &[agent], &native).unwrap();
+        assert_eq!(
+            layer.read_file("AGENT-07", file).unwrap(),
+            b"newer chunk work"
+        );
+        assert!(!source.join("main.py").exists());
+    }
+
+    #[test]
+    fn restore_validates_workspace_extents_without_treating_sha_as_legacy_blob() {
+        let directory = tempfile::tempdir().unwrap();
+        let plane = Arc::new(
+            sentinel_fs::artifact::ArtifactPlane::open(directory.path().join("home.redb")).unwrap(),
+        );
+        let layer = sentinel_fs::layer::LayerManager::with_artifact_plane(
+            sentinel_fs::cas::CasStore::open(directory.path()).unwrap(),
+            sentinel_fs::metadata::MetadataStore::open(directory.path().join("metadata.redb"))
+                .unwrap(),
+            Arc::clone(&plane),
+        );
+        layer.init_base_root().unwrap();
+        layer
+            .write_file("AGENT-01", 1, "source.py", b"print(42)\n", 0o600)
+            .unwrap();
+        let dump = layer.snapshot_metadata().unwrap();
+        assert!(sentinel_fs::metadata::referenced_blob_hashes(&dump).is_empty());
+        let refs = sentinel_fs::metadata::referenced_workspace_content(&dump);
+        assert_eq!(refs.len(), 1);
+        validate_fs_metadata_blobs(directory.path(), &dump).unwrap();
+        validate_fs_workspace_content(&layer, &dump).unwrap();
+
+        let empty_plane = Arc::new(
+            sentinel_fs::artifact::ArtifactPlane::open(directory.path().join("empty-content.redb"))
+                .unwrap(),
+        );
+        let wrong_layer = sentinel_fs::layer::LayerManager::with_artifact_plane(
+            sentinel_fs::cas::CasStore::open(directory.path()).unwrap(),
+            sentinel_fs::metadata::MetadataStore::open(
+                directory.path().join("empty-metadata.redb"),
+            )
+            .unwrap(),
+            empty_plane,
+        );
+        assert!(validate_fs_workspace_content(&wrong_layer, &dump).is_err());
     }
 
     #[test]

@@ -1,5 +1,17 @@
 # Changelog
 
+- Publish agent workspace updates as durable immutable chunk extents, deduplicate
+  shared bytes before storage, and retain content through explicit lifetime roots.
+  Add the writable POSIX adapter, exact per-agent inode mapping and shared
+  daemon/runtime content database. Native tools use the same private workspace;
+  trusted input and completion authorities remain separate (#856).
+
+- Run project commands through an additional irreversible child sandbox. Keep
+  writable assignment files separate from trusted completion receipts, exact
+  read-only inputs and other employees; fence parent signals and memory, clear
+  the environment and preserve actual interpreter failures for adaptive work
+  (#856).
+
 - Renew customer preview access through a short-lived, principal-bound durable
   grant to the same release and manifest. Preserve the original delivery receipt,
   exact retries and independent explicit customer acceptance (#856).

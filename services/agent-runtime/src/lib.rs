@@ -4,11 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -24,6 +26,9 @@ use sentinel_common::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+pub mod command_membership;
+pub mod command_sandbox;
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const COMMAND_CLEANUP_GRACE: Duration = Duration::from_secs(1);
@@ -346,6 +351,8 @@ pub struct WorkbenchExecutor {
     workspace_root: PathBuf,
     artifact_root: PathBuf,
     input_root: PathBuf,
+    command_runner: Option<PathBuf>,
+    command_boundary: Option<command_sandbox::CommandBoundary>,
     #[cfg(test)]
     fail_next_patch_reservation: Arc<AtomicBool>,
 }
@@ -357,6 +364,8 @@ impl WorkbenchExecutor {
             input_root: workspace_root.join(".inputs"),
             workspace_root,
             artifact_root: artifact_root.into(),
+            command_runner: None,
+            command_boundary: None,
             #[cfg(test)]
             fail_next_patch_reservation: Arc::new(AtomicBool::new(false)),
         }
@@ -371,9 +380,22 @@ impl WorkbenchExecutor {
             workspace_root: workspace_root.into(),
             artifact_root: artifact_root.into(),
             input_root: input_root.into(),
+            command_runner: None,
+            command_boundary: None,
             #[cfg(test)]
             fail_next_patch_reservation: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The trusted runtime binary, never an executable supplied by the model.
+    pub fn with_command_runner(mut self, runner: PathBuf) -> Self {
+        self.command_runner = Some(runner);
+        self
+    }
+
+    pub fn with_command_boundary(mut self, boundary: command_sandbox::CommandBoundary) -> Self {
+        self.command_boundary = Some(boundary);
+        self
     }
 
     /// Reconcile the unscoped runtime receipt authority before serving.
@@ -929,7 +951,9 @@ impl WorkbenchExecutor {
                 &[request.project_id.as_str(), request.work_item_id.as_str()],
             )?
         };
-        let scoped = Self::with_input_root(workspace_root, artifact_root, input_root);
+        let mut scoped = Self::with_input_root(workspace_root, artifact_root, input_root);
+        scoped.command_runner = self.command_runner.clone();
+        scoped.command_boundary = self.command_boundary.clone();
         #[cfg(test)]
         let scoped = Self {
             fail_next_patch_reservation: self.fail_next_patch_reservation.clone(),
@@ -1010,23 +1034,67 @@ impl WorkbenchExecutor {
                 Ok(PathBuf::from(argument))
             })
             .collect::<Result<Vec<_>, ExecutionError>>()?;
-        let mut command = Command::new(program);
+        let input_paths = request
+            .inputs
+            .iter()
+            .map(|input| {
+                Ok(input_root
+                    .as_ref()
+                    .expect("declared input root resolved")
+                    .join(checked_relative(&input.mount_path)?))
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        let (mut command, membership, mut setup) = match &self.command_runner {
+            Some(runner) => {
+                let boundary = self
+                    .command_boundary
+                    .as_ref()
+                    .ok_or_else(command_isolation_error)?;
+                let scoped = command_sandbox::launch_command(
+                    runner,
+                    &workspace,
+                    &input_paths,
+                    program,
+                    &request.resource_limits,
+                    boundary,
+                )
+                .map_err(|_| command_isolation_error())?;
+                (scoped.command, Some(scoped.membership), Some(scoped.setup))
+            }
+            None => {
+                #[cfg(test)]
+                {
+                    // Executor unit tests exercise accounting/cancellation;
+                    // real-process tests separately prove irreversible isolation.
+                    (Command::new(program), None, None)
+                }
+                #[cfg(not(test))]
+                return Err(ExecutionError::runtime(
+                    "command_isolation_unavailable",
+                    "the trusted scoped command runner is not installed",
+                    false,
+                ));
+            }
+        };
+        if membership.is_none() {
+            command.stdin(Stdio::null());
+        }
         command
             .args(&args)
             .current_dir(workspace)
             .env_clear()
             .envs(SAFE_ENVIRONMENT)
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
-        let mut child = command.spawn().map_err(|_| {
+        let mut child = OwnedCommandChild(command.spawn().map_err(|_| {
             ExecutionError::runtime(
                 "command_spawn_failed",
                 "the allowlisted command could not be started",
                 false,
             )
-        })?;
+        })?);
+        drop(command);
         let pid = child.id();
         let stdout = child.stdout.take().ok_or_else(|| {
             ExecutionError::runtime(
@@ -1042,17 +1110,18 @@ impl WorkbenchExecutor {
                 false,
             )
         })?;
-        let stdout_reader = drain_bounded(stdout, request.resource_limits.stdout_bytes);
-        let stderr_reader = drain_bounded(stderr, request.resource_limits.stderr_bytes);
+        let stdout_reader = drain_bounded(stdout, request.resource_limits.stdout_bytes)?;
+        let stderr_reader = drain_bounded(stderr, request.resource_limits.stderr_bytes)?;
         let absolute_deadline = UNIX_EPOCH + Duration::from_millis(request.deadline_unix_ms);
         let relative_deadline = started
             .checked_add(Duration::from_millis(request.resource_limits.wall_time_ms))
             .unwrap_or_else(Instant::now);
         let mut observed = ProcessGroupUsage::default();
+        let mut storage_bytes_written = 0;
 
-        let (status, forced_error) = loop {
+        let (status, mut forced_error) = loop {
             if cancelled.load(Ordering::Acquire) {
-                terminate_process_group(pid, &mut child)?;
+                terminate_command(pid, &mut child, membership.as_ref())?;
                 break (
                     None,
                     Some(ExecutionError::runtime(
@@ -1068,7 +1137,7 @@ impl WorkbenchExecutor {
                 SystemTime::now(),
                 Instant::now(),
             ) {
-                terminate_process_group(pid, &mut child)?;
+                terminate_command(pid, &mut child, membership.as_ref())?;
                 break (
                     None,
                     Some(ExecutionError::new(
@@ -1079,9 +1148,42 @@ impl WorkbenchExecutor {
                     )),
                 );
             }
-            let sample = sample_process_group(pid);
+            if setup
+                .as_mut()
+                .is_some_and(|channel| channel.poll().is_err())
+            {
+                terminate_command(pid, &mut child, membership.as_ref())?;
+                break (None, Some(command_isolation_error()));
+            }
+            let (sample, kernel_limit) = if let Some(group) = &membership {
+                let usage = group.sample().map_err(|_| command_cleanup_error())?;
+                (
+                    ProcessGroupUsage {
+                        cpu_time_ms: usage.cpu_time_ms,
+                        peak_memory_bytes: usage.peak_memory_bytes,
+                        peak_process_count: usage.peak_process_count,
+                    },
+                    if usage.oom_kills > 0 {
+                        Some((
+                            "memory_limit_exceeded",
+                            "the invocation exceeded its memory limit",
+                        ))
+                    } else if usage.process_limit_hits > 0 {
+                        Some((
+                            "process_limit_exceeded",
+                            "the invocation exceeded its process limit",
+                        ))
+                    } else {
+                        None
+                    },
+                )
+            } else {
+                (sample_process_group(pid), None)
+            };
             observed.observe(sample);
-            let limit_error = if observed.cpu_time_ms > request.resource_limits.cpu_time_ms {
+            let limit_error = if kernel_limit.is_some() {
+                kernel_limit
+            } else if observed.cpu_time_ms > request.resource_limits.cpu_time_ms {
                 Some((
                     "cpu_limit_exceeded",
                     "the invocation exceeded its CPU time limit",
@@ -1100,7 +1202,7 @@ impl WorkbenchExecutor {
                 None
             };
             if let Some((code, message)) = limit_error {
-                terminate_process_group(pid, &mut child)?;
+                terminate_command(pid, &mut child, membership.as_ref())?;
                 break (
                     None,
                     Some(ExecutionError::new(
@@ -1111,14 +1213,27 @@ impl WorkbenchExecutor {
                     )),
                 );
             }
-            match owned_process_group_leader_exited(pid) {
+            let exited = if membership.is_some() {
+                child
+                    .try_wait()
+                    .map(|status| status.is_some())
+                    .map_err(|_| command_cleanup_error())
+            } else {
+                owned_process_group_leader_exited(pid)
+            };
+            match exited {
                 Ok(true) => {
-                    let status = quiesce_process_group_after_leader_exit(pid, &mut child)?;
+                    let status = if let Some(group) = &membership {
+                        group.kill_and_wait().map_err(|_| command_cleanup_error())?;
+                        child.wait().map_err(|_| command_cleanup_error())?
+                    } else {
+                        quiesce_process_group_after_leader_exit(pid, &mut child)?
+                    };
                     break (Some(status), None);
                 }
                 Ok(false) => thread::sleep(COMMAND_POLL_INTERVAL),
                 Err(_) => {
-                    terminate_process_group(pid, &mut child)?;
+                    terminate_command(pid, &mut child, membership.as_ref())?;
                     break (
                         None,
                         Some(ExecutionError::runtime(
@@ -1131,49 +1246,88 @@ impl WorkbenchExecutor {
             }
         };
 
-        let stdout = stdout_reader.join().unwrap_or_default();
-        let stderr = stderr_reader.join().unwrap_or_default();
-        if let Some(error) = forced_error {
-            return Err(error);
+        let stdout = stdout_reader.finish()?;
+        let stderr = stderr_reader.finish()?;
+        if let Some(group) = &membership {
+            if group.populated().map_err(|_| command_cleanup_error())? {
+                return Err(command_cleanup_error());
+            }
+            let usage = group.sample().map_err(|_| command_cleanup_error())?;
+            observed.observe(ProcessGroupUsage {
+                cpu_time_ms: usage.cpu_time_ms,
+                peak_memory_bytes: usage.peak_memory_bytes,
+                peak_process_count: usage.peak_process_count,
+            });
+            storage_bytes_written = usage.storage_bytes_written;
+            if forced_error.is_none()
+                && (usage.oom_kills > 0
+                    || usage.process_limit_hits > 0
+                    || usage.cpu_time_ms > request.resource_limits.cpu_time_ms)
+            {
+                forced_error = Some(ExecutionError::new(
+                    WorkbenchErrorClass::Resource,
+                    "command_resource_limit_exceeded",
+                    "the invocation exceeded a kernel resource limit",
+                    false,
+                ));
+            }
+        }
+        if forced_error.is_none() {
+            if let Some(channel) = setup.as_mut() {
+                if !channel.poll().map_err(|_| command_isolation_error())? {
+                    return Err(command_isolation_error());
+                }
+            }
         }
         if stdout.total > request.resource_limits.stdout_bytes
             || stderr.total > request.resource_limits.stderr_bytes
         {
-            return Err(ExecutionError::new(
+            forced_error = Some(ExecutionError::new(
                 WorkbenchErrorClass::Resource,
                 "command_output_limit_exceeded",
                 "the invocation exceeded its command output limit",
                 false,
             ));
         }
-        let status = status.ok_or_else(|| {
-            ExecutionError::runtime(
-                "command_status_missing",
-                "command completion status was unavailable",
-                false,
-            )
-        })?;
+        if status.is_none() && forced_error.is_none() {
+            return Err(command_isolation_error());
+        }
         let mut output = BTreeMap::new();
         output.insert(
             "exit_code".to_string(),
-            status.code().unwrap_or(-1).to_string(),
+            status
+                .as_ref()
+                .and_then(std::process::ExitStatus::code)
+                .unwrap_or(-1)
+                .to_string(),
         );
         output.insert("stdout".to_string(), redact_output(&stdout.retained));
         output.insert("stderr".to_string(), redact_output(&stderr.retained));
         output.insert("stdout_bytes".to_string(), stdout.total.to_string());
         output.insert("stderr_bytes".to_string(), stderr.total.to_string());
+        if membership.is_some() {
+            output.insert(
+                "bytes_written_basis".to_string(),
+                "cgroup_v2_io_stat_wbytes".to_string(),
+            );
+        }
         if let Some(suite_id) = suite_id {
             output.insert("suite_id".to_string(), suite_id.to_string());
         }
         let completed = ExecutionSuccess {
             output,
             bytes_read: stdout.total + stderr.total,
+            bytes_written: storage_bytes_written,
             cpu_time_ms: observed.cpu_time_ms,
             peak_memory_bytes: observed.peak_memory_bytes,
             peak_process_count: observed.peak_process_count,
             ..ExecutionSuccess::default()
         };
-        if !status.success() {
+        if let Some(mut error) = forced_error {
+            error.command_result = Some(Box::new(completed));
+            return Err(error);
+        }
+        if !status.is_some_and(|status| status.success()) {
             let mut error = ExecutionError::tool(
                 "command_failed",
                 "the allowlisted command returned a non-zero status",
@@ -2546,6 +2700,69 @@ fn terminate_process_group(
     verify_reaped_process_group_quiescence(process_group)
 }
 
+fn command_isolation_error() -> ExecutionError {
+    ExecutionError::runtime(
+        "command_isolation_unavailable",
+        "the scoped command isolation or exec setup failed",
+        false,
+    )
+}
+
+struct OwnedCommandChild(std::process::Child);
+
+impl std::ops::Deref for OwnedCommandChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OwnedCommandChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for OwnedCommandChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let deadline = Instant::now() + COMMAND_CLEANUP_GRACE;
+        while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < deadline {
+            thread::sleep(COMMAND_POLL_INTERVAL);
+        }
+    }
+}
+
+fn terminate_command(
+    pid: u32,
+    child: &mut std::process::Child,
+    membership: Option<&command_membership::CommandMembership>,
+) -> Result<(), ExecutionError> {
+    let Some(group) = membership else {
+        return terminate_process_group(pid, child);
+    };
+    // Also stop the exact launcher if cancellation raced its cgroup join.
+    // Child::kill uses the still-owned child, never a recycled numeric group.
+    let _ = child.kill();
+    group.kill_and_wait().map_err(|_| command_cleanup_error())?;
+    let deadline = Instant::now() + COMMAND_CLEANUP_GRACE;
+    loop {
+        if child
+            .try_wait()
+            .map_err(|_| command_cleanup_error())?
+            .is_some()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(command_cleanup_error());
+        }
+        thread::sleep(COMMAND_POLL_INTERVAL);
+    }
+    // A second kill catches any fork between the first kill and launcher exit.
+    group.kill_and_wait().map_err(|_| command_cleanup_error())
+}
+
 fn quiesce_process_group_after_leader_exit(
     process_group: u32,
     child: &mut std::process::Child,
@@ -2673,18 +2890,71 @@ fn command_cleanup_error() -> ExecutionError {
 struct BoundedOutput {
     retained: Vec<u8>,
     total: u64,
+    complete: bool,
 }
 
-fn drain_bounded<R>(mut reader: R, limit: u64) -> thread::JoinHandle<BoundedOutput>
+struct OutputDrain {
+    stop: Arc<AtomicBool>,
+    reader: Option<thread::JoinHandle<BoundedOutput>>,
+}
+
+impl OutputDrain {
+    fn finish(mut self) -> Result<BoundedOutput, ExecutionError> {
+        self.stop.store(true, Ordering::Release);
+        let output = self
+            .reader
+            .take()
+            .ok_or_else(command_cleanup_error)?
+            .join()
+            .map_err(|_| command_cleanup_error())?;
+        if !output.complete {
+            return Err(command_cleanup_error());
+        }
+        Ok(output)
+    }
+}
+
+impl Drop for OutputDrain {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+fn drain_bounded<R>(mut reader: R, limit: u64) -> Result<OutputDrain, ExecutionError>
 where
-    R: Read + Send + 'static,
+    R: Read + AsFd + Send + 'static,
 {
-    thread::spawn(move || {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    let flags = fcntl(&reader, FcntlArg::F_GETFL).map_err(|_| command_cleanup_error())?;
+    fcntl(
+        &reader,
+        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+    )
+    .map_err(|_| command_cleanup_error())?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = stop.clone();
+    let reader = thread::spawn(move || {
         let mut output = BoundedOutput::default();
         let mut chunk = [0_u8; 8192];
+        let mut drain_deadline = None;
         loop {
+            if reader_stop.load(Ordering::Acquire) {
+                let deadline =
+                    *drain_deadline.get_or_insert_with(|| Instant::now() + COMMAND_CLEANUP_GRACE);
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
             match reader.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    output.complete = true;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(COMMAND_POLL_INTERVAL)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
                 Ok(count) => {
                     output.total = output.total.saturating_add(count as u64);
                     let remaining = limit.saturating_sub(output.retained.len() as u64) as usize;
@@ -2695,6 +2965,10 @@ where
             }
         }
         output
+    });
+    Ok(OutputDrain {
+        stop,
+        reader: Some(reader),
     })
 }
 
@@ -2752,6 +3026,7 @@ fn failure_message(
             peak_memory_bytes: completed.peak_memory_bytes,
             peak_process_count: completed.peak_process_count,
             bytes_read: completed.bytes_read,
+            bytes_written: completed.bytes_written,
             ..WorkbenchResourceUsage::default()
         },
         artifacts: Vec::new(),
@@ -3629,6 +3904,26 @@ mod tests {
             redact_output(b"visible\nAuthorization: Bearer abc\ntoken=abc"),
             "visible\n[REDACTED]\n[REDACTED]"
         );
+    }
+
+    #[test]
+    fn command_output_drain_bounds_retention_and_refuses_a_live_writer() {
+        use std::os::unix::net::UnixStream;
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"0123456789").unwrap();
+        let drain = drain_bounded(reader, 4).unwrap_or_else(|_| panic!("drain setup failed"));
+        drop(writer);
+        let output = drain
+            .finish()
+            .unwrap_or_else(|_| panic!("EOF drain failed"));
+        assert_eq!(output.retained, b"0123");
+        assert_eq!(output.total, 10);
+
+        let (reader, _still_open) = UnixStream::pair().unwrap();
+        let drain = drain_bounded(reader, 4).unwrap_or_else(|_| panic!("drain setup failed"));
+        let started = Instant::now();
+        assert!(drain.finish().is_err());
+        assert!(started.elapsed() < COMMAND_CLEANUP_GRACE + Duration::from_secs(1));
     }
 
     #[test]

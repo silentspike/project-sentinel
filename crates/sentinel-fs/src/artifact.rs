@@ -197,17 +197,28 @@ impl WorkspaceExtent {
     }
 }
 
-fn validate_workspace_binding(meta: &ObjectMetadata, content: WorkspaceContentRef) -> anyhow::Result<()> {
-    anyhow::ensure!(meta.size == content.size && meta.sha256 == content.sha256,
-        "workspace content binding mismatch for object {}", content.object_id);
+fn validate_workspace_binding(
+    meta: &ObjectMetadata,
+    content: WorkspaceContentRef,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        meta.size == content.size && meta.sha256 == content.sha256,
+        "workspace content binding mismatch for object {}",
+        content.object_id
+    );
     Ok(())
 }
 
 fn validate_extents(extents: &[WorkspaceExtent], size: u64) -> anyhow::Result<()> {
     let mut end = 0;
     for extent in extents {
-        anyhow::ensure!(extent.start == end && extent.len > 0, "invalid workspace extent index");
-        end = end.checked_add(extent.len).ok_or_else(|| anyhow::anyhow!("extent overflow"))?;
+        anyhow::ensure!(
+            extent.start == end && extent.len > 0,
+            "invalid workspace extent index"
+        );
+        end = end
+            .checked_add(extent.len)
+            .ok_or_else(|| anyhow::anyhow!("extent overflow"))?;
         anyhow::ensure!(end <= size, "workspace extent exceeds size");
     }
     anyhow::ensure!(end == size, "incomplete workspace extent index");
@@ -324,7 +335,9 @@ impl ArtifactPlane {
         patches: &[WorkspacePatch],
     ) -> anyhow::Result<WorkspaceContentRef> {
         for patch in patches {
-            patch.offset.checked_add(patch.data.len() as u64)
+            patch
+                .offset
+                .checked_add(patch.data.len() as u64)
                 .ok_or_else(|| anyhow::anyhow!("workspace patch overflow"))?;
         }
         // The database write lock serializes dedup, publication, release and GC.
@@ -333,32 +346,48 @@ impl ArtifactPlane {
         let mut extents = Vec::new();
         if let Some(base) = base {
             let objects = txn.open_table(FS_OBJECTS)?;
-            let meta = objects.get(base.object_id)?
+            let meta = objects
+                .get(base.object_id)?
                 .ok_or_else(|| anyhow::anyhow!("workspace base object not found"))?;
             validate_workspace_binding(&ObjectMetadata::deserialize(meta.value())?, base)?;
             let table = txn.open_table(FS_WORKSPACE_EXTENTS)?;
-            anyhow::ensure!(table.get((base.object_id, u64::MAX))?.is_some(), "object is not workspace content");
+            anyhow::ensure!(
+                table.get((base.object_id, u64::MAX))?.is_some(),
+                "object is not workspace content"
+            );
             let mut base_extents = Vec::new();
             for entry in table.range((base.object_id, 0)..(base.object_id, u64::MAX))? {
                 let (key, value) = entry?;
                 let extent: WorkspaceExtent = serde_json::from_slice(value.value())?;
-                anyhow::ensure!(extent.start == key.value().1, "workspace index key mismatch");
+                anyhow::ensure!(
+                    extent.start == key.value().1,
+                    "workspace index key mismatch"
+                );
                 base_extents.push(extent);
             }
             validate_extents(&base_extents, base.size)?;
             for extent in base_extents {
-                if extent.start >= size { break; }
+                if extent.start >= size {
+                    break;
+                }
                 extents.push(extent.slice(extent.start, (extent.start + extent.len).min(size)));
             }
         }
         let end = extents.last().map(|e| e.start + e.len).unwrap_or(0);
         if end < size {
-            extents.push(WorkspaceExtent { start: end, len: size - end, hash: None, chunk_offset: 0 });
+            extents.push(WorkspaceExtent {
+                start: end,
+                len: size - end,
+                hash: None,
+                chunk_offset: 0,
+            });
         }
         {
             let mut chunks = txn.open_table(FS_CHUNKS)?;
             for patch in patches {
-                if patch.offset >= size || patch.data.is_empty() { continue; }
+                if patch.offset >= size || patch.data.is_empty() {
+                    continue;
+                }
                 let len = (size - patch.offset).min(patch.data.len() as u64) as usize;
                 let end = patch.offset + len as u64;
                 let mut replacement = Vec::new();
@@ -367,12 +396,19 @@ impl ArtifactPlane {
                 while let Some(chunk) = iter.next_borrowed() {
                     if chunks.get(&chunk.hash)?.is_none() {
                         let compressed = crate::ingest::compress_chunk(chunk.data);
-                        let loc = self.segments.lock()
-                            .map_err(|e| anyhow::anyhow!("segment lock: {e}"))?.append(&compressed)?;
+                        let loc = self
+                            .segments
+                            .lock()
+                            .map_err(|e| anyhow::anyhow!("segment lock: {e}"))?
+                            .append(&compressed)?;
                         chunks.insert(&chunk.hash, loc.to_bytes().as_slice())?;
                     }
-                    replacement.push(WorkspaceExtent { start, len: chunk.data.len() as u64,
-                        hash: Some(chunk.hash), chunk_offset: 0 });
+                    replacement.push(WorkspaceExtent {
+                        start,
+                        len: chunk.data.len() as u64,
+                        hash: Some(chunk.hash),
+                        chunk_offset: 0,
+                    });
                     start += chunk.data.len() as u64;
                 }
                 let first = extents.partition_point(|e| e.start + e.len <= patch.offset);
@@ -381,7 +417,10 @@ impl ArtifactPlane {
                     replacement.insert(0, extents[first].slice(extents[first].start, patch.offset));
                 }
                 if extents[last - 1].start + extents[last - 1].len > end {
-                    replacement.push(extents[last - 1].slice(end, extents[last - 1].start + extents[last - 1].len));
+                    replacement.push(
+                        extents[last - 1]
+                            .slice(end, extents[last - 1].start + extents[last - 1].len),
+                    );
                 }
                 extents.splice(first..last, replacement);
             }
@@ -393,12 +432,20 @@ impl ArtifactPlane {
             let chunks = txn.open_table(FS_CHUNKS)?;
             for extent in &extents {
                 if let Some(hash) = extent.hash {
-                    let loc = chunks.get(&hash)?.ok_or_else(|| anyhow::anyhow!("workspace chunk missing"))?;
-                    let bytes = self.read_indexed_chunk(&hash, ChunkLocation::from_bytes(loc.value())?)?;
+                    let loc = chunks
+                        .get(&hash)?
+                        .ok_or_else(|| anyhow::anyhow!("workspace chunk missing"))?;
+                    let bytes =
+                        self.read_indexed_chunk(&hash, ChunkLocation::from_bytes(loc.value())?)?;
                     let start = usize::try_from(extent.chunk_offset)?;
-                    let end = start.checked_add(usize::try_from(extent.len)?)
+                    let end = start
+                        .checked_add(usize::try_from(extent.len)?)
                         .ok_or_else(|| anyhow::anyhow!("chunk slice overflow"))?;
-                    sha.update(bytes.get(start..end).ok_or_else(|| anyhow::anyhow!("invalid chunk slice"))?);
+                    sha.update(
+                        bytes
+                            .get(start..end)
+                            .ok_or_else(|| anyhow::anyhow!("invalid chunk slice"))?,
+                    );
                     manifest.push(hash);
                 } else {
                     let mut remaining = extent.len;
@@ -410,85 +457,160 @@ impl ArtifactPlane {
                 }
             }
         }
-        self.segments.lock().map_err(|e| anyhow::anyhow!("segment lock: {e}"))?.sync()?;
+        self.segments
+            .lock()
+            .map_err(|e| anyhow::anyhow!("segment lock: {e}"))?
+            .sync()?;
         let digest: [u8; 32] = sha.finalize().into();
         let object_id;
         {
             let mut objects = txn.open_table(FS_OBJECTS)?;
-            let current = objects.get(u64::MAX)?.map(|g| {
-                <[u8; 8]>::try_from(g.value()).map(u64::from_le_bytes)
-            }).transpose()?.unwrap_or(0);
-            object_id = current.checked_add(1).filter(|id| *id < u64::MAX)
+            let current = objects
+                .get(u64::MAX)?
+                .map(|g| <[u8; 8]>::try_from(g.value()).map(u64::from_le_bytes))
+                .transpose()?
+                .unwrap_or(0);
+            object_id = current
+                .checked_add(1)
+                .filter(|id| *id < u64::MAX)
                 .ok_or_else(|| anyhow::anyhow!("object id exhausted"))?;
             objects.insert(u64::MAX, object_id.to_le_bytes().as_slice())?;
-            let meta = ObjectMetadata::new(size, "application/octet-stream", u32::try_from(manifest.len())?, digest);
+            let meta = ObjectMetadata::new(
+                size,
+                "application/octet-stream",
+                u32::try_from(manifest.len())?,
+                digest,
+            );
             objects.insert(object_id, meta.serialize()?.as_slice())?;
-            txn.open_table(FS_MANIFESTS)?.insert(object_id, serde_json::to_vec(&manifest)?.as_slice())?;
+            txn.open_table(FS_MANIFESTS)?
+                .insert(object_id, serde_json::to_vec(&manifest)?.as_slice())?;
             let mut index = txn.open_table(FS_WORKSPACE_EXTENTS)?;
             index.insert((object_id, u64::MAX), &[][..])?;
             for extent in &extents {
-                index.insert((object_id, extent.start), serde_json::to_vec(extent)?.as_slice())?;
+                index.insert(
+                    (object_id, extent.start),
+                    serde_json::to_vec(extent)?.as_slice(),
+                )?;
             }
             let mut counts = txn.open_table(FS_CHUNK_REFCOUNT)?;
             let mut trash = txn.open_table(FS_TRASH_QUEUE)?;
             for hash in &manifest {
                 let count = counts.get(hash)?.map(|g| g.value()).unwrap_or(0);
-                counts.insert(hash, count.checked_add(1).ok_or_else(|| anyhow::anyhow!("chunk refcount overflow"))?)?;
+                counts.insert(
+                    hash,
+                    count
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("chunk refcount overflow"))?,
+                )?;
                 trash.remove(hash)?;
             }
         }
         txn.commit()?;
-        Ok(WorkspaceContentRef { object_id, size, sha256: digest })
+        Ok(WorkspaceContentRef {
+            object_id,
+            size,
+            sha256: digest,
+        })
     }
 
     /// Read through the shared cache using a location from the caller's snapshot.
     fn read_indexed_chunk(&self, hash: &ChunkHash, loc: ChunkLocation) -> anyhow::Result<Vec<u8>> {
-        if let Some(bytes) = self.cache.lock().map_err(|e| anyhow::anyhow!("cache lock: {e}"))?.get(hash) {
+        if let Some(bytes) = self
+            .cache
+            .lock()
+            .map_err(|e| anyhow::anyhow!("cache lock: {e}"))?
+            .get(hash)
+        {
             return Ok(bytes.to_vec());
         }
-        let raw = self.segments.lock().map_err(|e| anyhow::anyhow!("segment lock: {e}"))?.read(&loc)?;
+        let raw = self
+            .segments
+            .lock()
+            .map_err(|e| anyhow::anyhow!("segment lock: {e}"))?
+            .read(&loc)?;
         let bytes = crate::ingest::decompress_chunk(&raw)?;
-        anyhow::ensure!(crate::chunker::blake3_hash_128(&bytes) == *hash, "workspace chunk digest mismatch");
-        self.cache.lock().map_err(|e| anyhow::anyhow!("cache lock: {e}"))?.insert(*hash, bytes.clone());
+        anyhow::ensure!(
+            crate::chunker::blake3_hash_128(&bytes) == *hash,
+            "workspace chunk digest mismatch"
+        );
+        self.cache
+            .lock()
+            .map_err(|e| anyhow::anyhow!("cache lock: {e}"))?
+            .insert(*hash, bytes.clone());
         Ok(bytes)
     }
 
     /// Validate the binding, seek the extent index, and fetch only intersecting chunks.
-    pub fn read_workspace_range(&self, content: WorkspaceContentRef, offset: u64, length: usize) -> anyhow::Result<Vec<u8>> {
+    pub fn read_workspace_range(
+        &self,
+        content: WorkspaceContentRef,
+        offset: u64,
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
         let txn = self.db.begin_read()?;
         let objects = txn.open_table(FS_OBJECTS)?;
-        let meta = objects.get(content.object_id)?.ok_or_else(|| anyhow::anyhow!("workspace object not found"))?;
+        let meta = objects
+            .get(content.object_id)?
+            .ok_or_else(|| anyhow::anyhow!("workspace object not found"))?;
         validate_workspace_binding(&ObjectMetadata::deserialize(meta.value())?, content)?;
         let table = txn.open_table(FS_WORKSPACE_EXTENTS)?;
-        anyhow::ensure!(table.get((content.object_id, u64::MAX))?.is_some(), "object is not workspace content");
+        anyhow::ensure!(
+            table.get((content.object_id, u64::MAX))?.is_some(),
+            "object is not workspace content"
+        );
         let len = content.size.saturating_sub(offset).min(length as u64) as usize;
-        if len == 0 { return Ok(Vec::new()); }
+        if len == 0 {
+            return Ok(Vec::new());
+        }
         let end = offset.saturating_add(len as u64);
         let mut result = vec![0; len];
         let chunks = txn.open_table(FS_CHUNKS)?;
-        let first = table.range((content.object_id, 0)..=(content.object_id, offset))?
-            .next_back().transpose()?.ok_or_else(|| anyhow::anyhow!("workspace extent missing"))?.0.value().1;
+        let first = table
+            .range((content.object_id, 0)..=(content.object_id, offset))?
+            .next_back()
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("workspace extent missing"))?
+            .0
+            .value()
+            .1;
         let mut covered = offset;
         for entry in table.range((content.object_id, first)..(content.object_id, end))? {
             let (key, value) = entry?;
             let extent: WorkspaceExtent = serde_json::from_slice(value.value())?;
-            let extent_end = extent.start.checked_add(extent.len)
+            let extent_end = extent
+                .start
+                .checked_add(extent.len)
                 .ok_or_else(|| anyhow::anyhow!("workspace extent overflow"))?;
-            anyhow::ensure!(extent.start == key.value().1 && extent.len > 0 && extent_end <= content.size,
-                "invalid workspace extent");
-            anyhow::ensure!(extent.start.max(offset) == covered && extent_end > covered,
-                "workspace extent gap or overlap");
+            anyhow::ensure!(
+                extent.start == key.value().1 && extent.len > 0 && extent_end <= content.size,
+                "invalid workspace extent"
+            );
+            anyhow::ensure!(
+                extent.start.max(offset) == covered && extent_end > covered,
+                "workspace extent gap or overlap"
+            );
             if let Some(hash) = extent.hash {
-                let loc = chunks.get(&hash)?.ok_or_else(|| anyhow::anyhow!("workspace chunk missing"))?;
-                let bytes = self.read_indexed_chunk(&hash, ChunkLocation::from_bytes(loc.value())?)?;
+                let loc = chunks
+                    .get(&hash)?
+                    .ok_or_else(|| anyhow::anyhow!("workspace chunk missing"))?;
+                let bytes =
+                    self.read_indexed_chunk(&hash, ChunkLocation::from_bytes(loc.value())?)?;
                 let start = offset.max(extent.start);
                 let stop = end.min(extent_end);
-                let chunk_start = usize::try_from(extent.chunk_offset.checked_add(start - extent.start)
-                    .ok_or_else(|| anyhow::anyhow!("chunk offset overflow"))?)?;
-                let chunk_end = chunk_start.checked_add((stop - start) as usize)
+                let chunk_start = usize::try_from(
+                    extent
+                        .chunk_offset
+                        .checked_add(start - extent.start)
+                        .ok_or_else(|| anyhow::anyhow!("chunk offset overflow"))?,
+                )?;
+                let chunk_end = chunk_start
+                    .checked_add((stop - start) as usize)
                     .ok_or_else(|| anyhow::anyhow!("chunk slice overflow"))?;
                 result[(start - offset) as usize..(stop - offset) as usize].copy_from_slice(
-                    bytes.get(chunk_start..chunk_end).ok_or_else(|| anyhow::anyhow!("invalid chunk slice"))?);
+                    bytes
+                        .get(chunk_start..chunk_end)
+                        .ok_or_else(|| anyhow::anyhow!("invalid chunk slice"))?,
+                );
             }
             covered = extent_end.min(end);
         }
@@ -503,11 +625,19 @@ impl ArtifactPlane {
         let txn = self.begin_durable_write()?;
         {
             let objects = txn.open_table(FS_OBJECTS)?;
-            let meta = objects.get(content.object_id)?.ok_or_else(|| anyhow::anyhow!("workspace object not found"))?;
+            let meta = objects
+                .get(content.object_id)?
+                .ok_or_else(|| anyhow::anyhow!("workspace object not found"))?;
             validate_workspace_binding(&ObjectMetadata::deserialize(meta.value())?, content)?;
             let extents = txn.open_table(FS_WORKSPACE_EXTENTS)?;
-            anyhow::ensure!(extents.get((content.object_id, u64::MAX))?.is_some(), "object is not workspace content");
-            self.segments.lock().map_err(|e| anyhow::anyhow!("segment lock: {e}"))?.sync()?;
+            anyhow::ensure!(
+                extents.get((content.object_id, u64::MAX))?.is_some(),
+                "object is not workspace content"
+            );
+            self.segments
+                .lock()
+                .map_err(|e| anyhow::anyhow!("segment lock: {e}"))?
+                .sync()?;
             let mut roots = txn.open_table(FS_WORKSPACE_ROOTS)?;
             roots.insert(root, content.object_id)?;
         }
@@ -523,18 +653,35 @@ impl ArtifactPlane {
             let old = roots.remove(root)?.map(|g| g.value());
             old
         };
-        if let Some(old) = old { crate::gc::release_object_in_transaction(&txn, old)?; }
+        if let Some(old) = old {
+            crate::gc::release_object_in_transaction(&txn, old)?;
+        }
         txn.commit()?;
         Ok(())
     }
 
-    pub(crate) fn workspace_ref(&self, object_id: u64) -> anyhow::Result<Option<WorkspaceContentRef>> {
+    pub(crate) fn workspace_ref(
+        &self,
+        object_id: u64,
+    ) -> anyhow::Result<Option<WorkspaceContentRef>> {
         let txn = self.db.begin_read()?;
-        if txn.open_table(FS_WORKSPACE_EXTENTS)?.get((object_id, u64::MAX))?.is_none() { return Ok(None); }
+        if txn
+            .open_table(FS_WORKSPACE_EXTENTS)?
+            .get((object_id, u64::MAX))?
+            .is_none()
+        {
+            return Ok(None);
+        }
         let objects = txn.open_table(FS_OBJECTS)?;
-        let meta = objects.get(object_id)?.ok_or_else(|| anyhow::anyhow!("workspace object missing"))?;
+        let meta = objects
+            .get(object_id)?
+            .ok_or_else(|| anyhow::anyhow!("workspace object missing"))?;
         let meta = ObjectMetadata::deserialize(meta.value())?;
-        Ok(Some(WorkspaceContentRef { object_id, size: meta.size, sha256: meta.sha256 }))
+        Ok(Some(WorkspaceContentRef {
+            object_id,
+            size: meta.size,
+            sha256: meta.sha256,
+        }))
     }
 
     /// Configure the adaptive commit scheduler for IOPS protection.
@@ -572,7 +719,9 @@ impl ArtifactPlane {
                     }
                 })
                 .unwrap_or(0);
-            let next = current.checked_add(1).filter(|id| *id < u64::MAX)
+            let next = current
+                .checked_add(1)
+                .filter(|id| *id < u64::MAX)
                 .ok_or_else(|| anyhow::anyhow!("object id exhausted"))?;
             table.insert(u64::MAX, next.to_le_bytes().as_slice())?;
             next
@@ -665,17 +814,26 @@ impl ArtifactPlane {
         {
             let mut chunks = wtxn.open_table(FS_CHUNKS)?;
             if chunks.get(hash)?.is_none() {
-                let mut segments = self.segments.lock()
+                let mut segments = self
+                    .segments
+                    .lock()
                     .map_err(|e| anyhow::anyhow!("segment lock: {e}"))?;
                 let loc = segments.append(raw)?;
                 segments.sync()?;
                 chunks.insert(hash, loc.to_bytes().as_slice())?;
                 let mut refcount = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
                 let current = refcount.get(hash)?.map(|g| g.value()).unwrap_or(0);
-                refcount.insert(hash, current.checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("chunk refcount overflow"))?)?;
+                refcount.insert(
+                    hash,
+                    current
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("chunk refcount overflow"))?,
+                )?;
             } else {
-                self.segments.lock().map_err(|e| anyhow::anyhow!("segment lock: {e}"))?.sync()?;
+                self.segments
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("segment lock: {e}"))?
+                    .sync()?;
             }
         }
         wtxn.commit()?;
@@ -879,6 +1037,24 @@ impl ArtifactPlane {
         Ok(table.len()?)
     }
 
+    /// Physical segment inventory, including retained/trash bytes. These are
+    /// not only the bytes referenced by the current visible namespace; do not
+    /// present their difference from live logical bytes as pure dedup savings.
+    pub fn physical_storage_stats(&self) -> anyhow::Result<(u64, u64)> {
+        let chunks = self.chunk_count()?;
+        let segments = self
+            .segments
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut bytes = 0_u64;
+        for id in segments.segment_ids()? {
+            bytes = bytes
+                .checked_add(segments.segment_size(id)?)
+                .ok_or_else(|| anyhow::anyhow!("physical segment byte count overflow"))?;
+        }
+        Ok((chunks, bytes))
+    }
+
     // --- Ingest Session Tracking ---
 
     /// Register a new ingest session (shown as .part in FUSE).
@@ -995,18 +1171,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rotation.redb");
         let plane = ArtifactPlane::open_with_durability(&path, DurabilityLevel::Eventual).unwrap();
-        *plane.segments.lock().unwrap() = SegmentStore::open_with_target(path.with_extension("segments"), 32).unwrap();
-        let patches: Vec<_> = (0..4).map(|i| WorkspacePatch {
-            offset: i * 64,
-            data: vec![i as u8 + 1; 64],
-        }).collect();
+        *plane.segments.lock().unwrap() =
+            SegmentStore::open_with_target(path.with_extension("segments"), 32).unwrap();
+        let patches: Vec<_> = (0..4)
+            .map(|i| WorkspacePatch {
+                offset: i * 64,
+                data: vec![i as u8 + 1; 64],
+            })
+            .collect();
         let content = plane.publish_workspace(None, 256, &patches).unwrap();
-        assert_eq!(plane.segments.lock().unwrap().segment_ids().unwrap().len(), 4);
+        assert_eq!(
+            plane.segments.lock().unwrap().segment_ids().unwrap().len(),
+            4
+        );
         plane.retain_workspace("rotation", content).unwrap();
         drop(plane);
         let reopened = ArtifactPlane::open(&path).unwrap();
-        let expected: Vec<u8> = patches.iter().flat_map(|p| p.data.iter().copied()).collect();
-        assert_eq!(reopened.read_workspace_range(content, 0, 256).unwrap(), expected);
+        let expected: Vec<u8> = patches
+            .iter()
+            .flat_map(|p| p.data.iter().copied())
+            .collect();
+        assert_eq!(
+            reopened.read_workspace_range(content, 0, 256).unwrap(),
+            expected
+        );
         crate::gc::release_object(&reopened, content.object_id).unwrap();
         assert!(reopened.get_object(content.object_id).unwrap().is_some());
     }
@@ -1016,10 +1204,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("failure.redb");
         let plane = ArtifactPlane::open(&path).unwrap();
-        let base = plane.publish_workspace(None, 4, &[WorkspacePatch {
-            offset: 0,
-            data: b"base".to_vec(),
-        }]).unwrap();
+        let base = plane
+            .publish_workspace(
+                None,
+                4,
+                &[WorkspacePatch {
+                    offset: 0,
+                    data: b"base".to_vec(),
+                }],
+            )
+            .unwrap();
         let segment_dir = path.with_extension("segments");
         let moved = dir.path().join("moved-segments");
         std::fs::rename(&segment_dir, &moved).unwrap();
@@ -1027,10 +1221,16 @@ mod tests {
         // the directory sync after staging and before metadata publication.
         assert!(plane.publish_workspace(None, 0, &[]).is_err());
         let hash = crate::chunker::blake3_hash_128(b"uncommitted");
-        assert!(plane.publish_workspace(Some(base), 11, &[WorkspacePatch {
-            offset: 0,
-            data: b"uncommitted".to_vec(),
-        }]).is_err());
+        assert!(plane
+            .publish_workspace(
+                Some(base),
+                11,
+                &[WorkspacePatch {
+                    offset: 0,
+                    data: b"uncommitted".to_vec(),
+                }]
+            )
+            .is_err());
         assert!(!plane.has_chunk(&hash).unwrap());
         assert!(plane.get_object(base.object_id + 1).unwrap().is_none());
         std::fs::rename(&moved, &segment_dir).unwrap();
@@ -1044,13 +1244,22 @@ mod tests {
     #[test]
     fn expired_stale_trash_cannot_remove_a_live_workspace_chunk() {
         let (plane, _dir) = temp_plane();
-        let content = plane.publish_workspace(None, 4, &[WorkspacePatch {
-            offset: 0,
-            data: b"live".to_vec(),
-        }]).unwrap();
+        let content = plane
+            .publish_workspace(
+                None,
+                4,
+                &[WorkspacePatch {
+                    offset: 0,
+                    data: b"live".to_vec(),
+                }],
+            )
+            .unwrap();
         let hash = plane.get_manifest(content.object_id).unwrap().unwrap()[0];
         let txn = plane.begin_durable_write().unwrap();
-        txn.open_table(FS_TRASH_QUEUE).unwrap().insert(&hash, 0).unwrap();
+        txn.open_table(FS_TRASH_QUEUE)
+            .unwrap()
+            .insert(&hash, 0)
+            .unwrap();
         txn.commit().unwrap();
         crate::gc::gc_trash(&plane, 0).unwrap();
         assert!(plane.has_chunk(&hash).unwrap());

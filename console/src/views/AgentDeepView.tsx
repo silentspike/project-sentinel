@@ -403,8 +403,12 @@ export function AgentDeepView(): JSX.Element {
           <Show when={listing()}>
             {(l) => (
               <p class="muted" style={{ "font-size": "11px", "margin-bottom": "4px" }} data-testid="fs-dedup">
-                Dedup: {l().dedup_ratio_percent.toFixed(1)}% gespart ({l().cas_blob_count} CAS-Blobs,{" "}
-                {l().dedup_savings_bytes} B)
+                <Show when={l().dedup_metrics_available !== false} fallback={
+                  <>Chunk storage: {l().cas_blob_count} content units; dedup ratio unavailable</>
+                }>
+                  Dedup: {l().dedup_ratio_percent.toFixed(1)}% gespart ({l().cas_blob_count} CAS-Blobs,{" "}
+                  {l().dedup_savings_bytes} B)
+                </Show>
               </p>
             )}
           </Show>
