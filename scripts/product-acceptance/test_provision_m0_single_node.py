@@ -51,6 +51,12 @@ STOPPED_UNITS = (
     | {PREFLIGHT_MODULE.AUTH_INIT_UNIT, PREFLIGHT_MODULE.TARGET_UNIT}
 )
 MODES = {"binary": 0o755, "script": 0o755, "config": 0o644, "systemd": 0o644}
+NATIVE_SOURCES = (
+    "config/work-profiles/python-project-v1.toml",
+    "config/work-profiles/node-project-v1.toml",
+    "config/workbench-profiles/coding-qa-v1.toml",
+    "deploy/scripts/coding-qa-v1.py",
+)
 
 
 def encoded(value: object) -> bytes:
@@ -235,6 +241,44 @@ class ProvisionM0SingleNodeTests(unittest.TestCase):
         self.assertNotIn("target", receipt)
         self.assertNotIn("uid", json.dumps(receipt))
         self.assertNotIn("gid", json.dumps(receipt))
+
+    def test_native_artifact_failures_precede_any_target_mutation(self) -> None:
+        for source in NATIVE_SOURCES:
+            for attack, reason in (
+                ("omitted", "manifest_artifact_count"),
+                ("missing", "source_path_unsafe"),
+                ("tampered", "source_hash_mismatch"),
+                ("symlink", "source_path_unsafe"),
+                ("hardlink", "source_file_authority_invalid"),
+                ("mode", "source_file_mode_invalid"),
+                ("source", "manifest_artifact_authority_mismatch"),
+                ("type", "manifest_artifact_authority_mismatch"),
+            ):
+                with self.subTest(source=source, attack=attack):
+                    fixture = Fixture(self.case / f"native-{uuid.uuid4()}")
+                    row = next(item for item in fixture.artifacts if item["source"] == source)
+                    path = fixture.source / source
+                    if attack == "omitted":
+                        fixture.artifacts.remove(row)
+                    elif attack == "missing":
+                        path.unlink()
+                    elif attack == "tampered":
+                        path.write_bytes(b"tampered-native-artifact\n")
+                    elif attack == "symlink":
+                        path.unlink()
+                        path.symlink_to(fixture.source / "config/daemon.toml")
+                    elif attack == "hardlink":
+                        os.link(path, fixture.base / "artifact-alias")
+                    elif attack == "mode":
+                        path.chmod(0o644 if row["type"] == "script" else 0o755)
+                    elif attack == "source":
+                        row["source"] = "config/redirected.toml"
+                    else:
+                        row["type"] = "config" if row["type"] == "script" else "script"
+                    fixture.write_manifest()
+                    self.assert_failed(fixture.run(), reason)
+                    self.assertEqual(list(fixture.target.iterdir()), [])
+                    self.assertFalse((fixture.stage / "provision-receipt.json").exists())
 
     def test_idempotent_retry_has_no_mutation(self) -> None:
         first = self.fixture.run()

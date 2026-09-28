@@ -74,6 +74,10 @@ TIMER_SERVICES = {
 ACTIVATION_ONESHOT_TIMERS = {"sentinel-health-monitor.timer"}
 M0_CONTRACT_PATH = Path("/opt/sentinel/config/product-acceptance/m0-contract.toml")
 M0_PROFILE_PATH = Path("/opt/sentinel/config/work-profiles/web-project-v1.toml")
+WORK_PROFILE_PATHS = {
+    name: Path(f"/opt/sentinel/config/work-profiles/{name}.toml")
+    for name in ("web-project-v1", "python-project-v1", "node-project-v1")
+}
 M0_WORKBENCH_PROFILE_PATH = Path(
     "/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml"
 )
@@ -342,6 +346,19 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
         "config",
     ),
     str(M0_PROFILE_PATH): ("config/work-profiles/web-project-v1.toml", "config"),
+    "/opt/sentinel/config/work-profiles/python-project-v1.toml": (
+        "config/work-profiles/python-project-v1.toml",
+        "config",
+    ),
+    "/opt/sentinel/config/work-profiles/node-project-v1.toml": (
+        "config/work-profiles/node-project-v1.toml",
+        "config",
+    ),
+    "/opt/sentinel/config/workbench-profiles/coding-qa-v1.toml": (
+        "config/workbench-profiles/coding-qa-v1.toml",
+        "config",
+    ),
+    "/usr/bin/sentinel-coding-qa": ("deploy/scripts/coding-qa-v1.py", "script"),
     str(M0_WORKBENCH_PROFILE_PATH): (
         "config/workbench-profiles/web-authoring-v1.toml",
         "config",
@@ -1116,9 +1133,17 @@ def validate_contract_profile_roster(
 ) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
     contract = parse_toml(deps.read_file(inputs.contract, MAX_FILE_BYTES))
     profile = parse_toml(deps.read_file(inputs.profile, MAX_FILE_BYTES))
-    if contract.get("schema_version") != 1 or contract.get("profile") != "web-project-v1":
+    profile_id = contract.get("profile")
+    if (
+        contract.get("schema_version") != 1
+        or not isinstance(profile_id, str)
+        or profile_id not in WORK_PROFILE_PATHS
+    ):
         raise PreflightError("contract_identity_mismatch")
-    if contract.get("profile_path") != "config/work-profiles/web-project-v1.toml":
+    if (
+        contract.get("profile_path") != f"config/work-profiles/{profile_id}.toml"
+        or inputs.profile != WORK_PROFILE_PATHS[profile_id]
+    ):
         raise PreflightError("contract_profile_path_mismatch")
     if profile.get("schema_version") != 1 or profile.get("id") != contract["profile"]:
         raise PreflightError("profile_identity_mismatch")
@@ -2110,7 +2135,7 @@ def evaluate(inputs: Inputs, deps: Dependencies = DEFAULT_DEPENDENCIES) -> dict[
         raise PreflightError("store_path_invalid")
     if inputs.contract != M0_CONTRACT_PATH:
         raise PreflightError("contract_path_invalid")
-    if inputs.profile != M0_PROFILE_PATH:
+    if inputs.profile not in WORK_PROFILE_PATHS.values():
         raise PreflightError("profile_path_invalid")
     if inputs.agents_dir != Path("/opt/sentinel/config/agents"):
         raise PreflightError("agents_path_invalid")
