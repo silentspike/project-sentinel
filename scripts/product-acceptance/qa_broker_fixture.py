@@ -61,6 +61,11 @@ def load_test_runner(path, broker_socket):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.BROKER_SOCKET = str(broker_socket)
+    # Hosted CI keeps Node in its tool cache, unlike the deployed runtime.
+    interpreter_dirs = [str(Path(program).parent) for name in ("python3", "node")
+                        if (program := shutil.which(name)) is not None]
+    module.ENVIRONMENT = dict(module.ENVIRONMENT,
+                              PATH=os.pathsep.join([*interpreter_dirs, ENVIRONMENT["PATH"]]))
     if hasattr(module, "subprocess"):
         def forbidden(*args, **kwargs):
             raise AssertionError("production evaluator attempted direct subprocess fallback")
