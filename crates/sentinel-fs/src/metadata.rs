@@ -6,6 +6,7 @@
 //! - `CAS_REFCOUNT`: `sha256_hash` -> reference count (u32)
 
 use crate::cas::{CasStore, ChunkGcStats};
+use crate::artifact::WorkspaceContentRef;
 use crate::SHARED_BASE_LAYER_ID;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 use sentinel_common::{
@@ -39,6 +40,49 @@ const FS_SNAPSHOT_BLOB_REFS: TableDefinition<(&str, &[u8; 32]), u64> =
     TableDefinition::new("fs_snapshot_blob_refs");
 
 const INODE_DATA_BINCODE_V1: &[u8; 4] = b"SFI1";
+const INODE_DATA_BINCODE_V2: &[u8; 4] = b"SFI2";
+
+/// Binding versions do not change the identity or legacy SHA-256 of an inode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct WorkspaceInode {
+    pub data: InodeData,
+    pub generation: u64,
+    pub content: Option<WorkspaceContentRef>,
+    /// Explicit private CoW of a shared identity, not an accidental legacy collision.
+    pub inherited: bool,
+}
+
+impl WorkspaceInode {
+    pub(crate) fn legacy(data: InodeData) -> Self {
+        Self { data, generation: 0, content: None, inherited: false }
+    }
+
+    fn serialize(&self) -> anyhow::Result<Vec<u8>> {
+        if let Some(content) = self.content {
+            anyhow::ensure!(self.data.kind == FileKind::Regular
+                && self.data.size == content.size && self.data.hash == content.sha256,
+                "Incoherent workspace inode binding");
+        }
+        let mut bytes = INODE_DATA_BINCODE_V2.to_vec();
+        bytes.extend(bincode::serde::encode_to_vec(self, bincode::config::standard())?);
+        Ok(bytes)
+    }
+
+    fn deserialize(bytes: &[u8]) -> anyhow::Result<Self> {
+        if let Some(payload) = bytes.strip_prefix(INODE_DATA_BINCODE_V2) {
+            let (record, used): (Self, usize) =
+                bincode::serde::decode_from_slice(payload, bincode::config::standard())?;
+            anyhow::ensure!(used == payload.len(), "Trailing SFI2 inode bytes");
+            if let Some(content) = record.content {
+                anyhow::ensure!(record.data.kind == FileKind::Regular
+                    && record.data.size == content.size && record.data.hash == content.sha256,
+                    "Incoherent workspace inode binding");
+            }
+            return Ok(record);
+        }
+        Ok(Self::legacy(InodeData::deserialize(bytes)?))
+    }
+}
 
 /// The shared read-only base layer belongs to the world authority. Per-agent
 /// layers remain fenced by their nano-container scope.
@@ -56,13 +100,29 @@ fn owner_scope_for_layer(layer_id: &str) -> StateTransferScope {
 pub fn referenced_blob_hashes(dump: &FsMetadataDump) -> Vec<[u8; 32]> {
     let mut set: HashSet<[u8; 32]> = HashSet::new();
     for (_agent_id, _inode, bytes) in &dump.inodes {
-        if let Ok(data) = InodeData::deserialize(bytes) {
+        if let Ok(record) = WorkspaceInode::deserialize(bytes) {
+            if record.content.is_some() { continue; }
+            let data = record.data;
             if data.kind == FileKind::Regular && data.size != u64::MAX && data.hash != [0u8; 32] {
                 set.insert(data.hash);
             }
         }
     }
     set.into_iter().collect()
+}
+
+/// Chunk-backed bindings in a metadata dump. Snapshot integration must retain
+/// these in ArtifactPlane; SHA-256 equality does not make them legacy CAS blobs.
+pub fn referenced_workspace_content(dump: &FsMetadataDump) -> Vec<WorkspaceContentRef> {
+    let mut bindings = std::collections::BTreeMap::new();
+    for (_, _, bytes) in &dump.inodes {
+        if let Ok(record) = WorkspaceInode::deserialize(bytes) {
+            if let Some(content) = record.content {
+                bindings.insert(content.object_id, content);
+            }
+        }
+    }
+    bindings.into_values().collect()
 }
 
 // --- Types ---
@@ -150,6 +210,9 @@ impl InodeData {
     }
 
     fn deserialize(data: &[u8]) -> anyhow::Result<Self> {
+        if data.starts_with(INODE_DATA_BINCODE_V2) {
+            return Ok(WorkspaceInode::deserialize(data)?.data);
+        }
         if let Some(payload) = data.strip_prefix(INODE_DATA_BINCODE_V1) {
             let (decoded, _): (Self, usize) =
                 bincode::serde::decode_from_slice(payload, bincode::config::standard())
@@ -191,6 +254,113 @@ pub struct MetadataStorageStats {
 }
 
 impl MetadataStore {
+    pub(crate) fn workspace_has_retired_inodes(&self) -> anyhow::Result<bool> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FS_INODES)?;
+        for row in table.iter()? {
+            let (key, value) = row?;
+            if key.value().1 != 0 && WorkspaceInode::deserialize(value.value())?.data.nlinks == 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    pub(crate) fn workspace_parent_candidates(&self, agent: &str, inode: u64) -> anyhow::Result<Vec<(u64, String)>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FS_DIRENTS)?;
+        let mut candidates = Vec::new();
+        for row in table.iter()? {
+            let (key, value) = row?;
+            let (layer, parent, name) = key.value();
+            if (layer == agent || layer == SHARED_BASE_LAYER_ID) && value.value() == inode {
+                candidates.push((parent, name.to_string()));
+            }
+        }
+        Ok(candidates)
+    }
+    pub(crate) fn workspace_inode(&self, agent: &str, inode: u64) -> anyhow::Result<Option<WorkspaceInode>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FS_INODES)?;
+        let record = table.get((agent, inode))?
+            .map(|row| WorkspaceInode::deserialize(row.value())).transpose()?;
+        Ok(record)
+    }
+
+    /// Single-redb atomic adoption. Content retention must already be durable.
+    /// `None` dirents are removals; inode zero is a name-level base whiteout.
+    pub(crate) fn commit_namespace(
+        &self,
+        agent: &str,
+        guard: &OwnerWriteGuard,
+        inodes: &[(u64, WorkspaceInode)],
+        dirents: &[(u64, String, Option<u64>)],
+        durable: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(guard.scope() == &owner_scope_for_layer(agent), "Namespace guard scope mismatch");
+        let mut txn = self.begin_fenced_write(guard)?;
+        if durable {
+            txn.inner.set_durability(redb::Durability::Immediate)?;
+        }
+        {
+            let mut table = txn.open_table(FS_INODES)?;
+            let mut refs = txn.open_table(CAS_REFCOUNT)?;
+            let mut trash = txn.open_table(FS_TRASH_QUEUE)?;
+            for (inode, record) in inodes {
+                let old = table.get((agent, *inode))?
+                    .map(|row| WorkspaceInode::deserialize(row.value())).transpose()?;
+                // Only legacy blobs participate in the legacy GC/refcount tables.
+                let old_hash = old.as_ref().filter(|r| r.content.is_none()
+                    && r.data.kind == FileKind::Regular
+                    && r.data.size != u64::MAX).map(|r| r.data.hash);
+                let new_hash = (record.content.is_none() && record.data.kind == FileKind::Regular
+                    && record.data.size != u64::MAX).then_some(record.data.hash);
+                if old_hash != new_hash {
+                    if let Some(hash) = old_hash {
+                        let count = refs.get(&hash)?.map(|r| r.value()).unwrap_or(0).saturating_sub(1);
+                        if count == 0 {
+                            refs.remove(&hash)?;
+                            trash.insert(&hash, SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default().as_millis() as u64)?;
+                        } else { refs.insert(&hash, count)?; }
+                    }
+                    if let Some(hash) = new_hash {
+                        let count = refs.get(&hash)?.map(|r| r.value()).unwrap_or(0);
+                        refs.insert(&hash, count.checked_add(1).ok_or_else(|| anyhow::anyhow!("Refcount overflow"))?)?;
+                        trash.remove(&hash)?;
+                    }
+                }
+                let bytes = record.serialize()?;
+                table.insert((agent, *inode), bytes.as_slice())?;
+            }
+        }
+        {
+            let mut table = txn.open_table(FS_DIRENTS)?;
+            for (parent, name, child) in dirents {
+                if let Some(child) = child { table.insert((agent, *parent, name.as_str()), *child)?; }
+                else { table.remove((agent, *parent, name.as_str()))?; }
+            }
+        }
+        txn.commit()
+    }
+
+    pub(crate) fn namespace_guard(&self, agent: &str) -> anyhow::Result<OwnerWriteGuard> {
+        Ok(OwnerRegistry::global().issue(owner_scope_for_layer(agent))?)
+    }
+
+    /// Workspace identities share an allocation domain across base and agent layers.
+    /// Keep the public legacy per-layer allocator unchanged for older callers.
+    pub(crate) fn workspace_next_inode(&self, agent: &str) -> anyhow::Result<u64> {
+        let txn = self.begin_fenced_write(&self.namespace_guard(agent)?)?;
+        let inode = {
+            let mut table = txn.open_table(FS_INODES)?;
+            let inode = allocate_namespace_inode(&table, 1)?;
+            table.insert((agent, 0u64), inode.to_le_bytes().as_slice())?;
+            inode
+        };
+        txn.commit()?;
+        Ok(inode)
+    }
+
     /// Open or create the metadata store at the given path.
     #[instrument(level = "debug", fields(path = %path.as_ref().display()))]
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -356,13 +526,13 @@ impl MetadataStore {
         let table = read_txn.open_table(FS_DIRENTS)?;
 
         let range_start = (agent_id, parent, "");
-        let range_end = (agent_id, parent + 1, "");
 
         let mut entries = Vec::new();
-        let range = table.range(range_start..range_end)?;
+        let range = table.range(range_start..)?;
         for entry in range {
             let (key, value) = entry?;
-            let (_, _, name) = key.value();
+            let (layer, directory, name) = key.value();
+            if layer != agent_id || directory != parent { break; }
             entries.push((name.to_string(), value.value()));
         }
         Ok(entries)
@@ -620,9 +790,15 @@ impl MetadataStore {
 
     /// Restore all sentinel-fs metadata tables from a snapshot dump.
     pub fn restore_all_tables(&self, dump: &FsMetadataDump) -> anyhow::Result<()> {
+        let guard = OwnerRegistry::global().issue(StateTransferScope::World)?;
+        self.restore_workspace_tables(dump, &guard)
+    }
+
+    pub(crate) fn restore_workspace_tables(&self, dump: &FsMetadataDump, guard: &OwnerWriteGuard) -> anyhow::Result<()> {
+        anyhow::ensure!(guard.scope() == &StateTransferScope::World, "Restore requires World scope");
         let current = self.dump_all_tables()?;
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+        let mut write_txn = self.begin_fenced_write(guard)?;
+        write_txn.inner.set_durability(redb::Durability::Immediate)?;
         {
             let mut inodes = write_txn.open_table(FS_INODES)?;
             for (agent_id, inode, _) in &current.inodes {
@@ -901,6 +1077,21 @@ impl MetadataStore {
     }
 }
 
+// Include every layer and persisted allocation counter: deleted identities are not reused,
+// and a later base population cannot collide with an already allocated agent inode.
+fn allocate_namespace_inode(table: &redb::Table<'_, (&'static str, u64), &'static [u8]>, current: u64) -> anyhow::Result<u64> {
+    let mut maximum = current.max(1);
+    for row in table.iter()? {
+        let (key, value) = row?;
+        let (_, inode) = key.value();
+        maximum = maximum.max(inode);
+        if inode == 0 && value.value().len() == 8 {
+            maximum = maximum.max(u64::from_le_bytes(value.value().try_into()?));
+        }
+    }
+    maximum.checked_add(1).ok_or_else(|| std::io::Error::from_raw_os_error(28).into())
+}
+
 /// A fenced fs metadata write transaction (#496 V19). Like the redb store, the owner
 /// guard is re-checked at begin (in `begin_fenced_write`, which also applies the
 /// configured durability) **and** again at [`commit`](FencedFsWrite::commit), so a write
@@ -1085,6 +1276,61 @@ mod tests {
         assert_eq!(legacy_decoded.kind, FileKind::Regular);
         assert_eq!(legacy_decoded.hash, [0xA1; 32]);
         assert_eq!(legacy_decoded.size, 1024);
+    }
+
+    #[test]
+    fn golden_sfi1_binding_decodes_without_changing_legacy_layout() {
+        let mut bytes = b"SFI1".to_vec();
+        bytes.push(0); // Regular enum discriminant.
+        bytes.extend([0xA1; 32]);
+        bytes.extend([251, 0, 4, 251, 164, 1, 0, 0, 1, 7, 8, 9, 0]);
+        let record = WorkspaceInode::deserialize(&bytes).unwrap();
+        assert_eq!(record.generation, 0);
+        assert!(record.content.is_none());
+        assert_eq!(record.data.hash, [0xA1; 32]);
+        assert_eq!(record.data.size, 1024);
+        assert_eq!(record.data.mode, 0o644);
+        assert_eq!((record.data.mtime, record.data.ctime, record.data.atime), (7, 8, 9));
+        assert_eq!(record.data.serialize().unwrap(), bytes);
+        // Existing SFI1 decoding tolerates trailing bytes; retain that exact behavior.
+        bytes.push(42);
+        assert!(WorkspaceInode::deserialize(&bytes).is_ok());
+    }
+
+    #[test]
+    fn workspace_v2_is_coherent_and_snapshot_dump_stays_readable() {
+        let (store, _dir) = temp_meta();
+        let content = WorkspaceContentRef { object_id: 999, size: 12, sha256: [0xAB; 32] };
+        let record = WorkspaceInode { data: InodeData::regular(content.sha256, content.size, 0o644),
+            generation: 4, content: Some(content), inherited: false };
+        let guard = store.namespace_guard("agent").unwrap();
+        store.commit_namespace("agent", &guard, &[(2, record.clone())],
+            &[(1, "file".to_string(), Some(2))], true).unwrap();
+        let reopened = store.workspace_inode("agent", 2).unwrap().unwrap();
+        assert_eq!(reopened.generation, 4);
+        assert_eq!(reopened.content, Some(content));
+        assert_eq!(store.get_inode("agent", 2).unwrap().unwrap().hash, content.sha256);
+        let dump = store.dump_all_tables().unwrap();
+        assert!(referenced_blob_hashes(&dump).is_empty());
+        assert_eq!(referenced_workspace_content(&dump), vec![content]);
+        let mut corrupt = record.clone();
+        corrupt.data.hash = [0; 32];
+        assert!(corrupt.serialize().is_err());
+        let mut bytes = record.serialize().unwrap();
+        bytes.push(42);
+        assert!(WorkspaceInode::deserialize(&bytes).is_err());
+    }
+
+    #[test]
+    fn workspace_adoption_rejects_wrong_scope_and_stale_term_without_effects() {
+        let (store, _dir) = temp_meta();
+        let row = WorkspaceInode::legacy(InodeData::directory(0o755));
+        let wrong = store.namespace_guard("other").unwrap();
+        assert!(store.commit_namespace("agent", &wrong, &[(2, row.clone())], &[], true).is_err());
+        let stale = OwnerWriteGuard::for_test(StateTransferScope::for_agent("agent"),
+            OwnerRegistry::global().this_node(), 0);
+        assert!(store.commit_namespace("agent", &stale, &[(2, row)], &[], true).is_err());
+        assert!(store.get_inode("agent", 2).unwrap().is_none());
     }
 
     #[test]
