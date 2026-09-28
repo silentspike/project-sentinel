@@ -4,6 +4,7 @@ export interface PreviewBinding {
   project_id: string;
   delivery: DeliveryReference;
   release: DeliveryReference;
+  preview_access?: DeliveryReference | null;
 }
 export interface PreviewInventory extends PreviewBinding {
   manifest_digest: string;
@@ -20,7 +21,8 @@ export interface PreviewFile extends PreviewBinding {
 
 export function samePreviewBinding(value: PreviewBinding, expected: PreviewBinding): boolean {
   const same = (a: DeliveryReference, b: DeliveryReference) => a?.id === b.id && a?.generation === b.generation && a?.digest === b.digest;
-  return value?.project_id === expected.project_id && same(value?.delivery, expected.delivery) && same(value?.release, expected.release);
+  return value?.project_id === expected.project_id && same(value?.delivery, expected.delivery) && same(value?.release, expected.release)
+    && (expected.preview_access ? same(value?.preview_access as DeliveryReference, expected.preview_access) : !value?.preview_access);
 }
 
 export function previewHtml(value: PreviewFile, expected: PreviewInventory, artifact: string, path: string): string {

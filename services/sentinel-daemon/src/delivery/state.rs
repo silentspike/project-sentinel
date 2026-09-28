@@ -7,10 +7,10 @@ use super::{
     ports::WorkbenchEvidenceReceiptV1,
     schema::{
         AcceptanceV1, ApprovalV1, CandidateState, CustomerFeedbackV1, DeliveryReceiptV1,
-        DeliveryState, FindingV1, ProjectCloseoutV1, QaEvaluationPlanV1, QaEvaluationRunReceiptV1,
-        QaEvidenceGraphV1, QaReleaseGateReceiptV1, QaRunState, ReleaseCandidateV1,
-        ReleaseManifestV1, ReleaseState, ReleaseV1, ReviewV1, RollbackV1, TestRunV1,
-        DELIVERY_SCHEMA_V1,
+        DeliveryState, FindingV1, PreviewAccessV1, ProjectCloseoutV1, QaEvaluationPlanV1,
+        QaEvaluationRunReceiptV1, QaEvidenceGraphV1, QaReleaseGateReceiptV1, QaRunState,
+        ReleaseCandidateV1, ReleaseManifestV1, ReleaseState, ReleaseV1, ReviewV1, RollbackV1,
+        TestRunV1, DELIVERY_SCHEMA_V1,
     },
 };
 
@@ -34,6 +34,8 @@ pub struct DeliveryAggregateV1 {
     pub manifests: BTreeMap<String, ReleaseManifestV1>,
     pub releases: BTreeMap<String, ReleaseV1>,
     pub deliveries: BTreeMap<String, DeliveryReceiptV1>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub preview_access: BTreeMap<String, PreviewAccessV1>,
     pub feedback: BTreeMap<String, CustomerFeedbackV1>,
     pub acceptances: BTreeMap<String, AcceptanceV1>,
     pub rollbacks: BTreeMap<String, RollbackV1>,
@@ -61,6 +63,7 @@ impl DeliveryAggregateV1 {
             manifests: BTreeMap::new(),
             releases: BTreeMap::new(),
             deliveries: BTreeMap::new(),
+            preview_access: BTreeMap::new(),
             feedback: BTreeMap::new(),
             acceptances: BTreeMap::new(),
             rollbacks: BTreeMap::new(),

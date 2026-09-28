@@ -19,12 +19,12 @@ use super::{
     schema::{
         AcceptanceV1, ApprovalV1, AuthorityRole, CandidateState, CustomerAction,
         CustomerFeedbackV1, DataControlV1, DeliveryReceiptV1, DeliveryState, FindingV1,
-        PrincipalV1, ProjectCloseoutV1, QaAggregateOutcomesV1, QaCaseOutcome, QaCaseReasonCode,
-        QaDatasetCaseV1, QaEvaluationPlanV1, QaEvaluationRunReceiptV1, QaEvidenceGraphV1,
-        QaHarnessOutcome, QaReleaseGateReceiptV1, QaRunState, ReleaseCandidateV1,
-        ReleaseManifestV1, ReleaseState, ReleaseV1, ReviewV1, RollbackV1, SourceTupleV1, TestRunV1,
-        VersionedRefV1, DELIVERY_PREVIEW_MAX_TTL_MS, DELIVERY_PREVIEW_TTL_POLICY_V1,
-        DELIVERY_SCHEMA_V1,
+        PreviewAccessV1, PrincipalV1, ProjectCloseoutV1, QaAggregateOutcomesV1, QaCaseOutcome,
+        QaCaseReasonCode, QaDatasetCaseV1, QaEvaluationPlanV1, QaEvaluationRunReceiptV1,
+        QaEvidenceGraphV1, QaHarnessOutcome, QaReleaseGateReceiptV1, QaRunState,
+        ReleaseCandidateV1, ReleaseManifestV1, ReleaseState, ReleaseV1, ReviewV1, RollbackV1,
+        SourceTupleV1, TestRunV1, VersionedRefV1, DELIVERY_PREVIEW_MAX_TTL_MS,
+        DELIVERY_PREVIEW_TTL_POLICY_V1, DELIVERY_SCHEMA_V1,
     },
     state::{
         transition_candidate, transition_delivery, transition_qa_run, transition_release,
@@ -56,6 +56,7 @@ pub enum DeliveryCommandV1 {
     RecordReviewBundle,
     Promote,
     IssueDelivery,
+    RenewPreview,
     CustomerAccept,
     CustomerReject,
     CustomerRequestChanges,
@@ -114,6 +115,7 @@ where
             | DeliveryCommandV1::RecordGate
             | DeliveryCommandV1::RecordReviewBundle
             | DeliveryCommandV1::IssueDelivery
+            | DeliveryCommandV1::RenewPreview
             | DeliveryCommandV1::CustomerAccept
             | DeliveryCommandV1::CustomerReject => Ok(()),
         }
@@ -1620,13 +1622,114 @@ where
         )
     }
 
+    pub fn renew_preview_access(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        delivery: &VersionedRefV1,
+        release: &VersionedRefV1,
+        observed_now_ms: u64,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        validate_ref("preview delivery", delivery)?;
+        validate_ref("preview release", release)?;
+        let authority = self.require_current_authority(
+            context,
+            tenant_id,
+            AuthorityRole::Customer,
+            "renew_preview",
+        )?;
+        let digest = command_digest(context, &(tenant_id, project_id, delivery, release))?;
+        if let Some(existing) = self.existing(context, "renew_preview", tenant_id, &digest)? {
+            return Ok(existing);
+        }
+        let expires_at_ms = context
+            .now_ms
+            .checked_add(DELIVERY_PREVIEW_MAX_TTL_MS)
+            .ok_or_else(|| DeliveryError::Validation("preview expiry overflow".to_string()))?;
+        let mut aggregate = self.required_aggregate(tenant_id, project_id)?;
+        let manifest =
+            super::preview::preview_target(&aggregate, &authority.principal, delivery, release)?;
+        if observed_now_ms < context.now_ms
+            || observed_now_ms >= expires_at_ms
+            || context.now_ms < aggregate.deliveries[&delivery.id].issued_at_ms
+            || aggregate
+                .preview_access
+                .get(&delivery.id)
+                .is_some_and(|prior| context.now_ms < prior.issued_at_ms)
+        {
+            return Err(DeliveryError::AuthorityDenied(
+                "preview renewal clock is unavailable".to_string(),
+            ));
+        }
+        let expected_revision = aggregate.revision;
+        let next_revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(|| DeliveryError::Validation("preview revision overflow".to_string()))?;
+        let access = PreviewAccessV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            access_id: format!("preview-access:{}", context.idempotency_key),
+            generation: next_revision,
+            tenant_id: tenant_id.to_string(),
+            project_id: project_id.to_string(),
+            delivery: delivery.clone(),
+            release: release.clone(),
+            manifest: VersionedRefV1 {
+                id: manifest.manifest_id.clone(),
+                generation: manifest.generation,
+                digest: manifest.manifest_digest.clone(),
+            },
+            customer: authority.principal,
+            preview_digest: aggregate.deliveries[&delivery.id].preview_digest.clone(),
+            preview_ttl_policy_version: DELIVERY_PREVIEW_TTL_POLICY_V1,
+            issued_at_ms: context.now_ms,
+            expires_at_ms,
+            access_digest: ContentDigest::zero(),
+        }
+        .seal()?;
+        aggregate
+            .preview_access
+            .insert(delivery.id.clone(), access.clone());
+        aggregate.revision = next_revision;
+        self.commit(
+            context,
+            "renew_preview",
+            digest,
+            aggregate,
+            "customer_preview_access_issued_v1",
+            json!({ "preview_access": access }),
+            expected_revision,
+        )
+    }
+
     pub fn customer_action(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        feedback: CustomerFeedbackV1,
+        acceptance: Option<AcceptanceV1>,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        self.customer_action_with_preview(
+            context,
+            tenant_id,
+            project_id,
+            feedback,
+            acceptance,
+            None,
+            context.now_ms,
+        )
+    }
+
+    pub fn customer_action_with_preview(
         &self,
         context: &CommandContextV1,
         tenant_id: &str,
         project_id: &str,
         mut feedback: CustomerFeedbackV1,
         acceptance: Option<AcceptanceV1>,
+        preview_access: Option<&VersionedRefV1>,
+        observed_now_ms: u64,
     ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
         validate_record_header(
             feedback.schema_version,
@@ -1664,8 +1767,14 @@ where
             AuthorityRole::Customer,
             "customer_action",
         )?;
-        let command_digest =
-            command_digest(context, &(tenant_id, project_id, &feedback, &acceptance))?;
+        let command_digest = if let Some(access) = preview_access {
+            command_digest(
+                context,
+                &(tenant_id, project_id, &feedback, &acceptance, access),
+            )?
+        } else {
+            command_digest(context, &(tenant_id, project_id, &feedback, &acceptance))?
+        };
         if let Some(existing) =
             self.existing(context, "customer_action", tenant_id, &command_digest)?
         {
@@ -1704,11 +1813,36 @@ where
         if delivery_snapshot.customer_principal_id != context.principal.principal_id
             || delivery_snapshot.generation != feedback.delivery.generation
             || delivery_snapshot.receipt_digest != feedback.delivery.digest
-            || delivery_snapshot.expires_at_ms <= context.now_ms
             || delivery_snapshot.state != DeliveryState::Delivered
         {
             return Err(DeliveryError::AuthorityDenied(
                 "delivery is expired, already terminal, or belongs to another customer".to_string(),
+            ));
+        }
+        if preview_access.is_some() {
+            super::authorize_delivery_preview(
+                &aggregate,
+                &customer_authority.principal,
+                &feedback.delivery,
+                &delivery_snapshot.release,
+                preview_access,
+                observed_now_ms,
+            )?;
+            super::authorize_delivery_preview(
+                &aggregate,
+                &customer_authority.principal,
+                &feedback.delivery,
+                &delivery_snapshot.release,
+                preview_access,
+                context.now_ms,
+            )?;
+        } else if observed_now_ms < delivery_snapshot.issued_at_ms
+            || observed_now_ms >= delivery_snapshot.expires_at_ms
+            || context.now_ms < delivery_snapshot.issued_at_ms
+            || context.now_ms >= delivery_snapshot.expires_at_ms
+        {
+            return Err(DeliveryError::AuthorityDenied(
+                "delivery preview has expired".to_string(),
             ));
         }
         let next = match feedback.action {
@@ -2524,6 +2658,27 @@ where
         self.core.issue_delivery(context, project_id, receipt)
     }
 
+    pub fn renew_preview_access(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        delivery: &VersionedRefV1,
+        release: &VersionedRefV1,
+        observed_now_ms: u64,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        self.core
+            .command_readiness(DeliveryCommandV1::RenewPreview)?;
+        self.core.renew_preview_access(
+            context,
+            tenant_id,
+            project_id,
+            delivery,
+            release,
+            observed_now_ms,
+        )
+    }
+
     pub fn customer_action(
         &self,
         context: &CommandContextV1,
@@ -2540,6 +2695,33 @@ where
         self.core.command_readiness(command)?;
         self.core
             .customer_action(context, tenant_id, project_id, feedback, acceptance)
+    }
+
+    pub fn customer_action_with_preview(
+        &self,
+        context: &CommandContextV1,
+        tenant_id: &str,
+        project_id: &str,
+        feedback: CustomerFeedbackV1,
+        acceptance: Option<AcceptanceV1>,
+        preview_access: Option<&VersionedRefV1>,
+        observed_now_ms: u64,
+    ) -> Result<DeliveryCommitReceiptV1, DeliveryError> {
+        let command = match feedback.action {
+            CustomerAction::Accept => DeliveryCommandV1::CustomerAccept,
+            CustomerAction::Reject => DeliveryCommandV1::CustomerReject,
+            CustomerAction::RequestChanges => DeliveryCommandV1::CustomerRequestChanges,
+        };
+        self.core.command_readiness(command)?;
+        self.core.customer_action_with_preview(
+            context,
+            tenant_id,
+            project_id,
+            feedback,
+            acceptance,
+            preview_access,
+            observed_now_ms,
+        )
     }
 
     pub fn rollback(
