@@ -462,7 +462,7 @@ os.utime(p, (100, 100))
 p.rename('renamed.txt')
 with open('renamed.txt', 'r+') as f: f.truncate(5)
 assert Path('renamed.txt').read_text() == 'first'
-subprocess.run(['/bin/sh', '-c', 'printf toolchain'], check=True)
+subprocess.run(['/usr/bin/sh', '-c', 'printf toolchain'], check=True)
 print('python complete')
 "#,
     );
@@ -516,23 +516,36 @@ fn aggregate_workspace_budget_bounds_many_small_files_and_truncate_growth() {
     let budget = fixture.boundary().workspace_budget_bytes;
     let result = fixture.python(&format!(
         r#"
+import errno
 from pathlib import Path
 budget = {budget}
+part_size = 256 * 1024
+assert budget >= 4 * part_size, 'fixture budget too small for aggregate proof'
 denied = False
-for i in range(32):
+successful_bytes = 0
+for i in range(budget // part_size + 2):
     try:
-        Path('part-' + str(i)).write_bytes(b'x' * max(4096, budget // 8))
-    except OSError:
+        Path('part-' + str(i)).write_bytes(b'x' * part_size)
+        successful_bytes += part_size
+    except OSError as error:
+        assert error.errno == errno.EDQUOT, error
         denied = True
         break
 assert denied, 'aggregate growth was not rejected'
+assert successful_bytes >= budget - part_size, 'per-file limit cannot prove aggregate quota'
 assert sum(p.stat().st_size for p in Path('.').iterdir() if p.is_file()) <= budget
+for p in Path('.').glob('part-*'):
+    p.unlink()
+with open('sparse', 'wb') as f:
+    f.truncate(part_size)
+for i in range(budget // part_size - 1):
+    Path('part-' + str(i)).write_bytes(b'x' * part_size)
 try:
-    with open('sparse', 'wb') as f:
-        f.truncate(budget + 1)
+    with open('sparse', 'r+b') as f:
+        f.truncate(part_size + 1)
     raise AssertionError('truncate bypassed aggregate reservation')
-except OSError:
-    pass
+except OSError as error:
+    assert error.errno == errno.EDQUOT, error
 assert sum(p.stat().st_size for p in Path('.').iterdir() if p.is_file()) <= budget
 print('aggregate workspace budget held')
 "#

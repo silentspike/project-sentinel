@@ -466,9 +466,10 @@ fn private_observation_protocol_restart_replays_fail_closed_command() {
         .capabilities
         .insert(sentinel_common::WORKBENCH_RETAIN_OBSERVATION.into());
     request.input_digest = request.canonical_digest().unwrap();
-    let result = assert_private_observation_restart_replay(&workspace, &artifacts, &request, || {
-        fs::remove_dir_all(&workspace).unwrap();
-    });
+    let result =
+        assert_private_observation_restart_replay(&workspace, &artifacts, &request, || {
+            fs::remove_dir_all(&workspace).unwrap();
+        });
     let WorkbenchMessage::Result {
         outcome,
         output,
@@ -509,9 +510,10 @@ fn private_observation_protocol_restart_replays_inspect_without_reading_changed_
         max_bytes: 1024,
     };
     request.input_digest = request.canonical_digest().unwrap();
-    let result = assert_private_observation_restart_replay(&workspace, &artifacts, &request, || {
-        fs::write(&file, "changed after execution").unwrap();
-    });
+    let result =
+        assert_private_observation_restart_replay(&workspace, &artifacts, &request, || {
+            fs::write(&file, "changed after execution").unwrap();
+        });
     let WorkbenchMessage::Result {
         outcome,
         output,

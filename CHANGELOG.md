@@ -1,5 +1,18 @@
 # Changelog
 
+- Repair scheduled dependency automation, audit all Go modules and both Rust
+  locks, and propagate audit/freshness failures. Update Go crypto and Console
+  test/build dependencies; keep native-kernel acceptance separate from hosted
+  protocol and receipt tests (#856).
+
+- Update Rustls to the corrected TLS handshake implementation and Serde With
+  to its current patched release. Retain only the exact new syn macro-version
+  exception with a dated convergence review; advisory enforcement stays enabled.
+
+- Distinguish aggregate workspace quota rejection from per-file command limits
+  in deployment-kernel acceptance; use the actual mounted shell path and keep
+  command isolation clean under the pinned compiler's strict Clippy (#856).
+
 - Recover prepared workspace imports from verified durable namespace content
   when native sources disappear across reboot. Reject inadmissible restore
   budgets before publishing rollback snapshots or retention pins. Preserve

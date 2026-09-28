@@ -6,8 +6,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
-anyhow = { workspace = true }
-tracing = { workspace = true }
+anyhow = "1"
+tracing = "0.1"
 sentinel-common = { path = "../sentinel-common" }
 
 [dev-dependencies]

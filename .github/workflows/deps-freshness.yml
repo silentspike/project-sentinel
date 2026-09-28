@@ -75,15 +75,24 @@ jobs:
           test "$ACTUAL" = "$EXPECT" || { echo "::error::rustc $ACTUAL != $EXPECT"; exit 1; }
 
       - name: Install cargo-outdated
-        run: cargo install cargo-outdated --locked 2>/dev/null || true
+        run: cargo install cargo-outdated --locked
 
       - name: Check outdated dependencies
         run: |
           echo "## Rust Dependencies" >> "$GITHUB_STEP_SUMMARY"
-          OUTPUT=$(cargo outdated --root-deps-only --depth 1 2>&1) || true
+          if OUTPUT=$(cargo outdated --root-deps-only --depth 1 2>&1); then
+            STATUS=0
+          else
+            STATUS=$?
+          fi
+          printf '%s\n' "$OUTPUT"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Rust freshness inspection failed with exit code $STATUS."
+            exit "$STATUS"
+          fi
 
           # Fail nur bei MAJOR version gaps (semver-inkompatibel)
           MAJOR_OUTDATED=$(echo "$OUTPUT" | grep -E '^\S' | grep -v '^Name' | grep -v '^---' | awk '{
@@ -162,7 +171,16 @@ jobs:
         run: |
           echo "## Console Dependencies" >> "$GITHUB_STEP_SUMMARY"
           bun install --frozen-lockfile
-          OUTPUT=$(bun outdated 2>&1 || echo "Alle Packages aktuell.") || true
+          if OUTPUT=$(bun outdated 2>&1); then
+            STATUS=0
+          else
+            STATUS=$?
+          fi
+          printf '%s\n' "$OUTPUT"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Console freshness inspection failed with exit code $STATUS."
+            exit "$STATUS"
+          fi
