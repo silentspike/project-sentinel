@@ -1,5 +1,11 @@
 # Changelog
 
+- Recover reserved employee model effects before building a request from the
+  next simulation tick. Use the original durable digest and completion, retain
+  ambiguous dispatches, and require exact owner and no-dispatch proof before
+  releasing a reservation; never turn changing perception into provider replay
+  or a false request-identity conflict (#856).
+
 - Keep Sales and first-plan inference routing local to their assigned employee. Expired,
   already dispatched and completed calls cannot mask another
   project's current work or replay an unknown provider effect. Preserve the

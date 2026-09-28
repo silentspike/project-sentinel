@@ -540,6 +540,51 @@ pub mod bridge {
         }
     }
 
+    fn recover_reserved_model_request<S: CompletionStore>(
+        store: &S,
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
+        authority: &ProviderExecutionAuthority,
+        action_tx: &mpsc::Sender<AgentAction>,
+        max_attempts: u32,
+        now_ms: u64,
+        request_timeout: Duration,
+    ) -> anyhow::Result<bool> {
+        let request_id = authority.request_id();
+        let Some(entry) = store.get_completion(&request_id)? else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            entry.request_id == request_id
+                && entry.owner_scope
+                    == sentinel_common::StateTransferScope::for_agent(
+                        authority.agent_id().to_string(),
+                    ),
+            "reserved model request owner changed"
+        );
+        // A later tick is new perception, not a new version of the reserved
+        // effect. Recovery uses only its original digest and stored completion.
+        if entry.status == "provider_in_flight" {
+            if release_stale_undispatched_subscription(
+                store,
+                resolver,
+                Some(authority),
+                &entry,
+                now_ms,
+                request_timeout,
+            ) {
+                info!(
+                    request_id,
+                    "Definitively undispatched model reservation released"
+                );
+            } else {
+                debug!(request_id, "Prior model execution remains fail-closed");
+            }
+        } else {
+            recover_completion(store, entry, action_tx, max_attempts, resolver);
+        }
+        Ok(true)
+    }
+
     fn agent_runtime_request(
         client: &reqwest::Client,
         url: &str,
@@ -1427,6 +1472,30 @@ pub mod bridge {
                 }
 
                 let request_id = agent_runtime_request_id(&perception, usage_authority.as_ref());
+                if let Some(authority) = usage_authority.as_ref() {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX);
+                    match recover_reserved_model_request(
+                        event_store.as_ref(),
+                        config.provider_usage_authority.as_deref(),
+                        authority,
+                        &action_tx,
+                        completion_max_attempts,
+                        now_ms,
+                        config.request_timeout,
+                    ) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(error) => {
+                            error!(request_id, error = %error, "Reserved model recovery failed closed");
+                            continue;
+                        }
+                    }
+                }
                 let mut request = build_gateway_request(
                     &perception,
                     &state_store,
@@ -2494,6 +2563,90 @@ pub mod bridge {
         }
 
         #[test]
+        fn reserved_model_effect_ignores_later_perception_and_survives_reopen() {
+            let context: ModelWorkContext = crate::workflow_api::model_work::test_context().into();
+            let authority = context.binding();
+            let request_id = authority.request_id();
+            let dir = tempfile::tempdir().unwrap();
+            let state = StateStore::open(dir.path().join("state.redb").to_str().unwrap()).unwrap();
+            let path = dir.path().join("events.db");
+            let first = make_perception(6, "Original conversation", true);
+            let mut request = build_gateway_request(&first, &state, &request_id, Some(&authority));
+            bind_model_work_request(&mut request, &context).unwrap();
+            let original_digest = gateway_request_digest(&request).unwrap();
+            let store = EventStore::open(path.to_str().unwrap()).unwrap();
+            store
+                .reserve_request(&request_id, &original_digest, "AGENT-06")
+                .unwrap();
+            let original = store.get_completion(&request_id).unwrap().unwrap();
+            drop(store);
+            let store = EventStore::open(path.to_str().unwrap()).unwrap();
+            let mut later = first;
+            later.tick = Tick(999);
+            later.heard_text = "Later conversation".into();
+            let mut changed = build_gateway_request(&later, &state, &request_id, Some(&authority));
+            bind_model_work_request(&mut changed, &context).unwrap();
+            assert_ne!(original_digest, gateway_request_digest(&changed).unwrap());
+            let (tx, rx) = mpsc::channel();
+            assert!(recover_reserved_model_request(
+                &store,
+                None,
+                &authority,
+                &tx,
+                3,
+                u64::MAX,
+                Duration::ZERO,
+            )
+            .unwrap());
+            assert_eq!(
+                store.get_completion(&request_id).unwrap().unwrap(),
+                original
+            );
+            assert!(rx.try_recv().is_err());
+            assert!(!store
+                .reserve_request(&request_id, &original_digest, "AGENT-06")
+                .unwrap());
+        }
+
+        #[test]
+        fn reserved_model_recovery_rejects_another_owner_before_any_effect() {
+            let context: ModelWorkContext = crate::workflow_api::model_work::test_context().into();
+            let authority = context.binding();
+            let request_id = authority.request_id();
+            let store = EventStore::open(":memory:").unwrap();
+            let (tx, rx) = mpsc::channel();
+            assert!(!recover_reserved_model_request(
+                &store,
+                None,
+                &authority,
+                &tx,
+                3,
+                u64::MAX,
+                Duration::ZERO,
+            )
+            .unwrap());
+            store
+                .reserve_request(&request_id, &"a".repeat(64), "AGENT-03")
+                .unwrap();
+            let original = store.get_completion(&request_id).unwrap().unwrap();
+            assert!(recover_reserved_model_request(
+                &store,
+                None,
+                &authority,
+                &tx,
+                3,
+                u64::MAX,
+                Duration::ZERO,
+            )
+            .is_err());
+            assert_eq!(
+                store.get_completion(&request_id).unwrap().unwrap(),
+                original
+            );
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[test]
         fn sales_request_uses_the_normal_gateway_and_durable_question_adoption_path() {
             let dir = tempfile::tempdir().unwrap();
             let (api, sales) = crate::workflow_api::model_execution::tests::fixture(
@@ -2765,7 +2918,16 @@ pub mod bridge {
             assert!(rx.try_recv().is_err());
             drop(store);
             let restored = EventStore::open(path.to_str().unwrap()).unwrap();
-            recover_completion_batch(&restored, &tx, 3, Some(&resolver));
+            assert!(recover_reserved_model_request(
+                &restored,
+                Some(&resolver),
+                &context.binding(),
+                &tx,
+                3,
+                u64::MAX,
+                Duration::ZERO,
+            )
+            .unwrap());
             assert_eq!(
                 *resolver.admissions.lock().unwrap(),
                 vec![request_id.to_owned()]
@@ -3037,14 +3199,17 @@ pub mod bridge {
                 Duration::ZERO,
             ));
             assert!(store.get_completion(request_id).unwrap().is_some());
-            assert!(release_stale_undispatched_subscription(
+            let (tx, _rx) = mpsc::channel();
+            assert!(recover_reserved_model_request(
                 &store,
                 Some(&absent),
-                Some(&execution_authority),
-                &entry,
+                &execution_authority,
+                &tx,
+                3,
                 entry.created_at + 10_000,
                 Duration::ZERO,
-            ));
+            )
+            .unwrap());
             assert!(store.get_completion(request_id).unwrap().is_none());
         }
 
