@@ -865,7 +865,10 @@ mod protocol_cancellation_tests {
                 reason == "deadline_expired"
             );
         }
-        assert!(matches!(messages.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            messages.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         assert!(
             !receipt.exists(),
             "Cancel must not manufacture a receipt or acknowledgement"
@@ -939,7 +942,10 @@ mod protocol_cancellation_tests {
         assert_eq!(receive(&messages), result);
         assert!(matches!(
             receive(&messages),
-            WorkbenchMessage::Progress { stage: WorkbenchProgressStage::Completed, .. }
+            WorkbenchMessage::Progress {
+                stage: WorkbenchProgressStage::Completed,
+                ..
+            }
         ));
         assert!(matches!(
             messages.recv_timeout(SHUTDOWN_GRACE),

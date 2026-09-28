@@ -377,12 +377,12 @@ fn restrict_command(workspace: &Path) -> io::Result<()> {
             ruleset = add_path(ruleset, Path::new(path), read | AccessFs::Execute)?;
         }
     }
-    ruleset = add_path(ruleset, Path::new("/"), read.into())?;
+    ruleset = add_path(ruleset, Path::new("/"), read)?;
     for path in ["/dev/null", "/dev/zero", "/dev/urandom", "/dev/random"] {
         ruleset = add_path(
             ruleset,
             Path::new(path),
-            (AccessFs::ReadFile | AccessFs::WriteFile).into(),
+            AccessFs::ReadFile | AccessFs::WriteFile,
         )?;
     }
     ruleset = add_path(ruleset, Path::new("/dev/shm"), write)?;
