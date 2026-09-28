@@ -117,6 +117,11 @@ jobs:
       - name: Runtime-base provisioning contract (#646)
         run: bash scripts/check-runtime-base-provisioning.sh
 
+      - name: Install Node for native QA mechanism tests
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v6.0.0
+        with:
+          node-version: '22'
+
       - name: Virtual-company M0 product contract (#693)
         env:
           RUNNER_TEMP: /work/tmp/sentinel-ci-product-acceptance
@@ -126,7 +131,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq bubblewrap
           sudo sysctl --load deploy/vm-config/99-sentinel-bwrap.conf
-          test -x /usr/bin/node
+          command -v node
           python3 scripts/product-acceptance/check_contract.py --check
           python3 -m unittest discover -s scripts/product-acceptance -p 'test_*.py'
 

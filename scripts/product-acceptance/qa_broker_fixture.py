@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import selectors
+import shutil
 import socket
 import struct
 import subprocess
@@ -162,10 +163,13 @@ class QaBrokerFixture:
         root, scratch = Path(request["workspace"]), Path(request["scratch"])
         scratch.mkdir(mode=0o700, exist_ok=True)
         environment = dict(ENVIRONMENT, HOME=str(scratch), TMPDIR=str(scratch), PYTHONDONTWRITEBYTECODE="1")
+        program = shutil.which(request["program"])
+        if program is None:
+            raise ValueError("fixture interpreter unavailable")
         isolated = ["bwrap", "--unshare-user", "--unshare-pid", "--unshare-net",
                     "--cap-drop", "ALL", "--ro-bind", "/", "/", "--proc", "/proc",
                     "--dev", "/dev", "--bind", str(scratch), str(scratch),
-                    "--chdir", str(root), "--die-with-parent", "--", request["program"], *request["args"]]
+                    "--chdir", str(root), "--die-with-parent", "--", program, *request["args"]]
         process = subprocess.Popen(isolated, cwd=root, env=environment, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
         streams = {process.stdout: ("stdout", 0), process.stderr: ("stderr", 0)}
