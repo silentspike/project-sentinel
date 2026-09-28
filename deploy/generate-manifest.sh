@@ -45,6 +45,8 @@ ARTIFACT_DEFS=(
   "config/workbench-profiles/web-authoring-v1.toml|/opt/sentinel/config/workbench-profiles/web-authoring-v1.toml|config"
   "config/workbench-profiles/web-qa-v1.toml|/opt/sentinel/config/workbench-profiles/web-qa-v1.toml|config"
   "config/workbench-profiles/web-review-v1.toml|/opt/sentinel/config/workbench-profiles/web-review-v1.toml|config"
+  "config/workbench-profiles/python-coding-v1.toml|/opt/sentinel/config/workbench-profiles/python-coding-v1.toml|config"
+  "config/workbench-profiles/node-coding-v1.toml|/opt/sentinel/config/workbench-profiles/node-coding-v1.toml|config"
   "config/nats.conf|/etc/nats/nats.conf|config"
   # systemd units
   "deploy/systemd/sentinel-auth-init.service|/etc/systemd/system/sentinel-auth-init.service|systemd"
