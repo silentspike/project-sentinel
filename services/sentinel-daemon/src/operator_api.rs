@@ -305,6 +305,8 @@ struct AgentRuntimeStateResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct FsStorageStatsResponse {
     accepted: bool,
+    accounting_basis: String,
+    dedup_metrics_available: bool,
     fs_mount: Option<String>,
     cas_blob_count: u64,
     cas_bytes_on_disk: u64,
@@ -335,6 +337,8 @@ struct AgentFsEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct AgentFsBrowseResponse {
     accepted: bool,
+    accounting_basis: String,
+    dedup_metrics_available: bool,
     agent_id: u16,
     aggregate_id: String,
     inode: u64,
@@ -2561,35 +2565,14 @@ fn create_fs_trash_fixture(
     let (inode, inode_data) = with_direct_world_mutation(state, || {
         let (parent_inode, file_name) =
             fs_parent_and_name(&layer, &fs_agent_dir, &payload.relative_path)?;
-        if let Some(existing_inode) = layer
-            .lookup_dirent(&fs_agent_dir, parent_inode, &file_name)
-            .map_err(|_| ApiError::ServiceUnavailable("Fixture-Dirent-Lookup fehlgeschlagen"))?
-        {
-            layer
-                .unlink(&fs_agent_dir, parent_inode, &file_name, existing_inode)
-                .map_err(|_| {
-                    ApiError::ServiceUnavailable("Vorhandene Fixture-Datei nicht entfernbar")
-                })?;
-        }
-        let inode = layer
-            .write_file(
+        layer
+            .create_legacy_trash_fixture(
                 &fs_agent_dir,
                 parent_inode,
                 &file_name,
                 payload.content.as_bytes(),
-                0o644,
             )
-            .map_err(|_| ApiError::ServiceUnavailable("Fixture-Write fehlgeschlagen"))?;
-        let inode_data = layer
-            .lookup_inode(&fs_agent_dir, inode)
-            .map_err(|_| ApiError::ServiceUnavailable("Fixture-Inode nicht lesbar"))?
-            .ok_or(ApiError::ServiceUnavailable(
-                "Fixture-Inode fehlt nach Write",
-            ))?;
-        layer
-            .unlink(&fs_agent_dir, parent_inode, &file_name, inode)
-            .map_err(|_| ApiError::ServiceUnavailable("Fixture-Unlink fehlgeschlagen"))?;
-        Ok((inode, inode_data))
+            .map_err(|_| ApiError::ServiceUnavailable("Legacy-Trash-Fixture fehlgeschlagen"))
     })?;
     let trashed_chunks = u64::from(
         metadata
@@ -2658,6 +2641,8 @@ fn inspect_fs_storage_stats(
         .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Storage-Stats nicht lesbar"))?;
     Ok(FsStorageStatsResponse {
         accepted: true,
+        accounting_basis: stats.accounting_basis.to_string(),
+        dedup_metrics_available: stats.dedup_metrics_available,
         fs_mount: state.fs_mount.clone(),
         cas_blob_count: stats.cas_blob_count,
         cas_bytes_on_disk: stats.cas_bytes_on_disk,
@@ -2765,6 +2750,12 @@ fn inspect_agent_fs_browse(
     let stats = layer.storage_stats().ok();
     Ok(AgentFsBrowseResponse {
         accepted: true,
+        accounting_basis: stats
+            .as_ref()
+            .map(|s| s.accounting_basis)
+            .unwrap_or("unavailable")
+            .to_string(),
+        dedup_metrics_available: stats.as_ref().is_some_and(|s| s.dedup_metrics_available),
         agent_id,
         aggregate_id,
         inode,
@@ -6044,6 +6035,44 @@ mod tests {
             serde_json::from_slice(&inspect.body).unwrap();
         assert!(inspect_payload.found);
         assert!(inspect_payload.in_chunk_index);
+        assert_eq!(payload.trashed_chunks, 1);
+        assert_eq!(inspect_payload.refcount, 0);
+    }
+
+    #[test]
+    fn fs_trash_fixture_preserves_existing_employee_file() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let layer = attach_test_fs_layer(&mut state);
+        let agent = fs_agent_dir_for_name(&state, "Test Agent").unwrap();
+        let (parent, name) = fs_parent_and_name(&layer, &agent, "existing.txt").unwrap();
+        let inode = layer
+            .write_file(&agent, parent, &name, b"employee work", 0o644)
+            .unwrap();
+        let before = layer.lookup_inode(&agent, inode).unwrap().unwrap();
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,
+                serde_json::json!({
+                    "agent_name": "Test Agent",
+                    "relative_path": "existing.txt",
+                    "content": "probe must not replace work"
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 503);
+        assert_eq!(
+            layer.lookup_dirent(&agent, parent, &name).unwrap(),
+            Some(inode)
+        );
+        assert_eq!(
+            layer.lookup_inode(&agent, inode).unwrap().unwrap().hash,
+            before.hash
+        );
+        assert_eq!(
+            layer.meta().get_trash_timestamp(&before.hash).unwrap(),
+            None
+        );
     }
 
     #[test]

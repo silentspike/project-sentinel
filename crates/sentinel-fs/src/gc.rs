@@ -4,7 +4,10 @@
 //! `FS_CHUNK_REFCOUNT` is zero (i.e., no manifest references them).
 //! This integrates with the existing CasStore GC pattern.
 
-use crate::artifact::{ArtifactPlane, FS_CHUNKS, FS_CHUNK_REFCOUNT, FS_TRASH_QUEUE};
+use crate::artifact::{
+    ArtifactPlane, FS_CHUNKS, FS_CHUNK_REFCOUNT, FS_OBJECT_REFS, FS_TRASH_QUEUE,
+    FS_WORKSPACE_EXTENTS, FS_WORKSPACE_ROOTS,
+};
 use crate::cas::ChunkGcStats;
 use crate::segment::ChunkLocation;
 use redb::ReadableTable;
@@ -36,10 +39,11 @@ pub fn gc_chunks(plane: &ArtifactPlane) -> anyhow::Result<ChunkGcStats> {
     let wtxn = plane.begin_write()?;
     {
         let mut trash_table = wtxn.open_table(FS_TRASH_QUEUE)?;
+        let refcounts = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
 
         for hash in &orphans {
             // Only trash if not already in trash
-            if trash_table.get(hash)?.is_none() {
+            if refcounts.get(hash)?.is_none() && trash_table.get(hash)?.is_none() {
                 trash_table.insert(hash, now_ms)?;
                 stats.trashed += 1;
             }
@@ -59,7 +63,7 @@ pub fn gc_trash(plane: &ArtifactPlane, grace_period_hours: u64) -> anyhow::Resul
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let cutoff_ms = now_ms.saturating_sub(grace_period_hours * 3600 * 1000);
+    let cutoff_ms = now_ms.saturating_sub(grace_period_hours.saturating_mul(3_600_000));
 
     let mut stats = ChunkGcStats::default();
 
@@ -87,6 +91,11 @@ pub fn gc_trash(plane: &ArtifactPlane, grace_period_hours: u64) -> anyhow::Resul
         let mut trash_table = wtxn.open_table(FS_TRASH_QUEUE)?;
 
         for hash in &expired {
+            // A chunk may have been reacquired since its trash entry was added.
+            if refcount_table.get(hash)?.is_some_and(|g| g.value() > 0) {
+                trash_table.remove(hash)?;
+                continue;
+            }
             if let Some(g) = chunks_table.get(hash)? {
                 if let Ok(loc) = ChunkLocation::from_bytes(g.value()) {
                     stats.freed_bytes += loc.compressed_len as u64;
@@ -113,7 +122,8 @@ pub fn restore_from_trash(plane: &ArtifactPlane, hash: &[u8; 16]) -> anyhow::Res
         let mut trash_table = wtxn.open_table(FS_TRASH_QUEUE)?;
         if trash_table.remove(hash)?.is_some() {
             let mut refcount_table = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
-            refcount_table.insert(hash, 1u32)?;
+            let count = refcount_table.get(hash)?.map(|g| g.value()).unwrap_or(0);
+            refcount_table.insert(hash, count.max(1))?;
             true
         } else {
             false
@@ -128,16 +138,42 @@ pub fn restore_from_trash(plane: &ArtifactPlane, hash: &[u8; 16]) -> anyhow::Res
 ///
 /// Call this when an object is deleted to maintain refcount invariants.
 pub fn release_object(plane: &ArtifactPlane, object_id: u64) -> anyhow::Result<()> {
-    let manifest = match plane.get_manifest(object_id)? {
-        Some(m) => m,
-        None => return Ok(()), // already gone
-    };
+    let wtxn = plane.begin_durable_write()?;
+    release_object_in_transaction(&wtxn, object_id)?;
+    wtxn.commit()?;
+    Ok(())
+}
 
-    let wtxn = plane.begin_write()?;
+/// Release under the same transaction as root removal. Refcounts
+/// belong to manifests, not roots, and must be decremented exactly once.
+pub(crate) fn release_object_in_transaction(
+    wtxn: &redb::WriteTransaction,
+    object_id: u64,
+) -> anyhow::Result<()> {
+    {
+        let roots = wtxn.open_table(FS_WORKSPACE_ROOTS)?;
+        for entry in roots.iter()? {
+            if entry?.1.value() == object_id {
+                return Ok(());
+            }
+        }
+    }
+    {
+        let named_refs = wtxn.open_table(FS_OBJECT_REFS)?;
+        for entry in named_refs.iter()? {
+            if entry?.1.value() == object_id {
+                return Ok(());
+            }
+        }
+    }
     {
         let mut refcount_table = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
         let mut manifests_table = wtxn.open_table(crate::artifact::FS_MANIFESTS)?;
         let mut objects_table = wtxn.open_table(crate::artifact::FS_OBJECTS)?;
+        let manifest: Vec<crate::artifact::ChunkHash> = match manifests_table.get(object_id)? {
+            Some(bytes) => serde_json::from_slice(bytes.value())?,
+            None => return Ok(()),
+        };
 
         // Decrement refcounts
         for hash in &manifest {
@@ -153,9 +189,15 @@ pub fn release_object(plane: &ArtifactPlane, object_id: u64) -> anyhow::Result<(
         // Remove manifest and object metadata
         manifests_table.remove(object_id)?;
         objects_table.remove(object_id)?;
+        let mut extents = wtxn.open_table(FS_WORKSPACE_EXTENTS)?;
+        let keys: Vec<_> = extents
+            .range((object_id, 0)..=(object_id, u64::MAX))?
+            .map(|entry| entry.map(|(key, _)| key.value()))
+            .collect::<Result<_, _>>()?;
+        for key in keys {
+            extents.remove(key)?;
+        }
     }
-    wtxn.commit()?;
-
     Ok(())
 }
 

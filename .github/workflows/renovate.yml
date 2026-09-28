@@ -1,9 +1,9 @@
 name: Renovate
 
 on:
-  # Montags 06:00 UTC (07:00 CET / 08:00 CEST)
+  # Daily; repository update windows must not suppress security/lock maintenance.
   schedule:
-    - cron: '0 6 * * 1'
+    - cron: '17 6 * * *'
   # Manuell auslösbar
   workflow_dispatch: {}
 
@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Run Renovate
-        uses: renovatebot/github-action@e084b5eafaed19a7e98eb3a36e6998e1be1e6e86 # v41.0.15
+        uses: renovatebot/github-action@1cd96b855fee0da6f230617e89dbff0e06ea393a # v46.3.5
         with:
           configurationFile: renovate.json
           token: ${{ secrets.RENOVATE_TOKEN }}

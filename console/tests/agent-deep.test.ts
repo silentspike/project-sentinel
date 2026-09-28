@@ -134,6 +134,23 @@ describe("AgentDeepView (#428)", () => {
     await waitFor(() => expect(getByTestId("fs-file-content").textContent).toContain("hello world"));
   });
 
+  it("does not present unavailable chunk accounting as measured zero dedup", async () => {
+    stubFetch({ listing: {
+      ...LISTING,
+      accounting_basis: "chunk_segments_including_retention_and_legacy_cas",
+      dedup_metrics_available: false,
+      dedup_ratio_percent: 0,
+      dedup_savings_bytes: 0,
+      cas_blob_count: 3,
+    } });
+    setSelectedAgentId(7);
+    const { getAllByTestId, getByTestId } = render(AgentDeepView);
+    await waitFor(() => expect(getAllByTestId("fs-entry").length).toBe(2));
+    expect(getByTestId("fs-dedup").textContent).toContain("3 content units");
+    expect(getByTestId("fs-dedup").textContent).toContain("dedup ratio unavailable");
+    expect(getByTestId("fs-dedup").textContent).not.toContain("0.0%");
+  });
+
   it("navigates into a directory (breadcrumb grows)", async () => {
     stubFetch();
     setSelectedAgentId(7);

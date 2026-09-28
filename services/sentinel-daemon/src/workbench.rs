@@ -136,10 +136,19 @@ impl WorkbenchProfile {
         } = &request.tool
         {
             let permitted = self.test_suites.iter().any(|suite| {
+                let rule = sentinel_common::CommandRule {
+                    program: suite.program.clone(),
+                    required_arg_prefix: suite.required_arg_prefix.clone(),
+                    max_args: suite.max_args,
+                };
                 suite.id == *suite_id
                     && suite.program == *program
                     && args.len() <= usize::from(suite.max_args)
                     && args.starts_with(&suite.required_arg_prefix)
+                    && (!matches!(
+                        self.id.as_str(),
+                        "python-coding-v1" | "node-coding-v1" | "coding-qa-v1"
+                    ) || rule.allows(program, args))
             });
             if !permitted {
                 bail!("workbench test suite is not declared by its immutable profile");
@@ -615,6 +624,12 @@ pub struct WorkbenchInvocationRecord {
     /// Safe numeric command outcome, retained across process and daemon restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_status: Option<sentinel_common::WorkbenchCommandStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_qa_status: Option<sentinel_common::WorkbenchNativeQaStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_qa_suite: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_qa_inputs: Option<sentinel_common::NativeQaInputBinding>,
     /// Content stays in the private table, never in this public-safe record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation_digest: Option<String>,
@@ -675,6 +690,18 @@ impl WorkbenchInvocationRecord {
             resources: None,
             result_digest: None,
             command_status: None,
+            native_qa_status: None,
+            native_qa_suite: if sentinel_common::WorkbenchNativeQaStatus::requested(request) {
+                match &request.tool {
+                    sentinel_common::WorkbenchTool::RunTests { suite_id, .. } => {
+                        Some(suite_id.clone())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            },
+            native_qa_inputs: sentinel_common::NativeQaInputBinding::from_request(request).ok(),
             observation_digest: None,
             artifacts: Vec::new(),
             error: None,
@@ -928,6 +955,13 @@ impl WorkbenchInvocationStore {
         let next = state_for_outcome(*outcome)?;
         let command_status = sentinel_common::WorkbenchCommandStatus::from_output(output)
             .map_err(anyhow::Error::msg)?;
+        let native_qa_status = sentinel_common::WorkbenchNativeQaStatus::from_output(
+            output,
+            invocation_id,
+            input_digest,
+            *outcome,
+        )
+        .map_err(anyhow::Error::msg)?;
         let safe_error = error.as_ref().map(sanitize_runtime_error).transpose()?;
         let retained = self
             .load(invocation_id)?
@@ -944,8 +978,26 @@ impl WorkbenchInvocationStore {
             observation.as_ref(),
             revalidate,
             |record| {
+                if native_qa_status.is_some()
+                    && (record.tool_profile != "coding-qa-v1"
+                        || record.tool_class != "test.run_profile"
+                        || record.native_qa_suite.as_deref()
+                            != native_qa_status
+                                .as_ref()
+                                .map(|status| status.progress.suite_id.as_str()))
+                {
+                    bail!("only native QA tests can adopt native status");
+                }
+                if let Some(native) = &native_qa_status {
+                    native
+                        .validate_inputs(record.native_qa_inputs.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("native QA reserved input binding missing")
+                        })?)
+                        .map_err(anyhow::Error::msg)?;
+                }
                 if record.state == next && record.state.is_terminal() {
                     if record.resources.as_ref() != Some(resources)
+                        || record.native_qa_status != native_qa_status
                         || (record.command_status.is_some()
                             && record.command_status != command_status)
                         || record.artifacts != *artifacts
@@ -985,6 +1037,7 @@ impl WorkbenchInvocationStore {
                 record.resources = Some(resources.clone());
                 record.result_digest = terminal_result_digest(*outcome, output, artifacts);
                 record.command_status = command_status.clone();
+                record.native_qa_status = native_qa_status.clone();
                 record.artifacts = artifacts.clone();
                 record.error = safe_error.clone();
                 Ok(())
@@ -2580,6 +2633,119 @@ static WORKBENCH_DISPATCH: OnceLock<RwLock<Option<mpsc::SyncSender<WorkbenchDisp
     OnceLock::new();
 static WORKBENCH_SERVICE: OnceLock<Mutex<Option<WorkbenchService>>> = OnceLock::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum WorkbenchProfileId {
+    WebAuthoring,
+    WebQa,
+    WebReview,
+    PythonCoding,
+    NodeCoding,
+    CodingQa,
+}
+
+impl WorkbenchProfileId {
+    const ALL: [Self; 6] = [
+        Self::WebAuthoring,
+        Self::WebQa,
+        Self::WebReview,
+        Self::PythonCoding,
+        Self::NodeCoding,
+        Self::CodingQa,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WebAuthoring => "web-authoring-v1",
+            Self::WebQa => "web-qa-v1",
+            Self::WebReview => "web-review-v1",
+            Self::PythonCoding => "python-coding-v1",
+            Self::NodeCoding => "node-coding-v1",
+            Self::CodingQa => "coding-qa-v1",
+        }
+    }
+
+    fn from_str(id: &str) -> anyhow::Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|known| known.as_str() == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown workbench profile"))
+    }
+
+    fn immutable_bytes(self) -> &'static [u8] {
+        match self {
+            Self::WebAuthoring => {
+                include_bytes!("../../../config/workbench-profiles/web-authoring-v1.toml")
+            }
+            Self::WebQa => include_bytes!("../../../config/workbench-profiles/web-qa-v1.toml"),
+            Self::WebReview => {
+                include_bytes!("../../../config/workbench-profiles/web-review-v1.toml")
+            }
+            Self::PythonCoding => {
+                include_bytes!("../../../config/workbench-profiles/python-coding-v1.toml")
+            }
+            Self::NodeCoding => {
+                include_bytes!("../../../config/workbench-profiles/node-coding-v1.toml")
+            }
+            Self::CodingQa => {
+                include_bytes!("../../../config/workbench-profiles/coding-qa-v1.toml")
+            }
+        }
+    }
+
+    fn is_required(self) -> bool {
+        matches!(self, Self::WebAuthoring | Self::WebQa)
+    }
+}
+
+/// Only known, byte-exact authorities can occupy the bounded slots.
+#[derive(Clone, Default)]
+pub(crate) struct WorkbenchProfileRegistry {
+    profiles: BTreeMap<WorkbenchProfileId, (WorkbenchProfile, String)>,
+}
+
+impl WorkbenchProfileRegistry {
+    pub(crate) fn load(config_dir: &Path) -> anyhow::Result<Self> {
+        let base = canonical_secure_authority_base(&config_dir.join("workbench-profiles"))?;
+        let mut registry = Self::default();
+        for id in WorkbenchProfileId::ALL {
+            let path = base.join(format!("{}.toml", id.as_str()));
+            match fs::symlink_metadata(&path) {
+                Ok(_) => registry.insert(id, WorkbenchProfile::load(path)?)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && !id.is_required() => {
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(registry)
+    }
+
+    fn insert(
+        &mut self,
+        expected_id: WorkbenchProfileId,
+        loaded: (WorkbenchProfile, String),
+    ) -> anyhow::Result<()> {
+        let id = WorkbenchProfileId::from_str(&loaded.0.id)?;
+        anyhow::ensure!(id == expected_id, "workbench profile filename/id mismatch");
+        anyhow::ensure!(
+            !self.profiles.contains_key(&id),
+            "workbench profile identifiers must be unique"
+        );
+        anyhow::ensure!(
+            loaded.1 == hex_sha256(id.immutable_bytes()),
+            "immutable workbench profile digest mismatch"
+        );
+        self.profiles.insert(id, loaded);
+        Ok(())
+    }
+
+    pub(crate) fn resolve(&self, id: &str) -> anyhow::Result<(&WorkbenchProfile, &str)> {
+        self.profiles
+            .get(&WorkbenchProfileId::from_str(id)?)
+            .map(|(profile, digest)| (profile, digest.as_str()))
+            .ok_or_else(|| anyhow::anyhow!("requested workbench profile is unavailable"))
+    }
+}
+
 pub(crate) struct WorkbenchService {
     pub(crate) store: WorkbenchInvocationStore,
     pub(crate) profile: WorkbenchProfile,
@@ -2587,38 +2753,23 @@ pub(crate) struct WorkbenchService {
     pub(crate) qa_profile: WorkbenchProfile,
     pub(crate) qa_profile_digest: String,
     pub(crate) review_profile: Option<(WorkbenchProfile, String)>,
+    profile_registry: WorkbenchProfileRegistry,
     pub(crate) receiver: mpsc::Receiver<WorkbenchDispatchCommand>,
 }
 
 impl WorkbenchService {
     pub(crate) fn profile_for_id(&self, id: &str) -> anyhow::Result<(&WorkbenchProfile, &str)> {
-        select_workbench_profile(
-            id,
-            &self.profile,
-            &self.profile_digest,
-            &self.qa_profile,
-            &self.qa_profile_digest,
-            self.review_profile.as_ref(),
-        )
-    }
-}
-
-fn select_workbench_profile<'a>(
-    id: &str,
-    authoring: &'a WorkbenchProfile,
-    authoring_digest: &'a str,
-    qa: &'a WorkbenchProfile,
-    qa_digest: &'a str,
-    review: Option<&'a (WorkbenchProfile, String)>,
-) -> anyhow::Result<(&'a WorkbenchProfile, &'a str)> {
-    if id == authoring.id {
-        Ok((authoring, authoring_digest))
-    } else if id == qa.id {
-        Ok((qa, qa_digest))
-    } else if let Some((profile, digest)) = review.filter(|(profile, _)| profile.id == id) {
-        Ok((profile, digest))
-    } else {
-        bail!("unknown workbench profile")
+        let resolved = self.profile_registry.resolve(id)?;
+        match id {
+            "web-authoring-v1" => Ok((&self.profile, &self.profile_digest)),
+            "web-qa-v1" => Ok((&self.qa_profile, &self.qa_profile_digest)),
+            "web-review-v1" => self
+                .review_profile
+                .as_ref()
+                .map(|(profile, digest)| (profile, digest.as_str()))
+                .ok_or_else(|| anyhow::anyhow!("requested workbench profile is unavailable")),
+            _ => Ok(resolved),
+        }
     }
 }
 
@@ -2634,30 +2785,15 @@ pub(crate) fn install_workbench_service(
     if service.is_some() {
         bail!("workbench service is already installed");
     }
-    let (profile, profile_digest) =
-        WorkbenchProfile::load(config_dir.join("workbench-profiles/web-authoring-v1.toml"))?;
-    let (qa_profile, qa_profile_digest) =
-        WorkbenchProfile::load(config_dir.join("workbench-profiles/web-qa-v1.toml"))?;
-    if qa_profile.id == profile.id {
-        bail!("workbench profile identifiers must be unique");
-    }
-    let review_path = config_dir.join("workbench-profiles/web-review-v1.toml");
-    let review_profile = match std::fs::symlink_metadata(&review_path) {
-        Ok(_) => {
-            let review = WorkbenchProfile::load(review_path)?;
-            anyhow::ensure!(
-                review.0.id == "web-review-v1",
-                "invalid source review profile id"
-            );
-            anyhow::ensure!(
-                review.0.id != profile.id && review.0.id != qa_profile.id,
-                "workbench profile identifiers must be unique"
-            );
-            Some(review)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
+    let profile_registry = WorkbenchProfileRegistry::load(config_dir)?;
+    let (profile, profile_digest) = profile_registry.resolve("web-authoring-v1")?;
+    let (profile, profile_digest) = (profile.clone(), profile_digest.to_owned());
+    let (qa_profile, qa_profile_digest) = profile_registry.resolve("web-qa-v1")?;
+    let (qa_profile, qa_profile_digest) = (qa_profile.clone(), qa_profile_digest.to_owned());
+    let review_profile = profile_registry
+        .profiles
+        .get(&WorkbenchProfileId::WebReview)
+        .cloned();
     let store = WorkbenchInvocationStore::open_with_artifact_roots(
         data_dir.join("workbench.redb"),
         artifact_roots,
@@ -2671,6 +2807,7 @@ pub(crate) fn install_workbench_service(
         qa_profile,
         qa_profile_digest,
         review_profile,
+        profile_registry,
         receiver,
     });
     Ok(())
@@ -3126,6 +3263,43 @@ fn decode_record(bytes: &[u8]) -> anyhow::Result<WorkbenchInvocationRecord> {
             bail!("invalid private observation reference");
         }
     }
+    if let Some(native) = &record.native_qa_status {
+        let outcome = match record.state {
+            WorkbenchInvocationState::Succeeded => WorkbenchOutcome::Succeeded,
+            WorkbenchInvocationState::Failed => WorkbenchOutcome::Failed,
+            _ => bail!("native QA status requires a terminal evaluator outcome"),
+        };
+        if record.store_schema_version < 3
+            || record.tool_profile != "coding-qa-v1"
+            || record.tool_class != "test.run_profile"
+            || record.native_qa_suite.as_deref() != Some(native.progress.suite_id.as_str())
+        {
+            bail!("invalid durable native QA binding");
+        }
+        let command = record
+            .command_status
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native QA command status missing"))?;
+        native
+            .validate_command(command)
+            .map_err(anyhow::Error::msg)?;
+        native
+            .validate_inputs(
+                record
+                    .native_qa_inputs
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("durable native QA input binding missing"))?,
+            )
+            .map_err(anyhow::Error::msg)?;
+        native
+            .validate(
+                &record.invocation_id,
+                &record.request_digest,
+                outcome,
+                command.exit_code,
+            )
+            .map_err(anyhow::Error::msg)?;
+    }
     Ok(record)
 }
 
@@ -3151,6 +3325,14 @@ fn durable_terminal_projection(record: &WorkbenchInvocationRecord) -> WorkbenchM
             unreachable!("durable replay requires a terminal invocation")
         }
     };
+    let mut output = record
+        .command_status
+        .as_ref()
+        .map(|status| status.output())
+        .unwrap_or_default();
+    if let Some(native) = &record.native_qa_status {
+        native.insert_output(&mut output);
+    }
     WorkbenchMessage::Result {
         schema_version: WORKBENCH_SCHEMA_VERSION,
         invocation_id: record.invocation_id.clone(),
@@ -3158,11 +3340,7 @@ fn durable_terminal_projection(record: &WorkbenchInvocationRecord) -> WorkbenchM
         outcome,
         resources: record.resources.clone().unwrap_or_default(),
         artifacts: record.artifacts.clone(),
-        output: record
-            .command_status
-            .as_ref()
-            .map(|status| status.output())
-            .unwrap_or_default(),
+        output,
         error: record.error.clone(),
     }
 }
@@ -3309,6 +3487,23 @@ mod tests {
             _directory: directory,
             path,
         }
+    }
+
+    fn secure_test_profile_config(ids: &[WorkbenchProfileId]) -> tempfile::TempDir {
+        let directory = tempfile::Builder::new()
+            .prefix("sentinel-workbench-registry-")
+            .tempdir_in(secure_test_workbench_authority_base())
+            .unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let profiles = directory.path().join("workbench-profiles");
+        fs::create_dir(&profiles).unwrap();
+        fs::set_permissions(&profiles, fs::Permissions::from_mode(0o700)).unwrap();
+        for id in ids {
+            let path = profiles.join(format!("{}.toml", id.as_str()));
+            fs::write(&path, id.immutable_bytes()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        directory
     }
 
     fn authority(
@@ -3854,53 +4049,378 @@ mod tests {
 
     #[test]
     fn source_review_dispatch_selects_exact_profile_without_fallback() {
-        let authoring_authority = secure_test_workbench_profile_authority();
-        let (authoring, authoring_digest) =
-            WorkbenchProfile::load(authoring_authority.path()).unwrap();
-        let qa: WorkbenchProfile = toml::from_str(include_str!(
-            "../../../config/workbench-profiles/web-qa-v1.toml"
-        ))
-        .unwrap();
-        let review: WorkbenchProfile = toml::from_str(include_str!(
-            "../../../config/workbench-profiles/web-review-v1.toml"
-        ))
-        .unwrap();
-        let review = (review, "review-digest".to_owned());
-        for (id, digest) in [
-            ("web-authoring-v1", authoring_digest.as_str()),
-            ("web-qa-v1", "qa-digest"),
-            ("web-review-v1", "review-digest"),
-        ] {
-            let selected = select_workbench_profile(
-                id,
-                &authoring,
-                &authoring_digest,
-                &qa,
-                "qa-digest",
-                Some(&review),
-            )
-            .unwrap();
-            assert_eq!(selected.0.id, id);
-            assert_eq!(selected.1, digest);
+        let ids = [
+            WorkbenchProfileId::WebAuthoring,
+            WorkbenchProfileId::WebQa,
+            WorkbenchProfileId::WebReview,
+        ];
+        let config = secure_test_profile_config(&ids);
+        let registry = WorkbenchProfileRegistry::load(config.path()).unwrap();
+        for id in ids {
+            let selected = registry.resolve(id.as_str()).unwrap();
+            assert_eq!(selected.0.id, id.as_str());
+            assert_eq!(selected.1, hex_sha256(id.immutable_bytes()));
         }
-        assert!(select_workbench_profile(
-            "foreign",
-            &authoring,
-            &authoring_digest,
-            &qa,
-            "qa-digest",
-            Some(&review)
-        )
-        .is_err());
-        assert!(select_workbench_profile(
-            "web-review-v1",
-            &authoring,
-            &authoring_digest,
-            &qa,
-            "qa-digest",
-            None
-        )
-        .is_err());
+        assert!(registry.resolve("foreign").is_err());
+        fs::remove_file(config.path().join("workbench-profiles/web-review-v1.toml")).unwrap();
+        let registry = WorkbenchProfileRegistry::load(config.path()).unwrap();
+        assert!(registry.resolve("web-review-v1").is_err());
+    }
+
+    #[test]
+    fn coding_registry_and_service_resolve_all_exact_immutable_profiles() {
+        let config = secure_test_profile_config(&WorkbenchProfileId::ALL);
+        let registry = WorkbenchProfileRegistry::load(config.path()).unwrap();
+        assert_eq!(registry.profiles.len(), WorkbenchProfileId::ALL.len());
+        let (profile, profile_digest) =
+            registry.profiles[&WorkbenchProfileId::WebAuthoring].clone();
+        let (qa_profile, qa_profile_digest) = registry.profiles[&WorkbenchProfileId::WebQa].clone();
+        let review_profile = registry
+            .profiles
+            .get(&WorkbenchProfileId::WebReview)
+            .cloned();
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        let service = WorkbenchService {
+            store: store(&config),
+            profile,
+            profile_digest,
+            qa_profile,
+            qa_profile_digest,
+            review_profile,
+            profile_registry: registry,
+            receiver,
+        };
+        for (index, id) in WorkbenchProfileId::ALL.into_iter().enumerate() {
+            let (profile, digest) = service.profile_for_id(id.as_str()).unwrap();
+            assert_eq!(profile.id, id.as_str());
+            assert_eq!(digest, hex_sha256(id.immutable_bytes()));
+            let invocation_id = format!("018f3f32-4f01-7f2c-a6c1-f6f4a81b281{index}");
+            let mut request = request(&invocation_id);
+            request.tool_profile = profile.id.clone();
+            request.tool_profile_digest = digest.to_owned();
+            request.capabilities = BTreeSet::from(["file.inspect".to_owned()]);
+            request.output_artifact_kinds = profile.output_artifact_kinds.clone();
+            request.resource_limits = profile.resource_ceilings.clone();
+            request.tool = WorkbenchTool::InspectFile {
+                path: "src/app.txt".to_owned(),
+                max_bytes: 1024,
+            };
+            request.input_digest = request.canonical_digest().unwrap();
+            request.validate_at(1_900_000_000_000).unwrap();
+            profile.authorize_request(digest, &request).unwrap();
+            service.store.reserve(&request, 1_900_000_000_000).unwrap();
+            let record = service.store.load(&invocation_id).unwrap().unwrap();
+            let reserved_profile = service.profile_for_id(&record.tool_profile).unwrap();
+            assert_eq!(reserved_profile.0.id, request.tool_profile);
+            assert_eq!(reserved_profile.1, record.tool_profile_digest);
+            request.tool_profile_digest = "0".repeat(64);
+            assert!(profile.authorize_request(digest, &request).is_err());
+            assert_eq!(service.store.load(&invocation_id).unwrap(), Some(record));
+        }
+        assert!(service.profile_for_id("python-coding-v2").is_err());
+        assert!(service.profile_for_id("../node-coding-v1").is_err());
+    }
+
+    #[test]
+    fn coding_registry_optional_profiles_are_independent_and_never_fallback() {
+        for optional in [
+            None,
+            Some(WorkbenchProfileId::PythonCoding),
+            Some(WorkbenchProfileId::NodeCoding),
+        ] {
+            let mut ids = vec![WorkbenchProfileId::WebAuthoring, WorkbenchProfileId::WebQa];
+            ids.extend(optional);
+            let config = secure_test_profile_config(&ids);
+            let registry = WorkbenchProfileRegistry::load(config.path()).unwrap();
+            assert_eq!(registry.profiles.len(), ids.len());
+            for id in [
+                WorkbenchProfileId::PythonCoding,
+                WorkbenchProfileId::NodeCoding,
+            ] {
+                assert_eq!(registry.resolve(id.as_str()).is_ok(), optional == Some(id));
+            }
+            assert!(registry.resolve("web-review-v1").is_err());
+            fs::remove_file(config.path().join("workbench-profiles/web-qa-v1.toml")).unwrap();
+            assert!(WorkbenchProfileRegistry::load(config.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn coding_registry_rejects_unknown_mismatched_and_duplicate_ids_or_digests() {
+        let id = WorkbenchProfileId::PythonCoding;
+        let fixture = secure_test_workbench_profile_authority_with_bytes(id.immutable_bytes());
+        let loaded = WorkbenchProfile::load(fixture.path()).unwrap();
+        let mut registry = WorkbenchProfileRegistry::default();
+        let mut wrong = loaded.clone();
+        wrong.0.id = "foreign-coding-v1".to_owned();
+        assert!(registry.insert(id, wrong).is_err());
+        assert!(registry
+            .insert(WorkbenchProfileId::NodeCoding, loaded.clone())
+            .is_err());
+        let mut wrong = loaded.clone();
+        wrong.1 = "0".repeat(64);
+        assert!(registry.insert(id, wrong).is_err());
+        assert!(registry.profiles.is_empty());
+        registry.insert(id, loaded.clone()).unwrap();
+        assert!(registry.insert(id, loaded.clone()).is_err());
+        assert_eq!(registry.profiles.len(), 1);
+        assert_eq!(registry.resolve(id.as_str()).unwrap().0, &loaded.0);
+    }
+
+    #[test]
+    fn coding_registry_present_invalid_authority_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        for id in [
+            WorkbenchProfileId::PythonCoding,
+            WorkbenchProfileId::NodeCoding,
+        ] {
+            for mutation in [
+                "digest",
+                "unknown",
+                "collision",
+                "malformed",
+                "mode",
+                "symlink",
+                "hardlink",
+            ] {
+                let config = secure_test_profile_config(&WorkbenchProfileId::ALL);
+                let path = config
+                    .path()
+                    .join("workbench-profiles")
+                    .join(format!("{}.toml", id.as_str()));
+                match mutation {
+                    "digest" => {
+                        let mut bytes = id.immutable_bytes().to_vec();
+                        bytes.push(b'\n');
+                        fs::write(&path, bytes).unwrap();
+                    }
+                    "unknown" | "collision" => {
+                        let replacement = if mutation == "unknown" {
+                            "foreign-coding-v1"
+                        } else {
+                            "web-authoring-v1"
+                        };
+                        let source = std::str::from_utf8(id.immutable_bytes()).unwrap();
+                        fs::write(&path, source.replace(id.as_str(), replacement)).unwrap();
+                    }
+                    "malformed" => fs::write(&path, b"not toml").unwrap(),
+                    "mode" => {
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+                    }
+                    "symlink" => {
+                        fs::remove_file(&path).unwrap();
+                        symlink(config.path().join("missing-profile"), &path).unwrap();
+                    }
+                    "hardlink" => {
+                        fs::hard_link(&path, config.path().join("other-name")).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    WorkbenchProfileRegistry::load(config.path()).is_err(),
+                    "{mutation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coding_profiles_allow_native_execution_tests_and_authority_narrowing() {
+        for (id, program, prefix, suite_id, test_args) in [
+            (
+                WorkbenchProfileId::PythonCoding,
+                "python3",
+                vec!["-E", "-s", "--"],
+                "python-unittest",
+                vec!["-I", "-m", "unittest", "discover"],
+            ),
+            (
+                WorkbenchProfileId::PythonCoding,
+                "python3",
+                vec!["-E", "-s", "--"],
+                "python-unittest-directory",
+                vec!["-I", "-m", "unittest", "discover", "-s", "tests"],
+            ),
+            (
+                WorkbenchProfileId::NodeCoding,
+                "node",
+                vec!["--"],
+                "node-tests",
+                vec!["--test", "--", "tests/app.test.js"],
+            ),
+            (
+                WorkbenchProfileId::NodeCoding,
+                "node",
+                vec!["--"],
+                "node-syntax",
+                vec!["--check", "--", "src/app.js"],
+            ),
+        ] {
+            let fixture = secure_test_workbench_profile_authority_with_bytes(id.immutable_bytes());
+            let (profile, digest) = WorkbenchProfile::load(fixture.path()).unwrap();
+            let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2819");
+            request.tool_profile = id.as_str().to_owned();
+            request.tool_profile_digest = digest.clone();
+            request.capabilities = BTreeSet::from(["command.run_allowlisted".to_owned()]);
+            let mut args: Vec<String> = prefix.into_iter().map(str::to_owned).collect();
+            let project_file = if program == "node" {
+                "src/app.js"
+            } else {
+                "src/app.py"
+            };
+            args.push(project_file.to_owned());
+            request.command_policy = vec![sentinel_common::CommandRule {
+                program: program.to_owned(),
+                required_arg_prefix: args.clone(),
+                max_args: args.len() as u16,
+            }];
+            request.tool = WorkbenchTool::RunCommand {
+                program: program.to_owned(),
+                args,
+            };
+            request.input_digest = request.canonical_digest().unwrap();
+            request.validate_at(1_900_000_000_000).unwrap();
+            profile.authorize_request(&digest, &request).unwrap();
+            let active = authority(&request, &profile);
+            authorize_workbench_request(&request, &active).unwrap();
+
+            request.capabilities = BTreeSet::from(["test.run_profile".to_owned()]);
+            let args: Vec<String> = test_args.into_iter().map(str::to_owned).collect();
+            request.command_policy = vec![sentinel_common::CommandRule {
+                program: program.to_owned(),
+                required_arg_prefix: args.clone(),
+                max_args: args.len() as u16,
+            }];
+            request.tool = WorkbenchTool::RunTests {
+                suite_id: suite_id.to_owned(),
+                program: program.to_owned(),
+                args,
+            };
+            request.input_digest = request.canonical_digest().unwrap();
+            request.validate_at(1_900_000_000_000).unwrap();
+            profile.authorize_request(&digest, &request).unwrap();
+        }
+    }
+
+    #[test]
+    fn coding_profiles_reject_command_test_and_authority_expansion() {
+        for (id, program, good_args, bad_args, suite_id, test_args) in [
+            (
+                WorkbenchProfileId::PythonCoding,
+                "python3",
+                vec!["-E", "-s", "--", "src/app.py"],
+                vec!["-m", "pip", "install", "package"],
+                "python-unittest-directory",
+                vec!["-I", "-m", "unittest", "discover", "-s", "-v"],
+            ),
+            (
+                WorkbenchProfileId::NodeCoding,
+                "node",
+                vec!["--", "src/app.js"],
+                vec!["--eval", "payload"],
+                "node-tests",
+                vec!["--test", "--", "--require", "src/app.js"],
+            ),
+        ] {
+            let fixture = secure_test_workbench_profile_authority_with_bytes(id.immutable_bytes());
+            let (profile, digest) = WorkbenchProfile::load(fixture.path()).unwrap();
+            let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2819");
+            request.tool_profile = id.as_str().to_owned();
+            request.tool_profile_digest = digest.clone();
+            request.capabilities = BTreeSet::from(["command.run_allowlisted".to_owned()]);
+            request.command_policy = profile.command_rules.clone();
+            request.tool = WorkbenchTool::RunCommand {
+                program: program.to_owned(),
+                args: good_args.into_iter().map(str::to_owned).collect(),
+            };
+            profile.authorize_request(&digest, &request).unwrap();
+            let valid = request.clone();
+            for denied_program in ["sh", "bash", "pip", "npm", "npx"] {
+                request.tool = WorkbenchTool::RunCommand {
+                    program: denied_program.to_owned(),
+                    args: vec!["install".to_owned()],
+                };
+                assert!(profile.authorize_request(&digest, &request).is_err());
+            }
+            request.tool = WorkbenchTool::RunCommand {
+                program: program.to_owned(),
+                args: bad_args.into_iter().map(str::to_owned).collect(),
+            };
+            assert!(profile.authorize_request(&digest, &request).is_err());
+            request.tool = WorkbenchTool::RunTests {
+                suite_id: suite_id.to_owned(),
+                program: program.to_owned(),
+                args: test_args.into_iter().map(str::to_owned).collect(),
+            };
+            assert!(profile.authorize_request(&digest, &request).is_err());
+            request = valid.clone();
+            request.command_policy[0].required_arg_prefix.clear();
+            assert!(profile.authorize_request(&digest, &request).is_err());
+            request = valid.clone();
+            request.command_policy[0].max_args += 1;
+            assert!(profile.authorize_request(&digest, &request).is_err());
+            request = valid.clone();
+            request.resource_limits.memory_bytes = profile.resource_ceilings.memory_bytes + 1;
+            assert!(profile.authorize_request(&digest, &request).is_err());
+            request = valid.clone();
+            request.capabilities.insert("network.connect".to_owned());
+            assert!(profile.authorize_request(&digest, &request).is_err());
+            request = valid.clone();
+            request.runtime_key = "foreign-runtime".to_owned();
+            assert!(profile.authorize_request(&digest, &request).is_err());
+            request = valid;
+            let mut active = authority(&request, &profile);
+            active.role_capabilities.clear();
+            assert!(authorize_workbench_request(&request, &active).is_err());
+        }
+    }
+
+    #[test]
+    fn python_script_grant_preserves_local_imports_without_option_expansion() {
+        let id = WorkbenchProfileId::PythonCoding;
+        let fixture = secure_test_workbench_profile_authority_with_bytes(id.immutable_bytes());
+        let (profile, digest) = WorkbenchProfile::load(fixture.path()).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2819");
+        request.tool_profile = id.as_str().to_owned();
+        request.tool_profile_digest = digest.clone();
+        request.capabilities = BTreeSet::from(["command.run_allowlisted".to_owned()]);
+        let args = vec![
+            "-E".to_owned(),
+            "-s".to_owned(),
+            "--".to_owned(),
+            "src/app.py".to_owned(),
+            "project".to_owned(),
+        ];
+        request.command_policy = vec![sentinel_common::CommandRule {
+            program: "python3".to_owned(),
+            required_arg_prefix: args.clone(),
+            max_args: args.len() as u16,
+        }];
+        request.tool = WorkbenchTool::RunCommand {
+            program: "python3".to_owned(),
+            args,
+        };
+        request.input_digest = request.canonical_digest().unwrap();
+        request.validate_at(1_900_000_000_000).unwrap();
+        profile.authorize_request(&digest, &request).unwrap();
+
+        for denied in [
+            vec!["-I", "--", "src/app.py"],
+            vec!["-E", "--", "src/app.py"],
+            vec!["-s", "--", "src/app.py"],
+            vec!["-s", "-E", "--", "src/app.py"],
+            vec!["-E", "-s", "src/app.py"],
+            vec!["-E", "-s", "-c", "payload"],
+            vec!["-E", "-s", "-m", "pip", "install", "package"],
+            vec!["-E", "-s", "--", "src/app.py", "-c"],
+        ] {
+            request.tool = WorkbenchTool::RunCommand {
+                program: "python3".to_owned(),
+                args: denied.into_iter().map(str::to_owned).collect(),
+            };
+            assert!(profile.authorize_request(&digest, &request).is_err());
+        }
     }
 
     #[test]
@@ -3981,7 +4501,7 @@ mod tests {
                 "required_arg_prefix = [\"--check\"]",
                 "required_arg_prefix = [\"--check=/proc/self/environ\"]",
             ),
-            source.replace("max_args = 2", "max_args = 65"),
+            source.replace("max_args = 2", "max_args = 66"),
         ] {
             let authority =
                 secure_test_workbench_profile_authority_with_bytes(malformed.as_bytes());
@@ -4213,6 +4733,168 @@ mod tests {
         assert!(decode_record(&encode_record(&record).unwrap()).is_ok());
         record.command_status.as_mut().unwrap().exit_code = 256;
         assert!(decode_record(&encode_record(&record).unwrap()).is_err());
+    }
+
+    #[test]
+    fn native_qa_record_survives_restart_and_rejects_tampered_replay() {
+        use sentinel_common::{
+            NativeQaOutcome, NativeQaProgress, NativeQaStage, WorkbenchNativeQaStatus,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2890");
+        request.tool_profile = "coding-qa-v1".into();
+        request.inputs = ["app.py", "sentinel-qa.json"]
+            .into_iter()
+            .map(|path| sentinel_common::WorkbenchInputRef {
+                artifact_id: format!("sha256:{}", "d".repeat(64)),
+                sha256: "d".repeat(64),
+                mount_path: path.into(),
+                media_type: "text/plain".into(),
+            })
+            .collect();
+        request.tool = WorkbenchTool::RunTests {
+            suite_id: "python-qa-v1".into(),
+            program: "sentinel-coding-qa".into(),
+            args: vec!["python-project-v1".into()],
+        };
+        request.capabilities = BTreeSet::from(["test.run_profile".into()]);
+        request.command_policy = vec![sentinel_common::CommandRule {
+            program: "sentinel-coding-qa".into(),
+            required_arg_prefix: vec!["python-project-v1".into()],
+            max_args: 65,
+        }];
+        request.input_digest = request.canonical_digest().unwrap();
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+        store
+            .mark_executing(
+                &request.invocation_id,
+                &request.input_digest,
+                1_900_000_000_001,
+            )
+            .unwrap();
+        let native = WorkbenchNativeQaStatus {
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            inventory_digest: Some("a".repeat(64)),
+            input_inventory_digest: Some(
+                WorkbenchNativeQaStatus::expected_input_inventory_digest(&request).unwrap(),
+            ),
+            code: "tool_timeout".into(),
+            progress: NativeQaProgress {
+                schema_version: 1,
+                family: "python-project-v1".into(),
+                suite_id: "python-qa-v1".into(),
+                outcome: NativeQaOutcome::Error,
+                inventory: NativeQaStage {
+                    outcome: NativeQaOutcome::Pass,
+                    planned: 2,
+                    completed: 2,
+                },
+                syntax: NativeQaStage {
+                    outcome: NativeQaOutcome::Pass,
+                    planned: 1,
+                    completed: 1,
+                },
+                tests: NativeQaStage {
+                    outcome: NativeQaOutcome::Error,
+                    planned: 2,
+                    completed: 1,
+                },
+            },
+        };
+        let mut output = sentinel_common::WorkbenchCommandStatus {
+            exit_code: 2,
+            stdout_bytes: 512,
+            stderr_bytes: 0,
+        }
+        .output();
+        native.insert_output(&mut output);
+        output.insert("stdout".into(), "PRIVATE-CANDIDATE".into());
+        let mut message = WorkbenchMessage::Result {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            outcome: WorkbenchOutcome::Failed,
+            resources: WorkbenchResourceUsage::default(),
+            artifacts: vec![],
+            output,
+            error: Some(WorkbenchErrorInfo {
+                class: WorkbenchErrorClass::Tool,
+                code: "command_failed".into(),
+                safe_message: "command failed".into(),
+                retryable: false,
+            }),
+        };
+        if let WorkbenchMessage::Result { output, .. } = &message {
+            let mut wrong_message = message.clone();
+            let mut wrong_status = native.clone();
+            wrong_status.input_inventory_digest = Some("e".repeat(64));
+            if let WorkbenchMessage::Result {
+                output: wrong_output,
+                ..
+            } = &mut wrong_message
+            {
+                *wrong_output = output.clone();
+                wrong_status.insert_output(wrong_output);
+            }
+            assert!(store
+                .accept_result(&wrong_message, 1_900_000_000_002)
+                .is_err());
+            assert_eq!(
+                store.load(&request.invocation_id).unwrap().unwrap().state,
+                WorkbenchInvocationState::Executing
+            );
+        }
+        let record = store.accept_result(&message, 1_900_000_000_002).unwrap();
+        assert_eq!(record.native_qa_status, Some(native.clone()));
+        assert!(!String::from_utf8_lossy(&encode_record(&record).unwrap())
+            .contains("PRIVATE-CANDIDATE"));
+        drop(store);
+        let reopened =
+            WorkbenchInvocationStore::open(directory.path().join("workbench.redb")).unwrap();
+        let restored = reopened.load(&request.invocation_id).unwrap().unwrap();
+        assert_eq!(restored, record);
+        assert!(
+            matches!(durable_terminal_projection(&restored), WorkbenchMessage::Result { output, .. }
+            if output.contains_key(WorkbenchNativeQaStatus::OUTPUT_KEY) && !output.contains_key("stdout"))
+        );
+        if let WorkbenchMessage::Result { output, .. } = &mut message {
+            let mut tampered = native;
+            tampered.progress.tests.completed = 0;
+            tampered.insert_output(output);
+        }
+        assert!(reopened.accept_result(&message, 1_900_000_000_003).is_err());
+        for (stdout_bytes, stderr_bytes) in [(0, 0), (512, 1), (4097, 0)] {
+            let mut tampered = restored.clone();
+            let command = tampered.command_status.as_mut().unwrap();
+            command.stdout_bytes = stdout_bytes;
+            command.stderr_bytes = stderr_bytes;
+            assert!(decode_record(&encode_record(&tampered).unwrap()).is_err());
+        }
+        let mut tampered = restored;
+        let mut wrong_inputs = tampered.clone();
+        wrong_inputs.native_qa_inputs.as_mut().unwrap().digest = "e".repeat(64);
+        assert!(decode_record(&encode_record(&wrong_inputs).unwrap()).is_err());
+        wrong_inputs = tampered.clone();
+        wrong_inputs.native_qa_inputs.as_mut().unwrap().files = 1;
+        assert!(decode_record(&encode_record(&wrong_inputs).unwrap()).is_err());
+        tampered.native_qa_suite = Some("node-qa-v1".into());
+        assert!(decode_record(&encode_record(&tampered).unwrap()).is_err());
+    }
+
+    #[test]
+    fn native_qa_record_fields_default_for_legacy_records() {
+        let request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2891");
+        let record = WorkbenchInvocationRecord::reserved(&request, 1_900_000_000_000);
+        let mut value = serde_json::to_value(&record).unwrap();
+        value.as_object_mut().unwrap().remove("native_qa_status");
+        value.as_object_mut().unwrap().remove("native_qa_suite");
+        value.as_object_mut().unwrap().remove("native_qa_inputs");
+        assert_eq!(
+            decode_record(&serde_json::to_vec(&value).unwrap()).unwrap(),
+            record
+        );
     }
 
     #[test]
@@ -4659,6 +5341,85 @@ mod tests {
                 assert!(!root.join("workspace").exists());
             }
         }
+    }
+
+    #[test]
+    fn artifact_input_staging_preserves_repeated_blobs_at_distinct_package_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_agent = AgentId(3);
+        let destination_agent = AgentId(6);
+        let source_root = directory.path().join("agent-03");
+        let destination_root = directory.path().join("agent-06");
+        let source_artifacts = source_root.join("artifacts");
+        let destination_artifacts = destination_root.join("artifacts");
+        let source_scope = source_artifacts.join("project-m0/source");
+        fs::create_dir_all(source_scope.join("blobs")).unwrap();
+        fs::create_dir_all(&destination_artifacts).unwrap();
+        fs::create_dir(destination_root.join("inputs")).unwrap();
+        fs::write(source_root.join(".nano-runtime"), "AGENT-03").unwrap();
+        fs::write(destination_root.join(".nano-runtime"), "AGENT-06").unwrap();
+        let mut entries = Vec::new();
+        for (path, bytes) in [
+            ("lib/__init__.py", &b""[..]),
+            ("tests/__init__.py", &b""[..]),
+            ("lib/a.py", &b"value = 1\n"[..]),
+            ("lib/b.py", &b"value = 1\n"[..]),
+        ] {
+            let digest = hex_sha256(bytes);
+            let blob = source_scope.join("blobs").join(&digest);
+            if !blob.exists() {
+                fs::write(&blob, bytes).unwrap();
+                fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+            }
+            entries.push(
+                serde_json::json!({"path":path, "blob_id":format!("sha256:{digest}"),
+                "sha256":digest, "size_bytes":bytes.len()}),
+            );
+        }
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schema_version":WORKBENCH_SCHEMA_VERSION,
+            "invocation_id":"018f3f32-4f01-7f2c-a6c1-f6f4a81b2897",
+            "input_digest":"a".repeat(64), "project_id":"project-m0", "work_item_id":"source",
+            "workspace_id":"project-m0:source", "agent_id":source_agent.0,
+            "artifact_kind":"source_tree", "media_type":"text/x-python",
+            "runtime_key":WORKBENCH_RUNTIME_BWRAP, "tool_profile":"python-coding-v1",
+            "tool_profile_digest":"b".repeat(64), "policy_digest":"c".repeat(64), "entries":entries,
+        }))
+        .unwrap();
+        let digest = hex_sha256(&manifest);
+        fs::write(
+            source_scope.join(format!("{digest}.manifest.json")),
+            manifest,
+        )
+        .unwrap();
+        let roots = HashMap::from([
+            (source_agent, source_artifacts),
+            (destination_agent, destination_artifacts),
+        ]);
+        let staged = stage_verified_artifact_inputs(
+            &roots,
+            source_agent,
+            destination_agent,
+            "project-m0",
+            "verify",
+            &digest,
+            Some("source_tree"),
+            "text/x-python",
+        )
+        .unwrap();
+        assert_eq!(staged.len(), 4);
+        let mut validation = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2810");
+        validation.inputs = staged.clone();
+        validation.input_digest = validation.canonical_digest().unwrap();
+        validation.validate_at(1_900_000_000_000).unwrap();
+        for input in &staged {
+            let path = destination_root
+                .join("inputs/project-m0/verify")
+                .join(&input.mount_path);
+            assert_eq!(fs::metadata(&path).unwrap().nlink(), 1);
+            assert_eq!(hex_sha256(&fs::read(&path).unwrap()), input.sha256);
+        }
+        assert_eq!(fs::read_dir(source_scope.join("blobs")).unwrap().count(), 2);
     }
 
     #[test]

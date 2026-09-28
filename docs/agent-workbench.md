@@ -550,9 +550,74 @@ The M0 tools are:
 
 Packaging installs every file as an immutable SHA-256 blob and writes a digest-named immutable manifest that binds the invocation, authority digests, workspace, file paths, blob IDs, and sizes. Sandbox and daemon acceptance pin the scoped directories and read each manifest and blob only through a no-follow descriptor after checking its device, inode, owner, mode, link count, and size. The manifest never embeds private file content.
 
-The immutable start configuration is `config/workbench-profiles/web-authoring-v1.toml`. Its file SHA-256 is carried as `tool_profile_digest`. The daemon rejects requests whose runtime, capability set, artifact kinds, command rules, test suite, environment contract, or resource limits exceed that exact profile. Profile replacement therefore requires a new digest-bound request; there is no silent live mutation.
+The immutable start configuration is selected from the accepted project family
+and the assigned role. Web developers use `web-authoring-v1`; Python and Node
+developers use `python-coding-v1` and `node-coding-v1`. Design and independent
+model review retain their separate profiles. Native technical QA uses
+`coding-qa-v1`, not the developer's writable tool policy. Project and Workbench
+profiles must match the exact installed release bytes, generation and digest;
+missing native profiles never fall back to the web profile. Existing accepted
+agreements retain their original binding.
 
-Commands run in a new process group. Cancellation or deadline expiry kills the group. The sandbox/cgroup layer remains authoritative for CPU, memory, process, syscall, capability, filesystem, and network enforcement; the runtime also applies bounded I/O and wall-clock handling.
+The selected file SHA-256 is carried as `tool_profile_digest`. The daemon rejects
+requests whose runtime, capability set, artifact kinds, command rules, test suite,
+environment contract, or resource limits exceed that exact profile. Profile
+replacement therefore requires a new digest-bound request; there is no silent
+live mutation.
+
+### Native independent QA
+
+`sentinel-coding-qa` stages the exact immutable declared input inventory while
+preserving its relative package tree, including empty Python `__init__.py`
+files. Its inventory-only mode establishes source integrity, not code quality.
+Final QA runs syntax checks and any discovered unittest or Node test suites;
+their failures reject the candidate, but their self-reported counters are not
+authority for a passing receipt.
+
+Each native candidate also includes `sentinel-qa.json`, a bounded behavioral
+test plan. For example, a Python CLI that adds two integers can declare:
+
+```json
+{"schema_version":1,"cases":[{"id":"add-positive","script":"app.py","args":["2","3"],"stdin":"","expected_stdout":"5\n","expected_stderr":"","expected_exit":0}]}
+```
+
+The trusted evaluator validates the plan before execution and compares each
+child's observed stdout, stderr and exit status with these expectations. Only
+the evaluator counts successful cases. Candidate code cannot mint a passing
+receipt by printing a forged unittest or JSON summary. Empty plans, duplicate
+case IDs, cross-family scripts, traversal and vacuous assertions are rejected.
+The separate independent model review determines whether the declared cases
+cover the accepted requirements; a behavioral pass alone is not that judgment
+or a security assessment of arbitrary code.
+
+The runtime starts one constrained namespace launcher inside its outer
+bubblewrap sandbox before applying irreversible controller Landlock. Landlock
+does not permit a restricted process to construct new mounts, so the evaluator
+does not invoke bubblewrap itself. It sends bounded, token-bound requests to
+that trusted sibling. The launcher constructs each command namespace, applies
+mandatory child Landlock, and disables further user namespaces before exec.
+There is no unrestricted command fallback.
+
+For QA, the token binds the current evaluator, candidate workspace, command
+cgroup, deadline and resource ceilings. Candidate children see a read-only
+tree and a separate writable scratch directory, but no launcher socket, token,
+receipt directory or foreign workspace. They cannot rewrite the measured
+source or tests. Network access remains denied. Disconnect, timeout or failed
+isolation aborts the operation and requires full cgroup cleanup before success.
+
+The trusted summary records separate inventory, syntax and behavioral stages
+as `pass`, `fail`, `error` or `not_run`, with planned and observed counts. The
+runtime accepts only bounded, complete summaries from the exact installed QA
+program and matching family/suite. These safe facts persist with the invocation
+and replay after restart; raw candidate output stays private. A missing tool,
+timeout or truncated summary cannot claim that the later assertions ran.
+The native QA profile permits one family selector plus at most 64 input paths;
+other profiles retain their own smaller argument and resource ceilings.
+
+Command cancellation and deadlines quiesce the owned cgroup, including detached
+descendants; a process-group signal alone is not a cleanup receipt. The sandbox
+and cgroup layer enforce CPU, memory, process, filesystem and network limits;
+the runtime also bounds I/O and wall-clock handling.
 
 ## Output acceptance and redaction
 

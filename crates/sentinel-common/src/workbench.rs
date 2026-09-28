@@ -15,6 +15,10 @@ use crate::AgentId;
 
 mod observation;
 pub use observation::{WorkbenchPrivateObservation, WORKBENCH_RETAIN_OBSERVATION};
+mod qa;
+pub use qa::{
+    NativeQaInputBinding, NativeQaOutcome, NativeQaProgress, NativeQaStage, WorkbenchNativeQaStatus,
+};
 
 pub const WORKBENCH_SCHEMA_VERSION: u16 = 1;
 pub const WORKBENCH_RUNTIME_BWRAP: &str = "bwrap-landlock";
@@ -28,7 +32,9 @@ pub const WORKBENCH_MAX_CALLER_RESULT_BYTES: usize = 224 * 1024;
 /// remains below the caller-result budget even when every byte uses the longest
 /// JSON escape form.
 pub const WORKBENCH_MAX_INSPECT_BYTES: u64 = 32 * 1024;
-const MAX_COMMAND_ARGUMENTS: usize = 64;
+/// A native QA invocation binds one family selector plus up to 64 input files.
+/// Individual immutable profiles may grant a smaller argument budget.
+pub const WORKBENCH_MAX_COMMAND_ARGUMENTS: usize = 65;
 const MAX_COMMAND_ARGUMENT_BYTES: usize = 4096;
 const MAX_PROGRAM_BYTES: usize = 128;
 const MAX_PATCH_REPLACEMENTS: usize = 128;
@@ -298,14 +304,18 @@ impl WorkbenchRequest {
                 self.tool.required_capability().to_string(),
             ));
         }
-        let mut input_artifact_ids = BTreeSet::new();
+        let mut input_artifact_ids = BTreeMap::new();
         let mut input_mount_paths = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
             validate_identifier("artifact_id", &input.artifact_id)?;
             validate_sha256("input sha256", &input.sha256)?;
             validate_relative_path(&input.mount_path)?;
             let mount_path = std::path::Path::new(&input.mount_path);
-            if !input_artifact_ids.insert(input.artifact_id.as_str())
+            // A CAS blob may appear at several distinct package paths. Its
+            // digest identity must remain stable, but it is not a path identity.
+            if input_artifact_ids
+                .insert(input.artifact_id.as_str(), input.sha256.as_str())
+                .is_some_and(|digest| digest != input.sha256)
                 || input_mount_paths.iter().any(|existing: &&std::path::Path| {
                     mount_path.starts_with(*existing) || existing.starts_with(mount_path)
                 })
@@ -381,7 +391,7 @@ impl CommandRule {
     pub fn validate(&self) -> Result<(), WorkbenchValidationError> {
         validate_program(&self.program)?;
         if self.max_args == 0
-            || usize::from(self.max_args) > MAX_COMMAND_ARGUMENTS
+            || usize::from(self.max_args) > WORKBENCH_MAX_COMMAND_ARGUMENTS
             || self.required_arg_prefix.len() > usize::from(self.max_args)
             || self
                 .required_arg_prefix
@@ -820,6 +830,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_qa_command_rule_accepts_exact_bounded_inventory() {
+        let mut args = vec!["python-project-v1".to_owned()];
+        args.extend((0..64).map(|index| format!("inputs/source/file-{index}.py")));
+        let mut rule = CommandRule {
+            program: "sentinel-coding-qa".to_owned(),
+            required_arg_prefix: args.clone(),
+            max_args: WORKBENCH_MAX_COMMAND_ARGUMENTS as u16,
+        };
+        rule.validate().unwrap();
+        assert!(rule.allows("sentinel-coding-qa", &args));
+        args.push("inputs/source/extra.py".to_owned());
+        assert!(!rule.allows("sentinel-coding-qa", &args));
+        rule.max_args += 1;
+        assert!(rule.validate().is_err());
+    }
+
+    #[test]
     fn command_feedback_is_numeric_complete_and_canonical() {
         let expected = WorkbenchCommandStatus {
             exit_code: 1,
@@ -1030,6 +1057,36 @@ mod tests {
             overlapping_artifact.validate_at(1_900_000_000_000),
             Err(WorkbenchValidationError::InvalidPath)
         );
+    }
+
+    #[test]
+    fn repeated_input_content_is_allowed_only_at_distinct_nonoverlapping_paths() {
+        let mut request = request();
+        request.inputs = [
+            "lib/__init__.py",
+            "tests/__init__.py",
+            "lib/a.py",
+            "lib/b.py",
+        ]
+        .into_iter()
+        .map(|path| WorkbenchInputRef {
+            artifact_id: format!("sha256:{}", "c".repeat(64)),
+            sha256: "c".repeat(64),
+            mount_path: path.to_owned(),
+            media_type: "text/x-python".to_owned(),
+        })
+        .collect();
+        request.input_digest = request.canonical_digest().unwrap();
+        request.validate_at(1_900_000_000_000).unwrap();
+        for path in ["lib/__init__.py", "lib", "lib/__init__.py/child"] {
+            let mut aliased = request.clone();
+            aliased.inputs[1].mount_path = path.to_owned();
+            aliased.input_digest = aliased.canonical_digest().unwrap();
+            assert!(aliased.validate_at(1_900_000_000_000).is_err());
+        }
+        request.inputs[1].sha256 = "d".repeat(64);
+        request.input_digest = request.canonical_digest().unwrap();
+        assert!(request.validate_at(1_900_000_000_000).is_err());
     }
 
     #[test]

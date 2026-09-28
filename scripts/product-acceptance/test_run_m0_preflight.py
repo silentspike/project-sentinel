@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import ssl
@@ -31,6 +32,18 @@ TEST_CERTIFICATE = b"""-----BEGIN CERTIFICATE-----
 AA==
 -----END CERTIFICATE-----
 """
+NATIVE_BINDINGS = {
+    "/opt/sentinel/config/work-profiles/python-project-v1.toml": (
+        "config/work-profiles/python-project-v1.toml", "config"
+    ),
+    "/opt/sentinel/config/work-profiles/node-project-v1.toml": (
+        "config/work-profiles/node-project-v1.toml", "config"
+    ),
+    "/opt/sentinel/config/workbench-profiles/coding-qa-v1.toml": (
+        "config/workbench-profiles/coding-qa-v1.toml", "config"
+    ),
+    "/usr/bin/sentinel-coding-qa": ("deploy/scripts/coding-qa-v1.py", "script"),
+}
 
 
 def encoded(value: object) -> bytes:
@@ -674,6 +687,107 @@ id = "web-authoring-v1"
 
 
 class PreflightTests(unittest.TestCase):
+    def test_generator_inventory_matches_complete_preflight_authority(self) -> None:
+        generator = (Path(__file__).parents[2] / "deploy/generate-manifest.sh").read_text()
+        rows = re.findall(r'^  "([^"|]+)\|([^"|]+)\|([^"|]+)"$', generator, re.MULTILINE)
+        inventory = {dest: (source, kind) for source, dest, kind in rows}
+        self.assertEqual(len(inventory), len(rows))
+        self.assertEqual(len({source for source, _dest, _kind in rows}), len(rows))
+        inventory.update({
+            f"/opt/sentinel/config/agents/{name}": (f"config/agents/{name}", "config")
+            for name in preflight.CANONICAL_AGENT_FILES
+        })
+        self.assertEqual(inventory, preflight.CANONICAL_RELEASE_ARTIFACTS)
+        for destination, binding in NATIVE_BINDINGS.items():
+            self.assertEqual(inventory[destination], binding)
+
+    def test_native_bindings_missing_tampered_or_redirected_fail_closed(self) -> None:
+        evidence, authority = preflight.validate_manifest(self.fixture.inputs(), self.fixture.deps())
+        self.assertEqual(evidence["artifact_count"], len(preflight.CANONICAL_RELEASE_ARTIFACTS))
+        for destination, (source, kind) in NATIVE_BINDINGS.items():
+            self.assertEqual((authority[destination]["source"], authority[destination]["type"]), (source, kind))
+            for attack, reason in (
+                ("omitted", "manifest_required_artifact_missing"),
+                ("missing", "file_unavailable"),
+                ("tampered", "artifact_hash_mismatch"),
+                ("source", "manifest_artifact_authority_mismatch"),
+                ("type", "manifest_artifact_authority_mismatch"),
+                ("path", "manifest_unexpected_artifact"),
+            ):
+                with self.subTest(destination=destination, attack=attack):
+                    fixture = Fixture()
+                    row = next(item for item in fixture.manifest["artifacts"] if item["path"] == destination)
+                    if attack == "omitted":
+                        fixture.manifest["artifacts"].remove(row)
+                    elif attack == "missing":
+                        del fixture.files[Path(destination)]
+                    elif attack == "tampered":
+                        fixture.files[Path(destination)] = b"tampered-native-artifact"
+                    elif attack == "source":
+                        row["source"] = "config/redirected.toml"
+                    elif attack == "type":
+                        row["type"] = "config" if kind == "script" else "script"
+                    else:
+                        row["path"] = "/usr/bin/unapproved-coding-qa"
+                    fixture.authorize_manifest()
+                    with self.assertRaisesRegex(preflight.PreflightError, reason):
+                        preflight.validate_manifest(fixture.inputs(), fixture.deps())
+
+    def test_native_profile_gate_binds_contract_identity_and_path(self) -> None:
+        """Synthetic schemas prove binding, not the pending native profile contents."""
+        for name in ("python-project-v1", "node-project-v1"):
+            with self.subTest(profile=name):
+                fixture = Fixture()
+                fixture.profile_path = preflight.WORK_PROFILE_PATHS[name]
+                fixture.files[fixture.profile_path] = fixture.files[preflight.M0_PROFILE_PATH].replace(
+                    b"web-project-v1", name.encode("ascii")
+                )
+                fixture.files[fixture.contract_path] = fixture.files[fixture.contract_path].replace(
+                    b"web-project-v1", name.encode("ascii")
+                )
+                fixture.manifest = fixture._manifest()
+                fixture.authorize_manifest()
+                result = preflight.evaluate(fixture.inputs(), fixture.deps())
+                self.assertTrue(result["runtime_preflight_pass"], result)
+                self.assertFalse(result["m0_acceptance_pass"])
+                fixture.files[fixture.contract_path] = fixture.files[fixture.contract_path].replace(
+                    f"config/work-profiles/{name}.toml".encode("ascii"),
+                    b"config/work-profiles/web-project-v1.toml",
+                )
+                with self.assertRaisesRegex(preflight.PreflightError, "contract_profile_path_mismatch"):
+                    preflight.validate_contract_profile_roster(fixture.inputs(), fixture.deps())
+
+    def test_native_binding_does_not_expand_preflight_command_authority(self) -> None:
+        for executable in ("/usr/bin/python3", "/usr/bin/node", "/usr/bin/npm", "/usr/bin/sentinel-coding-qa"):
+            with self.subTest(executable=executable):
+                with self.assertRaisesRegex(preflight.PreflightError, "command_not_allowed"):
+                    preflight.default_command([executable], 1, 1024)
+
+    def test_general_coding_profiles_have_exact_release_generator_authority(self) -> None:
+        generator = (Path(__file__).parents[2] / "deploy/generate-manifest.sh").read_text()
+        for profile in ("python-coding-v1", "node-coding-v1"):
+            path = f"/opt/sentinel/config/workbench-profiles/{profile}.toml"
+            source = f"config/workbench-profiles/{profile}.toml"
+            self.assertEqual(preflight.CANONICAL_RELEASE_ARTIFACTS[path], (source, "config"))
+            self.assertEqual(generator.count(f'"{source}|{path}|config"'), 1)
+
+    def test_general_coding_profile_missing_or_tampered_fails_release_preflight(self) -> None:
+        for profile in ("python-coding-v1", "node-coding-v1"):
+            path = f"/opt/sentinel/config/workbench-profiles/{profile}.toml"
+            with self.subTest(profile=profile, failure="missing"):
+                fixture = Fixture()
+                fixture.manifest["artifacts"] = [
+                    row for row in fixture.manifest["artifacts"] if row["path"] != path
+                ]
+                fixture.authorize_manifest()
+                with self.assertRaisesRegex(preflight.PreflightError, "manifest_required_artifact_missing"):
+                    preflight.validate_manifest(fixture.inputs(), fixture.deps())
+            with self.subTest(profile=profile, failure="tampered"):
+                fixture = Fixture()
+                fixture.files[Path(path)] = b"different-profile-authority"
+                with self.assertRaisesRegex(preflight.PreflightError, "artifact_hash_mismatch"):
+                    preflight.validate_manifest(fixture.inputs(), fixture.deps())
+
     def test_nats_contract_requires_jetstream_readiness(self) -> None:
         contracts = {name: url for name, url, *_rest in preflight.HTTP_CONTRACTS}
         self.assertEqual(
