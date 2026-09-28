@@ -1,5 +1,12 @@
 # Changelog
 
+- Keep the legacy trash diagnostic separate from retained workspace versions;
+  reject a probe over an existing employee file rather than replacing it (#856).
+
+- Bind general Python and Node workbench profiles to the canonical release and
+  deployment preflight. Missing or altered profile artifacts fail closed while
+  existing customer profile bindings remain unchanged (#856).
+
 - Repair scheduled dependency automation, audit all Go modules and both Rust
   locks, and propagate audit/freshness failures. Update Go crypto and Console
   test/build dependencies; keep native-kernel acceptance separate from hosted

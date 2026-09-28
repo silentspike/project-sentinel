@@ -898,6 +898,36 @@ impl LayerManager {
     pub fn unlink(&self, agent: &str, parent: u64, name: &str, inode: u64) -> anyhow::Result<()> {
         self.remove(&mut *self.lock()?, agent, parent, name, Some(inode), false)
     }
+    /// Isolated legacy-CAS GC probe; ordinary workspace versions retain their
+    /// historical roots and must not be rewritten into the legacy trash queue.
+    pub fn create_legacy_trash_fixture(
+        &self,
+        agent: &str,
+        parent: u64,
+        name: &str,
+        bytes: &[u8],
+    ) -> anyhow::Result<(u64, InodeData)> {
+        validate_name(name)?;
+        if bytes.len() as u64 > MAX_LEGACY_SIZE {
+            return Err(errno(27));
+        }
+        let state = self.lock()?;
+        let guard = self.meta.namespace_guard(agent)?;
+        self.ensure_root(agent)?;
+        self.parent(&state, agent, parent, true)?;
+        if self.dirent(agent, parent, name)?.is_some() {
+            return Err(errno(17));
+        }
+        OwnerRegistry::global().validate(&guard)?;
+        let data = InodeData::regular(self.cas.store(bytes)?.0, bytes.len() as u64, 0o644);
+        OwnerRegistry::global().validate(&guard)?;
+        let inode = self.meta.workspace_next_inode(agent)?;
+        self.meta.create_file(agent, parent, name, inode, &data)?;
+        // Only the exact newly allocated legacy inode is removed; existing
+        // employee files and retained workspace identities are never deleted.
+        self.meta.remove_file(agent, parent, name, inode)?;
+        Ok((inode, data))
+    }
     pub fn rmdir(&self, agent: &str, parent: u64, name: &str) -> anyhow::Result<()> {
         self.remove(&mut *self.lock()?, agent, parent, name, None, true)
     }

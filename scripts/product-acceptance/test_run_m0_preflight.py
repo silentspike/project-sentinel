@@ -674,6 +674,31 @@ id = "web-authoring-v1"
 
 
 class PreflightTests(unittest.TestCase):
+    def test_general_coding_profiles_have_exact_release_generator_authority(self) -> None:
+        generator = (Path(__file__).parents[2] / "deploy/generate-manifest.sh").read_text()
+        for profile in ("python-coding-v1", "node-coding-v1"):
+            path = f"/opt/sentinel/config/workbench-profiles/{profile}.toml"
+            source = f"config/workbench-profiles/{profile}.toml"
+            self.assertEqual(preflight.CANONICAL_RELEASE_ARTIFACTS[path], (source, "config"))
+            self.assertEqual(generator.count(f'"{source}|{path}|config"'), 1)
+
+    def test_general_coding_profile_missing_or_tampered_fails_release_preflight(self) -> None:
+        for profile in ("python-coding-v1", "node-coding-v1"):
+            path = f"/opt/sentinel/config/workbench-profiles/{profile}.toml"
+            with self.subTest(profile=profile, failure="missing"):
+                fixture = Fixture()
+                fixture.manifest["artifacts"] = [
+                    row for row in fixture.manifest["artifacts"] if row["path"] != path
+                ]
+                fixture.authorize_manifest()
+                with self.assertRaisesRegex(preflight.PreflightError, "manifest_required_artifact_missing"):
+                    preflight.validate_manifest(fixture.inputs(), fixture.deps())
+            with self.subTest(profile=profile, failure="tampered"):
+                fixture = Fixture()
+                fixture.files[Path(path)] = b"different-profile-authority"
+                with self.assertRaisesRegex(preflight.PreflightError, "artifact_hash_mismatch"):
+                    preflight.validate_manifest(fixture.inputs(), fixture.deps())
+
     def test_nats_contract_requires_jetstream_readiness(self) -> None:
         contracts = {name: url for name, url, *_rest in preflight.HTTP_CONTRACTS}
         self.assertEqual(

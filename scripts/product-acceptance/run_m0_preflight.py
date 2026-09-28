@@ -351,6 +351,14 @@ CANONICAL_RELEASE_ARTIFACTS: dict[str, tuple[str, str]] = {
         "config/workbench-profiles/web-review-v1.toml",
         "config",
     ),
+    "/opt/sentinel/config/workbench-profiles/python-coding-v1.toml": (
+        "config/workbench-profiles/python-coding-v1.toml",
+        "config",
+    ),
+    "/opt/sentinel/config/workbench-profiles/node-coding-v1.toml": (
+        "config/workbench-profiles/node-coding-v1.toml",
+        "config",
+    ),
     "/usr/bin/sentinel-web-qa": ("deploy/scripts/web-qa-v1.py", "script"),
     "/usr/bin/sentinel-work-item-gate": (
         "deploy/scripts/work-item-gate-v1.py",
