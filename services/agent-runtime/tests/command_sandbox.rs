@@ -109,7 +109,7 @@ impl Fixture {
         )
         .unwrap();
         let mut command = scoped.command;
-        let result = command
+        let mut result = command
             .args(arguments)
             .env("SENTINEL_FORBIDDEN_SECRET", "must-not-survive")
             .env("SENTINEL_WORKBENCH_ATTESTATION_NONCE", "must-not-survive")
@@ -122,6 +122,9 @@ impl Fixture {
             setup.poll().unwrap(),
             "isolation/exec channel did not confirm execution"
         );
+        result.status = setup
+            .terminal_status()
+            .expect("broker did not prove the candidate status");
         result
     }
 

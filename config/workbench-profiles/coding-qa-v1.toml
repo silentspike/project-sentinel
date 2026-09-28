@@ -11,7 +11,8 @@ output_artifact_kinds = ["qa_evidence"]
 wall_time_ms = 30000
 cpu_time_ms = 10000
 memory_bytes = 134217728
-process_count = 8
+# Includes evaluator, nested namespaces and the Node test worker's OS threads.
+process_count = 32
 file_bytes = 8388608
 stdout_bytes = 65536
 stderr_bytes = 65536
@@ -21,11 +22,11 @@ program = "sentinel-coding-qa"
 required_arg_prefix = []
 max_args = 65
 
-# Compatibility integrity gate only; it does not prove native coding quality.
+# Compatibility inventory gate only; it does not prove native coding quality.
 [[command_rules]]
-program = "sentinel-work-item-gate"
-required_arg_prefix = []
-max_args = 64
+program = "sentinel-coding-qa"
+required_arg_prefix = ["--inventory-only"]
+max_args = 65
 
 [[test_suites]]
 id = "python-qa-v1"
@@ -41,6 +42,6 @@ max_args = 65
 
 [[test_suites]]
 id = "web-work-item-qa-v1"
-program = "sentinel-work-item-gate"
-required_arg_prefix = []
-max_args = 64
+program = "sentinel-coding-qa"
+required_arg_prefix = ["--inventory-only"]
+max_args = 65

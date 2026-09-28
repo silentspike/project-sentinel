@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import contextlib
-import importlib.util
+import ast
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
@@ -16,10 +18,13 @@ import tomllib
 import unittest
 from unittest import mock
 
+from qa_broker_fixture import QaBrokerFixture, TOKEN, event, frame, load_test_runner
+
 
 REPO = Path(__file__).resolve().parents[2]
-RUNNER = REPO / "deploy/scripts/coding-qa-v1.py"
-TEMP_ROOT = Path("/work/tmp")
+RUNNER = Path(os.environ.get("SENTINEL_QA_TEST_RUNNER", REPO / "deploy/scripts/coding-qa-v1.py"))
+TEST_LOADER = Path(__file__).with_name("qa_broker_fixture.py")
+TEMP_ROOT = Path(os.environ.get("RUNNER_TEMP", "/work/tmp"))
 PYTHON_FILES = {
     "lib/__init__.py": "",
     "lib/math_ops.py": "def add(a, b):\n    return a + b\n",
@@ -31,6 +36,11 @@ PYTHON_FILES = {
         "        self.assertEqual(add(2, 3), 5)\n"
     ),
     "data/config.json": '{"value": 5}\n',
+    "app.py": "from lib.math_ops import add\nprint(add(2, 3))\n",
+    "sentinel-qa.json": json.dumps({"schema_version": 1, "cases": [{
+        "id": "addition", "script": "app.py", "args": [], "stdin": "",
+        "expected_stdout": "5\n", "expected_stderr": "", "expected_exit": 0,
+    }]}),
 }
 NODE_FILES = {
     "package.json": '{"type":"module"}\n',
@@ -41,14 +51,23 @@ NODE_FILES = {
         "test('addition', () => assert.equal(add(2, 3), 5));\n"
     ),
     "data/config.json": '{"value": 5}\n',
+    "app.mjs": "import { add } from './lib/math.mjs';\nconsole.log(add(2, 3));\n",
+    "sentinel-qa.json": json.dumps({"schema_version": 1, "cases": [{
+        "id": "addition", "script": "app.mjs", "args": [], "stdin": "",
+        "expected_stdout": "5\n", "expected_stderr": "", "expected_exit": 0,
+    }]}),
 }
 
 
-def load_runner():
-    spec = importlib.util.spec_from_file_location("coding_qa_v1", RUNNER)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def load_runner(broker_socket):
+    return load_test_runner(RUNNER, broker_socket)
+
+
+def expected_input_inventory(files, ensure_ascii=False):
+    pairs = [[relative, hashlib.sha256(content if isinstance(content, bytes) else content.encode("utf-8")).hexdigest()]
+             for relative, content in sorted(files.items())]
+    encoded = json.dumps(pairs, separators=(",", ":"), ensure_ascii=ensure_ascii).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class CodingQaTests(unittest.TestCase):
@@ -58,7 +77,12 @@ class CodingQaTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.workspace = self.root / "qa"
         self.workspace.mkdir()
-        self.module = load_runner()
+        self.broker = QaBrokerFixture(self.root)
+        self.addCleanup(self.broker.close)
+        self.module = load_runner(self.broker.path)
+        token = mock.patch.dict(os.environ, {"SENTINEL_QA_BROKER_TOKEN": TOKEN})
+        token.start()
+        self.addCleanup(token.stop)
 
     def stage(self, files, artifact="candidate", real_contract=False):
         base = (self.root / ".inputs/project/work" if real_contract
@@ -73,7 +97,8 @@ class CodingQaTests(unittest.TestCase):
         return paths
 
     def invoke(self, family, paths):
-        result = subprocess.run([sys.executable, "-I", str(RUNNER), family, *paths],
+        result = subprocess.run([sys.executable, "-I", "-B", str(TEST_LOADER), "--invoke",
+                                 str(RUNNER), str(self.broker.path), TOKEN, family, *paths],
                                 cwd=self.workspace, capture_output=True, timeout=30)
         self.assertEqual(result.stderr, b"")
         payload = json.loads(result.stdout)
@@ -102,20 +127,126 @@ class CodingQaTests(unittest.TestCase):
         self.assertEqual(first, self.invoke("python-project-v1", list(reversed(paths))))
         self.assertEqual(first["outcome"], "pass")
         self.assertEqual(first["tests"], 1)
-        self.assertEqual(first["syntax_files"], 4)
+        self.assertEqual(first["syntax_files"], 5)
         self.assertEqual(first["files"], len(PYTHON_FILES))
+        self.assertEqual(first["input_inventory_sha256"], expected_input_inventory(PYTHON_FILES))
+        progress = first["native_status"]
+        self.assertEqual(progress["outcome"], "pass")
+        self.assertEqual(progress["inventory"], {"outcome": "pass", "planned": 7, "completed": 7})
+        self.assertEqual(progress["syntax"], {"outcome": "pass", "planned": 5, "completed": 5})
+        self.assertEqual(progress["tests"], {"outcome": "pass", "planned": 1, "completed": 1})
         self.assertEqual(before, {path: Path(path).read_bytes() for path in paths})
 
     def test_actual_workbench_staging_tree(self):
         result = self.invoke("python-project-v1", self.stage(PYTHON_FILES, real_contract=True))
         self.assertEqual(result["outcome"], "pass")
+        self.assertEqual(result["input_inventory_sha256"], expected_input_inventory(PYTHON_FILES))
+
+    def test_python_syntax_batches_64_or_more_sources_through_broker(self):
+        # Exercise syntax directly: main's unchanged 64-input limit must also
+        # reserve an input for the behavioral plan, leaving at most 63 sources.
+        for count in (64, 125):
+            with self.subTest(sources=count):
+                root = self.workspace / f"sources-{count}"
+                root.mkdir(mode=0o700)
+                sources = [f"source_{index:03d}.py" for index in range(count)]
+                for index, name in enumerate(sources):
+                    path = root / name
+                    path.write_text(f"VALUE = {index}\n", encoding="utf-8")
+                    path.chmod(0o444)
+                before = len(self.broker.requests)
+                progress = {"outcome": "not_run", "planned": 0, "completed": 0}
+                self.assertEqual(self.module.python_qa(root, time.monotonic() + 5, progress),
+                                 {"syntax_files": count})
+                self.assertEqual(progress["planned"], count)
+                self.assertEqual(progress["completed"], count)
+                requests = self.broker.requests[before:]
+                expected_sizes = [61, 3] if count == 64 else [61, 61, 3]
+                self.assertEqual([len(request["args"]) - 4 for request in requests], expected_sizes)
+                self.assertEqual([name for request in requests for name in request["args"][4:]], sources)
+                for request in requests:
+                    self.assertEqual(request["program"], "python3")
+                    self.assertEqual(request["args"][:4], ["-E", "-s", "-c", self.module.PYTHON_COMPILE])
+                    self.assertLessEqual(len(request["args"]), 65)
+                    self.assertEqual(request["workspace"], str(root))
+
+    def test_python_later_syntax_batch_failure_retains_observed_progress(self):
+        sources = [f"source_{index:03d}.py" for index in range(64)]
+        for index, name in enumerate(sources):
+            path = self.workspace / name
+            path.write_text("def broken(\n" if index == 62 else f"VALUE = {index}\n", encoding="utf-8")
+            path.chmod(0o444)
+        progress = {"outcome": "not_run", "planned": 0, "completed": 0}
+        with self.assertRaises(self.module.QaError) as caught:
+            self.module.python_qa(self.workspace, time.monotonic() + 5, progress)
+        self.assertEqual(caught.exception.code, "python_compile_failed")
+        self.assertEqual(progress["planned"], 64)
+        self.assertEqual(progress["completed"], 63)
+        self.assertEqual([len(request["args"]) - 4 for request in self.broker.requests], [61, 3])
+
+    def test_full_python_qa_batches_within_64_declared_input_limit(self):
+        files = {f"source_{index:03d}.py": f"VALUE = {index}\n" for index in range(61)}
+        files.update({"app.py": "print(5)\n", "sentinel-qa.json": PYTHON_FILES["sentinel-qa.json"],
+                      "test_smoke.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_value(self):\n        self.assertEqual(2 + 3, 5)\n"})
+        self.assertEqual(len(files), 64)
+        result = self.invoke("python-project-v1", self.stage(files))
+        self.assertEqual(result["outcome"], "pass", result)
+        self.assertEqual(result["syntax_files"], 63)
+        self.assertEqual(result["input_inventory_sha256"], expected_input_inventory(files))
+        self.assertEqual(result["native_status"]["syntax"], {"outcome": "pass", "planned": 63, "completed": 63})
+        syntax_requests = [request for request in self.broker.requests if request["args"][:3] == ["-E", "-s", "-c"]]
+        self.assertEqual([len(request["args"]) - 4 for request in syntax_requests], [61, 2])
+        self.assertTrue(all(len(request["args"]) <= 65 for request in self.broker.requests))
 
     def test_multifile_node_with_actual_tests_and_package_json(self):
         result = self.invoke("node-project-v1", self.stage(NODE_FILES))
         self.assertEqual(result["outcome"], "pass")
         self.assertEqual(result["tests"], 1)
-        self.assertEqual(result["syntax_files"], 2)
+        self.assertEqual(result["syntax_files"], 3)
         self.assertEqual(result["files"], len(NODE_FILES))
+        self.assertEqual(result["input_inventory_sha256"], expected_input_inventory(NODE_FILES))
+
+    def test_input_inventory_uses_utf8_relative_paths_and_canonical_compact_pairs(self):
+        files = {"data/z.bin": b"\x00\xff", "data/caf\u00e9.txt": "na\u00efve\n", "empty.txt": b""}
+        paths = self.stage(files)
+        first = self.invoke("--inventory-only", paths)
+        self.assertEqual(first["input_inventory_sha256"], expected_input_inventory(files))
+        self.assertNotEqual(first["input_inventory_sha256"], expected_input_inventory(files, ensure_ascii=True))
+        self.assertEqual(first, self.invoke("--inventory-only", list(reversed(paths))))
+        full_inventory = [[relative, len(content if isinstance(content, bytes) else content.encode("utf-8")),
+                           hashlib.sha256(content if isinstance(content, bytes) else content.encode("utf-8")).hexdigest()]
+                          for relative, content in sorted(files.items())]
+        self.assertEqual(first["inventory_sha256"], hashlib.sha256(
+            json.dumps(full_inventory, separators=(",", ":")).encode("utf-8")).hexdigest())
+
+    def test_observed_source_sha_tamper_cannot_match_declared_input_inventory(self):
+        paths = self.stage(PYTHON_FILES)
+        declared_digest = expected_input_inventory(PYTHON_FILES)
+        source = next(Path(path) for path in paths if path.endswith("/lib/math_ops.py"))
+        before = source.read_bytes()
+        changed = before.replace(b"return a + b", b"return a - b")
+        self.assertNotEqual(hashlib.sha256(before).digest(), hashlib.sha256(changed).digest())
+        self.assertEqual(len(before), len(changed))
+        source.chmod(0o644)
+        source.write_bytes(changed)
+        source.chmod(0o444)
+        result = self.invoke("python-project-v1", paths)
+        observed = dict(PYTHON_FILES, **{"lib/math_ops.py": changed})
+        self.assertEqual(result["input_inventory_sha256"], expected_input_inventory(observed))
+        self.assertNotEqual(result["input_inventory_sha256"], declared_digest)
+        self.assertEqual(result["files"], len(PYTHON_FILES))
+        self.assertEqual(result["bytes"], sum(len(content.encode("utf-8")) for content in PYTHON_FILES.values()))
+        self.assertEqual(result["outcome"], "fail")
+        self.assertEqual(source.read_bytes(), changed)
+
+    def test_input_inventory_binds_relative_paths_not_only_content_hashes(self):
+        first = {"data/first.bin": b"same source"}
+        second = {"data/second.bin": b"same source"}
+        result_a = self.invoke("--inventory-only", self.stage(first, "first"))
+        result_b = self.invoke("--inventory-only", self.stage(second, "second"))
+        self.assertEqual(result_a["input_inventory_sha256"], expected_input_inventory(first))
+        self.assertEqual(result_b["input_inventory_sha256"], expected_input_inventory(second))
+        self.assertNotEqual(result_a["input_inventory_sha256"], result_b["input_inventory_sha256"])
 
     def test_intentional_test_failure_for_both_families(self):
         for family, files, path, old, new in [
@@ -159,16 +290,18 @@ class CodingQaTests(unittest.TestCase):
             self.assertEqual(result["code"], "tests_missing")
 
     def test_node_nested_actual_tests_and_console_logs(self):
-        paths = self.stage({"nested.test.js": (
+        files = dict(NODE_FILES)
+        files["nested.test.cjs"] = (
             "const {describe, it} = require('node:test');\n"
             "describe('suite', () => {\n"
             "  it('works', () => { console.log('private test log'); });\n"
             "  it.skip('skip', () => {});\n});\n"
-        )})
+        )
+        paths = self.stage(files)
         result = self.invoke("node-project-v1", paths)
         self.assertEqual(result["outcome"], "pass")
-        self.assertEqual(result["tests"], 2)
-        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["tests"], 1)
+        self.assertEqual(result["skipped"], 0)
 
     def test_compile_does_not_import_candidate_stdlib_shadow(self):
         files = dict(PYTHON_FILES, **{"pathlib.py": "raise RuntimeError('must not execute at compile')\n"})
@@ -187,13 +320,48 @@ class CodingQaTests(unittest.TestCase):
             ("python", {"broken.py": "def broken(\n"}, "python_compile_failed"),
             ("node", {"broken.js": "const broken = ;\n"}, "node_syntax_failed"),
         ]:
-            result = self.invoke(family + "-project-v1", self.stage(files, family))
+            candidate = dict(PYTHON_FILES if family == "python" else NODE_FILES)
+            candidate.update(files)
+            result = self.invoke(family + "-project-v1", self.stage(candidate, family))
             self.assertEqual(result["code"], code)
+
+    def test_behavioral_assertions_are_executed_by_the_parent_not_candidate_reports(self):
+        for family, template, script, program in [
+            ("python", PYTHON_FILES, "app.py", "import sys\nprint(sys.stdin.read().upper(), end='')\n"),
+            ("node", NODE_FILES, "app.mjs", "import fs from 'node:fs';\nprocess.stdout.write(fs.readFileSync(0, 'utf8').toUpperCase());\n"),
+        ]:
+            candidate = dict(template)
+            candidate[script] = program
+            cases = [{"id": f"case-{index}", "script": script, "args": [], "stdin": text,
+                      "expected_stdout": text.upper(), "expected_stderr": "", "expected_exit": 0}
+                     for index, text in enumerate(["alpha\\nbeta", "mixed case\n"])]
+            candidate["sentinel-qa.json"] = json.dumps({"schema_version": 1, "cases": cases})
+            result = self.invoke(family + "-project-v1", self.stage(candidate, family))
+            self.assertEqual(result["outcome"], "pass")
+            self.assertEqual(result["tests"], 2)
+            cases[0]["expected_stdout"] = "wrong expectation"
+            candidate["sentinel-qa.json"] = json.dumps({"schema_version": 1, "cases": cases})
+            result = self.invoke(family + "-project-v1", self.stage(candidate, family + "-bad"))
+            self.assertEqual(result["code"], "behavioral_assertion_failed")
+
+    def test_behavioral_plan_rejects_empty_cross_family_and_ambiguous_cases(self):
+        valid = json.loads(PYTHON_FILES["sentinel-qa.json"])
+        for index, plan in enumerate([
+            {"schema_version": 1, "cases": []},
+            {"schema_version": 1, "cases": valid["cases"] * 2},
+            {"schema_version": 1, "cases": [dict(valid["cases"][0], script="../app.py")]},
+            {"schema_version": 1, "cases": [dict(valid["cases"][0], script="app.js")]},
+            {"schema_version": 1, "cases": [dict(valid["cases"][0], expected_stdout="")]},
+            {"schema_version": 1, "cases": [dict(valid["cases"][0], expected_exit=False)]},
+        ]):
+            files = dict(PYTHON_FILES, **{"sentinel-qa.json": json.dumps(plan)})
+            result = self.invoke("python-project-v1", self.stage(files, f"invalid{index}"))
+            self.assertEqual(result["code"], "test_plan_invalid")
 
     def test_failure_outcome_has_no_candidate_content(self):
         paths = self.stage({"test_private.py": "raise RuntimeError('secret-customer-data')\n"})
         result = self.invoke("python-project-v1", paths)
-        self.assertEqual(result["outcome"], "fail")
+        self.assertEqual(result["outcome"], "error")
         self.assertNotIn("secret-customer-data", json.dumps(result))
 
     def test_malformed_family_and_argument_limits(self):
@@ -231,7 +399,7 @@ class CodingQaTests(unittest.TestCase):
         self.assertEqual(self.invoke("python-project-v1", a + c)["code"], "input_collision")
 
     def test_distinct_artifact_trees_can_be_combined_without_flattening(self):
-        sources = {key: value for key, value in PYTHON_FILES.items() if key.startswith("lib/")}
+        sources = {key: value for key, value in PYTHON_FILES.items() if not key.startswith("tests/")}
         tests = {key: value for key, value in PYTHON_FILES.items() if key.startswith("tests/")}
         result = self.invoke("python-project-v1", self.stage(sources, "source") + self.stage(tests, "tests"))
         self.assertEqual(result["outcome"], "pass")
@@ -288,19 +456,128 @@ class CodingQaTests(unittest.TestCase):
             _, result = self.mechanism("python-project-v1", paths)
         self.assertEqual(result["code"], "input_changed")
 
-    def test_unavailable_interpreter_is_error(self):
+    def test_unavailable_broker_is_error(self):
         paths = self.stage(PYTHON_FILES)
-        with mock.patch.object(self.module.subprocess, "Popen", side_effect=FileNotFoundError):
+        with mock.patch.object(self.module, "BROKER_SOCKET", str(self.root / "unavailable.sock")):
             code, result = self.mechanism("python-project-v1", paths)
         self.assertEqual(code, 2)
         self.assertEqual(result["code"], "io_or_tool_error")
+        self.assertEqual(result["native_status"]["syntax"],
+                         {"outcome": "error", "planned": 5, "completed": 0})
+        self.assertEqual(result["native_status"]["tests"]["outcome"], "not_run")
 
-    def test_invalid_test_result_is_error(self):
-        paths = self.stage(PYTHON_FILES)
-        with mock.patch.object(self.module, "run_tool", side_effect=[(0, b""), (0, b"forged")]):
+    def test_duplicate_plan_keys_fail_before_any_tools(self):
+        valid = PYTHON_FILES["sentinel-qa.json"]
+        fixtures = [
+            valid.replace('"schema_version": 1', '"schema_version": 1, "schema_version": 1'),
+            valid.replace('"cases": [', '"cases": [], "cases": ['),
+            valid.replace('"expected_exit": 0', '"expected_exit": 1, "expected_exit": 0'),
+            valid.replace('"script": "app.py"', '"script": "bad.py", "script": "app.py"'),
+        ]
+        for index, plan in enumerate(fixtures):
+            with self.subTest(index=index):
+                files = dict(PYTHON_FILES, **{"sentinel-qa.json": plan})
+                with mock.patch.object(self.module, "run_tool") as tools:
+                    code, result = self.mechanism("python-project-v1", self.stage(files, f"duplicate{index}"))
+                tools.assert_not_called()
+                self.assertEqual(code, 2)
+                self.assertEqual(result["code"], "test_plan_invalid")
+                self.assertEqual(result["native_status"]["syntax"]["outcome"], "not_run")
+                self.assertEqual(result["native_status"]["tests"],
+                                 {"outcome": "error", "planned": 0, "completed": 0})
+
+    def test_missing_interpreter_preflight_is_not_an_assertion_failure(self):
+        with mock.patch.object(self.module.shutil, "which", return_value=None), \
+                mock.patch.object(self.module, "run_tool") as tools:
+            code, result = self.mechanism("python-project-v1", self.stage(PYTHON_FILES))
+        tools.assert_not_called()
+        self.assertEqual(code, 2)
+        self.assertEqual(result["native_status"]["syntax"],
+                         {"outcome": "error", "planned": 0, "completed": 0})
+        self.assertEqual(result["native_status"]["tests"]["outcome"], "not_run")
+
+    def test_missing_and_invalid_plans_never_run_tools(self):
+        for index, content in enumerate([None, "{", '{"schema_version":1,"cases":[]}']):
+            files = dict(PYTHON_FILES)
+            if content is None:
+                del files["sentinel-qa.json"]
+            else:
+                files["sentinel-qa.json"] = content
+            with mock.patch.object(self.module, "run_tool") as tools:
+                code, result = self.mechanism("python-project-v1", self.stage(files, f"missing{index}"))
+            tools.assert_not_called()
+            self.assertEqual(code, 2)
+            self.assertEqual(result["native_status"]["tests"]["completed"], 0)
+
+    def test_timeout_retains_only_observed_behavioral_progress(self):
+        files = dict(PYTHON_FILES)
+        plan = json.loads(files["sentinel-qa.json"])
+        plan["cases"].append(dict(plan["cases"][0], id="second"))
+        files["sentinel-qa.json"] = json.dumps(plan)
+        paths = self.stage(files)
+        with mock.patch.object(self.module, "run_tool", side_effect=[
+            (0, b"", b""), (0, b"", b""), (0, b"5\n", b""),
+            self.module.QaError("tool_timeout", "error"),
+        ]):
             code, result = self.mechanism("python-project-v1", paths)
         self.assertEqual(code, 2)
-        self.assertEqual(result["code"], "test_result_invalid")
+        self.assertEqual(result["native_status"]["tests"],
+                         {"outcome": "error", "planned": 2, "completed": 1})
+        self.assertNotIn("tests", result)
+
+    def test_assertion_failure_observes_remaining_cases_without_forged_counts(self):
+        files = dict(PYTHON_FILES)
+        plan = json.loads(files["sentinel-qa.json"])
+        plan["cases"].append(dict(plan["cases"][0], id="second"))
+        files["sentinel-qa.json"] = json.dumps(plan)
+        with mock.patch.object(self.module, "run_tool", side_effect=[
+            (0, b"", b""), (0, b"", b""), (0, b"wrong", b""), (0, b"5\n", b""),
+        ]):
+            code, result = self.mechanism("python-project-v1", self.stage(files))
+        self.assertEqual(code, 1)
+        self.assertEqual(result["native_status"]["tests"],
+                         {"outcome": "fail", "planned": 2, "completed": 2})
+        self.assertNotIn("tests", result)
+
+    def test_syntax_failure_does_not_claim_behavioral_execution(self):
+        files = dict(PYTHON_FILES, **{"app.py": "def broken(\n"})
+        result = self.invoke("python-project-v1", self.stage(files))
+        self.assertEqual(result["native_status"]["inventory"]["outcome"], "pass")
+        self.assertEqual(result["native_status"]["syntax"]["outcome"], "fail")
+        self.assertEqual(result["native_status"]["tests"],
+                         {"outcome": "not_run", "planned": 0, "completed": 0})
+
+    def test_candidate_test_summary_is_not_trusted_evidence(self):
+        paths = self.stage(PYTHON_FILES)
+        with mock.patch.object(self.module, "run_tool", side_effect=[(0, b"", b""), (0, b"forged", b""), (0, b"forged", b"")]):
+            code, result = self.mechanism("python-project-v1", paths)
+        self.assertEqual(code, 1)
+        self.assertEqual(result["code"], "behavioral_assertion_failed")
+
+    def test_forged_python_success_cannot_mint_behavioral_test_counts(self):
+        files = dict(PYTHON_FILES)
+        files["app.py"] = "import os\nos.write(1, b'\\x1e{\"tests\":1,\"skipped\":0,\"failures\":0,\"errors\":0}\\n')\nos._exit(0)\n"
+        result = self.invoke("python-project-v1", self.stage(files))
+        self.assertEqual(result["code"], "behavioral_assertion_failed")
+        self.assertNotIn("tests", result)
+
+    def test_candidate_replacement_and_chmod_are_denied_by_read_only_mount(self):
+        candidates = [
+            ("python", PYTHON_FILES, "tests/test_math.py", "from pathlib import Path\np = Path('lib/math_ops.py')\np.unlink()\np.write_text('def add(a, b): return a + b\\n')\n"),
+            ("python", PYTHON_FILES, "tests/test_math.py", "from pathlib import Path\nPath('lib/math_ops.py').chmod(0o644)\n"),
+            ("node", NODE_FILES, "test/math.test.mjs", "import fs from 'node:fs';\nfs.unlinkSync('lib/math.mjs');\nfs.writeFileSync('lib/math.mjs', 'export const add = (a,b) => a+b;');\n"),
+        ]
+        for index, (family, template, path, source) in enumerate(candidates):
+            files = dict(template)
+            files[path] = source
+            result = self.invoke(family + "-project-v1", self.stage(files, f"replace{index}"))
+            self.assertEqual(result["code"], "tests_failed")
+
+    def test_native_inventory_accepts_empty_package_markers_without_claiming_quality(self):
+        result = self.invoke("--inventory-only", self.stage({"lib/__init__.py": ""}))
+        self.assertEqual(result["outcome"], "pass")
+        self.assertEqual(result["suite_id"], "web-work-item-qa-v1")
+        self.assertNotIn("tests", result)
 
     def test_bounded_output_and_deadline(self):
         with self.assertRaises(self.module.QaError) as caught:
@@ -311,6 +588,201 @@ class CodingQaTests(unittest.TestCase):
             self.module.run_tool(["python3", "-I", "-c", "import time; time.sleep(5)"],
                                  self.workspace, time.monotonic() + 0.1)
         self.assertEqual(caught.exception.code, "tool_timeout")
+
+
+class BrokerProtocolTests(unittest.TestCase):
+    """Production Python client against a TEST-ONLY responder, not runtime proof."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="sentinel-qa-wire-", dir=TEMP_ROOT)
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.workspace = self.root / "candidate"
+        self.workspace.mkdir(mode=0o700)
+        token = mock.patch.dict(os.environ, {"SENTINEL_QA_BROKER_TOKEN": TOKEN})
+        token.start()
+        self.addCleanup(token.stop)
+
+    def call(self, module, deadline=2, args=None, input_bytes=b""):
+        return module.run_tool(args or ["python3", "-I", "-c", "pass"], self.workspace,
+                               time.monotonic() + deadline, input_bytes)
+
+    def reject(self, wire, code="io_or_tool_error", pause=False, deadline=1):
+        def reply(connection, request, stop):
+            connection.sendall(wire)
+            if pause:
+                stop.wait(0.5)
+        with QaBrokerFixture(self.root, reply) as broker:
+            module = load_runner(broker.path)
+            with self.assertRaises(module.QaError) as caught:
+                self.call(module, deadline=deadline)
+            self.assertEqual(caught.exception.outcome, "error")
+            self.assertEqual(caught.exception.code, code)
+            self.assertEqual(len(broker.requests), 1)
+
+    def test_observed_child_binary_stdin_stdout_stderr_and_exact_request(self):
+        with QaBrokerFixture(self.root) as broker:
+            module = load_runner(broker.path)
+            program = "import sys; data=sys.stdin.buffer.read(); sys.stdout.buffer.write(data); sys.stderr.buffer.write(b'err\\x00')"
+            data = b"hello\x00\xff\n"
+            self.assertEqual(self.call(module, args=["python3", "-I", "-c", program], input_bytes=data),
+                             (0, data, b"err\x00"))
+            self.assertEqual(len(broker.requests), 1)
+            request = broker.requests[0]
+            self.assertEqual(request["inputBytes"], list(data))
+            self.assertEqual(request["token"], TOKEN)
+            self.assertEqual(request["workspace"], str(self.workspace))
+            self.assertEqual(request["scratch"], str(self.root / "scratch"))
+            self.assertEqual(request["stdoutBytes"], 65536)
+            self.assertEqual(request["stderrBytes"], 65536)
+            self.assertLessEqual(request["wallTimeMs"], 2000)
+
+    def test_fragmented_frames_and_nonzero_exit_are_observed(self):
+        wire = frame(event("ready")) + frame(event("stdout", dataHex="00ff")) + frame(event("exit", code=1, signal=None))
+        def reply(connection, request, stop):
+            for byte in wire:
+                connection.sendall(bytes([byte]))
+        with QaBrokerFixture(self.root, reply) as broker:
+            module = load_runner(broker.path)
+            self.assertEqual(self.call(module), (1, b"\x00\xff", b""))
+
+    def test_malformed_payloads_and_exact_event_keys(self):
+        ready = frame(event("ready"))
+        fixtures = [b"{", b"\xff", b"[]", b"null", b'"ready"', b"true",
+                    frame(event("unknown")), frame(event("ready", extra=True)),
+                    frame({"kind": "ready"}),
+                    ready + frame(event("stdout", data_hex="00")),
+                    ready + frame(event("stdout", dataHex="00", extra=1)),
+                    ready + frame(event("exit", code=0)),
+                    ready + frame(event("exit", code=True, signal=None)),
+                    ready + frame(event("exit", code=-1, signal=None)),
+                    ready + frame(event("exit", code=256, signal=None)),
+                    ready + frame(event("exit", code="0", signal=None)),
+                    frame(event("error", code="broker_denied"))]
+        for index, wire in enumerate(fixtures):
+            with self.subTest(index=index):
+                self.reject(frame(wire) if index < 6 else wire)
+
+    def test_invalid_versions_are_rejected_for_every_event_kind(self):
+        for kind in ("ready", "stdout", "stderr", "exit"):
+            for version in (0, 2, True, "1", None):
+                with self.subTest(kind=kind, version=version):
+                    value = event(kind)
+                    value["version"] = version
+                    if kind in {"stdout", "stderr"}:
+                        value["dataHex"] = ""
+                    if kind == "exit":
+                        value.update(code=0, signal=None)
+                    self.reject((b"" if kind == "ready" else frame(event("ready"))) + frame(value))
+
+    def test_ready_order_and_post_exit_bytes_are_rejected(self):
+        ready, exit_event = frame(event("ready")), frame(event("exit", code=0, signal=None))
+        for wire in [frame(event("stdout", dataHex="00")), frame(event("stderr", dataHex="00")),
+                     exit_event, ready + ready, ready + exit_event + b"x",
+                     ready + exit_event + exit_event, ready + exit_event + frame(event("stdout", dataHex="00"))]:
+            with self.subTest(wire=wire):
+                self.reject(wire)
+
+    def test_hex_requires_bounded_lowercase_even_length_strings(self):
+        for kind in ("stdout", "stderr"):
+            for value in ("0", "FF", "gg", "00 00", "00\n", 12, None, [], "00" * 65537):
+                with self.subTest(kind=kind, value_type=type(value).__name__, length=len(value) if isinstance(value, str) else None):
+                    self.reject(frame(event("ready")) + frame(event(kind, dataHex=value)))
+
+    def test_duplicate_keys_in_every_event_fail_closed(self):
+        fixtures = [
+            b'{"kind":"ready","kind":"ready","version":1}',
+            b'{"kind":"ready","version":1,"version":1}',
+            b'{"kind":"stdout","version":1,"dataHex":"00","dataHex":"00"}',
+            b'{"kind":"stderr","version":1,"dataHex":"00","dataHex":"00"}',
+            b'{"kind":"exit","version":1,"code":0,"code":0,"signal":null}',
+            b'{"kind":"exit","version":1,"code":0,"signal":null,"signal":null}',
+        ]
+        for index, payload in enumerate(fixtures):
+            with self.subTest(index=index):
+                self.reject((b"" if index < 2 else frame(event("ready"))) + frame(payload))
+
+    def test_zero_oversized_and_aggregate_wire_limits(self):
+        self.reject(struct.pack("!I", 0), "tool_output_limit")
+        self.reject(struct.pack("!I", 512 * 1024), "tool_output_limit")
+        self.reject(struct.pack("!I", 0xffffffff), "tool_output_limit")
+        empty = frame(event("stdout", dataHex=""))
+        wire = frame(event("ready")) + empty * (512 * 1024 // len(empty) + 1)
+        self.reject(wire, "tool_output_limit", deadline=2)
+
+    def test_aggregate_stream_output_limits_are_independent(self):
+        for kind in ("stdout", "stderr"):
+            with self.subTest(kind=kind):
+                self.reject(frame(event("ready")) + frame(event(kind, dataHex="00" * 65536))
+                            + frame(event(kind, dataHex="00")), "tool_output_limit")
+
+    def test_eof_before_complete_header_payload_ready_or_exit_is_error(self):
+        for wire in (b"", b"\x00", b"\x00\x00\x00", struct.pack("!I", 8) + b"{",
+                     frame(event("ready")), frame(event("ready")) + frame(event("stdout", dataHex="00"))):
+            with self.subTest(wire=wire):
+                self.reject(wire)
+
+    def test_deadline_covers_idle_partial_header_and_post_exit_eof(self):
+        for wire in (b"", b"\x00\x00", frame(event("ready")),
+                     frame(event("ready")) + frame(event("exit", code=0, signal=None))):
+            with self.subTest(wire=wire):
+                started = time.monotonic()
+                self.reject(wire, "tool_timeout", pause=True, deadline=0.05)
+                self.assertLess(time.monotonic() - started, 1)
+
+    def test_signal_is_not_an_assertion_exit(self):
+        self.reject(frame(event("ready")) + frame(event("exit", code=None, signal=9)), "tool_terminated")
+
+    def test_request_preflight_denies_invalid_token_program_args_and_input(self):
+        with QaBrokerFixture(self.root) as broker:
+            module = load_runner(broker.path)
+            for value in ("", "a" * 63, "a" * 65, "A" * 64, "g" * 64):
+                with self.subTest(token_length=len(value)), mock.patch.dict(os.environ, {"SENTINEL_QA_BROKER_TOKEN": value}):
+                    with self.assertRaises(module.QaError) as caught:
+                        self.call(module)
+                    self.assertEqual(caught.exception.code, "io_or_tool_error")
+            for args, input_bytes in [(["sh"], b""), (["python3"] + ["x"] * 66, b""),
+                                      (["python3", "\x00"], b""), (["python3", "x" * 4097], b""),
+                                      (["python3"], b"x" * 65537),
+                                      (["python3"] + ["x" * 4096] * 65, b"\xff" * 65536)]:
+                with self.subTest(arg_count=len(args), input_length=len(input_bytes)):
+                    with self.assertRaises(module.QaError) as caught:
+                        self.call(module, args=args, input_bytes=input_bytes)
+                    self.assertEqual(caught.exception.code, "io_or_tool_error")
+            self.assertEqual(broker.requests, [])
+
+    def test_scratch_permissions_owner_and_symlinks_fail_before_connect(self):
+        with QaBrokerFixture(self.root) as broker:
+            module = load_runner(broker.path)
+            scratch = self.root / "scratch"
+            scratch.mkdir(mode=0o755)
+            for mode in (0o755, 0o777, 0o500):
+                scratch.chmod(mode)
+                with self.assertRaises(module.QaError) as caught:
+                    self.call(module)
+                self.assertEqual(caught.exception.code, "io_or_tool_error")
+            scratch.chmod(0o700)
+            with mock.patch.object(module.os, "geteuid", return_value=os.geteuid() + 1):
+                with self.assertRaises(module.QaError) as caught:
+                    self.call(module)
+                self.assertEqual(caught.exception.code, "io_or_tool_error")
+            scratch.rmdir()
+            scratch.symlink_to(self.workspace, target_is_directory=True)
+            with self.assertRaises(module.QaError) as caught:
+                self.call(module)
+            self.assertEqual(caught.exception.code, "io_or_tool_error")
+            self.assertEqual(broker.requests, [])
+
+    def test_production_runner_has_fixed_socket_and_no_subprocess_fallback(self):
+        tree = ast.parse(RUNNER.read_text())
+        imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        imported.update(node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom))
+        self.assertNotIn("subprocess", imported)
+        self.assertNotIn("selectors", imported)
+        assignments = [node for node in tree.body if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == "BROKER_SOCKET" for target in node.targets)]
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(ast.literal_eval(assignments[0].value), "/run/sentinel-qa-broker.sock")
 
 
 class ProfileContractTests(unittest.TestCase):
@@ -344,11 +816,13 @@ class ProfileContractTests(unittest.TestCase):
         profile = self.read("config/workbench-profiles/coding-qa-v1.toml")
         web = self.read("config/workbench-profiles/web-qa-v1.toml")
         self.assertEqual(profile["capabilities"], ["file.inspect", "test.run_profile"])
-        for field in ("runtime_key", "environment", "network", "resource_ceilings", "output_artifact_kinds"):
+        for field in ("runtime_key", "environment", "network", "output_artifact_kinds"):
             self.assertEqual(profile[field], web[field])
+        ceilings = dict(web["resource_ceilings"], process_count=32)
+        self.assertEqual(profile["resource_ceilings"], ceilings)
         self.assertEqual(profile["command_rules"], [
             {"program": "sentinel-coding-qa", "required_arg_prefix": [], "max_args": 65},
-            {"program": "sentinel-work-item-gate", "required_arg_prefix": [], "max_args": 64},
+            {"program": "sentinel-coding-qa", "required_arg_prefix": ["--inventory-only"], "max_args": 65},
         ])
         suites = {item["id"]: item for item in profile["test_suites"]}
         self.assertEqual(set(suites), {"python-qa-v1", "node-qa-v1", "web-work-item-qa-v1"})

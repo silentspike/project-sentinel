@@ -20,7 +20,8 @@ use sentinel_workflow::{
     WorkflowError, WorkflowErrorCode,
 };
 
-use super::delivery_runtime::{m0_qa_evidence_graph, m0_qa_fixture_cases, web_qa_runner_version};
+use super::delivery_runtime::{qa_evidence_graph, qa_fixture_cases, qa_runner_version};
+use super::project_profiles::ProjectFamily;
 use super::{
     delivery_error, delivery_principal, json, json_error, BoundPrincipal, WorkflowApi,
     WorkflowHttpResponse,
@@ -324,6 +325,7 @@ struct DeliveryIntentResponse {
 }
 
 struct ProjectMaterial {
+    family: ProjectFamily,
     project: sentinel_workflow::ProjectV1,
     agreement: sentinel_workflow::AgreementV1,
     request: sentinel_workflow::CustomerRequestV1,
@@ -929,6 +931,20 @@ fn load_material(
             "workflow project is not a completed delivery candidate".to_string(),
         ));
     }
+    let family = api
+        .authority
+        .as_ref()
+        .ok_or_else(|| DeliveryError::AdapterUnavailable {
+            dependency: "project_profile",
+            reason: "company profile authority is unavailable".to_owned(),
+        })?
+        .project_profiles
+        .family(&project.governance.project_profile)
+        .map_err(|_| {
+            DeliveryError::AuthorityDenied(
+                "project family authority differs from its release".to_owned(),
+            )
+        })?;
     let agreement = api
         .store
         .company_agreement(tenant_id, &project.agreement_id)
@@ -1068,6 +1084,7 @@ fn load_material(
     }
     .seal()?;
     Ok(ProjectMaterial {
+        family,
         project,
         agreement,
         request,
@@ -1107,14 +1124,14 @@ fn data_control(project: &sentinel_workflow::ProjectV1) -> Result<DataControlV1,
 }
 
 fn build_plan(material: &ProjectMaterial) -> Result<QaEvaluationPlanV1, DeliveryError> {
-    let fixtures = m0_qa_fixture_cases()?;
+    let fixtures = qa_fixture_cases(material.family)?;
     QaEvaluationPlanV1 {
         schema_version: DELIVERY_SCHEMA_V1,
         plan_id: format!(
             "qa-plan-{}-{}-{}",
             material.project.project_id.0,
             material.candidate.generation,
-            web_qa_runner_version()
+            qa_runner_version(material.family)
         ),
         generation: material.candidate.generation,
         request: VersionedRefV1 {
@@ -1161,7 +1178,7 @@ fn build_plan(material: &ProjectMaterial) -> Result<QaEvaluationPlanV1, Delivery
             DELIVERY_SCHEMA_V1,
             &material.project.project_id,
         )?,
-        runner_binary_digest: ContentDigest::parse(web_qa_runner_version())?,
+        runner_binary_digest: ContentDigest::parse(qa_runner_version(material.family))?,
         toolchain_digest: material.candidate.toolchain_digest.clone(),
         sandbox_profile_digest: material.candidate.runtime_profile_digest.clone(),
         capability_digest: ContentDigest::of_domain(
@@ -1172,7 +1189,7 @@ fn build_plan(material: &ProjectMaterial) -> Result<QaEvaluationPlanV1, Delivery
         environment_digest: ContentDigest::of_domain(
             "m0-qa-environment",
             DELIVERY_SCHEMA_V1,
-            &"web-qa-v1",
+            &material.family.technical_qa_profile(),
         )?,
         credential_policy_digest: ContentDigest::of_domain(
             "m0-qa-credential-policy",
@@ -1193,7 +1210,7 @@ fn run_id(material: &ProjectMaterial) -> String {
         "qa-run-{}-{}-{}",
         material.project.project_id.0,
         material.candidate.generation,
-        web_qa_runner_version()
+        qa_runner_version(material.family)
     )
 }
 
@@ -1424,7 +1441,7 @@ fn execute_qa(
             &(&plan.plan_digest, caller),
         )?,
     };
-    let graph = m0_qa_evidence_graph(&run_ref, &plan.plan_digest, &receipt)?;
+    let graph = qa_evidence_graph(material.family, &run_ref, &plan.plan_digest, &receipt)?;
     if receipt.result_inventory_digest != qa_evidence_inventory_digest(&graph)? {
         return Err(DeliveryError::StaleEvidence(
             "QA receipt and evidence graph inventory differ".to_string(),

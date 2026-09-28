@@ -537,8 +537,9 @@ pub(super) fn source_review_spec(
     qa: &sentinel_workflow::ParticipantBindingV1,
     authority: &CompanyAuthority,
 ) -> Result<sentinel_workflow::CompanyWorkItemSpecV1, &'static str> {
-    let family =
-        super::model_execution::accepted_project_family(&project.governance.project_profile)?;
+    let family = super::ProjectFamily::parse(&project.governance.project_profile.profile_id)
+        .map_err(|_| "source-review project family unavailable")?
+        .id();
     if authority
         .project_profile_binding(family)
         .map_err(|_| "source-review project family unavailable")?
@@ -606,7 +607,7 @@ pub(super) fn source_review_spec(
             contract_digest: output_digest,
         }],
         quality_gate: sentinel_workflow::QualityGateBindingV1 {
-            gate_id: super::model_execution::family_work_item_gate(family)?.to_owned(),
+            gate_id: sentinel_workflow::WORK_ITEM_GATE_PROFILE.to_owned(),
             generation: qa_profile.generation,
             digest: qa_profile.digest,
         },

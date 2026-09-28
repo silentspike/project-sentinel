@@ -5,7 +5,7 @@ use std::io::Read;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -40,50 +40,36 @@ pub struct SpawnedSandbox {
 }
 
 impl SpawnedSandbox {
-    /// Terminates both the sandboxed process and its bwrap supervisor.
+    /// Reaps the owned supervisor; --die-with-parent terminates its namespace.
     pub fn terminate(&mut self) {
-        terminate_sandbox_process(&mut self.child, self.child_pid);
+        terminate_sandbox_process(&mut self.child);
     }
 }
 
-pub(crate) fn terminate_sandbox_process(child: &mut Child, child_pid: Option<u32>) {
-    if let Some(pid) = child_pid {
-        signal_pid(pid, "TERM");
-    }
-
+pub(crate) fn terminate_sandbox_process(child: &mut Child) {
     match child.try_wait() {
         Ok(Some(_status)) => {}
         Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        Err(_) => {}
-    }
-
-    if let Some(pid) = child_pid {
-        for _ in 0..20 {
-            if !Path::new(&format!("/proc/{pid}")).exists() {
-                return;
+            // The unreaped supervisor owns this group ID. Never signal the
+            // cached init PID: it may already identify an unrelated process.
+            let group = match i32::try_from(child.id()) {
+                Ok(pid) => nix::unistd::Pid::from_raw(pid),
+                Err(_) => {
+                    warn!("sandbox supervisor PID exceeds pid_t");
+                    return;
+                }
+            };
+            match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => {
+                    if let Err(error) = child.wait() {
+                        warn!(%error, "sandbox supervisor could not be reaped");
+                    }
+                }
+                Err(error) => warn!(%error, "owned sandbox group could not be terminated"),
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
-        signal_pid(pid, "KILL");
-        for _ in 0..20 {
-            if !Path::new(&format!("/proc/{pid}")).exists() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        warn!(pid, "sandboxed child remained visible after SIGKILL");
+        Err(error) => warn!(%error, "sandbox supervisor state could not be queried"),
     }
-}
-
-fn signal_pid(pid: u32, signal: &str) {
-    let _ = Command::new("kill")
-        .args([format!("-{signal}"), pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 /// Bubblewrap sandbox configuration fuer einen einzelnen Agenten.
@@ -222,6 +208,20 @@ impl BwrapConfig {
             commands.to_string_lossy().into_owned(),
             "/run/sentinel-command-cgroups".to_owned(),
         ));
+        if let Some(agent) = commands
+            .parent()
+            .filter(|_| commands.file_name() == Some(std::ffi::OsStr::new("commands")))
+        {
+            // Join before spawning the namespace broker so every trusted
+            // descendant starts inside the cumulative agent runtime leaf.
+            self.writable_binds.push((
+                agent
+                    .join("runtime/cgroup.procs")
+                    .to_string_lossy()
+                    .into_owned(),
+                "/run/sentinel-runtime-cgroup.procs".to_owned(),
+            ));
+        }
         self.command_boundary = Some(("/run/sentinel-command-cgroups".to_owned(), budget_bytes));
         self
     }
@@ -648,6 +648,49 @@ mod tests {
     }
 
     #[test]
+    fn termination_never_signals_a_cached_foreign_init_pid() {
+        let mut foreign = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+        let child = Command::new("/usr/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut spawned = SpawnedSandbox {
+            child,
+            child_pid: Some(foreign.id()),
+        };
+        spawned.terminate();
+        assert!(spawned.child.try_wait().unwrap().is_some());
+        spawned.terminate();
+        let foreign_status = foreign.try_wait().unwrap();
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        assert!(
+            foreign_status.is_none(),
+            "saved numeric PID must not be signaled"
+        );
+    }
+
+    #[test]
+    fn reaped_supervisor_never_authorizes_a_later_group_signal() {
+        let mut foreign = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+        let mut child = Command::new("/usr/bin/true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+        let mut spawned = SpawnedSandbox {
+            child,
+            child_pid: Some(foreign.id()),
+        };
+        spawned.terminate();
+        let foreign_status = foreign.try_wait().unwrap();
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        assert!(foreign_status.is_none());
+    }
+
+    #[test]
     fn togaf_readonly_binds() {
         // TOGAF: --ro-bind /work/company /company + System-Binaries
         let config = BwrapConfig::for_agent("test");
@@ -772,6 +815,10 @@ mod tests {
         assert!(config.writable_binds.contains(&(
             "/sys/fs/cgroup/sentinel/test/commands".into(),
             "/run/sentinel-command-cgroups".into(),
+        )));
+        assert!(config.writable_binds.contains(&(
+            "/sys/fs/cgroup/sentinel/test/runtime/cgroup.procs".into(),
+            "/run/sentinel-runtime-cgroup.procs".into(),
         )));
         assert!(!config
             .writable_binds

@@ -27,6 +27,7 @@ use sentinel_common::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod command_broker;
 pub mod command_membership;
 pub mod command_sandbox;
 
@@ -1224,10 +1225,23 @@ impl WorkbenchExecutor {
             match exited {
                 Ok(true) => {
                     let status = if let Some(group) = &membership {
+                        quiesce_broker_group(group)?;
                         group.kill_and_wait().map_err(|_| command_cleanup_error())?;
                         child.wait().map_err(|_| command_cleanup_error())?
                     } else {
                         quiesce_process_group_after_leader_exit(pid, &mut child)?
+                    };
+                    let status = if let Some(channel) = setup.as_mut() {
+                        if !status.success()
+                            || !channel.poll().map_err(|_| command_isolation_error())?
+                        {
+                            break (None, Some(command_isolation_error()));
+                        }
+                        channel
+                            .terminal_status()
+                            .ok_or_else(command_isolation_error)?
+                    } else {
+                        status
                     };
                     break (Some(status), None);
                 }
@@ -1313,6 +1327,31 @@ impl WorkbenchExecutor {
         }
         if let Some(suite_id) = suite_id {
             output.insert("suite_id".to_string(), suite_id.to_string());
+        }
+        if forced_error.is_none()
+            && self.command_runner.is_some()
+            && sentinel_common::WorkbenchNativeQaStatus::requested(request)
+        {
+            let native = sentinel_common::WorkbenchNativeQaStatus::from_runner(
+                &stdout.retained,
+                request,
+                status
+                    .as_ref()
+                    .and_then(std::process::ExitStatus::code)
+                    .unwrap_or(-1),
+            );
+            match native {
+                Ok(native) if stdout.total == stdout.retained.len() as u64 && stderr.total == 0 => {
+                    native.insert_output(&mut output);
+                }
+                _ => {
+                    forced_error = Some(ExecutionError::runtime(
+                        "native_qa_summary_invalid",
+                        "the native evaluator did not return a valid bound summary",
+                        false,
+                    ));
+                }
+            }
         }
         let completed = ExecutionSuccess {
             output,
@@ -1845,6 +1884,7 @@ fn seal_terminal_result(
     let WorkbenchMessage::Result {
         invocation_id,
         input_digest,
+        outcome,
         error,
         ..
     } = message
@@ -1870,10 +1910,20 @@ fn seal_terminal_result(
     let WorkbenchMessage::Result { output, .. } = &mut durable_result else {
         unreachable!("terminal receipt validation already rejected non-results");
     };
+    let native = sentinel_common::WorkbenchNativeQaStatus::from_output(
+        output,
+        invocation_id,
+        input_digest,
+        *outcome,
+    )
+    .map_err(|_| recovery_error("native_qa_status_invalid", "native QA status is invalid"))?;
     *output = sentinel_common::WorkbenchCommandStatus::from_output(output)
         .map_err(|_| recovery_error("command_status_invalid", "command status is invalid"))?
         .map(|status| status.output())
         .unwrap_or_default();
+    if let Some(native) = native {
+        native.insert_output(output);
+    }
     let result_bytes = serde_json::to_vec(&durable_result).map_err(|_| {
         recovery_error(
             "caller_result_encode_failed",
@@ -2759,8 +2809,16 @@ fn terminate_command(
         }
         thread::sleep(COMMAND_POLL_INTERVAL);
     }
+    quiesce_broker_group(group)?;
     // A second kill catches any fork between the first kill and launcher exit.
     group.kill_and_wait().map_err(|_| command_cleanup_error())
+}
+
+fn quiesce_broker_group(
+    group: &command_membership::CommandMembership,
+) -> Result<(), ExecutionError> {
+    let socket = command_broker::configured_socket().map_err(|_| command_cleanup_error())?;
+    command_broker::quiesce_command(&socket, group.path()).map_err(|_| command_cleanup_error())
 }
 
 fn quiesce_process_group_after_leader_exit(
@@ -3904,6 +3962,124 @@ mod tests {
             redact_output(b"visible\nAuthorization: Bearer abc\ntoken=abc"),
             "visible\n[REDACTED]\n[REDACTED]"
         );
+    }
+
+    #[test]
+    fn native_qa_adoption_and_safe_receipt_replay_are_bound() {
+        use sentinel_common::{
+            NativeQaOutcome, NativeQaProgress, NativeQaStage, WorkbenchNativeQaStatus,
+        };
+        let mut request = request(
+            WorkbenchTool::RunTests {
+                suite_id: "python-qa-v1".into(),
+                program: "sentinel-coding-qa".into(),
+                args: vec!["python-project-v1".into(), "app.py".into()],
+            },
+            "test.run_profile",
+        );
+        request.tool_profile = "coding-qa-v1".into();
+        request.inputs.push(sentinel_common::WorkbenchInputRef {
+            artifact_id: format!("sha256:{}", "d".repeat(64)),
+            sha256: "d".repeat(64),
+            mount_path: "app.py".into(),
+            media_type: "text/plain".into(),
+        });
+        request.input_digest = request.canonical_digest().unwrap();
+        for (outcome, exit_code) in [
+            (NativeQaOutcome::Pass, 0),
+            (NativeQaOutcome::Fail, 1),
+            (NativeQaOutcome::Error, 2),
+        ] {
+            let progress = NativeQaProgress {
+                schema_version: 1,
+                family: "python-project-v1".into(),
+                suite_id: "python-qa-v1".into(),
+                outcome,
+                inventory: NativeQaStage {
+                    outcome: NativeQaOutcome::Pass,
+                    planned: 1,
+                    completed: 1,
+                },
+                syntax: NativeQaStage {
+                    outcome: NativeQaOutcome::Pass,
+                    planned: 1,
+                    completed: 1,
+                },
+                tests: NativeQaStage {
+                    outcome,
+                    planned: 1,
+                    completed: if outcome == NativeQaOutcome::Error {
+                        0
+                    } else {
+                        1
+                    },
+                },
+            };
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "schema_version":1, "family":"python-project-v1", "suite_id":"python-qa-v1",
+                "outcome":outcome, "native_status":progress,
+                "code": if exit_code == 0 { "checks_passed" } else if exit_code == 1 { "behavioral_assertion_failed" } else { "tool_timeout" },
+                "files":1, "bytes":10, "inventory_sha256":"d".repeat(64), "syntax_files":1,
+                "input_inventory_sha256":WorkbenchNativeQaStatus::expected_input_inventory_digest(&request).unwrap(),
+                "tests":if exit_code == 0 { Some(1) } else { None::<u16> }, "skipped":if exit_code == 0 { Some(0) } else { None::<u16> },
+            })).unwrap();
+            let status = WorkbenchNativeQaStatus::from_runner(&bytes, &request, exit_code).unwrap();
+            assert!(WorkbenchNativeQaStatus::from_runner(
+                &bytes[..bytes.len() - 1],
+                &request,
+                exit_code
+            )
+            .is_err());
+            assert!(WorkbenchNativeQaStatus::from_runner(b"{}", &request, exit_code).is_err());
+            assert!(
+                WorkbenchNativeQaStatus::from_runner(&bytes, &request, (exit_code + 1) % 3)
+                    .is_err()
+            );
+            let mut foreign = request.clone();
+            foreign.tool_profile = "web-qa-v1".into();
+            assert!(WorkbenchNativeQaStatus::from_runner(&bytes, &foreign, exit_code).is_err());
+            let mut changed = request.clone();
+            changed.inputs[0].sha256 = "e".repeat(64);
+            changed.inputs[0].artifact_id = format!("sha256:{}", "e".repeat(64));
+            changed.input_digest = changed.canonical_digest().unwrap();
+            assert!(WorkbenchNativeQaStatus::from_runner(&bytes, &changed, exit_code).is_err());
+            let mut output = sentinel_common::WorkbenchCommandStatus {
+                exit_code,
+                stdout_bytes: bytes.len() as u64,
+                stderr_bytes: 0,
+            }
+            .output();
+            status.insert_output(&mut output);
+            output.insert("stdout".into(), "PRIVATE-CANDIDATE".into());
+            let message = WorkbenchMessage::Result {
+                schema_version: WORKBENCH_SCHEMA_VERSION,
+                invocation_id: request.invocation_id.clone(),
+                input_digest: request.input_digest.clone(),
+                outcome: if exit_code == 0 {
+                    WorkbenchOutcome::Succeeded
+                } else {
+                    WorkbenchOutcome::Failed
+                },
+                resources: WorkbenchResourceUsage::default(),
+                artifacts: vec![],
+                output,
+                error: None,
+            };
+            let sealed = seal_terminal_result(&message).unwrap();
+            let encoded = serde_json::to_vec(&sealed).unwrap();
+            assert!(!String::from_utf8_lossy(&encoded).contains("PRIVATE-CANDIDATE"));
+            let replay =
+                validate_sealed_completion_receipt(serde_json::from_slice(&encoded).unwrap())
+                    .unwrap();
+            assert!(
+                matches!(replay, WorkbenchMessage::Result { output, .. } if output.contains_key(WorkbenchNativeQaStatus::OUTPUT_KEY) && !output.contains_key("stdout"))
+            );
+            let mut tampered: SealedCompletionReceipt = serde_json::from_slice(&encoded).unwrap();
+            if let WorkbenchMessage::Result { output, .. } = &mut tampered.result {
+                output.insert(WorkbenchNativeQaStatus::OUTPUT_KEY.into(), "{}".into());
+            }
+            assert!(validate_sealed_completion_receipt(tampered).is_err());
+        }
     }
 
     #[test]

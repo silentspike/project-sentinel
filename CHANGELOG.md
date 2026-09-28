@@ -1,5 +1,25 @@
 # Changelog
 
+- Inspect dependency freshness and proposed updates daily, including Actions
+  and transitive lockfile maintenance; retain existing CI and review gates.
+
+- Bind accepted Python and Node project families through Sales, planning,
+  assignment, model tool turns and delivery to exact released profiles. Keep
+  website compatibility and independent reviewers; native QA stages declared
+  read-only inputs and requires parent-observed behavioral assertions, not
+  syntax-only success or candidate-reported passing-test counters
+  (#856).
+
+- Construct native command namespaces through a bounded pre-Landlock launcher;
+  retain mandatory child Landlock and disabled user namespaces. Bind read-only
+  QA children to the evaluator's private token and cumulative cgroup limits,
+  and persist observed QA-stage results without exposing candidate output
+  (#856).
+
+- Bind observed QA inventories to reserved inputs through terminal adoption,
+  replay and delivery evidence; never signal a cached sandbox-init PID during
+  helper teardown (#856).
+
 - Keep the legacy trash diagnostic separate from retained workspace versions;
   reject a probe over an existing employee file or private whiteout rather than
   replacing it or exposing a previously renamed base file (#856).

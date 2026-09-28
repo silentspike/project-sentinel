@@ -145,8 +145,10 @@ impl WorkbenchProfile {
                     && suite.program == *program
                     && args.len() <= usize::from(suite.max_args)
                     && args.starts_with(&suite.required_arg_prefix)
-                    && (!matches!(self.id.as_str(), "python-coding-v1" | "node-coding-v1")
-                        || rule.allows(program, args))
+                    && (!matches!(
+                        self.id.as_str(),
+                        "python-coding-v1" | "node-coding-v1" | "coding-qa-v1"
+                    ) || rule.allows(program, args))
             });
             if !permitted {
                 bail!("workbench test suite is not declared by its immutable profile");
@@ -622,6 +624,12 @@ pub struct WorkbenchInvocationRecord {
     /// Safe numeric command outcome, retained across process and daemon restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_status: Option<sentinel_common::WorkbenchCommandStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_qa_status: Option<sentinel_common::WorkbenchNativeQaStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_qa_suite: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_qa_inputs: Option<sentinel_common::NativeQaInputBinding>,
     /// Content stays in the private table, never in this public-safe record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation_digest: Option<String>,
@@ -682,6 +690,18 @@ impl WorkbenchInvocationRecord {
             resources: None,
             result_digest: None,
             command_status: None,
+            native_qa_status: None,
+            native_qa_suite: if sentinel_common::WorkbenchNativeQaStatus::requested(request) {
+                match &request.tool {
+                    sentinel_common::WorkbenchTool::RunTests { suite_id, .. } => {
+                        Some(suite_id.clone())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            },
+            native_qa_inputs: sentinel_common::NativeQaInputBinding::from_request(request).ok(),
             observation_digest: None,
             artifacts: Vec::new(),
             error: None,
@@ -935,6 +955,13 @@ impl WorkbenchInvocationStore {
         let next = state_for_outcome(*outcome)?;
         let command_status = sentinel_common::WorkbenchCommandStatus::from_output(output)
             .map_err(anyhow::Error::msg)?;
+        let native_qa_status = sentinel_common::WorkbenchNativeQaStatus::from_output(
+            output,
+            invocation_id,
+            input_digest,
+            *outcome,
+        )
+        .map_err(anyhow::Error::msg)?;
         let safe_error = error.as_ref().map(sanitize_runtime_error).transpose()?;
         let retained = self
             .load(invocation_id)?
@@ -951,8 +978,26 @@ impl WorkbenchInvocationStore {
             observation.as_ref(),
             revalidate,
             |record| {
+                if native_qa_status.is_some()
+                    && (record.tool_profile != "coding-qa-v1"
+                        || record.tool_class != "test.run_profile"
+                        || record.native_qa_suite.as_deref()
+                            != native_qa_status
+                                .as_ref()
+                                .map(|status| status.progress.suite_id.as_str()))
+                {
+                    bail!("only native QA tests can adopt native status");
+                }
+                if let Some(native) = &native_qa_status {
+                    native
+                        .validate_inputs(record.native_qa_inputs.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("native QA reserved input binding missing")
+                        })?)
+                        .map_err(anyhow::Error::msg)?;
+                }
                 if record.state == next && record.state.is_terminal() {
                     if record.resources.as_ref() != Some(resources)
+                        || record.native_qa_status != native_qa_status
                         || (record.command_status.is_some()
                             && record.command_status != command_status)
                         || record.artifacts != *artifacts
@@ -992,6 +1037,7 @@ impl WorkbenchInvocationStore {
                 record.resources = Some(resources.clone());
                 record.result_digest = terminal_result_digest(*outcome, output, artifacts);
                 record.command_status = command_status.clone();
+                record.native_qa_status = native_qa_status.clone();
                 record.artifacts = artifacts.clone();
                 record.error = safe_error.clone();
                 Ok(())
@@ -2594,15 +2640,17 @@ enum WorkbenchProfileId {
     WebReview,
     PythonCoding,
     NodeCoding,
+    CodingQa,
 }
 
 impl WorkbenchProfileId {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::WebAuthoring,
         Self::WebQa,
         Self::WebReview,
         Self::PythonCoding,
         Self::NodeCoding,
+        Self::CodingQa,
     ];
 
     fn as_str(self) -> &'static str {
@@ -2612,6 +2660,7 @@ impl WorkbenchProfileId {
             Self::WebReview => "web-review-v1",
             Self::PythonCoding => "python-coding-v1",
             Self::NodeCoding => "node-coding-v1",
+            Self::CodingQa => "coding-qa-v1",
         }
     }
 
@@ -2637,6 +2686,9 @@ impl WorkbenchProfileId {
             Self::NodeCoding => {
                 include_bytes!("../../../config/workbench-profiles/node-coding-v1.toml")
             }
+            Self::CodingQa => {
+                include_bytes!("../../../config/workbench-profiles/coding-qa-v1.toml")
+            }
         }
     }
 
@@ -2645,14 +2697,14 @@ impl WorkbenchProfileId {
     }
 }
 
-/// Only known, byte-exact authorities can occupy the five bounded slots.
-#[derive(Default)]
-struct WorkbenchProfileRegistry {
+/// Only known, byte-exact authorities can occupy the bounded slots.
+#[derive(Clone, Default)]
+pub(crate) struct WorkbenchProfileRegistry {
     profiles: BTreeMap<WorkbenchProfileId, (WorkbenchProfile, String)>,
 }
 
 impl WorkbenchProfileRegistry {
-    fn load(config_dir: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn load(config_dir: &Path) -> anyhow::Result<Self> {
         let base = canonical_secure_authority_base(&config_dir.join("workbench-profiles"))?;
         let mut registry = Self::default();
         for id in WorkbenchProfileId::ALL {
@@ -2686,7 +2738,7 @@ impl WorkbenchProfileRegistry {
         Ok(())
     }
 
-    fn resolve(&self, id: &str) -> anyhow::Result<(&WorkbenchProfile, &str)> {
+    pub(crate) fn resolve(&self, id: &str) -> anyhow::Result<(&WorkbenchProfile, &str)> {
         self.profiles
             .get(&WorkbenchProfileId::from_str(id)?)
             .map(|(profile, digest)| (profile, digest.as_str()))
@@ -3211,6 +3263,43 @@ fn decode_record(bytes: &[u8]) -> anyhow::Result<WorkbenchInvocationRecord> {
             bail!("invalid private observation reference");
         }
     }
+    if let Some(native) = &record.native_qa_status {
+        let outcome = match record.state {
+            WorkbenchInvocationState::Succeeded => WorkbenchOutcome::Succeeded,
+            WorkbenchInvocationState::Failed => WorkbenchOutcome::Failed,
+            _ => bail!("native QA status requires a terminal evaluator outcome"),
+        };
+        if record.store_schema_version < 3
+            || record.tool_profile != "coding-qa-v1"
+            || record.tool_class != "test.run_profile"
+            || record.native_qa_suite.as_deref() != Some(native.progress.suite_id.as_str())
+        {
+            bail!("invalid durable native QA binding");
+        }
+        let command = record
+            .command_status
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native QA command status missing"))?;
+        native
+            .validate_command(command)
+            .map_err(anyhow::Error::msg)?;
+        native
+            .validate_inputs(
+                record
+                    .native_qa_inputs
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("durable native QA input binding missing"))?,
+            )
+            .map_err(anyhow::Error::msg)?;
+        native
+            .validate(
+                &record.invocation_id,
+                &record.request_digest,
+                outcome,
+                command.exit_code,
+            )
+            .map_err(anyhow::Error::msg)?;
+    }
     Ok(record)
 }
 
@@ -3236,6 +3325,14 @@ fn durable_terminal_projection(record: &WorkbenchInvocationRecord) -> WorkbenchM
             unreachable!("durable replay requires a terminal invocation")
         }
     };
+    let mut output = record
+        .command_status
+        .as_ref()
+        .map(|status| status.output())
+        .unwrap_or_default();
+    if let Some(native) = &record.native_qa_status {
+        native.insert_output(&mut output);
+    }
     WorkbenchMessage::Result {
         schema_version: WORKBENCH_SCHEMA_VERSION,
         invocation_id: record.invocation_id.clone(),
@@ -3243,11 +3340,7 @@ fn durable_terminal_projection(record: &WorkbenchInvocationRecord) -> WorkbenchM
         outcome,
         resources: record.resources.clone().unwrap_or_default(),
         artifacts: record.artifacts.clone(),
-        output: record
-            .command_status
-            .as_ref()
-            .map(|status| status.output())
-            .unwrap_or_default(),
+        output,
         error: record.error.clone(),
     }
 }
@@ -4408,7 +4501,7 @@ mod tests {
                 "required_arg_prefix = [\"--check\"]",
                 "required_arg_prefix = [\"--check=/proc/self/environ\"]",
             ),
-            source.replace("max_args = 2", "max_args = 65"),
+            source.replace("max_args = 2", "max_args = 66"),
         ] {
             let authority =
                 secure_test_workbench_profile_authority_with_bytes(malformed.as_bytes());
@@ -4640,6 +4733,168 @@ mod tests {
         assert!(decode_record(&encode_record(&record).unwrap()).is_ok());
         record.command_status.as_mut().unwrap().exit_code = 256;
         assert!(decode_record(&encode_record(&record).unwrap()).is_err());
+    }
+
+    #[test]
+    fn native_qa_record_survives_restart_and_rejects_tampered_replay() {
+        use sentinel_common::{
+            NativeQaOutcome, NativeQaProgress, NativeQaStage, WorkbenchNativeQaStatus,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2890");
+        request.tool_profile = "coding-qa-v1".into();
+        request.inputs = ["app.py", "sentinel-qa.json"]
+            .into_iter()
+            .map(|path| sentinel_common::WorkbenchInputRef {
+                artifact_id: format!("sha256:{}", "d".repeat(64)),
+                sha256: "d".repeat(64),
+                mount_path: path.into(),
+                media_type: "text/plain".into(),
+            })
+            .collect();
+        request.tool = WorkbenchTool::RunTests {
+            suite_id: "python-qa-v1".into(),
+            program: "sentinel-coding-qa".into(),
+            args: vec!["python-project-v1".into()],
+        };
+        request.capabilities = BTreeSet::from(["test.run_profile".into()]);
+        request.command_policy = vec![sentinel_common::CommandRule {
+            program: "sentinel-coding-qa".into(),
+            required_arg_prefix: vec!["python-project-v1".into()],
+            max_args: 65,
+        }];
+        request.input_digest = request.canonical_digest().unwrap();
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+        store
+            .mark_executing(
+                &request.invocation_id,
+                &request.input_digest,
+                1_900_000_000_001,
+            )
+            .unwrap();
+        let native = WorkbenchNativeQaStatus {
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            inventory_digest: Some("a".repeat(64)),
+            input_inventory_digest: Some(
+                WorkbenchNativeQaStatus::expected_input_inventory_digest(&request).unwrap(),
+            ),
+            code: "tool_timeout".into(),
+            progress: NativeQaProgress {
+                schema_version: 1,
+                family: "python-project-v1".into(),
+                suite_id: "python-qa-v1".into(),
+                outcome: NativeQaOutcome::Error,
+                inventory: NativeQaStage {
+                    outcome: NativeQaOutcome::Pass,
+                    planned: 2,
+                    completed: 2,
+                },
+                syntax: NativeQaStage {
+                    outcome: NativeQaOutcome::Pass,
+                    planned: 1,
+                    completed: 1,
+                },
+                tests: NativeQaStage {
+                    outcome: NativeQaOutcome::Error,
+                    planned: 2,
+                    completed: 1,
+                },
+            },
+        };
+        let mut output = sentinel_common::WorkbenchCommandStatus {
+            exit_code: 2,
+            stdout_bytes: 512,
+            stderr_bytes: 0,
+        }
+        .output();
+        native.insert_output(&mut output);
+        output.insert("stdout".into(), "PRIVATE-CANDIDATE".into());
+        let mut message = WorkbenchMessage::Result {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            outcome: WorkbenchOutcome::Failed,
+            resources: WorkbenchResourceUsage::default(),
+            artifacts: vec![],
+            output,
+            error: Some(WorkbenchErrorInfo {
+                class: WorkbenchErrorClass::Tool,
+                code: "command_failed".into(),
+                safe_message: "command failed".into(),
+                retryable: false,
+            }),
+        };
+        if let WorkbenchMessage::Result { output, .. } = &message {
+            let mut wrong_message = message.clone();
+            let mut wrong_status = native.clone();
+            wrong_status.input_inventory_digest = Some("e".repeat(64));
+            if let WorkbenchMessage::Result {
+                output: wrong_output,
+                ..
+            } = &mut wrong_message
+            {
+                *wrong_output = output.clone();
+                wrong_status.insert_output(wrong_output);
+            }
+            assert!(store
+                .accept_result(&wrong_message, 1_900_000_000_002)
+                .is_err());
+            assert_eq!(
+                store.load(&request.invocation_id).unwrap().unwrap().state,
+                WorkbenchInvocationState::Executing
+            );
+        }
+        let record = store.accept_result(&message, 1_900_000_000_002).unwrap();
+        assert_eq!(record.native_qa_status, Some(native.clone()));
+        assert!(!String::from_utf8_lossy(&encode_record(&record).unwrap())
+            .contains("PRIVATE-CANDIDATE"));
+        drop(store);
+        let reopened =
+            WorkbenchInvocationStore::open(directory.path().join("workbench.redb")).unwrap();
+        let restored = reopened.load(&request.invocation_id).unwrap().unwrap();
+        assert_eq!(restored, record);
+        assert!(
+            matches!(durable_terminal_projection(&restored), WorkbenchMessage::Result { output, .. }
+            if output.contains_key(WorkbenchNativeQaStatus::OUTPUT_KEY) && !output.contains_key("stdout"))
+        );
+        if let WorkbenchMessage::Result { output, .. } = &mut message {
+            let mut tampered = native;
+            tampered.progress.tests.completed = 0;
+            tampered.insert_output(output);
+        }
+        assert!(reopened.accept_result(&message, 1_900_000_000_003).is_err());
+        for (stdout_bytes, stderr_bytes) in [(0, 0), (512, 1), (4097, 0)] {
+            let mut tampered = restored.clone();
+            let command = tampered.command_status.as_mut().unwrap();
+            command.stdout_bytes = stdout_bytes;
+            command.stderr_bytes = stderr_bytes;
+            assert!(decode_record(&encode_record(&tampered).unwrap()).is_err());
+        }
+        let mut tampered = restored;
+        let mut wrong_inputs = tampered.clone();
+        wrong_inputs.native_qa_inputs.as_mut().unwrap().digest = "e".repeat(64);
+        assert!(decode_record(&encode_record(&wrong_inputs).unwrap()).is_err());
+        wrong_inputs = tampered.clone();
+        wrong_inputs.native_qa_inputs.as_mut().unwrap().files = 1;
+        assert!(decode_record(&encode_record(&wrong_inputs).unwrap()).is_err());
+        tampered.native_qa_suite = Some("node-qa-v1".into());
+        assert!(decode_record(&encode_record(&tampered).unwrap()).is_err());
+    }
+
+    #[test]
+    fn native_qa_record_fields_default_for_legacy_records() {
+        let request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2891");
+        let record = WorkbenchInvocationRecord::reserved(&request, 1_900_000_000_000);
+        let mut value = serde_json::to_value(&record).unwrap();
+        value.as_object_mut().unwrap().remove("native_qa_status");
+        value.as_object_mut().unwrap().remove("native_qa_suite");
+        value.as_object_mut().unwrap().remove("native_qa_inputs");
+        assert_eq!(
+            decode_record(&serde_json::to_vec(&value).unwrap()).unwrap(),
+            record
+        );
     }
 
     #[test]
@@ -5086,6 +5341,85 @@ mod tests {
                 assert!(!root.join("workspace").exists());
             }
         }
+    }
+
+    #[test]
+    fn artifact_input_staging_preserves_repeated_blobs_at_distinct_package_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_agent = AgentId(3);
+        let destination_agent = AgentId(6);
+        let source_root = directory.path().join("agent-03");
+        let destination_root = directory.path().join("agent-06");
+        let source_artifacts = source_root.join("artifacts");
+        let destination_artifacts = destination_root.join("artifacts");
+        let source_scope = source_artifacts.join("project-m0/source");
+        fs::create_dir_all(source_scope.join("blobs")).unwrap();
+        fs::create_dir_all(&destination_artifacts).unwrap();
+        fs::create_dir(destination_root.join("inputs")).unwrap();
+        fs::write(source_root.join(".nano-runtime"), "AGENT-03").unwrap();
+        fs::write(destination_root.join(".nano-runtime"), "AGENT-06").unwrap();
+        let mut entries = Vec::new();
+        for (path, bytes) in [
+            ("lib/__init__.py", &b""[..]),
+            ("tests/__init__.py", &b""[..]),
+            ("lib/a.py", &b"value = 1\n"[..]),
+            ("lib/b.py", &b"value = 1\n"[..]),
+        ] {
+            let digest = hex_sha256(bytes);
+            let blob = source_scope.join("blobs").join(&digest);
+            if !blob.exists() {
+                fs::write(&blob, bytes).unwrap();
+                fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+            }
+            entries.push(
+                serde_json::json!({"path":path, "blob_id":format!("sha256:{digest}"),
+                "sha256":digest, "size_bytes":bytes.len()}),
+            );
+        }
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schema_version":WORKBENCH_SCHEMA_VERSION,
+            "invocation_id":"018f3f32-4f01-7f2c-a6c1-f6f4a81b2897",
+            "input_digest":"a".repeat(64), "project_id":"project-m0", "work_item_id":"source",
+            "workspace_id":"project-m0:source", "agent_id":source_agent.0,
+            "artifact_kind":"source_tree", "media_type":"text/x-python",
+            "runtime_key":WORKBENCH_RUNTIME_BWRAP, "tool_profile":"python-coding-v1",
+            "tool_profile_digest":"b".repeat(64), "policy_digest":"c".repeat(64), "entries":entries,
+        }))
+        .unwrap();
+        let digest = hex_sha256(&manifest);
+        fs::write(
+            source_scope.join(format!("{digest}.manifest.json")),
+            manifest,
+        )
+        .unwrap();
+        let roots = HashMap::from([
+            (source_agent, source_artifacts),
+            (destination_agent, destination_artifacts),
+        ]);
+        let staged = stage_verified_artifact_inputs(
+            &roots,
+            source_agent,
+            destination_agent,
+            "project-m0",
+            "verify",
+            &digest,
+            Some("source_tree"),
+            "text/x-python",
+        )
+        .unwrap();
+        assert_eq!(staged.len(), 4);
+        let mut validation = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2810");
+        validation.inputs = staged.clone();
+        validation.input_digest = validation.canonical_digest().unwrap();
+        validation.validate_at(1_900_000_000_000).unwrap();
+        for input in &staged {
+            let path = destination_root
+                .join("inputs/project-m0/verify")
+                .join(&input.mount_path);
+            assert_eq!(fs::metadata(&path).unwrap().nlink(), 1);
+            assert_eq!(hex_sha256(&fs::read(&path).unwrap()), input.sha256);
+        }
+        assert_eq!(fs::read_dir(source_scope.join("blobs")).unwrap().count(), 2);
     }
 
     #[test]
