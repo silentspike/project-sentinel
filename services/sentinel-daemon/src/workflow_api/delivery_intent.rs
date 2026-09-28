@@ -55,6 +55,13 @@ enum DeliveryIntentV1 {
         project_id: ProjectId,
         delivery: VersionedRefV1,
         release: VersionedRefV1,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview_access: Option<VersionedRefV1>,
+    },
+    RenewPreview {
+        project_id: ProjectId,
+        delivery: VersionedRefV1,
+        release: VersionedRefV1,
     },
     Closeout {
         project_id: ProjectId,
@@ -195,6 +202,7 @@ pub(super) fn reconcile_internal(
         }
         DeliveryIntentV1::Accept { .. }
         | DeliveryIntentV1::ConfirmDelivery { .. }
+        | DeliveryIntentV1::RenewPreview { .. }
         | DeliveryIntentV1::Closeout { .. } => unreachable!("filtered above"),
     }
     Ok(true)
@@ -293,6 +301,7 @@ fn autonomous_role(intent: &DeliveryIntentV1) -> Result<CompanyRoleV1, DeliveryE
         DeliveryIntentV1::ExecuteQa { .. } => Ok(CompanyRoleV1::Qa),
         DeliveryIntentV1::Accept { .. }
         | DeliveryIntentV1::ConfirmDelivery { .. }
+        | DeliveryIntentV1::RenewPreview { .. }
         | DeliveryIntentV1::Closeout { .. } => Err(DeliveryError::AuthorityDenied(
             "customer acceptance and closeout are never autonomous".to_owned(),
         )),
@@ -327,6 +336,7 @@ struct CustomerPreviewRequest {
     project_id: ProjectId,
     delivery: VersionedRefV1,
     release: VersionedRefV1,
+    preview_access: Option<VersionedRefV1>,
     file: Option<CustomerPreviewFile>,
 }
 
@@ -420,6 +430,7 @@ pub(super) fn preview(
                 "project_id": request.project_id,
                 "delivery": request.delivery,
                 "release": request.release,
+                "preview_access": request.preview_access,
                 "manifest_digest": manifest.manifest_digest,
                 "artifact_id": file.artifact_id,
                 "path": file.path,
@@ -435,6 +446,7 @@ pub(super) fn preview(
             "project_id": request.project_id,
             "delivery": request.delivery,
             "release": request.release,
+            "preview_access": request.preview_access,
             "manifest_digest": manifest.manifest_digest,
             "artifacts": manifest.artifacts.iter().map(|artifact| serde_json::json!({
                 "artifact_id": artifact.artifact_id,
@@ -542,69 +554,19 @@ fn authorized_preview_manifest<'a>(
     request: &CustomerPreviewRequest,
     now_ms: u64,
 ) -> Result<&'a ReleaseManifestV1, DeliveryError> {
-    require_role(caller, AuthorityRole::Customer)?;
-    let denied = || DeliveryError::AuthorityDenied("preview binding is unavailable".to_string());
-    if aggregate.schema_version != DELIVERY_SCHEMA_V1
-        || aggregate.tenant_id != caller.tenant_id
-        || aggregate.project_id != request.project_id.0
-    {
-        return Err(denied());
+    if aggregate.project_id != request.project_id.0 {
+        return Err(DeliveryError::AuthorityDenied(
+            "foreign preview project".to_string(),
+        ));
     }
-    let receipt = aggregate
-        .deliveries
-        .get(&request.delivery.id)
-        .ok_or_else(denied)?;
-    if receipt.schema_version != DELIVERY_SCHEMA_V1
-        || receipt.tenant_id != caller.tenant_id
-        || receipt.customer_principal_id != caller.principal_id
-        || receipt.delivery_id != request.delivery.id
-        || receipt.generation != request.delivery.generation
-        || receipt.receipt_digest != request.delivery.digest
-        || receipt.receipt_digest == ContentDigest::zero()
-        || receipt.release != request.release
-        || !matches!(
-            receipt.state,
-            DeliveryState::Delivered | DeliveryState::Accepted
-        )
-        || receipt.preview_ttl_policy_version != DELIVERY_PREVIEW_TTL_POLICY_V1
-        || now_ms < receipt.issued_at_ms
-        || now_ms >= receipt.expires_at_ms
-        || receipt.expires_at_ms.saturating_sub(receipt.issued_at_ms) > DELIVERY_PREVIEW_MAX_TTL_MS
-    {
-        return Err(denied());
-    }
-    let release = aggregate
-        .releases
-        .get(&request.release.id)
-        .ok_or_else(denied)?;
-    if release.schema_version != DELIVERY_SCHEMA_V1
-        || release.release_id != request.release.id
-        || release.generation != request.release.generation
-        || canonical_release_reference_digest(release)? != request.release.digest
-        || release.state != ReleaseState::Active
-        || aggregate.active_release_id.as_deref() != Some(release.release_id.as_str())
-    {
-        return Err(denied());
-    }
-    let manifest = aggregate
-        .manifests
-        .get(&release.manifest.id)
-        .ok_or_else(denied)?;
-    if manifest.schema_version != DELIVERY_SCHEMA_V1
-        || manifest.tenant_id != caller.tenant_id
-        || manifest.project.id != aggregate.project_id
-        || manifest.manifest_id != release.manifest.id
-        || manifest.generation != release.manifest.generation
-        || manifest.manifest_digest != release.manifest.digest
-        || manifest.computed_digest()? != manifest.manifest_digest
-        || manifest.artifacts.is_empty()
-        || manifest.artifacts.len() > 64
-        || ContentDigest::of_domain("m0-preview", DELIVERY_SCHEMA_V1, &manifest.source_digest)?
-            != receipt.preview_digest
-    {
-        return Err(denied());
-    }
-    Ok(manifest)
+    crate::delivery::authorize_delivery_preview(
+        aggregate,
+        caller,
+        &request.delivery,
+        &request.release,
+        request.preview_access.as_ref(),
+        now_ms,
+    )
 }
 
 pub(super) fn customer_delivery_rows(
@@ -653,6 +615,13 @@ pub(super) fn customer_delivery_rows(
             "issued_at_ms": receipt.issued_at_ms,
             "expires_at_ms": receipt.expires_at_ms,
             "preview_digest": receipt.preview_digest,
+            "preview_access": aggregate.preview_access.get(&receipt.delivery_id)
+                .filter(|access| access.customer == *caller)
+                .map(|access| serde_json::json!({
+                    "access": access.reference(),
+                    "issued_at_ms": access.issued_at_ms,
+                    "expires_at_ms": access.expires_at_ms,
+                })),
         }));
     }
     Ok(rows)
@@ -698,9 +667,9 @@ pub(super) fn handle(
         | DeliveryIntentV1::Release { .. }
         | DeliveryIntentV1::Closeout { .. } => AuthorityRole::ReleaseManager,
         DeliveryIntentV1::ExecuteQa { .. } => AuthorityRole::Qa,
-        DeliveryIntentV1::Accept { .. } | DeliveryIntentV1::ConfirmDelivery { .. } => {
-            AuthorityRole::Customer
-        }
+        DeliveryIntentV1::Accept { .. }
+        | DeliveryIntentV1::ConfirmDelivery { .. }
+        | DeliveryIntentV1::RenewPreview { .. } => AuthorityRole::Customer,
     };
     if let Err(error) = require_role(&caller, required_role) {
         return delivery_error(error);
@@ -782,6 +751,7 @@ pub(super) fn handle(
             project_id,
             delivery: expected_delivery,
             release: expected_release,
+            preview_access,
         } => accept(
             api,
             delivery,
@@ -790,7 +760,21 @@ pub(super) fn handle(
             effective_now_ms,
             observed_now_ms,
             project_id,
-            Some((expected_delivery, expected_release)),
+            Some((expected_delivery, expected_release, preview_access.as_ref())),
+        ),
+        DeliveryIntentV1::RenewPreview {
+            project_id,
+            delivery: expected_delivery,
+            release: expected_release,
+        } => renew_preview(
+            delivery,
+            &caller,
+            envelope.operation_id,
+            effective_now_ms,
+            observed_now_ms,
+            project_id,
+            expected_delivery,
+            expected_release,
         ),
         DeliveryIntentV1::Closeout { project_id } => closeout(
             api,
@@ -1794,7 +1778,7 @@ fn accept(
     now_ms: u64,
     observed_now_ms: u64,
     project_id: &ProjectId,
-    expected: Option<(&VersionedRefV1, &VersionedRefV1)>,
+    expected: Option<(&VersionedRefV1, &VersionedRefV1, Option<&VersionedRefV1>)>,
 ) -> Result<DeliveryIntentResponse, DeliveryError> {
     require_role(caller, AuthorityRole::Customer)?;
     let material = load_material(api, &TenantId(caller.tenant_id.clone()), project_id)?;
@@ -1814,11 +1798,6 @@ fn accept(
         .get(&delivery_id)
         .ok_or_else(|| DeliveryError::MissingEvidence("delivery receipt".to_string()))?;
     let acceptance_id = format!("acceptance-{delivery_id}");
-    require_live_preview_or_replay(
-        observed_now_ms,
-        receipt.expires_at_ms,
-        aggregate.acceptances.contains_key(&acceptance_id),
-    )?;
     if receipt.customer_principal_id != caller.principal_id {
         return Err(DeliveryError::AuthorityDenied(
             "delivery belongs to another customer".to_string(),
@@ -1834,12 +1813,23 @@ fn accept(
         generation: release.generation,
         digest: canonical_release_reference_digest(release)?,
     };
-    if let Some((expected_delivery, expected_release)) = expected {
+    let preview_access = expected.and_then(|(_, _, access)| access);
+    if let Some((expected_delivery, expected_release, _)) = expected {
         require_displayed_delivery(
             expected_delivery,
             expected_release,
             &delivery_ref,
             &release_ref,
+        )?;
+    }
+    if !aggregate.acceptances.contains_key(&acceptance_id) {
+        crate::delivery::authorize_delivery_preview(
+            &aggregate,
+            caller,
+            &delivery_ref,
+            &release_ref,
+            preview_access,
+            observed_now_ms,
         )?;
     }
     let feedback = CustomerFeedbackV1 {
@@ -1865,12 +1855,14 @@ fn accept(
         accepted_at_ms: now_ms,
     }
     .seal()?;
-    let receipt = delivery.customer_action(
+    let receipt = delivery.customer_action_with_preview(
         &context(caller.clone(), operation_id, "customer-accept", now_ms),
         &caller.tenant_id,
         &project_id.0,
         feedback,
         Some(acceptance),
+        preview_access,
+        observed_now_ms,
     )?;
     Ok(response(
         receipt.duplicate,
@@ -1882,6 +1874,49 @@ fn accept(
         Some(acceptance_id),
         None,
     ))
+}
+
+fn renew_preview(
+    delivery: &super::ProductDeliveryCore,
+    caller: &PrincipalV1,
+    operation_id: Uuid,
+    now_ms: u64,
+    observed_now_ms: u64,
+    project_id: &ProjectId,
+    delivery_ref: &VersionedRefV1,
+    release_ref: &VersionedRefV1,
+) -> Result<DeliveryIntentResponse, DeliveryError> {
+    let receipt = delivery.renew_preview_access(
+        &context(caller.clone(), operation_id, "renew-preview", now_ms),
+        &caller.tenant_id,
+        &project_id.0,
+        delivery_ref,
+        release_ref,
+        observed_now_ms,
+    )?;
+    let aggregate = delivery
+        .aggregate(&caller.tenant_id, &project_id.0)?
+        .ok_or_else(|| DeliveryError::NotFound("delivery aggregate".to_string()))?;
+    let release = aggregate
+        .releases
+        .get(&release_ref.id)
+        .ok_or_else(|| DeliveryError::NotFound("delivery release".to_string()))?;
+    let manifest = aggregate
+        .manifests
+        .get(&release.manifest.id)
+        .ok_or_else(|| DeliveryError::NotFound("delivery manifest".to_string()))?;
+    Ok(DeliveryIntentResponse {
+        replayed: receipt.duplicate,
+        action: "renew_preview",
+        tenant_id: caller.tenant_id.clone(),
+        project_id: project_id.0.clone(),
+        candidate_id: manifest.candidate.id.clone(),
+        qa_run_id: None,
+        release_id: Some(release_ref.id.clone()),
+        delivery_id: Some(delivery_ref.id.clone()),
+        acceptance_id: None,
+        closeout_id: None,
+    })
 }
 
 fn require_displayed_delivery(
@@ -2084,6 +2119,12 @@ mod tests {
             DeliveryIntentV1::ConfirmDelivery {
                 project_id: project_id.clone(),
                 delivery: reference.clone(),
+                release: reference.clone(),
+                preview_access: None,
+            },
+            DeliveryIntentV1::RenewPreview {
+                project_id: project_id.clone(),
+                delivery: reference.clone(),
                 release: reference,
             },
             DeliveryIntentV1::Closeout { project_id },
@@ -2135,6 +2176,15 @@ mod tests {
             .idempotency_key
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')));
+    }
+
+    #[test]
+    fn legacy_customer_confirmation_serialization_omits_absent_preview_access() {
+        let value = serde_json::json!({"action":"confirm_delivery", "project_id":"project-example",
+            "delivery":{"id":"delivery-example","generation":1,"digest":"a".repeat(64)},
+            "release":{"id":"release-example","generation":1,"digest":"b".repeat(64)}});
+        let intent: DeliveryIntentV1 = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(intent).unwrap(), value);
     }
 
     #[test]
@@ -2248,7 +2298,8 @@ mod tests {
             rows[0]["delivery"]["digest"],
             serde_json::to_value(&receipt.receipt_digest).unwrap()
         );
-        assert_eq!(rows[0].as_object().unwrap().len(), 7);
+        assert_eq!(rows[0].as_object().unwrap().len(), 8);
+        assert!(rows[0]["preview_access"].is_null());
         let reference = receipt.release.clone();
         let manifest = ReleaseManifestV1 {
             schema_version: DELIVERY_SCHEMA_V1,
@@ -2300,6 +2351,7 @@ mod tests {
                 .unwrap();
         *updated = updated.clone().seal().unwrap();
         let request = CustomerPreviewRequest {
+            preview_access: None,
             file: None,
             project_id: ProjectId("project-example".to_string()),
             delivery: VersionedRefV1 {
@@ -2384,6 +2436,47 @@ mod tests {
         foreign.tenant_id = "another-tenant".to_string();
         assert!(customer_delivery_rows(&aggregate, &foreign).is_err());
         assert!(customer_delivery_rows(&aggregate, &principal(AuthorityRole::Developer)).is_err());
+        aggregate.revision = 2;
+        let access = crate::delivery::PreviewAccessV1 {
+            schema_version: DELIVERY_SCHEMA_V1,
+            access_id: "preview-access-example".to_string(),
+            generation: 2,
+            tenant_id: customer.tenant_id.clone(),
+            project_id: aggregate.project_id.clone(),
+            delivery: request.delivery.clone(),
+            release: request.release.clone(),
+            manifest: aggregate.releases[&request.release.id].manifest.clone(),
+            customer: customer.clone(),
+            preview_digest: aggregate.deliveries[&receipt.delivery_id]
+                .preview_digest
+                .clone(),
+            preview_ttl_policy_version: DELIVERY_PREVIEW_TTL_POLICY_V1,
+            issued_at_ms: 300,
+            expires_at_ms: 400,
+            access_digest: ContentDigest::zero(),
+        }
+        .seal()
+        .unwrap();
+        aggregate
+            .preview_access
+            .insert(receipt.delivery_id.clone(), access.clone());
+        let rows = customer_delivery_rows(&aggregate, &customer).unwrap();
+        assert_eq!(
+            rows[0]["preview_access"],
+            serde_json::json!({"access": access.reference(), "issued_at_ms": 300, "expires_at_ms": 400})
+        );
+        assert_eq!(rows[0]["expires_at_ms"], 200);
+        let mut revoked = customer.clone();
+        revoked.authority_generation += 1;
+        assert!(
+            customer_delivery_rows(&aggregate, &revoked).unwrap()[0]["preview_access"].is_null()
+        );
+        let renewed = CustomerPreviewRequest {
+            preview_access: Some(access.reference()),
+            ..request
+        };
+        assert!(authorized_preview_manifest(&aggregate, &customer, &renewed, 350).is_ok());
+        assert!(authorized_preview_manifest(&aggregate, &revoked, &renewed, 350).is_err());
         aggregate
             .deliveries
             .get_mut(&receipt.delivery_id)

@@ -23,9 +23,43 @@ const overview: Overview = {
     version: 1, work_items: [], deliveries: [delivery] }],
 };
 
-afterEach(() => { cleanup(); vi.useRealTimers(); vi.resetAllMocks(); localStorage.clear(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.resetAllMocks(); vi.unstubAllGlobals(); localStorage.clear(); });
 
 describe("customer workspace preview lifecycle", () => {
+  it("renews an expired delivery through a reserved customer command without accepting it", async () => {
+    vi.useFakeTimers();
+    const value = structuredClone(overview);
+    const receipt = value.projects![0].deliveries![0];
+    receipt.issued_at_ms = Date.now() - 120_000; receipt.expires_at_ms = Date.now() - 60_000;
+    const fetcher = vi.fn(async (_url: string, options: RequestInit) => {
+      const envelope = JSON.parse(options.body as string);
+      expect(envelope.intent.action).toBe("renew_preview");
+      receipt.preview_access = { access: { id: "preview-one", generation: 2, digest: "f".repeat(64) },
+        issued_at_ms: Date.now(), expires_at_ms: Date.now() + 60_000 };
+      return new Response("{}");
+    });
+    vi.stubGlobal("fetch", fetcher);
+    vi.stubGlobal("navigator", { locks: { request: async (_name: string, _options: object, callback: (lock: object) => Promise<void>) => callback({}) } });
+    vi.mocked(customerFetch).mockImplementation(async path => {
+      if (path === "status") return { authenticated: true, identity: {
+        schema_version: 1, principal_id: "customer", tenant_id: "tenant", customer_id: "customer-one",
+      } } as never;
+      if (path === "overview") return structuredClone(value) as never;
+      throw new Error(`unexpected_path_${path}`);
+    });
+    const view = render(CustomerWorkspace);
+    await vi.advanceTimersByTimeAsync(0);
+    expect((view.getByRole("button", { name: "Vorschau oeffnen" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(view.getByRole("button", { name: "Vorschau erneuern" }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect((view.getByRole("button", { name: "Vorschau oeffnen" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(view.queryByRole("button", { name: "Vorschau erneuern" })).toBeNull();
+    expect(receipt.state).toBe("delivered");
+    expect(receipt.expires_at_ms).toBeLessThan(Date.now());
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(view.getByRole("button", { name: "Vorschau erneuern" })).toBeDefined();
+  });
   it("preserves the loaded preview and focus through identical and unrelated overview refreshes", async () => {
     vi.useFakeTimers();
     let value = structuredClone(overview);

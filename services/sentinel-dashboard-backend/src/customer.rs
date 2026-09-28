@@ -332,6 +332,12 @@ enum CustomerDeliveryIntent {
         project_id: String,
         delivery: DeliveryReference,
         release: DeliveryReference,
+        preview_access: Option<DeliveryReference>,
+    },
+    RenewPreview {
+        project_id: String,
+        delivery: DeliveryReference,
+        release: DeliveryReference,
     },
 }
 
@@ -355,6 +361,7 @@ struct PreviewRequest {
     project_id: String,
     delivery: DeliveryReference,
     release: DeliveryReference,
+    preview_access: Option<DeliveryReference>,
     file: Option<PreviewFile>,
 }
 
@@ -370,6 +377,10 @@ pub async fn preview(State(st): State<AppState>, headers: HeaderMap, body: Bytes
         || value.project_id.len() > 512
         || !value.delivery.valid()
         || !value.release.valid()
+        || value
+            .preview_access
+            .as_ref()
+            .is_some_and(|access| !access.valid())
         || value.file.as_ref().is_some_and(|file| {
             file.artifact_id.is_empty()
                 || file.artifact_id.len() > 512
@@ -411,16 +422,27 @@ pub async fn delivery(State(st): State<AppState>, headers: HeaderMap, body: Byte
         Ok(value) => value,
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_delivery_confirmation"),
     };
-    let CustomerDeliveryIntent::ConfirmDelivery {
-        project_id,
-        delivery,
-        release,
-    } = value.intent;
+    let (project_id, delivery, release, preview_access) = match value.intent {
+        CustomerDeliveryIntent::ConfirmDelivery {
+            project_id,
+            delivery,
+            release,
+            preview_access,
+        } => (project_id, delivery, release, preview_access),
+        CustomerDeliveryIntent::RenewPreview {
+            project_id,
+            delivery,
+            release,
+        } => (project_id, delivery, release, None),
+    };
     if value.operation_id.is_nil()
         || project_id.is_empty()
         || project_id.len() > 512
         || !delivery.valid()
         || !release.valid()
+        || preview_access
+            .as_ref()
+            .is_some_and(|access| !access.valid())
     {
         return error(StatusCode::BAD_REQUEST, "invalid_delivery_confirmation");
     }
@@ -500,6 +522,14 @@ mod tests {
             value["intent"]["delivery"]["digest"] = json!(digest);
             cases.push(value);
         }
+        let mut invalid_access = confirmation();
+        invalid_access["intent"]["preview_access"] =
+            json!({"id":"preview","generation":1,"digest":"0".repeat(64)});
+        cases.push(invalid_access);
+        let mut injected_renewal = confirmation();
+        injected_renewal["intent"]["action"] = json!("renew_preview");
+        injected_renewal["intent"]["expires_at_ms"] = json!(u64::MAX);
+        cases.push(injected_renewal);
         let app = crate::build_app(state());
         for value in cases {
             let response = app
@@ -603,10 +633,34 @@ mod tests {
             assert!(!String::from_utf8_lossy(&response).contains("server-customer-credential"));
         }
         assert_eq!(*recorded.lock().unwrap(), vec![body.as_bytes().to_vec(); 2]);
+        let mut renewal = confirmation();
+        renewal["intent"]["action"] = json!("renew_preview");
+        let mut renewed_confirmation = confirmation();
+        renewed_confirmation["intent"]["preview_access"] =
+            json!({"id":"preview","generation":2,"digest":"c".repeat(64)});
+        for value in [renewal, renewed_confirmation] {
+            let bytes = value.to_string();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/customer/delivery")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, format!("{COOKIE}={token}"))
+                        .body(Body::from(bytes.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(recorded.lock().unwrap().last().unwrap(), bytes.as_bytes());
+        }
         let preview = json!({
             "project_id":"project-one",
             "delivery": confirmation()["intent"]["delivery"],
             "release": confirmation()["intent"]["release"],
+            "preview_access":{"id":"preview","generation":2,"digest":"c".repeat(64)},
             "file":{"artifact_id":"site","path":"index.html"},
         });
         for field in ["principal_id", "tenant_id", "root", "now_ms"] {
@@ -627,7 +681,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
-        assert_eq!(recorded.lock().unwrap().len(), 2);
+        assert_eq!(recorded.lock().unwrap().len(), 4);
         let preview_body = preview.to_string();
         let response = app
             .clone()

@@ -9,6 +9,15 @@ const inventory: PreviewInventory = {
 const file: PreviewFile = { ...inventory, artifact_id: "site-source_tree-0", path: "index.html", encoding: "base64", size_bytes: 4, content: "PHAvPg==" };
 
 describe("customer preview", () => {
+  it("binds renewed inventory and assets to the exact access grant", () => {
+    const access = { id: "preview-access", generation: 3, digest: "e".repeat(64) };
+    const renewed = { ...inventory, preview_access: access };
+    expect(previewHtml({ ...file, preview_access: access }, renewed, file.artifact_id, file.path)).toBe("<p/>");
+    for (const preview_access of [undefined, null, { ...access, generation: 4 }, { ...access, digest: "f".repeat(64) }]) {
+      expect(() => previewHtml({ ...file, preview_access }, renewed, file.artifact_id, file.path)).toThrow();
+    }
+    expect(() => previewHtml({ ...file, preview_access: access }, inventory, file.artifact_id, file.path)).toThrow();
+  });
   it("decodes only the exact selected artifact and delivery", () => {
     expect(previewHtml(file, inventory, file.artifact_id, file.path)).toBe("<p/>");
     for (const change of [

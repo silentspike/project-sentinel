@@ -1,6 +1,6 @@
 import { batch, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { customerFetch, CustomerApiError, dispatchReserved, pendingKey, readPending, reserveCommand, sendCustomerCommand,
+import { customerFetch, customerPreviewAvailable, CustomerApiError, dispatchReserved, pendingKey, readPending, reserveCommand, sendCustomerCommand,
   type CustomerIdentity, type Overview, type PendingCommand } from "./api";
 import "./customer.css";
 import { CustomerPreview } from "./CustomerPreview";
@@ -29,6 +29,9 @@ export function CustomerWorkspace() {
   const [reply, setReply] = createSignal("");
   const [pending, setPending] = createSignal<PendingCommand | null>(null);
   const [previewId, setPreviewId] = createSignal("");
+  const [now, setNow] = createSignal(Date.now());
+  const accessTimer = window.setInterval(() => setNow(Date.now()), 1000);
+  onCleanup(() => window.clearInterval(accessTimer));
   const current = createMemo(() => data().requests.find(value => value.request_id === selected()));
   const preview = createMemo(() => {
     const project = data().projects?.find(value => value.request_id === selected() && value.deliveries?.some(delivery => delivery.delivery.id === previewId()));
@@ -155,10 +158,13 @@ export function CustomerWorkspace() {
               <Show when={project.deliveries?.length}><h3>Lieferungen</h3>
                 <table><thead><tr><th>Lieferung</th><th>Version</th><th>Status</th></tr></thead>
                   <tbody><For each={project.deliveries}>{delivery => <tr>
-                    <td>{delivery.delivery.id}<button class="customer-preview-open" disabled={delivery.release_state !== "active" || !["delivered", "accepted"].includes(delivery.state) || delivery.expires_at_ms <= Date.now()} onClick={() => setPreviewId(delivery.delivery.id)}>Vorschau oeffnen</button>
-                      <button class="customer-preview-open" disabled={disabled() || delivery.release_state !== "active" || delivery.state !== "delivered" || delivery.expires_at_ms <= Date.now()} onClick={() => {
-                        if (delivery.expires_at_ms <= Date.now()) return;
-                        if (window.confirm(`Lieferung ${delivery.delivery.id}, Version ${delivery.delivery.generation}, verbindlich abnehmen?`)) void command({ command: "confirm_delivery", project_id: project.project_id, delivery: { ...delivery.delivery }, release: { ...delivery.release } });
+                    <td>{delivery.delivery.id}<button class="customer-preview-open" disabled={!customerPreviewAvailable(delivery, now())} onClick={() => setPreviewId(delivery.delivery.id)}>Vorschau oeffnen</button>
+                      <Show when={!customerPreviewAvailable(delivery, now()) && delivery.release_state === "active" && ["delivered", "accepted"].includes(delivery.state)}>
+                        <button class="customer-preview-open" disabled={disabled()} onClick={() => void command({ command: "renew_delivery_preview", project_id: project.project_id, delivery: { ...delivery.delivery }, release: { ...delivery.release } })}>Vorschau erneuern</button>
+                      </Show>
+                      <button class="customer-preview-open" disabled={disabled() || delivery.state !== "delivered" || !customerPreviewAvailable(delivery, now())} onClick={() => {
+                        if (!customerPreviewAvailable(delivery, Date.now())) return;
+                        if (window.confirm(`Lieferung ${delivery.delivery.id}, Version ${delivery.delivery.generation}, verbindlich abnehmen?`)) void command({ command: "confirm_delivery", project_id: project.project_id, delivery: { ...delivery.delivery }, release: { ...delivery.release }, ...(delivery.preview_access ? { preview_access: { ...delivery.preview_access.access } } : {}) });
                       }}>Lieferung abnehmen</button>
                     </td><td>{delivery.delivery.generation}</td><td>{delivery.state}</td>
                   </tr>}</For></tbody>
