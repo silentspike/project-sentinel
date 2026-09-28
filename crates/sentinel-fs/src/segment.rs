@@ -84,6 +84,13 @@ impl SegmentStore {
     pub fn open_with_target(dir: impl AsRef<Path>, target_bytes: u64) -> anyhow::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
+        // Persist the segment directory itself before any metadata can name it.
+        File::open(&dir)?.sync_all()?;
+        let parent = dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)?.sync_all()?;
 
         Ok(Self {
             dir,
@@ -95,12 +102,15 @@ impl SegmentStore {
     /// Append compressed chunk data to the current segment.
     /// Returns the `ChunkLocation` for the index.
     pub fn append(&mut self, compressed: &[u8]) -> anyhow::Result<ChunkLocation> {
-        let len = compressed.len() as u32;
+        let len = u32::try_from(compressed.len())?;
 
         // Ensure we have an active segment, potentially rotating if full.
         let seg = self.ensure_active_segment()?;
 
         let offset = seg.write_offset;
+        // A failed write may have advanced the file cursor without advancing
+        // write_offset. Retry from the last indexed boundary, not that cursor.
+        seg.file.seek(SeekFrom::Start(offset))?;
         seg.file.write_all(compressed)?;
         seg.write_offset += len as u64;
 
@@ -266,11 +276,13 @@ impl SegmentStore {
         Ok(results)
     }
 
-    /// Fsync the current active segment to disk.
+    /// Fsync the active bytes and directory entries. Rotated writers are synced
+    /// before they are dropped in `ensure_active_segment`.
     pub fn sync(&self) -> anyhow::Result<()> {
         if let Some(ref seg) = self.writer {
-            seg.file.sync_data()?;
+            seg.file.sync_all()?;
         }
+        File::open(&self.dir)?.sync_all()?;
         Ok(())
     }
 
@@ -323,6 +335,7 @@ impl SegmentStore {
         };
 
         if needs_new {
+            self.sync()?;
             let id = self.next_segment_id()?;
             let path = self.segment_path(id);
             let mut file = OpenOptions::new()
