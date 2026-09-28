@@ -82,7 +82,8 @@ test("delivery preview is isolated, inert, network-blocked and stable across ove
   };
   const binding = { project_id: "project-one", delivery: delivery.delivery, release: delivery.release };
   const artifact = { artifact_id: "website-source_tree-0", digest: "d".repeat(64), media_type: "application/json" };
-  const html = `<!doctype html><html><head><style>body{font:16px sans-serif;color:#162a24;padding:32px;background:#f3f8f5}h1{font-size:28px}details{padding:16px;border:1px solid #417b63}a{display:block;margin:24px 0}</style></head><body>
+  const css = "body{font:16px sans-serif;color:#162a24;padding:32px;background:#f3f8f5}h1{font-size:28px}details{padding:16px;border:1px solid #417b63}a{display:block;margin:24px 0} /* </style><script>document.body.dataset.executed='yes'</script> */";
+  const html = `<!doctype html><html><head><link rel="stylesheet" href="style.css"><meta http-equiv="refresh" content="1;url=https://preview-denied.invalid/refresh"></head><body>
     <h1>Studio Website</h1><p>Verifizierte Lieferung</p><details><summary>Projektumfang</summary><p>Drei barrierefreie Seiten</p></details>
     <script>document.body.dataset.executed="yes";top.localStorage.setItem("preview-escaped","yes");fetch("https://preview-denied.invalid/script")</script>
     <img src="https://preview-denied.invalid/image"><iframe src="https://preview-denied.invalid/frame"></iframe>
@@ -90,8 +91,12 @@ test("delivery preview is isolated, inert, network-blocked and stable across ove
     <form action="https://preview-denied.invalid/form"><button>Formular senden</button></form>
     </body></html>`;
   const outgoing: string[] = [], writes: string[] = [];
-  const htmlBytes = new TextEncoder().encode(html);
-  const encodedHtml = btoa(Array.from(htmlBytes, byte => String.fromCharCode(byte)).join(""));
+  const detached: string[] = [];
+  const assetReads: string[] = [];
+  page.on("framedetached", frame => detached.push(frame.url()));
+  const proposal = { proposal_id: "proposal-one", request_id: request.request_id, proposal_digest: "f".repeat(64),
+    scope: "Website", deliverables: ["Three pages"], exclusions: [], assumptions: [], acceptance_criteria: ["Usable preview"],
+    cost_ceiling_micros: 1_000_000, expires_at_unix_ms: Date.now() + 60_000 };
   let overviewReads = 0;
   await page.route("https://preview-denied.invalid/**", async route => { outgoing.push(route.request().url()); await route.abort(); });
   await page.route("**/api/customer/**", async route => {
@@ -99,13 +104,17 @@ test("delivery preview is isolated, inert, network-blocked and stable across ove
     if (path.endsWith("status")) return route.fulfill({ json: { authenticated: true, identity } });
     if (path.endsWith("overview")) {
       overviewReads++;
-      return route.fulfill({ json: { requests: [request], proposals: [], projects: [{ project_id: "project-one", request_id: request.request_id, state: "delivery_candidate", version: 2, work_items: [], deliveries: [delivery] }] } });
+      return route.fulfill({ json: { requests: [request], proposals: [proposal], projects: [{ project_id: "project-one", request_id: request.request_id, state: "delivery_candidate", version: 2, work_items: [], deliveries: [delivery] }] } });
     }
     if (path.endsWith("preview")) {
       const body = route.request().postDataJSON();
       if (!body.file) { expect(body).toEqual(binding); return route.fulfill({ json: { ...binding, manifest_digest: "e".repeat(64), artifacts: [artifact] } }); }
-      expect(body).toEqual({ ...binding, file: { artifact_id: artifact.artifact_id, path: "index.html" } });
-      return route.fulfill({ json: { ...binding, manifest_digest: "e".repeat(64), artifact_id: artifact.artifact_id, path: "index.html", encoding: "base64", size_bytes: htmlBytes.length, content: encodedHtml } });
+      expect(["index.html", "style.css"]).toContain(body.file.path);
+      expect(body).toEqual({ ...binding, file: { artifact_id: artifact.artifact_id, path: body.file.path } });
+      assetReads.push(body.file.path);
+      const bytes = new TextEncoder().encode(body.file.path === "style.css" ? css : html);
+      return route.fulfill({ json: { ...binding, manifest_digest: "e".repeat(64), artifact_id: artifact.artifact_id,
+        path: body.file.path, encoding: "base64", size_bytes: bytes.length, content: btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join("")) } });
     }
     writes.push(path); return route.fulfill({ status: 403, json: {} });
   });
@@ -120,14 +129,17 @@ test("delivery preview is isolated, inert, network-blocked and stable across ove
   await expect(inner.locator("body")).not.toHaveAttribute("data-executed", "yes");
   await inner.getByText("Projektumfang", { exact: true }).click();
   await expect(inner.getByText("Drei barrierefreie Seiten")).toBeVisible();
-  await expect.poll(() => overviewReads).toBeGreaterThan(1);
+  await expect.poll(() => overviewReads, { timeout: 10_000 }).toBeGreaterThan(3);
   await expect(inner.getByText("Drei barrierefreie Seiten")).toBeVisible();
-  await inner.getByRole("button", { name: "Formular senden" }).click();
+  expect(detached).toEqual([]);
+  expect(assetReads).toEqual(["index.html", "style.css"]);
+  await expect(inner.locator("form,script,meta[http-equiv=refresh]")).toHaveCount(0);
   expect(outgoing).toEqual([]); expect(writes).toEqual([]);
   expect(await page.evaluate(() => localStorage.getItem("preview-escaped"))).toBeNull();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(1440);
   await page.screenshot({ path: testInfo.outputPath("isolated-customer-preview.png"), fullPage: true });
-  await inner.getByRole("link", { name: "Externe Navigation" }).click();
+  await expect(inner.getByText("Externe Navigation", { exact: true })).not.toHaveAttribute("href");
+  await inner.getByText("Externe Navigation", { exact: true }).click();
   await page.waitForTimeout(200);
   expect(outgoing).toEqual([]);
   expect(page.url()).toContain("view=customer");

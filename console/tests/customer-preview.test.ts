@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { previewBroker, previewHtml, type PreviewInventory, type PreviewFile } from "../src/customer/preview";
+import { previewBroker, previewHtml, previewStylesheetPath, type PreviewInventory, type PreviewFile } from "../src/customer/preview";
 
 const inventory: PreviewInventory = {
   project_id: "project-one", delivery: { id: "delivery-one", generation: 1, digest: "a".repeat(64) },
@@ -27,5 +27,19 @@ describe("customer preview", () => {
     expect(html).toContain("script-src 'none'");
     expect(html).not.toContain("allow-same-origin");
     expect(html).not.toContain("innerHTML");
+  });
+  it("resolves only local CSS paths without escaping the selected artifact", () => {
+    expect(previewStylesheetPath("index.html", "style.css")).toBe("style.css");
+    expect(previewStylesheetPath("pages/index.html", "../css/style.css")).toBe("css/style.css");
+    expect(previewStylesheetPath("pages/index.html", "/style.css")).toBe("style.css");
+    expect(previewStylesheetPath("index.html", "%73tyle.css")).toBe("style.css");
+    for (const href of [null, [], "", "https://remote.invalid/style.css", "//remote.invalid/style.css", "file:///style.css",
+      "data:text/css,body{}", "javascript:alert(1)", "../style.css", "%2e%2e/style.css", "%252e%252e/style.css", "\\style.css",
+      "style.css?token=secret", "style.css#fragment", "style.css\n", "other.html", "%zz", "a".repeat(1025)]) {
+      expect(() => previewStylesheetPath("index.html", href)).toThrow("preview_stylesheet_path_invalid");
+    }
+    for (const path of ["../index.html", "/index.html", "https://remote.invalid/index.html", "index.html?x=1"]) {
+      expect(() => previewStylesheetPath(path, "style.css")).toThrow("preview_stylesheet_path_invalid");
+    }
   });
 });
