@@ -185,6 +185,224 @@ fn planning_fixture(path: &Path) -> (WorkflowApi, ProjectPlanningContext) {
 }
 
 #[test]
+fn request_sales_routing_preserves_another_employees_current_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = fixture(&temp.path().join("company.sqlite"));
+    let binding = super::super::model_work::assign_test_work_from(&api, Some(1), 1_000);
+    let sales = context.binding.grant.sales_principal.agent_id.unwrap();
+    let before = api.request_sales_call().unwrap().unwrap();
+    assert!(api.is_provider_usage_candidate(sales).unwrap());
+    assert!(matches!(
+        api.resolve_provider_usage_authority(sales).unwrap(),
+        Some(ProviderExecutionAuthority::RequestSales(_))
+    ));
+    assert!(api.is_provider_usage_candidate(binding.agent_id).unwrap());
+    assert_eq!(
+        api.resolve_provider_usage_authority(binding.agent_id)
+            .unwrap()
+            .unwrap()
+            .project(),
+        Some(&binding)
+    );
+    assert_eq!(api.request_sales_call().unwrap().unwrap(), before);
+}
+
+#[test]
+fn request_sales_routing_respects_expiry_and_retains_consumed_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let (api, context) = fixture(&path);
+    let binding = super::super::model_work::assign_test_work_from(&api, Some(1), 1_000);
+    let sales = context.binding.grant.sales_principal.agent_id.unwrap();
+    let before = api.request_sales_call().unwrap().unwrap();
+    assert!(api
+        .fresh_request_sales_call(sales, before.created_at_unix_ms - 1)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        api.fresh_request_sales_call(sales, before.grant.expires_at_unix_ms - 1)
+            .unwrap(),
+        Some(before.clone())
+    );
+    assert!(api
+        .fresh_request_sales_call(sales, before.grant.expires_at_unix_ms)
+        .unwrap()
+        .is_none());
+    assert!(api
+        .fresh_request_sales_call(binding.agent_id, before.created_at_unix_ms)
+        .unwrap()
+        .is_none());
+    let request = dispatch(&api, &context);
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+            .status,
+        200
+    );
+    let consumed = api.request_sales_call().unwrap().unwrap();
+    assert!(consumed.dispatch.is_some());
+    assert!(api
+        .fresh_request_sales_call(sales, now_unix_ms())
+        .unwrap()
+        .is_none());
+    assert!(!api.is_provider_usage_candidate(sales).unwrap());
+    assert!(api.is_provider_usage_candidate(binding.agent_id).unwrap());
+    assert_eq!(
+        api.resolve_provider_usage_authority(binding.agent_id)
+            .unwrap()
+            .unwrap()
+            .project(),
+        Some(&binding)
+    );
+    assert_eq!(
+        api.prepare_request_sales(&context.binding).unwrap(),
+        context
+    );
+    assert_eq!(
+        WorkflowStore::open(&path)
+            .unwrap()
+            .request_provider_call(
+                &context.binding.grant.sales_principal.tenant_id,
+                &context.binding.allowance_id,
+            )
+            .unwrap(),
+        Some(consumed)
+    );
+}
+
+#[test]
+fn project_planning_routing_preserves_another_employees_current_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
+    let binding = super::super::model_work::assign_test_work_from(&api, Some(1), 1_000);
+    let planner = context.binding.grant.planner_principal.agent_id.unwrap();
+    let planning_before = api
+        .store
+        .project_planning_call(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert!(api.is_provider_usage_candidate(planner).unwrap());
+    assert!(matches!(
+        api.resolve_provider_usage_authority(planner).unwrap(),
+        Some(ProviderExecutionAuthority::ProjectPlanning(_))
+    ));
+    assert!(api.is_provider_usage_candidate(binding.agent_id).unwrap());
+    let selected = api
+        .resolve_provider_usage_authority(binding.agent_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.project(), Some(&binding));
+    assert_eq!(
+        api.store
+            .project_planning_call(
+                &context.binding.grant.planner_principal.tenant_id,
+                &context.binding.grant.project_id,
+            )
+            .unwrap()
+            .unwrap(),
+        planning_before
+    );
+}
+
+#[test]
+fn project_planning_routing_respects_exact_expiry_without_mutating_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let (api, context) = planning_fixture(&path);
+    let planner = context.binding.grant.planner_principal.agent_id.unwrap();
+    let tenant = &context.binding.grant.planner_principal.tenant_id;
+    let project = &context.binding.grant.project_id;
+    let before = api
+        .store
+        .project_planning_call(tenant, project)
+        .unwrap()
+        .unwrap();
+    assert!(api
+        .project_planning_call(planner, before.grant_issued_at_unix_ms - 1)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        api.project_planning_call(planner, before.grant.expires_at_unix_ms - 1)
+            .unwrap(),
+        Some(before.clone())
+    );
+    assert!(api
+        .project_planning_call(planner, before.grant.expires_at_unix_ms)
+        .unwrap()
+        .is_none());
+    assert!(api
+        .project_planning_call(planner, before.grant.expires_at_unix_ms + 1)
+        .unwrap()
+        .is_none());
+    assert!(api
+        .project_planning_call(AgentId(6), before.grant_issued_at_unix_ms)
+        .unwrap()
+        .is_none());
+    let reopened = WorkflowStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.project_planning_call(tenant, project).unwrap(),
+        Some(before)
+    );
+}
+
+#[test]
+fn project_planning_routing_never_replays_a_consumed_call_or_blocks_other_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let (api, context) = planning_fixture(&path);
+    let binding = super::super::model_work::assign_test_work_from(&api, Some(1), 1_000);
+    let planner = context.binding.grant.planner_principal.agent_id.unwrap();
+    let now_ms = now_unix_ms();
+    let claimed = api
+        .store
+        .claim_project_planning_call(
+            &context.binding.grant.planner_principal,
+            &sentinel_workflow::ClaimProjectPlanningCallV1 {
+                allowance_id: context.binding.allowance_id.clone(),
+                project_id: context.binding.grant.project_id.clone(),
+                request_id: ProviderExecutionAuthority::ProjectPlanning(Box::new(
+                    context.binding.clone(),
+                ))
+                .request_id(),
+                request_digest: "d".repeat(64),
+                context_digest: "e".repeat(64),
+            },
+            now_ms,
+        )
+        .unwrap();
+    assert!(api
+        .project_planning_call(planner, now_ms)
+        .unwrap()
+        .is_none());
+    assert!(!api.is_provider_usage_candidate(planner).unwrap());
+    assert!(api.is_provider_usage_candidate(binding.agent_id).unwrap());
+    assert_eq!(
+        api.resolve_provider_usage_authority(binding.agent_id)
+            .unwrap()
+            .unwrap()
+            .project(),
+        Some(&binding)
+    );
+    assert_eq!(
+        api.prepare_project_planning(&context.binding).unwrap(),
+        context
+    );
+    let reopened = WorkflowStore::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .project_planning_call(
+                &context.binding.grant.planner_principal.tenant_id,
+                &context.binding.grant.project_id,
+            )
+            .unwrap(),
+        Some(claimed)
+    );
+}
+
+#[test]
 fn project_planning_uses_project_agreement_not_global_sales_proposal() {
     let temp = tempfile::tempdir().unwrap();
     let (api, first_context) = planning_fixture(&temp.path().join("company.sqlite"));
@@ -294,7 +512,7 @@ fn sales_abandonment_requires_exact_persisted_resolution_before_new_authority() 
     let operator = api.principals.principal("operator").unwrap();
     let customer = api.principals.principal("customer").unwrap();
     assert!(
-        <WorkflowApi as crate::llm_bridge::bridge::ProviderUsageAuthorityResolver>::is_provider_usage_candidate(
+        !<WorkflowApi as crate::llm_bridge::bridge::ProviderUsageAuthorityResolver>::is_provider_usage_candidate(
             &api,
             AgentId(3)
         )
@@ -376,10 +594,8 @@ fn sales_dispatch_requires_exact_subject_current_roster_and_one_durable_claim() 
         403
     );
     health.write().unwrap().agents[0].projection_present = true;
-    assert!(api
-        .resolve_provider_usage_authority(AgentId(6))
-        .unwrap()
-        .is_none());
+    assert!(!api.is_provider_usage_candidate(AgentId(6)).unwrap());
+    assert!(api.resolve_provider_usage_authority(AgentId(6)).is_err());
     assert_eq!(
         api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
             .status,
