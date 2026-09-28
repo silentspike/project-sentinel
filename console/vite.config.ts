@@ -33,6 +33,8 @@ export default defineConfig(({ mode }) => ({
   test: {
     environment: "jsdom",
     globals: true,
+    // Preserve pre-v5 mock history; existing tests manage their own cleanup.
+    clearMocks: false,
     include: ["tests/**/*.test.ts"],
   },
 }));
