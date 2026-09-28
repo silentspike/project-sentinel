@@ -2411,6 +2411,56 @@ pub mod bridge {
             bind_model_work_request(&mut a, &context).unwrap();
             bind_model_work_request(&mut same, &context).unwrap();
             assert_eq!(a.metadata["company_execution_output_kind"], "tool_plan");
+            let mut qa_context = context.clone();
+            let ModelWorkContext::Project(qa_work) = &mut qa_context else {
+                panic!("project fixture");
+            };
+            qa_work.task.required_role = sentinel_workflow::CompanyRoleV1::Qa;
+            qa_work.authority.profile_id = "web-review-v1".into();
+            qa_work.authority.capabilities =
+                std::collections::BTreeSet::from(["file.write".into(), "artifact.commit".into()]);
+            qa_work.task.outputs[0].media_type = "application/vnd.sentinel.qa-report+json".into();
+            let input = sentinel_workflow::WorkInputContractV1 {
+                name: "source".into(),
+                producer_work_item_id: sentinel_workflow::WorkItemId::parse("source-work").unwrap(),
+                producer_output_name: "site".into(),
+                expected_contract_generation: 1,
+                expected_contract_digest: "a".repeat(64),
+            };
+            qa_work
+                .task
+                .dependency_ids
+                .insert(input.producer_work_item_id.clone());
+            qa_work.task.inputs.push(input.clone());
+            let content = "let timer = null;\n".to_owned();
+            qa_work
+                .artifact_inputs
+                .push(crate::workflow_api::model_work::ModelArtifactInput {
+                    contract: input,
+                    producer_agent: AgentId(3),
+                    manifest_digest: "b".repeat(64),
+                    artifact_kind: "source_tree".into(),
+                    media_type: "application/vnd.sentinel.source-tree".into(),
+                    files: vec![crate::workbench::VerifiedArtifactTextFile {
+                        path: "app.js".into(),
+                        sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+                        content,
+                    }],
+                });
+            qa_work.schema_retry_feedback =
+                Some("Return the complete report as strict JSON.".into());
+            let mut qa_request =
+                build_gateway_request(&first, &state, &id, Some(&qa_context.binding()));
+            bind_model_work_request(&mut qa_request, &qa_context).unwrap();
+            assert_eq!(qa_request.metadata["company_execution_schema"], "1");
+            assert_eq!(
+                qa_request.metadata["company_execution_output_kind"],
+                "source_review"
+            );
+            assert_ne!(
+                gateway_request_digest(&qa_request).unwrap(),
+                gateway_request_digest(&a).unwrap()
+            );
             assert_eq!(
                 gateway_request_digest(&a).unwrap(),
                 gateway_request_digest(&same).unwrap()

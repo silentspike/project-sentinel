@@ -2533,6 +2533,176 @@ impl EventStore {
         Ok(true)
     }
 
+    /// Resolve one failed model completion before issuing a new, separately
+    /// authorized correction call. The original provider result is removed
+    /// from the replayable outbox, while the resolution event preserves the
+    /// consumed request identity and the reason for the new call.
+    pub fn resolve_failed_llm_completion_for_model_retry(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        expected_error: &str,
+        reason: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let expected_error = expected_error.trim();
+        let reason = reason.trim();
+        anyhow::ensure!(
+            !expected_error.is_empty(),
+            "expected error must not be empty"
+        );
+        anyhow::ensure!(!reason.is_empty(), "resolution reason must not be empty");
+        anyhow::ensure!(
+            reason.len() <= LLM_COMPLETION_RESOLUTION_REASON_MAX_BYTES,
+            "resolution reason exceeds {} bytes",
+            LLM_COMPLETION_RESOLUTION_REASON_MAX_BYTES
+        );
+        let operation_id = format!("llm_resolution_{request_id}");
+        let validate_existing = |event_id: String, payload: String| -> anyhow::Result<String> {
+            let payload: serde_json::Value = serde_json::from_str(&payload)?;
+            anyhow::ensure!(
+                payload
+                    .get("request_digest")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(request_digest)
+                    && payload
+                        .get("request_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(request_id)
+                    && payload
+                        .get("terminal_status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("failed")
+                    && payload
+                        .get("prior_error")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(expected_error)
+                    && payload.get("reason").and_then(serde_json::Value::as_str) == Some(reason)
+                    && payload
+                        .get("resolution")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("model_schema_correction"),
+                "LLM completion resolution conflict for {request_id}"
+            );
+            Ok(event_id)
+        };
+        let existing_event = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+            conn.query_row(
+                "SELECT event_id, payload FROM events WHERE operation_id = ?1",
+                params![operation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        };
+        if let Some((event_id, payload)) = existing_event {
+            return validate_existing(event_id, payload).map(Some);
+        }
+
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
+        if let Some((event_id, payload)) = conn
+            .query_row(
+                "SELECT event_id, payload FROM events WHERE operation_id = ?1",
+                params![operation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            let event_id = validate_existing(event_id, payload)?;
+            conn.commit()?;
+            return Ok(Some(event_id));
+        }
+        let state: Option<(String, String, String, Option<String>)> = conn
+            .query_row(
+                "SELECT request_digest, owner_scope, status, last_error
+                 FROM llm_completion_outbox WHERE request_id = ?1",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((stored_digest, owner_scope, status, last_error)) = state else {
+            conn.commit()?;
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            stored_digest == request_digest,
+            "LLM completion digest conflict for {request_id}"
+        );
+        anyhow::ensure!(
+            status == "failed" && last_error.as_deref() == Some(expected_error),
+            "LLM completion {request_id} is not the expected failed model result"
+        );
+        let scope = self.llm_completion_scope_from_wire(&owner_scope)?;
+        let aggregate_id = match scope {
+            StateTransferScope::NanoContainer(agent_id) => agent_id,
+            StateTransferScope::World => unreachable!("validated agent scope"),
+        };
+        let usage: Option<(String, String)> = conn
+            .query_row(
+                "SELECT event_type, aggregate_id FROM events WHERE operation_id = ?1",
+                params![format!("llm_usage_{request_id}")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        anyhow::ensure!(
+            usage.as_ref().is_some_and(
+                |(event_type, agent)| event_type == "agent_llm_usage" && agent == &aggregate_id
+            ),
+            "LLM schema correction requires exact durable usage evidence"
+        );
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut event = DomainEvent::new(
+            "llm_completion_resolved",
+            &aggregate_id,
+            &serde_json::json!({
+                "request_id": request_id,
+                "request_digest": request_digest,
+                "terminal_status": status,
+                "resolution": "model_schema_correction",
+                "prior_error": expected_error,
+                "reason": reason,
+            })
+            .to_string(),
+            request_id,
+            0,
+        )
+        .with_operation_id(&operation_id);
+        event.timestamp_ms = now_ms;
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                event.event_id,
+                event.event_type,
+                event.aggregate_id,
+                event.payload,
+                event.correlation_id,
+                event.causation_id,
+                event.operation_id,
+                event.tick as i64,
+                event.timestamp_ms as i64,
+                event.schema_version,
+                event.compensation_type,
+            ],
+        )?;
+        let changed = conn.execute(
+            "DELETE FROM llm_completion_outbox
+             WHERE request_id = ?1 AND request_digest = ?2 AND owner_scope = ?3
+               AND status = 'failed' AND last_error = ?4",
+            params![request_id, request_digest, owner_scope, expected_error],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "LLM completion failed state changed concurrently"
+        );
+        conn.commit()?;
+        Ok(Some(event.event_id))
+    }
+
     /// Check the durable operation id before issuing a provider call for a
     /// perception that has already completed in an earlier process.
     pub fn has_event_operation_id(&self, operation_id: &str) -> anyhow::Result<bool> {
@@ -4500,6 +4670,132 @@ mod tests {
         assert!(!store
             .reserve_llm_request("request-1", "digest-1", "AGENT-07")
             .unwrap());
+    }
+
+    #[test]
+    fn failed_llm_completion_model_retry_resolution_is_idempotent_and_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.sqlite");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let request_id = "qa-schema-retry-1";
+        let digest = "d".repeat(64);
+        let error = "source review is not strict JSON";
+        assert!(store
+            .reserve_llm_request(request_id, &digest, "AGENT-55")
+            .unwrap());
+        store
+            .enqueue_llm_completion(request_id, &digest, "not-json")
+            .unwrap();
+        let mut usage = test_event("agent_llm_usage", "AGENT-55");
+        usage.operation_id = format!("llm_usage_{request_id}");
+        store
+            .persist_llm_completion_usage(request_id, &digest, &usage)
+            .unwrap();
+        assert_eq!(
+            store
+                .record_llm_completion_failure(request_id, &digest, error, 1)
+                .unwrap(),
+            (1, true)
+        );
+
+        let event_id = store
+            .resolve_failed_llm_completion_for_model_retry(
+                request_id,
+                &digest,
+                error,
+                "strict-json-correction",
+            )
+            .unwrap()
+            .unwrap();
+        assert!(store.get_llm_completion(request_id).unwrap().is_none());
+        let event = store
+            .event_by_operation_id(&format!("llm_resolution_{request_id}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.event_id, event_id);
+        assert!(event.payload.contains("model_schema_correction"));
+        drop(store);
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .resolve_failed_llm_completion_for_model_retry(
+                    request_id,
+                    &digest,
+                    error,
+                    "strict-json-correction",
+                )
+                .unwrap(),
+            Some(event_id.clone())
+        );
+        for (changed_digest, changed_error, changed_reason) in [
+            ("other-digest", error, "strict-json-correction"),
+            (digest.as_str(), "other-error", "strict-json-correction"),
+            (digest.as_str(), error, "other-reason"),
+        ] {
+            assert!(store
+                .resolve_failed_llm_completion_for_model_retry(
+                    request_id,
+                    changed_digest,
+                    changed_error,
+                    changed_reason,
+                )
+                .is_err());
+        }
+        assert!(!store
+            .reserve_llm_request(request_id, &digest, "AGENT-55")
+            .unwrap());
+        assert_eq!(
+            store
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE event_type = 'llm_completion_resolved'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_llm_completion_model_retry_requires_consumed_usage() {
+        let store = EventStore::open(":memory:").unwrap();
+        let request_id = "qa-missing-usage";
+        let digest = "e".repeat(64);
+        store
+            .reserve_llm_request(request_id, &digest, "AGENT-55")
+            .unwrap();
+        store
+            .enqueue_llm_completion(request_id, &digest, "invalid")
+            .unwrap();
+        store
+            .record_llm_completion_failure(
+                request_id,
+                &digest,
+                "source review is not strict JSON",
+                1,
+            )
+            .unwrap();
+        assert!(store
+            .resolve_failed_llm_completion_for_model_retry(
+                request_id,
+                &digest,
+                "source review is not strict JSON",
+                "strict-json-correction"
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .get_llm_completion(request_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert!(store
+            .event_by_operation_id(&format!("llm_resolution_{request_id}"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

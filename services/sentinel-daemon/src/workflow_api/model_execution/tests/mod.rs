@@ -879,6 +879,254 @@ fn project_provider_abandonment_requires_resolution_and_regrants_autonomously() 
 }
 
 #[test]
+fn qa_schema_resolution_survives_archive_gap_and_binds_retry_feedback() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("company.sqlite");
+    let (mut api, context) = planning_fixture(&path);
+    let (_, request_id, digest) = dispatch_project_model_work(&api, &context);
+    let mut project = api
+        .store
+        .company_project(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .unwrap();
+    let allowance = project.subscription_call.as_ref().unwrap().clone();
+    assert!(api
+        .qa_schema_resolution_event(&allowance)
+        .unwrap()
+        .is_none());
+    let store = api.event_store.as_ref().unwrap();
+    store
+        .enqueue_llm_completion(&request_id, &digest, "not-json")
+        .unwrap();
+    let usage = sentinel_common::DomainEvent::new(
+        "agent_llm_usage",
+        &allowance.grant.agent_id.to_string(),
+        "{}",
+        &request_id,
+        0,
+    )
+    .with_operation_id(&format!("llm_usage_{request_id}"));
+    store
+        .persist_llm_completion_usage(&request_id, &digest, &usage)
+        .unwrap();
+    store
+        .record_llm_completion_failure(&request_id, &digest, QA_SCHEMA_ERROR, 1)
+        .unwrap();
+    let event_id = store
+        .resolve_failed_llm_completion_for_model_retry(
+            &request_id,
+            &digest,
+            QA_SCHEMA_ERROR,
+            QA_SCHEMA_RECOVERY_REASON,
+        )
+        .unwrap()
+        .unwrap();
+
+    // Reopen at the actual cross-store crash boundary: the failed outbox is
+    // gone, but the company allowance has not been archived yet.
+    api.event_store = Some(
+        sentinel_limbo::EventStore::open(path.with_extension("events.sqlite").to_str().unwrap())
+            .unwrap(),
+    );
+    assert!(api
+        .event_store
+        .as_ref()
+        .unwrap()
+        .get_llm_completion(&request_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        api.qa_schema_resolution_event(&allowance).unwrap(),
+        Some(event_id.clone())
+    );
+    let mut changed = allowance.clone();
+    changed.grant.agent_id = AgentId(8);
+    assert!(api.qa_schema_resolution_event(&changed).is_err());
+    changed = allowance.clone();
+    changed.dispatch.as_mut().unwrap().request_digest = "f".repeat(64);
+    assert!(api.qa_schema_resolution_event(&changed).is_err());
+
+    project
+        .abandoned_subscription_calls
+        .push(sentinel_workflow::AbandonedSubscriptionCallV1 {
+            allowance: allowance.clone(),
+            resolution_event_id: event_id,
+            abandoned_by: allowance.created_by.clone(),
+            abandoned_at_unix_ms: now_unix_ms(),
+        });
+    assert_eq!(
+        api.qa_schema_correction_count(&project, &allowance.grant)
+            .unwrap(),
+        1
+    );
+    assert!(api
+        .qa_schema_retry_feedback(
+            &project,
+            &allowance.grant.work_item_id,
+            &allowance.grant.provider
+        )
+        .unwrap()
+        .is_some());
+    let mut changed_grant = allowance.grant.clone();
+    changed_grant.assignment_version += 1;
+    assert_eq!(
+        api.qa_schema_correction_count(&project, &changed_grant)
+            .unwrap(),
+        0
+    );
+    project.abandoned_subscription_calls[0].resolution_event_id =
+        Uuid::from_u128(85699).to_string();
+    assert!(api
+        .qa_schema_retry_feedback(
+            &project,
+            &allowance.grant.work_item_id,
+            &allowance.grant.provider
+        )
+        .is_err());
+}
+
+#[test]
+fn qa_schema_retry_feedback_does_not_invent_operator_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
+    let (_, request_id, digest) = dispatch_project_model_work(&api, &context);
+    let mut project = api
+        .store
+        .company_project(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .unwrap();
+    let allowance = project.subscription_call.as_ref().unwrap().clone();
+    let store = api.event_store.as_ref().unwrap();
+    store
+        .resolve_llm_completion_terminal(&request_id, &digest, "operator decision")
+        .unwrap();
+    let event = store
+        .event_by_operation_id(&format!("llm_resolution_{request_id}"))
+        .unwrap()
+        .unwrap();
+    project
+        .abandoned_subscription_calls
+        .push(sentinel_workflow::AbandonedSubscriptionCallV1 {
+            allowance: allowance.clone(),
+            resolution_event_id: event.event_id,
+            abandoned_by: "operator".into(),
+            abandoned_at_unix_ms: now_unix_ms(),
+        });
+    assert!(api
+        .qa_schema_retry_feedback(
+            &project,
+            &allowance.grant.work_item_id,
+            &allowance.grant.provider
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        api.qa_schema_correction_count(&project, &allowance.grant)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn qa_schema_recovery_stops_after_two_exact_assignment_corrections() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
+    dispatch_project_model_work(&api, &context);
+    let mut project = api
+        .store
+        .company_project(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .unwrap();
+    let original = project.subscription_call.as_ref().unwrap().clone();
+    let work = project
+        .work_items
+        .get_mut(&original.grant.work_item_id)
+        .unwrap();
+    work.spec.required_role = CompanyRoleV1::Qa;
+    work.assignments[0].role = CompanyRoleV1::Qa;
+    let store = api.event_store.as_ref().unwrap();
+    let digest = "b".repeat(64);
+    for index in 0..=QA_SCHEMA_MAX_CORRECTIONS {
+        let mut allowance = original.clone();
+        allowance.allowance_id = format!("qa-schema-call-{index}");
+        let request_id = format!("company-provider-{}", allowance.allowance_id);
+        allowance.dispatch.as_mut().unwrap().request_id = request_id.clone();
+        allowance.dispatch.as_mut().unwrap().request_digest = digest.clone();
+        store
+            .reserve_llm_request(&request_id, &digest, &allowance.grant.agent_id.to_string())
+            .unwrap();
+        store
+            .enqueue_llm_completion(&request_id, &digest, "not-json")
+            .unwrap();
+        let usage = sentinel_common::DomainEvent::new(
+            "agent_llm_usage",
+            &allowance.grant.agent_id.to_string(),
+            "{}",
+            &request_id,
+            0,
+        )
+        .with_operation_id(&format!("llm_usage_{request_id}"));
+        store
+            .persist_llm_completion_usage(&request_id, &digest, &usage)
+            .unwrap();
+        store
+            .record_llm_completion_failure(&request_id, &digest, QA_SCHEMA_ERROR, 1)
+            .unwrap();
+        if index < QA_SCHEMA_MAX_CORRECTIONS {
+            let event_id = store
+                .resolve_failed_llm_completion_for_model_retry(
+                    &request_id,
+                    &digest,
+                    QA_SCHEMA_ERROR,
+                    QA_SCHEMA_RECOVERY_REASON,
+                )
+                .unwrap()
+                .unwrap();
+            project.abandoned_subscription_calls.push(
+                sentinel_workflow::AbandonedSubscriptionCallV1 {
+                    abandoned_by: allowance.created_by.clone(),
+                    allowance,
+                    resolution_event_id: event_id,
+                    abandoned_at_unix_ms: now_unix_ms(),
+                },
+            );
+        } else {
+            project.subscription_call = Some(allowance);
+            assert_eq!(
+                api.qa_schema_correction_count(&project, &original.grant)
+                    .unwrap(),
+                QA_SCHEMA_MAX_CORRECTIONS
+            );
+            assert_eq!(
+                api.recover_failed_qa_schema_call(&project),
+                Err("QA schema correction limit reached; leadership action required")
+            );
+            assert_eq!(
+                store
+                    .get_llm_completion(&request_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "failed"
+            );
+            assert!(store
+                .event_by_operation_id(&format!("llm_resolution_{request_id}"))
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
+#[test]
 fn qa_regrant_requires_the_archived_exact_assignment_and_original_issuer() {
     let temp = tempfile::tempdir().unwrap();
     let (api, context) = planning_fixture(&temp.path().join("company.sqlite"));
