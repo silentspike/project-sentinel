@@ -206,6 +206,15 @@ class CodingQaTests(unittest.TestCase):
         self.assertEqual(result["files"], len(NODE_FILES))
         self.assertEqual(result["input_inventory_sha256"], expected_input_inventory(NODE_FILES))
 
+    def test_fixture_resolves_hosted_interpreter_without_changing_production_path(self):
+        with mock.patch("qa_broker_fixture.shutil.which", side_effect=lambda name: {
+                "node": "/opt/hostedtoolcache/node/bin/node",
+                "python3": "/usr/bin/python3",
+        }[name]):
+            subject = load_runner(self.broker.path)
+        self.assertIn("/opt/hostedtoolcache/node/bin", subject.ENVIRONMENT["PATH"].split(os.pathsep))
+        self.assertIn('"PATH": "/usr/bin:/bin"', RUNNER.read_text())
+
     def test_input_inventory_uses_utf8_relative_paths_and_canonical_compact_pairs(self):
         files = {"data/z.bin": b"\x00\xff", "data/caf\u00e9.txt": "na\u00efve\n", "empty.txt": b""}
         paths = self.stage(files)
