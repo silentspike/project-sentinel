@@ -1080,6 +1080,131 @@ fn workflow_lineage_accepts_actual_history_without_inventing_optional_records() 
 }
 
 #[test]
+fn public_lineage_preserves_failed_qa_but_only_current_run_blocks() {
+    for state in [
+        QaRunState::Planned,
+        QaRunState::CompletedPass,
+        QaRunState::CompletedFail,
+    ] {
+        let temp = TempDir::new().expect("tempdir");
+        let config = config(&temp);
+        let candidate = candidate();
+        let old_plan = plan_for(&candidate);
+        let mut old_run = run_for(&old_plan);
+        old_run.state = QaRunState::CompletedFail;
+        old_run.finished_at_ms = Some(2);
+        old_run.harness_outcome = Some(QaHarnessOutcome::Fail);
+        old_run.cleanup_receipt = Some(reference("old-cleanup", 1));
+        let mut aggregate = DeliveryAggregateV1::new("tenant-a", "project-private-1");
+        aggregate.revision = 1;
+        aggregate
+            .candidates
+            .insert(candidate.candidate_id.clone(), candidate.clone());
+        aggregate
+            .qa_plans
+            .insert(old_plan.plan_id.clone(), old_plan.clone());
+        aggregate
+            .qa_runs
+            .insert(old_run.run_id.clone(), old_run.clone());
+        let mut new_plan = old_plan.clone();
+        new_plan.plan_id = "new-plan".to_string();
+        new_plan.runner_binary_digest = digest("new-evaluator");
+        let new_plan = new_plan.seal().expect("new plan");
+        let mut new_run = run_for(&new_plan);
+        new_run.run_id = "new-run".to_string();
+        new_run.state = state;
+        new_run.durable_event_generation = 2;
+        new_run.request_digest = digest("new-run-request");
+        new_run.supersedes = Some(VersionedRefV1 {
+            id: old_run.run_id.clone(),
+            generation: old_run.generation,
+            digest: old_run.request_digest.clone(),
+        });
+        let store = DeliveryStore::open(&config).expect("store");
+        for revision in 1..=2 {
+            if revision == 2 {
+                aggregate.revision = revision;
+                aggregate
+                    .qa_plans
+                    .insert(new_plan.plan_id.clone(), new_plan.clone());
+                aggregate
+                    .qa_runs
+                    .insert(new_run.run_id.clone(), new_run.clone());
+            }
+            store
+                .commit(&DeliveryCommitRequestV1 {
+                    tenant_id: "tenant-a".to_string(),
+                    project_id: "project-private-1".to_string(),
+                    expected_revision: revision - 1,
+                    principal_id: "qa".to_string(),
+                    command_kind: "fixture".to_string(),
+                    idempotency_key: format!("fixture-{revision}"),
+                    command_digest: digest(&format!("fixture-{revision}")),
+                    aggregate: aggregate.clone(),
+                    event_type: "qa_fixture".to_string(),
+                    event_payload: serde_json::json!({}),
+                    committed_at_ms: revision,
+                })
+                .expect("fixture commit");
+        }
+        drop(store);
+        let config = DeliveryStoreConfigV1::new(temp.path(), "delivery.redb")
+            .expect("existing store config");
+        let auditor = principal("auditor-private", AuthorityRole::Auditor);
+        let product = ConfiguredDeliveryCore::open(
+            &config,
+            DeterministicIntegration {
+                principals: vec![
+                    principal("developer-private", AuthorityRole::Developer),
+                    auditor.clone(),
+                ],
+                execution_ready: true,
+                workflow_fault: WorkflowFault::None,
+                lineage_phase: Arc::default(),
+            },
+            DeterministicEffects,
+            DeterministicPublisher::default(),
+        )
+        .expect("configured product");
+        let lineage = product
+            .read_public_lineage(
+                &CommandContextV1 {
+                    principal: auditor,
+                    idempotency_key: "read-qa-history".to_string(),
+                    now_ms: 100,
+                },
+                "tenant-a",
+                "project-private-1",
+            )
+            .expect("lineage");
+        let runs = lineage
+            .nodes
+            .iter()
+            .filter(|node| node.label == "Independent QA run")
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().any(|node| node.state == "completed_fail"));
+        assert_eq!(
+            lineage
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "Independent QA has no promotable result"),
+            state == QaRunState::CompletedFail
+        );
+        drop(product);
+        assert_eq!(
+            DeliveryStore::open(&config)
+                .expect("reopened store")
+                .load("tenant-a", "project-private-1")
+                .expect("aggregate")
+                .expect("persisted")
+                .qa_runs[&old_run.run_id],
+            old_run
+        );
+    }
+}
+
+#[test]
 fn workflow_lineage_fails_closed_on_omission_digest_substitution_and_private_keys() {
     for fault in [
         WorkflowFault::OmitClass,
