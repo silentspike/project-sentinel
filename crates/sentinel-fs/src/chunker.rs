@@ -136,6 +136,22 @@ impl Iterator for ChunkIter<'_> {
     type Item = Chunk;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let chunk = self.next_borrowed()?;
+        Some(Chunk {
+            hash: chunk.hash,
+            data: chunk.data.to_vec(),
+        })
+    }
+}
+
+/// A borrowed chunk allows deduplication before copying or compression.
+pub(crate) struct BorrowedChunk<'a> {
+    pub hash: ChunkHash,
+    pub data: &'a [u8],
+}
+
+impl<'a> ChunkIter<'a> {
+    pub(crate) fn next_borrowed(&mut self) -> Option<BorrowedChunk<'a>> {
         if self.pos >= self.data.len() {
             return None;
         }
@@ -146,10 +162,10 @@ impl Iterator for ChunkIter<'_> {
         // If remaining data fits within max, take it all as the last chunk.
         if remaining <= self.max_size {
             let end = start + remaining;
-            let chunk_data = self.data[start..end].to_vec();
-            let hash = blake3_hash_128(&chunk_data);
+            let chunk_data = &self.data[start..end];
+            let hash = blake3_hash_128(chunk_data);
             self.pos = end;
-            return Some(Chunk {
+            return Some(BorrowedChunk {
                 hash,
                 data: chunk_data,
             });
@@ -169,10 +185,10 @@ impl Iterator for ChunkIter<'_> {
             }
         }
 
-        let chunk_data = self.data[start..split].to_vec();
-        let hash = blake3_hash_128(&chunk_data);
+        let chunk_data = &self.data[start..split];
+        let hash = blake3_hash_128(chunk_data);
         self.pos = split;
-        Some(Chunk {
+        Some(BorrowedChunk {
             hash,
             data: chunk_data,
         })
@@ -260,6 +276,25 @@ mod tests {
         let chunks: Vec<_> = chunk_data(data).collect();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].data, data);
+    }
+
+    #[test]
+    fn borrowed_chunks_preserve_owned_and_parallel_profiles() {
+        for len in [0, 7, MAX_CHUNK_BYTES, MAX_CHUNK_BYTES + 1, 900_000] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let expected = chunk_data_parallel(&data);
+            let owned: Vec<_> = chunk_data(&data).collect();
+            let mut borrowed = chunk_data(&data);
+            for (parallel, owned) in expected.iter().zip(&owned) {
+                let chunk = borrowed.next_borrowed().unwrap();
+                assert_eq!(chunk.hash, parallel.hash);
+                assert_eq!(chunk.hash, owned.hash);
+                assert_eq!(chunk.data, parallel.data.as_slice());
+                assert_eq!(chunk.data, owned.data.as_slice());
+            }
+            assert!(borrowed.next_borrowed().is_none());
+            assert_eq!(expected.len(), owned.len());
+        }
     }
 
     #[test]

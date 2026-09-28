@@ -12,6 +12,9 @@ use crate::artifact::{ArtifactPlane, ChunkHash};
 /// Uses batch reads (io_uring when available) to fetch all chunks in one pass,
 /// then concatenates the decompressed data. Cache-first for each chunk.
 pub fn read_object(plane: &ArtifactPlane, object_id: u64) -> anyhow::Result<Vec<u8>> {
+    if let Some(content) = plane.workspace_ref(object_id)? {
+        return plane.read_workspace_range(content, 0, usize::try_from(content.size)?);
+    }
     let meta = plane
         .get_object(object_id)?
         .ok_or_else(|| anyhow::anyhow!("Object {object_id} not found"))?;
@@ -38,14 +41,21 @@ pub fn read_object_streaming(
     plane: &ArtifactPlane,
     object_id: u64,
 ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Vec<u8>>> + '_> {
-    let manifest = plane
-        .get_manifest(object_id)?
-        .ok_or_else(|| anyhow::anyhow!("Manifest for object {object_id} not found"))?;
+    let workspace = plane.workspace_ref(object_id)?;
+    let manifest = if workspace.is_some() {
+        Vec::new()
+    } else {
+        plane
+            .get_manifest(object_id)?
+            .ok_or_else(|| anyhow::anyhow!("Manifest for object {object_id} not found"))?
+    };
 
     Ok(ChunkStream {
         plane,
         manifest,
         index: 0,
+        workspace,
+        offset: 0,
     })
 }
 
@@ -54,12 +64,30 @@ struct ChunkStream<'a> {
     plane: &'a ArtifactPlane,
     manifest: Vec<ChunkHash>,
     index: usize,
+    workspace: Option<crate::artifact::WorkspaceContentRef>,
+    offset: u64,
 }
 
 impl Iterator for ChunkStream<'_> {
     type Item = anyhow::Result<Vec<u8>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(content) = self.workspace {
+            if self.offset >= content.size {
+                return None;
+            }
+            let result = self.plane.read_workspace_range(
+                content,
+                self.offset,
+                crate::chunker::MAX_CHUNK_BYTES,
+            );
+            // Advance even on error, matching the legacy iterator's behavior.
+            self.offset = self
+                .offset
+                .saturating_add(crate::chunker::MAX_CHUNK_BYTES as u64)
+                .min(content.size);
+            return Some(result);
+        }
         if self.index >= self.manifest.len() {
             return None;
         }
