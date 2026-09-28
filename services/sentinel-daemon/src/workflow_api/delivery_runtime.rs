@@ -13,6 +13,7 @@ use sentinel_workflow::{
     DependencyReadiness, GateEvidencePort, IndependentGateEvidence, PendingGateEvidenceV1,
     ProjectId, ProjectLifecycleStateV1, TenantId, WorkflowPortError, WorkflowStore,
 };
+use sha2::{Digest as _, Sha256};
 
 use crate::delivery::{
     expected_effect_saga_contract_digest, expected_integration_contract_digest,
@@ -39,6 +40,7 @@ use super::PrincipalAuthenticator;
 const DELIVERY_AUTHORITY_GENERATION: u64 = 1;
 const DELIVERY_EVENT_TOPIC: &str = "sentinel.delivery.events";
 const WEB_QA_PROGRAM: &str = "sentinel-web-qa";
+const WEB_QA_SOURCE: &[u8] = include_bytes!("../../../../deploy/scripts/web-qa-v1.py");
 const WORK_ITEM_GATE_PROGRAM: &str = "sentinel-work-item-gate";
 
 type M0QaEvidenceComponents = (
@@ -46,6 +48,21 @@ type M0QaEvidenceComponents = (
     Vec<QaCaseResultV1>,
     Vec<QaDeterministicAssertionResultV1>,
 );
+
+pub(super) fn web_qa_runner_version() -> String {
+    format!("{:x}", Sha256::digest(WEB_QA_SOURCE))
+}
+
+fn verify_web_qa_runner(bytes: &[u8]) -> Result<(), DeliveryError> {
+    if bytes == WEB_QA_SOURCE {
+        Ok(())
+    } else {
+        Err(DeliveryError::AdapterUnavailable {
+            dependency: "qa_runner",
+            reason: "installed QA runner differs from the pinned evaluator".to_string(),
+        })
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct WorkflowWorkItemGate {
@@ -766,6 +783,13 @@ impl DeliveryIntegrationPort for WorkflowDeliveryIntegration {
         let qa_agent = qa.principal.agent_id.ok_or_else(|| {
             DeliveryError::AuthorityDenied("assigned QA has no runtime agent".to_string())
         })?;
+        let runner = std::fs::read("/usr/bin/sentinel-web-qa").map_err(|_| {
+            DeliveryError::AdapterUnavailable {
+                dependency: "qa_runner",
+                reason: "pinned QA runner is unavailable".to_string(),
+            }
+        })?;
+        verify_web_qa_runner(&runner)?;
         let work_item_id = qa_work_item_id(&request.invocation.id).map_err(storage_error)?;
         let mut inputs = Vec::new();
         for artifact in &request.candidate_artifacts {
@@ -1917,6 +1941,17 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qa_evaluator_is_pinned_to_actual_script_bytes() {
+        assert!(verify_web_qa_runner(WEB_QA_SOURCE).is_ok());
+        let mut modified = WEB_QA_SOURCE.to_vec();
+        modified.push(b'\n');
+        assert!(verify_web_qa_runner(&modified).is_err());
+        assert!(verify_web_qa_runner(b"").is_err());
+        assert_eq!(web_qa_runner_version().len(), 64);
+        assert!(ContentDigest::parse(web_qa_runner_version()).is_ok());
+    }
 
     #[test]
     fn workflow_lineage_nodes_use_nonzero_contiguous_ordinals() {

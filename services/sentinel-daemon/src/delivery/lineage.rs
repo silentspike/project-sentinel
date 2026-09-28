@@ -133,6 +133,30 @@ pub fn validate_delivery_aggregate_references(
         if run.plan.generation != plan.generation || run.plan.digest != plan.plan_digest {
             return Err(corrupt("QA run plan reference is stale"));
         }
+        if let Some(previous_ref) = &run.supersedes {
+            let previous = aggregate
+                .qa_runs
+                .get(&previous_ref.id)
+                .ok_or_else(|| corrupt("superseded QA run is missing"))?;
+            let previous_plan = aggregate
+                .qa_plans
+                .get(&previous.plan.id)
+                .ok_or_else(|| corrupt("superseded QA plan is missing"))?;
+            if previous_ref.id == run.run_id
+                || previous_ref.generation != previous.generation
+                || previous_ref.digest != previous.request_digest
+                || previous.durable_event_generation >= run.durable_event_generation
+                || !matches!(
+                    previous.state,
+                    QaRunState::CompletedFail | QaRunState::HarnessError
+                )
+                || previous.cleanup_receipt.is_none()
+                || previous_plan.candidate != plan.candidate
+                || previous_plan.runner_binary_digest == plan.runner_binary_digest
+            {
+                return Err(corrupt("superseded QA run binding is stale"));
+            }
+        }
         if let Some(gate_ref) = &run.gate_receipt {
             let gate = aggregate
                 .gates
@@ -1158,9 +1182,6 @@ fn validate_workflow_lineage(
         WorkflowLineageKindV1::Project,
         WorkflowLineageKindV1::WorkItem,
         WorkflowLineageKindV1::Participant,
-        WorkflowLineageKindV1::Decision,
-        WorkflowLineageKindV1::Handoff,
-        WorkflowLineageKindV1::Blocker,
     ]);
     let mut kinds = BTreeSet::new();
     let mut ordinals = BTreeSet::new();
@@ -1183,7 +1204,7 @@ fn validate_workflow_lineage(
             .or_default()
             .push(node.node_ordinal);
     }
-    if kinds != required {
+    if !required.is_subset(&kinds) {
         return Err(corrupt("required workflow class is omitted"));
     }
     for root in [

@@ -20,7 +20,7 @@ use sentinel_workflow::{
     WorkflowError, WorkflowErrorCode,
 };
 
-use super::delivery_runtime::{m0_qa_evidence_graph, m0_qa_fixture_cases};
+use super::delivery_runtime::{m0_qa_evidence_graph, m0_qa_fixture_cases, web_qa_runner_version};
 use super::{
     delivery_error, delivery_principal, json, json_error, BoundPrincipal, WorkflowApi,
     WorkflowHttpResponse,
@@ -129,6 +129,7 @@ pub(super) fn reconcile_internal(
             &caller.principal_id,
             caller.authority_generation,
             &intent,
+            &run_id,
         ),
     )?;
     let operation_id = super::stable_operation_id(
@@ -266,12 +267,12 @@ fn next_internal_intent(
     if !candidate_registered {
         return Ok(Some(DeliveryIntentV1::PrepareCandidate { project_id }));
     }
-    let Some(qa_state) = qa_state else {
-        return Ok(Some(DeliveryIntentV1::AssignQa { project_id }));
-    };
     if delivery_exists {
         return Ok(None);
     }
+    let Some(qa_state) = qa_state else {
+        return Ok(Some(DeliveryIntentV1::AssignQa { project_id }));
+    };
     match qa_state {
         QaRunState::Planned | QaRunState::Admitted | QaRunState::Running => {
             Ok(Some(DeliveryIntentV1::ExecuteQa { project_id }))
@@ -1126,8 +1127,10 @@ fn build_plan(material: &ProjectMaterial) -> Result<QaEvaluationPlanV1, Delivery
     QaEvaluationPlanV1 {
         schema_version: DELIVERY_SCHEMA_V1,
         plan_id: format!(
-            "qa-plan-{}-{}",
-            material.project.project_id.0, material.candidate.generation
+            "qa-plan-{}-{}-{}",
+            material.project.project_id.0,
+            material.candidate.generation,
+            web_qa_runner_version()
         ),
         generation: material.candidate.generation,
         request: VersionedRefV1 {
@@ -1174,11 +1177,7 @@ fn build_plan(material: &ProjectMaterial) -> Result<QaEvaluationPlanV1, Delivery
             DELIVERY_SCHEMA_V1,
             &material.project.project_id,
         )?,
-        runner_binary_digest: ContentDigest::of_domain(
-            "m0-qa-runner",
-            DELIVERY_SCHEMA_V1,
-            &"sentinel-web-qa",
-        )?,
+        runner_binary_digest: ContentDigest::parse(web_qa_runner_version())?,
         toolchain_digest: material.candidate.toolchain_digest.clone(),
         sandbox_profile_digest: material.candidate.runtime_profile_digest.clone(),
         capability_digest: ContentDigest::of_domain(
@@ -1207,8 +1206,10 @@ fn build_plan(material: &ProjectMaterial) -> Result<QaEvaluationPlanV1, Delivery
 
 fn run_id(material: &ProjectMaterial) -> String {
     format!(
-        "qa-run-{}-{}",
-        material.project.project_id.0, material.candidate.generation
+        "qa-run-{}-{}-{}",
+        material.project.project_id.0,
+        material.candidate.generation,
+        web_qa_runner_version()
     )
 }
 
@@ -1323,7 +1324,27 @@ fn assign_qa(
     require_current_principal(caller, &release_manager)?;
     let plan = build_plan(&material)?;
     let qa = current_principal(api, &material.project, CompanyRoleV1::Qa)?;
-    let run = build_run(&material, &plan, qa)?;
+    let mut run = build_run(&material, &plan, qa)?;
+    if let Some(aggregate) = delivery.aggregate(&caller.tenant_id, &project_id.0)? {
+        if let Some(previous) = aggregate
+            .qa_runs
+            .values()
+            .filter(|previous| {
+                previous.run_id != run.run_id
+                    && aggregate
+                        .qa_plans
+                        .get(&previous.plan.id)
+                        .is_some_and(|old_plan| old_plan.candidate == plan.candidate)
+            })
+            .max_by_key(|previous| previous.durable_event_generation)
+        {
+            run.supersedes = Some(VersionedRefV1 {
+                id: previous.run_id.clone(),
+                generation: previous.generation,
+                digest: previous.request_digest.clone(),
+            });
+        }
+    }
     let receipt = delivery.assign_qa(
         &context(caller.clone(), operation_id, "assign-qa", now_ms),
         &caller.tenant_id,
@@ -1662,7 +1683,10 @@ fn release(
     let gate = aggregate
         .gates
         .values()
-        .find(|gate| gate.candidate.id == material.candidate.candidate_id)
+        .find(|gate| {
+            gate.candidate.id == material.candidate.candidate_id
+                && gate.plan.digest == plan.plan_digest
+        })
         .ok_or_else(|| DeliveryError::MissingEvidence("QA release gate".to_string()))?;
     if run.state != QaRunState::CompletedPass || !gate.passed {
         return Err(DeliveryError::MissingEvidence(
@@ -2034,6 +2058,10 @@ mod tests {
                 true,
             )
             .unwrap(),
+            None
+        );
+        assert_eq!(
+            next_internal_intent(project_id.clone(), true, None, true).unwrap(),
             None
         );
         for state in [

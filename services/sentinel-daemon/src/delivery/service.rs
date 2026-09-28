@@ -433,6 +433,7 @@ where
             &qa_authority.principal,
             AuthorityRole::Qa,
         )?;
+        validate_qa_assignment_history(&aggregate, &plan, &run)?;
         let candidate = aggregate
             .candidates
             .get_mut(candidate_id)
@@ -459,7 +460,9 @@ where
                 "QA plan is not bound to the exact candidate".to_string(),
             ));
         }
-        transition_candidate(candidate.state, CandidateState::QaAssigned)?;
+        if run.supersedes.is_none() {
+            transition_candidate(candidate.state, CandidateState::QaAssigned)?;
+        }
         candidate.state = CandidateState::QaAssigned;
         run.durable_event_generation = aggregate.revision + 1;
         if aggregate
@@ -2910,6 +2913,78 @@ fn validate_source_tuple(name: &str, value: &SourceTupleV1) -> Result<(), Delive
         return Err(DeliveryError::Validation(format!(
             "{name} source tuple is incomplete or malformed"
         )));
+    }
+    Ok(())
+}
+
+fn validate_qa_assignment_history(
+    aggregate: &DeliveryAggregateV1,
+    plan: &QaEvaluationPlanV1,
+    run: &QaEvaluationRunReceiptV1,
+) -> Result<(), DeliveryError> {
+    let previous = aggregate
+        .qa_runs
+        .values()
+        .filter(|previous| {
+            aggregate
+                .qa_plans
+                .get(&previous.plan.id)
+                .is_some_and(|old_plan| old_plan.candidate == plan.candidate)
+        })
+        .max_by_key(|previous| previous.durable_event_generation);
+    if run.retry_of.is_some() {
+        return Err(DeliveryError::Validation(
+            "QA assignment is not a case retry".to_string(),
+        ));
+    }
+    let Some(previous) = previous else {
+        if run.supersedes.is_some() {
+            return Err(DeliveryError::StaleEvidence(
+                "superseded QA run is missing".to_string(),
+            ));
+        }
+        return Ok(());
+    };
+    let previous_ref = VersionedRefV1 {
+        id: previous.run_id.clone(),
+        generation: previous.generation,
+        digest: previous.request_digest.clone(),
+    };
+    let previous_plan = aggregate
+        .qa_plans
+        .get(&previous.plan.id)
+        .ok_or_else(|| DeliveryError::CorruptStore("previous QA plan is missing".to_string()))?;
+    let candidate = aggregate
+        .candidates
+        .get(&plan.candidate.id)
+        .ok_or_else(|| DeliveryError::NotFound("QA candidate".to_string()))?;
+    if run.supersedes.as_ref() != Some(&previous_ref)
+        || !matches!(
+            previous.state,
+            QaRunState::CompletedFail | QaRunState::HarnessError
+        )
+        || previous.cleanup_receipt.is_none()
+        || previous.gate_receipt.is_some()
+        || !matches!(candidate.state, CandidateState::QaRunning)
+        || run.run_id == previous.run_id
+        || plan.plan_id == previous_plan.plan_id
+        || plan.runner_binary_digest == previous_plan.runner_binary_digest
+    {
+        return Err(DeliveryError::Conflict(
+            "QA renewal requires a distinct evaluator and the latest cleaned failed run"
+                .to_string(),
+        ));
+    }
+    // A harness upgrade must not quietly change the candidate, tests, policy,
+    // environment or authority. The failed run and its evidence stay immutable.
+    let mut expected = previous_plan.clone();
+    expected.plan_id = plan.plan_id.clone();
+    expected.runner_binary_digest = plan.runner_binary_digest.clone();
+    expected.plan_digest = plan.plan_digest.clone();
+    if &expected != plan || run.actors != previous.actors {
+        return Err(DeliveryError::StaleEvidence(
+            "QA renewal changed more than the pinned evaluator".to_string(),
+        ));
     }
     Ok(())
 }

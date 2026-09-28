@@ -198,6 +198,8 @@ enum WorkflowFault {
     #[default]
     None,
     OmitClass,
+    OmitOptionalClass(WorkflowLineageKindV1),
+    NoOptionalHistory,
     SubstituteDigest,
     PrivateBinding,
     GenerationMismatch,
@@ -362,8 +364,27 @@ impl DeliveryIntegrationPort for DeterministicIntegration {
             | WorkflowFault::AuthorityRevoked
             | WorkflowFault::CandidateSwap => {}
             WorkflowFault::OmitClass => {
-                snapshot.nodes.pop();
-                snapshot.edges.pop();
+                snapshot
+                    .nodes
+                    .retain(|node| node.kind != WorkflowLineageKindV1::WorkItem);
+                snapshot
+                    .edges
+                    .retain(|edge| edge.from_ordinal != 4 && edge.to_ordinal != 4);
+            }
+            WorkflowFault::OmitOptionalClass(kind) => {
+                snapshot.nodes.retain(|node| node.kind != kind);
+                snapshot.edges = snapshot
+                    .nodes
+                    .windows(2)
+                    .map(|pair| WorkflowLineageEdgeV1 {
+                        from_ordinal: pair[0].node_ordinal,
+                        to_ordinal: pair[1].node_ordinal,
+                    })
+                    .collect();
+            }
+            WorkflowFault::NoOptionalHistory => {
+                snapshot.nodes.truncate(5);
+                snapshot.edges.truncate(4);
             }
             WorkflowFault::SubstituteDigest => snapshot.candidate.digest = digest("substitute"),
             WorkflowFault::PrivateBinding => snapshot.tenant_id = "secret=private".to_string(),
@@ -1005,6 +1026,57 @@ fn production_shape_persists_publishes_and_returns_only_authorized_redacted_line
             .expect("published receipt persisted"),
         0
     );
+}
+
+#[test]
+fn workflow_lineage_accepts_actual_history_without_inventing_optional_records() {
+    for fault in [
+        WorkflowFault::OmitOptionalClass(WorkflowLineageKindV1::Decision),
+        WorkflowFault::OmitOptionalClass(WorkflowLineageKindV1::Handoff),
+        WorkflowFault::OmitOptionalClass(WorkflowLineageKindV1::Blocker),
+        WorkflowFault::NoOptionalHistory,
+    ] {
+        let temp = TempDir::new().expect("tempdir");
+        let developer = principal("developer-private", AuthorityRole::Developer);
+        let auditor = principal("auditor-private", AuthorityRole::Auditor);
+        let product = ConfiguredDeliveryCore::open(
+            &config(&temp),
+            DeterministicIntegration {
+                principals: vec![developer.clone(), auditor.clone()],
+                execution_ready: true,
+                workflow_fault: fault,
+                lineage_phase: Arc::default(),
+            },
+            DeterministicEffects,
+            DeterministicPublisher::default(),
+        )
+        .expect("configured product");
+        product
+            .register_candidate(
+                &CommandContextV1 {
+                    principal: developer,
+                    idempotency_key: "register-sparse".to_string(),
+                    now_ms: 100,
+                },
+                candidate(),
+            )
+            .expect("candidate commit");
+        let lineage = product
+            .read_public_lineage(
+                &CommandContextV1 {
+                    principal: auditor,
+                    idempotency_key: "read-sparse".to_string(),
+                    now_ms: 101,
+                },
+                "tenant-a",
+                "project-private-1",
+            )
+            .expect("a workflow need not contain optional history");
+        assert!(!lineage.nodes.is_empty());
+        product
+            .health()
+            .expect("lineage read leaves the authoritative store healthy");
+    }
 }
 
 #[test]
