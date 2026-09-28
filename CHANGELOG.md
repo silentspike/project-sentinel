@@ -1,5 +1,10 @@
 # Changelog
 
+- Keep Sales and first-plan inference routing local to their assigned employee. Expired,
+  already dispatched and completed calls cannot mask another
+  project's current work or replay an unknown provider effect. Preserve the
+  consumed planning authority and its durable recovery context (#856).
+
 - Validate archived source reviews against their own source/reviewer provider
   authority, not a newer live QA grant. Preserve historical retries while a
   post-rework QA schema correction archives and regrants its exact assignment,
