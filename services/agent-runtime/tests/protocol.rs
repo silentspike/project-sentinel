@@ -273,6 +273,70 @@ fn cancellable_command_request() -> WorkbenchRequest {
     request
 }
 
+#[test]
+fn production_executor_commands_fail_closed_without_outer_boundary_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let executor = WorkbenchExecutor::new(
+        directory.path().join("workspace"),
+        directory.path().join("artifacts"),
+    )
+    .with_command_runner(PathBuf::from(env!("CARGO_BIN_EXE_agent-runtime")));
+    let result = executor.execute(
+        cancellable_command_request(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    match result {
+        WorkbenchMessage::Result {
+            outcome,
+            error,
+            output,
+            ..
+        } => {
+            assert_eq!(outcome, WorkbenchOutcome::Failed);
+            assert_eq!(error.unwrap().code, "command_isolation_unavailable");
+            assert!(!output.contains_key("exit_code"));
+        }
+        other => panic!("expected fail-closed command result: {other:?}"),
+    }
+}
+
+#[test]
+fn startup_rejects_incomplete_command_boundary_before_readiness() {
+    let directory = tempfile::tempdir().unwrap();
+    for budget in [None, Some("0"), Some("not-a-number")] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-runtime"));
+        command
+            .env(
+                "SENTINEL_WORKBENCH_ATTESTATION_NONCE",
+                next_attestation_nonce(),
+            )
+            .env(
+                "SENTINEL_WORKSPACE_ROOT",
+                directory.path().join("workspace"),
+            )
+            .env("SENTINEL_ARTIFACT_ROOT", directory.path().join("artifacts"))
+            .env(
+                "SENTINEL_COMMAND_CGROUP_ROOT",
+                directory.path().join("not-a-cgroup"),
+            )
+            .env_remove("SENTINEL_WORKSPACE_BUDGET_BYTES")
+            .stdin(Stdio::null());
+        if let Some(budget) = budget {
+            command.env("SENTINEL_WORKSPACE_BUDGET_BYTES", budget);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(126));
+        assert!(
+            output.stdout.is_empty(),
+            "startup must not emit protocol readiness"
+        );
+        assert!(
+            !directory.path().join("artifacts").exists(),
+            "invalid boundary must not publish receipts"
+        );
+    }
+}
+
 fn prepare_completion_receipt_crash_state(
     workspace: &Path,
     artifacts: &Path,

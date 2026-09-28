@@ -305,6 +305,8 @@ struct AgentRuntimeStateResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct FsStorageStatsResponse {
     accepted: bool,
+    accounting_basis: String,
+    dedup_metrics_available: bool,
     fs_mount: Option<String>,
     cas_blob_count: u64,
     cas_bytes_on_disk: u64,
@@ -335,6 +337,8 @@ struct AgentFsEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct AgentFsBrowseResponse {
     accepted: bool,
+    accounting_basis: String,
+    dedup_metrics_available: bool,
     agent_id: u16,
     aggregate_id: String,
     inode: u64,
@@ -2658,6 +2662,8 @@ fn inspect_fs_storage_stats(
         .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Storage-Stats nicht lesbar"))?;
     Ok(FsStorageStatsResponse {
         accepted: true,
+        accounting_basis: stats.accounting_basis.to_string(),
+        dedup_metrics_available: stats.dedup_metrics_available,
         fs_mount: state.fs_mount.clone(),
         cas_blob_count: stats.cas_blob_count,
         cas_bytes_on_disk: stats.cas_bytes_on_disk,
@@ -2765,6 +2771,12 @@ fn inspect_agent_fs_browse(
     let stats = layer.storage_stats().ok();
     Ok(AgentFsBrowseResponse {
         accepted: true,
+        accounting_basis: stats
+            .as_ref()
+            .map(|s| s.accounting_basis)
+            .unwrap_or("unavailable")
+            .to_string(),
+        dedup_metrics_available: stats.as_ref().is_some_and(|s| s.dedup_metrics_available),
         agent_id,
         aggregate_id,
         inode,

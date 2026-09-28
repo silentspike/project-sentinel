@@ -99,6 +99,8 @@ pub struct BwrapConfig {
     pub die_with_parent: bool,
     /// Clear the parent daemon environment before starting the sandbox.
     pub clear_environment: bool,
+    /// Trusted command-controller bind, never supplied by an employee request.
+    pub command_boundary: Option<(String, u64)>,
     /// Missing host binds are fatal for profiles whose isolation contract is
     /// defined by those exact paths (the agent workbench).
     pub require_all_binds: bool,
@@ -149,6 +151,7 @@ impl BwrapConfig {
             share_net: false,
             die_with_parent: true,
             clear_environment: false,
+            command_boundary: None,
             require_all_binds: false,
             // TOGAF: --proc /proc
             proc_mount: Some("/proc".to_string()),
@@ -199,6 +202,27 @@ impl BwrapConfig {
                 .into_owned(),
             "/artifacts".to_string(),
         ));
+        self
+    }
+
+    /// Route native tools and direct file tools through the same private FUSE workspace.
+    /// Inputs and trusted completion artifacts retain their separate host boundaries.
+    pub fn with_workbench_workspace(mut self, workspace: &Path) -> Self {
+        self.writable_binds
+            .retain(|(_, guest)| guest != "/workspace");
+        self.writable_binds.push((
+            workspace.to_string_lossy().into_owned(),
+            "/workspace".to_string(),
+        ));
+        self
+    }
+
+    pub fn with_command_boundary(mut self, commands: &Path, budget_bytes: u64) -> Self {
+        self.writable_binds.push((
+            commands.to_string_lossy().into_owned(),
+            "/run/sentinel-command-cgroups".to_owned(),
+        ));
+        self.command_boundary = Some(("/run/sentinel-command-cgroups".to_owned(), budget_bytes));
         self
     }
 
@@ -267,6 +291,10 @@ impl BwrapConfig {
         let mut cmd = Command::new("bwrap");
         if config.clear_environment {
             cmd.env_clear().envs(WORKBENCH_ENVIRONMENT);
+            if let Some((root, budget)) = &config.command_boundary {
+                cmd.env("SENTINEL_COMMAND_CGROUP_ROOT", root)
+                    .env("SENTINEL_WORKSPACE_BUDGET_BYTES", budget.to_string());
+            }
         }
         cmd.args(&args)
             .stdin(std::process::Stdio::piped())
@@ -647,6 +675,29 @@ mod tests {
     }
 
     #[test]
+    fn chunk_workspace_replaces_only_the_writable_workspace_bind() {
+        let config = BwrapConfig::for_agent("test")
+            .for_workbench()
+            .with_workbench_roots(Path::new("/ram/agents/test"))
+            .with_workbench_workspace(Path::new("/sentinel-fs/AGENT-01/workspaces"));
+        let workspaces: Vec<_> = config
+            .writable_binds
+            .iter()
+            .filter(|(_, guest)| guest == "/workspace")
+            .collect();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].0, "/sentinel-fs/AGENT-01/workspaces");
+        assert!(config.writable_binds.contains(&(
+            "/ram/agents/test/artifacts".to_owned(),
+            "/artifacts".to_owned(),
+        )));
+        assert!(config.readonly_overlay_binds.contains(&(
+            "/ram/agents/test/inputs".to_owned(),
+            "/workspace/.inputs".to_owned(),
+        )));
+    }
+
+    #[test]
     fn workbench_roots_stay_inside_the_agent_backing_directory() {
         let config = BwrapConfig::for_agent("test")
             .for_workbench()
@@ -703,6 +754,30 @@ mod tests {
             workspace < inputs,
             "read-only input overlay must be mounted last"
         );
+    }
+
+    #[test]
+    fn command_controller_is_separate_from_employee_workspace_and_receipts() {
+        let config = BwrapConfig::for_agent("test")
+            .for_workbench()
+            .with_workbench_roots(Path::new("/ram/agents/test"))
+            .with_command_boundary(
+                Path::new("/sys/fs/cgroup/sentinel/test/commands"),
+                64 * 1024 * 1024,
+            );
+        assert_eq!(
+            config.command_boundary,
+            Some(("/run/sentinel-command-cgroups".into(), 64 * 1024 * 1024))
+        );
+        assert!(config.writable_binds.contains(&(
+            "/sys/fs/cgroup/sentinel/test/commands".into(),
+            "/run/sentinel-command-cgroups".into(),
+        )));
+        assert!(!config
+            .writable_binds
+            .iter()
+            .any(|(_, guest)| guest == "/sys/fs/cgroup"));
+        assert!(config.clear_environment);
     }
 
     #[test]

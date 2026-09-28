@@ -1,9 +1,5 @@
 //! Source-only offline import tests. No interpreters, mount, or runtime required.
-use sentinel_fs::{layer, metadata, SHARED_BASE_LAYER_ID};
-
-// Lead owns lib.rs export; keep this slice testable before that integration edit.
-#[path = "../src/workspace_import.rs"]
-mod workspace_import;
+use sentinel_fs::SHARED_BASE_LAYER_ID;
 
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -14,7 +10,7 @@ use sentinel_fs::artifact::ArtifactPlane;
 use sentinel_fs::cas::CasStore;
 use sentinel_fs::layer::LayerManager;
 use sentinel_fs::metadata::{MetadataDurability, MetadataStore};
-use workspace_import::{import_native_workspace, WorkspaceImportDisposition};
+use sentinel_fs::workspace_import::{import_native_workspace, WorkspaceImportDisposition};
 
 const MARKER: &str = ".sentinel-workspace-import-v1.json";
 
@@ -22,7 +18,11 @@ fn manager(path: &Path) -> LayerManager {
     fs::create_dir_all(path).unwrap();
     let layer = LayerManager::with_artifact_plane(
         CasStore::open(path).unwrap(),
-        MetadataStore::open_with_durability(path.join("namespace.redb"), MetadataDurability::Eventual).unwrap(),
+        MetadataStore::open_with_durability(
+            path.join("namespace.redb"),
+            MetadataDurability::Eventual,
+        )
+        .unwrap(),
         Arc::new(ArtifactPlane::open(path.join("content.redb")).unwrap()),
     );
     layer.init_base_root().unwrap();
@@ -49,7 +49,15 @@ fn receipt(layer: &LayerManager) -> serde_json::Value {
 fn prepared_receipt(layer: &LayerManager) -> serde_json::Value {
     let mut marker = receipt(layer);
     marker["state"] = serde_json::json!("prepared");
-    layer.write_file("alice", 1, MARKER, &serde_json::to_vec(&marker).unwrap(), 0o600).unwrap();
+    layer
+        .write_file(
+            "alice",
+            1,
+            MARKER,
+            &serde_json::to_vec(&marker).unwrap(),
+            0o600,
+        )
+        .unwrap();
     layer.sync_directory("alice", 1).unwrap();
     marker
 }
@@ -61,13 +69,26 @@ fn python_node_binary_files_modes_links_and_source_are_preserved() {
     fs::create_dir(source.join("src")).unwrap();
     fs::create_dir_all(source.join("node_modules/.bin")).unwrap();
     let python = b"from pathlib import Path\nprint(Path('result.txt').read_text())\n";
-    let node = b"const fs = require('node:fs');\nconsole.log(fs.readFileSync('result.txt', 'utf8'));\n";
+    let node =
+        b"const fs = require('node:fs');\nconsole.log(fs.readFileSync('result.txt', 'utf8'));\n";
     fs::write(source.join("app.py"), python).unwrap();
     fs::write(source.join("src/main.js"), node).unwrap();
-    fs::write(source.join("package.json"), b"{\"scripts\":{\"start\":\"node src/main.js\"}}\n").unwrap();
-    fs::write(source.join("package-lock.json"), b"{\"lockfileVersion\":3}\n").unwrap();
+    fs::write(
+        source.join("package.json"),
+        b"{\"scripts\":{\"start\":\"node src/main.js\"}}\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join("package-lock.json"),
+        b"{\"lockfileVersion\":3}\n",
+    )
+    .unwrap();
     fs::write(source.join("result.txt"), b"accepted work\n").unwrap();
-    fs::write(source.join("node_modules/tool.js"), b"#!/usr/bin/env node\nconsole.log('tool');\n").unwrap();
+    fs::write(
+        source.join("node_modules/tool.js"),
+        b"#!/usr/bin/env node\nconsole.log('tool');\n",
+    )
+    .unwrap();
     let binary: Vec<u8> = (0..350_000).map(|i| (i % 251) as u8).collect();
     fs::write(source.join("data.bin"), &binary).unwrap();
     fs::set_permissions(source.join("app.py"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -80,7 +101,10 @@ fn python_node_binary_files_modes_links_and_source_are_preserved() {
     let layer = manager(&dir.path().join("plane"));
     let result = import_native_workspace(&layer, "alice", &source).unwrap();
     assert_eq!(result.disposition, WorkspaceImportDisposition::Imported);
-    assert_eq!(layer.lookup_dirent("alice", 1, "workspaces").unwrap(), Some(result.workspace_inode));
+    assert_eq!(
+        layer.lookup_dirent("alice", 1, "workspaces").unwrap(),
+        Some(result.workspace_inode)
+    );
     let app = lookup(&layer, result.workspace_inode, "app.py");
     assert_eq!(app, lookup(&layer, result.workspace_inode, "src/alias.py"));
     let data = layer.lookup_inode("alice", app).unwrap().unwrap();
@@ -88,26 +112,101 @@ fn python_node_binary_files_modes_links_and_source_are_preserved() {
     assert_eq!(data.mode, 0o755);
     assert_eq!(data.mtime, before.mtime() as u64);
     assert_eq!(layer.read_file("alice", app).unwrap(), python);
-    assert_eq!(layer.read_file("alice", lookup(&layer, result.workspace_inode, "src/main.js")).unwrap(), node);
-    assert_eq!(layer.read_file("alice", lookup(&layer, result.workspace_inode, "data.bin")).unwrap(), binary);
-    assert_eq!(layer.lookup_inode("alice", lookup(&layer, result.workspace_inode, "src/current.py")).unwrap().unwrap().symlink_target, "../app.py");
-    assert_eq!(layer.lookup_inode("alice", lookup(&layer, result.workspace_inode, "node_modules/.bin/tool")).unwrap().unwrap().symlink_target, "../tool.js");
-    assert_eq!(layer.lookup_inode("alice", lookup(&layer, result.workspace_inode, "src")).unwrap().unwrap().mode, 0o750);
-    assert!(layer.lookup_dirent("alice", result.workspace_inode, MARKER).unwrap().is_none());
+    assert_eq!(
+        layer
+            .read_file(
+                "alice",
+                lookup(&layer, result.workspace_inode, "src/main.js")
+            )
+            .unwrap(),
+        node
+    );
+    assert_eq!(
+        layer
+            .read_file("alice", lookup(&layer, result.workspace_inode, "data.bin"))
+            .unwrap(),
+        binary
+    );
+    assert_eq!(
+        layer
+            .lookup_inode(
+                "alice",
+                lookup(&layer, result.workspace_inode, "src/current.py")
+            )
+            .unwrap()
+            .unwrap()
+            .symlink_target,
+        "../app.py"
+    );
+    assert_eq!(
+        layer
+            .lookup_inode(
+                "alice",
+                lookup(&layer, result.workspace_inode, "node_modules/.bin/tool")
+            )
+            .unwrap()
+            .unwrap()
+            .symlink_target,
+        "../tool.js"
+    );
+    assert_eq!(
+        layer
+            .lookup_inode("alice", lookup(&layer, result.workspace_inode, "src"))
+            .unwrap()
+            .unwrap()
+            .mode,
+        0o750
+    );
+    assert!(layer
+        .lookup_dirent("alice", result.workspace_inode, MARKER)
+        .unwrap()
+        .is_none());
     assert_eq!(receipt(&layer)["state"], "installed");
-    assert_eq!(receipt(&layer)["tree_sha256"], serde_json::json!(result.imported_sha256));
+    assert_eq!(
+        receipt(&layer)["tree_sha256"],
+        serde_json::json!(result.imported_sha256)
+    );
     assert_eq!(receipt(&layer)["bytes"], result.imported_bytes);
     assert!(!source.join(MARKER).exists());
     assert_eq!(fs::read(source.join("app.py")).unwrap(), python);
     assert_eq!(fs::read(source.join("src/main.js")).unwrap(), node);
     assert_eq!(fs::read(source.join("data.bin")).unwrap(), binary);
-    assert_eq!(fs::read_link(source.join("src/current.py")).unwrap(), Path::new("../app.py"));
+    assert_eq!(
+        fs::read_link(source.join("src/current.py")).unwrap(),
+        Path::new("../app.py")
+    );
     let after = fs::metadata(source.join("app.py")).unwrap();
-    assert_eq!((before.dev(), before.ino(), before.nlink(), before.mtime(), before.ctime()),
-        (after.dev(), after.ino(), after.nlink(), after.mtime(), after.ctime()));
+    assert_eq!(
+        (
+            before.dev(),
+            before.ino(),
+            before.nlink(),
+            before.mtime(),
+            before.ctime()
+        ),
+        (
+            after.dev(),
+            after.ino(),
+            after.nlink(),
+            after.mtime(),
+            after.ctime()
+        )
+    );
     let root_after = fs::metadata(&source).unwrap();
-    assert_eq!((root_before.dev(), root_before.ino(), root_before.mtime(), root_before.ctime()),
-        (root_after.dev(), root_after.ino(), root_after.mtime(), root_after.ctime()));
+    assert_eq!(
+        (
+            root_before.dev(),
+            root_before.ino(),
+            root_before.mtime(),
+            root_before.ctime()
+        ),
+        (
+            root_after.dev(),
+            root_after.ino(),
+            root_after.mtime(),
+            root_after.ctime()
+        )
+    );
 }
 
 #[test]
@@ -120,9 +219,20 @@ fn streaming_import_exceeds_per_file_dirty_limit_without_buffering_whole_file() 
     let result = import_native_workspace(&layer, "alice", &source).unwrap();
     let inode = lookup(&layer, result.workspace_inode, "large.bin");
     assert_eq!(result.imported_bytes, 9 * 1024 * 1024 + 17);
-    assert_eq!(layer.lookup_inode("alice", inode).unwrap().unwrap().size, result.imported_bytes);
-    assert_eq!(layer.read_file_range("alice", inode, result.imported_bytes - 3, 99).unwrap(), vec![0; 3]);
-    assert_eq!(fs::metadata(source.join("large.bin")).unwrap().len(), result.imported_bytes);
+    assert_eq!(
+        layer.lookup_inode("alice", inode).unwrap().unwrap().size,
+        result.imported_bytes
+    );
+    assert_eq!(
+        layer
+            .read_file_range("alice", inode, result.imported_bytes - 3, 99)
+            .unwrap(),
+        vec![0; 3]
+    );
+    assert_eq!(
+        fs::metadata(source.join("large.bin")).unwrap().len(),
+        result.imported_bytes
+    );
 }
 
 #[test]
@@ -130,7 +240,10 @@ fn hardlink_aliases_over_64_mib_by_name_charge_one_inode_and_matching_receipt() 
     let dir = tempfile::tempdir().unwrap();
     let source = source(dir.path());
     let size = 40 * 1024 * 1024;
-    fs::File::create(source.join("first.bin")).unwrap().set_len(size).unwrap();
+    fs::File::create(source.join("first.bin"))
+        .unwrap()
+        .set_len(size)
+        .unwrap();
     fs::set_permissions(source.join("first.bin"), fs::Permissions::from_mode(0o640)).unwrap();
     fs::hard_link(source.join("first.bin"), source.join("second.bin")).unwrap();
     let before = fs::metadata(source.join("first.bin")).unwrap();
@@ -141,18 +254,37 @@ fn hardlink_aliases_over_64_mib_by_name_charge_one_inode_and_matching_receipt() 
     let first = lookup(&layer, result.workspace_inode, "first.bin");
     assert_eq!(first, lookup(&layer, result.workspace_inode, "second.bin"));
     let data = layer.lookup_inode("alice", first).unwrap().unwrap();
-    assert_eq!((data.size, data.nlinks, data.mode, data.mtime), (size, 2, 0o640, before.mtime() as u64));
-    assert_eq!(layer.read_file_range("alice", first, size - 3, 99).unwrap(), vec![0; 3]);
+    assert_eq!(
+        (data.size, data.nlinks, data.mode, data.mtime),
+        (size, 2, 0o640, before.mtime() as u64)
+    );
+    assert_eq!(
+        layer.read_file_range("alice", first, size - 3, 99).unwrap(),
+        vec![0; 3]
+    );
     let marker = receipt(&layer);
     assert_eq!(marker["bytes"], size);
-    assert_eq!(marker["tree_sha256"], serde_json::json!(result.imported_sha256));
+    assert_eq!(
+        marker["tree_sha256"],
+        serde_json::json!(result.imported_sha256)
+    );
     let marker_inode = lookup(&layer, 1, MARKER);
-    let marker_size = layer.lookup_inode("alice", marker_inode).unwrap().unwrap().size;
-    assert_eq!(layer.workspace_budget("alice").unwrap().used_bytes, size + marker_size);
+    let marker_size = layer
+        .lookup_inode("alice", marker_inode)
+        .unwrap()
+        .unwrap()
+        .size;
+    assert_eq!(
+        layer.workspace_budget("alice").unwrap().used_bytes,
+        size + marker_size
+    );
     let retry = import_native_workspace(&layer, "alice", &source).unwrap();
     assert_eq!(retry.imported_bytes, size);
     assert_eq!(retry.imported_sha256, result.imported_sha256);
-    assert_eq!(retry.disposition, WorkspaceImportDisposition::AlreadyImported);
+    assert_eq!(
+        retry.disposition,
+        WorkspaceImportDisposition::AlreadyImported
+    );
     // Exercise namespace digest and byte-count verification during crash recovery.
     prepared_receipt(&layer);
     let recovered = import_native_workspace(&layer, "alice", &source).unwrap();
@@ -160,8 +292,24 @@ fn hardlink_aliases_over_64_mib_by_name_charge_one_inode_and_matching_receipt() 
     assert_eq!(recovered.imported_sha256, result.imported_sha256);
     assert_eq!(recovered.disposition, WorkspaceImportDisposition::Recovered);
     let after = fs::metadata(source.join("first.bin")).unwrap();
-    assert_eq!((before.dev(), before.ino(), before.len(), before.nlink(), before.mtime(), before.ctime()),
-        (after.dev(), after.ino(), after.len(), after.nlink(), after.mtime(), after.ctime()));
+    assert_eq!(
+        (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.nlink(),
+            before.mtime(),
+            before.ctime()
+        ),
+        (
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.nlink(),
+            after.mtime(),
+            after.ctime()
+        )
+    );
 }
 
 #[test]
@@ -169,16 +317,29 @@ fn exact_64_mib_source_fails_marker_reservation_before_creating_a_stage() {
     let dir = tempfile::tempdir().unwrap();
     let source = source(dir.path());
     let size = 64 * 1024 * 1024;
-    fs::File::create(source.join("full.bin")).unwrap().set_len(size).unwrap();
+    fs::File::create(source.join("full.bin"))
+        .unwrap()
+        .set_len(size)
+        .unwrap();
     let before = fs::metadata(source.join("full.bin")).unwrap();
     let layer = manager(&dir.path().join("plane"));
     let error = import_native_workspace(&layer, "alice", &source).unwrap_err();
-    assert!(error.to_string().contains("8192-byte trusted marker reservation"));
+    assert!(error
+        .to_string()
+        .contains("8192-byte trusted marker reservation"));
     assert!(layer.readdir("alice", 1).unwrap().is_empty());
     assert_eq!(layer.workspace_budget("alice").unwrap().used_bytes, 0);
     let after = fs::metadata(source.join("full.bin")).unwrap();
-    assert_eq!((before.dev(), before.ino(), before.len(), before.mtime(), before.ctime()),
-        (after.dev(), after.ino(), size, after.mtime(), after.ctime()));
+    assert_eq!(
+        (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mtime(),
+            before.ctime()
+        ),
+        (after.dev(), after.ino(), size, after.mtime(), after.ctime())
+    );
 }
 
 #[test]
@@ -187,29 +348,54 @@ fn existing_stage_and_inherited_data_reduce_available_import_capacity() {
     let source = source(dir.path());
     fs::write(source.join("file"), b"accepted native work").unwrap();
     let layer = manager(&dir.path().join("plane"));
-    layer.write_file(SHARED_BASE_LAYER_ID, 1, "inherited", b"shared bytes", 0o644).unwrap();
-    let stage = layer.mkdir("alice", 1, ".sentinel-workspace-stage-abandoned", 0o700).unwrap();
-    layer.write_file("alice", stage, "partial", b"private evidence", 0o600).unwrap();
+    layer
+        .write_file(SHARED_BASE_LAYER_ID, 1, "inherited", b"shared bytes", 0o644)
+        .unwrap();
+    let stage = layer
+        .mkdir("alice", 1, ".sentinel-workspace-stage-abandoned", 0o700)
+        .unwrap();
+    layer
+        .write_file("alice", stage, "partial", b"private evidence", 0o600)
+        .unwrap();
     // Hardlink the existing evidence: reservation must not charge its alias twice.
     let partial = lookup(&layer, stage, "partial");
     layer.link("alice", partial, stage, "alias").unwrap();
     let used = layer.workspace_budget("alice").unwrap().used_bytes;
-    assert_eq!(used, b"shared bytes".len() as u64 + b"private evidence".len() as u64);
+    assert_eq!(
+        used,
+        b"shared bytes".len() as u64 + b"private evidence".len() as u64
+    );
     let source_size = b"accepted native work".len() as u64;
-    layer.set_workspace_budget("alice", used + source_size + 8191).unwrap();
+    layer
+        .set_workspace_budget("alice", used + source_size + 8191)
+        .unwrap();
     let entries = layer.readdir("alice", 1).unwrap();
-    assert!(import_native_workspace(&layer, "alice", &source).unwrap_err().to_string().contains("marker reservation"));
+    assert!(import_native_workspace(&layer, "alice", &source)
+        .unwrap_err()
+        .to_string()
+        .contains("marker reservation"));
     assert_eq!(layer.readdir("alice", 1).unwrap(), entries);
-    assert_eq!(layer.read_file("alice", partial).unwrap(), b"private evidence");
-    assert_eq!(fs::read(source.join("file")).unwrap(), b"accepted native work");
+    assert_eq!(
+        layer.read_file("alice", partial).unwrap(),
+        b"private evidence"
+    );
+    assert_eq!(
+        fs::read(source.join("file")).unwrap(),
+        b"accepted native work"
+    );
     // The exact conservative reservation fits without increasing this limit.
-    layer.set_workspace_budget("alice", used + source_size + 8192).unwrap();
+    layer
+        .set_workspace_budget("alice", used + source_size + 8192)
+        .unwrap();
     let result = import_native_workspace(&layer, "alice", &source).unwrap();
     assert_eq!(result.imported_bytes, source_size);
     let budget = layer.workspace_budget("alice").unwrap();
     assert_eq!(budget.limit_bytes, used + source_size + 8192);
     assert!(budget.used_bytes <= budget.limit_bytes);
-    assert_eq!(layer.read_file("alice", partial).unwrap(), b"private evidence");
+    assert_eq!(
+        layer.read_file("alice", partial).unwrap(),
+        b"private evidence"
+    );
 }
 
 #[test]
@@ -220,17 +406,51 @@ fn installed_retry_and_reopen_keep_new_namespace_work_not_stale_native_bytes() {
     let database = dir.path().join("plane");
     let layer = manager(&database);
     let first = import_native_workspace(&layer, "alice", &source).unwrap();
-    layer.write_file("alice", first.workspace_inode, "main.py", b"new namespace work", 0o644).unwrap();
-    layer.write_file("alice", first.workspace_inode, "new.js", b"new Node task", 0o644).unwrap();
-    layer.sync_directory("alice", first.workspace_inode).unwrap();
+    layer
+        .write_file(
+            "alice",
+            first.workspace_inode,
+            "main.py",
+            b"new namespace work",
+            0o644,
+        )
+        .unwrap();
+    layer
+        .write_file(
+            "alice",
+            first.workspace_inode,
+            "new.js",
+            b"new Node task",
+            0o644,
+        )
+        .unwrap();
+    layer
+        .sync_directory("alice", first.workspace_inode)
+        .unwrap();
     drop(layer);
     let reopened = manager(&database);
     let retry = import_native_workspace(&reopened, "alice", &source).unwrap();
-    assert_eq!(retry.disposition, WorkspaceImportDisposition::AlreadyImported);
+    assert_eq!(
+        retry.disposition,
+        WorkspaceImportDisposition::AlreadyImported
+    );
     assert_eq!(retry.workspace_inode, first.workspace_inode);
-    assert_eq!(reopened.read_file("alice", lookup(&reopened, retry.workspace_inode, "main.py")).unwrap(), b"new namespace work");
-    assert_eq!(reopened.read_file("alice", lookup(&reopened, retry.workspace_inode, "new.js")).unwrap(), b"new Node task");
-    assert_eq!(fs::read(source.join("main.py")).unwrap(), b"old native work");
+    assert_eq!(
+        reopened
+            .read_file("alice", lookup(&reopened, retry.workspace_inode, "main.py"))
+            .unwrap(),
+        b"new namespace work"
+    );
+    assert_eq!(
+        reopened
+            .read_file("alice", lookup(&reopened, retry.workspace_inode, "new.js"))
+            .unwrap(),
+        b"new Node task"
+    );
+    assert_eq!(
+        fs::read(source.join("main.py")).unwrap(),
+        b"old native work"
+    );
     assert!(!source.join("new.js").exists());
 }
 
@@ -242,15 +462,40 @@ fn installed_retry_after_tmpfs_loss_or_recreation_keeps_newer_namespace_work() {
     let database = dir.path().join("plane");
     let layer = manager(&database);
     let first = import_native_workspace(&layer, "alice", &source).unwrap();
-    layer.write_file("alice", first.workspace_inode, "main.py", b"new durable work", 0o755).unwrap();
-    layer.write_file("alice", first.workspace_inode, "new.js", b"new Node work", 0o644).unwrap();
-    layer.sync_directory("alice", first.workspace_inode).unwrap();
+    layer
+        .write_file(
+            "alice",
+            first.workspace_inode,
+            "main.py",
+            b"new durable work",
+            0o755,
+        )
+        .unwrap();
+    let modified = lookup(&layer, first.workspace_inode, "main.py");
+    layer
+        .set_file_attributes("alice", modified, Some(0o755), None, None, None, None)
+        .unwrap();
+    layer
+        .write_file(
+            "alice",
+            first.workspace_inode,
+            "new.js",
+            b"new Node work",
+            0o644,
+        )
+        .unwrap();
+    layer
+        .sync_directory("alice", first.workspace_inode)
+        .unwrap();
     drop(layer);
     // Simulate reboot losing the entire native /ram subtree.
     fs::remove_dir_all(source.parent().unwrap().parent().unwrap()).unwrap();
     let reopened = manager(&database);
     let missing = import_native_workspace(&reopened, "alice", &source).unwrap();
-    assert_eq!(missing.disposition, WorkspaceImportDisposition::AlreadyImported);
+    assert_eq!(
+        missing.disposition,
+        WorkspaceImportDisposition::AlreadyImported
+    );
     assert_eq!(missing.workspace_inode, first.workspace_inode);
     assert_eq!(missing.imported_sha256, first.imported_sha256);
     assert!(!source.exists());
@@ -270,17 +515,46 @@ fn installed_retry_after_tmpfs_loss_or_recreation_keeps_newer_namespace_work() {
     }
     assert_ne!(fs::metadata(&source).unwrap().ino(), original_ino);
     let empty = import_native_workspace(&reopened, "alice", &source).unwrap();
-    assert_eq!(empty.disposition, WorkspaceImportDisposition::AlreadyImported);
+    assert_eq!(
+        empty.disposition,
+        WorkspaceImportDisposition::AlreadyImported
+    );
     assert!(fs::read_dir(&source).unwrap().next().is_none());
     fs::write(source.join("main.py"), b"unrelated recreated tmpfs work").unwrap();
     let recreated = import_native_workspace(&reopened, "alice", &source).unwrap();
-    assert_eq!(recreated.disposition, WorkspaceImportDisposition::AlreadyImported);
+    assert_eq!(
+        recreated.disposition,
+        WorkspaceImportDisposition::AlreadyImported
+    );
     assert_eq!(recreated.workspace_inode, first.workspace_inode);
-    assert_eq!(reopened.read_file("alice", lookup(&reopened, first.workspace_inode, "main.py")).unwrap(), b"new durable work");
-    assert_eq!(reopened.read_file("alice", lookup(&reopened, first.workspace_inode, "new.js")).unwrap(), b"new Node work");
-    assert_eq!(reopened.lookup_inode("alice", lookup(&reopened, first.workspace_inode, "main.py")).unwrap().unwrap().mode, 0o755);
-    assert_eq!(fs::read(source.join("main.py")).unwrap(), b"unrelated recreated tmpfs work");
-    assert_eq!(receipt(&reopened)["tree_sha256"], serde_json::json!(first.imported_sha256));
+    assert_eq!(
+        reopened
+            .read_file("alice", lookup(&reopened, first.workspace_inode, "main.py"))
+            .unwrap(),
+        b"new durable work"
+    );
+    assert_eq!(
+        reopened
+            .read_file("alice", lookup(&reopened, first.workspace_inode, "new.js"))
+            .unwrap(),
+        b"new Node work"
+    );
+    assert_eq!(
+        reopened
+            .lookup_inode("alice", lookup(&reopened, first.workspace_inode, "main.py"))
+            .unwrap()
+            .unwrap()
+            .mode,
+        0o755
+    );
+    assert_eq!(
+        fs::read(source.join("main.py")).unwrap(),
+        b"unrelated recreated tmpfs work"
+    );
+    assert_eq!(
+        receipt(&reopened)["tree_sha256"],
+        serde_json::json!(first.imported_sha256)
+    );
 }
 
 #[test]
@@ -296,9 +570,22 @@ fn marker_write_crash_after_rename_adopts_only_exact_verified_target() {
     assert_eq!(recovered.workspace_inode, first.workspace_inode);
     assert_eq!(receipt(&layer)["state"], "installed");
     prepared_receipt(&layer);
-    layer.write_file("alice", first.workspace_inode, "main.js", b"new work after crash", 0o644).unwrap();
+    layer
+        .write_file(
+            "alice",
+            first.workspace_inode,
+            "main.js",
+            b"new work after crash",
+            0o644,
+        )
+        .unwrap();
     assert!(import_native_workspace(&layer, "alice", &source).is_err());
-    assert_eq!(layer.read_file("alice", lookup(&layer, first.workspace_inode, "main.js")).unwrap(), b"new work after crash");
+    assert_eq!(
+        layer
+            .read_file("alice", lookup(&layer, first.workspace_inode, "main.js"))
+            .unwrap(),
+        b"new work after crash"
+    );
     assert_eq!(fs::read(source.join("main.js")).unwrap(), b"checkpoint");
     assert_eq!(receipt(&layer)["state"], "prepared");
 }
@@ -315,22 +602,56 @@ fn prepared_target_mode_time_and_same_length_digest_changes_refuse_adoption() {
         let inode = lookup(&layer, first.workspace_inode, "main.py");
         let data = layer.lookup_inode("alice", inode).unwrap().unwrap();
         match changed {
-            "mode" => layer.set_file_attributes("alice", inode, Some(data.mode ^ 0o100), None, None, None, None).unwrap(),
-            "mtime" => layer.set_file_attributes("alice", inode, None, None, None, None, Some(data.mtime + 1)).unwrap(),
+            "mode" => layer
+                .set_file_attributes(
+                    "alice",
+                    inode,
+                    Some(data.mode ^ 0o100),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            "mtime" => layer
+                .set_file_attributes("alice", inode, None, None, None, None, Some(data.mtime + 1))
+                .unwrap(),
             _ => {
-                layer.write_file("alice", first.workspace_inode, "main.py", b"new work", data.mode).unwrap();
-                layer.set_file_attributes("alice", inode, None, None, None, None, Some(data.mtime)).unwrap();
+                layer
+                    .write_file(
+                        "alice",
+                        first.workspace_inode,
+                        "main.py",
+                        b"new work",
+                        data.mode,
+                    )
+                    .unwrap();
+                layer
+                    .set_file_attributes("alice", inode, None, None, None, None, Some(data.mtime))
+                    .unwrap();
             }
         }
-        layer.sync_directory("alice", first.workspace_inode).unwrap();
+        layer
+            .sync_directory("alice", first.workspace_inode)
+            .unwrap();
         let before = layer.lookup_inode("alice", inode).unwrap().unwrap();
         let error = import_native_workspace(&layer, "alice", &source).unwrap_err();
-        assert!(error.to_string().contains("target differs from its receipt"), "{changed}: {error}");
+        assert!(
+            error
+                .to_string()
+                .contains("target differs from its receipt"),
+            "{changed}: {error}"
+        );
         let after = layer.lookup_inode("alice", inode).unwrap().unwrap();
-        assert_eq!((after.mode, after.mtime, after.size), (before.mode, before.mtime, before.size));
+        assert_eq!(
+            (after.mode, after.mtime, after.size),
+            (before.mode, before.mtime, before.size)
+        );
         assert_eq!(receipt(&layer)["state"], "prepared");
         assert_eq!(fs::read(source.join("main.py")).unwrap(), b"original");
-        if changed == "digest" { assert_eq!(layer.read_file("alice", inode).unwrap(), b"new work"); }
+        if changed == "digest" {
+            assert_eq!(layer.read_file("alice", inode).unwrap(), b"new work");
+        }
     }
 }
 
@@ -345,10 +666,18 @@ fn prepared_recovery_reserves_replacement_marker_without_mutating_target() {
     let used = layer.workspace_budget("alice").unwrap().used_bytes;
     layer.set_workspace_budget("alice", used + 4095).unwrap();
     let entries = layer.readdir("alice", 1).unwrap();
-    assert!(import_native_workspace(&layer, "alice", &source).unwrap_err().to_string().contains("4096-byte trusted marker reservation"));
+    assert!(import_native_workspace(&layer, "alice", &source)
+        .unwrap_err()
+        .to_string()
+        .contains("4096-byte trusted marker reservation"));
     assert_eq!(layer.readdir("alice", 1).unwrap(), entries);
     assert_eq!(receipt(&layer)["state"], "prepared");
-    assert_eq!(layer.read_file("alice", lookup(&layer, first.workspace_inode, "file")).unwrap(), b"source");
+    assert_eq!(
+        layer
+            .read_file("alice", lookup(&layer, first.workspace_inode, "file"))
+            .unwrap(),
+        b"source"
+    );
     assert_eq!(fs::read(source.join("file")).unwrap(), b"source");
 }
 
@@ -359,8 +688,12 @@ fn prepared_stage_retry_requires_unchanged_source_and_keeps_partial_stages() {
     fs::write(source.join("file"), b"source").unwrap();
     let layer = manager(&dir.path().join("plane"));
     layer.ensure_agent_root("alice").unwrap();
-    let abandoned = layer.mkdir("alice", 1, ".sentinel-workspace-stage-abandoned", 0o700).unwrap();
-    layer.write_file("alice", abandoned, "partial", b"keep evidence", 0o600).unwrap();
+    let abandoned = layer
+        .mkdir("alice", 1, ".sentinel-workspace-stage-abandoned", 0o700)
+        .unwrap();
+    layer
+        .write_file("alice", abandoned, "partial", b"keep evidence", 0o600)
+        .unwrap();
     let first = import_native_workspace(&layer, "alice", &source).unwrap();
     let marker = prepared_receipt(&layer);
     let stage = marker["stage_name"].as_str().unwrap();
@@ -369,15 +702,29 @@ fn prepared_stage_retry_requires_unchanged_source_and_keeps_partial_stages() {
     let recovered = import_native_workspace(&layer, "alice", &source).unwrap();
     assert_eq!(recovered.disposition, WorkspaceImportDisposition::Recovered);
     assert_eq!(recovered.workspace_inode, first.workspace_inode);
-    assert_eq!(layer.read_file("alice", lookup(&layer, abandoned, "partial")).unwrap(), b"keep evidence");
+    assert_eq!(
+        layer
+            .read_file("alice", lookup(&layer, abandoned, "partial"))
+            .unwrap(),
+        b"keep evidence"
+    );
     let marker = prepared_receipt(&layer);
     let stage = marker["stage_name"].as_str().unwrap();
     layer.rename("alice", 1, "workspaces", 1, stage, 1).unwrap();
     fs::write(source.join("file"), b"new native accepted work").unwrap();
     assert!(import_native_workspace(&layer, "alice", &source).is_err());
-    assert!(layer.lookup_dirent("alice", 1, "workspaces").unwrap().is_none());
-    assert_eq!(layer.lookup_dirent("alice", 1, stage).unwrap(), Some(first.workspace_inode));
-    assert_eq!(fs::read(source.join("file")).unwrap(), b"new native accepted work");
+    assert!(layer
+        .lookup_dirent("alice", 1, "workspaces")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        layer.lookup_dirent("alice", 1, stage).unwrap(),
+        Some(first.workspace_inode)
+    );
+    assert_eq!(
+        fs::read(source.join("file")).unwrap(),
+        b"new native accepted work"
+    );
 }
 
 #[test]
@@ -388,10 +735,24 @@ fn existing_unmarked_nonempty_or_empty_destination_is_never_overwritten() {
         fs::write(source.join("file"), b"native").unwrap();
         let layer = manager(&dir.path().join("plane"));
         let workspace = layer.mkdir("alice", 1, "workspaces", 0o755).unwrap();
-        if nonempty { layer.write_file("alice", workspace, "file", b"accepted namespace", 0o644).unwrap(); }
+        if nonempty {
+            layer
+                .write_file("alice", workspace, "file", b"accepted namespace", 0o644)
+                .unwrap();
+        }
         assert!(import_native_workspace(&layer, "alice", &source).is_err());
-        assert_eq!(layer.lookup_dirent("alice", 1, "workspaces").unwrap(), Some(workspace));
-        if nonempty { assert_eq!(layer.read_file("alice", lookup(&layer, workspace, "file")).unwrap(), b"accepted namespace"); }
+        assert_eq!(
+            layer.lookup_dirent("alice", 1, "workspaces").unwrap(),
+            Some(workspace)
+        );
+        if nonempty {
+            assert_eq!(
+                layer
+                    .read_file("alice", lookup(&layer, workspace, "file"))
+                    .unwrap(),
+                b"accepted namespace"
+            );
+        }
         assert!(layer.lookup_dirent("alice", 1, MARKER).unwrap().is_none());
         assert_eq!(fs::read(source.join("file")).unwrap(), b"native");
     }
@@ -416,9 +777,16 @@ fn external_hardlink_absolute_parent_and_intermediate_symlink_escapes_are_reject
         }
         let layer = manager(&dir.path().join("plane"));
         assert!(import_native_workspace(&layer, "alice", &source).is_err());
-        assert!(layer.lookup_dirent("alice", 1, "workspaces").unwrap().is_none());
+        assert!(layer
+            .lookup_dirent("alice", 1, "workspaces")
+            .unwrap()
+            .is_none());
         assert!(layer.lookup_dirent("alice", 1, MARKER).unwrap().is_none());
-        assert!(!layer.readdir("alice", 1).unwrap().iter().any(|(name, _, _)| name.starts_with(".sentinel-workspace-stage-")));
+        assert!(!layer
+            .readdir("alice", 1)
+            .unwrap()
+            .iter()
+            .any(|(name, _, _)| name.starts_with(".sentinel-workspace-stage-")));
         assert_eq!(fs::read(&outside).unwrap(), b"foreign authority");
     }
 }
@@ -430,7 +798,10 @@ fn symlinked_source_ancestor_cannot_transfer_another_tree() {
     fs::write(source.join("file"), b"protected").unwrap();
     symlink(source.parent().unwrap(), dir.path().join("agent-link")).unwrap();
     let layer = manager(&dir.path().join("plane"));
-    assert!(import_native_workspace(&layer, "alice", &dir.path().join("agent-link/workspaces")).is_err());
+    assert!(
+        import_native_workspace(&layer, "alice", &dir.path().join("agent-link/workspaces"))
+            .is_err()
+    );
     assert_eq!(fs::read(source.join("file")).unwrap(), b"protected");
 }
 
@@ -446,15 +817,32 @@ fn replaced_source_is_ignored_but_replaced_installed_namespace_refuses_replay() 
     fs::create_dir(&source).unwrap();
     fs::write(source.join("file"), b"different source").unwrap();
     let retry = import_native_workspace(&layer, "alice", &source).unwrap();
-    assert_eq!(retry.disposition, WorkspaceImportDisposition::AlreadyImported);
-    assert_eq!(layer.read_file("alice", lookup(&layer, first.workspace_inode, "file")).unwrap(), b"original");
+    assert_eq!(
+        retry.disposition,
+        WorkspaceImportDisposition::AlreadyImported
+    );
+    assert_eq!(
+        layer
+            .read_file("alice", lookup(&layer, first.workspace_inode, "file"))
+            .unwrap(),
+        b"original"
+    );
     fs::remove_dir_all(&source).unwrap();
     fs::rename(saved_source, &source).unwrap();
-    layer.rename("alice", 1, "workspaces", 1, "saved-namespace", 1).unwrap();
+    layer
+        .rename("alice", 1, "workspaces", 1, "saved-namespace", 1)
+        .unwrap();
     let replacement = layer.mkdir("alice", 1, "workspaces", 0o755).unwrap();
-    layer.write_file("alice", replacement, "file", b"new namespace", 0o644).unwrap();
+    layer
+        .write_file("alice", replacement, "file", b"new namespace", 0o644)
+        .unwrap();
     assert!(import_native_workspace(&layer, "alice", &source).is_err());
-    assert_eq!(layer.read_file("alice", lookup(&layer, replacement, "file")).unwrap(), b"new namespace");
+    assert_eq!(
+        layer
+            .read_file("alice", lookup(&layer, replacement, "file"))
+            .unwrap(),
+        b"new namespace"
+    );
 }
 
 #[test]
@@ -462,16 +850,31 @@ fn depth_and_aggregate_byte_limits_fail_without_hiding_source_work() {
     let dir = tempfile::tempdir().unwrap();
     let source = source(dir.path());
     let mut nested = source.clone();
-    for _ in 0..65 { nested = nested.join("d"); fs::create_dir(&nested).unwrap(); }
+    for _ in 0..65 {
+        nested = nested.join("d");
+        fs::create_dir(&nested).unwrap();
+    }
     fs::write(nested.join("file"), b"deep accepted work").unwrap();
     let layer = manager(&dir.path().join("plane"));
     assert!(import_native_workspace(&layer, "alice", &source).is_err());
-    assert_eq!(fs::read(nested.join("file")).unwrap(), b"deep accepted work");
+    assert_eq!(
+        fs::read(nested.join("file")).unwrap(),
+        b"deep accepted work"
+    );
     let other = crate::source(&dir.path().join("second"));
-    fs::File::create(other.join("too-large")).unwrap().set_len(64 * 1024 * 1024 + 1).unwrap();
+    fs::File::create(other.join("too-large"))
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
     assert!(import_native_workspace(&layer, "alice", &other).is_err());
-    assert!(layer.lookup_dirent("alice", 1, "workspaces").unwrap().is_none());
-    assert_eq!(fs::metadata(other.join("too-large")).unwrap().len(), 64 * 1024 * 1024 + 1);
+    assert!(layer
+        .lookup_dirent("alice", 1, "workspaces")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        fs::metadata(other.join("too-large")).unwrap().len(),
+        64 * 1024 * 1024 + 1
+    );
 }
 
 #[test]
@@ -482,13 +885,23 @@ fn unsupported_names_and_dangling_links_fail_explicitly_without_importing_a_subs
         let source = source(dir.path());
         fs::write(source.join("accepted.py"), b"print('preserve')\n").unwrap();
         if invalid_name {
-            fs::write(source.join(std::ffi::OsString::from_vec(vec![0xff])), b"accepted binary name").unwrap();
+            fs::write(
+                source.join(std::ffi::OsString::from_vec(vec![0xff])),
+                b"accepted binary name",
+            )
+            .unwrap();
         } else {
             symlink("missing-relative-target", source.join("dangling")).unwrap();
         }
         let layer = manager(&dir.path().join("plane"));
         assert!(import_native_workspace(&layer, "alice", &source).is_err());
-        assert!(layer.lookup_dirent("alice", 1, "workspaces").unwrap().is_none());
-        assert_eq!(fs::read(source.join("accepted.py")).unwrap(), b"print('preserve')\n");
+        assert!(layer
+            .lookup_dirent("alice", 1, "workspaces")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            fs::read(source.join("accepted.py")).unwrap(),
+            b"print('preserve')\n"
+        );
     }
 }

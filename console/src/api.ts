@@ -538,6 +538,8 @@ export interface FsEntry {
 /** GET /api/control/agent/{id}/fs?inode=N — directory listing of an agent layer. */
 export interface FsListing {
   accepted: boolean;
+  accounting_basis?: string;
+  dedup_metrics_available?: boolean;
   agent_id: number;
   aggregate_id: string;
   inode: number;

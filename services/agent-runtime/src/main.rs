@@ -66,7 +66,25 @@ enum BoundedJsonlRecord {
 }
 
 fn main() {
-    if workbench_mode_requested() {
+    if env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(
+            agent_runtime::command_sandbox::GATE_MODE,
+        ))
+    {
+        if let Err(error) = agent_runtime::command_sandbox::run_gate(env::args_os().skip(2)) {
+            eprintln!("agent-runtime: command membership or namespace setup failed: {error}");
+            std::process::exit(126);
+        }
+    } else if env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(
+            agent_runtime::command_sandbox::CHILD_MODE,
+        ))
+    {
+        if let Err(error) = agent_runtime::command_sandbox::run_child(env::args_os().skip(2)) {
+            eprintln!("agent-runtime: scoped command isolation or exec failed: {error}");
+            std::process::exit(126);
+        }
+    } else if workbench_mode_requested() {
         run_workbench();
     } else {
         run_general_agent();
@@ -113,6 +131,18 @@ fn run_general_agent() {
 }
 
 fn run_workbench() {
+    if nix::sys::prctl::set_dumpable(false).is_err() || nix::sys::prctl::get_dumpable() != Ok(false)
+    {
+        eprintln!("agent-runtime: trusted process memory protection failed");
+        std::process::exit(126);
+    }
+    let runner = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => {
+            eprintln!("agent-runtime: trusted command runner is unavailable");
+            std::process::exit(126);
+        }
+    };
     let workspace_root = std::env::var_os("SENTINEL_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/workspace"));
@@ -122,11 +152,42 @@ fn run_workbench() {
     let input_root = std::env::var_os("SENTINEL_INPUT_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/workspace/.inputs"));
-    let executor = Arc::new(WorkbenchExecutor::with_input_root(
-        workspace_root,
-        artifact_root,
-        input_root,
-    ));
+    let mut executor =
+        WorkbenchExecutor::with_input_root(&workspace_root, artifact_root, input_root)
+            .with_command_runner(runner.clone());
+    // Optional trusted outer-enforcer configuration. Without it native command
+    // execution fails closed; file tools/receipt recovery remain available.
+    match (
+        env::var_os("SENTINEL_COMMAND_CGROUP_ROOT"),
+        env::var("SENTINEL_WORKSPACE_BUDGET_BYTES"),
+    ) {
+        (Some(root), Ok(budget)) => {
+            let budget = match budget.parse::<u64>() {
+                Ok(value) if value > 0 => value,
+                _ => {
+                    eprintln!("agent-runtime: invalid command workspace budget contract");
+                    std::process::exit(126);
+                }
+            };
+            let boundary = agent_runtime::command_sandbox::CommandBoundary {
+                cgroup_root: PathBuf::from(root),
+                workspace_budget_bytes: budget,
+            };
+            if agent_runtime::command_sandbox::verify_readiness(&runner, &workspace_root, &boundary)
+                .is_err()
+            {
+                eprintln!("agent-runtime: native command isolation readiness failed");
+                std::process::exit(126);
+            }
+            executor = executor.with_command_boundary(boundary);
+        }
+        (None, Err(env::VarError::NotPresent)) => {}
+        _ => {
+            eprintln!("agent-runtime: incomplete command boundary contract");
+            std::process::exit(126);
+        }
+    }
+    let executor = Arc::new(executor);
     if executor
         .reconcile_root_completion_receipts_before_serving()
         .is_err()

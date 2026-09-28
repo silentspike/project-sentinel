@@ -138,6 +138,20 @@ impl LandlockRuleset {
         self
     }
 
+    /// Trusted controller may launch toolchains and generated workspace code.
+    /// Project commands receive a nested ruleset and a mount namespace which
+    /// excludes receipts, foreign workspaces and the controller's cgroup bind.
+    pub fn for_workbench(name: &str) -> Self {
+        let mut rules = Self::for_agent(name);
+        rules
+            .exec_paths
+            .extend([PathBuf::from("/usr"), PathBuf::from("/workspace")]);
+        rules
+            .write_paths
+            .push(PathBuf::from("/run/sentinel-command-cgroups"));
+        rules
+    }
+
     /// Applies the Landlock ruleset to the current process (irreversible).
     ///
     /// Must be called in the bwrap child process BEFORE exec'ing the agent.
@@ -265,6 +279,22 @@ pub fn detect_abi() -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workbench_toolchain_exec_grants_do_not_expand_general_agent_rules() {
+        use super::LandlockRuleset;
+        use std::path::PathBuf;
+        let ordinary = LandlockRuleset::for_agent("test");
+        assert!(!ordinary.exec_paths.contains(&PathBuf::from("/workspace")));
+        let workbench = LandlockRuleset::for_workbench("test");
+        assert!(workbench.exec_paths.contains(&PathBuf::from("/workspace")));
+        assert!(workbench.exec_paths.contains(&PathBuf::from("/usr")));
+        assert!(workbench
+            .write_paths
+            .contains(&PathBuf::from("/run/sentinel-command-cgroups")));
+        assert!(!workbench
+            .write_paths
+            .contains(&PathBuf::from("/sys/fs/cgroup")));
+    }
     use super::*;
 
     #[test]
