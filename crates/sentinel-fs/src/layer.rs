@@ -86,6 +86,7 @@ struct Handle {
 struct State {
     next_handle: u64,
     handles: HashMap<u64, Handle>,
+    directory_handles: HashMap<u64, InodeKey>,
     inodes: HashMap<InodeKey, OpenInode>,
     dirty_bytes: usize,
     invalidations: Vec<InodeKey>,
@@ -371,7 +372,10 @@ impl LayerManager {
     /// Side-effect-free budget preflight before external restore content adoption.
     pub fn validate_workspace_restore_budget(&self, dump: &FsMetadataDump) -> anyhow::Result<()> {
         let state = self.lock()?;
-        if !state.handles.is_empty() || state.inodes.values().any(|open| open.dirty) {
+        if !state.handles.is_empty()
+            || !state.directory_handles.is_empty()
+            || state.inodes.values().any(|open| open.dirty)
+        {
             return Err(errno(16));
         }
         self.restore_budget_locked(&state, &self.meta.dump_all_tables()?, dump)
@@ -1055,7 +1059,7 @@ impl LayerManager {
         if writable {
             self.meta.validate_layer_write_authority(agent)?;
         }
-        if state.handles.len() >= MAX_HANDLES {
+        if state.handles.len() + state.directory_handles.len() >= MAX_HANDLES {
             return Err(errno(24));
         }
         let data = self.required(&state, agent, inode)?.data;
@@ -1087,8 +1091,64 @@ impl LayerManager {
         }
         Ok(h)
     }
+    fn writable_handle(state: &State, agent: &str, inode: u64, handle: u64) -> anyhow::Result<()> {
+        let h = Self::handle(state, agent, handle)?;
+        if h.key.1 != inode || !h.writable {
+            return Err(errno(9));
+        }
+        Ok(())
+    }
+
+    pub fn open_directory(&self, agent: &str, inode: u64) -> anyhow::Result<u64> {
+        let mut state = self.lock()?;
+        self.parent(&state, agent, inode, false)?;
+        if state.handles.len() + state.directory_handles.len() >= MAX_HANDLES {
+            return Err(errno(24));
+        }
+        let handle = state.next_handle.checked_add(1).ok_or_else(|| errno(24))?;
+        state
+            .directory_handles
+            .insert(handle, (agent.to_string(), inode));
+        state.next_handle = handle;
+        Ok(handle)
+    }
+
+    fn directory_handle(state: &State, agent: &str, inode: u64, handle: u64) -> anyhow::Result<()> {
+        let key = state
+            .directory_handles
+            .get(&handle)
+            .ok_or_else(|| errno(9))?;
+        if key.0 != agent || key.1 != inode {
+            return Err(errno(9));
+        }
+        Ok(())
+    }
+
+    pub fn readdir_handle(
+        &self,
+        agent: &str,
+        inode: u64,
+        handle: u64,
+    ) -> anyhow::Result<Vec<(String, u64, FileKind)>> {
+        let state = self.lock()?;
+        Self::directory_handle(&state, agent, inode, handle)?;
+        self.entries(&state, agent, inode)
+    }
+
+    pub fn release_directory(&self, agent: &str, inode: u64, handle: u64) -> anyhow::Result<()> {
+        let mut state = self.lock()?;
+        Self::directory_handle(&state, agent, inode, handle)?;
+        state.directory_handles.remove(&handle);
+        Ok(())
+    }
     pub fn getattr_handle(&self, agent: &str, handle: u64) -> anyhow::Result<InodeData> {
         let state = self.lock()?;
+        if let Some((scope, inode)) = state.directory_handles.get(&handle) {
+            if scope != agent {
+                return Err(errno(9));
+            }
+            return Ok(self.parent(&state, agent, *inode, false)?.data);
+        }
         let h = Self::handle(&state, agent, handle)?;
         Ok(state
             .inodes
@@ -1496,6 +1556,18 @@ impl LayerManager {
         self.drop_idle(&mut state, agent, inode);
         Ok(())
     }
+    pub fn truncate_handle(
+        &self,
+        agent: &str,
+        inode: u64,
+        handle: u64,
+        size: u64,
+    ) -> anyhow::Result<()> {
+        let mut state = self.lock()?;
+        Self::writable_handle(&state, agent, inode, handle)?;
+        self.truncate_state(&mut state, agent, inode, size)?;
+        self.flush(&mut state, agent, inode, false)
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn set_file_attributes(
         &self,
@@ -1509,7 +1581,58 @@ impl LayerManager {
     ) -> anyhow::Result<()> {
         let mut state = self.lock()?;
         let guard = self.meta.namespace_guard(agent)?;
-        let mut record = self.required(&state, agent, inode)?;
+        let record = self.required(&state, agent, inode)?;
+        self.set_attributes_locked(
+            &mut state, agent, inode, &guard, record, mode, uid, gid, atime, mtime,
+        )
+    }
+
+    /// Descriptor mutations retain their open-time capability after unlink/chmod.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_handle_attributes(
+        &self,
+        agent: &str,
+        inode: u64,
+        handle: u64,
+        size: Option<u64>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let mut state = self.lock()?;
+        Self::writable_handle(&state, agent, inode, handle)?;
+        let guard = self.meta.namespace_guard(agent)?;
+        if let Some(size) = size {
+            self.truncate_state(&mut state, agent, inode, size)?;
+            self.flush(&mut state, agent, inode, false)?;
+        }
+        let record = state
+            .inodes
+            .get(&(agent.to_string(), inode))
+            .ok_or_else(|| errno(9))?
+            .record
+            .clone();
+        self.set_attributes_locked(
+            &mut state, agent, inode, &guard, record, mode, uid, gid, atime, mtime,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_attributes_locked(
+        &self,
+        state: &mut State,
+        agent: &str,
+        inode: u64,
+        guard: &OwnerWriteGuard,
+        mut record: WorkspaceInode,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
+    ) -> anyhow::Result<()> {
         if let Some(mode) = mode {
             record.data.mode = mode & 0o7777;
         }
@@ -1526,14 +1649,34 @@ impl LayerManager {
             record.data.mtime = mtime;
         }
         record.data.ctime = now();
-        self.adoption(&mut state, agent, &guard, &[(inode, record)], &[], false)
+        self.adoption(state, agent, guard, &[(inode, record)], &[], false)
     }
     pub fn sync_directory(&self, agent: &str, inode: u64) -> anyhow::Result<()> {
         let mut state = self.lock()?;
+        self.sync_directory_locked(&mut state, agent, inode)
+    }
+
+    pub fn sync_directory_handle(
+        &self,
+        agent: &str,
+        inode: u64,
+        handle: u64,
+    ) -> anyhow::Result<()> {
+        let mut state = self.lock()?;
+        Self::directory_handle(&state, agent, inode, handle)?;
+        self.sync_directory_locked(&mut state, agent, inode)
+    }
+
+    fn sync_directory_locked(
+        &self,
+        state: &mut State,
+        agent: &str,
+        inode: u64,
+    ) -> anyhow::Result<()> {
         let guard = self.meta.namespace_guard(agent)?;
-        let record = self.parent(&state, agent, inode, false)?;
+        let record = self.parent(state, agent, inode, false)?;
         // Immediate commit is a barrier for earlier transactions in this metadata DB.
-        self.adoption(&mut state, agent, &guard, &[(inode, record)], &[], true)
+        self.adoption(state, agent, &guard, &[(inode, record)], &[], true)
     }
 
     /// Atomic O_CREAT lookup/create, without O_TRUNC semantics.
@@ -1644,7 +1787,10 @@ impl LayerManager {
     /// Content/snapshot roots must be restored by the caller before this adoption.
     pub fn restore_metadata(&self, dump: &FsMetadataDump) -> anyhow::Result<()> {
         let mut state = self.lock()?;
-        if !state.handles.is_empty() || state.inodes.values().any(|open| open.dirty) {
+        if !state.handles.is_empty()
+            || !state.directory_handles.is_empty()
+            || state.inodes.values().any(|open| open.dirty)
+        {
             return Err(errno(16));
         }
         let guard = self.meta.namespace_guard(SHARED_BASE_LAYER_ID)?;

@@ -1082,12 +1082,20 @@ impl MetadataStore {
             .set_durability(redb::Durability::Immediate)?;
         {
             let mut inodes = write_txn.open_table(FS_INODES)?;
+            let previous_maximum = namespace_inode_high_water(&inodes)?;
             for (agent_id, inode, _) in &current.inodes {
                 inodes.remove((agent_id.as_str(), *inode))?;
             }
             for (agent_id, inode, data) in &dump.inodes {
                 inodes.insert((agent_id.as_str(), *inode), data.as_slice())?;
             }
+            // Restore content, not allocation identity: mapped kernel inodes can
+            // outlive the snapshot. Persist the floor in the existing counter format.
+            let maximum = previous_maximum.max(namespace_inode_high_water(&inodes)?);
+            inodes.insert(
+                (SHARED_BASE_LAYER_ID, 0u64),
+                maximum.to_le_bytes().as_slice(),
+            )?;
 
             let mut dirents = write_txn.open_table(FS_DIRENTS)?;
             for (agent_id, parent, name, _) in &current.dirents {
@@ -1251,7 +1259,10 @@ impl MetadataStore {
                     }
                 })
                 .unwrap_or(1);
-            let inode = current + 1;
+            let inode = current
+                .max(restored_allocation_floor(&inodes)?)
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(28))?;
             inodes.insert((agent_id, 0u64), inode.to_le_bytes().as_slice())?;
             inodes.insert((agent_id, inode), serialized.as_slice())?;
             inode
@@ -1349,7 +1360,10 @@ impl MetadataStore {
                     }
                 })
                 .unwrap_or(1);
-            let next = current + 1;
+            let next = current
+                .max(restored_allocation_floor(&table)?)
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(28))?;
             table.insert((agent_id, 0u64), next.to_le_bytes().as_slice())?;
             next
         };
@@ -1364,7 +1378,26 @@ fn allocate_namespace_inode(
     table: &redb::Table<'_, (&'static str, u64), &'static [u8]>,
     current: u64,
 ) -> anyhow::Result<u64> {
-    let mut maximum = current.max(1);
+    namespace_inode_high_water(table)?
+        .max(current)
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::from_raw_os_error(28).into())
+}
+
+fn restored_allocation_floor(
+    table: &redb::Table<'_, (&'static str, u64), &'static [u8]>,
+) -> anyhow::Result<u64> {
+    Ok(table
+        .get((SHARED_BASE_LAYER_ID, 0u64))?
+        .map(|row| <[u8; 8]>::try_from(row.value()).map(u64::from_le_bytes))
+        .transpose()?
+        .unwrap_or(1))
+}
+
+fn namespace_inode_high_water(
+    table: &redb::Table<'_, (&'static str, u64), &'static [u8]>,
+) -> anyhow::Result<u64> {
+    let mut maximum = 1;
     for row in table.iter()? {
         let (key, value) = row?;
         let (_, inode) = key.value();
@@ -1373,9 +1406,7 @@ fn allocate_namespace_inode(
             maximum = maximum.max(u64::from_le_bytes(value.value().try_into()?));
         }
     }
-    maximum
-        .checked_add(1)
-        .ok_or_else(|| std::io::Error::from_raw_os_error(28).into())
+    Ok(maximum)
 }
 
 /// A fenced fs metadata write transaction (#496 V19). Like the redb store, the owner

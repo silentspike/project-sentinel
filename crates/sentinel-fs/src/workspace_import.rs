@@ -948,24 +948,8 @@ pub fn import_native_workspace(
             return Ok(receipt.result(WorkspaceImportDisposition::AlreadyImported));
         }
     }
-    let root =
-        open_source(source).context("open static native workspace without symlink traversal")?;
-    let source_identity = Identity::of(&root.metadata()?)?;
     if let Some(mut receipt) = receipt {
-        ensure!(
-            receipt.source_dev == source_identity.dev && receipt.source_ino == source_identity.ino,
-            "import receipt source directory identity mismatch"
-        );
         reserve_import_capacity(layer, agent, 0, MARKER_BYTES as u64)?;
-        let tree = census(&root)?;
-        ensure!(
-            native_digest(&root, &tree)? == receipt.tree_sha256 && census(&root)? == tree,
-            "source changed since prepared import"
-        );
-        ensure!(
-            Identity::of(&open_source(source)?.metadata()?)? == source_identity,
-            "source directory path changed during recovery"
-        );
         let staged = layer.lookup_dirent(agent, 1, &receipt.stage_name)?;
         match destination {
             Some(inode) => {
@@ -981,6 +965,30 @@ pub fn import_native_workspace(
                     "prepared import staging directory missing/replaced"
                 );
                 verify_receipt_tree(layer, agent, &receipt)?;
+                // Prepared content is already durable. A reboot may remove or
+                // recreate the native source; never replay that replacement.
+                match open_source(source) {
+                    Ok(root) => {
+                        let identity = Identity::of(&root.metadata()?)?;
+                        if receipt.source_dev == identity.dev && receipt.source_ino == identity.ino
+                        {
+                            let tree = census(&root)?;
+                            ensure!(
+                                native_digest(&root, &tree)? == receipt.tree_sha256
+                                    && census(&root)? == tree,
+                                "source changed since prepared import"
+                            );
+                            ensure!(
+                                Identity::of(&open_source(source)?.metadata()?)? == identity,
+                                "source directory path changed during recovery"
+                            );
+                        }
+                    }
+                    Err(error)
+                        if error.downcast_ref::<rustix::io::Errno>()
+                            == Some(&rustix::io::Errno::NOENT) => {}
+                    Err(error) => return Err(error.context("open prepared import source")),
+                }
                 layer.rename(agent, 1, &receipt.stage_name, 1, "workspaces", NOREPLACE)?;
             }
         }
@@ -993,6 +1001,9 @@ pub fn import_native_workspace(
         destination.is_none(),
         "existing unmarked workspaces namespace; refusing to hide accepted work"
     );
+    let root =
+        open_source(source).context("open static native workspace without symlink traversal")?;
+    let source_identity = Identity::of(&root.metadata()?)?;
     let tree = census(&root)?;
     let bytes = native_bytes(&tree)?;
     reserve_import_capacity(layer, agent, bytes, INITIAL_RECEIPT_RESERVATION)?;

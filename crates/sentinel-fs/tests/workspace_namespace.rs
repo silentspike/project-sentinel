@@ -594,6 +594,266 @@ fn snapshot_cut_flushes_dirty_and_restore_rejects_live_handles() {
 }
 
 #[test]
+fn directory_handles_block_restore_until_exact_release() {
+    both(|layer| {
+        let snapshot = layer.snapshot_metadata().unwrap();
+        let directory = layer.mkdir("alice", 1, "directory", 0o755).unwrap();
+        let handle = layer.open_directory("alice", directory).unwrap();
+        assert_eq!(
+            layer.getattr_handle("alice", handle).unwrap().kind,
+            FileKind::Directory
+        );
+        check_errno(layer.getattr_handle("bob", handle), 9);
+        check_errno(layer.validate_workspace_restore_budget(&snapshot), 16);
+        check_errno(layer.restore_metadata(&snapshot), 16);
+        assert_eq!(
+            layer.lookup_dirent("alice", 1, "directory").unwrap(),
+            Some(directory)
+        );
+        check_errno(layer.readdir_handle("bob", directory, handle), 9);
+        check_errno(layer.readdir_handle("alice", 1, handle), 9);
+        check_errno(layer.sync_directory_handle("alice", 1, handle), 9);
+        check_errno(layer.release_directory("bob", directory, handle), 9);
+        check_errno(layer.release_directory("alice", 1, handle), 9);
+        check_errno(layer.restore_metadata(&snapshot), 16);
+        assert!(layer
+            .readdir_handle("alice", directory, handle)
+            .unwrap()
+            .is_empty());
+        layer
+            .sync_directory_handle("alice", directory, handle)
+            .unwrap();
+        // Release must not require a surviving pathname/link either.
+        layer.rmdir("alice", 1, "directory").unwrap();
+        check_errno(layer.restore_metadata(&snapshot), 16);
+        layer.release_directory("alice", directory, handle).unwrap();
+        check_errno(layer.release_directory("alice", directory, handle), 9);
+        layer.restore_metadata(&snapshot).unwrap();
+        let next = layer.open_directory("alice", 1).unwrap();
+        assert_ne!(next, handle);
+        check_errno(layer.readdir_handle("alice", 1, handle), 9);
+        layer.release_directory("alice", 1, next).unwrap();
+    });
+}
+
+#[test]
+fn restore_preserves_inode_high_water_across_agents_and_reopen() {
+    for chunked in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot;
+        let removed;
+        let later;
+        {
+            let layer = manager(dir.path(), chunked);
+            snapshot = layer.snapshot_metadata().unwrap();
+            removed = layer.mkdir("alice", 1, "removed", 0o755).unwrap();
+            layer.restore_metadata(&snapshot).unwrap();
+            later = layer.mkdir("bob", 1, "later", 0o755).unwrap();
+            assert!(later > removed);
+            assert!(layer.lookup_inode("alice", removed).unwrap().is_none());
+            layer.restore_metadata(&snapshot).unwrap();
+        }
+        let layer = manager(dir.path(), chunked);
+        let next = layer.mkdir("alice", 1, "next", 0o755).unwrap();
+        assert!(next > later);
+        assert!(layer.lookup_inode("alice", removed).unwrap().is_none());
+        assert!(layer.lookup_inode("bob", later).unwrap().is_none());
+        // The retained floor also applies to older allocation entrypoints.
+        let legacy = layer.meta().next_inode("legacy").unwrap();
+        assert!(legacy > later);
+        let allocated = layer
+            .meta()
+            .create_file_allocating_inode(
+                "legacy-directory",
+                1,
+                "allocated",
+                &sentinel_fs::metadata::InodeData::directory(0o755),
+                true,
+            )
+            .unwrap();
+        assert!(allocated > later);
+    }
+}
+
+#[test]
+fn descriptor_setattr_and_truncate_preserve_open_unlinked_files() {
+    both(|layer| {
+        let inode = layer
+            .write_file("alice", 1, "file", b"abcdef", 0o644)
+            .unwrap();
+        let handle = layer.open_file("alice", inode, true, false, false).unwrap();
+        layer.unlink("alice", 1, "file", inode).unwrap();
+        layer.truncate_handle("alice", inode, handle, 2).unwrap();
+        layer
+            .set_handle_attributes(
+                "alice",
+                inode,
+                handle,
+                Some(4),
+                Some(0o444),
+                Some(123),
+                Some(456),
+                Some(10),
+                Some(20),
+            )
+            .unwrap();
+        let attributes = layer.getattr_handle("alice", handle).unwrap();
+        assert_eq!(attributes.nlinks, 0);
+        assert_eq!(attributes.size, 4);
+        assert_eq!(attributes.mode, 0o444);
+        assert_eq!((attributes.uid, attributes.gid), (123, 456));
+        assert_eq!((attributes.atime, attributes.mtime), (10, 20));
+        assert_eq!(
+            layer.read_handle("alice", handle, 0, 10).unwrap(),
+            b"ab\0\0"
+        );
+        assert!(layer.lookup_inode("alice", inode).unwrap().is_none());
+        assert!(layer.lookup_dirent("alice", 1, "file").unwrap().is_none());
+        layer.set_workspace_budget("alice", 4).unwrap();
+        check_errno(layer.truncate_handle("alice", inode, handle, 5), 122);
+        assert_eq!(layer.getattr_handle("alice", handle).unwrap().size, 4);
+        layer.sync_handle("alice", handle).unwrap();
+        layer.release_handle("alice", handle).unwrap();
+        assert_eq!(layer.workspace_budget("alice").unwrap().used_bytes, 0);
+    });
+}
+
+#[test]
+fn descriptor_truncate_after_rename_replacement_does_not_touch_destination() {
+    both(|layer| {
+        let old = layer
+            .write_file("alice", 1, "destination", b"old", 0o644)
+            .unwrap();
+        let handle = layer.open_file("alice", old, true, false, false).unwrap();
+        let replacement = layer
+            .write_file("alice", 1, "source", b"new", 0o644)
+            .unwrap();
+        layer
+            .rename("alice", 1, "source", 1, "destination", 0)
+            .unwrap();
+        layer
+            .set_handle_attributes(
+                "alice",
+                old,
+                handle,
+                Some(0),
+                Some(0o600),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(layer.getattr_handle("alice", handle).unwrap().nlinks, 0);
+        assert!(layer
+            .read_handle("alice", handle, 0, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            layer.lookup_dirent("alice", 1, "destination").unwrap(),
+            Some(replacement)
+        );
+        assert_eq!(layer.read_file("alice", replacement).unwrap(), b"new");
+        layer.release_handle("alice", handle).unwrap();
+    });
+}
+
+#[test]
+fn descriptor_truncate_keeps_open_time_write_capability_after_chmod() {
+    both(|layer| {
+        let inode = layer
+            .write_file("alice", 1, "file", b"abcdef", 0o644)
+            .unwrap();
+        let handle = layer.open_file("alice", inode, true, false, false).unwrap();
+        layer
+            .set_file_attributes("alice", inode, Some(0o444), None, None, None, None)
+            .unwrap();
+        check_errno(layer.truncate_file("alice", inode, 0), 13);
+        layer.truncate_handle("alice", inode, handle, 2).unwrap();
+        layer
+            .set_handle_attributes(
+                "alice",
+                inode,
+                handle,
+                Some(1),
+                None,
+                None,
+                None,
+                None,
+                Some(20),
+            )
+            .unwrap();
+        assert_eq!(layer.read_handle("alice", handle, 0, 10).unwrap(), b"a");
+        assert_eq!(layer.getattr_handle("alice", handle).unwrap().mode, 0o444);
+        layer.release_handle("alice", handle).unwrap();
+        assert_eq!(layer.read_file("alice", inode).unwrap(), b"a");
+    });
+}
+
+#[test]
+fn descriptor_mutations_reject_wrong_agent_inode_access_and_handle_kind() {
+    both(|layer| {
+        let inode = layer
+            .write_file("alice", 1, "file", b"kept", 0o644)
+            .unwrap();
+        let other = layer
+            .write_file("alice", 1, "other", b"other", 0o644)
+            .unwrap();
+        let writable = layer.open_file("alice", inode, true, false, false).unwrap();
+        let readonly = layer
+            .open_file("alice", inode, false, false, false)
+            .unwrap();
+        let directory = layer.open_directory("alice", 1).unwrap();
+        for (agent, target, handle) in [
+            ("bob", inode, writable),
+            ("alice", other, writable),
+            ("alice", inode, readonly),
+            ("alice", 1, directory),
+        ] {
+            check_errno(layer.truncate_handle(agent, target, handle, 0), 9);
+            check_errno(
+                layer.set_handle_attributes(
+                    agent,
+                    target,
+                    handle,
+                    Some(0),
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                9,
+            );
+        }
+        check_errno(layer.readdir_handle("alice", inode, writable), 9);
+        check_errno(layer.release_directory("alice", inode, writable), 9);
+        check_errno(layer.release_handle("alice", directory), 9);
+        assert_eq!(layer.read_file("alice", inode).unwrap(), b"kept");
+        assert_eq!(layer.read_file("alice", other).unwrap(), b"other");
+        assert_eq!(layer.getattr_handle("alice", writable).unwrap().mode, 0o644);
+        layer.release_directory("alice", 1, directory).unwrap();
+        layer.release_handle("alice", readonly).unwrap();
+        layer.release_handle("alice", writable).unwrap();
+        check_errno(layer.truncate_handle("alice", inode, writable, 0), 9);
+        check_errno(
+            layer.set_handle_attributes(
+                "alice",
+                inode,
+                writable,
+                None,
+                Some(0),
+                None,
+                None,
+                None,
+                None,
+            ),
+            9,
+        );
+    });
+}
+
+#[test]
 fn restore_notifies_previous_and_restored_keys_outside_locks() {
     let dir = tempfile::tempdir().unwrap();
     let layer = Arc::new(manager(dir.path(), true));
