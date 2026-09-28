@@ -4136,14 +4136,14 @@ mod tests {
             (
                 WorkbenchProfileId::PythonCoding,
                 "python3",
-                vec!["-I", "--"],
+                vec!["-E", "-s", "--"],
                 "python-unittest",
                 vec!["-I", "-m", "unittest", "discover"],
             ),
             (
                 WorkbenchProfileId::PythonCoding,
                 "python3",
-                vec!["-I", "--"],
+                vec!["-E", "-s", "--"],
                 "python-unittest-directory",
                 vec!["-I", "-m", "unittest", "discover", "-s", "tests"],
             ),
@@ -4214,7 +4214,7 @@ mod tests {
             (
                 WorkbenchProfileId::PythonCoding,
                 "python3",
-                vec!["-I", "--", "src/app.py"],
+                vec!["-E", "-s", "--", "src/app.py"],
                 vec!["-m", "pip", "install", "package"],
                 "python-unittest-directory",
                 vec!["-I", "-m", "unittest", "discover", "-s", "-v"],
@@ -4278,6 +4278,53 @@ mod tests {
             let mut active = authority(&request, &profile);
             active.role_capabilities.clear();
             assert!(authorize_workbench_request(&request, &active).is_err());
+        }
+    }
+
+    #[test]
+    fn python_script_grant_preserves_local_imports_without_option_expansion() {
+        let id = WorkbenchProfileId::PythonCoding;
+        let fixture = secure_test_workbench_profile_authority_with_bytes(id.immutable_bytes());
+        let (profile, digest) = WorkbenchProfile::load(fixture.path()).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2819");
+        request.tool_profile = id.as_str().to_owned();
+        request.tool_profile_digest = digest.clone();
+        request.capabilities = BTreeSet::from(["command.run_allowlisted".to_owned()]);
+        let args = vec![
+            "-E".to_owned(),
+            "-s".to_owned(),
+            "--".to_owned(),
+            "src/app.py".to_owned(),
+            "project".to_owned(),
+        ];
+        request.command_policy = vec![sentinel_common::CommandRule {
+            program: "python3".to_owned(),
+            required_arg_prefix: args.clone(),
+            max_args: args.len() as u16,
+        }];
+        request.tool = WorkbenchTool::RunCommand {
+            program: "python3".to_owned(),
+            args,
+        };
+        request.input_digest = request.canonical_digest().unwrap();
+        request.validate_at(1_900_000_000_000).unwrap();
+        profile.authorize_request(&digest, &request).unwrap();
+
+        for denied in [
+            vec!["-I", "--", "src/app.py"],
+            vec!["-E", "--", "src/app.py"],
+            vec!["-s", "--", "src/app.py"],
+            vec!["-s", "-E", "--", "src/app.py"],
+            vec!["-E", "-s", "src/app.py"],
+            vec!["-E", "-s", "-c", "payload"],
+            vec!["-E", "-s", "-m", "pip", "install", "package"],
+            vec!["-E", "-s", "--", "src/app.py", "-c"],
+        ] {
+            request.tool = WorkbenchTool::RunCommand {
+                program: "python3".to_owned(),
+                args: denied.into_iter().map(str::to_owned).collect(),
+            };
+            assert!(profile.authorize_request(&digest, &request).is_err());
         }
     }
 

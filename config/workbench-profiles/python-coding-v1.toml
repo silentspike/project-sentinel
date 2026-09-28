@@ -25,7 +25,7 @@ stderr_bytes = 65536
 
 [[command_rules]]
 program = "python3"
-required_arg_prefix = ["-I", "--"]
+required_arg_prefix = ["-E", "-s", "--"]
 max_args = 32
 
 [[command_rules]]
