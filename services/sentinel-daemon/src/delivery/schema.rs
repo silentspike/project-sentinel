@@ -16,6 +16,46 @@ pub struct VersionedRefV1 {
     pub digest: ContentDigest,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewAccessV1 {
+    pub schema_version: u16,
+    pub access_id: String,
+    pub generation: u64,
+    pub tenant_id: String,
+    pub project_id: String,
+    pub delivery: VersionedRefV1,
+    pub release: VersionedRefV1,
+    pub manifest: VersionedRefV1,
+    pub customer: PrincipalV1,
+    pub preview_digest: ContentDigest,
+    pub preview_ttl_policy_version: u16,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub access_digest: ContentDigest,
+}
+
+impl PreviewAccessV1 {
+    pub fn computed_digest(&self) -> Result<ContentDigest, super::DeliveryError> {
+        let mut value = self.clone();
+        value.access_digest = ContentDigest::zero();
+        ContentDigest::of_domain("delivery-preview-access", DELIVERY_SCHEMA_V1, &value)
+    }
+
+    pub fn seal(mut self) -> Result<Self, super::DeliveryError> {
+        self.access_digest = self.computed_digest()?;
+        Ok(self)
+    }
+
+    pub fn reference(&self) -> VersionedRefV1 {
+        VersionedRefV1 {
+            id: self.access_id.clone(),
+            generation: self.generation,
+            digest: self.access_digest.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorityRole {

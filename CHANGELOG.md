@@ -1,5 +1,9 @@
 # Changelog
 
+- Renew customer preview access through a short-lived, principal-bound durable
+  grant to the same release and manifest. Preserve the original delivery receipt,
+  exact retries and independent explicit customer acceptance (#856).
+
 - Preserve customer preview frames across overview polling and load bounded
   local artifact stylesheets through the authenticated delivery-bound API.
   Keep artifact scripts, navigation and external networking disabled (#856).

@@ -1,5 +1,5 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
-import { customerFetch, type CustomerDelivery } from "./api";
+import { customerFetch, customerPreviewAvailable, type CustomerDelivery } from "./api";
 import { PREVIEW_MAX_STYLE_BYTES, PREVIEW_MAX_STYLESHEETS, previewBroker, previewHtml, previewStylesheetPath,
   samePreviewBinding, type PreviewBinding, type PreviewFile, type PreviewInventory } from "./preview";
 
@@ -19,10 +19,10 @@ export function CustomerPreview(props: { projectId: string; delivery: CustomerDe
   let frame: HTMLIFrameElement | undefined;
   let stylesRequested = "";
   const clearDocument = () => { renderGeneration++; setDocument(undefined); };
-  const binding = (): PreviewBinding => ({ project_id: props.projectId, delivery: props.delivery.delivery, release: props.delivery.release });
+  const binding = (): PreviewBinding => ({ project_id: props.projectId, delivery: props.delivery.delivery, release: props.delivery.release,
+    ...(props.delivery.preview_access ? { preview_access: props.delivery.preview_access.access } : {}) });
   const bindingKey = createMemo(() => JSON.stringify(binding()));
-  const active = () => props.delivery.release_state === "active"
-    && ["delivered", "accepted"].includes(props.delivery.state) && now() < props.delivery.expires_at_ms;
+  const active = () => customerPreviewAvailable(props.delivery, now());
   const receive = (event: MessageEvent) => {
     const value = document();
     if (!value || !active() || event.source !== frame?.contentWindow || event.data?.channel !== value.channel) return;
@@ -46,7 +46,8 @@ export function CustomerPreview(props: { projectId: string; delivery: CustomerDe
         let css = cache.get(path);
         if (css === undefined) {
           const response = await customerFetch<PreviewFile>("preview", { project_id: value.inventory.project_id,
-            delivery: value.inventory.delivery, release: value.inventory.release, file: { artifact_id: value.artifact, path } });
+            delivery: value.inventory.delivery, release: value.inventory.release,
+            ...(value.inventory.preview_access ? { preview_access: value.inventory.preview_access } : {}), file: { artifact_id: value.artifact, path } });
           if (document() !== value || !active()) return;
           css = previewHtml(response, value.inventory, value.artifact, path);
           cache.set(path, css);

@@ -40,6 +40,17 @@ export interface CustomerDelivery {
   issued_at_ms: number;
   expires_at_ms: number;
   preview_digest: string;
+  preview_access?: { access: DeliveryReference; issued_at_ms: number; expires_at_ms: number } | null;
+}
+
+export function customerPreviewWindow(delivery: CustomerDelivery): { issued_at_ms: number; expires_at_ms: number } {
+  return delivery.preview_access ?? delivery;
+}
+
+export function customerPreviewAvailable(delivery: CustomerDelivery, now: number): boolean {
+  const window = customerPreviewWindow(delivery);
+  return delivery.release_state === "active" && ["delivered", "accepted"].includes(delivery.state)
+    && now >= window.issued_at_ms && now < window.expires_at_ms;
 }
 export interface ProjectProgress { project_id: string; request_id: string; state: string; version: number; work_items: { work_item_id: string; state: string }[]; deliveries?: CustomerDelivery[] }
 export interface Overview { requests: CustomerRequest[]; proposals: Proposal[]; projects?: ProjectProgress[] }
@@ -64,9 +75,9 @@ export async function customerFetch<T>(path: string, body?: unknown): Promise<T>
 }
 
 export function sendCustomerCommand(body: Pick<PendingCommand, "operation_id" | "command">): Promise<unknown> {
-  if (body.command.command === "confirm_delivery") {
+  if (body.command.command === "confirm_delivery" || body.command.command === "renew_delivery_preview") {
     const { command: _command, ...intent } = body.command;
-    return customerFetch("delivery", { operation_id: body.operation_id, intent: { ...intent, action: "confirm_delivery" } });
+    return customerFetch("delivery", { operation_id: body.operation_id, intent: { ...intent, action: _command === "confirm_delivery" ? "confirm_delivery" : "renew_preview" } });
   }
   return customerFetch("commands", body);
 }
