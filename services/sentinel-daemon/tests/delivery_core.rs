@@ -2733,6 +2733,184 @@ fn unresolved_or_malformed_findings_cannot_authorize_gate_or_promotion() {
 }
 
 #[test]
+fn changed_evaluator_qa_run_preserves_failure_evidence_and_reopens_cleanly() {
+    let temp = TempDir::new().unwrap();
+    let (integration, controls) = FakeIntegration::controlled();
+    *controls.harness_outcome.lock().unwrap() = QaHarnessOutcome::Fail;
+    let (core, candidate, original_plan, qa) = running_qa_core(&temp, integration);
+    let (_, receipt) = core
+        .execute_qa(
+            &context("qa-1", AuthorityRole::Qa, "failed-execute", 140),
+            "tenant-a",
+            "project-1",
+            "run-1",
+        )
+        .unwrap();
+    let previous_ref = VersionedRefV1 {
+        id: "run-1".to_string(),
+        generation: 1,
+        digest: digest("run-request"),
+    };
+    core.import_evidence_graph(
+        &context("qa-1", AuthorityRole::Qa, "failed-graph", 145),
+        "tenant-a",
+        "project-1",
+        "run-1",
+        evidence_graph(&previous_ref, &original_plan.plan_digest, &receipt),
+    )
+    .unwrap();
+    core.transition_qa(
+        &context("qa-1", AuthorityRole::Qa, "failed-complete", 150),
+        "tenant-a",
+        "project-1",
+        "run-1",
+        QaRunState::CompletedFail,
+    )
+    .unwrap();
+    let before = core.load("tenant-a", "project-1").unwrap().unwrap();
+    let mut new_plan = original_plan.clone();
+    new_plan.plan_id = "plan-new-evaluator".to_string();
+    new_plan.runner_binary_digest = digest("corrected-evaluator");
+    let new_plan = new_plan.seal().unwrap();
+    let mut next_run = run(&new_plan, qa);
+    next_run.run_id = "run-new-evaluator".to_string();
+    next_run.request_digest = digest("new-evaluator-request");
+    next_run.supersedes = Some(previous_ref.clone());
+    let command = context(
+        "release-manager",
+        AuthorityRole::ReleaseManager,
+        "assign-new-evaluator",
+        160,
+    );
+
+    for fault in 0..5 {
+        let mut invalid_plan = new_plan.clone();
+        let mut invalid_run = next_run.clone();
+        match fault {
+            0 => invalid_plan.runner_binary_digest = original_plan.runner_binary_digest.clone(),
+            1 => invalid_plan.required_case_ids.clear(),
+            2 => invalid_run.supersedes.as_mut().unwrap().digest = digest("forged-failure"),
+            3 => invalid_run.supersedes = None,
+            4 => invalid_run.retry_of = Some(previous_ref.clone()),
+            _ => unreachable!(),
+        }
+        let invalid_plan = invalid_plan.seal().unwrap();
+        invalid_run.plan.digest = invalid_plan.plan_digest.clone();
+        assert!(core
+            .assign_qa(
+                &command,
+                "tenant-a",
+                "project-1",
+                &candidate.candidate_id,
+                invalid_plan,
+                invalid_run
+            )
+            .is_err());
+        assert_eq!(core.load("tenant-a", "project-1").unwrap().unwrap(), before);
+    }
+    let committed = core
+        .assign_qa(
+            &command,
+            "tenant-a",
+            "project-1",
+            &candidate.candidate_id,
+            new_plan.clone(),
+            next_run.clone(),
+        )
+        .unwrap();
+    let after = core.load("tenant-a", "project-1").unwrap().unwrap();
+    assert_eq!(after.qa_runs["run-1"], before.qa_runs["run-1"]);
+    assert_eq!(after.evidence_graphs, before.evidence_graphs);
+    assert_eq!(after.workbench_receipts, before.workbench_receipts);
+    assert_eq!(
+        after.qa_runs["run-new-evaluator"].state,
+        QaRunState::Planned
+    );
+    assert!(
+        core.assign_qa(
+            &command,
+            "tenant-a",
+            "project-1",
+            &candidate.candidate_id,
+            new_plan.clone(),
+            next_run.clone()
+        )
+        .unwrap()
+        .duplicate
+    );
+
+    drop(core);
+    let reopened = DeliveryCore::new_test_only(store(&temp), FakeIntegration::new().0, FakeEffects);
+    assert_eq!(
+        reopened.load("tenant-a", "project-1").unwrap().unwrap(),
+        after
+    );
+    assert_eq!(
+        reopened
+            .assign_qa(
+                &command,
+                "tenant-a",
+                "project-1",
+                &candidate.candidate_id,
+                new_plan,
+                next_run
+            )
+            .unwrap()
+            .project_revision,
+        committed.project_revision
+    );
+    assert!(reopened
+        .transition_qa(
+            &context("qa-1", AuthorityRole::Qa, "do-not-reopen-failed", 170),
+            "tenant-a",
+            "project-1",
+            "run-1",
+            QaRunState::Running,
+        )
+        .is_err());
+}
+
+#[test]
+fn evaluator_change_does_not_replace_an_active_or_passing_qa_run() {
+    for completed in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let (core, candidate, old_plan, qa) = if completed {
+            completed_qa_core(&temp)
+        } else {
+            running_qa_core(&temp, FakeIntegration::new().0)
+        };
+        let mut new_plan = old_plan;
+        new_plan.plan_id = "plan-next".to_string();
+        new_plan.runner_binary_digest = digest("new-runner");
+        let new_plan = new_plan.seal().unwrap();
+        let mut next_run = run(&new_plan, qa);
+        next_run.run_id = "run-next".to_string();
+        next_run.supersedes = Some(VersionedRefV1 {
+            id: "run-1".to_string(),
+            generation: 1,
+            digest: digest("run-request"),
+        });
+        let before = core.load("tenant-a", "project-1").unwrap().unwrap();
+        assert!(core
+            .assign_qa(
+                &context(
+                    "release-manager",
+                    AuthorityRole::ReleaseManager,
+                    "no-active-replacement",
+                    160
+                ),
+                "tenant-a",
+                "project-1",
+                &candidate.candidate_id,
+                new_plan,
+                next_run,
+            )
+            .is_err());
+        assert_eq!(core.load("tenant-a", "project-1").unwrap().unwrap(), before);
+    }
+}
+
+#[test]
 fn failed_qa_records_durable_non_promotable_gate() {
     let temp = TempDir::new().unwrap();
     let (integration, controls) = FakeIntegration::controlled();

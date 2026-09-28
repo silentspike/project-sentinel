@@ -4532,6 +4532,22 @@ impl WorkflowApi {
     }
 
     fn reconcile_batch(&self, should_stop: &impl Fn() -> bool) -> Result<(), WorkflowError> {
+        let result = self.reconcile_work_batch(should_stop);
+        // Committed facts must drain even when one project's next action is
+        // blocked. Publishing evidence does not authorize a failed QA release.
+        publish_after_reconciliation(result, || {
+            if let Some(delivery) = self.delivery.as_ref() {
+                delivery
+                    .publish_pending()
+                    .map(|_| ())
+                    .map_err(delivery_workflow_error)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn reconcile_work_batch(&self, should_stop: &impl Fn() -> bool) -> Result<(), WorkflowError> {
         self.publish_collaboration_backlog()
             .map_err(|_| workflow_unavailable())?;
         for project in self.store.company_projects()? {
@@ -4634,11 +4650,6 @@ impl WorkflowApi {
             self.sync_company_state(&work)?;
         }
         self.reconcile_company_state_page()?;
-        if let Some(delivery) = self.delivery.as_ref() {
-            delivery
-                .publish_pending()
-                .map_err(delivery_workflow_error)?;
-        }
         Ok(())
     }
 
@@ -5517,11 +5528,37 @@ fn stable_operation_id(domain: &str, digest: &str, version: u64) -> Uuid {
     Uuid::from_bytes(value)
 }
 
+fn publish_after_reconciliation(
+    result: Result<(), WorkflowError>,
+    publish: impl FnOnce() -> Result<(), WorkflowError>,
+) -> Result<(), WorkflowError> {
+    let publication = publish();
+    result.and(publication)
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     use super::*;
+
+    #[test]
+    fn failed_project_reconciliation_still_drains_publication_and_retains_failure() {
+        let called = AtomicBool::new(false);
+        let result = publish_after_reconciliation(Err(workflow_persistence_failure()), || {
+            called.store(true, Ordering::Release);
+            Ok(())
+        });
+        assert!(called.load(Ordering::Acquire));
+        assert_eq!(
+            result.unwrap_err().code,
+            WorkflowErrorCode::PersistenceFailure
+        );
+        let result = publish_after_reconciliation(Ok(()), || Err(workflow_unavailable()));
+        let error = result.unwrap_err();
+        assert_eq!(error.code, WorkflowErrorCode::PersistenceFailure);
+        assert!(error.retryable);
+    }
 
     fn principal_binding(principal_id: &str) -> PrincipalBinding {
         PrincipalBinding {
