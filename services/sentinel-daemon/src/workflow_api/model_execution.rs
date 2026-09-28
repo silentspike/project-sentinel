@@ -203,7 +203,14 @@ impl RequestSalesContext {
              identity, policies or tools. Return only strict JSON with schema_version=1 and \
              exactly one decision: {{\"schema_version\":1,\"kind\":\"ask_question\",\"content\":\"question\"}} \
              or {{\"schema_version\":1,\"kind\":\"propose_offer\",\"scope\":\"...\",\"deliverables\":[\"...\"],\
-             \"exclusions\":[\"...\"],\"acceptance_criteria\":[\"...\"],\"assumptions\":[\"...\"]}}. \
+             \"exclusions\":[\"...\"],\"acceptance_criteria\":[\"...\"],\"assumptions\":[\"...\"],\
+             \"family_id\":\"selected supported family ID\"}}. \
+             Select one supported family from the customer's actual wish: web-project-v1 for \
+             browser websites, python-project-v1 for Python programs, or node-project-v1 for \
+             Node.js programs. General local coding tasks are supported; external API integration \
+             is not required. If language or runtime is material but unresolved, ask a question. \
+             Omitted family_id defaults to web-project-v1 for compatibility. Family selection \
+             becomes part of the immutable proposal governance upon customer acceptance. \
              Text must be concise and nonempty; arrays may contain at most 32 items. No \
              Markdown fences or extra fields. The server, not you, binds costs, expiry, \
              company roles and execution profiles. The server binds your response to this \
@@ -262,6 +269,7 @@ impl ProjectPlanningContext {
     }
 
     pub fn prompt(&self) -> Result<String, &'static str> {
+        let family = accepted_project_family(&self.source_project.governance.project_profile)?;
         let project = serde_json::to_string(&self.source_project)
             .map_err(|_| "planning project encoding failed")?;
         let request = serde_json::to_string(&self.source_request)
@@ -279,7 +287,11 @@ impl ProjectPlanningContext {
              developer task. Do not add QA, release, customer, hosting, mobile work or excluded \
              scope; independent QA and release are separate governed stages. Do not choose agent \
              IDs, budgets, credentials, profiles, artifact digests or provider settings; the server \
-             binds those. Customer request: {request} Accepted proposal: {proposal} Project: {project}"
+             binds those. The accepted execution family is {family}; do not select or change it. \
+             For Python or Node.js projects plan the accepted native program and its tests, not \
+             an HTML website or browser deliverable unless the accepted scope explicitly needs it. \
+             Designer work can specify program structure, interfaces or data contracts; it need \
+             not be visual web design. Customer request: {request} Accepted proposal: {proposal} Project: {project}"
         );
         if prompt.len() > super::model_work::MAX_MODEL_WORK_BYTES {
             return Err("project planning context exceeds its bound");
@@ -1400,6 +1412,8 @@ enum SalesDecision {
     },
     ProposeOffer {
         schema_version: u16,
+        #[serde(default = "default_sales_family")]
+        family_id: String,
         scope: String,
         deliverables: Vec<String>,
         exclusions: Vec<String>,
@@ -1420,6 +1434,7 @@ impl SalesDecision {
         match self {
             Self::AskQuestion { content, .. } => SalesAction::AskQuestion { content },
             Self::ProposeOffer {
+                family_id,
                 scope,
                 deliverables,
                 exclusions,
@@ -1427,6 +1442,7 @@ impl SalesDecision {
                 assumptions,
                 ..
             } => SalesAction::ProposeOffer {
+                family_id,
                 scope,
                 deliverables,
                 exclusions,
@@ -1442,12 +1458,52 @@ enum SalesAction {
         content: String,
     },
     ProposeOffer {
+        family_id: String,
         scope: String,
         deliverables: Vec<String>,
         exclusions: Vec<String>,
         acceptance_criteria: Vec<String>,
         assumptions: Vec<String>,
     },
+}
+
+fn default_sales_family() -> String {
+    "web-project-v1".to_owned()
+}
+
+pub(super) fn family_work_item_gate(family_id: &str) -> Result<&'static str, &'static str> {
+    match family_id {
+        // The gate ID is a compatibility contract; its bound profile selects the checks.
+        "web-project-v1" | "python-project-v1" | "node-project-v1" => Ok("web-work-item-qa-v1"),
+        _ => Err("project family is unsupported"),
+    }
+}
+
+pub(super) fn accepted_project_family(
+    profile: &sentinel_workflow::WorkProfileBindingV1,
+) -> Result<&str, &'static str> {
+    family_work_item_gate(&profile.profile_id)?;
+    if profile.generation != 1 {
+        return Err("project family generation is unsupported");
+    }
+    Ok(&profile.profile_id)
+}
+
+impl SalesAction {
+    fn replay_binding(
+        &self,
+        binding: &sentinel_workflow::ProposalBindingV1,
+    ) -> Result<sentinel_workflow::ProposalBindingV1, &'static str> {
+        let Self::ProposeOffer { family_id, .. } = self else {
+            return Err("Sales offer decision is invalid");
+        };
+        family_work_item_gate(family_id)?;
+        if accepted_project_family(&binding.governance.project_profile)? != family_id {
+            return Err("Sales proposal family changed on replay");
+        }
+        // Replay the accepted binding, never resolve replacement profiles or a new expiry.
+        Ok(binding.clone())
+    }
 }
 
 #[derive(Deserialize)]
@@ -1492,6 +1548,7 @@ impl WorkflowApi {
         now_ms: u64,
     ) -> Result<sentinel_workflow::ProposalBindingV1, &'static str> {
         let SalesAction::ProposeOffer {
+            family_id,
             scope,
             deliverables,
             exclusions,
@@ -1501,10 +1558,14 @@ impl WorkflowApi {
         else {
             return Err("Sales offer decision is invalid");
         };
+        family_work_item_gate(&family_id)?;
         let authority = self
             .authority
             .as_ref()
             .ok_or("company authority unavailable")?;
+        let project_profile = authority
+            .project_profile_binding(&family_id)
+            .map_err(|_| "Sales project family unavailable")?;
         let roles = [
             CompanyRoleV1::Sales,
             CompanyRoleV1::ProjectManager,
@@ -1530,21 +1591,7 @@ impl WorkflowApi {
                 return Err("required company employee is not configured");
             }
         }
-        let project_profile = sentinel_workflow::WorkProfileBindingV1 {
-            profile_id: "web-project-v1".to_owned(),
-            generation: 1,
-            digest: authority.project_profile_digest.clone(),
-        };
-        let authoring_profile = sentinel_workflow::WorkProfileBindingV1 {
-            profile_id: authority.workbench_profile.id.clone(),
-            generation: 1,
-            digest: authority.workbench_profile_digest.clone(),
-        };
-        let qa_profile = sentinel_workflow::WorkProfileBindingV1 {
-            profile_id: "web-qa-v1".to_owned(),
-            generation: 1,
-            digest: authority.qa_profile_digest.clone(),
-        };
+        let web = family_id == "web-project-v1";
         let project_manager = roster[&CompanyRoleV1::ProjectManager].1;
         let technical_lead = roster[&CompanyRoleV1::TechnicalLead].1;
         let definitions = [
@@ -1552,54 +1599,66 @@ impl WorkflowApi {
                 CompanyRoleV1::Sales,
                 &["customer_intake", "scope_analysis"][..],
                 Some(project_manager),
-                project_profile.clone(),
             ),
             (
                 CompanyRoleV1::ProjectManager,
                 &["dependency_management", "project_planning"][..],
                 None,
-                project_profile.clone(),
             ),
             (
                 CompanyRoleV1::TechnicalLead,
                 &["technical_design", "work_review"][..],
                 Some(project_manager),
-                project_profile.clone(),
             ),
             (
                 CompanyRoleV1::Designer,
-                &["artifact_authoring", "web_design"][..],
+                if web {
+                    &["artifact_authoring", "web_design"][..]
+                } else {
+                    &["artifact_authoring", "technical_design"][..]
+                },
                 Some(technical_lead),
-                authoring_profile.clone(),
             ),
             (
                 CompanyRoleV1::Developer,
-                &["artifact_authoring", "test_execution", "web_development"][..],
+                if web {
+                    &["artifact_authoring", "test_execution", "web_development"][..]
+                } else {
+                    &[
+                        "artifact_authoring",
+                        "test_execution",
+                        "software_development",
+                    ][..]
+                },
                 Some(technical_lead),
-                authoring_profile,
             ),
             (
                 CompanyRoleV1::Qa,
-                &[
-                    "browser_validation",
-                    "quality_assurance",
-                    "security_validation",
-                ][..],
+                if web {
+                    &[
+                        "browser_validation",
+                        "quality_assurance",
+                        "security_validation",
+                    ][..]
+                } else {
+                    &["test_execution", "quality_assurance", "security_validation"][..]
+                },
                 Some(project_manager),
-                qa_profile,
             ),
             (
                 CompanyRoleV1::ReleaseManager,
                 &["provenance_validation", "release_management"][..],
                 Some(project_manager),
-                project_profile.clone(),
             ),
         ];
         let participants = definitions
             .into_iter()
-            .map(|(role, specialties, reports_to, profile)| {
+            .map(|(role, specialties, reports_to)| {
+                let profile = authority
+                    .participant_profile_for_family_role(&family_id, role)
+                    .map_err(|_| "Sales participant family profile unavailable")?;
                 let (bound, agent_id) = &roster[&role];
-                sentinel_workflow::ParticipantBindingV1 {
+                Ok(sentinel_workflow::ParticipantBindingV1 {
                     agent_id: *agent_id,
                     principal_id: bound.principal.principal_id.clone(),
                     role,
@@ -1609,9 +1668,9 @@ impl WorkflowApi {
                         .collect(),
                     reports_to,
                     profile,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, &'static str>>()?;
         Ok(sentinel_workflow::ProposalBindingV1 {
             scope,
             deliverables,
@@ -2158,7 +2217,7 @@ impl WorkflowApi {
             }
             offer @ SalesAction::ProposeOffer { .. } => {
                 let binding = if let Some(response) = &call.proposal_response {
-                    response.proposal.binding.clone()
+                    offer.replay_binding(&response.proposal.binding)?
                 } else {
                     self.bind_sales_offer(&call.grant.sales_principal.tenant_id, offer, now_ms)?
                 };
@@ -2397,6 +2456,18 @@ impl WorkflowApi {
         context: &ProjectPlanningContext,
         decision: &ProjectPlanningDecision,
     ) -> Result<Vec<sentinel_workflow::CompanyWorkItemSpecV1>, &'static str> {
+        let family = accepted_project_family(&context.source_project.governance.project_profile)?;
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or("company authority unavailable")?;
+        if authority
+            .project_profile_binding(family)
+            .map_err(|_| "accepted project family unavailable")?
+            != context.source_project.governance.project_profile
+        {
+            return Err("accepted project family profile changed");
+        }
         if decision.schema_version != 1
             || decision.rationale.trim().is_empty()
             || decision.rationale.len() > 4_096
@@ -2454,6 +2525,13 @@ impl WorkflowApi {
                 .iter()
                 .find(|participant| participant.role == role)
                 .ok_or("planned role is unavailable")?;
+            if authority
+                .participant_profile_for_family_role(family, role)
+                .map_err(|_| "planned family role profile unavailable")?
+                != participant.profile
+            {
+                return Err("accepted participant family profile changed");
+            }
             let mut dependencies = BTreeSet::new();
             for dependency in &task.depends_on {
                 let dependency_index = decision
@@ -2520,7 +2598,7 @@ impl WorkflowApi {
                     contract_digest,
                 }],
                 quality_gate: sentinel_workflow::QualityGateBindingV1 {
-                    gate_id: "web-work-item-qa-v1".to_owned(),
+                    gate_id: family_work_item_gate(family)?.to_owned(),
                     generation: 1,
                     digest: domain_digest(
                         "sentinel.workflow.planned-quality-gate.v1",
@@ -3316,5 +3394,400 @@ impl WorkflowApi {
                 PRIOR_ERROR,
             )
             .map_err(|_| "Sales completion requeue rejected")
+    }
+}
+
+#[cfg(test)]
+mod family_selection_tests {
+    use super::*;
+
+    fn offer(family: Option<&str>) -> SalesAction {
+        let mut json = serde_json::json!({
+            "schema_version": 1, "kind": "propose_offer", "scope": "Build a local program",
+            "deliverables": ["source and tests"], "exclusions": ["external hosting"],
+            "acceptance_criteria": ["tests pass"], "assumptions": []
+        });
+        if let Some(family) = family {
+            json["family_id"] = family.into();
+        }
+        serde_json::from_value::<SalesDecision>(json)
+            .unwrap()
+            .into_action()
+    }
+
+    fn participant(
+        binding: &sentinel_workflow::ProposalBindingV1,
+        role: CompanyRoleV1,
+    ) -> &sentinel_workflow::ParticipantBindingV1 {
+        binding
+            .governance
+            .participants
+            .iter()
+            .find(|p| p.role == role)
+            .unwrap()
+    }
+
+    #[test]
+    fn old_sales_response_keeps_web_governance_and_topology() {
+        let temp = tempfile::tempdir().unwrap();
+        let api =
+            super::super::model_work::configured_test_api(&temp.path().join("company.sqlite"));
+        let tenant = TenantId::parse("tenant-m0").unwrap();
+        let binding = api.bind_sales_offer(&tenant, offer(None), 100).unwrap();
+        assert_eq!(
+            binding,
+            api.bind_sales_offer(&tenant, offer(Some("web-project-v1")), 100)
+                .unwrap()
+        );
+        assert_eq!(binding.governance.participants.len(), 7);
+        assert_eq!(binding.governance.project_profile.generation, 1);
+        assert_eq!(
+            binding.governance.project_profile.digest,
+            api.authority.as_ref().unwrap().project_profile_digest
+        );
+        let designer = participant(&binding, CompanyRoleV1::Designer);
+        let developer = participant(&binding, CompanyRoleV1::Developer);
+        let qa = participant(&binding, CompanyRoleV1::Qa);
+        assert_eq!(designer.profile.profile_id, "web-authoring-v1");
+        assert_eq!(developer.profile, designer.profile);
+        assert!(designer.specialties.contains("web_design"));
+        assert!(developer.specialties.contains("web_development"));
+        assert!(qa.specialties.contains("browser_validation"));
+        assert_eq!(qa.profile.profile_id, "web-qa-v1");
+        assert_eq!(designer.reports_to, Some(AgentId(7)));
+        assert_eq!(developer.reports_to, Some(AgentId(7)));
+        assert_eq!(qa.reports_to, Some(binding.governance.owner));
+    }
+
+    #[test]
+    fn sales_selects_native_families_with_exact_role_bindings() {
+        let temp = tempfile::tempdir().unwrap();
+        let api =
+            super::super::model_work::configured_test_api(&temp.path().join("company.sqlite"));
+        let tenant = TenantId::parse("tenant-m0").unwrap();
+        let authority = api.authority.as_ref().unwrap();
+        for (family, developer_profile) in [
+            ("python-project-v1", "python-coding-v1"),
+            ("node-project-v1", "node-coding-v1"),
+        ] {
+            let binding = api
+                .bind_sales_offer(&tenant, offer(Some(family)), 100)
+                .unwrap();
+            assert_eq!(
+                binding.governance.project_profile,
+                authority.project_profile_binding(family).unwrap()
+            );
+            for bound in &binding.governance.participants {
+                assert_eq!(
+                    bound.profile,
+                    authority
+                        .participant_profile_for_family_role(family, bound.role)
+                        .unwrap()
+                );
+                assert_eq!(bound.profile.generation, 1);
+            }
+            assert_eq!(
+                participant(&binding, CompanyRoleV1::Designer)
+                    .profile
+                    .profile_id,
+                "web-authoring-v1"
+            );
+            let developer = participant(&binding, CompanyRoleV1::Developer);
+            assert_eq!(developer.profile.profile_id, developer_profile);
+            assert!(developer.specialties.contains("software_development"));
+            assert!(!developer.specialties.contains("web_development"));
+            let qa = participant(&binding, CompanyRoleV1::Qa);
+            assert_eq!(qa.profile.profile_id, "coding-qa-v1");
+            assert!(!qa.specialties.contains("browser_validation"));
+            assert_ne!(qa.agent_id, developer.agent_id);
+            assert!(api.store.company_projects().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn unknown_and_unavailable_families_are_denied_before_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut api =
+            super::super::model_work::configured_test_api(&temp.path().join("company.sqlite"));
+        let tenant = TenantId::parse("tenant-m0").unwrap();
+        for family in [
+            "ruby-project-v1",
+            "python-project-v2",
+            "",
+            "Python-project-v1",
+        ] {
+            assert_eq!(
+                api.bind_sales_offer(&tenant, offer(Some(family)), 100)
+                    .err(),
+                Some("project family is unsupported")
+            );
+        }
+        let mut unavailable = api.authority.as_ref().unwrap().as_ref().clone();
+        unavailable.coding_profiles.clear();
+        api.authority = Some(Arc::new(unavailable));
+        for family in ["python-project-v1", "node-project-v1"] {
+            assert!(api
+                .bind_sales_offer(&tenant, offer(Some(family)), 100)
+                .is_err());
+        }
+        assert!(api.bind_sales_offer(&tenant, offer(None), 100).is_ok());
+        api.authority = None;
+        assert_eq!(
+            api.bind_sales_offer(&tenant, offer(Some("python-project-v1")), 100)
+                .err(),
+            Some("company authority unavailable")
+        );
+        assert!(api.store.company_projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sales_prompt_allows_genuine_family_selection_without_external_api_requirement() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, context) = tests::fixture(&temp.path().join("company.sqlite"));
+        let prompt = context.prompt().unwrap();
+        for family in ["web-project-v1", "python-project-v1", "node-project-v1"] {
+            assert!(prompt.contains(family));
+        }
+        assert!(prompt.contains("customer's actual wish"));
+        assert!(prompt.contains("external API integration is not required"));
+        assert!(prompt.contains("ask a question"));
+        let mut question = serde_json::json!({"schema_version":1,"kind":"ask_question","content":"Which runtime?"});
+        question["family_id"] = "python-project-v1".into();
+        assert!(serde_json::from_value::<SalesDecision>(question).is_err());
+    }
+
+    #[test]
+    fn replay_keeps_the_persisted_binding_and_rejects_family_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut api =
+            super::super::model_work::configured_test_api(&temp.path().join("company.sqlite"));
+        let tenant = TenantId::parse("tenant-m0").unwrap();
+        for family in [None, Some("python-project-v1"), Some("node-project-v1")] {
+            let binding = api.bind_sales_offer(&tenant, offer(family), 100).unwrap();
+            assert_eq!(offer(family).replay_binding(&binding).unwrap(), binding);
+            assert_eq!(
+                offer(Some("ruby-project-v1"))
+                    .replay_binding(&binding)
+                    .err(),
+                Some("project family is unsupported")
+            );
+            let other = if family.is_none() {
+                "python-project-v1"
+            } else {
+                "web-project-v1"
+            };
+            assert_eq!(
+                offer(Some(other)).replay_binding(&binding).err(),
+                Some("Sales proposal family changed on replay")
+            );
+        }
+        let web = api.bind_sales_offer(&tenant, offer(None), 100).unwrap();
+        api.authority = None;
+        assert_eq!(offer(None).replay_binding(&web).unwrap(), web);
+    }
+
+    fn accepted_context(
+        api: &WorkflowApi,
+        sales: &RequestSalesContext,
+        family: &str,
+    ) -> ProjectPlanningContext {
+        let now = now_unix_ms();
+        let binding = api
+            .bind_sales_offer(&sales.source_request.tenant_id, offer(Some(family)), now)
+            .unwrap();
+        let response = api
+            .store
+            .apply_company_command(
+                &sales.binding.grant.sales_principal,
+                Uuid::from_u128(856101),
+                &CompanyWorkflowCommandV1::QualifyCustomerRequest {
+                    request_id: sales.source_request.request_id.clone(),
+                    expected_version: sales.source_request.version,
+                    reason_ref: "Local coding scope".into(),
+                },
+                now,
+            )
+            .unwrap();
+        let CompanyWorkflowResponseV1::CustomerRequest(request) = response.response else {
+            panic!("qualified request")
+        };
+        let response = api
+            .store
+            .apply_company_command(
+                &sales.binding.grant.sales_principal,
+                Uuid::from_u128(856102),
+                &CompanyWorkflowCommandV1::CreateProposal {
+                    request_id: request.request_id.clone(),
+                    expected_version: request.version,
+                    binding,
+                },
+                now,
+            )
+            .unwrap();
+        let CompanyWorkflowResponseV1::Proposal(proposal) = response.response else {
+            panic!("proposal")
+        };
+        let customer = api.principals.principal("customer").unwrap();
+        let request = api
+            .store
+            .company_customer_request(&request.tenant_id, &request.request_id)
+            .unwrap()
+            .unwrap();
+        let response = api
+            .store
+            .apply_company_command(
+                &customer.principal,
+                Uuid::from_u128(856103),
+                &CompanyWorkflowCommandV1::AcceptProposal {
+                    request_id: request.request_id.clone(),
+                    expected_version: request.version,
+                    proposal_id: proposal.proposal_id.clone(),
+                    proposal_digest: proposal.proposal_digest.clone(),
+                },
+                now,
+            )
+            .unwrap();
+        let CompanyWorkflowResponseV1::AgreementProject { project, .. } = response.response else {
+            panic!("agreement")
+        };
+        let request = api
+            .store
+            .company_customer_request(&request.tenant_id, &request.request_id)
+            .unwrap()
+            .unwrap();
+        let call = api.ensure_project_planning_call(&project).unwrap();
+        ProjectPlanningContext {
+            binding: ProjectPlanningAuthority {
+                schema_version: 4,
+                allowance_id: call.allowance_id,
+                grant: call.grant,
+            },
+            source_project: *project,
+            source_request: request,
+            source_proposal: proposal,
+        }
+    }
+
+    #[test]
+    fn accepted_native_planning_and_independent_review_bind_native_profiles() {
+        for family in ["python-project-v1", "node-project-v1"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (api, sales) = tests::fixture(&temp.path().join("company.sqlite"));
+            let mut context = accepted_context(&api, &sales, family);
+            context.validate_dispatch(now_unix_ms()).unwrap();
+            assert!(context
+                .prompt()
+                .unwrap()
+                .contains(&format!("accepted execution family is {family}")));
+            let decision: ProjectPlanningDecision = serde_json::from_value(serde_json::json!({
+                "schema_version": 1, "rationale": "Specify the data contract before coding.",
+                "tasks": [
+                    {"key":"design", "title":"Specify program", "objective":"Define inputs and outputs", "role":"designer", "depends_on":[]},
+                    {"key":"code", "title":"Implement program", "objective":"Implement the accepted program and tests", "role":"developer", "depends_on":["design"]}
+                ]
+            })).unwrap();
+            let items = api.bind_project_plan(&context, &decision).unwrap();
+            assert_eq!(
+                items[0].outputs[0].media_type,
+                "application/vnd.sentinel.design-specification+json"
+            );
+            assert_eq!(
+                items[1].outputs[0].media_type,
+                "application/vnd.sentinel.source-tree+json"
+            );
+            for item in &items {
+                assert_eq!(item.quality_gate.gate_id, "web-work-item-qa-v1");
+                assert!(!item.required_specialties.contains("web_development"));
+            }
+            assert!(api
+                .store
+                .company_project(
+                    &context.source_project.tenant_id,
+                    &context.source_project.project_id
+                )
+                .unwrap()
+                .unwrap()
+                .work_items
+                .is_empty());
+            for item in items {
+                context.source_project.work_items.insert(
+                    item.work_item_id.clone(),
+                    sentinel_workflow::CompanyWorkItemV1 {
+                        spec: item,
+                        state: CompanyWorkStateV1::Done,
+                        version: 1,
+                        assignments: vec![],
+                        output_receipts: vec![],
+                        gate_receipt: None,
+                        transition_history: vec![],
+                    },
+                );
+            }
+            let qa = context
+                .source_project
+                .governance
+                .participants
+                .iter()
+                .find(|p| p.role == CompanyRoleV1::Qa)
+                .unwrap();
+            let review = super::super::model_review::source_review_spec(
+                &context.source_project,
+                WorkItemId::parse("source-review-native").unwrap(),
+                qa,
+                api.authority.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(review.required_role, CompanyRoleV1::Qa);
+            assert_eq!(review.dependency_ids.len(), 2);
+            assert_eq!(review.quality_gate.gate_id, "web-work-item-qa-v1");
+            assert_eq!(review.quality_gate.digest, qa.profile.digest);
+            assert_eq!(
+                review.outputs[0].media_type,
+                super::super::model_review::MEDIA_TYPE
+            );
+            let accepted = context.source_project.governance.clone();
+            let mut changed_qa = qa.clone();
+            changed_qa.profile.digest = "0".repeat(64);
+            assert_eq!(
+                super::super::model_review::source_review_spec(
+                    &context.source_project,
+                    WorkItemId::parse("source-review-native").unwrap(),
+                    &changed_qa,
+                    api.authority.as_ref().unwrap(),
+                )
+                .err(),
+                Some("source-review technical QA profile changed")
+            );
+            let developer = context
+                .source_project
+                .governance
+                .participants
+                .iter_mut()
+                .find(|p| p.role == CompanyRoleV1::Developer)
+                .unwrap();
+            developer.profile.digest = "0".repeat(64);
+            assert_eq!(
+                api.bind_project_plan(&context, &decision).err(),
+                Some("accepted participant family profile changed")
+            );
+            context.source_project.governance = accepted;
+            context.source_project.governance.project_profile.digest = "0".repeat(64);
+            assert_eq!(
+                api.bind_project_plan(&context, &decision).err(),
+                Some("accepted project family profile changed")
+            );
+            context.source_project.governance.project_profile.generation = 2;
+            assert!(context.prompt().is_err());
+            assert_eq!(
+                api.bind_project_plan(&context, &decision).err(),
+                Some("project family generation is unsupported")
+            );
+            context.source_project.governance.project_profile.profile_id = "ruby-project-v1".into();
+            assert!(context.prompt().is_err());
+            assert_eq!(
+                api.bind_project_plan(&context, &decision).err(),
+                Some("project family is unsupported")
+            );
+        }
     }
 }
