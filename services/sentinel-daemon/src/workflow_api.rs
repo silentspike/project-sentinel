@@ -4536,6 +4536,16 @@ impl WorkflowApi {
             .map_err(|_| workflow_unavailable())?;
         for project in self.store.company_projects()? {
             #[cfg(feature = "llm")]
+            if self
+                .recover_failed_qa_schema_call(&project)
+                .map_err(|_| workflow_unavailable())?
+            {
+                // The new allowance is deliberately dispatched on the next
+                // reconciliation turn, after the archive and grant commits
+                // are both durable.
+                continue;
+            }
+            #[cfg(feature = "llm")]
             if project.lifecycle_state == sentinel_workflow::ProjectLifecycleStateV1::Blocked
                 && project.source_review_previous_call.is_some()
                 && project.blockers.iter().any(|blocker| {

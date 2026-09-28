@@ -23,6 +23,11 @@ pub struct ModelWorkContext {
     pub accepted_customer_contract: Option<AcceptedCustomerContract>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) artifact_inputs: Vec<ModelArtifactInput>,
+    /// Server-observed feedback for a new QA call after the prior provider
+    /// response failed the strict admission schema. This is task context, not
+    /// an authority source, and is bound into the next request digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_retry_feedback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +98,9 @@ impl ModelWorkContext {
     pub fn prompt(&self) -> Result<String, &'static str> {
         self.validate_artifact_inputs()?;
         if self.task.required_role == CompanyRoleV1::Qa {
-            return super::model_review::prompt(self);
+            let mut prompt = super::model_review::prompt(self)?;
+            self.append_schema_retry_feedback(&mut prompt)?;
+            return Ok(prompt);
         }
         let contract = serde_json::to_string(self.customer_contract()?)
             .map_err(|_| "customer contract encoding failed")?;
@@ -145,10 +152,27 @@ impl ModelWorkContext {
             );
             prompt.push_str(&previous);
         }
+        self.append_schema_retry_feedback(&mut prompt)?;
         if prompt.len() > MAX_MODEL_WORK_BYTES {
             return Err("model work context exceeds its bound");
         }
         Ok(prompt)
+    }
+
+    fn append_schema_retry_feedback(&self, prompt: &mut String) -> Result<(), &'static str> {
+        if let Some(feedback) = &self.schema_retry_feedback {
+            prompt.push_str(
+                " This is a fresh QA correction turn after the previous provider response was \
+                 rejected by the server because it was not strict JSON. Return exactly one raw \
+                 JSON object, with no Markdown fences, prose, prefix, suffix, or code block. \
+                 The server will reject any non-JSON response. Server feedback: ",
+            );
+            prompt.push_str(feedback);
+        }
+        if prompt.len() > MAX_MODEL_WORK_BYTES {
+            return Err("model work context exceeds its bound");
+        }
+        Ok(())
     }
 }
 
@@ -317,6 +341,11 @@ impl WorkflowApi {
                 None
             },
             artifact_inputs: self.model_artifact_inputs(&project, &work.spec)?,
+            schema_retry_feedback: if work.spec.required_role == CompanyRoleV1::Qa {
+                self.qa_schema_retry_feedback(&project, &work_id, &binding.provider)?
+            } else {
+                None
+            },
         };
         context.prompt()?;
         Ok(Some(context))
@@ -643,6 +672,7 @@ pub(crate) fn test_context() -> ModelWorkContext {
             assumptions: vec![],
         }),
         artifact_inputs: Vec::new(),
+        schema_retry_feedback: None,
     }
 }
 
