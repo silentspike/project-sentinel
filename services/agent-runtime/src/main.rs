@@ -51,6 +51,19 @@ struct ActiveInvocation {
 
 type ActiveInvocations = Arc<Mutex<BTreeMap<String, ActiveInvocation>>>;
 
+#[derive(Default)]
+struct ProtocolOutput {
+    lock: Mutex<()>,
+    #[cfg(test)]
+    test: Option<TestProtocolOutput>,
+}
+
+#[cfg(test)]
+struct TestProtocolOutput {
+    messages: mpsc::Sender<String>,
+    resume_execution: Mutex<mpsc::Receiver<()>>,
+}
+
 enum ReaderEvent {
     Command(WorkbenchCommand),
     Malformed,
@@ -205,7 +218,7 @@ fn run_workbench() {
     );
 
     let active: ActiveInvocations = Arc::new(Mutex::new(BTreeMap::new()));
-    let output_lock = Arc::new(Mutex::new(()));
+    let output_lock = Arc::new(ProtocolOutput::default());
     let running = Arc::new(AtomicBool::new(true));
     let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_READER_EVENTS);
 
@@ -389,7 +402,7 @@ fn handle_command(
     command: WorkbenchCommand,
     executor: Arc<WorkbenchExecutor>,
     active: ActiveInvocations,
-    output_lock: Arc<Mutex<()>>,
+    output_lock: Arc<ProtocolOutput>,
 ) {
     match command {
         WorkbenchCommand::Execute { request } => {
@@ -460,6 +473,16 @@ fn handle_command(
                     WorkbenchProgressStage::Executing,
                     0,
                 );
+                // Unit tests hold this boundary until Cancel has been handled;
+                // the real executor still owns all effects and terminal results.
+                #[cfg(test)]
+                if let Some(test) = &output_lock.test {
+                    test.resume_execution
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(SHUTDOWN_GRACE)
+                        .expect("test must release execution after handling cancellation");
+                }
                 let mut result = executor.execute(*request.clone(), cancellation);
                 apply_outer_deadline_outcome(&mut result, &deadline_cancellation);
                 let receipt_persisted = match executor.persist_request_completion(&request, &result)
@@ -649,7 +672,7 @@ fn apply_outer_deadline_outcome(message: &mut WorkbenchMessage, deadline_cancell
 }
 
 fn emit_progress(
-    output_lock: &Arc<Mutex<()>>,
+    output_lock: &Arc<ProtocolOutput>,
     invocation_id: &str,
     stage: WorkbenchProgressStage,
     elapsed_ms: u64,
@@ -665,10 +688,18 @@ fn emit_progress(
     );
 }
 
-fn emit(output_lock: &Arc<Mutex<()>>, message: &WorkbenchMessage) {
+fn emit(output_lock: &Arc<ProtocolOutput>, message: &WorkbenchMessage) {
     let _guard = output_lock
+        .lock
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    #[cfg(test)]
+    if let Some(test) = &output_lock.test {
+        test.messages
+            .send(serde_json::to_string(message).unwrap())
+            .unwrap();
+        return;
+    }
     let mut stdout = io::stdout().lock();
     if serde_json::to_writer(&mut stdout, message).is_err()
         || stdout.write_all(b"\n").is_err()
@@ -721,6 +752,253 @@ fn unix_time_ms() -> u64 {
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod protocol_cancellation_tests {
+    use super::*;
+    use sentinel_common::{
+        AgentId, WorkbenchOutcome, WorkbenchRequest, WorkbenchResourceLimits, WorkbenchTool,
+        WORKBENCH_RUNTIME_BWRAP,
+    };
+    use std::collections::BTreeSet;
+
+    fn write_request() -> WorkbenchRequest {
+        WorkbenchRequest {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: "018f3f32-4f01-7f2c-a6c1-f6f4a81b2902".into(),
+            agent_id: AgentId(7),
+            project_id: "project-01".into(),
+            work_item_id: "work-04".into(),
+            workspace_id: "project-01:work-04".into(),
+            caller_id: "AGENT-07".into(),
+            caller_role: "developer".into(),
+            assignment_version: 2,
+            credential_generation: 3,
+            policy_digest: "a".repeat(64),
+            tool_profile: "web-authoring-v1".into(),
+            tool_profile_digest: "b".repeat(64),
+            runtime_key: WORKBENCH_RUNTIME_BWRAP.into(),
+            capabilities: BTreeSet::from(["file.write".into()]),
+            output_artifact_kinds: BTreeSet::from(["source_tree".into()]),
+            inputs: Vec::new(),
+            command_policy: Vec::new(),
+            resource_limits: WorkbenchResourceLimits {
+                wall_time_ms: 10_000,
+                cpu_time_ms: 5_000,
+                memory_bytes: 128 * 1024 * 1024,
+                process_count: 8,
+                file_bytes: 1024 * 1024,
+                stdout_bytes: 64 * 1024,
+                stderr_bytes: 64 * 1024,
+            },
+            deadline_unix_ms: unix_time_ms() + 30_000,
+            attempt: 1,
+            tool: WorkbenchTool::WriteFile {
+                path: "src/index.html".into(),
+                content: "must not be written".into(),
+                expected_sha256: None,
+            },
+            input_digest: String::new(),
+        }
+        .bind_digest()
+        .unwrap()
+    }
+
+    fn receive(messages: &mpsc::Receiver<String>) -> WorkbenchMessage {
+        serde_json::from_str(&messages.recv_timeout(SHUTDOWN_GRACE).unwrap()).unwrap()
+    }
+
+    fn assert_receipted_cancellation(reason: &str, expected: WorkbenchOutcome) {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let artifacts = directory.path().join("artifacts");
+        let executor = Arc::new(WorkbenchExecutor::new(&workspace, &artifacts));
+        let active: ActiveInvocations = Arc::new(Mutex::new(BTreeMap::new()));
+        let (sender, messages) = mpsc::channel();
+        let (resume, gate) = mpsc::channel();
+        let output = Arc::new(ProtocolOutput {
+            lock: Mutex::new(()),
+            test: Some(TestProtocolOutput {
+                messages: sender,
+                resume_execution: Mutex::new(gate),
+            }),
+        });
+        let request = write_request();
+        let receipt = artifacts
+            .join(".workbench-receipts")
+            .join(format!("{}.json", request.invocation_id));
+        handle_command(
+            WorkbenchCommand::Execute {
+                request: Box::new(request.clone()),
+            },
+            executor.clone(),
+            active.clone(),
+            output.clone(),
+        );
+        for expected_stage in [
+            WorkbenchProgressStage::Validated,
+            WorkbenchProgressStage::Executing,
+        ] {
+            assert!(matches!(
+                receive(&messages),
+                WorkbenchMessage::Progress { invocation_id, stage, .. }
+                    if invocation_id == request.invocation_id && stage == expected_stage
+            ));
+        }
+        handle_command(
+            WorkbenchCommand::Cancel {
+                schema_version: WORKBENCH_SCHEMA_VERSION,
+                invocation_id: request.invocation_id.clone(),
+                reason: reason.into(),
+            },
+            executor.clone(),
+            active.clone(),
+            output.clone(),
+        );
+        {
+            let active_guard = active.lock().unwrap();
+            let invocation = active_guard.get(&request.invocation_id).unwrap();
+            assert!(invocation.cancelled.load(Ordering::Acquire));
+            assert_eq!(
+                invocation.deadline_cancelled.load(Ordering::Acquire),
+                reason == "deadline_expired"
+            );
+        }
+        assert!(matches!(messages.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(
+            !receipt.exists(),
+            "Cancel must not manufacture a receipt or acknowledgement"
+        );
+        resume.send(()).unwrap();
+
+        let result = receive(&messages);
+        let WorkbenchMessage::Result {
+            invocation_id,
+            input_digest,
+            outcome,
+            resources,
+            artifacts: result_artifacts,
+            output: feedback,
+            error: Some(error),
+            ..
+        } = &result
+        else {
+            panic!("cancellation must terminate with a real executor result: {result:?}");
+        };
+        assert_eq!(invocation_id, &request.invocation_id);
+        assert_eq!(input_digest, &request.input_digest);
+        assert_eq!(*outcome, expected);
+        assert_eq!(resources.bytes_written, 0);
+        assert!(result_artifacts.is_empty() && feedback.is_empty());
+        assert_eq!(
+            error.code,
+            if reason == "deadline_expired" {
+                reason
+            } else {
+                "cancelled"
+            }
+        );
+        assert_eq!(
+            error.class,
+            if reason == "deadline_expired" {
+                WorkbenchErrorClass::Resource
+            } else {
+                WorkbenchErrorClass::Runtime
+            }
+        );
+        assert!(!error.retryable);
+        assert!(!workspace.join("project-01/work-04/src/index.html").exists());
+        assert!(
+            receipt.is_file(),
+            "receipt must exist before the terminal result is emitted"
+        );
+        assert_eq!(
+            executor
+                .recover_completion(&request.invocation_id, &request.input_digest)
+                .unwrap(),
+            result
+        );
+        assert!(matches!(
+            receive(&messages),
+            WorkbenchMessage::Progress { invocation_id, stage: WorkbenchProgressStage::Completed, .. }
+                if invocation_id == request.invocation_id
+        ));
+        cancel_all_and_wait(&active);
+        assert!(active.lock().unwrap().is_empty());
+        handle_command(
+            WorkbenchCommand::Recover {
+                schema_version: WORKBENCH_SCHEMA_VERSION,
+                invocation_id: request.invocation_id.clone(),
+                input_digest: request.input_digest.clone(),
+            },
+            Arc::new(WorkbenchExecutor::new(&workspace, &artifacts)),
+            active,
+            output,
+        );
+        assert_eq!(receive(&messages), result);
+        assert!(matches!(
+            receive(&messages),
+            WorkbenchMessage::Progress { stage: WorkbenchProgressStage::Completed, .. }
+        ));
+        assert!(matches!(
+            messages.recv_timeout(SHUTDOWN_GRACE),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn cancel_waits_for_the_receipted_result_instead_of_acknowledging_early() {
+        assert_receipted_cancellation("test_cancel", WorkbenchOutcome::Cancelled);
+    }
+
+    #[test]
+    fn adapter_deadline_cancel_is_receipted_as_timed_out() {
+        assert_receipted_cancellation("deadline_expired", WorkbenchOutcome::TimedOut);
+    }
+
+    #[test]
+    fn outer_deadline_does_not_overwrite_finished_success_or_isolation_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let executor = WorkbenchExecutor::new(
+            directory.path().join("workspace"),
+            directory.path().join("artifacts"),
+        )
+        .with_command_runner(std::env::current_exe().unwrap());
+        let write = write_request();
+        let mut command = write.clone();
+        command.capabilities = BTreeSet::from(["command.run_allowlisted".into()]);
+        command.command_policy = vec![sentinel_common::CommandRule {
+            program: "sleep".into(),
+            required_arg_prefix: Vec::new(),
+            max_args: 1,
+        }];
+        command.tool = WorkbenchTool::RunCommand {
+            program: "sleep".into(),
+            args: vec!["5".into()],
+        };
+        command.input_digest = command.canonical_digest().unwrap();
+        for (request, expected) in [
+            (write, WorkbenchOutcome::Succeeded),
+            (command, WorkbenchOutcome::Failed),
+        ] {
+            let original = executor.execute(request, Arc::new(AtomicBool::new(false)));
+            assert!(matches!(
+                &original,
+                WorkbenchMessage::Result { outcome, .. } if *outcome == expected
+            ));
+            if expected == WorkbenchOutcome::Failed {
+                assert!(matches!(
+                    &original,
+                    WorkbenchMessage::Result { error: Some(error), output, .. }
+                        if error.code == "command_isolation_unavailable" && output.is_empty()
+                ));
+            }
+            let mut result = original.clone();
+            apply_outer_deadline_outcome(&mut result, &AtomicBool::new(true));
+            assert_eq!(result, original);
+        }
+    }
 }
 
 #[cfg(test)]
