@@ -82,7 +82,8 @@ impl WorkflowApi {
         if !self.enabled
             || !self.model_work_enabled
             || !matches!(request.schema_version, 1..=4)
-            || (matches!(request.schema_version, 2 | 4)
+            || ((request.schema_version == 4
+                || (request.schema_version == 2 && !self.request_sales_autonomous_enabled))
                 && self.subscription_allowance_id.as_deref() != Some(request.allowance_id.as_str()))
         {
             return Err("subscription mode unavailable");
@@ -395,9 +396,11 @@ impl WorkflowApi {
         else {
             return Err("Sales request subject missing");
         };
-        let call = self
-            .request_sales_call()?
-            .ok_or("Sales allowance unavailable")?;
+        let tenant = self
+            .request_sales_tenant
+            .as_ref()
+            .ok_or("Sales tenant unavailable")?;
+        let call = self.request_sales_call_for(tenant, &request.allowance_id)?;
         let grant = &call.grant;
         if request_id != &grant.request_id
             || *request_version != grant.expected_version

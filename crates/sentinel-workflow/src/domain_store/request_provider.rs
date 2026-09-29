@@ -363,6 +363,71 @@ fn owned_call(
 }
 
 impl WorkflowStore {
+    /// Oldest bounded Sales candidates; query hints never confer authority.
+    /// Any exact-version grant permanently excludes that request version.
+    pub fn company_sales_intake_requests(
+        &self,
+        tenant_id: &TenantId,
+        customer_id: &str,
+    ) -> Result<Vec<CustomerRequestV1>, WorkflowError> {
+        tenant_id.validate()?;
+        validate_identifier(customer_id)?;
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        // Validate global bounded history before using any grant as a search hint.
+        let calls = all_calls(&connection)?;
+        let granted_versions: Vec<_> = calls
+            .iter()
+            .filter(|call| &call.granted_by.tenant_id == tenant_id)
+            .map(|call| (&call.grant.request_id, call.grant.expected_version))
+            .collect();
+        let mut statement = connection.prepare(
+            "SELECT request.entity_id FROM company_entities AS request
+             WHERE request.tenant_id=?1 AND request.entity_kind='request'
+               AND json_extract(request.payload,'$.customer_id')=?2
+               AND json_extract(request.payload,'$.state') IN ('submitted','clarifying')
+               AND COALESCE(json_extract(request.payload,'$.consultation[#-1].role'),'')<>'sales'
+               AND NOT EXISTS (
+                   SELECT 1 FROM json_each(?3) AS granted
+                   WHERE json_extract(granted.value,'$[0]')=request.entity_id
+                     AND json_extract(granted.value,'$[1]')=request.version
+               )
+             ORDER BY json_extract(request.payload,'$.created_at_unix_ms'),request.entity_id
+             LIMIT ?4",
+        )?;
+        let ids = statement
+            .query_map(
+                params![
+                    tenant_id.0,
+                    customer_id,
+                    encode(&granted_versions)?,
+                    MAX_AGGREGATE_ITEMS as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                let request: CustomerRequestV1 =
+                    get_entity(&connection, tenant_id, "request", &id)?.ok_or_else(corrupt)?;
+                validate_customer_request(&request)?;
+                if &request.tenant_id != tenant_id
+                    || request.customer_id != customer_id
+                    || !matches!(
+                        request.state,
+                        CustomerRequestStateV1::Submitted | CustomerRequestStateV1::Clarifying
+                    )
+                    || request_has_unanswered_question(&request)
+                    || granted_versions.iter().any(|(request_id, version)| {
+                        *request_id == &request.request_id && *version == request.version
+                    })
+                {
+                    return Err(corrupt());
+                }
+                Ok(request)
+            })
+            .collect()
+    }
+
     /// Trusted daemon admission only; never expose grant creation to an agent.
     /// Existing grants, including expired/unknown ones, permanently count.
     pub fn authorize_request_provider_call(
@@ -372,6 +437,31 @@ impl WorkflowStore {
         grant: &RequestProviderGrantV1,
         now_ms: u64,
     ) -> Result<RequestProviderCallV1, WorkflowError> {
+        self.authorize_request_provider_call_inner(principal, operation_id, grant, now_ms, false)?
+            .ok_or_else(corrupt)
+    }
+
+    /// Trusted autonomous admission reserves global capacity atomically.
+    /// Exhaustion or a duplicate reservation returns None without writes;
+    /// exact operation replay returns the existing call, not dispatch permission.
+    pub fn admit_autonomous_request_provider_call(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        operation_id: Uuid,
+        grant: &RequestProviderGrantV1,
+        now_ms: u64,
+    ) -> Result<Option<RequestProviderCallV1>, WorkflowError> {
+        self.authorize_request_provider_call_inner(principal, operation_id, grant, now_ms, true)
+    }
+
+    fn authorize_request_provider_call_inner(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        operation_id: Uuid,
+        grant: &RequestProviderGrantV1,
+        now_ms: u64,
+        autonomous: bool,
+    ) -> Result<Option<RequestProviderCallV1>, WorkflowError> {
         grant_actor(principal)?;
         if operation_id.is_nil() {
             return Err(invalid("provider grant operation is missing"));
@@ -392,7 +482,7 @@ impl WorkflowStore {
                     "provider grant operation changed",
                 ));
             }
-            return Ok(existing);
+            return Ok(Some(existing));
         }
         validate_grant(grant, now_ms)?;
         if principal.tenant_id != grant.sales_principal.tenant_id {
@@ -407,19 +497,41 @@ impl WorkflowStore {
         .ok_or_else(not_found)?;
         require_version(source_request.version, grant.expected_version)?;
         let calls = all_calls(&transaction)?;
-        let (legacy_total, _) = legacy_usage(&transaction, &calls)?;
+        let (legacy_total, legacy_active) = legacy_usage(&transaction, &calls)?;
         if calls.len() + legacy_total >= usize::from(grant.total_call_limit)
             || calls.iter().any(|call| {
                 call.granted_by.tenant_id == principal.tenant_id
                     && call.grant.request_id == grant.request_id
-                    && call.grant.expected_version == grant.expected_version
                     && call.abandonment_event_id.is_none()
-                    && (call.dispatch.is_some() || now_ms < call.grant.expires_at_unix_ms)
+                    && ((call.dispatch.is_some()
+                        && call.question_response.is_none()
+                        && call.proposal_response.is_none())
+                        || (call.grant.expected_version == grant.expected_version
+                            && (call.dispatch.is_some() || now_ms < call.grant.expires_at_unix_ms)))
             })
         {
+            if autonomous {
+                return Ok(None);
+            }
             return Err(invalid(
                 "request provider allowance exhausted or already reserved",
             ));
+        }
+        if autonomous {
+            let occupied = calls
+                .iter()
+                .filter(|call| {
+                    call.abandonment_event_id.is_none()
+                        && ((call.dispatch.is_some()
+                            && call.question_response.is_none()
+                            && call.proposal_response.is_none())
+                            || (call.dispatch.is_none() && now_ms < call.grant.expires_at_unix_ms))
+                })
+                .count()
+                + legacy_active;
+            if occupied >= usize::from(grant.concurrent_call_limit) {
+                return Ok(None);
+            }
         }
         let call = RequestProviderCallV1 {
             schema_version: 1,
@@ -444,7 +556,7 @@ impl WorkflowStore {
             "request_provider_call_authorized",
         )?;
         transaction.commit()?;
-        Ok(call)
+        Ok(Some(call))
     }
 
     pub fn request_provider_call(
@@ -456,6 +568,25 @@ impl WorkflowStore {
         validate_identifier(allowance_id)?;
         let connection = self.connection.lock().map_err(|_| persistence())?;
         get_entity(&connection, tenant, KIND, allowance_id)
+    }
+
+    /// Validated tenant history, including expired and completed allowances.
+    pub fn request_provider_calls(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<RequestProviderCallV1>, WorkflowError> {
+        tenant.validate()?;
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        let mut calls: Vec<_> = all_calls(&connection)?
+            .into_iter()
+            .filter(|call| &call.granted_by.tenant_id == tenant)
+            .collect();
+        calls.sort_by(|a, b| {
+            a.created_at_unix_ms
+                .cmp(&b.created_at_unix_ms)
+                .then_with(|| a.allowance_id.cmp(&b.allowance_id))
+        });
+        Ok(calls)
     }
 
     /// Not replayable permission: a second claim must never reach a provider.
