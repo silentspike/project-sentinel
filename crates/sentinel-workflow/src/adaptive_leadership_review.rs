@@ -98,6 +98,15 @@ pub struct AdaptiveLeadershipReviewCallV1 {
     pub continuation: Option<crate::adaptive::AdaptiveContinuationAuthorizationV1>,
 }
 
+/// Adaptive spending is recorded in the journal, never as a fabricated subscription dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveLeadershipAbandonedAllowanceV2 {
+    pub schema_version: u16,
+    pub allowance_id: String,
+    pub review: AdaptiveLeadershipReviewCallV1,
+}
+
 impl AdaptiveLeadershipReviewCallV1 {
     pub fn context_digest(&self) -> Result<String, WorkflowError> {
         canonical_sha256(
@@ -456,6 +465,8 @@ impl AdaptiveLeadershipReviewContextV1 {
             }
             Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation { reason_code, resolution_event_id }) => {
                 session.last_model_result_digest.is_some()
+                    && session.last_model_result_digest.as_ref().is_some_and(|digest|
+                        self.evidence_refs.contains(&format!("adaptive-model-result:{digest}")))
                     && match (&session.cursor, resolution_event_id) {
                         (AdaptiveCursorV1::Blocked { reason_code: actual }, None) => actual == reason_code,
                         (AdaptiveCursorV1::BlockedResolved { reason_code: actual, resolution_event_id: actual_id }, Some(id)) => actual == reason_code && actual_id == id,

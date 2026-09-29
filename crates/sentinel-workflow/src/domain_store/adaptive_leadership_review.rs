@@ -4,11 +4,13 @@ use crate::{
     AdaptiveLeadershipReviewGrantV1, ClaimAdaptiveLeadershipReviewCallV1,
     CompleteAdaptiveLeadershipReviewCallV1, RequestProviderDispatchV1,
     AdaptiveLeadershipReviewDecisionKindV1, AdaptiveLeadershipReviewSubjectV2,
+    AdaptiveLeadershipAbandonedAllowanceV2,
     adaptive_leadership_continuation_audit_id, ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
 };
 
 const KIND: &str = "adaptive_leadership_review_call";
 const MAX_TENANT_REVIEW_SCAN: usize = 4096;
+const ABANDONED_KIND: &str = "adaptive_leadership_abandoned_allowance";
 
 #[cfg(test)]
 mod tests {
@@ -56,23 +58,7 @@ mod tests {
         session_grant.provider_authority_digest = adaptive_leadership_continuation_provider_authority_digest(
             allowance, &f.grant.assignee_authority).unwrap();
         let (_, initial) = f.store.begin_adaptive_session(&session_grant, &f.grant.assignee_authority, 600_001).unwrap();
-        let employee = AuthenticatedCompanyPrincipalV1 {
-            schema_version: 1, tenant_id: f.leader.tenant_id.clone(),
-            principal_id: f.grant.assignee_authority.principal.principal_id.clone(),
-            kind: CompanyPrincipalKindV1::Agent, role: CompanyRoleV1::Developer,
-            customer_id: None, agent_id: Some(f.grant.assignee_authority.agent_id),
-            authority_generation: f.grant.assignee_authority.principal.principal_generation,
-            authority_digest: f.grant.assignee_authority.principal.authority_digest.clone(),
-        };
-        let response = f.store.apply_company_command(&employee, Uuid::new_v4(),
-            &CompanyWorkflowCommandV1::ClaimSubscriptionCall {
-                project_id: project.project_id.clone(), expected_version: project.version,
-                allowance_id: session_grant.provider_allowance_id.clone(),
-                request_id: format!("company-provider-{}", session_grant.provider_allowance_id),
-                request_digest: DIGEST.into(),
-            }, 600_002).unwrap().response;
-        let CompanyWorkflowResponseV1::Project(updated) = response else { panic!("project"); };
-        project = *updated;
+        assert!(project.subscription_call.as_ref().unwrap().dispatch.is_none());
         let effect = AdaptiveEffectV1 { id: Uuid::new_v4(), request_digest: DIGEST.into() };
         let (_, pending) = f.store.advance_adaptive_session(session_grant.session_id, initial.version,
             Uuid::new_v4(), &AdaptiveTransitionV1::ClaimModel {
@@ -185,8 +171,11 @@ mod tests {
             let project = f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap();
             assert_eq!(project.subscription_call.as_ref().unwrap(),
                 &call.continuation_allowance(CONTINUATION_AT + 2, CONTINUATION_AT + 120_002, 1).unwrap());
-            assert_eq!(project.abandoned_subscription_calls.last().unwrap().allowance,
-                f.context.source_project.subscription_call.clone().unwrap());
+            assert!(project.abandoned_subscription_calls.is_empty());
+            let abandoned = f.store.adaptive_leadership_abandoned_allowance(&f.leader.tenant_id,
+                &f.context.source_session.grant.provider_allowance_id).unwrap().unwrap();
+            assert_eq!(abandoned.review, completed);
+            assert!(abandoned.review.context.source_project.subscription_call.as_ref().unwrap().dispatch.is_none());
             let before = rows(&f.store);
             assert_eq!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 900_000).unwrap(), completed);
             assert_eq!(rows(&f.store), before);
@@ -275,6 +264,84 @@ mod tests {
     }
 
     #[test]
+    fn schema2_audit_gap_completion_keeps_original_authorization_clock_and_deadline() {
+        // Domain-side retry of a daemon-verified audit; no Limbo persistence is simulated here.
+        for (unknown, expired) in [(true, false), (false, false), (true, true)] {
+            let f = continuation_fixture(unknown, false);
+            let call = dispatch_continuation(&f);
+            let result = continue_result(&call);
+            let authorization = result.continuation.as_ref().unwrap();
+            call.validate_completion_proposal(&result).unwrap();
+            let now = if expired { authorization.deadline_ms } else { authorization.issued_at_ms + 7 };
+            let before = rows(&f.store);
+            let completed = f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now);
+            if expired {
+                assert!(completed.is_err());
+                assert_eq!(rows(&f.store), before);
+                assert_eq!(session(&f), f.context.source_session);
+                continue;
+            }
+            let completed = completed.unwrap();
+            completed.validate_completion_proposal(&result).unwrap();
+            assert_eq!(completed.continuation.as_ref(), Some(authorization));
+            assert_eq!(completed.updated_at_unix_ms, now);
+            let current = session(&f);
+            assert_eq!(current.active_deadline_ms(), authorization.deadline_ms);
+            assert_eq!(current.updated_at_ms, now);
+            let project = f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap();
+            let fresh = project.subscription_call.as_ref().unwrap();
+            assert_eq!(fresh.created_at_unix_ms, authorization.issued_at_ms);
+            assert_eq!(fresh.grant.expires_at_unix_ms, authorization.deadline_ms);
+            assert_eq!(fresh.allowance_id, authorization.provider_allowance_id);
+            let before = rows(&f.store);
+            assert_eq!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result,
+                authorization.deadline_ms + 1).unwrap(), completed);
+            assert_eq!(rows(&f.store), before);
+        }
+    }
+
+    #[test]
+    fn schema2_journal_abandonment_does_not_weaken_ordinary_subscription_checks() {
+        let f = continuation_fixture(true, false);
+        let call = dispatch_continuation(&f);
+        let result = continue_result(&call);
+        let mut project = f.context.source_project.clone();
+        assert!(project.subscription_call.as_ref().unwrap().dispatch.is_none());
+        let before = project.clone();
+        assert!(subscription::abandon(&mut project, &f.leader,
+            &f.context.source_session.grant.provider_allowance_id, DIGEST,
+            &result.resolution_event_id.unwrap().to_string(), &f.leader.principal_id,
+            CONTINUATION_AT + 2).is_err());
+        assert_eq!(project, before);
+        f.store.complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 2).unwrap();
+        let abandoned = f.store.adaptive_leadership_abandoned_allowance(&f.leader.tenant_id,
+            &f.context.source_session.grant.provider_allowance_id).unwrap().unwrap();
+        assert_eq!(abandoned.allowance_id, f.context.source_session.grant.provider_allowance_id);
+        assert!(abandoned.review.context.source_project.subscription_call.as_ref().unwrap().dispatch.is_none());
+    }
+
+    #[test]
+    fn schema2_abandonment_readback_rejects_checksum_valid_unrelated_receipt() {
+        let f = continuation_fixture(true, false);
+        let call = dispatch_continuation(&f);
+        let result = continue_result(&call);
+        f.store.complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 2).unwrap();
+        let mut abandoned = f.store.adaptive_leadership_abandoned_allowance(&f.leader.tenant_id,
+            &f.context.source_session.grant.provider_allowance_id).unwrap().unwrap();
+        abandoned.review.model_response_digest = Some("d".repeat(64));
+        let audit = adaptive_leadership_continuation_audit_id(call.grant.review_id,
+            &result.request_digest, abandoned.review.model_response_digest.as_deref().unwrap(),
+            abandoned.review.decision.as_ref().unwrap()).unwrap();
+        abandoned.review.resolution_event_id = Some(audit);
+        abandoned.review.continuation.as_mut().unwrap().resolution_event_id = audit;
+        persist_entity(&f.store, &abandoned);
+        let before = rows(&f.store);
+        assert!(f.store.adaptive_leadership_abandoned_allowance(&f.leader.tenant_id,
+            &f.context.source_session.grant.provider_allowance_id).is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+
+    #[test]
     fn schema2_exhausted_single_call_source_does_not_reset_original_budget() {
         let f = continuation_fixture_with_calls(true, false, 1);
         let call = dispatch_continuation(&f);
@@ -328,6 +395,8 @@ mod tests {
         let call = dispatch_continuation(&f);
         let result = continue_result(&call);
         let before = rows(&f.store);
+        call.validate_completion_proposal(&result).unwrap();
+        assert_eq!(rows(&f.store), before);
         for case in 0..15 {
             let mut candidate = result.clone();
             let auth = candidate.continuation.as_mut().unwrap();
@@ -357,11 +426,13 @@ mod tests {
                     } },
                 _ => candidate.decision.schema_version = 3,
             }
+            assert!(call.validate_completion_proposal(&candidate).is_err());
             assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &candidate, CONTINUATION_AT + 2).is_err());
             assert_eq!(rows(&f.store), before);
         }
         change_project(&f, CONTINUATION_AT + 2);
         let changed = rows(&f.store);
+        call.validate_completion_proposal(&result).unwrap();
         assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 2).is_err());
         assert_eq!(rows(&f.store), changed);
         let f = continuation_fixture(true, false);
@@ -385,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn schema2_allowance_failure_rolls_back_continuation_journal() {
+    fn schema2_missing_allowance_source_rejects_without_journal_effects() {
         let mut f = continuation_fixture(true, false);
         // Real fixture without subscription authority is valid leadership input, not continuation authority.
         f.context.source_project.subscription_call = None;
@@ -395,6 +466,49 @@ mod tests {
         assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &continue_result(&call), CONTINUATION_AT + 2).is_err());
         assert_eq!(rows(&f.store), before);
         assert_eq!(session(&f), f.context.source_session);
+    }
+
+    #[test]
+    fn schema2_audit_write_failure_rolls_back_journal_allowance_and_abandonment_receipt() {
+        let f = continuation_fixture(true, false);
+        let call = dispatch_continuation(&f);
+        f.store.connection.lock().unwrap().execute_batch(
+            "CREATE TRIGGER reject_continuation_audit BEFORE INSERT ON company_events
+             WHEN NEW.event_type = 'adaptive_leadership_continuation_authorized'
+             BEGIN SELECT RAISE(ABORT, 'test continuation audit failure'); END;"
+        ).unwrap();
+        let result = continue_result(&call);
+        call.validate_completion_proposal(&result).unwrap();
+        let before = rows(&f.store);
+        assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 2).is_err());
+        assert_eq!(rows(&f.store), before);
+        assert_eq!(session(&f), f.context.source_session);
+        assert!(f.store.adaptive_leadership_abandoned_allowance(&f.leader.tenant_id,
+            &f.context.source_session.grant.provider_allowance_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn schema2_proposal_validation_rejects_spoofed_identity_request_and_unclaimed_input_without_effects() {
+        let f = continuation_fixture(true, false);
+        let pending = f.store.authorize_adaptive_leadership_review_call(&f.leader, Uuid::new_v4(),
+            "unclaimed-proposal", &f.grant, &f.context, CONTINUATION_AT).unwrap();
+        let call = f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&pending), CONTINUATION_AT + 1).unwrap();
+        let result = continue_result(&call);
+        let before = rows(&f.store);
+        assert!(pending.validate_completion_proposal(&result).is_err());
+        for case in 0..4 {
+            let mut invalid = result.clone();
+            match case {
+                0 => invalid.review_id = Uuid::new_v4(),
+                1 => invalid.allowance_id = "borrowed-allowance".into(),
+                2 => invalid.request_digest = "b".repeat(64),
+                _ => invalid.model_response_digest = "not-a-raw-response-hash".into(),
+            }
+            assert!(call.validate_completion_proposal(&invalid).is_err());
+        }
+        assert_eq!(rows(&f.store), before);
+        call.validate_completion_proposal(&result).unwrap();
+        assert_eq!(rows(&f.store), before);
     }
 
     #[test]
@@ -447,8 +561,11 @@ mod tests {
         let receipts: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
         assert_eq!(receipts[0], receipts[1]);
         assert_eq!(session(&f).version, f.context.source_session.version + 1);
-        assert_eq!(f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap()
-            .abandoned_subscription_calls.len(), 1);
+        assert!(f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap()
+            .abandoned_subscription_calls.is_empty());
+        let abandoned = f.store.adaptive_leadership_abandoned_allowance(&f.leader.tenant_id,
+            &f.context.source_session.grant.provider_allowance_id).unwrap().unwrap();
+        assert_eq!(abandoned.review, receipts[0]);
     }
 
     #[test]
@@ -778,8 +895,7 @@ fn commit_continuation_allowance(
 ) -> Result<(), WorkflowError> {
     let mut project = call.context.source_project.clone();
     let prior = project.subscription_call.as_ref().ok_or_else(unauthorized)?;
-    let dispatch = prior.dispatch.as_ref().ok_or_else(unauthorized)?;
-    let prior_request_digest = dispatch.request_digest.clone();
+    require_adaptive_allowance_source(call)?;
     let allowance = call.continuation_allowance(
         authorization.issued_at_ms,
         authorization.deadline_ms,
@@ -800,12 +916,28 @@ fn commit_continuation_allowance(
     {
         return Err(unauthorized());
     }
-    subscription::abandon(
-        &mut project, &call.grant.leadership_principal,
-        call.context.source_session.active_provider_allowance_id(), &prior_request_digest,
-        &authorization.resolution_event_id.to_string(),
-        &call.grant.leadership_principal.principal_id, now_ms,
-    )?;
+    let mut completed = call.clone();
+    completed.decision = Some(result.decision.clone());
+    completed.model_response_digest = Some(result.model_response_digest.clone());
+    completed.resolution_event_id = result.resolution_event_id;
+    completed.continuation = Some(authorization.clone());
+    completed.updated_at_unix_ms = now_ms;
+    completed.version = 3;
+    let abandoned = AdaptiveLeadershipAbandonedAllowanceV2 {
+        schema_version: 2,
+        allowance_id: prior.allowance_id.clone(),
+        review: completed,
+    };
+    abandoned.validate_entity()?;
+    if get_entity::<AdaptiveLeadershipAbandonedAllowanceV2>(
+        transaction, &project.tenant_id, ABANDONED_KIND, &abandoned.allowance_id,
+    )?.is_some() {
+        return Err(transition());
+    }
+    put_entity(transaction, &project.tenant_id, ABANDONED_KIND, &abandoned.allowance_id, 1, &abandoned)?;
+    // The exact source journal was verified by the continuation transaction helper.
+    // Preserve the undispatched allowance in its own receipt, not legacy dispatch history.
+    project.subscription_call = None;
     subscription::grant(
         &mut project, &call.grant.leadership_principal, authorization.operation_id,
         &allowance.grant, authorization.issued_at_ms,
@@ -825,6 +957,109 @@ fn commit_continuation_allowance(
     )?;
     put_projection(transaction, &project.tenant_id, &project.project_id, sequence, &project)?;
     Ok(())
+}
+
+fn require_adaptive_allowance_source(call: &AdaptiveLeadershipReviewCallV1) -> Result<(), WorkflowError> {
+    let source = &call.context.source_session;
+    let prior = call.context.source_project.subscription_call.as_ref().ok_or_else(unauthorized)?;
+    if call.grant.schema_version != 2
+        || prior.dispatch.is_some()
+        || prior.allowance_id != source.active_provider_allowance_id()
+        || prior.grant.work_item_id != call.grant.work_item_id
+        || prior.grant.assignment_id != call.grant.assignment_id
+        || prior.grant.assignment_version != call.grant.assignee_authority.assignment_version
+        || prior.grant.agent_id != call.grant.assignee_authority.agent_id
+        || prior.grant.provider != source.grant.provider
+        || prior.grant.model != source.grant.model
+        || prior.grant.catalog_digest != source.grant.catalog_digest
+        || prior.grant.max_duration_ms != source.effective_grant().max_call_duration_ms
+        || prior.grant.expires_at_unix_ms != source.active_deadline_ms()
+        || prior.grant.token_policy != call.grant.token_policy
+        || crate::adaptive_leadership_continuation_provider_authority_digest(
+            prior, &call.grant.assignee_authority,
+        )? != source.effective_grant().provider_authority_digest
+    {
+        return Err(unauthorized());
+    }
+    // Context validation binds either the exact unknown effect/proof refs or the
+    // recorded model-result digest and blocked reason/resolution at this journal head.
+    call.context.validate(&call.grant)?;
+    Ok(())
+}
+
+impl CompanyEntity for AdaptiveLeadershipAbandonedAllowanceV2 {
+    fn row_binding(&self) -> (&TenantId, &'static str, &str, u64) {
+        (&self.review.grant.leadership_principal.tenant_id, ABANDONED_KIND, &self.allowance_id, 1)
+    }
+
+    fn validate_entity(&self) -> Result<(), WorkflowError> {
+        self.review.validate_entity()?;
+        require_adaptive_allowance_source(&self.review)?;
+        let prior = self.review.context.source_project.subscription_call.as_ref().ok_or_else(corrupt)?;
+        if self.schema_version != 2
+            || self.allowance_id != prior.allowance_id
+            || self.review.version != 3
+            || self.review.continuation.is_none()
+        {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
+}
+
+impl AdaptiveLeadershipReviewCallV1 {
+    /// Validate immutable audit inputs before external persistence. This does not
+    /// renew time authority or replace the transaction's current-source checks.
+    pub fn validate_completion_proposal(
+        &self,
+        result: &CompleteAdaptiveLeadershipReviewCallV1,
+    ) -> Result<(), WorkflowError> {
+        self.validate_entity()?;
+        validate_digest(&result.request_digest)?;
+        validate_digest(&result.model_response_digest)?;
+        result.decision.validate(&self.context.evidence_refs)?;
+        if result.review_id != self.grant.review_id
+            || result.allowance_id != self.allowance_id
+            || self.retired_at_unix_ms.is_some()
+            || self.dispatch.as_ref().is_none_or(|dispatch|
+                dispatch.request_digest != result.request_digest)
+        {
+            return Err(unauthorized());
+        }
+        validate_continuation(
+            self, &result.decision, &result.request_digest, &result.model_response_digest,
+            result.resolution_event_id, result.continuation.as_ref(),
+        )?;
+        if (result.decision.resolves_blocked() || result.continuation.is_some())
+            != result.resolution_event_id.is_some()
+            || result.resolution_event_id.is_some_and(|id| id.is_nil())
+        {
+            return Err(unauthorized());
+        }
+        if result.continuation.is_some() {
+            require_adaptive_allowance_source(self)?;
+            let source = &self.context.source_session.grant;
+            if source.provider != self.grant.provider
+                || source.model != self.grant.model
+                || source.catalog_digest != self.grant.catalog_digest
+            {
+                return Err(unauthorized());
+            }
+        }
+        if self.decision.is_some()
+            && (self.decision.as_ref() != Some(&result.decision)
+                || self.model_response_digest.as_ref() != Some(&result.model_response_digest)
+                || self.resolution_event_id != result.resolution_event_id
+                || self.continuation != result.continuation)
+        {
+            return Err(WorkflowError::new(
+                WorkflowErrorCode::IdempotencyConflict,
+                false,
+                "adaptive leadership result changed",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
@@ -915,6 +1150,32 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
 }
 
 impl WorkflowStore {
+    pub fn adaptive_leadership_abandoned_allowance(
+        &self,
+        tenant: &TenantId,
+        allowance_id: &str,
+    ) -> Result<Option<AdaptiveLeadershipAbandonedAllowanceV2>, WorkflowError> {
+        tenant.validate()?;
+        validate_identifier(allowance_id)?;
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        let Some(abandoned) = get_entity::<AdaptiveLeadershipAbandonedAllowanceV2>(
+            &connection, tenant, ABANDONED_KIND, allowance_id,
+        )? else { return Ok(None); };
+        let review: AdaptiveLeadershipReviewCallV1 = get_entity(
+            &connection, tenant, KIND, &abandoned.review.review_key,
+        )?.ok_or_else(corrupt)?;
+        let (session, _) = crate::store::adaptive::load(&connection, review.grant.session_id)?.ok_or_else(corrupt)?;
+        let authorization = review.continuation.as_ref().ok_or_else(corrupt)?;
+        if review != abandoned.review
+            || session.grant != review.context.source_session.grant
+            || session.continuation.as_ref().is_none_or(|state|
+                !state.authorizations.contains(authorization))
+        {
+            return Err(corrupt());
+        }
+        Ok(Some(abandoned))
+    }
+
     pub fn authorize_adaptive_leadership_review_call(
         &self,
         leader: &AuthenticatedCompanyPrincipalV1,
@@ -1172,40 +1433,18 @@ impl WorkflowStore {
             &result.review_id.to_string(),
         )?
         .ok_or_else(not_found)?;
-        result.decision.validate(&call.context.evidence_refs)?;
-        if leader != &call.grant.leadership_principal
-            || result.allowance_id != call.allowance_id
-            || call.retired_at_unix_ms.is_some()
-            || call
-                .dispatch
-                .as_ref()
-                .is_none_or(|dispatch| dispatch.request_digest != result.request_digest)
-        {
+        call.validate_completion_proposal(result)?;
+        if leader != &call.grant.leadership_principal {
             return Err(unauthorized());
         }
-        validate_continuation(
-            &call, &result.decision, &result.request_digest, &result.model_response_digest,
-            result.resolution_event_id, result.continuation.as_ref(),
-        )?;
-        if let Some(decision) = &call.decision {
-            if decision == &result.decision
-                && call.model_response_digest.as_ref() == Some(&result.model_response_digest)
-                && call.resolution_event_id == result.resolution_event_id
-                && call.continuation == result.continuation
-            {
-                return Ok(call);
-            }
-            return Err(WorkflowError::new(
-                WorkflowErrorCode::IdempotencyConflict,
-                false,
-                "adaptive leadership result changed",
-            ));
+        if call.decision.is_some() {
+            return Ok(call);
         }
         if now_ms < call.updated_at_unix_ms {
             return Err(transition());
         }
         if let Some(authorization) = &result.continuation {
-            if now_ms < authorization.issued_at_ms {
+            if now_ms < authorization.issued_at_ms || now_ms >= authorization.deadline_ms {
                 return Err(transition());
             }
             let project: ProjectV1 = get_entity(
@@ -1222,7 +1461,7 @@ impl WorkflowStore {
                 authorization.deadline_ms,
                 authorization.additional_model_calls,
             )?;
-            let (replay, continued) = crate::store::adaptive::continue_adaptive_session_in_transaction(
+            let (_, continued) = crate::store::adaptive::continue_adaptive_session_in_transaction(
                 &transaction,
                 authorization,
                 &call,
@@ -1231,7 +1470,7 @@ impl WorkflowStore {
                 now_ms,
             )?;
             let (current, _) = crate::store::adaptive::load(&transaction, call.grant.session_id)?.ok_or_else(not_found)?;
-            if current != continued || (!replay && authorization.issued_at_ms != now_ms) {
+            if current != continued {
                 return Err(transition());
             }
             commit_continuation_allowance(&transaction, &call, authorization, result, now_ms)?;
