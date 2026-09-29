@@ -3928,8 +3928,10 @@ impl WorkflowApi {
         &self,
         agent_id: AgentId,
     ) -> Result<Option<ProviderUsageBinding>, &'static str> {
-        let binding = self.selected_provider_usage_binding_for_agent(agent_id)?;
+        let (binding, inactive_adaptive_work) =
+            self.selected_provider_usage_binding_with_queue_state(agent_id)?;
         if self.subscription_allowance_id.is_some()
+            && !(binding.is_none() && inactive_adaptive_work)
             && !binding
                 .as_ref()
                 .is_some_and(|binding| binding.subscription_grant.is_some())
@@ -3943,13 +3945,22 @@ impl WorkflowApi {
         &self,
         agent_id: AgentId,
     ) -> Result<Option<ProviderUsageBinding>, &'static str> {
+        self.selected_provider_usage_binding_with_queue_state(agent_id)
+            .map(|(binding, _)| binding)
+    }
+
+    fn selected_provider_usage_binding_with_queue_state(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<(Option<ProviderUsageBinding>, bool), &'static str> {
         if !self.enabled {
-            return Ok(None);
+            return Ok((None, false));
         }
         let projects = self
             .store
             .company_projects()
             .map_err(|_| "company provider authority could not be read")?;
+        let mut inactive_adaptive_work = false;
         let selected_allowance = select_subscription_queue_allowance_id(
             &projects,
             agent_id,
@@ -3968,7 +3979,11 @@ impl WorkflowApi {
             |binding| {
                 #[cfg(feature = "llm")]
                 {
-                    self.adaptive_subscription_queue_priority(binding)
+                    let priority = self.adaptive_subscription_queue_priority(binding)?;
+                    // Exact grant validation precedes this callback. An idle
+                    // authorized campaign is not a foreign-agent authorization.
+                    inactive_adaptive_work |= priority.is_none();
+                    Ok(priority)
                 }
                 #[cfg(not(feature = "llm"))]
                 {
@@ -3978,9 +3993,10 @@ impl WorkflowApi {
             },
         )?;
         if self.subscription_allowance_id.is_some() && selected_allowance.is_none() {
-            return Ok(None);
+            return Ok((None, inactive_adaptive_work));
         }
         select_provider_usage_binding(&projects, agent_id, selected_allowance)
+            .map(|binding| (binding, inactive_adaptive_work))
     }
 
     fn agent_command(&self, principal: &BoundPrincipal, body: &[u8]) -> WorkflowHttpResponse {

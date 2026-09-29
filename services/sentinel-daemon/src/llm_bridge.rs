@@ -2849,6 +2849,7 @@ pub mod bridge {
                 None,
                 "a terminal adaptive campaign cannot fall back to legacy execution"
             );
+            assert!(api.resolve_provider_usage_authority(AgentId(7)).is_err());
 
             let rejected = tempfile::tempdir().unwrap();
             let (api, store, binding, id) = run_case(rejected.path(), r#"{"not":"a decision"}"#);
