@@ -123,6 +123,12 @@ func (a *SubscriptionAdmission) dispatchRequest(provider Provider, req *LLMReque
 }
 
 func (a *SubscriptionAdmission) validSubscriptionIdentity(metadata map[string]string, agentID uint64) bool {
+	if metadata["company_execution_schema"] == "5" {
+		// The daemon owns this separate leadership grant. A review reservation
+		// is not an allowance, and the bootstrap developer grant cannot be reused.
+		return agentID > 0 && agentID <= 65535 && subscriptionIdentifier.MatchString(metadata["subscription_allowance_id"]) &&
+			metadata["subscription_allowance_id"] != a.allowanceID && metadata["subscription_allowance_id"] != metadata["reservation_id"]
+	}
 	return agentID > 0 && agentID <= 65535 &&
 		subscriptionIdentifier.MatchString(metadata["subscription_allowance_id"]) &&
 		metadata["reservation_id"] == metadata["subscription_allowance_id"]
@@ -142,6 +148,9 @@ func (a *SubscriptionAdmission) validSubscriptionModelBinding(req *LLMRequest) b
 }
 
 func subscriptionExecutionSubject(req *LLMRequest) (int, *customerRequestExecutionSubject, error) {
+	if req.Metadata["company_execution_schema"] != "5" && hasLeadershipReviewMetadata(req.Metadata) {
+		return 0, nil, errors.New("mixed subscription subjects")
+	}
 	switch req.Metadata["company_execution_schema"] {
 	case "1":
 		if hasCustomerRequestMetadata(req.Metadata) {
@@ -172,6 +181,12 @@ func subscriptionExecutionSubject(req *LLMRequest) (int, *customerRequestExecuti
 		}
 		subject, err := projectPlanningSubject(req.Metadata)
 		return 4, subject, err
+	case "5":
+		if classified, err := classifyModelWorkRequest(req, req.Metadata["request_id"]); err != nil || !classified {
+			return 0, nil, errors.New("invalid leadership review execution request")
+		}
+		subject, err := leadershipReviewSubject(req.Metadata)
+		return 5, subject, err
 	default:
 		return 0, nil, errors.New("unsupported subscription execution schema")
 	}

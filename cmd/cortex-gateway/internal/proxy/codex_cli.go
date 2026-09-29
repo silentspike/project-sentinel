@@ -69,6 +69,9 @@ var codexCLIReviewSchema []byte
 //go:embed codex_cli_adaptive_schema.json
 var codexCLIAdaptiveSchema []byte
 
+//go:embed codex_cli_leadership_schema.json
+var codexCLILeadershipSchema []byte
+
 type codexCLIUsage struct {
 	InputTokens           int64 `json:"input_tokens"`
 	CachedInputTokens     int64 `json:"cached_input_tokens"`
@@ -257,11 +260,21 @@ func (p *CodexCLIProvider) cleanupOutputSchema(path string) {
 
 func (p *CodexCLIProvider) outputSchemaPath(req *LLMRequest) (string, error) {
 	executionSchema := req.Metadata["company_execution_schema"]
-	if executionSchema != "1" && executionSchema != "3" {
+	if executionSchema != "1" && executionSchema != "3" && executionSchema != "5" {
+		if hasLeadershipReviewMetadata(req.Metadata) {
+			return "", fmt.Errorf("codex-cli mixed leadership output subject")
+		}
 		return "", nil
 	}
 	selected := codexCLIAdaptiveSchema
-	if executionSchema == "1" {
+	if executionSchema == "5" {
+		if classified, err := classifyModelWorkRequest(req, req.Metadata["request_id"]); err != nil || !classified {
+			return "", fmt.Errorf("codex-cli leadership request is invalid")
+		}
+		selected = codexCLILeadershipSchema
+	} else if hasLeadershipReviewMetadata(req.Metadata) {
+		return "", fmt.Errorf("codex-cli mixed leadership output subject")
+	} else if executionSchema == "1" {
 		selected = codexCLIWorkSchema
 		switch req.Metadata["company_execution_output_kind"] {
 		case "", "tool_plan": // Empty preserves already-reserved legacy requests.
@@ -574,7 +587,7 @@ func codexCLIResponseByteLimit(req *LLMRequest) int {
 		return codexCLIMaxResponseBytes
 	}
 	switch req.Metadata["company_execution_schema"] {
-	case "1", "2", "3", "4":
+	case "1", "2", "3", "4", "5":
 		// Company execution returns a bounded structured tool proposal. The
 		// native subscription transport does not guarantee the requested
 		// generation-token hint, so its byte guard must use the independently
