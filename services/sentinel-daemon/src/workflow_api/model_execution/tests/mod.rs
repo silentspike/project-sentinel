@@ -2,6 +2,299 @@ use super::*;
 use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
 use sentinel_workflow::CustomerRequestStateV1;
 
+fn additional_request(api: &WorkflowApi, operation: u128) -> sentinel_workflow::CustomerRequestV1 {
+    let customer = api.principals.principal("customer").unwrap();
+    let outcome = api
+        .store
+        .apply_company_command(
+            &customer.principal,
+            Uuid::from_u128(operation),
+            &CompanyWorkflowCommandV1::SubmitCustomerRequest {
+                summary_ref: "A separate internal coding request".into(),
+                desired_outcome: "Develop and independently test a local Python program".into(),
+                constraints: vec!["INTERNAL, no external customer acceptance".into()],
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::CustomerRequest(request) = outcome.response else {
+        panic!("request");
+    };
+    request
+}
+
+fn settle_anchor_question(api: &WorkflowApi, context: &RequestSalesContext) {
+    let request = dispatch(api, context);
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+            .status,
+        200
+    );
+    api.store
+        .adopt_sales_question(
+            &context.binding.grant.sales_principal,
+            &sentinel_workflow::AdoptSalesQuestionV1 {
+                allowance_id: context.binding.allowance_id.clone(),
+                request_digest: "b".repeat(64),
+                model_response_digest: "c".repeat(64),
+                content: "Which pages are required?".into(),
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn autonomous_sales_is_explicit_bounded_and_replay_does_not_reissue_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut api, anchor_context) = fixture(&temp.path().join("workflow.sqlite"));
+    settle_anchor_question(&api, &anchor_context);
+    let anchor = api.request_sales_call().unwrap().unwrap();
+    let request = additional_request(&api, 500);
+    let tenant = request.tenant_id.clone();
+    api.reconcile_sales_intake().unwrap();
+    assert_eq!(api.store.request_provider_calls(&tenant).unwrap().len(), 1);
+    api.request_sales_autonomous_enabled = true;
+    api.request_sales_total_limit = 40;
+    api.reconcile_sales_intake().unwrap();
+    let calls = api.store.request_provider_calls(&tenant).unwrap();
+    assert_eq!(calls.len(), 2);
+    let next = calls
+        .iter()
+        .find(|call| call.grant.request_id == request.request_id)
+        .unwrap();
+    assert_ne!(next.allowance_id, anchor.allowance_id);
+    assert_eq!(next.granted_by, anchor.granted_by);
+    assert_eq!(next.grant.total_call_limit, anchor.grant.total_call_limit);
+    assert_eq!(next.grant.model, anchor.grant.model);
+    assert_eq!(next.grant.catalog_digest, anchor.grant.catalog_digest);
+    assert!(next.dispatch.is_none());
+    let cursor = api.store.company_event_cursor().unwrap();
+    api.reconcile_sales_intake().unwrap();
+    assert_eq!(api.store.request_provider_calls(&tenant).unwrap(), calls);
+    assert_eq!(api.store.company_event_cursor().unwrap(), cursor);
+    assert_eq!(api.request_sales_call().unwrap().unwrap(), anchor);
+    let binding = RequestSalesAuthority {
+        schema_version: 2,
+        allowance_id: next.allowance_id.clone(),
+        grant: next.grant.clone(),
+    };
+    let context = api.prepare_request_sales(&binding).unwrap();
+    assert_eq!(context.source_request, request);
+    let dispatch = dispatch(&api, &context);
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&dispatch).unwrap())
+            .status,
+        200
+    );
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&dispatch).unwrap())
+            .status,
+        403
+    );
+    assert!(api
+        .fresh_request_sales_call(AgentId(3), now_unix_ms())
+        .unwrap()
+        .is_none());
+    assert_eq!(api.request_sales_call().unwrap().unwrap(), anchor);
+}
+
+#[test]
+fn autonomous_sales_requires_current_operator_and_healthy_on_duty_employee() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut api, anchor_context) = fixture(&temp.path().join("workflow.sqlite"));
+    settle_anchor_question(&api, &anchor_context);
+    let request = additional_request(&api, 501);
+    api.request_sales_autonomous_enabled = true;
+    let health = Arc::clone(&api.authority.as_ref().unwrap().runtime_health);
+    health
+        .write()
+        .unwrap()
+        .agents
+        .iter_mut()
+        .find(|agent| agent.agent_id == 3)
+        .unwrap()
+        .expected_active = false;
+    api.reconcile_sales_intake().unwrap();
+    assert_eq!(
+        api.store
+            .request_provider_calls(&request.tenant_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    health
+        .write()
+        .unwrap()
+        .agents
+        .iter_mut()
+        .find(|agent| agent.agent_id == 3)
+        .unwrap()
+        .expected_active = true;
+    api.principals = Arc::new(PrincipalAuthenticator {
+        by_credential_digest: api.principals.by_credential_digest.clone(),
+        by_principal_id: api.principals.by_principal_id.clone(),
+    });
+    let principals = Arc::get_mut(&mut api.principals).unwrap();
+    principals
+        .by_principal_id
+        .get_mut("operator")
+        .unwrap()
+        .principal
+        .authority_generation += 1;
+    assert!(api.reconcile_sales_intake().is_err());
+    assert_eq!(
+        api.store
+            .request_provider_calls(&request.tenant_id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn operator_can_authorize_another_request_without_replacing_bootstrap_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut api, anchor_context) = fixture(&temp.path().join("workflow.sqlite"));
+    settle_anchor_question(&api, &anchor_context);
+    let anchor = api.request_sales_call().unwrap().unwrap();
+    let request = additional_request(&api, 502);
+    api.request_sales_autonomous_enabled = true;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "operation_id": Uuid::from_u128(503), "request_id": request.request_id,
+        "expected_version": request.version, "sales_principal_id": "sales", "model": "model-test",
+        "catalog_digest": "a".repeat(64), "concurrent_call_limit": 1,
+        "expires_at_unix_ms": now_unix_ms() + 240_000
+    }))
+    .unwrap();
+    assert_eq!(
+        api.authorize_sales_request(&api.principals.principal("customer").unwrap(), &body)
+            .status,
+        403
+    );
+    assert_eq!(
+        api.authorize_sales_request(&api.principals.principal("operator").unwrap(), &body)
+            .status,
+        200
+    );
+    let next = api
+        .fresh_request_sales_call(AgentId(3), now_unix_ms())
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.grant.request_id, request.request_id);
+    assert_eq!(api.request_sales_call().unwrap().unwrap(), anchor);
+    let mut foreign = next.grant;
+    foreign.sales_principal.tenant_id = TenantId::parse("tenant-foreign").unwrap();
+    assert!(api
+        .prepare_request_sales(&RequestSalesAuthority {
+            schema_version: 2,
+            allowance_id: next.allowance_id,
+            grant: foreign,
+        })
+        .is_err());
+}
+
+#[test]
+fn autonomous_sales_does_not_spend_pending_or_unknown_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut api, anchor_context) = fixture(&temp.path().join("workflow.sqlite"));
+    let request = additional_request(&api, 504);
+    api.request_sales_autonomous_enabled = true;
+    api.reconcile_sales_intake().unwrap();
+    assert_eq!(
+        api.store
+            .request_provider_calls(&request.tenant_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    let request = dispatch(&api, &anchor_context);
+    assert_eq!(
+        api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+            .status,
+        200
+    );
+    api.reconcile_sales_intake().unwrap();
+    assert_eq!(
+        api.store
+            .request_provider_calls(&anchor_context.source_request.tenant_id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn disabling_sales_autonomy_keeps_bootstrap_selection_and_preserves_dynamic_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut api, anchor_context) = fixture(&temp.path().join("workflow.sqlite"));
+    let request = additional_request(&api, 505);
+    let operator = api.principals.principal("operator").unwrap();
+    let mut grant = anchor_context.binding.grant.clone();
+    grant.request_id = request.request_id;
+    grant.expected_version = request.version;
+    grant.expires_at_unix_ms = now_unix_ms() + 300_000;
+    let dynamic = api
+        .store
+        .authorize_request_provider_call(
+            &operator.principal,
+            Uuid::from_u128(506),
+            &grant,
+            now_unix_ms(),
+        )
+        .unwrap();
+    api.request_sales_autonomous_enabled = true;
+    let future = anchor_context.binding.grant.expires_at_unix_ms + 1;
+    assert_eq!(
+        api.fresh_request_sales_call(AgentId(3), future)
+            .unwrap()
+            .unwrap(),
+        dynamic
+    );
+    api.request_sales_autonomous_enabled = false;
+    assert!(api
+        .fresh_request_sales_call(AgentId(3), future)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        api.fresh_request_sales_call(AgentId(3), now_unix_ms())
+            .unwrap()
+            .unwrap()
+            .allowance_id,
+        anchor_context.binding.allowance_id
+    );
+    assert_eq!(
+        api.request_sales_call_for(&operator.principal.tenant_id, &dynamic.allowance_id)
+            .unwrap(),
+        dynamic
+    );
+}
+
+#[test]
+fn autonomous_sales_exhaustion_does_not_block_an_accepted_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut api, context) = planning_fixture(&temp.path().join("workflow.sqlite"));
+    additional_request(&api, 507);
+    api.request_sales_autonomous_enabled = true;
+    api.request_sales_total_limit = 1;
+    api.reconcile_work_batch(&|| false).unwrap();
+    assert_eq!(
+        api.store
+            .request_provider_calls(&context.binding.grant.planner_principal.tenant_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(api
+        .store
+        .project_planning_call(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .is_some());
+}
+
 pub(crate) fn fixture(path: &Path) -> (WorkflowApi, RequestSalesContext) {
     let mut api = super::super::model_work::configured_test_api(path);
     // The product campaign covers Sales, planning, and bounded work calls.
@@ -1807,6 +2100,106 @@ fn project_planning_reconcile_grants_existing_assigned_project_once() {
         )
         .unwrap();
     assert_eq!(replayed_renewal, renewed);
+}
+
+#[test]
+fn malformed_dynamic_sales_history_does_not_block_compatible_completion_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut api, anchor_context) = fixture(&temp.path().join("company.sqlite"));
+    let request = additional_request(&api, 508);
+    let operator = api.principals.principal("operator").unwrap();
+    let mut grant = anchor_context.binding.grant.clone();
+    grant.request_id = request.request_id;
+    grant.expected_version = request.version;
+    grant.concurrent_call_limit = 2;
+    let dynamic = api
+        .store
+        .authorize_request_provider_call(
+            &operator.principal,
+            Uuid::from_u128(509),
+            &grant,
+            now_unix_ms(),
+        )
+        .unwrap();
+    let dynamic_context = api
+        .prepare_request_sales(&RequestSalesAuthority {
+            schema_version: 2,
+            allowance_id: dynamic.allowance_id,
+            grant: dynamic.grant,
+        })
+        .unwrap();
+    api.request_sales_autonomous_enabled = true;
+    let store = api.event_store.as_ref().unwrap();
+    let mut failed = Vec::new();
+    for (context, content) in [
+        (
+            &anchor_context,
+            r#"{"schema_version":1,"kind":"ask_question","content":"Which format?"}"#,
+        ),
+        (&dynamic_context, "malformed model content"),
+    ] {
+        let request = dispatch(&api, context);
+        assert_eq!(
+            api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+                .status,
+            200
+        );
+        let id = request["request_id"].as_str().unwrap();
+        let digest = request["request_digest"].as_str().unwrap();
+        let completion = ModelExecutionCompletion {
+            context: ModelExecutionContext::RequestSales(Box::new(context.clone())),
+            content: content.into(),
+            admissible: true,
+        };
+        let event = DomainEvent::new("agent_llm_usage", &AgentId(3).to_string(), "{}", id, 1)
+            .with_operation_id(&format!("llm_usage_{id}"));
+        store
+            .enqueue_llm_completion(
+                id,
+                digest,
+                &serde_json::to_string(&serde_json::json!({
+                    "version":2,"request_id":id,"request_digest":digest,
+                    "usage_event":event,"actions":[],"tokens_used":10,"model_work":completion
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .persist_llm_completion_usage(id, digest, &event)
+            .unwrap();
+        assert_eq!(
+            store
+                .record_llm_completion_failure(id, digest, "Sales decision is not strict JSON", 1,)
+                .unwrap(),
+            (1, true)
+        );
+        failed.push(store.get_llm_completion(id).unwrap().unwrap());
+    }
+    let calls = api
+        .store
+        .request_provider_calls(&anchor_context.source_request.tenant_id)
+        .unwrap();
+    assert!(api.requeue_request_sales_schema_mismatch().unwrap());
+    assert_eq!(
+        store
+            .get_llm_completion(&failed[0].request_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "ready_for_action"
+    );
+    let malformed = store
+        .get_llm_completion(&failed[1].request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(malformed, failed[1]);
+    assert_eq!(
+        api.store
+            .request_provider_calls(&anchor_context.source_request.tenant_id)
+            .unwrap(),
+        calls
+    );
+    assert!(!api.requeue_request_sales_schema_mismatch().unwrap());
 }
 
 #[test]

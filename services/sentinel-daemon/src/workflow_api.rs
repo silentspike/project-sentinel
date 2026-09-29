@@ -2991,6 +2991,7 @@ pub struct WorkflowApi {
     subscription_allowance_id: Option<String>,
     request_sales_tenant: Option<TenantId>,
     request_sales_total_limit: u16,
+    request_sales_autonomous_enabled: bool,
     scan_succeeded: AtomicBool,
     collaboration_publication_pending: AtomicUsize,
     last_error: Mutex<Option<String>>,
@@ -3034,6 +3035,13 @@ impl WorkflowApi {
                 value.parse::<u16>().map_err(|_| workflow_unavailable())
             })?;
         if !matches!(request_sales_total_limit, 1 | 10 | 40) {
+            return Err(workflow_unavailable());
+        }
+        let request_sales_autonomous_enabled =
+            workflow_flag("SENTINEL_REQUEST_SALES_AUTONOMOUS_ENABLED")?;
+        if request_sales_autonomous_enabled
+            && (!enabled || !model_work_enabled || request_sales_tenant.is_none())
+        {
             return Err(workflow_unavailable());
         }
         if let Some(id) = &subscription_allowance_id {
@@ -3171,6 +3179,7 @@ impl WorkflowApi {
             subscription_allowance_id,
             request_sales_tenant,
             request_sales_total_limit,
+            request_sales_autonomous_enabled,
             scan_succeeded: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(usize::MAX),
             last_error: Mutex::new(None),
@@ -3206,6 +3215,7 @@ impl WorkflowApi {
             subscription_allowance_id: None,
             request_sales_tenant: None,
             request_sales_total_limit: 1,
+            request_sales_autonomous_enabled: false,
             scan_succeeded: AtomicBool::new(false),
             collaboration_publication_pending: AtomicUsize::new(0),
             last_error: Mutex::new(None),
@@ -4699,6 +4709,11 @@ impl WorkflowApi {
     fn reconcile_work_batch(&self, should_stop: &impl Fn() -> bool) -> Result<(), WorkflowError> {
         self.publish_collaboration_backlog()
             .map_err(|_| workflow_unavailable())?;
+        if should_stop() {
+            return Ok(());
+        }
+        #[cfg(feature = "llm")]
+        self.reconcile_sales_intake()?;
         for project in self.store.company_projects()? {
             if project.lifecycle_state
                 == sentinel_workflow::ProjectLifecycleStateV1::DeliveryCandidate

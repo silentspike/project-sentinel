@@ -214,8 +214,8 @@ healthy runtime, freezes the exact request version and conversation, and sends
 it through the normal authenticated Gateway/Cortex agent-runtime route.
 The provider returns a strict `ask_question` decision; neither tests nor the
 operator supply its answer. Only the customer may answer that question or accept
-a subsequent proposal. This initial consultation increment does not implement
-automatic proposal generation or the complete autonomous company.
+a subsequent proposal. Sales may author a policy-bound offer through the same
+durable decision path; no employee or operator may accept it for the customer.
 
 Request execution uses Gateway metadata schema 2 with a `customer_request`
 subject. Schema 1 continues to describe project work. Mixed subjects are denied.
@@ -234,12 +234,43 @@ The authenticated operator endpoint `POST /operator/workflow/request-provider`
 accepts a stable operation ID, request ID/version, registered Sales principal ID,
 model/catalog digest, concurrency bound, and expiry. It derives principal
 authority, provider, total ceiling, token policy, and 120-second duration on the
-server. The configured allowance must equal the canonical operation-derived ID.
+server. Without autonomous intake enabled, the configured allowance must equal
+the canonical operation-derived ID.
 The request body cannot raise the configured total ceiling. Both services must
 bind the same allowance and catalog before any provider effect is enabled.
 The existing credential initializer provisions the independent `workflow-operator`
 credential and the daemon loads it through systemd. It is not a customer or
 employee credential and is not exposed to the customer dashboard.
+
+`SENTINEL_REQUEST_SALES_AUTONOMOUS_ENABLED=true` is an explicit, protected
+Operator configuration opt-in in both daemon and Gateway. It defaults to false;
+it cannot be enabled by a customer request or model output. The daemon uses the
+immutable configured grant only as the policy anchor: its granting Operator
+must still match the authenticated principal registry exactly, and its provider,
+model, catalog, concurrency and duration remain binding. New intake uses the
+smaller of the configured total ceiling and the anchor's total ceiling. Enabling
+intake does not revive or dispatch the anchor's consumed call.
+
+Periodic reconciliation inspects validated inboxes for registered customers in
+the configured tenant. It admits the oldest eligible request version to the
+unique healthy on-duty Sales employee, at most one grant per turn and only when
+pending/unknown Sales calls leave capacity. An unanswered customer question
+waits for the customer's reply. The operation derives from the anchor, request
+and version; restart recognizes the original immutable reservation instead of
+renewing its expiry. An expired or unknown reservation for that version is not
+automatically replaced. Unresolved dispatched calls also prevent new authority
+for a newer version of the same request.
+
+Fresh inference selects the oldest current eligible grant for that employee.
+Preparation, dispatch, completion adoption and recovery instead resolve the
+exact tenant and allowance carried by the binding: advancing the inbox never
+changes the authority of a previous result. The Gateway admits non-bootstrap
+schema-2 Sales IDs only in explicit autonomous mode, then still requires the
+daemon's secret-authenticated durable claim and exact receipt before sending.
+Catalog/model, subject, request/context digests, expiry and caller checks remain
+mandatory. Project planning retains its separate bootstrap policy and accepted
+agreement/proposal lineage. These source contracts need live employee-journey
+evidence; configuration and tests alone are not company acceptance.
 
 Every grant counts toward the store-wide cumulative ceiling, including legacy
 project grants and expired unsent grants. Unknown dispatched outcomes retain
@@ -288,7 +319,8 @@ pre-agreement Sales and model-authored project planning. It is not rewritten for
 each employee task. Project work carries its durable allowance ID in the exact
 request metadata; the Gateway validates that ID and forwards it to the daemon,
 which resolves it against the current project, assignment and grant before
-claiming dispatch. A dynamic work ID cannot be used for Sales or planning, and
+claiming dispatch. A dynamic work ID cannot be used for planning; Sales accepts
+its own exact request grant only under the explicit autonomous policy above, and
 multiple project grants for one employee fail closed as ambiguous. The daemon
 also requires model work and usage-v2. The Gateway requires its existing protected
 operator credential and a loopback-only `SENTINEL_OPERATOR_API_URL`. A

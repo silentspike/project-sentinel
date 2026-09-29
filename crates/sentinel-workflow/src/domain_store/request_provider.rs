@@ -372,6 +372,31 @@ impl WorkflowStore {
         grant: &RequestProviderGrantV1,
         now_ms: u64,
     ) -> Result<RequestProviderCallV1, WorkflowError> {
+        self.authorize_request_provider_call_inner(principal, operation_id, grant, now_ms, false)?
+            .ok_or_else(corrupt)
+    }
+
+    /// Trusted autonomous admission reserves global capacity atomically.
+    /// Exhaustion or a duplicate reservation returns None without writes;
+    /// exact operation replay returns the existing call, not dispatch permission.
+    pub fn admit_autonomous_request_provider_call(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        operation_id: Uuid,
+        grant: &RequestProviderGrantV1,
+        now_ms: u64,
+    ) -> Result<Option<RequestProviderCallV1>, WorkflowError> {
+        self.authorize_request_provider_call_inner(principal, operation_id, grant, now_ms, true)
+    }
+
+    fn authorize_request_provider_call_inner(
+        &self,
+        principal: &AuthenticatedCompanyPrincipalV1,
+        operation_id: Uuid,
+        grant: &RequestProviderGrantV1,
+        now_ms: u64,
+        autonomous: bool,
+    ) -> Result<Option<RequestProviderCallV1>, WorkflowError> {
         grant_actor(principal)?;
         if operation_id.is_nil() {
             return Err(invalid("provider grant operation is missing"));
@@ -392,7 +417,7 @@ impl WorkflowStore {
                     "provider grant operation changed",
                 ));
             }
-            return Ok(existing);
+            return Ok(Some(existing));
         }
         validate_grant(grant, now_ms)?;
         if principal.tenant_id != grant.sales_principal.tenant_id {
@@ -407,19 +432,41 @@ impl WorkflowStore {
         .ok_or_else(not_found)?;
         require_version(source_request.version, grant.expected_version)?;
         let calls = all_calls(&transaction)?;
-        let (legacy_total, _) = legacy_usage(&transaction, &calls)?;
+        let (legacy_total, legacy_active) = legacy_usage(&transaction, &calls)?;
         if calls.len() + legacy_total >= usize::from(grant.total_call_limit)
             || calls.iter().any(|call| {
                 call.granted_by.tenant_id == principal.tenant_id
                     && call.grant.request_id == grant.request_id
-                    && call.grant.expected_version == grant.expected_version
                     && call.abandonment_event_id.is_none()
-                    && (call.dispatch.is_some() || now_ms < call.grant.expires_at_unix_ms)
+                    && ((call.dispatch.is_some()
+                        && call.question_response.is_none()
+                        && call.proposal_response.is_none())
+                        || (call.grant.expected_version == grant.expected_version
+                            && (call.dispatch.is_some() || now_ms < call.grant.expires_at_unix_ms)))
             })
         {
+            if autonomous {
+                return Ok(None);
+            }
             return Err(invalid(
                 "request provider allowance exhausted or already reserved",
             ));
+        }
+        if autonomous {
+            let occupied = calls
+                .iter()
+                .filter(|call| {
+                    call.abandonment_event_id.is_none()
+                        && ((call.dispatch.is_some()
+                            && call.question_response.is_none()
+                            && call.proposal_response.is_none())
+                            || (call.dispatch.is_none() && now_ms < call.grant.expires_at_unix_ms))
+                })
+                .count()
+                + legacy_active;
+            if occupied >= usize::from(grant.concurrent_call_limit) {
+                return Ok(None);
+            }
         }
         let call = RequestProviderCallV1 {
             schema_version: 1,
@@ -444,7 +491,7 @@ impl WorkflowStore {
             "request_provider_call_authorized",
         )?;
         transaction.commit()?;
-        Ok(call)
+        Ok(Some(call))
     }
 
     pub fn request_provider_call(
@@ -456,6 +503,25 @@ impl WorkflowStore {
         validate_identifier(allowance_id)?;
         let connection = self.connection.lock().map_err(|_| persistence())?;
         get_entity(&connection, tenant, KIND, allowance_id)
+    }
+
+    /// Validated tenant history, including expired and completed allowances.
+    pub fn request_provider_calls(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<RequestProviderCallV1>, WorkflowError> {
+        tenant.validate()?;
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        let mut calls: Vec<_> = all_calls(&connection)?
+            .into_iter()
+            .filter(|call| &call.granted_by.tenant_id == tenant)
+            .collect();
+        calls.sort_by(|a, b| {
+            a.created_at_unix_ms
+                .cmp(&b.created_at_unix_ms)
+                .then_with(|| a.allowance_id.cmp(&b.allowance_id))
+        });
+        Ok(calls)
     }
 
     /// Not replayable permission: a second claim must never reach a provider.

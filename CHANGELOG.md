@@ -1,5 +1,10 @@
 # Changelog
 
+- Admit customer Sales work through an explicit opt-in bounded Operator policy
+  and durable per-request grants instead of a single process-global request.
+  Preserve consumed and unknown provider effects, current employee duty,
+  immutable dispatch/result bindings and cumulative campaign limits (#856).
+
 - Add an independent internal company Customer identity and protected workflow
   credential without changing the actual customer binding or the existing 23
   secrets. Preserve credential bytes during migration and reinitialization

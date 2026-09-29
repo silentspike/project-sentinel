@@ -2027,12 +2027,14 @@ impl WorkflowApi {
             {
                 return Err(principal_unavailable());
             }
-            let id = sentinel_workflow::request_provider_allowance_id(
-                &principal.principal.tenant_id,
-                request.operation_id,
-            )?;
-            if self.subscription_allowance_id.as_deref() != Some(id.as_str()) {
-                return Err(principal_unavailable());
+            if !self.request_sales_autonomous_enabled {
+                let id = sentinel_workflow::request_provider_allowance_id(
+                    &principal.principal.tenant_id,
+                    request.operation_id,
+                )?;
+                if self.subscription_allowance_id.as_deref() != Some(id.as_str()) {
+                    return Err(principal_unavailable());
+                }
             }
             let sales = self
                 .principals
@@ -2088,20 +2090,167 @@ impl WorkflowApi {
             .ok_or("Sales allowance missing")
     }
 
+    pub(super) fn request_sales_call_for(
+        &self,
+        tenant: &TenantId,
+        allowance_id: &str,
+    ) -> Result<RequestProviderCallV1, &'static str> {
+        if !self.enabled
+            || !self.model_work_enabled
+            || self.request_sales_tenant.as_ref() != Some(tenant)
+        {
+            return Err("Sales tenant is not enabled");
+        }
+        self.store
+            .request_provider_call(tenant, allowance_id)
+            .map_err(|_| "Sales allowance store unavailable")?
+            .ok_or("Sales allowance missing")
+    }
+
+    /// The opt-in daemon configuration is standing Operator admission policy,
+    /// not a replay or renewal of the anchor's consumed provider dispatch.
+    pub(super) fn reconcile_sales_intake(&self) -> Result<(), WorkflowError> {
+        if !self.request_sales_autonomous_enabled {
+            return Ok(());
+        }
+        let anchor = self
+            .request_sales_call()
+            .map_err(|_| workflow_unavailable())?
+            .ok_or_else(workflow_unavailable)?;
+        let operator = self
+            .principals
+            .principal(&anchor.granted_by.principal_id)
+            .filter(|bound| bound.principal == anchor.granted_by)
+            .ok_or_else(principal_unavailable)?;
+        let tenant = &operator.principal.tenant_id;
+        let calls = self.store.request_provider_calls(tenant)?;
+        let total_call_limit = self
+            .request_sales_total_limit
+            .min(anchor.grant.total_call_limit);
+        let mut sales = self
+            .principals
+            .agents_for_role(tenant, CompanyRoleV1::Sales)
+            .filter(|bound| self.validate_sales_principal(&bound.principal).is_ok());
+        let Some(sales_principal) = sales.next().map(|bound| bound.principal.clone()) else {
+            return Ok(());
+        };
+        if sales.next().is_some() {
+            return Err(principal_unavailable());
+        }
+        let mut requests = Vec::new();
+        for customer in self.principals.by_principal_id.values().filter(|bound| {
+            bound.principal.tenant_id == *tenant
+                && bound.principal.kind == CompanyPrincipalKindV1::Customer
+        }) {
+            let customer_id = customer
+                .principal
+                .customer_id
+                .as_deref()
+                .ok_or_else(principal_unavailable)?;
+            requests.extend(self.store.company_customer_requests(tenant, customer_id)?);
+        }
+        requests.sort_by(|left, right| {
+            (left.created_at_unix_ms, &left.request_id)
+                .cmp(&(right.created_at_unix_ms, &right.request_id))
+        });
+        requests.dedup_by(|left, right| left.request_id == right.request_id);
+        let now_ms = now_unix_ms();
+        for request in requests {
+            if !matches!(
+                request.state,
+                sentinel_workflow::CustomerRequestStateV1::Submitted
+                    | sentinel_workflow::CustomerRequestStateV1::Clarifying
+            ) || calls.iter().any(|call| {
+                call.grant.request_id == request.request_id
+                    && (call.grant.expected_version == request.version
+                        || (call.dispatch.is_some()
+                            && call.question_response.is_none()
+                            && call.proposal_response.is_none()
+                            && call.abandonment_event_id.is_none()))
+            }) || request
+                .consultation
+                .last()
+                .is_some_and(|message| message.role == CompanyRoleV1::Sales)
+            {
+                continue;
+            }
+            let operation_id = stable_operation_id(
+                "sentinel.workflow.autonomous-sales-grant.v1",
+                &format!("{}:{}", anchor.allowance_id, request.request_id),
+                request.version,
+            );
+            // Admission and global legacy/request capacity share the store
+            // transaction. A full queue is a no-op, not a project failure.
+            if self
+                .store
+                .admit_autonomous_request_provider_call(
+                    &operator.principal,
+                    operation_id,
+                    &RequestProviderGrantV1 {
+                        schema_version: 1,
+                        request_id: request.request_id,
+                        expected_version: request.version,
+                        sales_principal,
+                        provider: anchor.grant.provider,
+                        model: anchor.grant.model,
+                        catalog_digest: anchor.grant.catalog_digest,
+                        total_call_limit,
+                        concurrent_call_limit: anchor.grant.concurrent_call_limit,
+                        max_duration_ms: anchor.grant.max_duration_ms,
+                        token_policy: anchor.grant.token_policy,
+                        expires_at_unix_ms: now_ms
+                            .checked_add(240_000)
+                            .ok_or_else(workflow_unavailable)?,
+                    },
+                    now_ms,
+                )?
+                .is_none()
+            {
+                return Ok(());
+            }
+            // Admit one durable queue entry per bounded reconciliation turn.
+            break;
+        }
+        Ok(())
+    }
+
     pub(crate) fn fresh_request_sales_call(
         &self,
         agent_id: AgentId,
         now_ms: u64,
     ) -> Result<Option<RequestProviderCallV1>, &'static str> {
-        Ok(self.request_sales_call()?.filter(|call| {
-            call.grant.sales_principal.agent_id == Some(agent_id)
+        let Some(tenant) = &self.request_sales_tenant else {
+            return Ok(None);
+        };
+        if !self.enabled || !self.model_work_enabled {
+            return Err("Sales model execution is disabled");
+        }
+        for call in self
+            .store
+            .request_provider_calls(tenant)
+            .map_err(|_| "Sales allowance store unavailable")?
+        {
+            if call.grant.sales_principal.agent_id == Some(agent_id)
+                && (self.request_sales_autonomous_enabled
+                    || self.subscription_allowance_id.as_deref()
+                        == Some(call.allowance_id.as_str()))
                 && call.question_response.is_none()
                 && call.proposal_response.is_none()
                 && call.abandonment_event_id.is_none()
                 && call.dispatch.is_none()
                 && now_ms >= call.created_at_unix_ms
                 && now_ms < call.grant.expires_at_unix_ms
-        }))
+                && self
+                    .store
+                    .company_customer_request(tenant, &call.grant.request_id)
+                    .map_err(|_| "Sales request store unavailable")?
+                    .as_ref()
+                    == Some(&call.source_request)
+            {
+                return Ok(Some(call));
+            }
+        }
+        Ok(None)
     }
 
     fn validate_sales_principal(
@@ -2149,7 +2298,10 @@ impl WorkflowApi {
         &self,
         binding: &RequestSalesAuthority,
     ) -> Result<RequestSalesContext, &'static str> {
-        let call = self.request_sales_call()?.ok_or("Sales call missing")?;
+        let call = self.request_sales_call_for(
+            &binding.grant.sales_principal.tenant_id,
+            &binding.allowance_id,
+        )?;
         if binding.schema_version != 2
             || binding.allowance_id != call.allowance_id
             || binding.grant != call.grant
@@ -2199,9 +2351,10 @@ impl WorkflowApi {
         {
             return Err("Sales completion is not admissible");
         }
-        let call = self
-            .request_sales_call()?
-            .ok_or("Sales allowance missing")?;
+        let call = self.request_sales_call_for(
+            &context.binding.grant.sales_principal.tenant_id,
+            &context.binding.allowance_id,
+        )?;
         let context_digest = format!(
             "{:x}",
             Sha256::digest(
@@ -3406,11 +3559,29 @@ impl WorkflowApi {
     }
 
     pub(crate) fn requeue_request_sales_schema_mismatch(&self) -> Result<bool, &'static str> {
-        const PRIOR_ERROR: &str = "Sales decision is not strict JSON";
-
-        let Some(call) = self.request_sales_call()? else {
+        let Some(tenant) = &self.request_sales_tenant else {
             return Ok(false);
         };
+        if !self.enabled || !self.model_work_enabled {
+            return Err("Sales model execution is disabled");
+        }
+        let mut requeued = false;
+        for call in self
+            .store
+            .request_provider_calls(tenant)
+            .map_err(|_| "Sales allowance store unavailable")?
+        {
+            requeued |= self.requeue_sales_call_schema_mismatch(&call)?;
+        }
+        Ok(requeued)
+    }
+
+    fn requeue_sales_call_schema_mismatch(
+        &self,
+        call: &RequestProviderCallV1,
+    ) -> Result<bool, &'static str> {
+        const PRIOR_ERROR: &str = "Sales decision is not strict JSON";
+
         if call.question_response.is_some()
             || call.proposal_response.is_some()
             || call.abandonment_event_id.is_some()
@@ -3461,10 +3632,11 @@ impl WorkflowApi {
         {
             return Err("Sales completion context changed");
         }
-        let decision: SalesDecision = serde_json::from_str(&completion.content)
-            .map_err(|_| "Sales completion still violates the active schema")?;
+        let Ok(decision) = serde_json::from_str::<SalesDecision>(&completion.content) else {
+            return Ok(false);
+        };
         if decision.schema_version() != 1 {
-            return Err("Sales decision schema unsupported");
+            return Ok(false);
         }
         store
             .requeue_failed_llm_completion(
