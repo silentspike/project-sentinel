@@ -1562,6 +1562,13 @@ mod tests {
             api.adaptive_subscription_queue_priority(&selected).unwrap(),
             Some(2)
         );
+        let mut renewed = selected.clone();
+        renewed.reservation_id = "subscription-renewed".into();
+        assert_eq!(
+            api.adaptive_subscription_queue_priority(&renewed).unwrap(),
+            None,
+            "a new allowance cannot displace an unexpired session"
+        );
         assert_eq!(
             api.core
                 .adaptive_session(binding.grant.session_id, &binding.grant.authority)
@@ -1611,6 +1618,11 @@ mod tests {
         assert_eq!(
             api.adaptive_subscription_queue_priority(&selected).unwrap(),
             None
+        );
+        assert_eq!(
+            api.adaptive_subscription_queue_priority(&renewed).unwrap(),
+            None,
+            "a renewed allowance cannot silently reset a blocked model decision"
         );
         assert_eq!(
             api.provider_usage_binding_for_agent(AgentId(6))
