@@ -346,6 +346,207 @@ fn authorize(f: &Fixture) -> AdaptiveLeadershipReviewCallV1 {
         .unwrap()
 }
 
+#[test]
+fn retirement_requires_actual_source_drift_and_exact_leader() {
+    let f = fixture();
+    let call = authorize(&f);
+    let before = rows(&f.store);
+    assert!(f
+        .store
+        .retire_stale_adaptive_leadership_review_call(
+            &f.leader,
+            call.grant.review_id,
+            call.version,
+            21,
+        )
+        .is_err());
+    assert_eq!(rows(&f.store), before);
+    change_project(&f, 21);
+    let mut wrong = f.leader.clone();
+    wrong.authority_generation += 1;
+    let before = rows(&f.store);
+    assert!(f
+        .store
+        .retire_stale_adaptive_leadership_review_call(
+            &wrong,
+            call.grant.review_id,
+            call.version,
+            22,
+        )
+        .is_err());
+    assert!(f
+        .store
+        .retire_stale_adaptive_leadership_review_call(&f.leader, call.grant.review_id, 2, 22,)
+        .is_err());
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
+fn stale_dispatched_retirement_is_durable_without_fabricated_decision() {
+    let f = fixture();
+    let call = authorize(&f);
+    let dispatched = f
+        .store
+        .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), 21)
+        .unwrap();
+    let original = session(&f);
+    change_project(&f, 22);
+    let retired = f
+        .store
+        .retire_stale_adaptive_leadership_review_call(
+            &f.leader,
+            call.grant.review_id,
+            dispatched.version,
+            23,
+        )
+        .unwrap();
+    assert_eq!(retired.version, 4);
+    assert_eq!(retired.retired_at_unix_ms, Some(23));
+    assert_eq!(retired.dispatch, dispatched.dispatch);
+    assert_eq!(retired.allowance_id, dispatched.allowance_id);
+    assert!(retired.decision.is_none());
+    assert!(retired.model_response_digest.is_none());
+    assert!(retired.resolution_event_id.is_none());
+    assert_eq!(session(&f), original);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    let before = rows(&reopened);
+    assert_eq!(
+        reopened
+            .retire_stale_adaptive_leadership_review_call(
+                &f.leader,
+                call.grant.review_id,
+                dispatched.version,
+                24,
+            )
+            .unwrap(),
+        retired
+    );
+    assert!(reopened
+        .complete_adaptive_leadership_review_call(&f.leader, &completion(&call, false), 24,)
+        .is_err());
+    assert!(reopened
+        .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), 24,)
+        .is_err());
+    assert_eq!(rows(&reopened), before);
+}
+
+#[test]
+fn committed_resolution_cannot_be_retired_after_project_drift() {
+    let f = fixture();
+    let call = authorize(&f);
+    let dispatched = f
+        .store
+        .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), 21)
+        .unwrap();
+    let resolution = Uuid::new_v4();
+    resolve(&f, resolution, 22);
+    change_project(&f, 23);
+    let before = rows(&f.store);
+    assert!(f
+        .store
+        .retire_stale_adaptive_leadership_review_call(
+            &f.leader,
+            call.grant.review_id,
+            dispatched.version,
+            24,
+        )
+        .is_err());
+    assert_eq!(rows(&f.store), before);
+    let mut result = completion(&call, true);
+    result.resolution_event_id = Some(resolution);
+    let completed = f
+        .store
+        .complete_adaptive_leadership_review_call(&f.leader, &result, 24)
+        .unwrap();
+    assert_eq!(completed.resolution_event_id, Some(resolution));
+    assert!(completed.retired_at_unix_ms.is_none());
+}
+
+#[test]
+fn retired_reviews_free_pending_barrier_but_count_towards_head_limit() {
+    let f = fixture();
+    let original = session(&f);
+    for index in 0..ADAPTIVE_LEADERSHIP_MAX_REVIEWS {
+        let project = f
+            .store
+            .company_project(&f.leader.tenant_id, &f.grant.project_id)
+            .unwrap()
+            .unwrap();
+        let mut context = f.context.clone();
+        context.source_project = project.clone();
+        context
+            .evidence_refs
+            .push(format!("project-version:{}", project.version));
+        let mut grant = f.grant.clone();
+        grant.expected_project_version = project.version;
+        grant.evidence_fingerprint =
+            adaptive_leadership_evidence_fingerprint(&context.tool_catalog, &context.evidence_refs)
+                .unwrap();
+        grant.review_id = adaptive_leadership_review_id(
+            grant.session_id,
+            grant.expected_session_version,
+            &grant.evidence_fingerprint,
+        )
+        .unwrap();
+        let now = 30 + index as u64 * 3;
+        let call = f
+            .store
+            .authorize_adaptive_leadership_review_call(
+                &f.leader,
+                Uuid::new_v4(),
+                &format!("retirement-{index}"),
+                &grant,
+                &context,
+                now,
+            )
+            .unwrap();
+        change_project(&f, now + 1);
+        f.store
+            .retire_stale_adaptive_leadership_review_call(
+                &f.leader,
+                call.grant.review_id,
+                call.version,
+                now + 2,
+            )
+            .unwrap();
+    }
+    let project = f
+        .store
+        .company_project(&f.leader.tenant_id, &f.grant.project_id)
+        .unwrap()
+        .unwrap();
+    let mut context = f.context.clone();
+    context.source_project = project.clone();
+    context
+        .evidence_refs
+        .push(format!("project-version:{}", project.version));
+    let mut grant = f.grant.clone();
+    grant.expected_project_version = project.version;
+    grant.evidence_fingerprint =
+        adaptive_leadership_evidence_fingerprint(&context.tool_catalog, &context.evidence_refs)
+            .unwrap();
+    grant.review_id = adaptive_leadership_review_id(
+        grant.session_id,
+        grant.expected_session_version,
+        &grant.evidence_fingerprint,
+    )
+    .unwrap();
+    let before = rows(&f.store);
+    assert!(f
+        .store
+        .authorize_adaptive_leadership_review_call(
+            &f.leader,
+            Uuid::new_v4(),
+            "retirement-fourth",
+            &grant,
+            &context,
+            50,
+        )
+        .is_err());
+    assert_eq!(rows(&f.store), before);
+    assert_eq!(session(&f), original);
+}
+
 fn claim(call: &AdaptiveLeadershipReviewCallV1) -> ClaimAdaptiveLeadershipReviewCallV1 {
     ClaimAdaptiveLeadershipReviewCallV1 {
         review_id: call.grant.review_id,
