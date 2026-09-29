@@ -3,7 +3,8 @@
 use super::*;
 use crate::{
     adaptive_collaboration_digest, AdaptiveEffectV1, AdaptiveModelDecisionV1,
-    AdaptiveSessionGrantV1, AdaptiveSessionV1, AdaptiveTransitionV1,
+    AdaptiveRecoveryFeedbackV1, AdaptiveSessionGrantV1, AdaptiveSessionV1, AdaptiveTransitionV1,
+    ADAPTIVE_SCHEMA_MAX_CORRECTIONS,
 };
 use serde::Deserialize;
 
@@ -15,6 +16,9 @@ struct Entry {
     previous_digest: Option<String>,
     command: Option<AdaptiveTransitionV1>,
     session: AdaptiveSessionV1,
+    // Only the initial entry carries lineage. Omitting None preserves old entry digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_feedback: Option<AdaptiveRecoveryFeedbackV1>,
 }
 
 impl WorkflowStore {
@@ -39,38 +43,81 @@ impl WorkflowStore {
             require_head(&tx, &existing)?;
             return Ok((true, existing));
         }
-        if now_ms != grant.created_at_ms || now_ms >= grant.deadline_ms {
+        if now_ms < grant.created_at_ms || now_ms >= grant.deadline_ms {
             return Err(authority_conflict());
         }
         let previous = if let Some(head) = read_head(&tx, current)? {
             if head.session_id == grant.session_id {
                 return Err(corrupt_store());
             }
-            let (previous, previous_digest) =
-                load(&tx, head.session_id)?.ok_or_else(corrupt_store)?;
+            let (previous, previous_digest, feedback) =
+                load_with_feedback(&tx, head.session_id)?.ok_or_else(corrupt_store)?;
             authorize(&previous.grant, current)?;
             validate_head(&head, &previous)?;
-            // A renewed allowance may replace only a session that never claimed
-            // a provider or tool effect. All other cursors need explicit recovery.
-            if previous.version != 1
-                || previous.model_calls != 0
-                || previous.tool_calls != 0
-                || !matches!(previous.cursor, crate::AdaptiveCursorV1::ReadyForModel)
-                || previous.last_observation.is_some()
-                || previous.last_model_result_digest.is_some()
-                || !previous.effect_ids.is_empty()
+            // Never replace unresolved effects or implicitly clear a blocked result.
+            let never_claimed = previous.version == 1
+                && previous.model_calls == 0
+                && previous.tool_calls == 0
+                && matches!(previous.cursor, crate::AdaptiveCursorV1::ReadyForModel)
+                && previous.last_observation.is_none()
+                && previous.last_model_result_digest.is_none()
+                && previous.effect_ids.is_empty();
+            let rejected_first_model = matches!(previous.version, 3 | 4)
+                && previous.model_calls == 1
+                && previous.tool_calls == 0
+                && matches!(
+                    previous.cursor,
+                    crate::AdaptiveCursorV1::ModelRejected { .. }
+                )
+                && previous.last_observation.is_none()
+                && previous.last_model_result_digest.is_none()
+                && previous.effect_ids.len() == 1;
+            let blocked_resolved = matches!(
+                previous.cursor,
+                crate::AdaptiveCursorV1::BlockedResolved { .. }
+            );
+            if !(never_claimed || rejected_first_model || blocked_resolved)
                 || previous.grant.provider_allowance_id == grant.provider_allowance_id
                 || previous.grant.deadline_ms > now_ms
             {
                 return Err(idempotency_conflict());
             }
-            Some((previous, previous_digest))
+            let feedback = if rejected_first_model {
+                let count = feedback.as_ref().map_or(0, |feedback| feedback.count);
+                if count >= ADAPTIVE_SCHEMA_MAX_CORRECTIONS {
+                    return Err(idempotency_conflict());
+                }
+                let crate::AdaptiveCursorV1::ModelRejected {
+                    reason_code,
+                    resolution_event_id,
+                } = &previous.cursor else {
+                    return Err(corrupt_store());
+                };
+                Some(AdaptiveRecoveryFeedbackV1 {
+                    count: count + 1,
+                    reason_code: reason_code.clone(),
+                    resolution_event_id: resolution_event_id.clone(),
+                    previous_session_id: previous.grant.session_id,
+                })
+            } else {
+                feedback
+            };
+            Some((previous, previous_digest, feedback))
         } else {
             None
         };
-        let session = AdaptiveSessionV1::initial(grant.clone())?;
-        if let Some((previous, previous_digest)) = previous {
-            let cancelled = previous.transition(&AdaptiveTransitionV1::Cancel, now_ms)?;
+        let mut session = AdaptiveSessionV1::initial(grant.clone())?;
+        // A grant can predate the resolution that made rollover safe. Use a recorded
+        // journal time as the floor, without rewriting the grant's creation time.
+        session.updated_at_ms = previous
+            .as_ref()
+            .map_or(now_ms, |(prior, _, _)| now_ms.max(prior.updated_at_ms));
+        if session.updated_at_ms >= grant.deadline_ms {
+            return Err(authority_conflict());
+        }
+        let recovery_feedback = if let Some((previous, previous_digest, feedback)) = previous {
+            let cancelled =
+                previous.transition(&AdaptiveTransitionV1::Cancel, session.updated_at_ms)?;
             append(
                 &tx,
                 &self::namespace(previous.grant.session_id),
@@ -78,6 +125,7 @@ impl WorkflowStore {
                     previous_digest: Some(previous_digest),
                     command: Some(AdaptiveTransitionV1::Cancel),
                     session: cancelled,
+                    recovery_feedback: None,
                 },
             )?;
             let changed = tx
@@ -96,9 +144,11 @@ impl WorkflowStore {
             if changed != 1 {
                 return Err(corrupt_store());
             }
+            feedback
         } else {
             insert_head(&tx, &session)?;
-        }
+            None
+        };
         append(
             &tx,
             &namespace,
@@ -106,6 +156,7 @@ impl WorkflowStore {
                 previous_digest: None,
                 command: None,
                 session: session.clone(),
+                recovery_feedback,
             },
         )?;
         tx.commit().map_err(map_sqlite_error)?;
@@ -141,6 +192,39 @@ impl WorkflowStore {
         authorize(&session.grant, current)?;
         validate_head(&head, &session)?;
         Ok(Some(session))
+    }
+
+    /// Latest bounded rejection context on one exact-authority read snapshot.
+    /// Before rollover, count still denotes corrections already consumed.
+    pub fn adaptive_recovery_feedback(
+        &self,
+        current: &RuntimeAuthoritySnapshotV1,
+    ) -> Result<Option<AdaptiveRecoveryFeedbackV1>, WorkflowError> {
+        current.validate()?;
+        let mut connection = self.lock()?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(map_sqlite_error)?;
+        let Some(head) = read_head(&tx, current)? else {
+            return Ok(None);
+        };
+        let (session, _, feedback) =
+            load_with_feedback(&tx, head.session_id)?.ok_or_else(corrupt_store)?;
+        authorize(&session.grant, current)?;
+        validate_head(&head, &session)?;
+        if let crate::AdaptiveCursorV1::ModelRejected {
+            reason_code,
+            resolution_event_id,
+        } = session.cursor
+        {
+            return Ok(Some(AdaptiveRecoveryFeedbackV1 {
+                count: feedback.as_ref().map_or(0, |feedback| feedback.count),
+                reason_code,
+                resolution_event_id,
+                previous_session_id: session.grant.session_id,
+            }));
+        }
+        Ok(feedback)
     }
 
     /// Reads exact durable adoption evidence; does not authorize or dispatch an effect.
@@ -270,6 +354,7 @@ impl WorkflowStore {
                 previous_digest: Some(prior_digest),
                 command: Some(command.clone()),
                 session: next.clone(),
+                recovery_feedback: None,
             },
         )?;
         insert_operation(
@@ -427,6 +512,15 @@ fn load(
     connection: &Connection,
     id: Uuid,
 ) -> Result<Option<(AdaptiveSessionV1, String)>, WorkflowError> {
+    Ok(load_with_feedback(connection, id)?.map(|(session, digest, _)| (session, digest)))
+}
+
+type LoadedSession = (AdaptiveSessionV1, String, Option<AdaptiveRecoveryFeedbackV1>);
+
+fn load_with_feedback(
+    connection: &Connection,
+    id: Uuid,
+) -> Result<Option<LoadedSession>, WorkflowError> {
     let mut statement = connection.prepare(
         "SELECT operation_id, request_digest, response, created_at_ms FROM workflow_operations WHERE operation_namespace=?1 ORDER BY operation_id LIMIT ?2"
     ).map_err(map_sqlite_error)?;
@@ -434,6 +528,7 @@ fn load(
         .query(params![namespace(id), (MAX_JOURNAL_ENTRIES + 1) as i64])
         .map_err(map_sqlite_error)?;
     let mut previous: Option<(AdaptiveSessionV1, String)> = None;
+    let mut feedback = None;
     let mut count = 0;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         count += 1;
@@ -453,9 +548,27 @@ fn load(
         }
         let expected = match &previous {
             None if entry.previous_digest.is_none() && entry.command.is_none() => {
-                AdaptiveSessionV1::initial(entry.session.grant.clone())
+                if let Some(inherited) = &entry.recovery_feedback {
+                    inherited.validate().map_err(|_| corrupt_store())?;
+                    if inherited.count == 0 || inherited.previous_session_id == id {
+                        return Err(corrupt_store());
+                    }
+                }
+                feedback = entry.recovery_feedback.clone();
+                let mut initial = AdaptiveSessionV1::initial(entry.session.grant.clone())
+                    .map_err(|_| corrupt_store())?;
+                if entry.session.updated_at_ms < initial.grant.created_at_ms
+                    || entry.session.updated_at_ms >= initial.grant.deadline_ms
+                {
+                    return Err(corrupt_store());
+                }
+                initial.updated_at_ms = entry.session.updated_at_ms;
+                Ok(initial)
             }
-            Some((prior, prior_digest)) if entry.previous_digest.as_ref() == Some(prior_digest) => {
+            Some((prior, prior_digest))
+                if entry.previous_digest.as_ref() == Some(prior_digest)
+                    && entry.recovery_feedback.is_none() =>
+            {
                 prior.transition(
                     entry.command.as_ref().ok_or_else(corrupt_store)?,
                     entry.session.updated_at_ms,
@@ -469,5 +582,5 @@ fn load(
         }
         previous = Some((entry.session, digest));
     }
-    Ok(previous)
+    Ok(previous.map(|(session, digest)| (session, digest, feedback)))
 }

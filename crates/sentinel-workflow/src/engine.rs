@@ -162,6 +162,29 @@ where
         self.store.adaptive_session_for_authority(&current)
     }
 
+    pub fn adaptive_recovery_feedback(
+        &self,
+        authority: &crate::RuntimeAuthoritySnapshotV1,
+    ) -> Result<Option<crate::AdaptiveRecoveryFeedbackV1>, WorkflowError> {
+        require_ready(
+            self.organization.readiness(),
+            WorkflowErrorCode::OrganizationUnavailable,
+        )?;
+        let current = self
+            .organization
+            .authority_snapshot(
+                &authority.tenant_id,
+                &authority.project_id,
+                &authority.work_item_id,
+                authority.agent_id,
+            )
+            .map_err(map_organization_error)?;
+        if current != *authority {
+            return Err(authority_conflict());
+        }
+        self.store.adaptive_recovery_feedback(&current)
+    }
+
     pub fn advance_adaptive_session(
         &self,
         session_id: uuid::Uuid,
