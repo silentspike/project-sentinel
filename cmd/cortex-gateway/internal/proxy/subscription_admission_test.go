@@ -52,6 +52,198 @@ func salesSubscriptionTestRequest() *LLMRequest {
 	return req
 }
 
+func dynamicSalesSubscriptionTestRequest() *LLMRequest {
+	req := salesSubscriptionTestRequest()
+	req.Metadata["subscription_allowance_id"] = "subscription-sales-request-test"
+	req.Metadata["reservation_id"] = req.Metadata["subscription_allowance_id"]
+	req.Metadata["request_id"] = "company-provider-" + req.Metadata["reservation_id"]
+	return req
+}
+
+func TestSalesSubscriptionDynamicAllowanceRequiresExplicitOptIn(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			var callbacks atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				callbacks.Add(1)
+				w.WriteHeader(http.StatusForbidden)
+			}))
+			defer server.Close()
+			admission, err := NewSubscriptionAdmission("subscription-test", strings.Repeat("c", 64), server.URL, "test-operator")
+			if enabled {
+				admission, err = NewSubscriptionAdmissionWithSalesAutonomy("subscription-test", strings.Repeat("c", 64), server.URL, "test-operator", true)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider := &subscriptionTestProvider{}
+			wrapped := NewSubscriptionQueuedProvider(provider, forwardqueue.NewManager(1), admission)
+			if _, err := wrapped.Send(context.Background(), dynamicSalesSubscriptionTestRequest()); err == nil {
+				t.Fatal("unclaimed dynamic Sales request admitted")
+			}
+			planning := projectPlanningSubscriptionTestRequest()
+			planning.Metadata["subscription_allowance_id"] = "subscription-sales-request-test"
+			planning.Metadata["reservation_id"] = planning.Metadata["subscription_allowance_id"]
+			planning.Metadata["request_id"] = "company-planning-" + planning.Metadata["reservation_id"] + "-project-test"
+			if _, err := wrapped.Send(context.Background(), planning); err == nil {
+				t.Fatal("Sales opt-in admitted a foreign planning allowance")
+			}
+			wantCallbacks := int32(0)
+			if enabled {
+				wantCallbacks = 1
+			}
+			if callbacks.Load() != wantCallbacks || provider.calls.Load() != 0 {
+				t.Fatalf("authority calls=%d provider calls=%d", callbacks.Load(), provider.calls.Load())
+			}
+		})
+	}
+}
+
+func TestSalesSubscriptionAutonomousDispatchRequiresExactAuthorityReceipt(t *testing.T) {
+	for _, mode := range []string{"approved", "rejected", "cross-subject", "forged-model", "forged-digest", "schema-mismatch", "allowance-mismatch", "request-mismatch", "digest-mismatch", "expired", "lost", "claim-lost"} {
+		t.Run(mode, func(t *testing.T) {
+			provider := &subscriptionTestProvider{}
+			queue := forwardqueue.NewManager(1)
+			var callbacks atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				callbacks.Add(1)
+				if provider.calls.Load() != 0 || queue.Stats().Active != 1 {
+					t.Error("authority claim must follow queue lease and precede provider I/O")
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				if r.Method != http.MethodPost || r.URL.Path != "/operator/workflow/subscription-dispatch" || r.Header.Get("Authorization") != "Bearer test-operator" {
+					t.Error("wrong authority transport or credential")
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				var claim subscriptionDispatch
+				decoder := json.NewDecoder(r.Body)
+				decoder.DisallowUnknownFields()
+				if err := decoder.Decode(&claim); err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				wantSubject := customerRequestExecutionSubject{Kind: "customer_request", RequestID: "request-test", RequestVersion: 1}
+				if claim.SchemaVersion != 2 || claim.AllowanceID != "subscription-sales-request-test" || claim.AgentID != 5 ||
+					claim.RequestID != "company-provider-subscription-sales-request-test" || claim.Subject == nil ||
+					*claim.Subject != wantSubject || claim.Provider != CodexCLIProviderName || claim.Model != "model-a" ||
+					claim.CatalogDigest != strings.Repeat("c", 64) || claim.ContextDigest != strings.Repeat("b", 64) || claim.RequestDigest != strings.Repeat("d", 64) {
+					if mode != "cross-subject" && mode != "forged-model" && mode != "forged-digest" {
+						t.Error("unexpected authority claim binding")
+					}
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				if mode == "rejected" {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				if mode == "claim-lost" {
+					connection, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					_ = connection.Close()
+					return
+				}
+				if mode == "lost" {
+					_, _ = io.WriteString(w, "{")
+					return
+				}
+				receipt := subscriptionDispatchReceipt{SchemaVersion: claim.SchemaVersion, AllowanceID: claim.AllowanceID,
+					RequestID: claim.RequestID, RequestDigest: claim.RequestDigest, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli()}
+				switch mode {
+				case "schema-mismatch":
+					receipt.SchemaVersion = 1
+				case "allowance-mismatch":
+					receipt.AllowanceID = "subscription-test"
+				case "request-mismatch":
+					receipt.RequestID = "company-provider-subscription-test"
+				case "digest-mismatch":
+					receipt.RequestDigest = strings.Repeat("e", 64)
+				case "expired":
+					receipt.DeadlineUnixMS = time.Now().Add(-time.Second).UnixMilli()
+				}
+				_ = json.NewEncoder(w).Encode(receipt)
+			}))
+			defer server.Close()
+			admission, err := NewSubscriptionAdmissionWithSalesAutonomy("subscription-test", strings.Repeat("c", 64), server.URL, "test-operator", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := dynamicSalesSubscriptionTestRequest()
+			switch mode {
+			case "cross-subject":
+				req.Metadata["customer_request_id"] = "request-other"
+			case "forged-model":
+				req.Model, req.EffectiveModel = "model-other", "model-other"
+			case "forged-digest":
+				req.AuthorityRequestDigest = strings.Repeat("e", 64)
+			}
+			_, err = NewSubscriptionQueuedProvider(provider, queue, admission).Send(context.Background(), req)
+			wantCalls := int32(0)
+			if mode == "approved" {
+				wantCalls = 1
+			}
+			if (err == nil) != (mode == "approved") || provider.calls.Load() != wantCalls || callbacks.Load() != 1 || queue.Stats().Active != 0 {
+				t.Fatalf("result=%v provider calls=%d authority calls=%d queue=%+v", err, provider.calls.Load(), callbacks.Load(), queue.Stats())
+			}
+		})
+	}
+}
+
+func TestSalesSubscriptionAutonomousInvalidBindingsNeverReachAuthority(t *testing.T) {
+	var callbacks atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callbacks.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+	admission, err := NewSubscriptionAdmissionWithSalesAutonomy("subscription-test", strings.Repeat("c", 64), server.URL, "test-operator", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &subscriptionTestProvider{}
+	wrapped := NewSubscriptionQueuedProvider(provider, forwardqueue.NewManager(1), admission)
+	mutations := map[string]func(*LLMRequest){
+		"mixed_subject": func(r *LLMRequest) { r.Metadata["project_id"] = "project-test" },
+		"wrong_subject": func(r *LLMRequest) { r.Metadata["company_execution_subject"] = "project_planning" },
+		"version":       func(r *LLMRequest) { r.Metadata["customer_request_version"] = "01" },
+		"allowance":     func(r *LLMRequest) { r.Metadata["subscription_allowance_id"] = "../forged" },
+		"reservation":   func(r *LLMRequest) { r.Metadata["reservation_id"] = "subscription-other" },
+		"request":       func(r *LLMRequest) { r.Metadata["request_id"] = "company-provider-subscription-other" },
+		"agent":         func(r *LLMRequest) { r.Metadata["agent_id"] = "0" },
+		"class":         func(r *LLMRequest) { r.RequestClass = RequestClassExternalCompat },
+		"caller":        func(r *LLMRequest) { r.CallerRole = CallerRolePlatformControlplane },
+		"provider":      func(r *LLMRequest) { r.Metadata["reserved_provider"] = "local-loop" },
+		"catalog":       func(r *LLMRequest) { r.Metadata["subscription_catalog_digest"] = strings.Repeat("e", 64) },
+		"model":         func(r *LLMRequest) { r.EffectiveModel = "model-other" },
+		"digest":        func(r *LLMRequest) { r.AuthorityRequestDigest = "forged" },
+		"context":       func(r *LLMRequest) { r.Metadata["company_execution_context_digest"] = "forged" },
+		"stream":        func(r *LLMRequest) { r.Stream = true },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			req := dynamicSalesSubscriptionTestRequest()
+			mutate(req)
+			if _, err := wrapped.Send(context.Background(), req); err == nil {
+				t.Fatal("invalid dynamic Sales binding admitted")
+			}
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := wrapped.Send(ctx, dynamicSalesSubscriptionTestRequest()); err == nil {
+		t.Fatal("cancelled queue lease admitted an authority claim")
+	}
+	if callbacks.Load() != 0 || provider.calls.Load() != 0 {
+		t.Fatalf("authority calls=%d provider calls=%d", callbacks.Load(), provider.calls.Load())
+	}
+}
+
 func adaptiveSubscriptionTestRequest() *LLMRequest {
 	req := subscriptionTestRequest()
 	for key, value := range adaptiveRequestMetadata() {

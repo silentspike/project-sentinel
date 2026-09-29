@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,6 +20,42 @@ import (
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/synthesis"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/ticksync"
 )
+
+func TestRequestSalesAutonomousEnabledStrictStartupPolicy(t *testing.T) {
+	const key = "SENTINEL_REQUEST_SALES_AUTONOMOUS_ENABLED"
+	t.Setenv(key, "false")
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, err := requestSalesAutonomousEnabled(); err != nil || enabled {
+		t.Fatalf("absent flag: enabled=%v error=%v", enabled, err)
+	}
+	for _, value := range []string{"1", "true", "TRUE", "0", "false", "FALSE", "", "True", "False", "yes", " true", "true ", "2"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(key, value)
+			enabled, err := requestSalesAutonomousEnabled()
+			wantEnabled := value == "1" || value == "true" || value == "TRUE"
+			valid := wantEnabled || value == "0" || value == "false" || value == "FALSE"
+			if enabled != wantEnabled || (err == nil) != valid {
+				t.Fatalf("value=%q enabled=%v error=%v", value, enabled, err)
+			}
+		})
+	}
+}
+
+func TestSalesAutonomyRequiresStartupAnchor(t *testing.T) {
+	for _, value := range []string{"", " ", "bootstrap-allowance"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("SENTINEL_MODEL_WORK_ALLOWANCE_ID", value)
+			if err := validateSalesAutonomyAnchor(false); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateSalesAutonomyAnchor(true); (err == nil) != (strings.TrimSpace(value) != "") {
+				t.Fatalf("anchor=%q error=%v", value, err)
+			}
+		})
+	}
+}
 
 func TestProxyHTTPWriteDeadlineCoversInflightBudget(t *testing.T) {
 	for _, seconds := range []int{30, 120, 180, 300} {

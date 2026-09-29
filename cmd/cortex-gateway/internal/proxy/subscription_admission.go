@@ -22,11 +22,12 @@ var subscriptionDigest = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // SubscriptionAdmission is a client of workflow authority, not another store.
 // All registry providers, including internal/background callers, pass this gate.
 type SubscriptionAdmission struct {
-	allowanceID   string
-	catalogDigest string
-	endpoint      string
-	credential    string
-	client        *http.Client
+	allowanceID            string
+	catalogDigest          string
+	endpoint               string
+	credential             string
+	client                 *http.Client
+	salesAutonomousEnabled bool
 }
 
 // ProviderAdmissionError reports a failure before provider I/O. Authority,
@@ -68,6 +69,13 @@ type subscriptionDispatchReceipt struct {
 }
 
 func NewSubscriptionAdmission(allowanceID, catalogDigest, operatorURL, credential string) (*SubscriptionAdmission, error) {
+	return NewSubscriptionAdmissionWithSalesAutonomy(allowanceID, catalogDigest, operatorURL, credential, false)
+}
+
+// NewSubscriptionAdmissionWithSalesAutonomy fixes the Sales policy before the
+// admission is shared. Opt-in permits dynamic customer allowances, not dispatch
+// without an authoritative daemon claim.
+func NewSubscriptionAdmissionWithSalesAutonomy(allowanceID, catalogDigest, operatorURL, credential string, enabled bool) (*SubscriptionAdmission, error) {
 	endpoint, err := url.Parse(operatorURL)
 	if err != nil || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
 		return nil, errors.New("invalid subscription authority endpoint")
@@ -82,7 +90,8 @@ func NewSubscriptionAdmission(allowanceID, catalogDigest, operatorURL, credentia
 	endpoint.RawPath = ""
 	return &SubscriptionAdmission{
 		allowanceID: allowanceID, catalogDigest: catalogDigest, endpoint: endpoint.String(), credential: credential,
-		client: &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
+		salesAutonomousEnabled: enabled,
+		client:                 &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
 	}, nil
 }
 
@@ -99,7 +108,7 @@ func (a *SubscriptionAdmission) dispatchRequest(provider Provider, req *LLMReque
 	if err != nil {
 		return subscriptionDispatch{}, err
 	}
-	if (schemaVersion == 2 || schemaVersion == 4) && m["subscription_allowance_id"] != a.allowanceID {
+	if (schemaVersion == 4 || (schemaVersion == 2 && !a.salesAutonomousEnabled)) && m["subscription_allowance_id"] != a.allowanceID {
 		return subscriptionDispatch{}, errors.New("subscription bootstrap authority mismatch")
 	}
 	if !a.validSubscriptionRequestID(m, schemaVersion) {
