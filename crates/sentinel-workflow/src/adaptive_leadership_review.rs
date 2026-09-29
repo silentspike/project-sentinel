@@ -1,4 +1,4 @@
-//! One bounded leadership inference for an immutable blocked head and evidence set.
+//! Bounded leadership inference for an immutable execution head and evidence set.
 
 use std::collections::BTreeSet;
 
@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::digest::canonical_sha256;
 use crate::model::{validate_digest, validate_identifier};
 use crate::{
-    AdaptiveCursorV1, AdaptiveSessionV1, AuthenticatedCompanyPrincipalV1, CompanyPrincipalKindV1,
-    CompanyRoleV1, CompanyWorkStateV1, PrincipalAuthorityV1, ProjectId, ProjectV1,
+    AdaptiveCursorV1, AdaptiveEffectV1, AdaptiveSessionV1, AuthenticatedCompanyPrincipalV1,
+    CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkStateV1, PrincipalAuthorityV1, ProjectId, ProjectV1,
     RequestProviderDispatchV1, RuntimeAuthoritySnapshotV1, SubscriptionTokenPolicyV1, WorkItemId,
     WorkflowError, WorkflowErrorCode,
 };
@@ -24,6 +24,21 @@ pub const ADAPTIVE_LEADERSHIP_MAX_DECISION_REFS: usize = 8;
 pub const ADAPTIVE_LEADERSHIP_MAX_RATIONALE_BYTES: usize = 2048;
 pub const ADAPTIVE_LEADERSHIP_MAX_DURATION_MS: u64 = 120_000;
 pub const ADAPTIVE_LEADERSHIP_MAX_GRANT_MS: u64 = 300_000;
+
+/// None is the historical schema 1 blocked subject. Unknown tools are never eligible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AdaptiveLeadershipReviewSubjectV2 {
+    UnknownModel {
+        effect: AdaptiveEffectV1,
+        sealed_unknown_proof_digest: String,
+    },
+    BlockedContinuation {
+        reason_code: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolution_event_id: Option<String>,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +71,8 @@ pub struct AdaptiveLeadershipReviewGrantV1 {
     pub max_duration_ms: u64,
     pub token_policy: SubscriptionTokenPolicyV1,
     pub expires_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<AdaptiveLeadershipReviewSubjectV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +94,8 @@ pub struct AdaptiveLeadershipReviewCallV1 {
     pub resolution_event_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<crate::adaptive::AdaptiveContinuationAuthorizationV1>,
 }
 
 impl AdaptiveLeadershipReviewCallV1 {
@@ -90,6 +109,47 @@ impl AdaptiveLeadershipReviewCallV1 {
     pub fn request_id(&self) -> String {
         format!("company-leadership-{}", self.grant.review_id)
     }
+
+    pub fn continuation_allowance(
+        &self,
+        issued_at_ms: u64,
+        deadline_ms: u64,
+        additional_model_calls: u16,
+    ) -> Result<crate::SubscriptionCallAllowanceV1, WorkflowError> {
+        Ok(crate::SubscriptionCallAllowanceV1 {
+            allowance_id: crate::domain::stable_domain_id(
+                "subscription",
+                &self.grant.leadership_principal.tenant_id,
+                self.operation_id,
+            )?,
+            grant: crate::SubscriptionCallGrantV1 {
+                schema_version: 1,
+                work_item_id: self.grant.work_item_id.clone(),
+                assignment_id: self.grant.assignment_id.clone(),
+                assignment_version: self.grant.assignee_authority.assignment_version,
+                agent_id: self.grant.assignee_authority.agent_id,
+                provider: self.grant.provider.clone(),
+                model: self.grant.model.clone(),
+                catalog_digest: self.grant.catalog_digest.clone(),
+                max_calls: additional_model_calls,
+                max_concurrent: 1,
+                max_duration_ms: self.context.source_session.grant.max_call_duration_ms,
+                token_policy: self.grant.token_policy,
+                expires_at_unix_ms: deadline_ms,
+            },
+            created_by: self.grant.leadership_principal.principal_id.clone(),
+            created_at_unix_ms: issued_at_ms,
+            dispatch: None,
+        })
+    }
+}
+
+/// Matches the production adaptive-provider authority encoding, not a new grant namespace.
+pub fn adaptive_leadership_continuation_provider_authority_digest(
+    allowance: &crate::SubscriptionCallAllowanceV1,
+    authority: &RuntimeAuthoritySnapshotV1,
+) -> Result<String, WorkflowError> {
+    crate::adaptive::adaptive_continuation_provider_digest(allowance, authority)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +171,8 @@ pub struct CompleteAdaptiveLeadershipReviewCallV1 {
     pub model_response_digest: String,
     pub decision: AdaptiveLeadershipReviewDecisionV1,
     pub resolution_event_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<crate::adaptive::AdaptiveContinuationAuthorizationV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +190,16 @@ pub enum AdaptiveLeadershipReviewDecisionKindV1 {
         evidence_refs: Vec<String>,
     },
     KeepBlocked {
+        rationale: String,
+        evidence_refs: Vec<String>,
+    },
+    KeepUnknown {
+        rationale: String,
+        evidence_refs: Vec<String>,
+    },
+    Continue {
+        additional_model_calls: u16,
+        window_ms: u64,
         rationale: String,
         evidence_refs: Vec<String>,
     },
@@ -151,10 +223,38 @@ impl AdaptiveLeadershipReviewDecisionV1 {
             | AdaptiveLeadershipReviewDecisionKindV1::KeepBlocked {
                 rationale,
                 evidence_refs,
+            }
+            | AdaptiveLeadershipReviewDecisionKindV1::KeepUnknown {
+                rationale,
+                evidence_refs,
+            }
+            | AdaptiveLeadershipReviewDecisionKindV1::Continue {
+                rationale,
+                evidence_refs,
+                ..
             } => (rationale, evidence_refs),
         };
-        if self.schema_version != 1
+        let version_matches = match self.decision {
+            AdaptiveLeadershipReviewDecisionKindV1::ResolveBlocked { .. } => {
+                self.schema_version == 1
+            }
+            AdaptiveLeadershipReviewDecisionKindV1::KeepBlocked { .. } => {
+                matches!(self.schema_version, 1 | 2)
+            }
+            AdaptiveLeadershipReviewDecisionKindV1::KeepUnknown { .. } => self.schema_version == 2,
+            AdaptiveLeadershipReviewDecisionKindV1::Continue {
+                additional_model_calls,
+                window_ms,
+                ..
+            } => {
+                self.schema_version == 2
+                    && (1..=crate::ADAPTIVE_SESSION_MAX_CALLS).contains(&additional_model_calls)
+                    && (1_000..=ADAPTIVE_LEADERSHIP_MAX_GRANT_MS).contains(&window_ms)
+            }
+        };
+        if !version_matches
             || !valid_text(rationale, ADAPTIVE_LEADERSHIP_MAX_RATIONALE_BYTES)
+            || (self.schema_version == 2 && refs.is_empty())
         {
             return Err(invalid());
         }
@@ -167,6 +267,51 @@ impl AdaptiveLeadershipReviewDecisionV1 {
         }
         Ok(())
     }
+
+    pub fn validate_subject(
+        &self,
+        grant: &AdaptiveLeadershipReviewGrantV1,
+    ) -> Result<(), WorkflowError> {
+        if self.schema_version != grant.schema_version {
+            return Err(invalid());
+        }
+        let valid = match (&grant.subject, &self.decision) {
+            (None, AdaptiveLeadershipReviewDecisionKindV1::ResolveBlocked { .. }
+                | AdaptiveLeadershipReviewDecisionKindV1::KeepBlocked { .. }) => true,
+            (Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. }),
+                AdaptiveLeadershipReviewDecisionKindV1::KeepUnknown { .. }
+                | AdaptiveLeadershipReviewDecisionKindV1::Continue { .. }) => true,
+            (Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation { .. }),
+                AdaptiveLeadershipReviewDecisionKindV1::KeepBlocked { .. }
+                | AdaptiveLeadershipReviewDecisionKindV1::Continue { .. }) => true,
+            _ => false,
+        };
+        if !valid {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+
+/// The audit identity binds the actual dispatched request, raw response and model decision.
+pub fn adaptive_leadership_continuation_audit_id(
+    review_id: Uuid,
+    request_digest: &str,
+    model_response_digest: &str,
+    decision: &AdaptiveLeadershipReviewDecisionV1,
+) -> Result<Uuid, WorkflowError> {
+    validate_digest(request_digest)?;
+    validate_digest(model_response_digest)?;
+    if review_id.is_nil()
+        || !matches!(decision.decision, AdaptiveLeadershipReviewDecisionKindV1::Continue { .. })
+    {
+        return Err(invalid());
+    }
+    let digest = canonical_sha256(
+        "sentinel.workflow.adaptive-leadership-continuation-audit.v1",
+        &(review_id, request_digest, model_response_digest, decision),
+    )?;
+    adaptive_leadership_review_id(review_id, 1, &digest)
 }
 
 /// Evidence refs must name concrete daemon-supplied evidence, not model-authored claims.
@@ -227,7 +372,20 @@ impl AdaptiveLeadershipReviewGrantV1 {
         validate_identifier(&self.model)?;
         validate_digest(&self.catalog_digest)?;
         let leader = &self.leadership_principal;
-        if self.schema_version != 1
+        let valid_subject = match (&self.subject, self.schema_version) {
+            (None, 1) => valid_reason(&self.expected_reason_code),
+            (Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { effect, sealed_unknown_proof_digest }), 2) => {
+                validate_digest(&effect.request_digest)?;
+                validate_digest(sealed_unknown_proof_digest)?;
+                !effect.id.is_nil() && self.expected_reason_code.is_empty()
+            }
+            (Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation { reason_code, resolution_event_id }), 2) => {
+                valid_reason(reason_code) && reason_code == &self.expected_reason_code
+                    && resolution_event_id.as_ref().is_none_or(|id| Uuid::parse_str(id).is_ok_and(|id| !id.is_nil()))
+            }
+            _ => false,
+        };
+        if !valid_subject
             || self.review_id
                 != adaptive_leadership_review_id(
                     self.session_id,
@@ -235,7 +393,6 @@ impl AdaptiveLeadershipReviewGrantV1 {
                     &self.evidence_fingerprint,
                 )?
             || self.expected_project_version == 0
-            || !valid_reason(&self.expected_reason_code)
             || leader.kind != CompanyPrincipalKindV1::Agent
             || !matches!(
                 leader.role,
@@ -277,6 +434,23 @@ impl AdaptiveLeadershipReviewContextV1 {
             .collect();
         let assignment = assignments.first().ok_or_else(invalid)?;
         let authority = &grant.assignee_authority;
+        let valid_subject = match &grant.subject {
+            None => matches!(&session.cursor, AdaptiveCursorV1::Blocked { reason_code }
+                if reason_code == &grant.expected_reason_code) && session.last_model_result_digest.is_some(),
+            Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { effect, sealed_unknown_proof_digest }) => {
+                matches!(&session.cursor, AdaptiveCursorV1::ModelUnknown { effect: actual } if actual == effect)
+                    && self.evidence_refs.contains(&format!("adaptive-model-unknown:{}:{}", effect.id, effect.request_digest))
+                    && self.evidence_refs.contains(&format!("sealed-provider-unknown:{sealed_unknown_proof_digest}"))
+            }
+            Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation { reason_code, resolution_event_id }) => {
+                session.last_model_result_digest.is_some()
+                    && match (&session.cursor, resolution_event_id) {
+                        (AdaptiveCursorV1::Blocked { reason_code: actual }, None) => actual == reason_code,
+                        (AdaptiveCursorV1::BlockedResolved { reason_code: actual, resolution_event_id: actual_id }, Some(id)) => actual == reason_code && actual_id == id,
+                        _ => false,
+                    }
+            }
+        };
         if project.schema_version != 1
             || project.tenant_id != grant.leadership_principal.tenant_id
             || project.project_id != grant.project_id
@@ -306,9 +480,7 @@ impl AdaptiveLeadershipReviewContextV1 {
             || session.grant.session_id != grant.session_id
             || session.version != grant.expected_session_version
             || session.grant.authority != *authority
-            || !matches!(&session.cursor, AdaptiveCursorV1::Blocked { reason_code }
-                if reason_code == &grant.expected_reason_code)
-            || session.last_model_result_digest.is_none()
+            || !valid_subject
             || grant.evidence_fingerprint
                 != adaptive_leadership_evidence_fingerprint(
                     &self.tool_catalog,
