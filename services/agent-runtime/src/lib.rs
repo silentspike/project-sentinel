@@ -752,6 +752,125 @@ impl WorkbenchExecutor {
         self.validate_declared_inputs(request, cancelled, started)?;
 
         match &request.tool {
+            WorkbenchTool::ListDirectory {
+                path,
+                after,
+                max_entries,
+            } => {
+                let mut directory = PinnedDirectory::open_chain(&self.workspace_root, false)
+                    .map_err(workspace_io_error)?;
+                if path != "." {
+                    for component in Path::new(path).components() {
+                        let Component::Normal(name) = component else {
+                            return Err(ExecutionError::workspace(
+                                "invalid_directory_path",
+                                "directory path is not canonical",
+                            ));
+                        };
+                        let name = name.to_str().ok_or_else(|| {
+                            ExecutionError::workspace(
+                                "invalid_directory_path",
+                                "directory path is not valid UTF-8",
+                            )
+                        })?;
+                        directory = directory
+                            .open_child_directory(name, false)
+                            .map_err(workspace_io_error)?
+                            .ok_or_else(|| {
+                                ExecutionError::tool(
+                                    "directory_not_found",
+                                    "directory does not exist in the assigned workspace",
+                                )
+                            })?;
+                    }
+                }
+                let mut entries = Vec::new();
+                for entry in fs::read_dir(directory.child_path(".")).map_err(workspace_io_error)? {
+                    let entry = entry.map_err(workspace_io_error)?;
+                    let name = entry.file_name().into_string().map_err(|_| {
+                        ExecutionError::tool(
+                            "non_utf8_directory_entry",
+                            "directory entry is not valid UTF-8",
+                        )
+                    })?;
+                    let kind = entry.file_type().map_err(workspace_io_error)?;
+                    let kind = if kind.is_file() {
+                        "file"
+                    } else if kind.is_dir() {
+                        "directory"
+                    } else if kind.is_symlink() {
+                        "symlink"
+                    } else {
+                        "other"
+                    };
+                    entries.push((name, kind));
+                    if entries.len() > 4096 {
+                        return Err(ExecutionError::tool(
+                            "directory_too_large",
+                            "directory has too many entries to list safely",
+                        ));
+                    }
+                    if entries.len() % 64 == 0 {
+                        ensure_invocation_active(request, cancelled, started)?;
+                    }
+                }
+                entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+                let mut selected = Vec::new();
+                let mut truncated = false;
+                let mut encoded_len = 2;
+                let max_bytes = WORKBENCH_MAX_INSPECT_BYTES
+                    .min(request.resource_limits.file_bytes)
+                    .try_into()
+                    .unwrap_or(usize::MAX);
+                for (name, kind) in entries {
+                    if after.as_ref().is_some_and(|cursor| name <= *cursor) {
+                        continue;
+                    }
+                    let encoded = serde_json::to_string(&(name.as_str(), kind)).map_err(|_| {
+                        ExecutionError::tool(
+                            "directory_encode",
+                            "directory entry could not be encoded",
+                        )
+                    })?;
+                    if selected.len() == usize::from(*max_entries)
+                        || encoded_len + encoded.len() + 1 > max_bytes
+                    {
+                        if selected.is_empty() {
+                            return Err(ExecutionError::tool(
+                                "directory_entry_exceeds_limit",
+                                "directory entry exceeds the inspection byte limit",
+                            ));
+                        }
+                        truncated = true;
+                        break;
+                    }
+                    encoded_len += encoded.len() + 1;
+                    selected.push((name, kind));
+                }
+                ensure_invocation_active(request, cancelled, started)?;
+                let next_after = selected.last().map(|(name, _)| name.clone());
+                let mut output = BTreeMap::new();
+                output.insert(
+                    "entries".to_owned(),
+                    serde_json::to_string(&selected).map_err(|_| {
+                        ExecutionError::tool(
+                            "directory_encode",
+                            "directory entries could not be encoded",
+                        )
+                    })?,
+                );
+                output.insert("truncated".to_owned(), truncated.to_string());
+                if truncated {
+                    if let Some(name) = next_after {
+                        output.insert("next_after".to_owned(), name);
+                    }
+                }
+                Ok(ExecutionSuccess {
+                    output,
+                    bytes_read: encoded_len as u64,
+                    ..ExecutionSuccess::default()
+                })
+            }
             WorkbenchTool::InspectFile { path, max_bytes } => {
                 let path = self.resolve_read_path(request, path)?;
                 let limit = (*max_bytes)
@@ -3209,6 +3328,102 @@ mod tests {
 
     fn scoped(base: &Path) -> PathBuf {
         base.join("project-01").join("work-04")
+    }
+
+    #[test]
+    fn directory_discovery_is_bounded_sorted_and_workspace_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let artifacts = root.path().join("artifacts");
+        let assigned = scoped(&workspace);
+        fs::create_dir_all(assigned.join("src")).unwrap();
+        fs::write(assigned.join("src/main.js"), "console.log('ok')").unwrap();
+        fs::write(assigned.join("README.md"), "private workspace").unwrap();
+        std::os::unix::fs::symlink(root.path(), assigned.join("outside")).unwrap();
+        let executor = WorkbenchExecutor::new(&workspace, &artifacts);
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let mut sequence = 0_u8;
+        let mut list = |path: &str, after: Option<&str>, max_entries| {
+            sequence += 1;
+            let mut request = request(
+                WorkbenchTool::ListDirectory {
+                    path: path.to_owned(),
+                    after: after.map(str::to_owned),
+                    max_entries,
+                },
+                "file.inspect",
+            );
+            request
+                .invocation_id
+                .replace_range(35..36, &format!("{sequence:x}"));
+            let request = request.bind_digest().unwrap();
+            executor.execute(request, cancelled.clone())
+        };
+        let WorkbenchMessage::Result {
+            outcome: WorkbenchOutcome::Succeeded,
+            output,
+            ..
+        } = list(".", None, 1)
+        else {
+            panic!("root listing must succeed");
+        };
+        assert_eq!(output.get("entries").unwrap(), r#"[["README.md","file"]]"#);
+        assert_eq!(output.get("truncated").unwrap(), "true");
+        assert_eq!(output.get("next_after").unwrap(), "README.md");
+        let WorkbenchMessage::Result {
+            outcome: WorkbenchOutcome::Succeeded,
+            output,
+            ..
+        } = list(".", Some("README.md"), 4)
+        else {
+            panic!("next page must succeed");
+        };
+        assert_eq!(
+            output.get("entries").unwrap(),
+            r#"[["outside","symlink"],["src","directory"]]"#
+        );
+        assert_eq!(output.get("truncated").unwrap(), "false");
+        let WorkbenchMessage::Result {
+            outcome: WorkbenchOutcome::Succeeded,
+            output,
+            ..
+        } = list("src", None, 4)
+        else {
+            panic!("nested listing must succeed");
+        };
+        assert_eq!(output.get("entries").unwrap(), r#"[["main.js","file"]]"#);
+        assert_eq!(outcome(&list("outside", None, 4)), WorkbenchOutcome::Failed);
+        let mut limited = request(
+            WorkbenchTool::ListDirectory {
+                path: ".".to_owned(),
+                after: None,
+                max_entries: 4,
+            },
+            "file.inspect",
+        );
+        limited.invocation_id.replace_range(35..36, "9");
+        limited.resource_limits.file_bytes = 4;
+        assert_eq!(
+            outcome(&executor.execute(limited.bind_digest().unwrap(), cancelled.clone())),
+            WorkbenchOutcome::Failed
+        );
+        for path in ["../", "/etc", "src/../", "src/./"] {
+            let mut invalid = request(
+                WorkbenchTool::ListDirectory {
+                    path: ".".to_owned(),
+                    after: None,
+                    max_entries: 4,
+                },
+                "file.inspect",
+            );
+            invalid.tool = WorkbenchTool::ListDirectory {
+                path: path.to_owned(),
+                after: None,
+                max_entries: 4,
+            };
+            assert!(invalid.validate_at(unix_time_ms()).is_err(), "{path}");
+        }
     }
 
     fn completion_result() -> (WorkbenchMessage, String, String) {

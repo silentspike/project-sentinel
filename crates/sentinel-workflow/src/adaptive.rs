@@ -10,7 +10,33 @@ use crate::digest::{canonical_sha256, validate_sha256};
 use crate::{CompanyRoleV1, RuntimeAuthoritySnapshotV1, WorkflowError, WorkflowErrorCode};
 
 pub const ADAPTIVE_SESSION_MAX_CALLS: u16 = 64;
+pub const ADAPTIVE_SCHEMA_MAX_CORRECTIONS: u16 = 2;
 pub const ADAPTIVE_TOOL_MAX_BYTES: usize = 256 * 1024;
+
+/// Bounded rejection context, not a provider grant or successful work receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveRecoveryFeedbackV1 {
+    /// Schema-correction rollovers already consumed by this exact authority.
+    pub count: u16,
+    pub reason_code: String,
+    pub resolution_event_id: String,
+    /// Session that supplied this rejection, including the current rejected head.
+    pub previous_session_id: Uuid,
+}
+
+impl AdaptiveRecoveryFeedbackV1 {
+    pub(crate) fn validate(&self) -> Result<(), WorkflowError> {
+        if self.count > ADAPTIVE_SCHEMA_MAX_CORRECTIONS
+            || !valid_reason(&self.reason_code)
+            || !valid_resolution(&self.resolution_event_id)
+            || self.previous_session_id.is_nil()
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
 
 /// The composition layer must bind this journal to separately validated provider grants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +158,14 @@ pub enum AdaptiveCursorV1 {
     Blocked {
         reason_code: String,
     },
+    BlockedResolved {
+        reason_code: String,
+        resolution_event_id: String,
+    },
+    ModelRejected {
+        resolution_event_id: String,
+        reason_code: String,
+    },
     Cancelled,
 }
 
@@ -175,6 +209,15 @@ pub enum AdaptiveTransitionV1 {
     },
     MarkUnknown {
         effect: AdaptiveEffectV1,
+    },
+    RejectModel {
+        effect: AdaptiveEffectV1,
+        resolution_event_id: String,
+        reason_code: String,
+    },
+    ResolveBlocked {
+        expected_reason_code: String,
+        resolution_event_id: String,
     },
     Cancel,
 }
@@ -362,6 +405,34 @@ impl AdaptiveSessionV1 {
                 }
             }
             (
+                Cursor::ModelPending { effect } | Cursor::ModelUnknown { effect },
+                Command::RejectModel {
+                    effect: rejected,
+                    resolution_event_id,
+                    reason_code,
+                },
+            ) if effect == rejected
+                && valid_resolution(resolution_event_id)
+                && valid_reason(reason_code) =>
+            {
+                Cursor::ModelRejected {
+                    resolution_event_id: resolution_event_id.clone(),
+                    reason_code: reason_code.clone(),
+                }
+            }
+            (
+                Cursor::Blocked { reason_code },
+                Command::ResolveBlocked {
+                    expected_reason_code,
+                    resolution_event_id,
+                },
+            ) if reason_code == expected_reason_code && valid_resolution(resolution_event_id) => {
+                Cursor::BlockedResolved {
+                    reason_code: reason_code.clone(),
+                    resolution_event_id: resolution_event_id.clone(),
+                }
+            }
+            (
                 Cursor::ToolPending {
                     effect,
                     tool,
@@ -373,9 +444,13 @@ impl AdaptiveSessionV1 {
                 tool: tool.clone(),
                 tool_digest: tool_digest.clone(),
             },
-            (Cursor::ReadyForModel | Cursor::ReadyForTool { .. }, Command::Cancel) => {
-                Cursor::Cancelled
-            }
+            (
+                Cursor::ReadyForModel
+                | Cursor::ReadyForTool { .. }
+                | Cursor::ModelRejected { .. }
+                | Cursor::BlockedResolved { .. },
+                Command::Cancel,
+            ) => Cursor::Cancelled,
             _ => return Err(invalid()),
         };
         next.version = next.version.checked_add(1).ok_or_else(invalid)?;
@@ -465,6 +540,10 @@ fn valid_reason(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn valid_resolution(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|id| !id.is_nil())
 }
 
 fn invalid() -> WorkflowError {
