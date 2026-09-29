@@ -1,7 +1,10 @@
 //! Append-only rounds reuse the existing FULL/WAL operation journal and backup boundary.
 
 use super::*;
-use crate::{AdaptiveSessionGrantV1, AdaptiveSessionV1, AdaptiveTransitionV1};
+use crate::{
+    adaptive_collaboration_digest, AdaptiveEffectV1, AdaptiveModelDecisionV1, AdaptiveSessionGrantV1,
+    AdaptiveSessionV1, AdaptiveTransitionV1,
+};
 use serde::Deserialize;
 
 const MAX_JOURNAL_ENTRIES: usize = 512;
@@ -86,6 +89,69 @@ impl WorkflowStore {
         authorize(&session.grant, current)?;
         validate_head(&head, &session)?;
         Ok(Some(session))
+    }
+
+    /// Reads exact durable adoption evidence; does not authorize or dispatch an effect.
+    /// Collaboration proposals are adopted only after their matching durable commit.
+    pub fn adaptive_model_result_is_adopted(
+        &self,
+        grant: &AdaptiveSessionGrantV1,
+        effect: &AdaptiveEffectV1,
+        result_digest: &str,
+        decision: &AdaptiveModelDecisionV1,
+    ) -> Result<bool, WorkflowError> {
+        authorize(grant, &grant.authority)?;
+        let mut connection = self.lock()?;
+        // Keep validation and lookup on one read snapshot, including external writers.
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(map_sqlite_error)?;
+        let (session, _) = load(&tx, grant.session_id)?.ok_or_else(not_found)?;
+        authorize(&session.grant, &grant.authority)?;
+        if session.grant != *grant {
+            return Err(idempotency_conflict());
+        }
+        require_head(&tx, &session)?;
+
+        let mut statement = tx
+            .prepare(
+                "SELECT response FROM workflow_operations WHERE operation_namespace=?1 ORDER BY operation_id LIMIT ?2",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = statement
+            .query(params![namespace(grant.session_id), MAX_JOURNAL_ENTRIES as i64])
+            .map_err(map_sqlite_error)?;
+        let mut collaboration_digest = None;
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            let bytes: Vec<u8> = row.get(0).map_err(map_sqlite_error)?;
+            let entry: Entry = decode(&bytes)?;
+            match entry.command {
+                Some(AdaptiveTransitionV1::ResolveModel {
+                    effect: recorded_effect,
+                    result_digest: recorded_digest,
+                    decision: recorded_decision,
+                }) if recorded_effect == *effect
+                    && recorded_digest == result_digest
+                    && recorded_decision == *decision =>
+                {
+                    if let AdaptiveModelDecisionV1::Collaborate { action } = &recorded_decision {
+                        collaboration_digest = Some(adaptive_collaboration_digest(action)?);
+                    } else {
+                        return Ok(true);
+                    }
+                }
+                Some(AdaptiveTransitionV1::CommitCollaboration {
+                    effect: recorded_effect,
+                    action_digest,
+                }) if recorded_effect == *effect
+                    && collaboration_digest.as_ref() == Some(&action_digest) =>
+                {
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
     }
 
     /// State and idempotent response commit together, before any caller dispatches an effect.
