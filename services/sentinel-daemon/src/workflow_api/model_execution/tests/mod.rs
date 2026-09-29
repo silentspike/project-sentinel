@@ -2425,6 +2425,11 @@ fn corrected_sales_schema_requeues_only_the_exact_failed_completion_without_prov
 
 #[test]
 fn adaptive_parser_accepts_one_typed_decision_and_rejects_ambiguous_output() {
+    let discovery = parse_adaptive_decision(
+        r#"{"schema_version":1,"decision":{"kind":"tool","tool":{"tool":"list_directory","path":".","max_entries":64}}}"#,
+    )
+    .unwrap();
+    assert!(matches!(discovery, AdaptiveModelDecisionV1::Tool { .. }));
     let tool = parse_adaptive_decision(
         r#"{"schema_version":1,"decision":{"kind":"tool","tool":{"tool":"inspect_file","path":"src/main.rs","max_bytes":4096}}}"#,
     )
@@ -2469,6 +2474,9 @@ fn adaptive_parser_accepts_one_typed_decision_and_rejects_ambiguous_output() {
         r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"../blocked"}}"#,
         r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"Dependency.Unavailable"}}"#,
         r#"{"schema_version":1,"decision":{"kind":"tool","tool":{"tool":"inspect_file","path":"../secret","max_bytes":4096}}}"#,
+        r#"{"schema_version":1,"decision":{"kind":"tool","tool":{"tool":"inspect_file","path":".","max_bytes":1024}}}"#,
+        r#"{"schema_version":1,"decision":{"kind":"tool","tool":{"tool":"list_directory","path":"../secret","max_entries":64}}}"#,
+        r#"{"schema_version":1,"decision":{"kind":"tool","tool":{"tool":"list_directory","path":".","max_entries":0}}}"#,
         r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"blocked"},"extra":true}"#,
         r#"{"schema_version":1,"decision":{"kind":"propose_completion","artifact_digest":"ABC"}}"#,
         r#"{"schema_version":1,"decision":{"kind":"collaborate","action":{"kind":"offer_handoff","consumer_role":"customer","artifact_digests":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"reason_ref":"invalid"}}}"#,

@@ -205,6 +205,11 @@ pub struct PatchReplacementV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutionToolV1 {
+    ListDirectory {
+        path: String,
+        after: Option<String>,
+        max_entries: u16,
+    },
     InspectFile {
         path: String,
         max_bytes: u64,
@@ -237,7 +242,7 @@ pub enum ExecutionToolV1 {
 impl ExecutionToolV1 {
     pub fn required_capability(&self) -> &'static str {
         match self {
-            Self::InspectFile { .. } => "file.inspect",
+            Self::ListDirectory { .. } | Self::InspectFile { .. } => "file.inspect",
             Self::WriteFile { .. } => "file.write",
             Self::ApplyPatch { .. } => "patch.apply",
             Self::RunCommand { .. } => "command.run_allowlisted",
@@ -810,6 +815,23 @@ fn validate_tool(
         ));
     }
     match tool {
+        ExecutionToolV1::ListDirectory {
+            path,
+            after,
+            max_entries,
+        } => {
+            if path != "." {
+                validate_relative_path(path)?;
+            }
+            if after.as_ref().is_some_and(|name| {
+                name.is_empty() || name.contains('/') || validate_relative_path(name).is_err()
+            }) {
+                return Err(invalid("directory cursor is invalid"));
+            }
+            if *max_entries == 0 || *max_entries > 128 {
+                return Err(invalid("directory entry limit is invalid"));
+            }
+        }
         ExecutionToolV1::InspectFile { path, max_bytes } => {
             validate_relative_path(path)?;
             if *max_bytes == 0 {

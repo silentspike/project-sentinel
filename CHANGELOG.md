@@ -1,5 +1,9 @@
 # Changelog
 
+- Let company coding agents list a bounded, assigned workspace directory through
+  their existing file-inspection capability. Keep the directory descriptor pinned,
+  reject path escape, and expose a paginated result without shell authority (#856).
+
 - Order independent project subscription work per employee by persisted grant
   age and stable identity, prioritizing local completion recovery and consumed
   calls before new work. Keep each grant separately authorized and reject

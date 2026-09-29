@@ -259,6 +259,60 @@ fn write_request() -> WorkbenchRequest {
     .unwrap()
 }
 
+#[test]
+fn jsonl_process_lists_only_the_assigned_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let assigned = workspace.join("project-01/work-04");
+    fs::create_dir_all(&assigned).unwrap();
+    fs::write(assigned.join("README.md"), "private project data").unwrap();
+    fs::write(workspace.join("foreign.txt"), "not assigned").unwrap();
+    let artifacts = root.path().join("artifacts");
+    let (child, mut input, mut output) = spawn_attested_runtime(&workspace, &artifacts);
+    let mut child = ChildCleanup::new(child);
+    let mut request = write_request();
+    request.invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2909".to_owned();
+    request.capabilities = BTreeSet::from(["file.inspect".to_owned()]);
+    request.tool = WorkbenchTool::ListDirectory {
+        path: ".".to_owned(),
+        after: None,
+        max_entries: 16,
+    };
+    let request = request.bind_digest().unwrap();
+    writeln!(
+        input,
+        "{}",
+        serde_json::to_string(&WorkbenchCommand::Execute {
+            request: Box::new(request),
+        })
+        .unwrap()
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut listed = false;
+    loop {
+        let mut line = String::new();
+        read_runtime_line(&mut child, &mut output, &mut line);
+        match serde_json::from_str::<WorkbenchMessage>(&line).unwrap() {
+            WorkbenchMessage::Result {
+                outcome: WorkbenchOutcome::Succeeded,
+                output,
+                ..
+            } => {
+                assert_eq!(output.get("entries").unwrap(), r#"[["README.md","file"]]"#);
+                assert!(!output.values().any(|value| value.contains("foreign.txt")));
+                listed = true;
+            }
+            WorkbenchMessage::Progress {
+                stage: sentinel_common::WorkbenchProgressStage::Completed,
+                ..
+            } => break,
+            _ => {}
+        }
+    }
+    assert!(listed);
+}
+
 fn unisolated_command_request() -> WorkbenchRequest {
     let mut request = write_request();
     request.invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2902".to_string();
