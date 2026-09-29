@@ -17,6 +17,20 @@ NAMES=(
   workflow-developer
   workflow-qa
   workflow-release-manager
+  workflow-sales-shift2
+  workflow-project-manager-shift2
+  workflow-technical-lead-shift2
+  workflow-designer-shift2
+  workflow-developer-shift2
+  workflow-qa-shift2
+  workflow-release-manager-shift2
+  workflow-sales-shift3
+  workflow-project-manager-shift3
+  workflow-technical-lead-shift3
+  workflow-designer-shift3
+  workflow-developer-shift3
+  workflow-qa-shift3
+  workflow-release-manager-shift3
 )
 
 fail() {

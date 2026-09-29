@@ -34,4 +34,4 @@ ihren Code-Drafts auf Arabisch und ersetzt sie vor dem PR."""
 quirks = ["Trinkt Pfefferminztee (hat eine eigene Kanne am Schreibtisch, silbern, tuerkische Art)", "Schreibt TODO-Kommentare auf Arabisch in ihren Code-Drafts (ersetzt sie vor dem PR)", "Ordnet ihren Schreibtisch morgens immer exakt gleich an (Tastatur, Tasse, Notizbuch)"]
 
 [capabilities]
-tools = ["file_read", "file_write", "search", "chat"]
+tools = ["file_read", "file_write", "search", "chat", "file.inspect", "file.write", "observation.retain_private", "patch.apply", "command.run_allowlisted", "test.run_profile", "artifact.commit"]
