@@ -12,6 +12,17 @@ fn validate_grant(
     grant: &SubscriptionCallGrantV1,
     created_at_ms: u64,
 ) -> Result<(), WorkflowError> {
+    validate_grant_shape(grant, created_at_ms)?;
+    if grant.max_duration_ms != 120_000 {
+        return Err(invalid("invalid ordinary subscription call duration"));
+    }
+    Ok(())
+}
+
+fn validate_grant_shape(
+    grant: &SubscriptionCallGrantV1,
+    created_at_ms: u64,
+) -> Result<(), WorkflowError> {
     grant.work_item_id.validate()?;
     validate_identifier(&grant.assignment_id)?;
     validate_identifier(&grant.model)?;
@@ -22,10 +33,12 @@ fn validate_grant(
         || grant.provider != "codex-cli"
         || !(1..=crate::ADAPTIVE_SESSION_MAX_CALLS).contains(&grant.max_calls)
         || grant.max_concurrent != 1
-        || grant.max_duration_ms != 120_000
+        || !(1_000..=120_000).contains(&grant.max_duration_ms)
         || grant.expires_at_unix_ms <= created_at_ms
         || grant.expires_at_unix_ms - created_at_ms > MAX_GRANT_WINDOW_MS
         || created_at_ms == 0
+        || (grant.max_duration_ms != 120_000
+            && grant.max_duration_ms > grant.expires_at_unix_ms - created_at_ms)
     {
         return Err(invalid("invalid subscription call grant"));
     }
@@ -103,6 +116,34 @@ pub(super) fn grant(
         &[CompanyRoleV1::ProjectManager, CompanyRoleV1::TechnicalLead],
     )?;
     validate_grant(grant, now_ms)?;
+    grant_validated(project, principal, operation_id, grant, now_ms)
+}
+
+pub(super) fn grant_governed_continuation(
+    project: &mut ProjectV1,
+    receipt: &crate::AdaptiveLeadershipReviewCallV1,
+    allowance: &SubscriptionCallAllowanceV1,
+) -> Result<(), WorkflowError> {
+    adaptive_leadership_review::validate_governed_allowance_receipt(receipt, allowance)?;
+    let mut expected = receipt.context.source_project.clone();
+    expected.subscription_call = None;
+    if *project != expected || project.subscription_call.is_some() {
+        return Err(unauthorized());
+    }
+    let principal = &receipt.grant.leadership_principal;
+    require_role(principal, &[CompanyRoleV1::ProjectManager, CompanyRoleV1::TechnicalLead])?;
+    validate_grant_shape(&allowance.grant, allowance.created_at_unix_ms)?;
+    grant_validated(project, principal, receipt.operation_id, &allowance.grant,
+        allowance.created_at_unix_ms)
+}
+
+fn grant_validated(
+    project: &mut ProjectV1,
+    principal: &AuthenticatedCompanyPrincipalV1,
+    operation_id: Uuid,
+    grant: &SubscriptionCallGrantV1,
+    now_ms: u64,
+) -> Result<(), WorkflowError> {
     if project.lifecycle_state != ProjectLifecycleStateV1::Active
         || !active_assignment_matches(project, grant)
         || project
@@ -189,6 +230,7 @@ pub(super) fn claim(
     validate_identifier(request_id)?;
     validate_digest(request_digest)?;
     let allowance = project.subscription_call.as_ref().ok_or_else(not_found)?;
+    validate_grant(&allowance.grant, allowance.created_at_unix_ms)?;
     if project.lifecycle_state != ProjectLifecycleStateV1::Active
         || principal.kind != CompanyPrincipalKindV1::Agent
         || principal.agent_id != Some(allowance.grant.agent_id)
@@ -336,7 +378,7 @@ pub(super) fn validate_allowance(
     allowance: &SubscriptionCallAllowanceV1,
 ) -> Result<(), WorkflowError> {
     validate_identifier(&allowance.allowance_id).map_err(|_| corrupt())?;
-    validate_grant(&allowance.grant, allowance.created_at_unix_ms).map_err(|_| corrupt())?;
+    validate_grant_shape(&allowance.grant, allowance.created_at_unix_ms).map_err(|_| corrupt())?;
     let creator = project
         .governance
         .participants
@@ -376,6 +418,22 @@ pub(super) fn validate_allowance(
             || dispatch.dispatched_at_unix_ms > project.updated_at_unix_ms
         {
             return Err(corrupt());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_persisted(
+    connection: &Connection,
+    project: &ProjectV1,
+) -> Result<(), WorkflowError> {
+    for allowance in project.subscription_call.iter()
+        .chain(project.source_review_previous_call.iter())
+        .chain(project.abandoned_subscription_calls.iter().map(|entry| &entry.allowance))
+        .chain(project.work_corrections.iter().filter_map(|record| record.previous_subscription_call.as_ref()))
+    {
+        if allowance.grant.max_duration_ms != 120_000 {
+            adaptive_leadership_review::validate_persisted_governed_allowance(connection, project, allowance)?;
         }
     }
     Ok(())

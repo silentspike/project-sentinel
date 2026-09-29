@@ -386,6 +386,7 @@ fn validate_project_snapshot_event(
         return Err(corrupt());
     }
     validate_project(&project)?;
+    subscription::validate_persisted(connection, &project)?;
     let operation = connection
         .query_row(
             "SELECT request_digest,authority_binding_digest,target_predecessor_digest,response,response_digest,created_at_ms FROM company_operations WHERE authority_namespace=?1 AND operation_id=?2",
@@ -786,6 +787,7 @@ impl WorkflowStore {
                 return Err(corrupt());
             }
             validate_project(&project).map_err(|_| corrupt())?;
+            subscription::validate_persisted(&connection, &project).map_err(|_| corrupt())?;
             Ok(project)
         })
         .collect()
@@ -5610,6 +5612,7 @@ fn validate_replay_response(
         CompanyWorkflowResponseV1::AgreementProject { agreement, project } => {
             validate_agreement(agreement)?;
             validate_project(project)?;
+            subscription::validate_persisted(transaction, project)?;
             let stored_agreement: AgreementV1 = get_entity(
                 transaction,
                 &principal.tenant_id,
@@ -5635,6 +5638,7 @@ fn validate_replay_response(
         }
         CompanyWorkflowResponseV1::Project(value) => {
             validate_project(value)?;
+            subscription::validate_persisted(transaction, value)?;
             let stored: ProjectV1 = get_entity(
                 transaction,
                 &principal.tenant_id,
@@ -7484,6 +7488,9 @@ fn put_entity<T: Serialize>(
 trait CompanyEntity {
     fn row_binding(&self) -> (&TenantId, &'static str, &str, u64);
     fn validate_entity(&self) -> Result<(), WorkflowError>;
+    fn validate_persisted(&self, _connection: &Connection) -> Result<(), WorkflowError> {
+        Ok(())
+    }
 }
 
 impl CompanyEntity for CustomerRequestV1 {
@@ -7529,6 +7536,10 @@ impl CompanyEntity for ProjectV1 {
     fn validate_entity(&self) -> Result<(), WorkflowError> {
         validate_project(self)
     }
+
+    fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
+        subscription::validate_persisted(connection, self)
+    }
 }
 
 fn get_entity<T: DeserializeOwned + CompanyEntity>(
@@ -7551,6 +7562,7 @@ fn get_entity<T: DeserializeOwned + CompanyEntity>(
             return Err(corrupt());
         }
         value.validate_entity().map_err(|_| corrupt())?;
+        value.validate_persisted(connection).map_err(|_| corrupt())?;
         Ok(value)
     }).transpose()
 }

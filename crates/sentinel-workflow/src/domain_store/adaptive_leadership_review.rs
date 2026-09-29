@@ -229,38 +229,126 @@ mod tests {
         assert_eq!(rows(&f.store), before);
     }
 
-    #[test]
-    fn schema2_short_window_commits_a_single_call_with_matching_effective_duration() {
-        let f = continuation_fixture(true, false);
-        let call = dispatch_continuation(&f);
-        let mut result = continue_result(&call);
-        let window = 60_000;
+    fn continue_result_with_window(call: &AdaptiveLeadershipReviewCallV1, window: u64)
+        -> CompleteAdaptiveLeadershipReviewCallV1
+    {
+        continue_result_with_window_at(call, window, CONTINUATION_AT + 2)
+    }
+
+    fn continue_result_with_window_at(call: &AdaptiveLeadershipReviewCallV1, window: u64, issued: u64)
+        -> CompleteAdaptiveLeadershipReviewCallV1
+    {
+        let mut result = continue_result(call);
         if let AdaptiveLeadershipReviewDecisionKindV1::Continue { window_ms, .. } = &mut result.decision.decision {
             *window_ms = window;
         }
         let audit = adaptive_leadership_continuation_audit_id(call.grant.review_id,
             &result.request_digest, &result.model_response_digest, &result.decision).unwrap();
         let authorization = result.continuation.as_mut().unwrap();
+        authorization.issued_at_ms = issued;
         authorization.deadline_ms = authorization.issued_at_ms + window;
         authorization.resolution_event_id = audit;
         let allowance = call.continuation_allowance(authorization.issued_at_ms, authorization.deadline_ms, 1).unwrap();
         authorization.provider_authority_digest = adaptive_leadership_continuation_provider_authority_digest(
             &allowance, &call.grant.assignee_authority).unwrap();
         result.resolution_event_id = Some(audit);
-        f.store.complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 2).unwrap();
-        let current = session(&f);
-        assert_eq!(current.grant, f.context.source_session.grant);
-        assert_eq!(current.model_calls, f.context.source_session.model_calls);
-        assert_eq!(current.active_model_ceiling(), current.model_calls + 1);
-        assert_eq!(current.effective_grant().max_call_duration_ms, window);
-        assert!(current.requires_fresh_observation());
-        let project = f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap();
-        assert_eq!(project.subscription_call.as_ref(), Some(&allowance));
-        assert_eq!(allowance.grant.max_calls, 1);
-        assert_eq!(allowance.grant.max_duration_ms, window);
-        let before = rows(&f.store);
-        f.store.complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 3).unwrap();
-        assert_eq!(rows(&f.store), before);
+        result
+    }
+
+    #[test]
+    fn schema2_short_window_commits_a_single_call_with_matching_effective_duration() {
+        for (unknown, resolved) in [(true, false), (false, false), (false, true)] {
+            for window in [1_000, 1_001, 60_000, 119_999, 120_000, 300_000] {
+                let f = continuation_fixture(unknown, resolved);
+                let call = dispatch_continuation(&f);
+                let result = continue_result_with_window(&call, window);
+                call.validate_completion_proposal(&result).unwrap();
+                let authorization = result.continuation.as_ref().unwrap();
+                let allowance = call.continuation_allowance(authorization.issued_at_ms,
+                    authorization.deadline_ms, 1).unwrap();
+                let completed = f.store.complete_adaptive_leadership_review_call(&f.leader, &result,
+                    authorization.issued_at_ms + 7).unwrap();
+                let current = session(&f);
+                assert_eq!(current.grant, f.context.source_session.grant);
+                assert_eq!(current.model_calls, f.context.source_session.model_calls);
+                assert_eq!(current.tool_calls, f.context.source_session.tool_calls);
+                assert_eq!(current.active_model_ceiling(), current.model_calls + 1);
+                assert_eq!(current.effective_grant().max_call_duration_ms, window.min(120_000));
+                assert!(current.requires_fresh_observation());
+                let reopened = WorkflowStore::open(&f.path).unwrap();
+                let project = reopened.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap();
+                assert_eq!(project.subscription_call.as_ref(), Some(&allowance));
+                assert_eq!(allowance.grant.max_calls, 1);
+                assert_eq!(allowance.grant.max_duration_ms, window.min(120_000));
+                assert!(reopened.company_projects().unwrap().contains(&project));
+                assert_eq!(reopened.adaptive_leadership_abandoned_allowance(&f.leader.tenant_id,
+                    f.context.source_session.active_provider_allowance_id()).unwrap().unwrap().review, completed);
+                let before = rows(&f.store);
+                assert_eq!(reopened.complete_adaptive_leadership_review_call(&f.leader, &result,
+                    authorization.deadline_ms + 1).unwrap(), completed);
+                assert_eq!(rows(&f.store), before);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_short_grants_and_unfinished_governed_receipts_are_rejected_without_effects() {
+        let f = continuation_fixture(true, false);
+        let call = dispatch_continuation(&f);
+        let issued = CONTINUATION_AT + 2;
+        for window in [1_000, 60_000, 119_999] {
+            let allowance = call.continuation_allowance(issued, issued + window, 1).unwrap();
+            let mut candidate = f.context.source_project.clone();
+            candidate.subscription_call = None;
+            let before = candidate.clone();
+            assert!(subscription::grant(&mut candidate, &f.leader, call.operation_id,
+                &allowance.grant, issued).is_err());
+            assert_eq!(candidate, before);
+            assert!(subscription::grant_governed_continuation(&mut candidate, &call, &allowance).is_err());
+            assert_eq!(candidate, before);
+            candidate.subscription_call = Some(allowance.clone());
+            let before_claim = candidate.clone();
+            let mut employee = f.leader.clone();
+            employee.role = CompanyRoleV1::Developer;
+            employee.agent_id = Some(allowance.grant.agent_id);
+            assert!(subscription::claim(&mut candidate, &employee, &allowance.allowance_id,
+                &format!("company-provider-{}", allowance.allowance_id), DIGEST, issued).is_err());
+            assert_eq!(candidate, before_claim);
+            let durable = rows(&f.store);
+            assert!(f.store.apply_company_command(&f.leader, Uuid::new_v4(),
+                &CompanyWorkflowCommandV1::GrantSubscriptionCall {
+                    project_id: f.grant.project_id.clone(), expected_version: f.context.source_project.version,
+                    grant: allowance.grant,
+                }, issued).is_err());
+            assert_eq!(rows(&f.store), durable);
+        }
+    }
+
+    #[test]
+    fn persisted_short_allowance_requires_exact_completed_receipt_and_journal() {
+        for committed in [false, true] {
+            let f = continuation_fixture(true, false);
+            let call = dispatch_continuation(&f);
+            let result = continue_result_with_window(&call, 60_000);
+            if committed {
+                f.store.complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 2).unwrap();
+            }
+            let mut project = f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap();
+            let authorization = result.continuation.as_ref().unwrap();
+            project.subscription_call = Some(call.continuation_allowance(authorization.issued_at_ms,
+                authorization.deadline_ms, 1).unwrap());
+            if committed {
+                project.subscription_call.as_mut().unwrap().grant.max_duration_ms -= 1;
+            }
+            project.updated_at_unix_ms = CONTINUATION_AT + 2;
+            project.version += 1;
+            // The production writer seals the forged row; receipt validation must still reject it.
+            persist_entity(&f.store, &project);
+            let before = rows(&f.store);
+            assert!(f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).is_err());
+            assert!(f.store.company_projects().is_err());
+            assert_eq!(rows(&f.store), before);
+        }
     }
 
     #[test]
@@ -298,6 +386,69 @@ mod tests {
                 authorization.deadline_ms + 1).unwrap(), completed);
             assert_eq!(rows(&f.store), before);
         }
+    }
+
+    #[test]
+    fn schema2_authorization_must_precede_review_expiry_but_audit_recovery_may_follow_it() {
+        for offset in [0, 1] {
+            let f = continuation_fixture(true, false);
+            let call = dispatch_continuation(&f);
+            let issued = call.grant.expires_at_unix_ms + offset;
+            let result = continue_result_with_window_at(&call, 60_000, issued);
+            let before = rows(&f.store);
+            assert!(call.validate_completion_proposal(&result).is_err());
+            assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, issued).is_err());
+            assert_eq!(rows(&f.store), before);
+            assert_eq!(session(&f), f.context.source_session);
+        }
+        let f = continuation_fixture(true, false);
+        let call = dispatch_continuation(&f);
+        let result = continue_result_with_window_at(&call, 60_000, call.grant.expires_at_unix_ms - 1);
+        call.validate_completion_proposal(&result).unwrap();
+        let recovered_at = call.grant.expires_at_unix_ms + 7;
+        let receipt = f.store.complete_adaptive_leadership_review_call(&f.leader, &result, recovered_at).unwrap();
+        assert_eq!(receipt.continuation, result.continuation);
+        assert_eq!(session(&f).active_deadline_ms(), result.continuation.as_ref().unwrap().deadline_ms);
+        let before = rows(&f.store);
+        assert_eq!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result,
+            recovered_at + 1).unwrap(), receipt);
+        assert_eq!(rows(&f.store), before);
+    }
+
+    #[test]
+    fn schema2_keep_decisions_reject_fresh_expiry_but_allow_completed_replay_and_legacy_completion() {
+        for (unknown, resolved) in [(true, false), (false, false), (false, true)] {
+            let f = continuation_fixture(unknown, resolved);
+            let call = dispatch_continuation(&f);
+            let mut result = completion(&call, false);
+            result.decision.schema_version = 2;
+            if unknown {
+                result.decision.decision = AdaptiveLeadershipReviewDecisionKindV1::KeepUnknown {
+                    rationale: "Retain the exact unknown model effect".into(),
+                    evidence_refs: vec![call.context.evidence_refs[0].clone()],
+                };
+            }
+            let expires = call.grant.expires_at_unix_ms;
+            let before = rows(&f.store);
+            for now in [expires, expires + 1] {
+                assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now).is_err());
+                assert_eq!(rows(&f.store), before);
+            }
+            assert_eq!(session(&f), f.context.source_session);
+            let receipt = f.store.complete_adaptive_leadership_review_call(&f.leader, &result, expires - 1).unwrap();
+            let before = rows(&f.store);
+            assert_eq!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result,
+                expires + 1).unwrap(), receipt);
+            assert_eq!(rows(&f.store), before);
+        }
+        let legacy = fixture();
+        let call = authorize(&legacy);
+        let call = legacy.store.claim_adaptive_leadership_review_call(&legacy.leader, &claim(&call),
+            AUTHORIZED_AT + 1).unwrap();
+        let result = completion(&call, false);
+        let receipt = legacy.store.complete_adaptive_leadership_review_call(&legacy.leader, &result,
+            call.grant.expires_at_unix_ms + 1).unwrap();
+        assert_eq!(receipt.decision.as_ref(), Some(&result.decision));
     }
 
     #[test]
@@ -638,6 +789,147 @@ mod tests {
     }
 
     #[test]
+    fn schema2_undispatched_expiry_retires_unchanged_subject_without_releasing_authority() {
+        for (unknown, resolved) in [(true, false), (false, false), (false, true)] {
+            let f = continuation_fixture(unknown, resolved);
+            let call = f.store.authorize_adaptive_leadership_review_call(&f.leader, Uuid::new_v4(),
+                "expire-subject", &f.grant, &f.context, CONTINUATION_AT).unwrap();
+            let expires = call.grant.expires_at_unix_ms;
+            let before = rows(&f.store);
+            assert!(f.store.retire_stale_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+                call.version, expires - 1).is_err());
+            assert!(f.store.retire_stale_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+                call.version + 1, expires).is_err());
+            let mut foreign = f.leader.clone(); foreign.principal_id = "other-leader".into();
+            assert!(f.store.retire_stale_adaptive_leadership_review_call(&foreign, call.grant.review_id,
+                call.version, expires).is_err());
+            assert_eq!(rows(&f.store), before);
+            let retired = f.store.retire_stale_adaptive_leadership_review_call(&f.leader,
+                call.grant.review_id, call.version, expires).unwrap();
+            assert_eq!(retired.retired_at_unix_ms, Some(expires));
+            assert_eq!(retired.version, 4);
+            assert!(retired.dispatch.is_none() && retired.decision.is_none()
+                && retired.continuation.is_none() && retired.model_response_digest.is_none()
+                && retired.resolution_event_id.is_none());
+            assert_eq!(session(&f), f.context.source_session);
+            assert_eq!(f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap(),
+                f.context.source_project);
+            let before = rows(&f.store);
+            assert_eq!(f.store.retire_stale_adaptive_leadership_review_call(&f.leader,
+                call.grant.review_id, call.version, expires + 1).unwrap(), retired);
+            assert!(f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&call), expires).is_err());
+            assert_eq!(rows(&f.store), before);
+        }
+    }
+
+    #[test]
+    fn schema2_expiry_retirement_keeps_dispatched_legacy_and_committed_recovery_guards() {
+        let f = continuation_fixture(true, false);
+        let call = dispatch_continuation(&f);
+        let before = rows(&f.store);
+        assert!(f.store.retire_stale_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+            call.version, call.grant.expires_at_unix_ms).is_err());
+        assert_eq!(rows(&f.store), before);
+        let result = continue_result(&call);
+        f.store.complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 2).unwrap();
+        // Recoverable committed journal state must never be retired, even with its receipt pending.
+        persist_entity(&f.store, &call);
+        let before = rows(&f.store);
+        assert!(f.store.retire_stale_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+            call.version, call.grant.expires_at_unix_ms).is_err());
+        assert!(f.store.expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+            call.version, call.grant.expires_at_unix_ms).is_err());
+        assert_eq!(rows(&f.store), before);
+
+        let legacy = fixture();
+        let call = legacy.store.authorize_adaptive_leadership_review_call(&legacy.leader, Uuid::new_v4(),
+            "legacy-expiry", &legacy.grant, &legacy.context, AUTHORIZED_AT).unwrap();
+        let before = rows(&legacy.store);
+        assert!(legacy.store.retire_stale_adaptive_leadership_review_call(&legacy.leader, call.grant.review_id,
+            call.version, call.grant.expires_at_unix_ms).is_err());
+        assert!(legacy.store.expire_adaptive_leadership_review_call(&legacy.leader, call.grant.review_id,
+            call.version, call.grant.expires_at_unix_ms).is_err());
+        assert_eq!(rows(&legacy.store), before);
+        let mut renewed = call.grant.clone(); renewed.expires_at_unix_ms += 120_000;
+        let renewed_call = legacy.store.authorize_adaptive_leadership_review_call(&legacy.leader,
+            call.operation_id, &call.allowance_id, &renewed, &call.context, call.grant.expires_at_unix_ms).unwrap();
+        assert_eq!(renewed_call.grant, renewed);
+        assert!(renewed_call.retired_at_unix_ms.is_none());
+    }
+
+    #[test]
+    fn schema2_explicit_expiry_terminates_uncompleted_dispatch_without_rewriting_history() {
+        for dispatched in [false, true] {
+            for source_changed in [false, true] {
+                let f = continuation_fixture(true, false);
+                let call = if dispatched { dispatch_continuation(&f) } else {
+                    f.store.authorize_adaptive_leadership_review_call(&f.leader, Uuid::new_v4(),
+                        "explicit-expiry", &f.grant, &f.context, CONTINUATION_AT).unwrap()
+                };
+                let expires = call.grant.expires_at_unix_ms;
+                if source_changed { change_project(&f, expires - 1); }
+                let project = f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap();
+                let before = rows(&f.store);
+                assert!(f.store.expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+                    call.version, expires - 1).is_err());
+                assert!(f.store.expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+                    if dispatched { 1 } else { 2 }, expires).is_err());
+                assert_eq!(rows(&f.store), before);
+                let retired = f.store.expire_adaptive_leadership_review_call(&f.leader,
+                    call.grant.review_id, call.version, expires).unwrap();
+                assert_eq!(retired.dispatch, call.dispatch);
+                assert_eq!(retired.context, call.context);
+                assert_eq!(retired.grant, call.grant);
+                assert_eq!(retired.retired_at_unix_ms, Some(expires));
+                assert!(retired.decision.is_none() && retired.continuation.is_none()
+                    && retired.model_response_digest.is_none() && retired.resolution_event_id.is_none());
+                assert_eq!(session(&f), f.context.source_session);
+                assert_eq!(f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap(), project);
+                let before = rows(&f.store);
+                assert_eq!(f.store.expire_adaptive_leadership_review_call(&f.leader,
+                    call.grant.review_id, call.version, expires + 1).unwrap(), retired);
+                assert!(f.store.expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+                    if dispatched { 1 } else { 2 }, expires + 1).is_err());
+                if dispatched {
+                    let result = continue_result(&call);
+                    assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, expires + 1).is_err());
+                }
+                assert_eq!(rows(&f.store), before);
+            }
+        }
+    }
+
+    #[test]
+    fn schema2_expiry_retirements_count_against_root_review_bound() {
+        let mut f = continuation_fixture(true, false);
+        let mut now = CONTINUATION_AT;
+        for index in 0..ADAPTIVE_LEADERSHIP_MAX_REVIEWS {
+            f.context.evidence_refs.push(format!("expiry-review:{index}"));
+            f.grant.evidence_fingerprint = adaptive_leadership_evidence_fingerprint(
+                &f.context.tool_catalog, &f.context.evidence_refs).unwrap();
+            f.grant.review_id = adaptive_leadership_review_id(f.grant.session_id,
+                f.grant.expected_session_version, &f.grant.evidence_fingerprint).unwrap();
+            f.grant.expires_at_unix_ms = now + 120_000;
+            let call = f.store.authorize_adaptive_leadership_review_call(&f.leader, Uuid::new_v4(),
+                &format!("expiry-bound-{index}"), &f.grant, &f.context, now).unwrap();
+            now = call.grant.expires_at_unix_ms;
+            f.store.retire_stale_adaptive_leadership_review_call(&f.leader, call.grant.review_id,
+                call.version, now).unwrap();
+        }
+        f.context.evidence_refs.push("expiry-review:excess".into());
+        f.grant.evidence_fingerprint = adaptive_leadership_evidence_fingerprint(
+            &f.context.tool_catalog, &f.context.evidence_refs).unwrap();
+        f.grant.review_id = adaptive_leadership_review_id(f.grant.session_id,
+            f.grant.expected_session_version, &f.grant.evidence_fingerprint).unwrap();
+        f.grant.expires_at_unix_ms = now + 120_000;
+        let before = rows(&f.store);
+        assert!(f.store.authorize_adaptive_leadership_review_call(&f.leader, Uuid::new_v4(),
+            "expiry-bound-excess", &f.grant, &f.context, now).is_err());
+        assert_eq!(rows(&f.store), before);
+        assert_eq!(session(&f), f.context.source_session);
+    }
+
+    #[test]
     fn schema2_decision_strict_serde_and_original_limits_and_historical_bytes() {
         let legacy = fixture();
         let original = serde_json::to_value(&legacy.grant).unwrap();
@@ -854,6 +1146,7 @@ fn validate_continuation(
         || authorization.deadline_ms.checked_sub(authorization.issued_at_ms) != Some(*window_ms)
         || *window_ms > source.grant.deadline_ms - source.grant.created_at_ms
         || authorization.issued_at_ms < call.dispatch.as_ref().ok_or_else(unauthorized)?.dispatched_at_unix_ms
+        || authorization.issued_at_ms >= call.grant.expires_at_unix_ms
         || authorization.provider_allowance_id != crate::domain::stable_domain_id(
             "subscription", &call.grant.leadership_principal.tenant_id, call.operation_id,
         )?
@@ -926,7 +1219,7 @@ fn commit_continuation_allowance(
     let abandoned = AdaptiveLeadershipAbandonedAllowanceV2 {
         schema_version: 2,
         allowance_id: prior.allowance_id.clone(),
-        review: completed,
+        review: completed.clone(),
     };
     abandoned.validate_entity()?;
     if get_entity::<AdaptiveLeadershipAbandonedAllowanceV2>(
@@ -938,10 +1231,7 @@ fn commit_continuation_allowance(
     // The exact source journal was verified by the continuation transaction helper.
     // Preserve the undispatched allowance in its own receipt, not legacy dispatch history.
     project.subscription_call = None;
-    subscription::grant(
-        &mut project, &call.grant.leadership_principal, authorization.operation_id,
-        &allowance.grant, authorization.issued_at_ms,
-    )?;
+    subscription::grant_governed_continuation(&mut project, &completed, &allowance)?;
     if project.subscription_call.as_ref() != Some(&allowance) {
         return Err(unauthorized());
     }
@@ -984,6 +1274,55 @@ fn require_adaptive_allowance_source(call: &AdaptiveLeadershipReviewCallV1) -> R
     // Context validation binds either the exact unknown effect/proof refs or the
     // recorded model-result digest and blocked reason/resolution at this journal head.
     call.context.validate(&call.grant)?;
+    Ok(())
+}
+
+pub(super) fn validate_governed_allowance_receipt(
+    receipt: &AdaptiveLeadershipReviewCallV1,
+    allowance: &SubscriptionCallAllowanceV1,
+) -> Result<(), WorkflowError> {
+    receipt.validate_entity()?;
+    let authorization = receipt.continuation.as_ref().ok_or_else(unauthorized)?;
+    if receipt.version != 3 || receipt.grant.schema_version != 2
+        || receipt.grant.subject.is_none() || receipt.retired_at_unix_ms.is_some()
+        || *allowance != receipt.continuation_allowance(authorization.issued_at_ms,
+            authorization.deadline_ms, authorization.additional_model_calls)?
+    {
+        return Err(unauthorized());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_persisted_governed_allowance(
+    connection: &Connection,
+    project: &ProjectV1,
+    allowance: &SubscriptionCallAllowanceV1,
+) -> Result<(), WorkflowError> {
+    let mut statement = connection.prepare(
+        "SELECT entity_id FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2 AND json_extract(payload,'$.continuation.provider_allowance_id')=?3 LIMIT 2",
+    )?;
+    let ids = statement.query_map(params![project.tenant_id.0, KIND, allowance.allowance_id],
+        |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    if ids.len() != 1 {
+        return Err(corrupt());
+    }
+    let receipt: AdaptiveLeadershipReviewCallV1 = get_entity(connection, &project.tenant_id, KIND, &ids[0])?
+        .ok_or_else(corrupt)?;
+    validate_governed_allowance_receipt(&receipt, allowance).map_err(|_| corrupt())?;
+    let authorization = receipt.continuation.as_ref().ok_or_else(corrupt)?;
+    let prior = receipt.context.source_project.subscription_call.as_ref().ok_or_else(corrupt)?;
+    let abandoned: AdaptiveLeadershipAbandonedAllowanceV2 = get_entity(
+        connection, &project.tenant_id, ABANDONED_KIND, &prior.allowance_id,
+    )?.ok_or_else(corrupt)?;
+    let (session, _) = crate::store::adaptive::load(connection, receipt.grant.session_id)?.ok_or_else(corrupt)?;
+    crate::store::adaptive::require_head(connection, &session)?;
+    if receipt.grant.project_id != project.project_id || abandoned.review != receipt
+        || session.grant != receipt.context.source_session.grant
+        || session.continuation.as_ref().is_none_or(|state|
+            !state.authorizations.contains(authorization))
+    {
+        return Err(corrupt());
+    }
     Ok(())
 }
 
@@ -1297,13 +1636,36 @@ impl WorkflowStore {
         calls_for_session(&connection, tenant, session_id)
     }
 
-    /// Retire stale input without fabricating a model decision or releasing its allowance.
+    /// Retire stale input or an expired undispatched schema2 subject without releasing authority.
     pub fn retire_stale_adaptive_leadership_review_call(
         &self,
         leader: &AuthenticatedCompanyPrincipalV1,
         review_id: Uuid,
         expected_version: u64,
         now_ms: u64,
+    ) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
+        self.retire_adaptive_leadership_review_call(leader, review_id, expected_version, now_ms, false)
+    }
+
+    /// Explicit schema2 expiry after scheduler or durable provider-completion verification.
+    /// Keeps dispatch, usage history and allowance; never fabricates a model decision.
+    pub fn expire_adaptive_leadership_review_call(
+        &self,
+        leader: &AuthenticatedCompanyPrincipalV1,
+        review_id: Uuid,
+        expected_version: u64,
+        now_ms: u64,
+    ) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
+        self.retire_adaptive_leadership_review_call(leader, review_id, expected_version, now_ms, true)
+    }
+
+    fn retire_adaptive_leadership_review_call(
+        &self,
+        leader: &AuthenticatedCompanyPrincipalV1,
+        review_id: Uuid,
+        expected_version: u64,
+        now_ms: u64,
+        explicit_expiry: bool,
     ) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
         leader.validate()?;
         if review_id.is_nil() {
@@ -1321,8 +1683,16 @@ impl WorkflowStore {
         if leader != &call.grant.leadership_principal {
             return Err(unauthorized());
         }
+        if explicit_expiry && (call.grant.schema_version != 2 || call.grant.subject.is_none()
+            || now_ms < call.grant.expires_at_unix_ms)
+        {
+            return Err(transition());
+        }
         if call.retired_at_unix_ms.is_some() {
-            if !matches!(expected_version, 1 | 2 | 4) {
+            let source_version = if call.dispatch.is_some() { 2 } else { 1 };
+            if (explicit_expiry && expected_version != source_version && expected_version != 4)
+                || (!explicit_expiry && !matches!(expected_version, 1 | 2 | 4))
+            {
                 return Err(transition());
             }
             return Ok(call);
@@ -1360,7 +1730,12 @@ impl WorkflowStore {
         {
             return Err(transition());
         }
-        if project == call.context.source_project && session == call.context.source_session {
+        let expired_subject = call.grant.schema_version == 2
+            && call.grant.subject.is_some() && (call.dispatch.is_none() || explicit_expiry)
+            && now_ms >= call.grant.expires_at_unix_ms;
+        if project == call.context.source_project && session == call.context.source_session
+            && !expired_subject
+        {
             return Err(transition());
         }
         call.retired_at_unix_ms = Some(now_ms);
@@ -1439,6 +1814,11 @@ impl WorkflowStore {
         }
         if call.decision.is_some() {
             return Ok(call);
+        }
+        if call.grant.schema_version == 2 && result.continuation.is_none()
+            && now_ms >= call.grant.expires_at_unix_ms
+        {
+            return Err(transition());
         }
         if now_ms < call.updated_at_unix_ms {
             return Err(transition());
