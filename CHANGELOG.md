@@ -9,6 +9,11 @@
   Cover both npm and Bun managers, serialize repository updater runs, and load
   dependency policy once through repository configuration (#856).
 
+- Add an independent internal company Customer identity and protected workflow
+  credential without changing the actual customer binding or the existing 23
+  secrets. Preserve credential bytes during migration and reinitialization
+  (#856).
+
 - Bind the scheduled dependency updater to this repository explicitly instead
   of returning success without inspecting any repository. Keep automatic
   repository discovery disabled and existing upgrade/review policy unchanged
