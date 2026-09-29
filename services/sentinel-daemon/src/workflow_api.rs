@@ -3973,7 +3973,38 @@ impl WorkflowApi {
                     false,
                 );
             }
-            let result = self.core.admit_plan(&envelope.plan, now_unix_ms());
+            let result = (|| {
+                if let Some(existing) = self.store.work_item_for_plan(
+                    &envelope.plan.tenant_id,
+                    &envelope.plan.project_id,
+                    &envelope.plan.work_item_id,
+                    envelope.plan.plan_id,
+                )? {
+                    let historical = authority
+                        .snapshot_for_admission(
+                            &envelope.plan.tenant_id,
+                            &envelope.plan.project_id,
+                            &envelope.plan.work_item_id,
+                            envelope.plan.agent_id,
+                            false,
+                        )
+                        .map_err(execution_intent_port_error)?;
+                    if existing.plan != envelope.plan {
+                        return Err(WorkflowError::new(
+                            WorkflowErrorCode::IdempotencyConflict,
+                            false,
+                            "execution plan changed for an existing operation",
+                        ));
+                    }
+                    if !existing.plan.authority_matches(&historical) {
+                        return Err(execution_authority_conflict());
+                    }
+                    return self
+                        .store
+                        .admit_plan(&envelope.plan, &historical, now_unix_ms());
+                }
+                self.core.admit_plan(&envelope.plan, now_unix_ms())
+            })();
             return match result {
                 Ok((replayed, work_item)) => json(200, &(replayed, work_item)),
                 Err(error) => workflow_error(error),
@@ -6863,11 +6894,15 @@ mod tests {
             "9".repeat(64),
         )
         .unwrap();
-        let CompanyWorkflowCommandV1::AdmitCollaboration { candidates, .. } = off_duty else {
+        let CompanyWorkflowCommandV1::AdmitCollaboration {
+            candidates: off_duty_candidates,
+            ..
+        } = off_duty
+        else {
             panic!("expected admission command")
         };
-        assert!(!candidates[0].active);
-        assert!(!candidates[0].runtime_available);
+        assert!(!off_duty_candidates[0].active);
+        assert!(!off_duty_candidates[0].runtime_available);
         authority.runtime_health.write().unwrap().agents.clear();
         let unavailable = derive_collaboration_admission_command(
             &authority,

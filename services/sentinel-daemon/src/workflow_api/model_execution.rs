@@ -2406,7 +2406,7 @@ impl WorkflowApi {
             .map_err(|_| "project planning grant was rejected")
     }
 
-    fn validate_company_employee(
+    pub(super) fn validate_company_employee(
         &self,
         principal: &AuthenticatedCompanyPrincipalV1,
     ) -> Result<(), &'static str> {
@@ -3607,7 +3607,7 @@ mod family_selection_tests {
 
     #[test]
     fn all_three_shift_rosters_bind_healthy_capable_family_employees() {
-        for shift in 0..3 {
+        for (shift, roster) in SHIFT_ROSTERS.iter().enumerate() {
             let temp = tempfile::tempdir().unwrap();
             let api = all_shift_api(&temp.path().join("company.sqlite"), shift);
             let sales = shift_sales(&api, shift);
@@ -3615,8 +3615,8 @@ mod family_selection_tests {
                 let binding = api
                     .bind_sales_offer(&sales, offer(Some(family)), 100)
                     .unwrap();
-                assert_eq!(binding.governance.owner, AgentId(SHIFT_ROSTERS[shift][1]));
-                for (role, id) in ROSTER_ROLES.into_iter().zip(SHIFT_ROSTERS[shift]) {
+                assert_eq!(binding.governance.owner, AgentId(roster[1]));
+                for (role, &id) in ROSTER_ROLES.into_iter().zip(roster) {
                     let employee = participant(&binding, role);
                     assert_eq!(employee.agent_id, AgentId(id));
                     assert_eq!(
