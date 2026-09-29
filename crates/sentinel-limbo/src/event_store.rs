@@ -9,9 +9,11 @@
 //! rusqlite unterstuetzt keine INSTEAD OF Trigger auf normalen Tabellen.
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use sentinel_common::{
     agent_config::AgentConfig, nano_runtime::NanoSnapshot, room::BuildingConfig, AgentId,
-    DomainEvent, FencedStore, OwnerRegistry, OwnerWriteGuard, StateTransferScope,
+    CostSource, DomainEvent, DomainEventPayload, FencedStore, OwnerRegistry, OwnerWriteGuard,
+    StateTransferScope,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -382,6 +384,181 @@ pub struct LlmCompletionEntry {
     pub last_error: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+/// Only model subjects are representable; this is not tool or collaboration authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LlmModelSubjectV1 {
+    Adaptive {
+        session_id: uuid::Uuid,
+        effect_id: uuid::Uuid,
+        session_version: u64,
+    },
+    AdaptiveLeadershipReview {
+        review_id: uuid::Uuid,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmModelUsageBindingV1 {
+    pub agent_id: AgentId,
+    pub tenant_id: String,
+    pub project_id: String,
+    pub work_item_id: String,
+    pub reservation_id: String,
+    pub assignment_id: String,
+    pub assignment_version: u64,
+    pub provider: String,
+    pub model: String,
+}
+
+/// Bound before send by the trusted bridge, not reconstructed from empty output.
+/// The digests identify authority/input; they do not attest deployment isolation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmModelReservationV1 {
+    pub schema_version: u16,
+    pub request_id: String,
+    pub request_digest: String,
+    pub owner_scope: StateTransferScope,
+    pub subject: LlmModelSubjectV1,
+    pub allowance_id: String,
+    pub context_digest: String,
+    pub authority_digest: String,
+    pub usage_binding: LlmModelUsageBindingV1,
+}
+
+/// Reservation evidence only. Eligibility additionally requires the domain journal
+/// and retrospective deployment proof; unknown provider activity is not denied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmSealedUnknownModelEvidenceV1 {
+    pub reservation: LlmModelReservationV1,
+    pub reason: String,
+    pub reserved_at_ms: u64,
+    pub sealed_at_ms: u64,
+}
+
+fn sealed_unknown_reason(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some("UnknownOutcome: bridge_task_ended_without_durable_response")
+            | Some("UnknownOutcome: provider_transport_deadline_elapsed")
+    )
+}
+
+impl LlmModelReservationV1 {
+    fn validate(&self) -> anyhow::Result<()> {
+        let binding = &self.usage_binding;
+        let request_id = match &self.subject {
+            LlmModelSubjectV1::Adaptive { session_id, effect_id, session_version } => {
+                anyhow::ensure!(!session_id.is_nil() && !effect_id.is_nil() && *session_version > 0,
+                    "invalid adaptive model subject");
+                anyhow::ensure!(self.allowance_id == binding.reservation_id,
+                    "adaptive allowance binding changed");
+                format!("company-adaptive-{session_id}-{effect_id}")
+            }
+            LlmModelSubjectV1::AdaptiveLeadershipReview { review_id } => {
+                anyhow::ensure!(!review_id.is_nil() && binding.reservation_id == review_id.to_string(),
+                    "invalid leadership model subject");
+                format!("company-leadership-{review_id}")
+            }
+        };
+        anyhow::ensure!(self.schema_version == 1 && self.request_id == request_id
+            && self.owner_scope == StateTransferScope::for_agent(binding.agent_id.to_string())
+            && is_canonical_sha256(&self.request_digest)
+            && is_canonical_sha256(&self.context_digest)
+            && is_canonical_sha256(&self.authority_digest)
+            && binding.assignment_version > 0 && binding.provider == "codex-cli",
+            "invalid model reservation binding");
+        for identifier in [&self.allowance_id, &binding.tenant_id, &binding.project_id,
+            &binding.work_item_id, &binding.reservation_id, &binding.assignment_id, &binding.model] {
+            anyhow::ensure!(!identifier.is_empty() && identifier.len() <= 128
+                && identifier.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'_' | b'.' | b':' | b'-')),
+                "invalid model reservation identifier");
+        }
+        Ok(())
+    }
+
+    fn validate_usage(&self, event: &DomainEvent) -> anyhow::Result<()> {
+        self.validate()?;
+        let binding = &self.usage_binding;
+        anyhow::ensure!(event.payload.len() <= 32 * 1024, "late model usage exceeds its bound");
+        let payload: DomainEventPayload = serde_json::from_str(&event.payload)?;
+        let DomainEventPayload::AgentLlmUsage { agent_id, tenant_id, project_id, work_item_id,
+            reservation_id, assignment_id, assignment_version, provider, requested_model,
+            effective_model, caller_role, tier, hierarchy_tier, cost_source, cost_usd, .. } = payload
+        else { anyhow::bail!("late model usage type is invalid"); };
+        let schema = match &self.subject {
+            LlmModelSubjectV1::Adaptive { .. } => 3,
+            LlmModelSubjectV1::AdaptiveLeadershipReview { .. } => 6,
+        };
+        anyhow::ensure!(event.schema_version == schema && event.event_type == "agent_llm_usage"
+            && event.aggregate_id == binding.agent_id.to_string()
+            && event.correlation_id == self.request_id
+            && event.operation_id == format!("llm_usage_{}", self.request_id)
+            && uuid::Uuid::parse_str(&event.event_id).is_ok_and(|id|
+                !id.is_nil() && id.to_string() == event.event_id)
+            && event.compensation_type == "none"
+            && agent_id == binding.agent_id && tenant_id.as_ref() == Some(&binding.tenant_id)
+            && project_id.as_ref() == Some(&binding.project_id)
+            && work_item_id.as_ref() == Some(&binding.work_item_id)
+            && reservation_id.as_ref() == Some(&binding.reservation_id)
+            && assignment_id.as_ref() == Some(&binding.assignment_id)
+            && assignment_version == Some(binding.assignment_version)
+            && provider.as_ref() == Some(&binding.provider)
+            && requested_model.as_ref() == Some(&binding.model)
+            && effective_model.as_ref() == Some(&binding.model)
+            && caller_role.as_deref() == Some("agent_runtime") && !tier.trim().is_empty()
+            && hierarchy_tier.is_some() && cost_source.is_some()
+            && cost_source != Some(CostSource::NonProviderZero)
+            && cost_usd.is_finite() && cost_usd >= 0.0,
+            "late model usage authority mismatch");
+        i64::try_from(event.tick)?;
+        i64::try_from(event.timestamp_ms)?;
+        Ok(())
+    }
+}
+
+fn sealed_model_evidence(
+    conn: &Connection,
+    request_id: &str,
+    request_digest: &str,
+    owner: &StateTransferScope,
+) -> anyhow::Result<Option<LlmSealedUnknownModelEvidenceV1>> {
+    anyhow::ensure!(is_canonical_sha256(request_digest)
+        && matches!(owner, StateTransferScope::NanoContainer(_)), "invalid model evidence identity");
+    let state = conn.query_row(
+        "SELECT request_id, request_digest, owner_scope, payload, status, attempt_count, last_error,
+            created_at, updated_at, model_binding FROM llm_completion_outbox WHERE request_id=?1",
+        params![request_id], |row| Ok((llm_completion_from_row(row)?, row.get::<_, String>(9)?)),
+    ).optional()?;
+    let Some((entry, encoded)) = state else {
+        return Ok(None);
+    };
+    anyhow::ensure!(entry.request_digest == request_digest && &entry.owner_scope == owner,
+        "sealed model reservation identity changed");
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+    let reservation: LlmModelReservationV1 = serde_json::from_str(&encoded)?;
+    reservation.validate()?;
+    anyhow::ensure!(reservation.request_id == request_id && reservation.request_digest == request_digest
+        && &reservation.owner_scope == owner, "sealed model binding changed");
+    if entry.status != "failed"
+        || !entry.payload.is_empty()
+        || !sealed_unknown_reason(entry.last_error.as_deref())
+    {
+        return Ok(None);
+    }
+    anyhow::ensure!(entry.updated_at >= entry.created_at, "invalid model reservation time");
+    Ok(Some(LlmSealedUnknownModelEvidenceV1 {
+        reservation, reason: entry.last_error.unwrap(),
+        reserved_at_ms: entry.created_at, sealed_at_ms: entry.updated_at,
+    }))
 }
 
 /// Validated local evidence retained after a rejected result leaves the outbox.
@@ -788,6 +965,9 @@ impl EventStore {
                 "ALTER TABLE llm_completion_outbox ADD COLUMN owner_scope TEXT NOT NULL DEFAULT ''",
                 [],
             )?;
+        }
+        if !Self::table_has_column(conn, "llm_completion_outbox", "model_binding")? {
+            conn.execute("ALTER TABLE llm_completion_outbox ADD COLUMN model_binding TEXT NOT NULL DEFAULT ''", [])?;
         }
         Ok(())
     }
@@ -2173,6 +2353,89 @@ impl EventStore {
         Ok(scope)
     }
 
+    /// Register the exact model binding before send. This does not prove dispatch
+    /// or deployment isolation and cannot bind a terminal or completed result.
+    pub fn bind_llm_model_reservation(
+        &self,
+        reservation: &LlmModelReservationV1,
+    ) -> anyhow::Result<()> {
+        reservation.validate()?;
+        let conn = self.begin_fenced_write_for_llm_completion(&reservation.request_id)?;
+        let (digest, owner, payload, status, encoded): (String, String, String, String, String) = conn.query_row(
+            "SELECT request_digest, owner_scope, payload, status, model_binding FROM llm_completion_outbox WHERE request_id=?1",
+            params![reservation.request_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+        anyhow::ensure!(digest == reservation.request_digest && owner == reservation.owner_scope.to_wire()
+            && payload.is_empty() && status == "provider_in_flight", "model reservation is not bindable");
+        if !encoded.is_empty() {
+            let prior: LlmModelReservationV1 = serde_json::from_str(&encoded)?;
+            anyhow::ensure!(&prior == reservation, "model reservation binding conflict");
+        } else {
+            let changed = conn.execute(
+                "UPDATE llm_completion_outbox SET model_binding=?3 WHERE request_id=?1 AND request_digest=?2
+                    AND owner_scope=?4 AND status='provider_in_flight' AND payload='' AND model_binding=''",
+                params![reservation.request_id, reservation.request_digest, serde_json::to_string(reservation)?, owner],
+            )?;
+            anyhow::ensure!(changed == 1, "model reservation changed while binding");
+        }
+        conn.commit()?;
+        Ok(())
+    }
+
+    /// Exact reservation evidence, not permission to abandon a domain effect.
+    /// Missing/unregistered/non-unknown rows return None; identity conflicts fail.
+    pub fn sealed_unknown_llm_model_evidence(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        owner: &StateTransferScope,
+    ) -> anyhow::Result<Option<LlmSealedUnknownModelEvidenceV1>> {
+        let conn = self.conn.lock().map_err(|error| anyhow::anyhow!("Lock poisoned: {error}"))?;
+        sealed_model_evidence(&conn, request_id, request_digest, owner)
+    }
+
+    /// Append authenticated bridge-validated usage without reopening adoption.
+    /// The reservation, reason, payload, attempts and timestamps remain unchanged.
+    /// Exact event replay returns false; every conflicting duplicate is an error.
+    pub fn persist_sealed_unknown_llm_model_usage(
+        &self,
+        evidence: &LlmSealedUnknownModelEvidenceV1,
+        event: &DomainEvent,
+    ) -> anyhow::Result<bool> {
+        let reservation = &evidence.reservation;
+        reservation.validate_usage(event)?;
+        let conn = self.begin_fenced_write_for_llm_completion(&reservation.request_id)?;
+        let current = sealed_model_evidence(&conn, &reservation.request_id,
+            &reservation.request_digest, &reservation.owner_scope)?;
+        anyhow::ensure!(current.as_ref() == Some(evidence), "sealed model evidence changed");
+        let operation_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE operation_id=?1)", params![event.operation_id], |row| row.get(0),
+        )?;
+        if operation_exists {
+            let exact: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE operation_id=?1 AND event_id=?2 AND event_type=?3
+                    AND aggregate_id=?4 AND payload=?5 AND correlation_id=?6 AND schema_version=?7
+                    AND timestamp_ms=?8 AND tick=?9 AND causation_id IS ?10 AND compensation_type=?11)",
+                params![event.operation_id, event.event_id, event.event_type, event.aggregate_id,
+                    event.payload, event.correlation_id, event.schema_version, event.timestamp_ms as i64,
+                    event.tick as i64, event.causation_id, event.compensation_type], |row| row.get(0),
+            )?;
+            anyhow::ensure!(exact, "late model usage event conflict");
+            conn.commit()?;
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id,
+                operation_id, tick, timestamp_ms, schema_version, compensation_type)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![event.event_id, event.event_type, event.aggregate_id, event.payload, event.correlation_id,
+                event.causation_id, event.operation_id, event.tick as i64, event.timestamp_ms as i64,
+                event.schema_version, event.compensation_type],
+        )?;
+        conn.commit()?;
+        Ok(true)
+    }
+
     /// Seal a reservation whose provider outcome is unknown without allowing replay.
     pub fn mark_llm_provider_outcome_unknown(
         &self,
@@ -2578,6 +2841,14 @@ impl EventStore {
             existing_digest == request_digest,
             "LLM completion digest conflict for {request_id}"
         );
+        let protected: bool = conn.query_row(
+            "SELECT COALESCE(model_binding != '' AND status='failed' AND payload='' AND last_error IN
+                ('UnknownOutcome: bridge_task_ended_without_durable_response',
+                 'UnknownOutcome: provider_transport_deadline_elapsed'), 0)
+                FROM llm_completion_outbox WHERE request_id=?1",
+            params![request_id], |row| row.get(0),
+        )?;
+        anyhow::ensure!(!protected, "sealed unknown model history cannot be deleted");
         anyhow::ensure!(
             matches!(
                 status.as_str(),
@@ -2778,6 +3049,14 @@ impl EventStore {
             stored_digest == request_digest,
             "LLM completion digest conflict for {request_id}"
         );
+        let protected: bool = conn.query_row(
+            "SELECT COALESCE(model_binding != '' AND payload='' AND last_error IN
+                ('UnknownOutcome: bridge_task_ended_without_durable_response',
+                 'UnknownOutcome: provider_transport_deadline_elapsed'), 0)
+                FROM llm_completion_outbox WHERE request_id=?1",
+            params![request_id], |row| row.get(0),
+        )?;
+        anyhow::ensure!(!protected, "sealed unknown model history is not a schema correction");
         anyhow::ensure!(
             status == "failed" && last_error.as_deref() == Some(expected_error),
             "LLM completion {request_id} is not the expected failed model result"
@@ -4823,6 +5102,304 @@ mod tests {
         assert_eq!(entry.status, "pending_usage");
         assert_eq!(entry.payload, "durable response");
         assert!(entry.last_error.is_none());
+    }
+
+    fn model_reservation_fixture() -> LlmModelReservationV1 {
+        let session_id = uuid::Uuid::new_v4();
+        let effect_id = uuid::Uuid::new_v4();
+        LlmModelReservationV1 {
+            schema_version: 1,
+            request_id: format!("company-adaptive-{session_id}-{effect_id}"),
+            request_digest: "a".repeat(64),
+            owner_scope: StateTransferScope::for_agent("AGENT-07"),
+            subject: LlmModelSubjectV1::Adaptive { session_id, effect_id, session_version: 1 },
+            allowance_id: "original-allowance".into(), context_digest: "b".repeat(64),
+            authority_digest: "c".repeat(64),
+            usage_binding: LlmModelUsageBindingV1 {
+                agent_id: AgentId(7), tenant_id: "tenant".into(), project_id: "project".into(),
+                work_item_id: "work".into(), reservation_id: "original-allowance".into(),
+                assignment_id: "assignment".into(), assignment_version: 1,
+                provider: "codex-cli".into(), model: "gpt-5.4".into(),
+            },
+        }
+    }
+
+    fn late_model_usage_fixture(reservation: &LlmModelReservationV1) -> DomainEvent {
+        let binding = &reservation.usage_binding;
+        let payload = serde_json::json!({
+            "type": "AgentLlmUsage", "agent_id": binding.agent_id,
+            "tenant_id": binding.tenant_id, "project_id": binding.project_id,
+            "work_item_id": binding.work_item_id, "reservation_id": binding.reservation_id,
+            "assignment_id": binding.assignment_id, "assignment_version": binding.assignment_version,
+            "provider": binding.provider, "requested_model": binding.model,
+            "effective_model": binding.model, "caller_role": "agent_runtime",
+            "tier": "mid", "hierarchy_tier": 2, "cost_source": "provider_reported",
+            "input_tokens": 5, "output_tokens": 10, "cache_read": 1, "cache_creation": 2,
+            "cost_usd": 0.125,
+        });
+        DomainEvent::new("agent_llm_usage", &binding.agent_id.to_string(),
+            &payload.to_string(), &reservation.request_id, 1)
+            .with_operation_id(&format!("llm_usage_{}", reservation.request_id))
+            .with_schema_version(match &reservation.subject {
+                LlmModelSubjectV1::Adaptive { .. } => 3,
+                LlmModelSubjectV1::AdaptiveLeadershipReview { .. } => 6,
+            })
+    }
+
+    fn bind_and_seal_model(store: &EventStore, reservation: &LlmModelReservationV1) -> LlmSealedUnknownModelEvidenceV1 {
+        assert!(store.reserve_llm_request(&reservation.request_id, &reservation.request_digest,
+            &reservation.usage_binding.agent_id.to_string()).unwrap());
+        store.bind_llm_model_reservation(reservation).unwrap();
+        store.bind_llm_model_reservation(reservation).unwrap();
+        assert!(store.mark_llm_provider_outcome_unknown(&reservation.request_id,
+            &reservation.request_digest, "UnknownOutcome: provider_transport_deadline_elapsed").unwrap());
+        store.sealed_unknown_llm_model_evidence(&reservation.request_id,
+            &reservation.request_digest, &reservation.owner_scope).unwrap().unwrap()
+    }
+
+    #[test]
+    fn sealed_model_usage_survives_reopen_without_reopening_adoption_or_deleting_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sealed-model.db");
+        let reservation = model_reservation_fixture();
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let evidence = bind_and_seal_model(&store, &reservation);
+        let original = store.get_llm_completion(&reservation.request_id).unwrap().unwrap();
+        let usage = late_model_usage_fixture(&reservation);
+        drop(store);
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &usage).unwrap());
+        assert!(!store.persist_sealed_unknown_llm_model_usage(&evidence, &usage).unwrap());
+        assert_eq!(store.get_llm_completion(&reservation.request_id).unwrap().unwrap(), original);
+        assert!(store.resolve_llm_completion_terminal(&reservation.request_id,
+            &reservation.request_digest, "generic abandonment").is_err());
+        assert!(store.resolve_failed_llm_completion_for_model_retry(&reservation.request_id,
+            &reservation.request_digest, &evidence.reason, "schema correction").is_err());
+        assert!(store.release_undispatched_llm_request(&reservation.request_id, &reservation.request_digest).is_err());
+        assert!(!store.requeue_failed_llm_completion(&reservation.request_id,
+            &reservation.request_digest, &evidence.reason).unwrap());
+        assert!(!store.claim_llm_completion_actions(&reservation.request_id, &reservation.request_digest).unwrap());
+        assert!(store.enqueue_llm_completion(&reservation.request_id, &reservation.request_digest, "late content").is_err());
+        assert!(!store.reserve_llm_request(&reservation.request_id, &reservation.request_digest, "AGENT-07").unwrap());
+        drop(store);
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(store.sealed_unknown_llm_model_evidence(&reservation.request_id,
+            &reservation.request_digest, &reservation.owner_scope).unwrap(), Some(evidence));
+        assert!(!store.persist_sealed_unknown_llm_model_usage(
+            &store.sealed_unknown_llm_model_evidence(&reservation.request_id,
+                &reservation.request_digest, &reservation.owner_scope).unwrap().unwrap(), &usage).unwrap());
+        let durable = store.event_by_operation_id(&usage.operation_id).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(durable).unwrap(), serde_json::to_value(usage).unwrap());
+        assert_eq!(store.get_all_events().unwrap().len(), 1);
+        assert_eq!(store.get_llm_completion(&reservation.request_id).unwrap().unwrap(), original);
+    }
+
+    #[test]
+    fn model_binding_migration_preserves_legacy_unknown_without_inventing_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-model.db");
+        let reservation = model_reservation_fixture();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(CREATE_LLM_COMPLETION_OUTBOX).unwrap();
+        conn.execute("INSERT INTO llm_completion_outbox (request_id,request_digest,owner_scope,payload,status,last_error,created_at,updated_at)
+            VALUES (?1,?2,?3,'','failed','UnknownOutcome: provider_transport_deadline_elapsed',1,2)",
+            params![reservation.request_id, reservation.request_digest, reservation.owner_scope.to_wire()]).unwrap();
+        drop(conn);
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let original = store.get_llm_completion(&reservation.request_id).unwrap().unwrap();
+        assert!(store.sealed_unknown_llm_model_evidence(&reservation.request_id,
+            &reservation.request_digest, &reservation.owner_scope).unwrap().is_none());
+        assert!(store.bind_llm_model_reservation(&reservation).is_err());
+        drop(store);
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(store.get_llm_completion(&reservation.request_id).unwrap().unwrap(), original);
+        assert!(store.get_all_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sealed_model_evidence_requires_registration_and_exact_identity_not_empty_output() {
+        let store = EventStore::open(":memory:").unwrap();
+        let reservation = model_reservation_fixture();
+        assert!(store.reserve_llm_request(&reservation.request_id, &reservation.request_digest, "AGENT-07").unwrap());
+        store.mark_llm_provider_outcome_unknown(&reservation.request_id, &reservation.request_digest,
+            "UnknownOutcome: provider_transport_deadline_elapsed").unwrap();
+        assert!(store.sealed_unknown_llm_model_evidence(&reservation.request_id,
+            &reservation.request_digest, &reservation.owner_scope).unwrap().is_none());
+        assert!(store.bind_llm_model_reservation(&reservation).is_err());
+        let reservation = model_reservation_fixture();
+        let evidence = bind_and_seal_model(&store, &reservation);
+        assert!(store.sealed_unknown_llm_model_evidence(&reservation.request_id, &"d".repeat(64),
+            &reservation.owner_scope).is_err());
+        assert!(store.sealed_unknown_llm_model_evidence(&reservation.request_id, &reservation.request_digest,
+            &StateTransferScope::for_agent("AGENT-08")).is_err());
+        assert!(store.sealed_unknown_llm_model_evidence(&reservation.request_id, &reservation.request_digest,
+            &StateTransferScope::World).is_err());
+        for (status, payload, reason) in [
+            ("action_claimed", "", evidence.reason.as_str()),
+            ("pending_usage", "response", ""), ("ready_for_action", "response", ""),
+            ("failed", "response", evidence.reason.as_str()),
+            ("failed", "", "UnknownOutcome: unapproved reason"), ("failed", "", "ordinary failure"),
+        ] {
+            store.conn().execute("UPDATE llm_completion_outbox SET status=?2,payload=?3,last_error=?4 WHERE request_id=?1",
+                params![reservation.request_id, status, payload, reason]).unwrap();
+            assert!(store.sealed_unknown_llm_model_evidence(&reservation.request_id,
+                &reservation.request_digest, &reservation.owner_scope).unwrap().is_none());
+            assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &late_model_usage_fixture(&reservation)).is_err());
+        }
+        let mut tool = serde_json::to_value(&reservation).unwrap();
+        tool["subject"]["kind"] = serde_json::json!("tool");
+        assert!(serde_json::from_value::<LlmModelReservationV1>(tool).is_err());
+    }
+
+    #[test]
+    fn sealed_model_usage_rejects_identity_conflicts_and_forged_or_zero_cost_provenance() {
+        let store = EventStore::open(":memory:").unwrap();
+        let reservation = model_reservation_fixture();
+        let evidence = bind_and_seal_model(&store, &reservation);
+        let usage = late_model_usage_fixture(&reservation);
+        let original = store.get_llm_completion(&reservation.request_id).unwrap();
+        for field in ["tenant_id", "project_id", "work_item_id", "reservation_id", "assignment_id",
+            "provider", "requested_model", "effective_model", "caller_role"] {
+            let mut invalid = usage.clone();
+            let mut payload: serde_json::Value = serde_json::from_str(&invalid.payload).unwrap();
+            payload[field] = serde_json::json!("wrong");
+            invalid.payload = payload.to_string();
+            assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &invalid).is_err(), "{field}");
+        }
+        for (field, value) in [
+            ("agent_id", serde_json::json!(8)), ("assignment_version", serde_json::json!(2)),
+            ("cost_usd", serde_json::json!(-1)), ("cost_source", serde_json::json!("non_provider_zero")),
+            ("cost_source", serde_json::Value::Null), ("hierarchy_tier", serde_json::Value::Null),
+        ] {
+            let mut invalid = usage.clone();
+            let mut payload: serde_json::Value = serde_json::from_str(&invalid.payload).unwrap();
+            payload[field] = value;
+            invalid.payload = payload.to_string();
+            assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &invalid).is_err(), "{field}");
+        }
+        for field in ["event_id", "event_type", "aggregate_id", "correlation_id", "operation_id", "compensation_type"] {
+            let mut encoded = serde_json::to_value(&usage).unwrap();
+            encoded[field] = serde_json::json!("wrong");
+            let invalid: DomainEvent = serde_json::from_value(encoded).unwrap();
+            assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &invalid).is_err(), "{field}");
+        }
+        let mut invalid = usage.clone();
+        invalid.schema_version = 6;
+        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &invalid).is_err());
+        invalid = usage.clone();
+        invalid.tick = u64::MAX;
+        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &invalid).is_err());
+        let mut forged = evidence.clone();
+        forged.sealed_at_ms += 1;
+        assert!(store.persist_sealed_unknown_llm_model_usage(&forged, &usage).is_err());
+        assert!(store.get_all_events().unwrap().is_empty());
+        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &usage).unwrap());
+        for field in ["event_id", "tick", "timestamp_ms", "causation_id", "payload"] {
+            let mut altered = usage.clone();
+            match field {
+                "event_id" => altered.event_id = uuid::Uuid::new_v4().to_string(),
+                "tick" => altered.tick += 1, "timestamp_ms" => altered.timestamp_ms += 1,
+                "causation_id" => altered.causation_id = Some("other".into()),
+                _ => {
+                    let mut payload: serde_json::Value = serde_json::from_str(&altered.payload).unwrap();
+                    payload["cost_usd"] = serde_json::json!(0.25);
+                    altered.payload = payload.to_string();
+                }
+            }
+            assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &altered).is_err(), "{field}");
+        }
+        assert_eq!(store.get_all_events().unwrap().len(), 1);
+        assert_eq!(store.get_llm_completion(&reservation.request_id).unwrap(), original);
+    }
+
+    #[test]
+    fn model_seal_and_response_race_has_one_winner_and_usage_never_reopens_the_seal() {
+        for _ in 0..8 {
+            let store = Arc::new(EventStore::open(":memory:").unwrap());
+            let reservation = model_reservation_fixture();
+            store.reserve_llm_request(&reservation.request_id, &reservation.request_digest, "AGENT-07").unwrap();
+            store.bind_llm_model_reservation(&reservation).unwrap();
+            let mut conflicting = reservation.clone();
+            conflicting.context_digest = "d".repeat(64);
+            assert!(store.bind_llm_model_reservation(&conflicting).is_err());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let other = Arc::clone(&store);
+            let started = Arc::clone(&barrier);
+            let model = reservation.clone();
+            let response = std::thread::spawn(move || {
+                started.wait();
+                other.enqueue_llm_completion(&model.request_id, &model.request_digest, "durable response").is_ok()
+            });
+            barrier.wait();
+            let sealed = store.mark_llm_provider_outcome_unknown(&reservation.request_id,
+                &reservation.request_digest, "UnknownOutcome: provider_transport_deadline_elapsed").unwrap();
+            assert_ne!(sealed, response.join().unwrap());
+            let evidence = store.sealed_unknown_llm_model_evidence(&reservation.request_id,
+                &reservation.request_digest, &reservation.owner_scope).unwrap();
+            assert_eq!(evidence.is_some(), sealed);
+            if let Some(evidence) = evidence {
+                let usage = late_model_usage_fixture(&reservation);
+                let other = Arc::clone(&store);
+                let copy = evidence.clone();
+                let duplicate = usage.clone();
+                let append = std::thread::spawn(move || other.persist_sealed_unknown_llm_model_usage(&copy, &duplicate).unwrap());
+                let inserted = store.persist_sealed_unknown_llm_model_usage(&evidence, &usage).unwrap();
+                assert_ne!(inserted, append.join().unwrap());
+                assert_eq!(store.get_all_events().unwrap().len(), 1);
+                assert_eq!(store.get_llm_completion(&reservation.request_id).unwrap().unwrap().status, "failed");
+            } else {
+                assert_eq!(store.get_llm_completion(&reservation.request_id).unwrap().unwrap().payload, "durable response");
+                assert!(store.get_all_events().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn leadership_unknown_usage_preserves_schema_six_and_original_allowance() {
+        let store = EventStore::open(":memory:").unwrap();
+        let mut reservation = model_reservation_fixture();
+        let review_id = uuid::Uuid::new_v4();
+        reservation.subject = LlmModelSubjectV1::AdaptiveLeadershipReview { review_id };
+        reservation.request_id = format!("company-leadership-{review_id}");
+        reservation.usage_binding.reservation_id = review_id.to_string();
+        let evidence = bind_and_seal_model(&store, &reservation);
+        let usage = late_model_usage_fixture(&reservation);
+        assert_eq!(usage.schema_version, 6);
+        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &usage).unwrap());
+        assert_eq!(evidence.reservation.allowance_id, "original-allowance");
+        assert_eq!(store.sealed_unknown_llm_model_evidence(&reservation.request_id,
+            &reservation.request_digest, &reservation.owner_scope).unwrap(), Some(evidence));
+    }
+
+    #[test]
+    fn sealed_model_accounting_uses_agent_fence_and_rejects_event_id_collision() {
+        let registry = cluster_owner_registry();
+        assert!(registry.issue(StateTransferScope::World).is_err());
+        let store = EventStore::open_with_owner_registry(":memory:", registry).unwrap();
+        let reservation = model_reservation_fixture();
+        let evidence = bind_and_seal_model(&store, &reservation);
+        let usage = late_model_usage_fixture(&reservation);
+        let mut unrelated = usage.clone();
+        unrelated.operation_id = "unrelated".into();
+        store.append_event(&unrelated).unwrap();
+        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &usage).is_err());
+        assert!(!store.has_event_operation_id(&usage.operation_id).unwrap());
+        let mut fresh = usage;
+        fresh.event_id = uuid::Uuid::new_v4().to_string();
+        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &fresh).unwrap());
+        let mut foreign = reservation.clone();
+        foreign.usage_binding.agent_id = AgentId(8);
+        foreign.owner_scope = StateTransferScope::for_agent("AGENT-08");
+        let foreign_evidence = LlmSealedUnknownModelEvidenceV1 { reservation: foreign.clone(),
+            reason: evidence.reason.clone(), reserved_at_ms: 1, sealed_at_ms: 2 };
+        // A follower may hold replicated evidence but cannot append accounting.
+        store.conn().execute("UPDATE llm_completion_outbox SET owner_scope=?2,model_binding=?3,created_at=1,updated_at=2 WHERE request_id=?1",
+            params![foreign.request_id, foreign.owner_scope.to_wire(), serde_json::to_string(&foreign).unwrap()]).unwrap();
+        assert_eq!(store.sealed_unknown_llm_model_evidence(&foreign.request_id, &foreign.request_digest,
+            &foreign.owner_scope).unwrap(), Some(foreign_evidence.clone()));
+        assert!(store.persist_sealed_unknown_llm_model_usage(&foreign_evidence, &late_model_usage_fixture(&foreign))
+            .unwrap_err().downcast_ref::<sentinel_common::OwnerIssueError>().is_some());
+        assert_eq!(store.get_all_events().unwrap().len(), 2);
     }
 
     #[test]
