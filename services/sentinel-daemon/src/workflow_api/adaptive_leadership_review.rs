@@ -126,19 +126,32 @@ impl WorkflowApi {
             let calls = self.store.adaptive_leadership_review_calls(&project.tenant_id, session.grant.session_id)
                 .map_err(|_| "leadership calls unavailable")?;
             // An unfinished receipt remains a barrier even after ResolveBlocked committed.
-            if let Some(call) = calls.iter().find(|call| call.decision.is_none()) {
-                blocked = true;
-                if call.dispatch.is_none() && now_unix_ms() >= call.grant.expires_at_unix_ms {
+            if let Some(call) = calls.iter().find(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none()) {
+                let committed_head = call.grant.expected_session_version.checked_add(1) == Some(session.version)
+                    && session.grant == call.context.source_session.grant
+                    && matches!(&session.cursor, AdaptiveCursorV1::BlockedResolved { .. });
+                if !committed_head && (call.context.source_project != *project || call.context.source_session != session) {
                     let leader = self.principals.principal(&call.grant.leadership_principal.principal_id).ok_or("leader principal missing")?;
-                    if leader.principal != call.grant.leadership_principal || leader.execution_authority != call.grant.leadership_authority { return Err("leader authority changed"); }
+                    if leader.principal != call.grant.leadership_principal || leader.execution_authority != call.grant.leadership_authority {
+                        return Err("leader authority changed");
+                    }
                     self.validate_company_employee(&leader.principal)?;
-                    let now = now_unix_ms();
-                    let mut grant = call.grant.clone();
-                    grant.expires_at_unix_ms = now.checked_add(300_000).ok_or("leadership clock overflow")?;
-                    self.store.authorize_adaptive_leadership_review_call(&leader.principal, call.operation_id,
-                        &call.allowance_id, &grant, &call.context, now).map_err(|_| "leadership renewal rejected")?;
+                    self.store.retire_stale_adaptive_leadership_review_call(&leader.principal,
+                        call.grant.review_id, call.version, now_unix_ms()).map_err(|_| "stale leadership retirement rejected")?;
+                } else {
+                    blocked = true;
+                    if call.dispatch.is_none() && now_unix_ms() >= call.grant.expires_at_unix_ms {
+                        let leader = self.principals.principal(&call.grant.leadership_principal.principal_id).ok_or("leader principal missing")?;
+                        if leader.principal != call.grant.leadership_principal || leader.execution_authority != call.grant.leadership_authority { return Err("leader authority changed"); }
+                        self.validate_company_employee(&leader.principal)?;
+                        let now = now_unix_ms();
+                        let mut grant = call.grant.clone();
+                        grant.expires_at_unix_ms = now.checked_add(300_000).ok_or("leadership clock overflow")?;
+                        self.store.authorize_adaptive_leadership_review_call(&leader.principal, call.operation_id,
+                            &call.allowance_id, &grant, &call.context, now).map_err(|_| "leadership renewal rejected")?;
+                    }
+                    continue;
                 }
-                continue;
             }
             let AdaptiveCursorV1::Blocked { reason_code } = &session.cursor else { continue; };
             blocked = true;
@@ -147,7 +160,8 @@ impl WorkflowApi {
                 .profile_for_binding(&session.grant.authority.profile_id).map_err(|_| "leadership profile unavailable")?;
             if digest != session.grant.authority.profile_digest { return Err("leadership profile changed"); }
             let catalog = super::model_execution::tool_catalog::adaptive_tool_catalog(profile, &session.grant.authority, &work.spec)?;
-            let mut refs = vec![format!("adaptive-session:{}:{}", session.grant.session_id, session.version),
+            let mut refs = vec![format!("project:{}:{}", project.project_id, project.version),
+                format!("adaptive-session:{}:{}", session.grant.session_id, session.version),
                 format!("adaptive-model-result:{}", session.last_model_result_digest.as_ref().ok_or("blocked model evidence missing")?),
                 format!("tool-catalog:{:x}", Sha256::digest(serde_json::to_vec(&catalog).map_err(|_| "catalog invalid")?))];
             if let Some(observation) = &session.last_observation {
@@ -209,7 +223,8 @@ impl WorkflowApi {
             for session in self.review_sessions(&project)? {
                 for call in self.store.adaptive_leadership_review_calls(&project.tenant_id, session.grant.session_id)
                     .map_err(|_| "leadership calls unavailable")? {
-                    if call.grant.leadership_principal.agent_id == Some(agent) && call.decision.is_none()
+                    if call.grant.leadership_principal.agent_id == Some(agent) && call.decision.is_none() && call.retired_at_unix_ms.is_none()
+                        && call.context.source_project == project && call.context.source_session == session
                         && call.dispatch.is_none() && now >= call.grant_issued_at_unix_ms && now < call.grant.expires_at_unix_ms {
                         return Ok(Some(call));
                     }
@@ -222,6 +237,7 @@ impl WorkflowApi {
     pub(super) fn prepare_leadership_review(&self, binding: &LeadershipAuthority) -> Result<LeadershipContext, &'static str> {
         let call = self.store.adaptive_leadership_review_call(&binding.grant.leadership_principal.tenant_id, binding.grant.review_id)
             .map_err(|_| "leadership call unavailable")?.ok_or("leadership call missing")?;
+        if call.retired_at_unix_ms.is_some() { return Err("leadership call retired"); }
         if LeadershipAuthority::from_call(&call) != *binding { return Err("leadership binding changed"); }
         let leader = self.principals.principal(&binding.grant.leadership_principal.principal_id).ok_or("leadership principal missing")?;
         if leader.principal != binding.grant.leadership_principal || leader.execution_authority != binding.grant.leadership_authority {
@@ -257,6 +273,7 @@ impl WorkflowApi {
         }
         let call = self.store.adaptive_leadership_review_call(&context.binding.grant.leadership_principal.tenant_id, context.binding.grant.review_id)
             .map_err(|_| "leadership call unavailable")?.ok_or("leadership call missing")?;
+        if call.retired_at_unix_ms.is_some() { return Err("leadership call retired"); }
         let context_digest = call.context_digest().map_err(|_| "leadership context digest invalid")?;
         if LeadershipAuthority::from_call(&call) != context.binding || call.context != context.source || call.request_id() != request_id
             || context.context_digest != context_digest
@@ -298,18 +315,34 @@ impl WorkflowApi {
         self.validate_company_employee(&leader.principal)?;
         let current_project = self.store.company_project(&leader.principal.tenant_id, &call.grant.project_id)
             .map_err(|_| "leadership current project unavailable")?.ok_or("leadership current project missing")?;
-        if current_project != call.context.source_project { return Err("leadership source project changed"); }
         let current_authority = self.authority.as_ref().ok_or("leadership runtime missing")?
             .snapshot(&current_project.tenant_id, &current_project.project_id, &call.grant.work_item_id, call.grant.assignee_authority.agent_id)
             .map_err(|_| "leadership current assignee unavailable")?;
         if current_authority != call.grant.assignee_authority { return Err("leadership assignee changed"); }
-        let event_id = if decision.resolves_blocked() {
-            let request = super::adaptive_recovery::ResolveBlockedAdaptiveWorkV1 { schema_version: 1,
+        let resolution_request = super::adaptive_recovery::ResolveBlockedAdaptiveWorkV1 { schema_version: 1,
                 operation_id: call.grant.review_id, project_id: call.grant.project_id.clone(), work_item_id: call.grant.work_item_id.clone(),
                 session_id: call.grant.session_id, expected_session_version: call.grant.expected_session_version,
                 expected_reason_code: call.grant.expected_reason_code.clone(), reason_ref: format!("leadership-review:{}:response:{digest}", call.grant.review_id) };
-            self.resolve_blocked_adaptive_work_fenced(&leader, &request).map_err(|_| "leadership resolution rejected")?;
-            Some(super::adaptive_recovery::resolution_event_id(request.operation_id))
+        let committed = decision.resolves_blocked() && self.committed_leadership_resolution(&leader,
+            &resolution_request, &call.context.source_session, &call.grant.assignment_id)?;
+        if committed {
+            // Only an exact committed audit permits append-only decision drift.
+            let mut relevant_project = current_project.clone();
+            if !relevant_project.decisions.starts_with(&call.context.source_project.decisions) {
+                return Err("leadership source decisions changed");
+            }
+            relevant_project.decisions = call.context.source_project.decisions.clone();
+            relevant_project.version = call.context.source_project.version;
+            relevant_project.updated_at_unix_ms = call.context.source_project.updated_at_unix_ms;
+            if relevant_project != call.context.source_project { return Err("leadership resolution project lineage changed"); }
+        } else if current_project != call.context.source_project {
+            return Err("leadership source project changed");
+        }
+        let event_id = if decision.resolves_blocked() {
+            if !committed {
+                self.resolve_blocked_adaptive_work_fenced(&leader, &resolution_request).map_err(|_| "leadership resolution rejected")?;
+            }
+            Some(super::adaptive_recovery::resolution_event_id(resolution_request.operation_id))
         } else { None };
         self.store.complete_adaptive_leadership_review_call(&leader.principal, &CompleteAdaptiveLeadershipReviewCallV1 {
             review_id: call.grant.review_id, allowance_id: call.allowance_id, request_digest: request_digest.to_owned(),
@@ -430,6 +463,66 @@ pub(crate) mod tests {
         let events = api.event_store.as_ref().unwrap();
         events.enqueue_llm_completion(id, digest, &payload.to_string()).unwrap();
         if ready { events.persist_llm_completion_usage(id, digest, &event).unwrap(); }
+    }
+
+    fn record_independent_decision(api: &WorkflowApi, project: &sentinel_workflow::ProjectV1) -> sentinel_workflow::ProjectV1 {
+        let leader = api.principals.principal("pm").unwrap();
+        let response = api.store.apply_company_command(&leader.principal, Uuid::new_v4(),
+            &CompanyWorkflowCommandV1::RecordDecision { project_id: project.project_id.clone(),
+                expected_version: project.version, work_item_id: None,
+                choice_ref: "Independent project decision".into(), rationale_ref: "No assignment or governance change".into() },
+            now_unix_ms()).unwrap();
+        let CompanyWorkflowResponseV1::Project(project) = response.response else { panic!("project decision"); };
+        *project
+    }
+
+    #[test]
+    fn stale_calls_retire_without_decisions_and_count_toward_head_bound() {
+        for dispatched in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (api, initial) = fixture(&temp.path().join("company.sqlite"), &temp.path().join("events.sqlite"));
+            let mut context = initial.clone();
+            for index in 0..ADAPTIVE_LEADERSHIP_MAX_REVIEWS {
+                let completion = make_completion(&context, "resolve_blocked");
+                let queued = if dispatched {
+                    let (id, digest) = reserve_and_claim(&api, &context);
+                    persist(&api, &completion, &context, &id, &digest, true);
+                    Some((id, digest))
+                } else { None };
+                let project = record_independent_decision(&api, &context.source.source_project);
+                if let Some((id, digest)) = &queued {
+                    assert!(api.accept_leadership_review(&completion, &context, id, digest).is_err());
+                }
+                {
+                    let _fence = api.mutation_fence.write().unwrap();
+                    assert!(api.reconcile_adaptive_leadership_reviews(&project).unwrap());
+                    assert!(api.reconcile_adaptive_leadership_reviews(&project).unwrap());
+                }
+                let retired = api.store.adaptive_leadership_review_call(&project.tenant_id, context.binding.grant.review_id).unwrap().unwrap();
+                assert_eq!(retired.version, 4);
+                assert!(retired.retired_at_unix_ms.is_some());
+                assert!(retired.decision.is_none());
+                assert!(retired.model_response_digest.is_none());
+                assert!(retired.resolution_event_id.is_none());
+                assert_eq!(retired.grant, context.binding.grant);
+                assert!(api.prepare_leadership_review(&context.binding).is_err());
+                if let Some((id, digest)) = &queued {
+                    assert!(api.accept_leadership_review(&completion, &context, id, digest).is_err());
+                }
+                let next = api.leadership_review_for_agent(context.binding.grant.leadership_principal.agent_id.unwrap()).unwrap();
+                if index + 1 < ADAPTIVE_LEADERSHIP_MAX_REVIEWS {
+                    let next = next.unwrap();
+                    assert_ne!(next.grant.review_id, context.binding.grant.review_id);
+                    assert_ne!(next.grant.evidence_fingerprint, context.binding.grant.evidence_fingerprint);
+                    assert_eq!(next.grant.expected_project_version, project.version);
+                    context = api.prepare_leadership_review(&LeadershipAuthority::from_call(&next)).unwrap();
+                } else {
+                    assert!(next.is_none());
+                    assert_eq!(api.store.adaptive_leadership_review_calls(&project.tenant_id, initial.binding.grant.session_id).unwrap().len(), ADAPTIVE_LEADERSHIP_MAX_REVIEWS);
+                }
+                assert_eq!(api.store.adaptive_session_for_authority(&initial.binding.grant.assignee_authority).unwrap(), Some(initial.source.source_session.clone()));
+            }
+        }
     }
 
     #[test]
@@ -586,7 +679,8 @@ pub(crate) mod tests {
     fn journal_then_receipt_crash_replays_with_no_provider_or_rollover() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("company.sqlite");
-        let (api, context) = fixture(&path, &temp.path().join("events.sqlite"));
+        let event_path = temp.path().join("events.sqlite");
+        let (api, context) = fixture(&path, &event_path);
         let (id, digest) = reserve_and_claim(&api, &context);
         let completion = make_completion(&context, "resolve_blocked");
         persist(&api, &completion, &context, &id, &digest, true);
@@ -598,14 +692,32 @@ pub(crate) mod tests {
             expected_reason_code:context.binding.grant.expected_reason_code.clone(),
             reason_ref:format!("leadership-review:{}:response:{response_digest}",context.binding.grant.review_id) };
         assert_eq!(api.resolve_blocked_adaptive_work(&api.principals.principal("pm").unwrap(), &serde_json::to_vec(&request).unwrap()).status, 200);
-        let project = &context.source.source_project;
-        assert!(api.reconcile_adaptive_leadership_reviews(project).unwrap());
+        let project = &record_independent_decision(&api, &context.source.source_project);
+        let resolved = api.store.adaptive_session_for_authority(&context.binding.grant.assignee_authority).unwrap().unwrap();
+        let event_id = super::super::adaptive_recovery::resolution_event_id(request.operation_id).to_string();
+        let audit = api.event_store.as_ref().unwrap().event_v2_by_id(&event_id).unwrap().unwrap();
+        drop(api);
+        let mut api = super::super::model_work::configured_test_api(&path);
+        api.event_store = Some(sentinel_limbo::EventStore::open(event_path.to_str().unwrap()).unwrap());
+        {
+            let _fence = api.mutation_fence.write().unwrap();
+            assert!(api.reconcile_adaptive_leadership_reviews(project).unwrap());
+        }
         assert!(api.leadership_review_for_agent(context.binding.grant.leadership_principal.agent_id.unwrap()).unwrap().is_none());
-        api.accept_leadership_review(&completion, &context, &id, &digest).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| api.accept_leadership_review(&completion, &context, &id, &digest).unwrap());
+            }
+        });
         api.accept_leadership_review(&completion, &context, &id, &digest).unwrap();
         let session = api.store.adaptive_session_for_authority(&context.binding.grant.assignee_authority).unwrap().unwrap();
         assert_eq!(session.version, context.binding.grant.expected_session_version + 1);
-        assert!(!api.reconcile_adaptive_leadership_reviews(project).unwrap());
+        assert_eq!(session, resolved);
+        assert_eq!(api.event_store.as_ref().unwrap().event_v2_by_id(&event_id).unwrap(), Some(audit));
+        {
+            let _fence = api.mutation_fence.write().unwrap();
+            assert!(!api.reconcile_adaptive_leadership_reviews(project).unwrap());
+        }
         let receipt = api.store.adaptive_leadership_review_call(&project.tenant_id, context.binding.grant.review_id).unwrap().unwrap();
         assert_eq!(receipt.model_response_digest.as_deref(), Some(response_digest.as_str()));
         assert_eq!(receipt.resolution_event_id, Some(super::super::adaptive_recovery::resolution_event_id(request.operation_id)));
