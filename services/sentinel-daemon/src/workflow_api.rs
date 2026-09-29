@@ -5185,8 +5185,12 @@ impl WorkflowApi {
 
 #[cfg(feature = "llm")]
 impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
+    fn allows_unbound_provider_usage(&self) -> bool {
+        self.subscription_allowance_id.is_none() && self.request_sales_tenant.is_none()
+    }
+
     fn is_provider_usage_candidate(&self, agent_id: AgentId) -> Result<bool, &'static str> {
-        if self.request_sales_tenant.is_none() {
+        if self.request_sales_tenant.is_none() && self.subscription_allowance_id.is_none() {
             return Ok(true);
         }
         if self

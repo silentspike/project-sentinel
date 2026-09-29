@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::{
-    adaptive_collaboration_digest, AdaptiveEffectV1, AdaptiveModelDecisionV1, AdaptiveSessionGrantV1,
-    AdaptiveSessionV1, AdaptiveTransitionV1,
+    adaptive_collaboration_digest, AdaptiveEffectV1, AdaptiveModelDecisionV1,
+    AdaptiveSessionGrantV1, AdaptiveSessionV1, AdaptiveTransitionV1,
 };
 use serde::Deserialize;
 
@@ -119,7 +119,10 @@ impl WorkflowStore {
             )
             .map_err(map_sqlite_error)?;
         let mut rows = statement
-            .query(params![namespace(grant.session_id), MAX_JOURNAL_ENTRIES as i64])
+            .query(params![
+                namespace(grant.session_id),
+                MAX_JOURNAL_ENTRIES as i64
+            ])
             .map_err(map_sqlite_error)?;
         let mut collaboration_digest = None;
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {

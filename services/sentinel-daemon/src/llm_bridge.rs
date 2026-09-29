@@ -129,6 +129,10 @@ pub mod bridge {
     }
 
     pub trait ProviderUsageAuthorityResolver: Send + Sync {
+        fn allows_unbound_provider_usage(&self) -> bool {
+            true
+        }
+
         fn is_provider_usage_candidate(&self, _agent_id: AgentId) -> Result<bool, &'static str> {
             Ok(true)
         }
@@ -913,6 +917,9 @@ pub mod bridge {
     ) -> Result<(), String> {
         match resolver {
             Some(resolver) => {
+                if expected.is_none() && !resolver.allows_unbound_provider_usage() {
+                    return Err("provider work requires explicit authority".to_owned());
+                }
                 let current = resolver
                     .resolve_provider_usage_authority(agent_id)
                     .map_err(|reason| format!("provider usage reauthorization failed: {reason}"))?;
@@ -931,7 +938,11 @@ pub mod bridge {
     fn validate_provider_usage_mode(
         authority: Option<&ProviderExecutionAuthority>,
         usage_v2_enabled: bool,
+        unbound_allowed: bool,
     ) -> Result<(), &'static str> {
+        if authority.is_none() && !unbound_allowed {
+            return Err("provider work requires explicit authority");
+        }
         if authority.is_some() && !usage_v2_enabled {
             return Err("project provider usage requires schema-v3 accounting");
         }
@@ -1453,9 +1464,18 @@ pub mod bridge {
                     error!(agent = %agent_id, "Provider usage authority returned another agent");
                     continue;
                 }
-                if let Err(reason) =
-                    validate_provider_usage_mode(usage_authority.as_ref(), config.usage_v2_enabled)
-                {
+                let unbound_allowed = config
+                    .provider_usage_authority
+                    .as_ref()
+                    .is_none_or(|resolver| resolver.allows_unbound_provider_usage());
+                if usage_authority.is_none() && !unbound_allowed {
+                    continue;
+                }
+                if let Err(reason) = validate_provider_usage_mode(
+                    usage_authority.as_ref(),
+                    config.usage_v2_enabled,
+                    unbound_allowed,
+                ) {
                     error!(agent = %agent_id, reason, "Provider usage accounting is unavailable");
                     continue;
                 }
@@ -2742,6 +2762,8 @@ pub mod bridge {
                 EventStore,
                 ProviderExecutionAuthority,
                 String,
+                ModelWorkContext,
+                String,
             ) {
                 let (api, authority, store) =
                     crate::workflow_api::model_work::configured_adaptive_test_api(
@@ -2829,11 +2851,11 @@ pub mod bridge {
                 )
                 .unwrap();
                 assert!(rx.try_recv().is_err());
-                (api, store, binding, id)
+                (api, store, binding, id, context, digest)
             }
 
             let accepted = tempfile::tempdir().unwrap();
-            let (api, store, _, id) = run_case(
+            let (api, store, _, id, context, digest) = run_case(
                 accepted.path(),
                 r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"dependency_unavailable"}}"#,
             );
@@ -2850,9 +2872,27 @@ pub mod bridge {
                 "a terminal adaptive campaign cannot fall back to legacy execution"
             );
             assert!(api.resolve_provider_usage_authority(AgentId(7)).is_err());
+            assert!(!api.allows_unbound_provider_usage());
+            assert!(!api.is_provider_usage_candidate(AgentId(6)).unwrap());
+            assert!(validate_provider_usage_mode(None, true, false).is_err());
+            assert!(
+                validate_current_provider_usage_authority(Some(&api), None, AgentId(6)).is_err()
+            );
+            let mut replay = ModelWorkCompletion {
+                context,
+                content: r#"{"schema_version":1,"decision":{"kind":"blocked","reason_code":"dependency_unavailable"}}"#.to_owned(),
+                admissible: true,
+            };
+            api.admit_model_work(&replay, &id, &digest).unwrap();
+            assert!(store.get_completion(&id).unwrap().is_none());
+            replay.content = replay
+                .content
+                .replace("dependency_unavailable", "changed_reason");
+            assert!(api.admit_model_work(&replay, &id, &digest).is_err());
 
             let rejected = tempfile::tempdir().unwrap();
-            let (api, store, binding, id) = run_case(rejected.path(), r#"{"not":"a decision"}"#);
+            let (api, store, binding, id, _, _) =
+                run_case(rejected.path(), r#"{"not":"a decision"}"#);
             assert!(store.get_completion(&id).unwrap().is_some());
             assert_eq!(
                 api.resolve_provider_usage_authority(AgentId(6))
@@ -4161,11 +4201,14 @@ pub mod bridge {
                 "company-provider-reservation-m0"
             );
             assert_eq!(
-                validate_provider_usage_mode(Some(&authority.clone().into()), true),
+                validate_provider_usage_mode(Some(&authority.clone().into()), true, false),
                 Ok(())
             );
-            assert!(validate_provider_usage_mode(Some(&authority.clone().into()), false).is_err());
-            assert_eq!(validate_provider_usage_mode(None, false), Ok(()));
+            assert!(
+                validate_provider_usage_mode(Some(&authority.clone().into()), false, false)
+                    .is_err()
+            );
+            assert_eq!(validate_provider_usage_mode(None, false, true), Ok(()));
             let mut response = GatewayResponse {
                 content: "done".to_owned(),
                 decision: "forward".to_owned(),

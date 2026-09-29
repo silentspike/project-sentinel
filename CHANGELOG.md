@@ -6,6 +6,8 @@
   duplicate authority instead of treating a valid work queue as ambiguous (#856).
   Treat an exactly authorized inactive adaptive campaign as idle without
   admitting foreign employees or falling back to legacy execution.
+  Require explicit provider authority before dispatch in bounded company modes,
+  and recognize exact journaled adaptive results during completion recovery.
 
 - Admit customer Sales work through an explicit opt-in bounded Operator policy
   and durable per-request grants instead of a single process-global request.
