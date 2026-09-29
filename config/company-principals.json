@@ -230,6 +230,16 @@
       "customer_id": null,
       "agent_id": 60,
       "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-internal-customer",
+      "tenant_id": "m0-company",
+      "principal_id": "customer-internal",
+      "kind": "customer",
+      "role": "customer",
+      "customer_id": "customer-internal",
+      "agent_id": null,
+      "authority_generation": 1
     }
   ]
 }
