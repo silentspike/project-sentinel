@@ -216,6 +216,9 @@ func (a *SubscriptionAdmission) claim(ctx context.Context, claim subscriptionDis
 	if err != nil || len(receiptBytes) > 4096 {
 		return time.Time{}, errors.New("subscription claim receipt exceeds its bound")
 	}
+	if claim.SchemaVersion == 5 && !exactLeadershipReceiptFields(receiptBytes) {
+		return time.Time{}, errors.New("invalid leadership claim receipt fields")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(receiptBytes))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&receipt); err != nil {
@@ -228,6 +231,38 @@ func (a *SubscriptionAdmission) claim(ctx context.Context, claim subscriptionDis
 		return time.Time{}, errors.New("subscription claim receipt mismatch")
 	}
 	return time.UnixMilli(receipt.DeadlineUnixMS), nil
+}
+
+// encoding/json otherwise accepts duplicate and case-insensitive field names.
+func exactLeadershipReceiptFields(body []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return false
+	}
+	seen := make(map[string]bool, 5)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		key, ok := token.(string)
+		if !ok || seen[key] {
+			return false
+		}
+		switch key {
+		case "schema_version", "allowance_id", "request_id", "request_digest", "deadline_unix_ms":
+		default:
+			return false
+		}
+		seen[key] = true
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return false
+		}
+	}
+	end, err := decoder.Token()
+	return err == nil && end == json.Delim('}') && len(seen) == 5
 }
 
 func (a *SubscriptionAdmission) send(ctx context.Context, provider Provider, req *LLMRequest) (*LLMResponse, error) {
