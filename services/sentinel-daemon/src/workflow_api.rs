@@ -2649,17 +2649,33 @@ fn select_provider_usage_binding(
     Ok(selected)
 }
 
+#[cfg(test)]
 fn select_actionable_subscription_allowance_id<F>(
     projects: &[sentinel_workflow::ProjectV1],
     agent_id: AgentId,
     now_ms: u64,
-    mut locally_recoverable: F,
+    locally_recoverable: F,
 ) -> Result<Option<&str>, &'static str>
 where
     F: FnMut(&str) -> Result<bool, &'static str>,
 {
-    let mut recovery = None;
-    let mut dispatchable = None;
+    select_subscription_queue_allowance_id(projects, agent_id, now_ms, locally_recoverable, |_| {
+        Ok(Some(2))
+    })
+}
+
+fn select_subscription_queue_allowance_id<F, G>(
+    projects: &[sentinel_workflow::ProjectV1],
+    agent_id: AgentId,
+    now_ms: u64,
+    mut locally_recoverable: F,
+    mut adaptive_priority: G,
+) -> Result<Option<&str>, &'static str>
+where
+    F: FnMut(&str) -> Result<bool, &'static str>,
+    G: FnMut(&ProviderUsageBinding) -> Result<Option<u8>, &'static str>,
+{
+    let mut selected = None;
     for project in projects {
         let Some(allowance) = project
             .subscription_call
@@ -2668,27 +2684,48 @@ where
         else {
             continue;
         };
-        if select_provider_usage_binding(projects, agent_id, Some(&allowance.allowance_id))?
-            .is_none()
-        {
+        let Some(binding) =
+            select_provider_usage_binding(projects, agent_id, Some(&allowance.allowance_id))?
+        else {
             continue;
-        }
+        };
+        let adaptive_rank = if allowance.grant.max_calls > 1 {
+            let Some(rank) = adaptive_priority(&binding)? else {
+                continue;
+            };
+            rank
+        } else {
+            2
+        };
         let has_local_completion = match &allowance.dispatch {
             Some(dispatch) => locally_recoverable(&dispatch.request_id)?,
             None => false,
         };
-        let selected = if has_local_completion {
-            &mut recovery
+        let priority = if has_local_completion || adaptive_rank == 0 {
+            0
         } else if now_ms < allowance.grant.expires_at_unix_ms {
-            &mut dispatchable
+            if allowance.dispatch.is_some() {
+                1
+            } else {
+                adaptive_rank
+            }
         } else {
             continue;
         };
-        if selected.replace(allowance.allowance_id.as_str()).is_some() {
-            return Err("agent has ambiguous subscription work authority");
+        // Scheduling independent grants must not merge their authority. Exact
+        // duplicate/assignment validation above still fails closed for every row.
+        let candidate = (
+            priority,
+            allowance.created_at_unix_ms,
+            project.tenant_id.0.as_str(),
+            project.project_id.0.as_str(),
+            allowance.allowance_id.as_str(),
+        );
+        if selected.is_none_or(|current| candidate < current) {
+            selected = Some(candidate);
         }
     }
-    Ok(recovery.or(dispatchable))
+    Ok(selected.map(|(_, _, _, _, allowance_id)| allowance_id))
 }
 
 fn validate_provider_usage_event(
@@ -3891,8 +3928,10 @@ impl WorkflowApi {
         &self,
         agent_id: AgentId,
     ) -> Result<Option<ProviderUsageBinding>, &'static str> {
-        let binding = self.selected_provider_usage_binding_for_agent(agent_id)?;
+        let (binding, inactive_adaptive_work) =
+            self.selected_provider_usage_binding_with_queue_state(agent_id)?;
         if self.subscription_allowance_id.is_some()
+            && !(binding.is_none() && inactive_adaptive_work)
             && !binding
                 .as_ref()
                 .is_some_and(|binding| binding.subscription_grant.is_some())
@@ -3906,14 +3945,23 @@ impl WorkflowApi {
         &self,
         agent_id: AgentId,
     ) -> Result<Option<ProviderUsageBinding>, &'static str> {
+        self.selected_provider_usage_binding_with_queue_state(agent_id)
+            .map(|(binding, _)| binding)
+    }
+
+    fn selected_provider_usage_binding_with_queue_state(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<(Option<ProviderUsageBinding>, bool), &'static str> {
         if !self.enabled {
-            return Ok(None);
+            return Ok((None, false));
         }
         let projects = self
             .store
             .company_projects()
             .map_err(|_| "company provider authority could not be read")?;
-        let selected_allowance = select_actionable_subscription_allowance_id(
+        let mut inactive_adaptive_work = false;
+        let selected_allowance = select_subscription_queue_allowance_id(
             &projects,
             agent_id,
             now_unix_ms(),
@@ -3928,11 +3976,27 @@ impl WorkflowApi {
                     matches!(entry.status.as_str(), "pending_usage" | "ready_for_action")
                 }))
             },
+            |binding| {
+                #[cfg(feature = "llm")]
+                {
+                    let priority = self.adaptive_subscription_queue_priority(binding)?;
+                    // Exact grant validation precedes this callback. An idle
+                    // authorized campaign is not a foreign-agent authorization.
+                    inactive_adaptive_work |= priority.is_none();
+                    Ok(priority)
+                }
+                #[cfg(not(feature = "llm"))]
+                {
+                    let _ = binding;
+                    Err("adaptive model work unavailable")
+                }
+            },
         )?;
         if self.subscription_allowance_id.is_some() && selected_allowance.is_none() {
-            return Ok(None);
+            return Ok((None, inactive_adaptive_work));
         }
         select_provider_usage_binding(&projects, agent_id, selected_allowance)
+            .map(|binding| (binding, inactive_adaptive_work))
     }
 
     fn agent_command(&self, principal: &BoundPrincipal, body: &[u8]) -> WorkflowHttpResponse {
@@ -5121,8 +5185,12 @@ impl WorkflowApi {
 
 #[cfg(feature = "llm")]
 impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
+    fn allows_unbound_provider_usage(&self) -> bool {
+        self.subscription_allowance_id.is_none() && self.request_sales_tenant.is_none()
+    }
+
     fn is_provider_usage_candidate(&self, agent_id: AgentId) -> Result<bool, &'static str> {
-        if self.request_sales_tenant.is_none() {
+        if self.request_sales_tenant.is_none() && self.subscription_allowance_id.is_none() {
             return Ok(true);
         }
         if self
