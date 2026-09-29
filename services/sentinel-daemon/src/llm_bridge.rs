@@ -330,6 +330,9 @@ pub mod bridge {
         tokens_used: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_work: Option<ModelWorkCompletion>,
+        // Digest of the retained, bounded content, including inadmissible content.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_response_digest: Option<String>,
     }
 
     trait CompletionStore: Send + Sync {
@@ -352,6 +355,13 @@ pub mod bridge {
         ) -> anyhow::Result<()>;
         fn get_completion(&self, request_id: &str) -> anyhow::Result<Option<LlmCompletionEntry>>;
         fn poll_completions(&self, limit: usize) -> anyhow::Result<Vec<LlmCompletionEntry>>;
+        fn poll_provider_in_flight(&self, limit: usize) -> anyhow::Result<Vec<LlmCompletionEntry>>;
+        fn mark_provider_unknown(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+            reason: &str,
+        ) -> anyhow::Result<bool>;
         fn persist_usage(
             &self,
             request_id: &str,
@@ -371,6 +381,19 @@ pub mod bridge {
     }
 
     impl CompletionStore for EventStore {
+        fn poll_provider_in_flight(&self, limit: usize) -> anyhow::Result<Vec<LlmCompletionEntry>> {
+            self.poll_llm_provider_in_flight(limit)
+        }
+
+        fn mark_provider_unknown(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+            reason: &str,
+        ) -> anyhow::Result<bool> {
+            self.mark_llm_provider_outcome_unknown(request_id, request_digest, reason)
+        }
+
         fn reserve_request(
             &self,
             request_id: &str,
@@ -434,6 +457,132 @@ pub mod bridge {
 
         fn has_operation(&self, operation_id: &str) -> anyhow::Result<bool> {
             self.has_event_operation_id(operation_id)
+        }
+    }
+
+    type ActiveProviderRequests = Arc<Mutex<HashMap<String, usize>>>;
+
+    // Register before reserving, so the orphan watcher cannot race live dispatch.
+    // Counts also protect the original task when a duplicate reservation is denied.
+    struct ProviderOutcomeGuard<S: CompletionStore> {
+        store: Arc<S>,
+        request_id: String,
+        request_digest: String,
+        active: ActiveProviderRequests,
+        armed: bool,
+    }
+
+    impl<S: CompletionStore> ProviderOutcomeGuard<S> {
+        fn new(
+            store: Arc<S>,
+            active: ActiveProviderRequests,
+            request_id: &str,
+            request_digest: &str,
+        ) -> Self {
+            *active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(request_id.to_owned())
+                .or_default() += 1;
+            Self {
+                store,
+                active,
+                request_id: request_id.to_owned(),
+                request_digest: request_digest.to_owned(),
+                armed: false,
+            }
+        }
+
+        fn disarm_if_resolved(&mut self) {
+            match self.store.get_completion(&self.request_id) {
+                Ok(None) => self.armed = false,
+                Ok(Some(entry))
+                    if entry.request_digest == self.request_digest
+                        && (entry.status != "provider_in_flight" || !entry.payload.is_empty()) =>
+                {
+                    self.armed = false;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl<S: CompletionStore> Drop for ProviderOutcomeGuard<S> {
+        fn drop(&mut self) {
+            self.disarm_if_resolved();
+            if self.armed {
+                if let Err(error) = self.store.mark_provider_unknown(
+                    &self.request_id,
+                    &self.request_digest,
+                    "UnknownOutcome: bridge_task_ended_without_durable_response",
+                ) {
+                    // Completion/release may remove the row between lookup and mark.
+                    self.disarm_if_resolved();
+                    if self.armed {
+                        error!(request_id = %self.request_id, error = %error, "Provider outcome classification failed closed");
+                    }
+                }
+            }
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(count) = active.get_mut(&self.request_id) {
+                *count -= 1;
+                if *count == 0 {
+                    active.remove(&self.request_id);
+                }
+            }
+        }
+    }
+
+    fn unix_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    fn classify_stale_provider_requests<S: CompletionStore>(
+        store: &S,
+        active: &ActiveProviderRequests,
+        now_ms: u64,
+        request_timeout: Duration,
+    ) {
+        // Age bounds orphaned transport only. Live tasks have the reqwest deadline
+        // and their drop guard; local durable persistence must not be interrupted.
+        let active = active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let age = u64::try_from(request_timeout.as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_add(10_000);
+        match store.poll_provider_in_flight(64) {
+            Ok(entries) => {
+                for entry in entries {
+                    if entry.status == "provider_in_flight"
+                        && entry.payload.is_empty()
+                        && !active.contains_key(&entry.request_id)
+                        && now_ms >= entry.created_at.saturating_add(age)
+                    {
+                        if let Err(error) = store.mark_provider_unknown(
+                            &entry.request_id,
+                            &entry.request_digest,
+                            "UnknownOutcome: provider_transport_deadline_elapsed",
+                        ) {
+                            let unresolved = store.get_completion(&entry.request_id)
+                                .map(|current| current.is_some_and(|current| {
+                                    current.status == "provider_in_flight" && current.payload.is_empty()
+                                }))
+                                .unwrap_or(true);
+                            if unresolved {
+                                error!(request_id = %entry.request_id, error = %error, "Stale provider classification failed closed");
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => error!(error = %error, "Provider reservation scan failed closed"),
         }
     }
 
@@ -659,6 +808,9 @@ pub mod bridge {
             agent_id,
             tenant_id: authority.map(|value| value.tenant_id().to_owned()),
             project_id: authority.and_then(|value| match value {
+                ProviderExecutionAuthority::AdaptiveLeadershipReview(review) => {
+                    Some(review.grant.project_id.0.clone())
+                }
                 ProviderExecutionAuthority::Project(project) => Some(project.project_id.clone()),
                 ProviderExecutionAuthority::Adaptive(adaptive) => {
                     Some(adaptive.grant.authority.project_id.0.clone())
@@ -669,6 +821,9 @@ pub mod bridge {
                 ProviderExecutionAuthority::RequestSales(_) => None,
             }),
             work_item_id: authority.and_then(|value| match value {
+                ProviderExecutionAuthority::AdaptiveLeadershipReview(review) => {
+                    Some(review.grant.work_item_id.0.clone())
+                }
                 ProviderExecutionAuthority::Project(project) => Some(project.work_item_id.clone()),
                 ProviderExecutionAuthority::Adaptive(adaptive) => {
                     Some(adaptive.grant.authority.work_item_id.0.clone())
@@ -678,6 +833,9 @@ pub mod bridge {
             }),
             reservation_id: authority.map(|value| value.reservation_id().to_owned()),
             assignment_id: authority.and_then(|value| match value {
+                ProviderExecutionAuthority::AdaptiveLeadershipReview(review) => {
+                    Some(review.grant.assignment_id.clone())
+                }
                 ProviderExecutionAuthority::Project(project) => Some(project.assignment_id.clone()),
                 ProviderExecutionAuthority::Adaptive(adaptive) => {
                     Some(adaptive.assignment_id.clone())
@@ -686,6 +844,9 @@ pub mod bridge {
                 | ProviderExecutionAuthority::ProjectPlanning(_) => None,
             }),
             assignment_version: authority.and_then(|value| match value {
+                ProviderExecutionAuthority::AdaptiveLeadershipReview(review) => {
+                    Some(review.grant.assignee_authority.assignment_version)
+                }
                 ProviderExecutionAuthority::Project(project) => Some(project.assignment_version),
                 ProviderExecutionAuthority::Adaptive(adaptive) => {
                     Some(adaptive.grant.authority.assignment_version)
@@ -736,6 +897,7 @@ pub mod bridge {
         }
         if usage_v2_enabled {
             event = event.with_schema_version(match authority {
+                Some(ProviderExecutionAuthority::AdaptiveLeadershipReview(_)) => 6,
                 Some(ProviderExecutionAuthority::RequestSales(_)) => 4,
                 Some(ProviderExecutionAuthority::ProjectPlanning(_)) => 5,
                 Some(
@@ -778,6 +940,9 @@ pub mod bridge {
             || completed.request_digest != entry.request_digest
             || completed.model_work.as_ref().is_some_and(|model_work| {
                 !completed.actions.is_empty()
+                    || (matches!(model_work.context, ModelWorkContext::AdaptiveLeadershipReview(_))
+                        && completed.model_response_digest.as_deref()
+                            != Some(format!("{:x}", Sha256::digest(model_work.content.as_bytes())).as_str()))
                     || entry.owner_scope
                         != sentinel_common::StateTransferScope::for_agent(
                             model_work.context.binding().agent_id().to_string(),
@@ -1097,6 +1262,10 @@ pub mod bridge {
             usage_event,
             actions,
             tokens_used: gateway_resp.tokens_used.max(0) as u64,
+            model_response_digest: model_completion.as_ref().and_then(|completion| {
+                matches!(completion.context, ModelWorkContext::AdaptiveLeadershipReview(_))
+                    .then(|| format!("{:x}", Sha256::digest(completion.content.as_bytes())))
+            }),
             model_work: model_completion,
         };
         let payload = serde_json::to_string(&completed).map_err(|error| error.to_string())?;
@@ -1284,6 +1453,7 @@ pub mod bridge {
         let pending_retries = Arc::new(AsyncMutex::new(HashMap::<AgentId, Perception>::new()));
         let mut last_call_tick: HashMap<AgentId, u64> = HashMap::new();
         let mut provider_tasks = JoinSet::new();
+        let active_provider_requests: ActiveProviderRequests = Arc::new(Mutex::new(HashMap::new()));
         let mut provider_task_failed = false;
         // Debounce: Operator-Impulse (Gaia/Broadcast) nur beim ERSTEN Tick urgent,
         // danach 60 Ticks Cooldown. Verhindert Semaphore-Starvation bei 300-Tick TTL.
@@ -1298,6 +1468,12 @@ pub mod bridge {
         } else {
             config.completion_retry_interval
         };
+        classify_stale_provider_requests(
+            event_store.as_ref(),
+            &active_provider_requests,
+            unix_now_ms(),
+            config.request_timeout,
+        );
         recover_completion_batch(
             event_store.as_ref(),
             &action_tx,
@@ -1310,6 +1486,8 @@ pub mod bridge {
         let recovery_interval = completion_retry_interval;
         let recovery_max_attempts = completion_max_attempts;
         let recovery_resolver = config.provider_usage_authority.clone();
+        let recovery_request_timeout = config.request_timeout;
+        let recovery_active = Arc::clone(&active_provider_requests);
         let recovery_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(recovery_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1317,12 +1495,16 @@ pub mod bridge {
             interval.tick().await;
             loop {
                 tokio::select! {
-                    _ = interval.tick() => recover_completion_batch(
-                        recovery_store.as_ref(),
-                        &recovery_action_tx,
-                        recovery_max_attempts,
-                        recovery_resolver.as_deref(),
-                    ),
+                    _ = interval.tick() => {
+                        classify_stale_provider_requests(
+                            recovery_store.as_ref(), &recovery_active,
+                            unix_now_ms(), recovery_request_timeout,
+                        );
+                        recover_completion_batch(
+                            recovery_store.as_ref(), &recovery_action_tx,
+                            recovery_max_attempts, recovery_resolver.as_deref(),
+                        );
+                    },
                     changed = recovery_shutdown_rx.changed() => {
                         if changed.is_err() || *recovery_shutdown_rx.borrow() {
                             break;
@@ -1492,6 +1674,13 @@ pub mod bridge {
                 }
 
                 let request_id = agent_runtime_request_id(&perception, usage_authority.as_ref());
+                if active_provider_requests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&request_id)
+                {
+                    continue;
+                }
                 if let Some(authority) = usage_authority.as_ref() {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -1622,6 +1811,7 @@ pub mod bridge {
                 let usage_v2_enabled = config.usage_v2_enabled;
                 let request_completion_max_attempts = completion_max_attempts;
                 let task_provider_admission = Arc::clone(&provider_admission);
+                let task_active = Arc::clone(&active_provider_requests);
                 let provider_usage_authority = usage_authority.clone();
                 let provider_usage_authority_resolver =
                     config.provider_usage_authority.as_ref().map(Arc::clone);
@@ -1664,6 +1854,9 @@ pub mod bridge {
                             }
                         };
                         let call_start = Instant::now();
+                        let mut outcome_guard = ProviderOutcomeGuard::new(
+                            Arc::clone(&bridge_event_store), task_active, &request_id, &request_digest,
+                        );
                         match reserve_provider_request(
                             task_provider_admission.as_ref(),
                             bridge_event_store.as_ref(),
@@ -1671,7 +1864,7 @@ pub mod bridge {
                             &request_digest,
                             &agent_id.to_string(),
                         ) {
-                            Ok(Some(true)) => {}
+                            Ok(Some(true)) => outcome_guard.armed = true,
                             Ok(Some(false)) => {
                                 warn!(request_id = %request_id, "LLM provider request already reserved");
                                 return;
@@ -1695,6 +1888,7 @@ pub mod bridge {
                             model_work.as_ref(),
                         ) {
                             warn!(request_id = %request_id, error, "Provider request reauthorization failed before dispatch");
+                            outcome_guard.disarm_if_resolved();
                             return;
                         }
                         match agent_runtime_request(
@@ -1735,6 +1929,7 @@ pub mod bridge {
                                                 request_completion_max_attempts,
                                             ) {
                                                 warn!(agent = %agent_id, error = %e, "Completed gateway response rejected fail-closed");
+                                                outcome_guard.disarm_if_resolved();
                                                 telemetry
                                                     .calls_failed
                                                     .fetch_add(1, Ordering::Relaxed);
@@ -1742,6 +1937,7 @@ pub mod bridge {
                                                 return;
                                             }
                                             let latency_ms = call_start.elapsed().as_millis();
+                                            outcome_guard.armed = false;
                                             telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
                                             telemetry.tokens_total.fetch_add(
                                                 gateway_resp.tokens_used.max(0) as u64,
@@ -1776,6 +1972,9 @@ pub mod bridge {
                                         provider_io,
                                     );
                                     warn!(agent = %agent_id, status = status.as_u16(), reservation_released, "Gateway HTTP Fehler");
+                                    if reservation_released {
+                                        outcome_guard.armed = false;
+                                    }
                                     telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                     cb.lock().unwrap().record_failure();
                                 }
@@ -1789,6 +1988,9 @@ pub mod bridge {
                                     &e,
                                 );
                                 warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, reservation_released, "Gateway Request fehlgeschlagen");
+                                if reservation_released {
+                                    outcome_guard.armed = false;
+                                }
                                 telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                 cb.lock().unwrap().record_failure();
                             }
@@ -1805,6 +2007,9 @@ pub mod bridge {
                     };
                     provider_tasks.spawn(async move {
                         let call_start = Instant::now();
+                        let mut outcome_guard = ProviderOutcomeGuard::new(
+                            Arc::clone(&bridge_event_store), task_active, &request_id, &request_digest,
+                        );
                         match reserve_provider_request(
                             task_provider_admission.as_ref(),
                             bridge_event_store.as_ref(),
@@ -1812,7 +2017,7 @@ pub mod bridge {
                             &request_digest,
                             &agent_id.to_string(),
                         ) {
-                            Ok(Some(true)) => {}
+                            Ok(Some(true)) => outcome_guard.armed = true,
                             Ok(Some(false)) => {
                                 warn!(request_id = %request_id, "LLM provider request already reserved");
                                 return;
@@ -1836,6 +2041,7 @@ pub mod bridge {
                             model_work.as_ref(),
                         ) {
                             warn!(request_id = %request_id, error, "Provider request reauthorization failed before dispatch");
+                            outcome_guard.disarm_if_resolved();
                             return;
                         }
                         match agent_runtime_request(
@@ -1874,6 +2080,7 @@ pub mod bridge {
                                                 request_completion_max_attempts,
                                             ) {
                                                 warn!(agent = %agent_id, error = %e, "Completed gateway response rejected fail-closed");
+                                                outcome_guard.disarm_if_resolved();
                                                 telemetry
                                                     .calls_failed
                                                     .fetch_add(1, Ordering::Relaxed);
@@ -1881,6 +2088,7 @@ pub mod bridge {
                                                 return;
                                             }
                                             let latency_ms = call_start.elapsed().as_millis();
+                                            outcome_guard.armed = false;
                                             telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
                                             telemetry.tokens_total.fetch_add(
                                                 gateway_resp.tokens_used.max(0) as u64,
@@ -1915,6 +2123,9 @@ pub mod bridge {
                                         provider_io,
                                     );
                                     warn!(agent = %agent_id, status = status.as_u16(), reservation_released, "Gateway HTTP Fehler");
+                                    if reservation_released {
+                                        outcome_guard.armed = false;
+                                    }
                                     telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                     cb.lock().unwrap().record_failure();
                                 }
@@ -1928,6 +2139,9 @@ pub mod bridge {
                                     &e,
                                 );
                                 warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, reservation_released, "Gateway Request fehlgeschlagen");
+                                if reservation_released {
+                                    outcome_guard.armed = false;
+                                }
                                 telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                 cb.lock().unwrap().record_failure();
                             }
@@ -2136,6 +2350,10 @@ pub mod bridge {
     ) -> Result<(), &'static str> {
         let binding = context.binding();
         let forbidden = match binding {
+            ProviderExecutionAuthority::AdaptiveLeadershipReview(_) => &[
+                "customer_request_id", "customer_request_version", "adaptive_session_id",
+                "adaptive_effect_id", "adaptive_session_version", "project_version",
+            ][..],
             ProviderExecutionAuthority::Project(_) | ProviderExecutionAuthority::Adaptive(_) => &[
                 "company_execution_subject",
                 "customer_request_id",
@@ -2194,6 +2412,7 @@ pub mod bridge {
         request.metadata.insert(
             "company_execution_schema".to_owned(),
             match binding {
+                ProviderExecutionAuthority::AdaptiveLeadershipReview(_) => "5",
                 ProviderExecutionAuthority::RequestSales(_) => "2",
                 ProviderExecutionAuthority::Adaptive(_) => "3",
                 ProviderExecutionAuthority::ProjectPlanning(_) => "4",
@@ -2203,7 +2422,10 @@ pub mod bridge {
         );
         request.metadata.insert(
             "company_execution_context_digest".to_owned(),
-            format!("{:x}", Sha256::digest(context_bytes)),
+            match context {
+                ModelWorkContext::AdaptiveLeadershipReview(review) => review.context_digest.clone(),
+                _ => format!("{:x}", Sha256::digest(context_bytes)),
+            },
         );
         if let ModelWorkContext::Project(work) = context {
             request.metadata.insert(
@@ -2220,6 +2442,8 @@ pub mod bridge {
                 "company_execution_output_kind".to_owned(),
                 "adaptive_decision".to_owned(),
             );
+        } else if matches!(context, ModelWorkContext::AdaptiveLeadershipReview(_)) {
+            request.metadata.insert("company_execution_output_kind".to_owned(), "leadership_decision".to_owned());
         }
         if let Some(grant) = binding
             .project()
@@ -2270,6 +2494,11 @@ pub mod bridge {
                 planning.grant.catalog_digest.clone(),
             );
         }
+        if let ProviderExecutionAuthority::AdaptiveLeadershipReview(review) = &binding {
+            request.model = review.grant.model.clone();
+            request.metadata.insert("subscription_allowance_id".to_owned(), review.allowance_id.clone());
+            request.metadata.insert("subscription_catalog_digest".to_owned(), review.grant.catalog_digest.clone());
+        }
         request.messages = vec![GatewayMessage {
             role: "user".to_owned(),
             content: context.prompt()?,
@@ -2294,6 +2523,14 @@ pub mod bridge {
             ),
         ]);
         match binding {
+            ProviderExecutionAuthority::AdaptiveLeadershipReview(value) => values.extend([
+                ("company_execution_subject".to_owned(), "adaptive_leadership_review".to_owned()),
+                ("leadership_review_id".to_owned(), value.grant.review_id.to_string()),
+                ("project_id".to_owned(), value.grant.project_id.0.clone()),
+                ("work_item_id".to_owned(), value.grant.work_item_id.0.clone()),
+                ("assignment_id".to_owned(), value.grant.assignment_id.clone()),
+                ("assignment_version".to_owned(), value.grant.assignee_authority.assignment_version.to_string()),
+            ]),
             ProviderExecutionAuthority::Project(value) => values.extend([
                 ("project_id".to_owned(), value.project_id.clone()),
                 ("work_item_id".to_owned(), value.work_item_id.clone()),
@@ -2452,6 +2689,113 @@ pub mod bridge {
     mod tests {
         use super::*;
 
+        fn reserved_guard(
+            store: &Arc<EventStore>,
+            active: &ActiveProviderRequests,
+            id: &str,
+        ) -> ProviderOutcomeGuard<EventStore> {
+            let mut guard = ProviderOutcomeGuard::new(Arc::clone(store), Arc::clone(active), id, "digest");
+            assert!(store.reserve_request(id, "digest", &AgentId(6).to_string()).unwrap());
+            guard.armed = true;
+            guard
+        }
+
+        #[test]
+        fn overdue_orphan_is_unknown_without_retry_or_late_response() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap();
+            let active = Arc::new(Mutex::new(HashMap::new()));
+            assert!(store.reserve_request("orphan", "digest", &AgentId(6).to_string()).unwrap());
+            let created_at = store.get_completion("orphan").unwrap().unwrap().created_at;
+            classify_stale_provider_requests(&store, &active, created_at + 44_999, Duration::from_secs(35));
+            assert_eq!(store.get_completion("orphan").unwrap().unwrap().status, "provider_in_flight");
+            classify_stale_provider_requests(&store, &active, created_at + 45_000, Duration::from_secs(35));
+            let entry = store.get_completion("orphan").unwrap().unwrap();
+            assert_eq!(entry.status, "failed");
+            assert_eq!(entry.last_error.as_deref(), Some("UnknownOutcome: provider_transport_deadline_elapsed"));
+            assert_eq!(entry.attempt_count, 0);
+            classify_stale_provider_requests(&store, &active, created_at + 21 * 60_000, Duration::from_secs(35));
+            assert!(!store.reserve_request("orphan", "digest", &AgentId(6).to_string()).unwrap());
+            assert!(store.enqueue_completion("orphan", "digest", "late response").is_err());
+            let (tx, rx) = mpsc::channel();
+            recover_completion(&store, entry, &tx, 3, None);
+            assert!(rx.try_recv().is_err());
+            assert_eq!(store.get_completion("orphan").unwrap().unwrap().last_error.as_deref(),
+                Some("UnknownOutcome: provider_transport_deadline_elapsed"));
+        }
+
+        #[test]
+        fn healthy_live_task_is_not_classified_by_reservation_age() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap());
+            let active = Arc::new(Mutex::new(HashMap::new()));
+            let guard = reserved_guard(&store, &active, "live");
+            let created_at = store.get_completion("live").unwrap().unwrap().created_at;
+            classify_stale_provider_requests(store.as_ref(), &active, created_at + 21 * 60_000, Duration::from_secs(35));
+            assert_eq!(store.get_completion("live").unwrap().unwrap().status, "provider_in_flight");
+            drop(guard);
+            let entry = store.get_completion("live").unwrap().unwrap();
+            assert_eq!(entry.status, "failed");
+            assert_eq!(entry.last_error.as_deref(), Some("UnknownOutcome: bridge_task_ended_without_durable_response"));
+            assert!(active.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn duplicate_guard_does_not_abandon_the_original_task() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap());
+            let active = Arc::new(Mutex::new(HashMap::new()));
+            let original = reserved_guard(&store, &active, "live");
+            let duplicate = ProviderOutcomeGuard::new(Arc::clone(&store), Arc::clone(&active), "live", "digest");
+            assert!(!store.reserve_request("live", "digest", &AgentId(6).to_string()).unwrap());
+            drop(duplicate);
+            assert_eq!(active.lock().unwrap().get("live"), Some(&1));
+            assert_eq!(store.get_completion("live").unwrap().unwrap().status, "provider_in_flight");
+            drop(original);
+        }
+
+        #[test]
+        fn guard_preserves_durable_response_even_before_disarm() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap());
+            let active = Arc::new(Mutex::new(HashMap::new()));
+            let guard = reserved_guard(&store, &active, "durable");
+            store.enqueue_completion("durable", "digest", "durable response").unwrap();
+            drop(guard);
+            let entry = store.get_completion("durable").unwrap().unwrap();
+            assert_eq!(entry.status, "pending_usage");
+            assert_eq!(entry.payload, "durable response");
+            assert!(entry.last_error.is_none());
+            classify_stale_provider_requests(store.as_ref(), &active, entry.created_at + 21 * 60_000, Duration::from_secs(35));
+            assert_eq!(store.get_completion("durable").unwrap().unwrap().status, "pending_usage");
+        }
+
+        #[test]
+        fn guard_disarms_for_released_and_removed_completion_rows() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap());
+            let active = Arc::new(Mutex::new(HashMap::new()));
+            let mut guard = reserved_guard(&store, &active, "released");
+            assert!(store.release_undispatched_request("released", "digest").unwrap());
+            guard.disarm_if_resolved();
+            assert!(!guard.armed);
+            drop(guard);
+            assert!(store.get_completion("released").unwrap().is_none());
+            let mut removed = reserved_guard(&store, &active, "removed");
+            store.enqueue_completion("removed", "digest", "durable response").unwrap();
+            let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+                "request_id": "removed", "tokens_used": 1
+            })).unwrap();
+            let usage = build_usage_event(AgentId(6), 1, "", None, &response, false).unwrap();
+            store.persist_usage("removed", "digest", &usage).unwrap();
+            assert!(store.claim_actions("removed", "digest").unwrap());
+            assert!(store.complete_actions("removed", "digest").unwrap());
+            removed.disarm_if_resolved();
+            assert!(!removed.armed);
+            drop(removed);
+            assert!(active.lock().unwrap().is_empty());
+        }
+
         struct ModelWorkResolver {
             context: ModelWorkContext,
             admissions: Mutex<Vec<String>>,
@@ -2485,6 +2829,123 @@ pub mod bridge {
                 }
                 self.admissions.lock().unwrap().push(id.to_owned());
                 Ok(())
+            }
+        }
+
+        #[test]
+        fn leadership_dispatch_schema_five_adopts_usage_schema_six_without_legacy_actions() {
+            let dir = tempfile::tempdir().unwrap();
+            let event_path = dir.path().join("events.sqlite");
+            let (api, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
+                &dir.path().join("company.sqlite"), &event_path,
+            );
+            let context = ModelWorkContext::AdaptiveLeadershipReview(Box::new(review.clone()));
+            let binding = context.binding();
+            let agent = binding.agent_id();
+            let perception = make_perception(agent.0, "Review blocked work", true);
+            let id = agent_runtime_request_id(&perception, Some(&binding));
+            let state = StateStore::open(dir.path().join("state.redb").to_str().unwrap()).unwrap();
+            let mut request = build_gateway_request(&perception, &state, &id, Some(&binding));
+            bind_model_work_request(&mut request, &context).unwrap();
+            assert_eq!(request.metadata["company_execution_schema"], "5");
+            assert_eq!(request.metadata["company_execution_subject"], "adaptive_leadership_review");
+            assert_eq!(request.metadata["company_execution_output_kind"], "leadership_decision");
+            assert_eq!(request.metadata["company_execution_context_digest"], review.context_digest);
+            assert_eq!(request.metadata["leadership_review_id"], review.binding.grant.review_id.to_string());
+            assert_eq!(request.metadata["subscription_allowance_id"], review.binding.allowance_id);
+            assert_eq!(request.metadata["assignment_version"], review.binding.grant.assignee_authority.assignment_version.to_string());
+            assert_eq!(request.model, review.binding.grant.model);
+            for key in ["adaptive_session_id", "adaptive_effect_id", "adaptive_session_version",
+                "customer_request_id", "customer_request_version", "project_version"] {
+                let mut mixed = build_gateway_request(&perception, &state, &id, Some(&binding));
+                mixed.metadata.insert(key.to_owned(), "foreign".to_owned());
+                assert!(bind_model_work_request(&mut mixed, &context).is_err(), "{key}");
+            }
+            let digest = gateway_request_digest(&request).unwrap();
+            let store = Arc::new(EventStore::open(event_path.to_str().unwrap()).unwrap());
+            let active = Arc::new(Mutex::new(HashMap::new()));
+            let mut guard = ProviderOutcomeGuard::new(Arc::clone(&store), active, &id, &digest);
+            assert!(store.reserve_request(&id, &digest, &agent.to_string()).unwrap());
+            guard.armed = true;
+            let dispatch = serde_json::json!({
+                "schema_version": 5, "allowance_id": review.binding.allowance_id,
+                "agent_id": agent.0, "request_id": id, "request_digest": digest,
+                "context_digest": review.context_digest, "provider": review.binding.grant.provider,
+                "model": request.model, "catalog_digest": review.binding.grant.catalog_digest,
+                "subject": {"kind": "adaptive_leadership_review", "review_id": review.binding.grant.review_id}
+            });
+            assert_eq!(api.subscription_dispatch(&serde_json::to_vec(&dispatch).unwrap()).status, 200);
+            // Fixture inference, not live provider evidence.
+            let content = serde_json::json!({"schema_version": 1, "decision": {
+                "kind": "keep_blocked", "rationale": "Supplied evidence still shows a dependency.",
+                "evidence_refs": review.source.evidence_refs
+            }}).to_string();
+            let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+                "content": content, "decision": "forward", "request_id": id,
+                "provider": review.binding.grant.provider, "effective_model": request.model,
+                "tokens_used": 15, "input_tokens": 5, "output_tokens": 10, "tier": "mid",
+                "hierarchy_tier": 2, "cost_source": "provider_reported", "cost_usd": 0.0,
+                "actions": [{"type": "tool_use", "content": "must never execute"}]
+            })).unwrap();
+            let (tx, rx) = mpsc::channel();
+            store_gateway_completion(store.as_ref(), &tx, GatewayCompletionContext {
+                request_id: &id, request_digest: &digest, agent_id: agent, tick: 1,
+                requested_model: &request.model, authority: Some(&binding), authority_resolver: Some(&api),
+                gateway_response: &response, usage_v2_enabled: true, model_work: Some(&context),
+            }, 3).unwrap();
+            let usage = store.event_by_operation_id(&format!("llm_usage_{id}")).unwrap().unwrap();
+            assert_eq!(usage.schema_version, 6);
+            assert!(store.get_completion(&id).unwrap().is_none());
+            guard.disarm_if_resolved();
+            assert!(!guard.armed);
+            drop(guard);
+            assert!(!store.reserve_request(&id, &digest, &agent.to_string()).unwrap());
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[test]
+        fn leadership_response_digest_fences_recovery_and_preserves_oversized_usage() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_api, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
+                &dir.path().join("company.sqlite"), &dir.path().join("events.sqlite"),
+            );
+            let context = ModelWorkContext::AdaptiveLeadershipReview(Box::new(review));
+            let binding = context.binding();
+            let id = binding.request_id();
+            for content in ["{}".to_owned(), "x".repeat(MAX_MODEL_WORK_BYTES + 1)] {
+                let resolver = ModelWorkResolver {
+                    context: context.clone(), admissions: Mutex::new(Vec::new()), fail_next: AtomicBool::new(true),
+                };
+                let store = EventStore::open(":memory:").unwrap();
+                assert!(store.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
+                let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+                    "content": content, "decision": "forward", "request_id": id,
+                    "provider": binding.provider(), "effective_model": "gpt-5.4", "tokens_used": 15,
+                    "input_tokens": 5, "output_tokens": 10, "tier": "mid", "hierarchy_tier": 2,
+                    "cost_source": "provider_reported", "cost_usd": 0.0
+                })).unwrap();
+                let (tx, rx) = mpsc::channel();
+                store_gateway_completion(&store, &tx, GatewayCompletionContext {
+                    request_id: &id, request_digest: "digest", agent_id: binding.agent_id(), tick: 1,
+                    requested_model: "gpt-5.4", authority: Some(&binding), authority_resolver: Some(&resolver),
+                    gateway_response: &response, usage_v2_enabled: true, model_work: Some(&context),
+                }, 3).unwrap();
+                let entry = store.get_completion(&id).unwrap().unwrap();
+                assert_eq!(entry.status, "ready_for_action");
+                assert!(store.has_operation(&format!("llm_usage_{id}")).unwrap());
+                let mut completed: CompletedLlmResponse = serde_json::from_str(&entry.payload).unwrap();
+                let retained = &completed.model_work.as_ref().unwrap().content;
+                assert_eq!(completed.model_response_digest, Some(format!("{:x}", Sha256::digest(retained.as_bytes()))));
+                assert_eq!(completed.model_work.as_ref().unwrap().admissible, content.len() <= MAX_MODEL_WORK_BYTES);
+                completed.model_work.as_mut().unwrap().content.push_str("tampered");
+                let corrupted = EventStore::open(":memory:").unwrap();
+                assert!(corrupted.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
+                corrupted.enqueue_completion(&id, "digest", &serde_json::to_string(&completed).unwrap()).unwrap();
+                recover_completion(&corrupted, corrupted.get_completion(&id).unwrap().unwrap(), &tx, 1, Some(&resolver));
+                assert_eq!(corrupted.get_completion(&id).unwrap().unwrap().status, "failed");
+                assert!(!corrupted.has_operation(&format!("llm_usage_{id}")).unwrap());
+                assert!(resolver.admissions.lock().unwrap().is_empty());
+                assert!(rx.try_recv().is_err());
             }
         }
 
@@ -3343,6 +3804,13 @@ pub mod bridge {
         }
 
         impl CompletionStore for FailFirstCompletionStore {
+            fn poll_provider_in_flight(&self, limit: usize) -> anyhow::Result<Vec<LlmCompletionEntry>> {
+                self.inner.poll_llm_provider_in_flight(limit)
+            }
+
+            fn mark_provider_unknown(&self, request_id: &str, request_digest: &str, reason: &str) -> anyhow::Result<bool> {
+                self.inner.mark_llm_provider_outcome_unknown(request_id, request_digest, reason)
+            }
             fn reserve_request(
                 &self,
                 request_id: &str,
@@ -3940,7 +4408,7 @@ pub mod bridge {
                     .unwrap()
                     .unwrap()
                     .status,
-                "provider_in_flight"
+                "failed"
             );
             assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
             provider_task.abort();
