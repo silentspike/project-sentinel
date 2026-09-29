@@ -281,6 +281,7 @@ impl ProjectionWorker {
                         continue;
                     }
                     let DomainEventPayload::AgentLlmUsage {
+                        agent_id,
                         tenant_id,
                         project_id,
                         work_item_id,
@@ -327,8 +328,40 @@ impl ProjectionWorker {
                         {
                             anyhow::bail!("v2 agent_llm_usage is missing effective_model");
                         }
-                        if event.schema_version > 5 {
+                        if event.schema_version > 6 {
                             anyhow::bail!("unsupported agent_llm_usage authority schema");
+                        }
+                        if event.schema_version == 6 {
+                            // The leader owns the usage; assignment fields name the reviewed assignee.
+                            let reservation = reservation_id.as_deref().unwrap_or_default();
+                            if [
+                                tenant_id.as_deref(),
+                                project_id.as_deref(),
+                                work_item_id.as_deref(),
+                                reservation_id.as_deref(),
+                                assignment_id.as_deref(),
+                                provider.as_deref(),
+                                requested_model.as_deref(),
+                            ]
+                            .into_iter()
+                            .any(|value| value.is_none_or(|value| value.trim().is_empty()))
+                                || assignment_version.is_none_or(|value| value == 0)
+                                || caller_role.as_deref() != Some("agent_runtime")
+                                || provider.as_deref() != Some("codex-cli")
+                                || effective_model != requested_model
+                                || cost_source == Some(sentinel_common::CostSource::NonProviderZero)
+                                || !uuid::Uuid::parse_str(reservation)
+                                    .is_ok_and(|id| !id.is_nil() && id.to_string() == reservation)
+                                || event.aggregate_id != agent_id.to_string()
+                                || event.correlation_id
+                                    != format!("company-leadership-{reservation}")
+                                || event.operation_id
+                                    != format!("llm_usage_{}", event.correlation_id)
+                            {
+                                anyhow::bail!(
+                                    "v6 agent_llm_usage has invalid leadership authority"
+                                );
+                            }
                         }
                         if event.schema_version == 5
                             && ([
@@ -654,6 +687,327 @@ mod tests {
         )
         .with_operation_id(&format!("llm_usage_{request_id}"))
         .with_schema_version(5)
+    }
+
+    fn leadership_usage_event() -> DomainEvent {
+        let review_id = "00000000-0000-7000-8000-000000000001";
+        let mut event = planning_usage_event("project-a");
+        let mut payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        payload["work_item_id"] = serde_json::json!("build-source");
+        payload["reservation_id"] = serde_json::json!(review_id);
+        payload["assignment_id"] = serde_json::json!("assignment-developer-a");
+        payload["assignment_version"] = serde_json::json!(3);
+        event.payload = payload.to_string();
+        event.correlation_id = format!("company-leadership-{review_id}");
+        event.operation_id = format!("llm_usage_{}", event.correlation_id);
+        event.schema_version = 6;
+        event
+    }
+
+    fn assert_hierarchy_usage_rejected(event: &DomainEvent, expected_message: &str) {
+        let dir = tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(dir.path().join("events.db").to_str().unwrap()).unwrap());
+        let worker = ProjectionWorker::new(
+            Arc::clone(&event_store),
+            ProjectionConfig {
+                db_path: dir
+                    .path()
+                    .join("projection.db")
+                    .to_string_lossy()
+                    .into_owned(),
+                ..ProjectionConfig::default()
+            },
+        )
+        .unwrap();
+        let before = worker.read_store().hierarchy_projection_meta().unwrap();
+        // The valid first row must roll back along with the rejected second row.
+        let error = worker
+            .process_hierarchy_batch(&[(1, planning_usage_event("project-a")), (2, event.clone())])
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(expected_message), "{error:#}");
+        assert!(worker
+            .read_store()
+            .cost_by_hierarchy_tier()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            worker.read_store().hierarchy_projection_meta().unwrap(),
+            before
+        );
+        assert_eq!(
+            worker
+                .read_store()
+                .transaction(|txn| txn.projection_watermark(HIERARCHY_PROJECTION_NAME))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            event_store.get_offset(HIERARCHY_PROJECTION_NAME).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn hierarchy_projection_accepts_leader_usage_with_reviewed_assignee_authority() {
+        for output_tokens in [20, 0] {
+            let dir = tempdir().unwrap();
+            let event_store =
+                Arc::new(EventStore::open(dir.path().join("events.db").to_str().unwrap()).unwrap());
+            let mut event = leadership_usage_event();
+            let mut payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+            // Usage is retained even when the provider response was not admissible.
+            payload["output_tokens"] = serde_json::json!(output_tokens);
+            event.payload = payload.to_string();
+            append_raw_event(&event_store, &event);
+            let worker = ProjectionWorker::new(
+                Arc::clone(&event_store),
+                ProjectionConfig {
+                    db_path: dir
+                        .path()
+                        .join("projection.db")
+                        .to_string_lossy()
+                        .into_owned(),
+                    ..ProjectionConfig::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(worker.catch_up_hierarchy().unwrap(), 1);
+            let costs = worker.read_store().cost_by_hierarchy_tier().unwrap();
+            assert_eq!(costs.len(), 1);
+            assert_eq!(costs[0].call_count, 1);
+            assert_eq!(costs[0].input_tokens, 10);
+            assert_eq!(costs[0].output_tokens, output_tokens);
+            assert_eq!(
+                event_store.get_offset(HIERARCHY_PROJECTION_NAME).unwrap(),
+                Some(1)
+            );
+            assert_eq!(worker.catch_up_hierarchy().unwrap(), 0);
+            assert_eq!(
+                worker.read_store().cost_by_hierarchy_tier().unwrap()[0].call_count,
+                1
+            );
+            let batch = event_store.get_events_since_with_id(0, 16).unwrap();
+            worker.process_batch(&batch).unwrap();
+            let agents = worker.read_store().cost_by_agent().unwrap();
+            assert_eq!(agents.len(), 1);
+            assert_eq!(agents[0].key, "AGENT-09");
+        }
+    }
+
+    #[test]
+    fn hierarchy_projection_rejects_missing_or_blank_leadership_authority() {
+        for field in [
+            "tenant_id",
+            "project_id",
+            "work_item_id",
+            "reservation_id",
+            "assignment_id",
+            "provider",
+            "requested_model",
+            "caller_role",
+        ] {
+            for value in [
+                None,
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!("  ")),
+            ] {
+                let mut event = leadership_usage_event();
+                let mut payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+                if let Some(value) = value {
+                    payload[field] = value;
+                } else {
+                    payload.as_object_mut().unwrap().remove(field);
+                }
+                event.payload = payload.to_string();
+                assert_hierarchy_usage_rejected(&event, "invalid leadership authority");
+            }
+        }
+        for value in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(0)),
+        ] {
+            let mut event = leadership_usage_event();
+            let mut payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+            if let Some(value) = value {
+                payload["assignment_version"] = value;
+            } else {
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("assignment_version");
+            }
+            event.payload = payload.to_string();
+            assert_hierarchy_usage_rejected(&event, "invalid leadership authority");
+        }
+    }
+
+    #[test]
+    fn hierarchy_projection_rejects_invalid_leadership_usage_policy() {
+        for (field, value) in [
+            ("caller_role", serde_json::json!("developer")),
+            ("provider", serde_json::json!("different-provider")),
+            ("effective_model", serde_json::json!("different-model")),
+            ("reservation_id", serde_json::json!("not-a-review-id")),
+            (
+                "reservation_id",
+                serde_json::json!(uuid::Uuid::nil().to_string()),
+            ),
+            (
+                "cost_source",
+                serde_json::to_value(CostSource::NonProviderZero).unwrap(),
+            ),
+        ] {
+            let mut event = leadership_usage_event();
+            let mut payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+            payload[field] = value;
+            event.payload = payload.to_string();
+            assert_hierarchy_usage_rejected(&event, "invalid leadership authority");
+        }
+    }
+
+    #[test]
+    fn hierarchy_projection_rejects_borrowed_leadership_subject_and_request_identity() {
+        for change in 0..5 {
+            let mut event = leadership_usage_event();
+            match change {
+                0 => event.aggregate_id = "AGENT-02".into(),
+                1 => {
+                    let mut payload: serde_json::Value =
+                        serde_json::from_str(&event.payload).unwrap();
+                    payload["agent_id"] = serde_json::json!(2);
+                    event.payload = payload.to_string();
+                }
+                2 => {
+                    // Another well-formed review ID is not this usage's reservation.
+                    event.correlation_id =
+                        "company-leadership-00000000-0000-7000-8000-000000000002".into();
+                    event.operation_id = format!("llm_usage_{}", event.correlation_id);
+                }
+                3 => event.operation_id = "llm_usage_borrowed-request".into(),
+                _ => {
+                    event.correlation_id = "company-provider-borrowed-developer-reservation".into();
+                    event.operation_id = format!("llm_usage_{}", event.correlation_id);
+                }
+            }
+            assert_hierarchy_usage_rejected(&event, "invalid leadership authority");
+        }
+    }
+
+    #[test]
+    fn hierarchy_projection_rejects_usage_authority_schemas_above_six() {
+        for schema in [7, u32::MAX] {
+            let event = leadership_usage_event().with_schema_version(schema);
+            assert_hierarchy_usage_rejected(&event, "unsupported agent_llm_usage authority schema");
+        }
+    }
+
+    #[test]
+    fn hierarchy_projection_preserves_pre_leadership_usage_schemas() {
+        for schema in 1..=5 {
+            let mut event = planning_usage_event("project-a").with_schema_version(schema);
+            let mut payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+            match schema {
+                1 | 2 => {
+                    for field in [
+                        "tenant_id",
+                        "project_id",
+                        "reservation_id",
+                        "provider",
+                        "requested_model",
+                        "caller_role",
+                    ] {
+                        payload.as_object_mut().unwrap().remove(field);
+                    }
+                    if schema == 1 {
+                        for field in ["hierarchy_tier", "cost_source", "effective_model"] {
+                            payload.as_object_mut().unwrap().remove(field);
+                        }
+                    }
+                    event.correlation_id = "legacy-usage".into();
+                    event.operation_id = "llm_usage_legacy-usage".into();
+                }
+                3 => {
+                    payload["work_item_id"] = serde_json::json!("build-source");
+                    payload["assignment_id"] = serde_json::json!("assignment-developer-a");
+                    payload["assignment_version"] = serde_json::json!(3);
+                    // V3 authority did not impose leadership's model/provider/UUID binding.
+                    payload["provider"] = serde_json::json!("legacy-provider");
+                    payload["effective_model"] = serde_json::json!("legacy-effective-model");
+                    event.correlation_id = "company-provider-subscription-planning-a".into();
+                    event.operation_id = format!("llm_usage_{}", event.correlation_id);
+                }
+                4 => {
+                    payload.as_object_mut().unwrap().remove("project_id");
+                    event.correlation_id = "company-provider-subscription-planning-a".into();
+                    event.operation_id = format!("llm_usage_{}", event.correlation_id);
+                }
+                _ => {}
+            }
+            event.payload = payload.to_string();
+            let dir = tempdir().unwrap();
+            let event_store =
+                Arc::new(EventStore::open(dir.path().join("events.db").to_str().unwrap()).unwrap());
+            let worker = ProjectionWorker::new(
+                Arc::clone(&event_store),
+                ProjectionConfig {
+                    db_path: dir
+                        .path()
+                        .join("projection.db")
+                        .to_string_lossy()
+                        .into_owned(),
+                    ..ProjectionConfig::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(worker.process_hierarchy_batch(&[(1, event)]).unwrap(), 1);
+            let costs = worker.read_store().cost_by_hierarchy_tier().unwrap();
+            if schema == 1 {
+                assert!(costs.is_empty());
+                assert_eq!(
+                    worker
+                        .read_store()
+                        .hierarchy_projection_meta()
+                        .unwrap()
+                        .unattributed_v1_usage_events,
+                    1
+                );
+            } else {
+                assert_eq!(costs.len(), 1);
+                assert_eq!(costs[0].call_count, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn hierarchy_projection_applies_existing_accounting_validation_to_leadership_usage() {
+        for (field, value, expected_message) in [
+            ("tier", serde_json::json!("  "), "missing model tier"),
+            (
+                "hierarchy_tier",
+                serde_json::Value::Null,
+                "missing hierarchy_tier",
+            ),
+            (
+                "cost_source",
+                serde_json::Value::Null,
+                "missing cost_source",
+            ),
+            (
+                "effective_model",
+                serde_json::json!("  "),
+                "missing effective_model",
+            ),
+            ("cost_usd", serde_json::json!(-0.01), "invalid cost_usd"),
+        ] {
+            let mut event = leadership_usage_event();
+            let mut payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+            payload[field] = value;
+            event.payload = payload.to_string();
+            assert_hierarchy_usage_rejected(&event, expected_message);
+        }
     }
 
     #[test]

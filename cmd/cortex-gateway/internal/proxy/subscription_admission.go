@@ -123,6 +123,12 @@ func (a *SubscriptionAdmission) dispatchRequest(provider Provider, req *LLMReque
 }
 
 func (a *SubscriptionAdmission) validSubscriptionIdentity(metadata map[string]string, agentID uint64) bool {
+	if metadata["company_execution_schema"] == "5" {
+		// The daemon owns this separate leadership grant. A review reservation
+		// is not an allowance, and the bootstrap developer grant cannot be reused.
+		return agentID > 0 && agentID <= 65535 && subscriptionIdentifier.MatchString(metadata["subscription_allowance_id"]) &&
+			metadata["subscription_allowance_id"] != a.allowanceID && metadata["subscription_allowance_id"] != metadata["reservation_id"]
+	}
 	return agentID > 0 && agentID <= 65535 &&
 		subscriptionIdentifier.MatchString(metadata["subscription_allowance_id"]) &&
 		metadata["reservation_id"] == metadata["subscription_allowance_id"]
@@ -142,6 +148,9 @@ func (a *SubscriptionAdmission) validSubscriptionModelBinding(req *LLMRequest) b
 }
 
 func subscriptionExecutionSubject(req *LLMRequest) (int, *customerRequestExecutionSubject, error) {
+	if req.Metadata["company_execution_schema"] != "5" && hasLeadershipReviewMetadata(req.Metadata) {
+		return 0, nil, errors.New("mixed subscription subjects")
+	}
 	switch req.Metadata["company_execution_schema"] {
 	case "1":
 		if hasCustomerRequestMetadata(req.Metadata) {
@@ -172,6 +181,12 @@ func subscriptionExecutionSubject(req *LLMRequest) (int, *customerRequestExecuti
 		}
 		subject, err := projectPlanningSubject(req.Metadata)
 		return 4, subject, err
+	case "5":
+		if classified, err := classifyModelWorkRequest(req, req.Metadata["request_id"]); err != nil || !classified {
+			return 0, nil, errors.New("invalid leadership review execution request")
+		}
+		subject, err := leadershipReviewSubject(req.Metadata)
+		return 5, subject, err
 	default:
 		return 0, nil, errors.New("unsupported subscription execution schema")
 	}
@@ -201,6 +216,9 @@ func (a *SubscriptionAdmission) claim(ctx context.Context, claim subscriptionDis
 	if err != nil || len(receiptBytes) > 4096 {
 		return time.Time{}, errors.New("subscription claim receipt exceeds its bound")
 	}
+	if claim.SchemaVersion == 5 && !exactLeadershipReceiptFields(receiptBytes) {
+		return time.Time{}, errors.New("invalid leadership claim receipt fields")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(receiptBytes))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&receipt); err != nil {
@@ -213,6 +231,38 @@ func (a *SubscriptionAdmission) claim(ctx context.Context, claim subscriptionDis
 		return time.Time{}, errors.New("subscription claim receipt mismatch")
 	}
 	return time.UnixMilli(receipt.DeadlineUnixMS), nil
+}
+
+// encoding/json otherwise accepts duplicate and case-insensitive field names.
+func exactLeadershipReceiptFields(body []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return false
+	}
+	seen := make(map[string]bool, 5)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		key, ok := token.(string)
+		if !ok || seen[key] {
+			return false
+		}
+		switch key {
+		case "schema_version", "allowance_id", "request_id", "request_digest", "deadline_unix_ms":
+		default:
+			return false
+		}
+		seen[key] = true
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return false
+		}
+	}
+	end, err := decoder.Token()
+	return err == nil && end == json.Delim('}') && len(seen) == 5
 }
 
 func (a *SubscriptionAdmission) send(ctx context.Context, provider Provider, req *LLMRequest) (*LLMResponse, error) {

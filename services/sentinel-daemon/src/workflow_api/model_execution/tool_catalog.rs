@@ -15,7 +15,7 @@ const MAX_RULES: usize = 64;
 const INVALID: &str = "adaptive tool catalogue contract is invalid";
 const TOO_LARGE: &str = "adaptive tool catalogue exceeds its context bound";
 
-pub(super) fn adaptive_tool_catalog(
+pub(in crate::workflow_api) fn adaptive_tool_catalog(
     profile: &crate::workbench::WorkbenchProfile,
     authority: &sentinel_workflow::RuntimeAuthoritySnapshotV1,
     task: &sentinel_workflow::CompanyWorkItemSpecV1,

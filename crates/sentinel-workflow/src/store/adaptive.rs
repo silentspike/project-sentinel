@@ -455,7 +455,10 @@ fn update_head(
     Ok(())
 }
 
-fn require_head(connection: &Connection, session: &AdaptiveSessionV1) -> Result<(), WorkflowError> {
+pub(crate) fn require_head(
+    connection: &Connection,
+    session: &AdaptiveSessionV1,
+) -> Result<(), WorkflowError> {
     let head = read_head(connection, &session.grant.authority)?.ok_or_else(corrupt_store)?;
     validate_head(&head, session)
 }
@@ -509,7 +512,7 @@ fn append(tx: &Transaction<'_>, ns: &str, entry: &Entry) -> Result<(), WorkflowE
     )
 }
 
-fn load(
+pub(crate) fn load(
     connection: &Connection,
     id: Uuid,
 ) -> Result<Option<(AdaptiveSessionV1, String)>, WorkflowError> {

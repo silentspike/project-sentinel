@@ -137,6 +137,35 @@ class EventAppendBoundaryTest(unittest.TestCase):
             MODULE.check(root, rust_inventory={}, go_inventory={}), []
         )
 
+    def test_visible_test_fixtures_remain_cfg_test_only(self):
+        for visibility in ["pub ", "pub(crate) ", "pub(super) ", "pub(self) "]:
+            with self.subTest(visibility=visibility):
+                root = self.fixture()
+                rust = root / "services/example/lib.rs"
+                rust.parent.mkdir(parents=True)
+                rust.write_text(
+                    "#[cfg(test)]\n" + visibility + "mod tests {\n"
+                    '    fn fixture() { let _ = EventStore::open(":memory:"); }\n'
+                    "}\n", encoding="utf-8",
+                )
+                self.assertEqual(MODULE.check(root, rust_inventory={}, go_inventory={}), [])
+                rust.write_text(rust.read_text().replace("#[cfg(test)]\n", ""), encoding="utf-8")
+                self.assertTrue(any("may not own event DDL" in error
+                    for error in MODULE.check(root, rust_inventory={}, go_inventory={})))
+
+    def test_visible_test_module_does_not_hide_preceding_production_writer(self):
+        root = self.fixture()
+        rust = root / "services/example/lib.rs"
+        rust.parent.mkdir(parents=True)
+        rust.write_text(
+            'fn production() { let _ = EventStore::open("events.db"); }\n'
+            "#[cfg(test)]\npub(crate) mod tests {\n"
+            '    fn fixture() { let _ = EventStore::open(":memory:"); }\n'
+            "}\n", encoding="utf-8",
+        )
+        errors = MODULE.check(root, rust_inventory={}, go_inventory={})
+        self.assertEqual(sum("may not own event DDL" in error for error in errors), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 pub(crate) mod tests;
-mod tool_catalog;
+pub(super) mod tool_catalog;
 
 use super::*;
 use crate::llm_bridge::bridge::ProviderUsageAuthority;
@@ -92,6 +92,7 @@ impl AdaptiveProviderAuthority {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ProviderExecutionAuthority {
+    AdaptiveLeadershipReview(Box<super::adaptive_leadership_review::LeadershipAuthority>),
     RequestSales(Box<RequestSalesAuthority>),
     ProjectPlanning(Box<ProjectPlanningAuthority>),
     Adaptive(Box<AdaptiveProviderAuthority>),
@@ -107,6 +108,11 @@ impl From<ProviderUsageAuthority> for ProviderExecutionAuthority {
 impl ProviderExecutionAuthority {
     pub fn agent_id(&self) -> AgentId {
         match self {
+            Self::AdaptiveLeadershipReview(value) => value
+                .grant
+                .leadership_principal
+                .agent_id
+                .unwrap_or(AgentId(0)),
             Self::Project(value) => value.agent_id,
             Self::Adaptive(value) => value.grant.authority.agent_id,
             Self::RequestSales(value) => value.grant.sales_principal.agent_id.unwrap_or(AgentId(0)),
@@ -118,6 +124,7 @@ impl ProviderExecutionAuthority {
 
     pub fn tenant_id(&self) -> &str {
         match self {
+            Self::AdaptiveLeadershipReview(value) => &value.grant.leadership_principal.tenant_id.0,
             Self::Project(value) => &value.tenant_id,
             Self::Adaptive(value) => &value.grant.authority.tenant_id.0,
             Self::RequestSales(value) => &value.grant.sales_principal.tenant_id.0,
@@ -127,6 +134,7 @@ impl ProviderExecutionAuthority {
 
     pub fn reservation_id(&self) -> &str {
         match self {
+            Self::AdaptiveLeadershipReview(value) => &value.reservation_id,
             Self::Project(value) => &value.reservation_id,
             Self::Adaptive(value) => &value.grant.provider_allowance_id,
             Self::RequestSales(value) => &value.allowance_id,
@@ -136,6 +144,7 @@ impl ProviderExecutionAuthority {
 
     pub fn provider(&self) -> &str {
         match self {
+            Self::AdaptiveLeadershipReview(value) => &value.grant.provider,
             Self::Project(value) => &value.provider,
             Self::Adaptive(value) => &value.grant.provider,
             Self::RequestSales(value) => &value.grant.provider,
@@ -146,12 +155,18 @@ impl ProviderExecutionAuthority {
     pub fn project(&self) -> Option<&ProviderUsageAuthority> {
         match self {
             Self::Project(value) => Some(value),
-            Self::RequestSales(_) | Self::ProjectPlanning(_) | Self::Adaptive(_) => None,
+            Self::RequestSales(_)
+            | Self::ProjectPlanning(_)
+            | Self::Adaptive(_)
+            | Self::AdaptiveLeadershipReview(_) => None,
         }
     }
 
     pub fn request_id(&self) -> String {
         match self {
+            Self::AdaptiveLeadershipReview(value) => {
+                format!("company-leadership-{}", value.grant.review_id)
+            }
             Self::Adaptive(value) => value.request_id(),
             Self::ProjectPlanning(value) => format!(
                 "company-planning-{}-{}",
@@ -450,6 +465,7 @@ impl AdaptiveModelContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ModelExecutionContext {
+    AdaptiveLeadershipReview(Box<super::adaptive_leadership_review::LeadershipContext>),
     RequestSales(Box<RequestSalesContext>),
     ProjectPlanning(Box<ProjectPlanningContext>),
     Adaptive(Box<AdaptiveModelContext>),
@@ -465,6 +481,11 @@ impl From<super::model_work::ModelWorkContext> for ModelExecutionContext {
 impl ModelExecutionContext {
     pub fn binding(&self) -> ProviderExecutionAuthority {
         match self {
+            Self::AdaptiveLeadershipReview(value) => {
+                ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(
+                    value.binding.clone(),
+                ))
+            }
             Self::Project(value) => value.binding.clone().into(),
             Self::Adaptive(value) => {
                 ProviderExecutionAuthority::Adaptive(Box::new(value.binding.clone()))
@@ -480,6 +501,7 @@ impl ModelExecutionContext {
 
     pub fn validate_dispatch(&self, now_ms: u64) -> Result<(), &'static str> {
         match self {
+            Self::AdaptiveLeadershipReview(value) => value.validate_dispatch(now_ms),
             Self::Project(value) => value.validate_dispatch(now_ms),
             Self::Adaptive(value) => value.validate_dispatch(now_ms),
             Self::RequestSales(value) => value.validate_dispatch(now_ms),
@@ -489,6 +511,7 @@ impl ModelExecutionContext {
 
     pub fn prompt(&self) -> Result<String, &'static str> {
         match self {
+            Self::AdaptiveLeadershipReview(value) => value.prompt(),
             Self::Project(value) => value.prompt(),
             Self::Adaptive(value) => value.prompt(),
             Self::RequestSales(value) => value.prompt(),
@@ -508,6 +531,9 @@ pub struct ModelExecutionCompletion {
 impl ModelExecutionCompletion {
     pub(crate) fn validate_usage(&self, event: &DomainEvent) -> Result<(), &'static str> {
         match &self.context {
+            ModelExecutionContext::AdaptiveLeadershipReview(context) => {
+                context.validate_usage(self.admissible, event)
+            }
             ModelExecutionContext::Project(context) => super::model_work::ModelWorkCompletion {
                 context: context.as_ref().clone(),
                 content: self.content.clone(),
@@ -796,6 +822,101 @@ fn validate_adaptive_usage_binding(
 }
 
 impl WorkflowApi {
+    fn adaptive_provider_outcome_unknown(
+        &self,
+        session: &AdaptiveSessionV1,
+        effect: &AdaptiveEffectV1,
+    ) -> Result<bool, &'static str> {
+        let request_id = format!(
+            "company-adaptive-{}-{}",
+            session.grant.session_id, effect.id
+        );
+        let Some(events) = self.event_store.as_ref() else {
+            return Ok(false);
+        };
+        let Some(entry) = events
+            .get_llm_completion(&request_id)
+            .map_err(|_| "adaptive provider outcome unavailable")?
+        else {
+            return Ok(false);
+        };
+        Ok(entry.request_id == request_id
+            && entry.status == "failed"
+            && entry.payload.is_empty()
+            && entry.request_digest == effect.request_digest
+            && entry.owner_scope
+                == sentinel_common::StateTransferScope::for_agent(
+                    session.grant.authority.agent_id.to_string(),
+                )
+            && entry
+                .last_error
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("UnknownOutcome:")))
+    }
+
+    pub(super) fn adaptive_models_have_unknown_outcome(&self) -> Result<bool, &'static str> {
+        if !self.model_work_enabled {
+            return Ok(false);
+        }
+        for project in self
+            .store
+            .company_projects()
+            .map_err(|_| "adaptive projects unavailable")?
+        {
+            for session in self.review_sessions(&project)? {
+                match &session.cursor {
+                    AdaptiveCursorV1::ModelUnknown { .. } => return Ok(true),
+                    AdaptiveCursorV1::ModelPending { effect }
+                        if self.adaptive_provider_outcome_unknown(&session, effect)? =>
+                    {
+                        return Ok(true);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    // Reconciliation owns the exclusive fence. Unknown is not blocked and can
+    // never enter leadership resolution or ordinary provider grant rollover.
+    pub(super) fn reconcile_unknown_adaptive_models(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+    ) -> Result<(), &'static str> {
+        if !self.model_work_enabled {
+            return Ok(());
+        }
+        for session in self.review_sessions(project)? {
+            let AdaptiveCursorV1::ModelPending { effect } = &session.cursor else {
+                continue;
+            };
+            let request_id = format!(
+                "company-adaptive-{}-{}",
+                session.grant.session_id, effect.id
+            );
+            if self.adaptive_provider_outcome_unknown(&session, effect)? {
+                self.store
+                    .advance_adaptive_session(
+                        session.grant.session_id,
+                        session.version,
+                        stable_operation_id(
+                            "sentinel.workflow.provider-unknown.v1",
+                            &request_id,
+                            session.version,
+                        ),
+                        &AdaptiveTransitionV1::MarkUnknown {
+                            effect: effect.clone(),
+                        },
+                        &session.grant.authority,
+                        now_unix_ms().max(session.updated_at_ms),
+                    )
+                    .map_err(|_| "adaptive unknown outcome journal failed")?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn recover_rejected_first_adaptive_model(
         &self,
         project: &sentinel_workflow::ProjectV1,
@@ -1045,8 +1166,11 @@ impl WorkflowApi {
             | AdaptiveCursorV1::Cancelled
             | AdaptiveCursorV1::CompletionProposed { .. }
             | AdaptiveCursorV1::CollaborationProposed { .. } => Ok(None),
-            AdaptiveCursorV1::ModelPending { effect }
-            | AdaptiveCursorV1::ModelUnknown { effect } => {
+            AdaptiveCursorV1::ModelUnknown { .. } => Ok(None),
+            AdaptiveCursorV1::ModelPending { effect } => {
+                if self.adaptive_provider_outcome_unknown(&session, effect)? {
+                    return Ok(None);
+                }
                 let request_id = format!(
                     "company-adaptive-{}-{}",
                     session.grant.session_id, effect.id
@@ -1187,13 +1311,16 @@ impl WorkflowApi {
                 ),
             ),
             AdaptiveCursorV1::ModelPending { effect }
-            | AdaptiveCursorV1::ModelUnknown { effect } => (
-                session
-                    .version
-                    .checked_sub(1)
-                    .ok_or("adaptive session version underflow")?,
-                effect.id,
-            ),
+                if !self.adaptive_provider_outcome_unknown(&session, effect)? =>
+            {
+                (
+                    session
+                        .version
+                        .checked_sub(1)
+                        .ok_or("adaptive session version underflow")?,
+                    effect.id,
+                )
+            }
             _ => return Ok(None),
         };
         Ok(Some(AdaptiveProviderAuthority {
@@ -4686,6 +4813,113 @@ mod family_selection_tests {
             source_project: *project,
             source_request: request,
             source_proposal: proposal,
+        }
+    }
+
+    #[test]
+    fn off_duty_unrelated_work_and_project_decisions_do_not_mask_sales_or_planning() {
+        use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
+
+        for planning in [false, true] {
+            for has_session in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let (api, sales) = tests::fixture(&temp.path().join("company.sqlite"));
+                let expected = if planning {
+                    ModelExecutionContext::ProjectPlanning(Box::new(accepted_context(
+                        &api,
+                        &sales,
+                        "python-project-v1",
+                    )))
+                } else {
+                    ModelExecutionContext::RequestSales(Box::new(sales))
+                };
+                let unrelated =
+                    super::super::model_work::assign_test_work_from(&api, Some(8), 1_000);
+                if has_session {
+                    assert!(api
+                        .adaptive_provider_authority(unrelated.agent_id)
+                        .unwrap()
+                        .is_some());
+                }
+                let leader = api.principals.principal("pm").unwrap();
+                let project = api
+                    .store
+                    .company_project(
+                        &leader.principal.tenant_id,
+                        &ProjectId::parse(&unrelated.project_id).unwrap(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let response = api
+                    .store
+                    .apply_company_command(
+                        &leader.principal,
+                        Uuid::new_v4(),
+                        &CompanyWorkflowCommandV1::RecordDecision {
+                            project_id: project.project_id.clone(),
+                            expected_version: project.version,
+                            work_item_id: None,
+                            choice_ref: "Independent project decision".into(),
+                            rationale_ref: "No change to another project's inference authority"
+                                .into(),
+                        },
+                        now_unix_ms(),
+                    )
+                    .unwrap();
+                let CompanyWorkflowResponseV1::Project(updated) = response.response else {
+                    panic!("independent project decision");
+                };
+                api.authority
+                    .as_ref()
+                    .unwrap()
+                    .runtime_health
+                    .write()
+                    .unwrap()
+                    .agents
+                    .iter_mut()
+                    .find(|agent| agent.agent_id == unrelated.agent_id.0)
+                    .unwrap()
+                    .expected_active = false;
+                assert_eq!(
+                    api.review_sessions(&updated).unwrap().len(),
+                    usize::from(has_session)
+                );
+                {
+                    let _fence = api.mutation_fence.write().unwrap();
+                    api.reconcile_unknown_adaptive_models(&updated).unwrap();
+                    assert!(!api.reconcile_adaptive_leadership_reviews(&updated).unwrap());
+                }
+                let target = expected.binding();
+                assert!(api.is_provider_usage_candidate(target.agent_id()).unwrap());
+                assert_eq!(
+                    api.resolve_provider_usage_authority(target.agent_id())
+                        .unwrap(),
+                    Some(target.clone())
+                );
+                assert_eq!(
+                    api.model_work_context(&target).unwrap(),
+                    Some(expected.clone())
+                );
+                assert_eq!(
+                    api.store
+                        .company_project(&updated.tenant_id, &updated.project_id)
+                        .unwrap(),
+                    Some((*updated).clone())
+                );
+                // Discovery must not make the actual target's duty check optional.
+                api.authority
+                    .as_ref()
+                    .unwrap()
+                    .runtime_health
+                    .write()
+                    .unwrap()
+                    .agents
+                    .iter_mut()
+                    .find(|agent| agent.agent_id == target.agent_id().0)
+                    .unwrap()
+                    .expected_active = false;
+                assert!(api.model_work_context(&target).is_err());
+            }
         }
     }
 
