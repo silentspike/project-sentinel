@@ -11,6 +11,7 @@ use crate::{
 use serde::Deserialize;
 
 const MAX_JOURNAL_ENTRIES: usize = 512;
+const MAX_SCOPED_ADAPTIVE_HEADS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,20 +183,59 @@ impl WorkflowStore {
         Ok(Some(session))
     }
 
-    /// Resolves the only session owned by the exact current runtime authority.
+    /// Resolves exact authority without hiding same-assignment campaigns after drift.
     pub fn adaptive_session_for_authority(
         &self,
         current: &RuntimeAuthoritySnapshotV1,
     ) -> Result<Option<AdaptiveSessionV1>, WorkflowError> {
         current.validate()?;
-        let connection = self.lock()?;
-        let Some(head) = read_head(&connection, current)? else {
-            return Ok(None);
-        };
-        let (session, _) = load(&connection, head.session_id)?.ok_or_else(corrupt_store)?;
-        authorize(&session.grant, current)?;
-        validate_head(&head, &session)?;
-        Ok(Some(session))
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(map_sqlite_error)?;
+        let mut statement = tx.prepare(
+            "SELECT authority_digest,session_id,version,updated_at_ms FROM workflow_adaptive_heads WHERE tenant_id=?1 AND project_id=?2 AND work_item_id=?3 AND agent_id=?4 ORDER BY authority_digest LIMIT ?5"
+        ).map_err(map_sqlite_error)?;
+        let mut rows = statement.query(params![current.tenant_id.0, current.project_id.0,
+            current.work_item_id.0, i64::from(current.agent_id.0), (MAX_SCOPED_ADAPTIVE_HEADS + 1) as i64])
+            .map_err(map_sqlite_error)?;
+        let mut exact = None;
+        let mut drifted_assignment = false;
+        let mut count = 0;
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            count += 1;
+            if count > MAX_SCOPED_ADAPTIVE_HEADS {
+                return Err(authority_conflict());
+            }
+            let stored_digest: String = row.get(0).map_err(map_sqlite_error)?;
+            let session_id: String = row.get(1).map_err(map_sqlite_error)?;
+            let head = AdaptiveHead {
+                session_id: Uuid::parse_str(&session_id).map_err(|_| corrupt_store())?,
+                version: stored_u64(row.get(2).map_err(map_sqlite_error)?)?,
+                updated_at_ms: stored_u64(row.get(3).map_err(map_sqlite_error)?)?,
+            };
+            let (session, _) = load(&tx, head.session_id)?.ok_or_else(corrupt_store)?;
+            validate_head(&head, &session)?;
+            let source = &session.grant.authority;
+            if source.tenant_id != current.tenant_id || source.project_id != current.project_id
+                || source.work_item_id != current.work_item_id || source.agent_id != current.agent_id
+                || !constant_time_eq(&stored_digest, &source.canonical_digest()?) {
+                return Err(corrupt_store());
+            }
+            // Prior assignments remain history, never current provider authority.
+            // Do not stop at an exact match: another head may hide spent authority.
+            if source.assignment_version == current.assignment_version {
+                if source != current {
+                    drifted_assignment = true;
+                } else {
+                    authorize(&session.grant, current)?;
+                    if exact.replace(session).is_some() {
+                        return Err(corrupt_store());
+                    }
+                }
+            }
+        }
+        if drifted_assignment { return Err(authority_conflict()); }
+        Ok(exact)
     }
 
     /// Read-only journal provenance for the original first model's sealed unknown.
@@ -681,6 +721,164 @@ mod continuation_tests {
         let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
             .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         rows
+    }
+
+    fn head_rows(store: &WorkflowStore) -> Vec<(String, String, String, i64, String, String, i64, i64)> {
+        let connection = store.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT tenant_id,project_id,work_item_id,agent_id,authority_digest,session_id,version,updated_at_ms FROM workflow_adaptive_heads ORDER BY tenant_id,project_id,work_item_id,agent_id,authority_digest"
+        ).unwrap();
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+            row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)))
+            .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        rows
+    }
+
+    fn continued_unknown_for_head_test(store: &WorkflowStore) -> AdaptiveSessionV1 {
+        let source = persisted_unknown(store);
+        let auth = authorization(&source);
+        let next = source.transition(&AdaptiveTransitionV1::ContinueGoverned { authorization: auth.clone() }, auth.issued_at_ms).unwrap();
+        let mut connection = store.lock().unwrap();
+        let tx = immediate(&mut connection).unwrap();
+        let (_, prior_digest) = load(&tx, auth.session_id).unwrap().unwrap();
+        // Seed journal facts only; these tests exercise read-only head discovery,
+        // not lane C's real-leader authorization and receipt verification.
+        append(&tx, &namespace(auth.session_id), &Entry {
+            previous_digest: Some(prior_digest), command: Some(AdaptiveTransitionV1::ContinueGoverned { authorization: auth }),
+            session: next.clone(), recovery_feedback: None,
+        }).unwrap();
+        update_head(&tx, &source, &next).unwrap();
+        tx.commit().unwrap();
+        next
+    }
+
+    #[test]
+    fn scoped_head_exact_match_and_authority_drift_are_read_only_across_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workflow.sqlite");
+        let store = WorkflowStore::open(&path).unwrap();
+        let source = continued_unknown_for_head_test(&store);
+        let before = (operation_rows(&store), head_rows(&store));
+        let current = source.grant.authority.clone();
+        let mut drifts = Vec::new();
+        let mut changed = current.clone(); changed.profile_generation += 1; drifts.push(changed);
+        let mut changed = current.clone(); changed.runtime_generation += 1; drifts.push(changed);
+        let mut changed = current.clone(); changed.policy_generation += 1; drifts.push(changed);
+        let mut changed = current.clone(); changed.organization_generation += 1; drifts.push(changed);
+        let mut changed = current.clone();
+        changed.principal = crate::PrincipalAuthorityV1::derive("agent-07", 5, &[0x5a; 32]).unwrap();
+        drifts.push(changed);
+        assert_eq!(store.adaptive_session_for_authority(&current).unwrap(), Some(source.clone()));
+        for drift in &drifts {
+            assert_eq!(store.adaptive_session_for_authority(drift).unwrap_err().code, WorkflowErrorCode::AuthorityConflict);
+        }
+        assert_eq!((operation_rows(&store), head_rows(&store)), before);
+        drop(store);
+        let reopened = WorkflowStore::open(&path).unwrap();
+        assert_eq!(reopened.adaptive_session_for_authority(&current).unwrap(), Some(source));
+        for drift in &drifts {
+            assert_eq!(reopened.adaptive_session_for_authority(drift).unwrap_err().code, WorkflowErrorCode::AuthorityConflict);
+        }
+        assert_eq!((operation_rows(&reopened), head_rows(&reopened)), before);
+    }
+
+    #[test]
+    fn scoped_head_rejects_hidden_older_campaign_even_with_exact_fresh_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workflow.sqlite");
+        let store = WorkflowStore::open(&path).unwrap();
+        let source = continued_unknown_for_head_test(&store);
+        let mut fresh = source.grant.clone();
+        fresh.session_id = Uuid::from_u128(999);
+        fresh.provider_allowance_id = "foreign-fresh-root".into();
+        fresh.authority.profile_generation += 1;
+        store.begin_adaptive_session(&fresh, &fresh.authority, NOW).unwrap();
+        let before = (operation_rows(&store), head_rows(&store));
+        assert_eq!(store.adaptive_session_for_authority(&fresh.authority).unwrap_err().code, WorkflowErrorCode::AuthorityConflict);
+        assert_eq!(store.adaptive_session_for_authority(&source.grant.authority).unwrap_err().code, WorkflowErrorCode::AuthorityConflict);
+        drop(store);
+        let reopened = WorkflowStore::open(&path).unwrap();
+        assert_eq!(reopened.adaptive_session_for_authority(&fresh.authority).unwrap_err().code, WorkflowErrorCode::AuthorityConflict);
+        assert_eq!((operation_rows(&reopened), head_rows(&reopened)), before);
+    }
+
+    #[test]
+    fn scoped_head_does_not_inherit_unrelated_scope_or_new_assignment() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();
+        let source = continued_unknown_for_head_test(&store);
+        let mut scopes = Vec::new();
+        let mut current = source.grant.authority.clone(); current.tenant_id = crate::TenantId::parse("other-tenant").unwrap(); scopes.push(current);
+        let mut current = source.grant.authority.clone(); current.project_id = crate::ProjectId::parse("other-project").unwrap(); scopes.push(current);
+        let mut current = source.grant.authority.clone(); current.work_item_id = crate::WorkItemId::parse("other-work").unwrap(); scopes.push(current);
+        let mut current = source.grant.authority.clone(); current.agent_id = crate::AgentId(8); scopes.push(current);
+        let mut current = source.grant.authority.clone();
+        current.assignment_version += 1; current.assignment_digest = "a".repeat(64); scopes.push(current);
+        for (index, current) in scopes.into_iter().enumerate() {
+            assert!(store.adaptive_session_for_authority(&current).unwrap().is_none());
+            let mut fresh = source.grant.clone();
+            fresh.session_id = Uuid::from_u128(500 + index as u128);
+            fresh.provider_allowance_id = format!("new-scope-{index}");
+            fresh.authority = current.clone();
+            let initial = store.begin_adaptive_session(&fresh, &current, NOW).unwrap().1;
+            assert_eq!(store.adaptive_session_for_authority(&current).unwrap(), Some(initial.clone()));
+            assert_eq!((initial.model_calls, initial.tool_calls), (0, 0));
+            assert!(initial.continuation.is_none());
+        }
+        assert_eq!(store.adaptive_session_for_authority(&source.grant.authority).unwrap(), Some(source));
+    }
+
+    #[test]
+    fn scoped_head_rejects_corrupt_head_digest_and_complete_journal() {
+        for sql in [
+            "UPDATE workflow_adaptive_heads SET authority_digest='invalid'",
+            "UPDATE workflow_adaptive_heads SET session_id='invalid'",
+            "UPDATE workflow_adaptive_heads SET version=version+1",
+            "UPDATE workflow_adaptive_heads SET updated_at_ms=updated_at_ms+1",
+            "UPDATE workflow_operations SET request_digest='invalid' WHERE operation_namespace NOT LIKE '%:operations' AND operation_id='00000000000000000004'",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();
+            let source = continued_unknown_for_head_test(&store);
+            assert!(store.lock().unwrap().execute(sql, []).unwrap() > 0);
+            let before = (operation_rows(&store), head_rows(&store));
+            let mut drifted = source.grant.authority.clone(); drifted.policy_generation += 1;
+            assert!(store.adaptive_session_for_authority(&drifted).is_err(), "{sql}");
+            assert!(store.adaptive_session_for_authority(&source.grant.authority).is_err(), "{sql}");
+            assert_eq!((operation_rows(&store), head_rows(&store)), before);
+        }
+    }
+
+    #[test]
+    fn scoped_head_rejects_cross_scope_session_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();
+        let source = continued_unknown_for_head_test(&store);
+        let mut foreign = grant();
+        foreign.session_id = Uuid::from_u128(999);
+        foreign.authority.work_item_id = crate::WorkItemId::parse("foreign-work").unwrap();
+        store.begin_adaptive_session(&foreign, &foreign.authority, NOW).unwrap();
+        store.lock().unwrap().execute(
+            "UPDATE workflow_adaptive_heads SET session_id=?1,authority_digest=?2,version=1,updated_at_ms=?3 WHERE work_item_id=?4",
+            params![foreign.session_id.to_string(), foreign.authority.canonical_digest().unwrap(), NOW as i64,
+                source.grant.authority.work_item_id.0]).unwrap();
+        assert_eq!(store.adaptive_session_for_authority(&source.grant.authority).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+    }
+
+    #[test]
+    fn scoped_head_scan_overflow_fails_closed_without_truncation_or_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();
+        let current = grant().authority;
+        for index in 0..=MAX_SCOPED_ADAPTIVE_HEADS {
+            let mut root = grant();
+            root.session_id = Uuid::from_u128(1_000 + index as u128);
+            root.authority.assignment_version = 10 + index as u64;
+            store.begin_adaptive_session(&root, &root.authority, NOW).unwrap();
+        }
+        let before = (operation_rows(&store), head_rows(&store));
+        assert_eq!(store.adaptive_session_for_authority(&current).unwrap_err().code, WorkflowErrorCode::AuthorityConflict);
+        assert_eq!((operation_rows(&store), head_rows(&store)), before);
     }
 
     #[test]
