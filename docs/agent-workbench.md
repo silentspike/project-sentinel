@@ -346,6 +346,13 @@ exact effect digest and employee owner scope, not just a matching request ID.
 An exactly validated but inactive adaptive grant returns no provider work,
 not an authorization error or a legacy execution fallback. An employee without
 the matching project subscription authority remains rejected.
+The Bridge separately requires explicit provider authority in subscription and
+Sales-scoped modes. An idle or tool-waiting session cannot become an unbound
+legacy provider request, including during pre-dispatch reauthorization.
+Recovery recognizes the exact result already adopted in the immutable adaptive
+journal. It can finish local completion cleanup without another provider call
+or model/tool transition; altered effects, results and decisions remain rejected.
+Collaboration is adopted only after its exact collaboration commit is durable.
 Each saved result is revalidated against its own exact allowance, even when
 another job is next. This does not authorize a fresh unselected provider call:
 the dispatch callback still requires the current selection and exact pending

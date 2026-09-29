@@ -2479,6 +2479,106 @@ fn adaptive_parser_accepts_one_typed_decision_and_rejects_ambiguous_output() {
 }
 
 #[test]
+fn adaptive_collaboration_recovers_after_company_commit_without_duplicate_question() {
+    let root = tempfile::tempdir().unwrap();
+    let database = root.path().join("company.sqlite");
+    let events = root.path().join("events.sqlite");
+    let (api, binding, _) =
+        super::super::model_work::configured_adaptive_test_api(&database, &events);
+    let context = api.prepare_adaptive_model(&binding).unwrap();
+    let request_id = binding.request_id();
+    let request_digest = "e".repeat(64);
+    let effect = AdaptiveEffectV1 {
+        id: binding.effect_id,
+        request_digest: request_digest.clone(),
+    };
+    let action = AdaptiveCollaborationActionV1::AskQuestion {
+        question_ref: "question-recovery".into(),
+    };
+    let content = r#"{"schema_version":1,"decision":{"kind":"collaborate","action":{"kind":"ask_question","question_ref":"question-recovery"}}}"#;
+    let (_, pending) = api
+        .core
+        .advance_adaptive_session(
+            binding.grant.session_id,
+            binding.session_version,
+            Uuid::from_u128(810_001),
+            &AdaptiveTransitionV1::ClaimModel {
+                effect: effect.clone(),
+                previous_observation_digest: None,
+            },
+            &binding.grant.authority,
+            now_unix_ms(),
+        )
+        .unwrap();
+    api.core
+        .advance_adaptive_session(
+            binding.grant.session_id,
+            pending.version,
+            Uuid::from_u128(810_002),
+            &AdaptiveTransitionV1::ResolveModel {
+                effect,
+                result_digest: hex_sha256(content.as_bytes()),
+                decision: AdaptiveModelDecisionV1::Collaborate {
+                    action: action.clone(),
+                },
+            },
+            &binding.grant.authority,
+            now_unix_ms(),
+        )
+        .unwrap();
+    api.apply_adaptive_collaboration(&context, &action, &request_id, &request_digest)
+        .unwrap();
+    let project = api
+        .store
+        .company_project(
+            &binding.grant.authority.tenant_id,
+            &binding.grant.authority.project_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(project.questions.len(), 1);
+    drop(api);
+
+    // Reopen at the actual crash boundary: company command committed, adaptive
+    // collaboration commit absent, original provider completion still retained.
+    let mut api = super::super::model_work::configured_test_api(&database);
+    api.subscription_allowance_id = Some(binding.grant.provider_allowance_id.clone());
+    api.event_store = Some(sentinel_limbo::EventStore::open(events.to_str().unwrap()).unwrap());
+    let completion = ModelExecutionCompletion {
+        context: ModelExecutionContext::Adaptive(Box::new(context.clone())),
+        content: content.into(),
+        admissible: true,
+    };
+    api.admit_model_work(&completion, &request_id, &request_digest)
+        .unwrap();
+    api.admit_model_work(&completion, &request_id, &request_digest)
+        .unwrap();
+    assert_eq!(
+        api.store
+            .company_project(
+                &binding.grant.authority.tenant_id,
+                &binding.grant.authority.project_id,
+            )
+            .unwrap()
+            .unwrap(),
+        project
+    );
+    let session = api
+        .core
+        .adaptive_session(binding.grant.session_id, &binding.grant.authority)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(session.cursor, AdaptiveCursorV1::ReadyForModel));
+    let mut changed = completion;
+    changed.content = changed
+        .content
+        .replace("question-recovery", "question-changed");
+    assert!(api
+        .admit_model_work(&changed, &request_id, &request_digest)
+        .is_err());
+}
+
+#[test]
 fn adaptive_completion_requires_an_observed_successful_artifact() {
     let digest = "a".repeat(64);
     let result = sentinel_common::WorkbenchMessage::Result {

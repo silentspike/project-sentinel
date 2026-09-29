@@ -1180,6 +1180,8 @@ impl WorkflowApi {
         if !completion.admissible || request_id != context.binding.request_id() {
             return Err("adaptive model completion was not admitted");
         }
+        let decision = parse_adaptive_decision(&completion.content)?;
+        validate_adaptive_decision_evidence(context.observation.as_ref(), &decision)?;
         let session = self
             .core
             .adaptive_session(
@@ -1188,6 +1190,24 @@ impl WorkflowApi {
             )
             .map_err(|_| "adaptive session unavailable")?
             .ok_or("adaptive session missing")?;
+        if session.grant != context.binding.grant {
+            return Err("adaptive provider grant changed");
+        }
+        if self
+            .store
+            .adaptive_model_result_is_adopted(
+                &context.binding.grant,
+                &AdaptiveEffectV1 {
+                    id: context.binding.effect_id,
+                    request_digest: request_digest.to_owned(),
+                },
+                &hex_sha256(completion.content.as_bytes()),
+                &decision,
+            )
+            .map_err(|_| "adaptive result replay unavailable")?
+        {
+            return Ok(());
+        }
         let (effect, proposed_action, needs_resolution) = match &session.cursor {
             AdaptiveCursorV1::ModelPending { effect }
             | AdaptiveCursorV1::ModelUnknown { effect }
@@ -1206,8 +1226,6 @@ impl WorkflowApi {
             }
             _ => return Err("adaptive provider effect changed"),
         };
-        let decision = parse_adaptive_decision(&completion.content)?;
-        validate_adaptive_decision_evidence(context.observation.as_ref(), &decision)?;
         if let Some(action) = &proposed_action {
             if decision
                 != (AdaptiveModelDecisionV1::Collaborate {
@@ -1307,11 +1325,40 @@ impl WorkflowApi {
                     && bound.principal.role == context.agent_context.permanent_role
             })
             .ok_or("adaptive collaboration principal changed")?;
+        let operation_id = stable_operation_id(
+            "sentinel.workflow.adaptive-collaboration.v1",
+            &format!("{request_id}:{request_digest}"),
+            1,
+        );
+        // Reconstruct a committed command from its sealed response, not a newer
+        // project head. The normal command path still verifies every replay digest.
+        let (current, expected_version) = match self
+            .store
+            .company_operation_response(&principal.principal, operation_id)
+            .map_err(|_| "adaptive collaboration replay unavailable")?
+        {
+            Some(CompanyWorkflowResponseV1::Project(project))
+                if project.tenant_id == current.tenant_id
+                    && project.project_id == current.project_id =>
+            {
+                let version = project
+                    .version
+                    .checked_sub(1)
+                    .filter(|version| *version > 0)
+                    .ok_or("adaptive collaboration replay version invalid")?;
+                (*project, version)
+            }
+            Some(_) => return Err("adaptive collaboration replay changed"),
+            None => {
+                let version = current.version;
+                (current, version)
+            }
+        };
         let command = match action {
             AdaptiveCollaborationActionV1::AskQuestion { question_ref } => {
                 CompanyWorkflowCommandV1::RecordQuestion {
                     project_id: current.project_id.clone(),
-                    expected_version: current.version,
+                    expected_version,
                     work_item_id: Some(context.task.work_item_id.clone()),
                     owner: context.binding.grant.authority.agent_id,
                     question_ref: question_ref.clone(),
@@ -1358,7 +1405,7 @@ impl WorkflowApi {
                 }
                 CompanyWorkflowCommandV1::CreateHandoff {
                     project_id: current.project_id.clone(),
-                    expected_version: current.version,
+                    expected_version,
                     work_item_id: context.task.work_item_id.clone(),
                     consumer: *consumer,
                     artifact_digests: artifact_digests.clone(),
@@ -1366,11 +1413,6 @@ impl WorkflowApi {
                 }
             }
         };
-        let operation_id = stable_operation_id(
-            "sentinel.workflow.adaptive-collaboration.v1",
-            &format!("{request_id}:{request_digest}"),
-            1,
-        );
         self.core
             .apply_company_command(&principal.principal, operation_id, &command, now_unix_ms())
             .map_err(|_| "adaptive collaboration command rejected")?;
