@@ -232,15 +232,36 @@ impl PrincipalAuthenticator {
         self.by_principal_id.get(principal_id).cloned()
     }
 
-    fn agent_for_role(&self, tenant: &TenantId, role: CompanyRoleV1) -> Option<BoundPrincipal> {
-        let mut matching = self.by_principal_id.values().filter(|bound| {
+    fn agents_for_role<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        role: CompanyRoleV1,
+    ) -> impl Iterator<Item = &'a BoundPrincipal> + 'a {
+        self.by_principal_id.values().filter(move |bound| {
             bound.principal.tenant_id == *tenant
                 && bound.principal.kind == CompanyPrincipalKindV1::Agent
                 && bound.principal.role == role
-        });
-        let result = matching.next()?.clone();
-        matching.next().is_none().then_some(result)
+        })
     }
+}
+
+pub(crate) fn company_tool_capabilities(tools: &[String]) -> BTreeSet<String> {
+    tools
+        .iter()
+        .filter(|tool| {
+            matches!(
+                tool.as_str(),
+                "file.inspect"
+                    | "file.write"
+                    | "patch.apply"
+                    | "command.run_allowlisted"
+                    | "test.run_profile"
+                    | "artifact.commit"
+                    | "observation.retain_private"
+            )
+        })
+        .cloned()
+        .collect()
 }
 
 fn read_principal_bindings_file(path: &Path) -> Result<Vec<u8>, WorkflowError> {
@@ -490,6 +511,26 @@ impl CompanyAuthority {
             .collect::<BTreeSet<_>>();
         if capabilities.is_empty() {
             return Err(WorkflowPortError::AuthorityConflict);
+        }
+        // Exact durable intent replay validates lineage without minting fresh
+        // employee authority. Every new admission requires current duty/ownership.
+        if require_serving_state {
+            let health = self
+                .runtime_health
+                .read()
+                .map_err(|_| WorkflowPortError::Unavailable)?;
+            if !health
+                .agents
+                .iter()
+                .find(|agent| agent.agent_id == agent_id.0)
+                .is_some_and(|agent| {
+                    agent.expected_active
+                        && crate::runtime_health::classify_runtime_agent(agent)
+                            == crate::runtime_health::RuntimeAgentHealthClass::Healthy
+                })
+            {
+                return Err(WorkflowPortError::AuthorityConflict);
+            }
         }
         let runtime_digest = domain_digest(
             "sentinel.workflow.runtime.v1",
@@ -1324,6 +1365,7 @@ fn derive_collaboration_admission_command(
                         .agents
                         .iter()
                         .find(|agent| agent.agent_id == participant.agent_id.0)
+                        .filter(|agent| agent.expected_active)
                         .map(crate::runtime_health::classify_runtime_agent)
                         == Some(crate::runtime_health::RuntimeAgentHealthClass::Healthy);
                     let active = bound_principal.is_some()
@@ -3931,7 +3973,38 @@ impl WorkflowApi {
                     false,
                 );
             }
-            let result = self.core.admit_plan(&envelope.plan, now_unix_ms());
+            let result = (|| {
+                if let Some(existing) = self.store.work_item_for_plan(
+                    &envelope.plan.tenant_id,
+                    &envelope.plan.project_id,
+                    &envelope.plan.work_item_id,
+                    envelope.plan.plan_id,
+                )? {
+                    let historical = authority
+                        .snapshot_for_admission(
+                            &envelope.plan.tenant_id,
+                            &envelope.plan.project_id,
+                            &envelope.plan.work_item_id,
+                            envelope.plan.agent_id,
+                            false,
+                        )
+                        .map_err(execution_intent_port_error)?;
+                    if existing.plan != envelope.plan {
+                        return Err(WorkflowError::new(
+                            WorkflowErrorCode::IdempotencyConflict,
+                            false,
+                            "execution plan changed for an existing operation",
+                        ));
+                    }
+                    if !existing.plan.authority_matches(&historical) {
+                        return Err(execution_authority_conflict());
+                    }
+                    return self
+                        .store
+                        .admit_plan(&envelope.plan, &historical, now_unix_ms());
+                }
+                self.core.admit_plan(&envelope.plan, now_unix_ms())
+            })();
             return match result {
                 Ok((replayed, work_item)) => json(200, &(replayed, work_item)),
                 Err(error) => workflow_error(error),
@@ -6743,6 +6816,7 @@ mod tests {
             runtime_health: Arc::new(RwLock::new(crate::runtime_health::RuntimeHealthSnapshot {
                 agents: vec![crate::runtime_health::RuntimeHealthAgentSnapshot {
                     agent_id: 6,
+                    expected_active: true,
                     runtime_present: true,
                     projection_present: true,
                     security_runtime_present: true,
@@ -6812,6 +6886,23 @@ mod tests {
         );
         assert!(reliability.is_empty());
 
+        authority.runtime_health.write().unwrap().agents[0].expected_active = false;
+        let off_duty = derive_collaboration_admission_command(
+            &authority,
+            &project,
+            admission_request(&project, now_unix_ms().saturating_add(10_000)),
+            "9".repeat(64),
+        )
+        .unwrap();
+        let CompanyWorkflowCommandV1::AdmitCollaboration {
+            candidates: off_duty_candidates,
+            ..
+        } = off_duty
+        else {
+            panic!("expected admission command")
+        };
+        assert!(!off_duty_candidates[0].active);
+        assert!(!off_duty_candidates[0].runtime_available);
         authority.runtime_health.write().unwrap().agents.clear();
         let unavailable = derive_collaboration_admission_command(
             &authority,

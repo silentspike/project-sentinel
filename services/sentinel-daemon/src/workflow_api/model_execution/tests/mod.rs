@@ -11,29 +11,6 @@ pub(crate) fn fixture(path: &Path) -> (WorkflowApi, RequestSalesContext) {
         sentinel_limbo::EventStore::open(path.with_extension("events.sqlite").to_str().unwrap())
             .unwrap(),
     );
-    api.authority
-        .as_ref()
-        .unwrap()
-        .runtime_health
-        .write()
-        .unwrap()
-        .agents
-        .extend([3, 4, 5, 6, 7, 8, 9].map(|agent_id| {
-            crate::runtime_health::RuntimeHealthAgentSnapshot {
-                agent_id,
-                aggregate_id: AgentId(agent_id).to_string(),
-                name: format!("Company agent {agent_id}"),
-                runtime_present: true,
-                projection_present: true,
-                security_runtime_present: true,
-                adapter_handle_present: true,
-                adapter_instance_matches: true,
-                runtime_resources_healthy: true,
-                adapter_health_state: Some(sentinel_common::NanoHealthState::Healthy),
-                logical_status: Some(sentinel_runtime::AgentStatus::Active),
-                ..Default::default()
-            }
-        }));
     let customer = api.principals.principal("customer").unwrap();
     let response = api
         .store
@@ -1895,6 +1872,15 @@ fn corrected_sales_schema_requeues_only_the_exact_failed_completion_without_prov
     assert_eq!(requeued.attempt_count, 0);
     assert!(requeued.last_error.is_none());
     assert!(!api.requeue_request_sales_schema_mismatch().unwrap());
+    let healthy_roster = api
+        .authority
+        .as_ref()
+        .unwrap()
+        .runtime_health
+        .write()
+        .unwrap()
+        .agents
+        .clone();
     api.authority
         .as_ref()
         .unwrap()
@@ -1903,6 +1889,22 @@ fn corrected_sales_schema_requeues_only_the_exact_failed_completion_without_prov
         .unwrap()
         .agents
         .clear();
+    assert!(api
+        .accept_request_sales(&completion, &context, id, digest)
+        .is_err());
+    assert!(api
+        .request_sales_call()
+        .unwrap()
+        .unwrap()
+        .proposal_response
+        .is_none());
+    api.authority
+        .as_ref()
+        .unwrap()
+        .runtime_health
+        .write()
+        .unwrap()
+        .agents = healthy_roster;
     api.accept_request_sales(&completion, &context, id, digest)
         .unwrap();
     assert!(api

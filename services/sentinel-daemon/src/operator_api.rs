@@ -3969,6 +3969,7 @@ mod tests {
                         agent_id: 7,
                         aggregate_id: "AGENT-07".to_string(),
                         name: "Test Agent".to_string(),
+                        expected_active: true,
                         runtime_key: sentinel_common::RUNTIME_BWRAP_LANDLOCK.to_string(),
                         runtime_present: true,
                         projection_present: false,

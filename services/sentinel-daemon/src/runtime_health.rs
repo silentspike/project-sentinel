@@ -38,6 +38,8 @@ pub struct RuntimeHealthAgentSnapshot {
     pub aggregate_id: String,
     pub name: String,
     #[serde(default)]
+    pub expected_active: bool,
+    #[serde(default)]
     pub runtime_key: String,
     pub runtime_present: bool,
     pub projection_present: bool,
@@ -402,6 +404,7 @@ fn build_runtime_health_snapshot_with_registry(
             agent_id,
             aggregate_id,
             name,
+            expected_active,
             runtime_key,
             runtime_present,
             projection_present,
@@ -820,6 +823,7 @@ mod tests {
         assert_eq!(snapshot.projection_drift_agents, 1);
         assert_eq!(snapshot.stale_runtime_entries, 1);
         assert_eq!(snapshot.agents.len(), 1);
+        assert!(snapshot.agents[0].expected_active);
         assert!(snapshot.agents[0].runtime_present);
         assert!(!snapshot.agents[0].projection_present);
         assert!(!snapshot.agents[0].security_runtime_present);
@@ -1008,6 +1012,7 @@ mod tests {
                 agent_id: 7,
                 aggregate_id: "AGENT-07".to_string(),
                 name: "Runtime Agent".to_string(),
+                expected_active: true,
                 runtime_key: runtime_key.to_string(),
                 runtime_present: true,
                 projection_present: true,
@@ -1065,6 +1070,18 @@ mod tests {
     }
 
     #[test]
+    fn legacy_health_row_does_not_imply_on_duty_authority() {
+        let mut value = serde_json::to_value(RuntimeHealthAgentSnapshot {
+            expected_active: true,
+            ..Default::default()
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("expected_active");
+        let restored: RuntimeHealthAgentSnapshot = serde_json::from_value(value).unwrap();
+        assert!(!restored.expected_active);
+    }
+
+    #[test]
     fn build_snapshot_marks_projection_only_agents_as_stale() {
         let tmp = tempdir().unwrap();
         let projection_path = tmp.path().join("projection.db");
@@ -1103,6 +1120,7 @@ mod tests {
         assert_eq!(snapshot.stale_runtime_entries, 1);
         assert_eq!(snapshot.agents.len(), 1);
         assert_eq!(snapshot.agents[0].agent_id, 16);
+        assert!(!snapshot.agents[0].expected_active);
         assert!(!snapshot.agents[0].runtime_present);
         assert!(snapshot.agents[0].projection_present);
         assert_eq!(

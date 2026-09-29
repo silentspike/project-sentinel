@@ -5,6 +5,13 @@
   repository discovery disabled and existing upgrade/review policy unchanged
   (#856).
 
+- Bind fresh company projects to the healthy, locally owned on-duty employees
+  across all three shifts, with distinct credentials and required Python/Node
+  tool capabilities. Keep the exact Sales caller, reject ambiguous eligible
+  roles, and preserve accepted project assignments and dispatched replay across
+  shift changes. Publish explicit duty eligibility in runtime health; legacy
+  health rows never imply authority (#856).
+
 - Recognize the exact already dispatched project-planning call before checking
   fresh provider allowance or employee shift readiness. Preserve durable pending
   outcomes, reject changed project lineage and retain strict on-duty admission

@@ -3139,23 +3139,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let workflow_agent_capabilities = all_agents
         .iter()
         .map(|agent| {
-            let capabilities = agent
-                .capabilities
-                .tools
-                .iter()
-                .filter(|capability| {
-                    matches!(
-                        capability.as_str(),
-                        "file.inspect"
-                            | "file.write"
-                            | "patch.apply"
-                            | "command.run_allowlisted"
-                            | "test.run_profile"
-                            | "artifact.commit"
-                    )
-                })
-                .cloned()
-                .collect();
+            let capabilities =
+                crate::workflow_api::company_tool_capabilities(&agent.capabilities.tools);
             (AgentId(agent.identity.id), capabilities)
         })
         .collect();
@@ -12821,6 +12806,7 @@ mod tests {
             aggregate_id: "AGENT-07".to_string(),
             name: "Runtime Agent".to_string(),
             runtime_key: runtime_key.to_string(),
+            expected_active: true,
             runtime_present: true,
             projection_present: true,
             tracked_pid,
@@ -20771,6 +20757,7 @@ mod tests {
             aggregate_id: format!("AGENT-{agent_id:02}"),
             name: format!("Agent{agent_id}"),
             runtime_key: sentinel_common::RUNTIME_ECS_NATIVE.to_string(),
+            expected_active: true,
             runtime_present: true,
             projection_present: true,
             tracked_pid: None,
