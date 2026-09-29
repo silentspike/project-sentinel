@@ -1,5 +1,6 @@
 //! Authenticated M0 company workflow and productive Workbench integration.
 
+mod adaptive_recovery;
 mod delivery_intent;
 mod delivery_runtime;
 #[cfg(feature = "llm")]
@@ -85,6 +86,7 @@ pub const REQUEST_PROVIDER_ABANDON_PATH: &str = "/operator/workflow/request-prov
 pub const PROJECT_PROVIDER_ABANDON_PATH: &str = "/operator/workflow/project-provider/abandon";
 pub const AGENT_COMMAND_PATH: &str = "/agent/workflow/commands";
 pub const WORK_CORRECTION_PATH: &str = "/agent/workflow/corrections";
+pub const ADAPTIVE_RECOVERY_PATH: &str = "/agent/workflow/adaptive-recovery";
 pub const SOURCE_REVIEW_PATH: &str = "/agent/workflow/source-reviews";
 pub const OPERATOR_PROJECT_PATH: &str = "/operator/workflow/projects";
 pub const OPERATOR_WORK_ITEM_PATH: &str = "/operator/workflow/work-items";
@@ -3314,6 +3316,9 @@ impl WorkflowApi {
             }
             ("POST", AGENT_COMMAND_PATH) => self.agent_command(&principal, body),
             ("POST", WORK_CORRECTION_PATH) => self.correct_model_work(&principal, body),
+            ("POST", ADAPTIVE_RECOVERY_PATH) => {
+                self.resolve_blocked_adaptive_work(&principal, body)
+            }
             ("POST", SOURCE_REVIEW_PATH) => self.append_source_review(&principal, body),
             ("GET", CUSTOMER_REQUEST_PATH) => self.customer_request(&principal, path),
             ("GET", CUSTOMER_IDENTITY_PATH) => customer_identity(&principal),
@@ -4798,6 +4803,13 @@ impl WorkflowApi {
             }
             #[cfg(feature = "llm")]
             if self
+                .recover_rejected_first_adaptive_model(&project)
+                .map_err(|_| workflow_unavailable())?
+            {
+                continue;
+            }
+            #[cfg(feature = "llm")]
+            if self
                 .recover_failed_qa_schema_call(&project)
                 .map_err(|_| workflow_unavailable())?
             {
@@ -5624,6 +5636,7 @@ fn is_workflow_path(path: &str) -> bool {
             | OPERATOR_COMMAND_PATH
             | REQUEST_PROVIDER_PATH
             | WORK_CORRECTION_PATH
+            | ADAPTIVE_RECOVERY_PATH
             | SOURCE_REVIEW_PATH
             | REQUEST_PROVIDER_ABANDON_PATH
             | PROJECT_PROVIDER_ABANDON_PATH

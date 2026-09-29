@@ -1239,7 +1239,10 @@ fn schema_corrections_are_bounded_across_restart_expiry_and_idle_renewal() {
                 )
                 .unwrap();
             assert_eq!(store.adaptive_recovery_feedback(&reassigned).unwrap(), None);
-            assert_eq!(store.adaptive_recovery_feedback(&auth).unwrap(), Some(feedback));
+            assert_eq!(
+                store.adaptive_recovery_feedback(&auth).unwrap(),
+                Some(feedback)
+            );
         }
     }
 }
@@ -1273,15 +1276,25 @@ fn failed_rollover_rolls_back_cancellation_head_and_feedback_together() {
         Some(rejected)
     );
     assert_eq!(
-        store.adaptive_recovery_feedback(&auth).unwrap().unwrap().count,
+        store
+            .adaptive_recovery_feedback(&auth)
+            .unwrap()
+            .unwrap()
+            .count,
         0
     );
-    connection.execute_batch("DROP TRIGGER deny_renewal").unwrap();
+    connection
+        .execute_batch("DROP TRIGGER deny_renewal")
+        .unwrap();
     store
         .begin_adaptive_session(&renewed, &auth, renewed.created_at_ms)
         .unwrap();
     assert_eq!(
-        store.adaptive_recovery_feedback(&auth).unwrap().unwrap().count,
+        store
+            .adaptive_recovery_feedback(&auth)
+            .unwrap()
+            .unwrap()
+            .count,
         1
     );
 }
@@ -1399,7 +1412,8 @@ fn explicit_blocked_resolution_preserves_history_and_correction_lineage_on_rollo
     let AdaptiveTransitionV1::ResolveBlocked {
         resolution_event_id,
         ..
-    } = &resolution else {
+    } = &resolution
+    else {
         unreachable!();
     };
     expected.cursor = AdaptiveCursorV1::BlockedResolved {
@@ -1467,8 +1481,14 @@ fn explicit_blocked_resolution_preserves_history_and_correction_lineage_on_rollo
     );
     drop(store);
     let store = WorkflowStore::open(&database).unwrap();
-    assert_eq!(store.adaptive_recovery_feedback(&auth).unwrap(), Some(feedback));
-    assert_eq!(store.adaptive_session_for_authority(&auth).unwrap(), Some(fresh));
+    assert_eq!(
+        store.adaptive_recovery_feedback(&auth).unwrap(),
+        Some(feedback)
+    );
+    assert_eq!(
+        store.adaptive_session_for_authority(&auth).unwrap(),
+        Some(fresh)
+    );
 }
 
 #[test]

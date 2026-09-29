@@ -21,7 +21,7 @@ GitHub, and Rust validation actions belong to ORC, not this lane.
 
 ## Protected API
 
-ORC wires `POST /agent/workflow/adaptive-recovery` to:
+`POST /agent/workflow/adaptive-recovery` uses the authenticated workflow handler:
 
 ```rust
 pub(super) fn resolve_blocked_adaptive_work(
@@ -104,19 +104,26 @@ allows one decision per session authority, including the event/transition crash
 gap. The scope is independent of the leadership actor, so competing leadership
 operations cannot both claim the same session. Changed content for an existing
 operation UUID conflicts, including changed rationale, reason, version,
-principal, tenant, work, or assignment authority.
+leadership identity, tenant, work, or assignment authority. Credential rotation
+may resume the original decision only for the same currently authorized leader
+with a non-regressing authority generation and identical decision/assignee
+bindings. The original sealed event retains its historical credential binding.
 
 Sequence:
 
 1. Authenticate current leadership and exact assignee/head authority.
-2. Read any prior sealed event by its deterministic UUID and compare its
-   canonical request digest and typed payload to the freshly bound request.
+2. Read any prior sealed event by its deterministic UUID. Validate the sealed
+   event against its recorded typed proposal and compare the complete request,
+   assignment and assignee authority with current state. Require the same
+   leadership identity and a non-regressing generation. Reuse the historical
+   proposal on replay; new decisions bind the current credentials.
 3. For a new decision, or a prior event whose transition is still missing,
    recheck exact blocked version/reason before appending/replaying the event.
    A completed retry requires the exact next version and `BlockedResolved`
    cursor; a prior event never permits replay from pending/unknown state.
-4. Call the existing atomic `advance_adaptive_session` with the request's
-   operation UUID and expected version, exact assignee snapshot, and
+4. Call the existing atomic `advance_adaptive_session` with a domain-separated
+   operation UUID derived from session, caller operation and expected version,
+   exact assignee snapshot, and
    `ResolveBlocked { expected_reason_code, resolution_event_id }`.
 5. Return the committed resolution version and event UUID. The store checks
    current authorization before its atomic operation replay path.
@@ -126,15 +133,16 @@ transition leaves the same durable decision available to an exact authenticated
 retry. A crash after transition recovers the same journal operation, event UUID,
 and resolution version; `replay` is then true. There is no startup scan that
 blindly applies an old leadership decision. Recovery requires an exact retry
-under current authority. Changed credentials, health, assignment, governance,
-or replacement of the session head fail closed, including on retries.
+under current authority. Revoked credentials, changed leadership identity,
+regressed generations, health, assignment, governance, or replacement of the
+session head fail closed, including on retries. An authenticated credential
+rotation of the same leader can finish a prior decision across the crash gap
+without a new model call or alteration of the historical event.
 
 ## ORC Integration Contract
 
-This base does not yet define the transition or resolved cursor. Add
-`mod adaptive_recovery;` and an `ADAPTIVE_RECOVERY_PATH` constant in
-`workflow_api.rs`, include the path in `is_workflow_path`, and dispatch its
-authenticated POST branch in `WorkflowApi::handle` to the method above.
+`workflow_api.rs` declares `mod adaptive_recovery;`, an `ADAPTIVE_RECOVERY_PATH`
+constant, the workflow path classification and authenticated POST dispatch.
 No governance helper visibility change is needed:
 the child module can use parent `governed_project_participant` and
 `CompanyAuthority::snapshot`, and project readback validates governance.
@@ -144,7 +152,7 @@ The core lane must supply this variant:
 ```rust
 AdaptiveTransitionV1::ResolveBlocked {
     expected_reason_code: String,
-    resolution_event_id: uuid::Uuid,
+    resolution_event_id: String,
 }
 ```
 

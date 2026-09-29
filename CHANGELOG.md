@@ -1,5 +1,13 @@
 # Changelog
 
+- Bind adaptive model correction to durable usage, completion and assignment
+  evidence across restart. Limit schema correction renewals, preserve monotonic
+  journal time and provide the exact capability-filtered tool syntax. Resolve
+  model-blocked work only through an authenticated project-leadership decision;
+  retain original history through authorized leadership credential rotation
+  and forbid replay of unknown provider/tool effects
+  (#856).
+
 - Let company coding agents list a bounded, assigned workspace directory through
   their existing file-inspection capability. Keep the directory descriptor pinned,
   reject path escape, and expose a paginated result without shell authority (#856).

@@ -90,7 +90,8 @@ impl WorkflowStore {
                 let crate::AdaptiveCursorV1::ModelRejected {
                     reason_code,
                     resolution_event_id,
-                } = &previous.cursor else {
+                } = &previous.cursor
+                else {
                     return Err(corrupt_store());
                 };
                 Some(AdaptiveRecoveryFeedbackV1 {
@@ -515,7 +516,11 @@ fn load(
     Ok(load_with_feedback(connection, id)?.map(|(session, digest, _)| (session, digest)))
 }
 
-type LoadedSession = (AdaptiveSessionV1, String, Option<AdaptiveRecoveryFeedbackV1>);
+type LoadedSession = (
+    AdaptiveSessionV1,
+    String,
+    Option<AdaptiveRecoveryFeedbackV1>,
+);
 
 fn load_with_feedback(
     connection: &Connection,

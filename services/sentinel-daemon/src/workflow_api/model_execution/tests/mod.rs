@@ -1,5 +1,6 @@
 use super::*;
 use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
+use sentinel_limbo::rusqlite;
 use sentinel_workflow::CustomerRequestStateV1;
 
 fn additional_request(api: &WorkflowApi, operation: u128) -> sentinel_workflow::CustomerRequestV1 {
@@ -2483,6 +2484,211 @@ fn adaptive_parser_accepts_one_typed_decision_and_rejects_ambiguous_output() {
         r#"{"schema_version":1,"decision":{"kind":"collaborate","action":{"kind":"offer_handoff","consumer_role":"qa","artifact_digests":["not-a-digest"],"reason_ref":"invalid"}}}"#,
     ] {
         assert!(parse_adaptive_decision(invalid).is_err(), "{invalid}");
+    }
+}
+
+#[test]
+fn adaptive_prompt_contains_profile_bound_tool_syntax_and_reads_legacy_context() {
+    let root = tempfile::tempdir().unwrap();
+    let (api, binding, _) = super::super::model_work::configured_adaptive_test_api(
+        &root.path().join("company.sqlite"),
+        &root.path().join("events.sqlite"),
+    );
+    let context = api.prepare_adaptive_model(&binding).unwrap();
+    let prompt = context.prompt().unwrap();
+    assert!(prompt.contains("list_directory"));
+    assert!(prompt.contains("expected_occurrences"));
+    assert!(prompt.contains("required_arg_prefix"));
+    assert!(prompt.contains("source_tree"));
+    let mut legacy = serde_json::to_value(&context).unwrap();
+    legacy.as_object_mut().unwrap().remove("tool_catalog");
+    let restored: AdaptiveModelContext = serde_json::from_value(legacy).unwrap();
+    assert!(restored.tool_catalog.is_none());
+    restored.validate_dispatch(now_unix_ms()).unwrap();
+}
+
+#[test]
+fn rejected_first_adaptive_model_is_resolved_once_without_repeating_provider_io() {
+    for (resolved_before_restart, tamper_usage) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("company.sqlite");
+        let events = root.path().join("events.sqlite");
+        let (api, binding, store) =
+            super::super::model_work::configured_adaptive_test_api(&database, &events);
+        let context = api.prepare_adaptive_model(&binding).unwrap();
+        let request_id = binding.request_id();
+        let request_digest = "d".repeat(64);
+        let effect = sentinel_workflow::AdaptiveEffectV1 {
+            id: binding.effect_id,
+            request_digest: request_digest.clone(),
+        };
+        api.core
+            .advance_adaptive_session(
+                binding.grant.session_id,
+                binding.session_version,
+                Uuid::from_u128(0x01991c34e03c70c2b97e0591f4be2611),
+                &sentinel_workflow::AdaptiveTransitionV1::ClaimModel {
+                    effect: effect.clone(),
+                    previous_observation_digest: None,
+                },
+                &binding.grant.authority,
+                now_unix_ms(),
+            )
+            .unwrap();
+        let completion = ModelExecutionCompletion {
+            context: ModelExecutionContext::Adaptive(Box::new(context)),
+            content: r#"{"schema_version":1,"decision":{"kind":"tool","tool":{"tool":"inspect_file","path":".","max_bytes":1024}}}"#.into(),
+            admissible: true,
+        };
+        let usage_payload = serde_json::json!({
+            "type": "AgentLlmUsage",
+            "agent_id": binding.grant.authority.agent_id,
+            "tenant_id": binding.grant.authority.tenant_id,
+            "project_id": binding.grant.authority.project_id,
+            "work_item_id": binding.grant.authority.work_item_id,
+            "reservation_id": binding.grant.provider_allowance_id,
+            "assignment_id": binding.assignment_id,
+            "assignment_version": binding.grant.authority.assignment_version,
+            "provider": binding.grant.provider,
+            "caller_role": "agent_runtime",
+            "effective_model": binding.grant.model,
+            "requested_model": binding.grant.model,
+            "tier": "mid",
+            "hierarchy_tier": 2,
+            "cost_source": "provider_reported",
+            "input_tokens": 5,
+            "output_tokens": 5,
+            "cache_read": 0,
+            "cache_creation": 0,
+            "cost_usd": 0.0
+        });
+        let usage = DomainEvent::new(
+            "agent_llm_usage",
+            &binding.grant.authority.agent_id.to_string(),
+            &usage_payload.to_string(),
+            &request_id,
+            1,
+        )
+        .with_operation_id(&format!("llm_usage_{request_id}"))
+        .with_schema_version(3);
+        completion.validate_usage(&usage).unwrap();
+        store
+            .reserve_llm_request(
+                &request_id,
+                &request_digest,
+                &binding.grant.authority.agent_id.to_string(),
+            )
+            .unwrap();
+        let completion_payload = serde_json::json!({
+            "version": 2,
+            "request_id": request_id,
+            "request_digest": request_digest,
+            "usage_event": usage,
+            "actions": [],
+            "tokens_used": 5,
+            "model_work": completion
+        })
+        .to_string();
+        store
+            .enqueue_llm_completion(&request_id, &request_digest, &completion_payload)
+            .unwrap();
+        let project = api
+            .store
+            .company_project(
+                &binding.grant.authority.tenant_id,
+                &binding.grant.authority.project_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!api.recover_rejected_first_adaptive_model(&project).unwrap());
+        store
+            .persist_llm_completion_usage(&request_id, &request_digest, &usage)
+            .unwrap();
+        store
+            .record_llm_completion_failure(
+                &request_id,
+                &request_digest,
+                ADAPTIVE_TOOL_SCHEMA_ERROR,
+                1,
+            )
+            .unwrap();
+        if resolved_before_restart {
+            store
+                .resolve_failed_llm_completion_with_evidence(
+                    &request_id,
+                    &request_digest,
+                    ADAPTIVE_TOOL_SCHEMA_ERROR,
+                    ADAPTIVE_TOOL_SCHEMA_RESOLUTION,
+                    &sentinel_limbo::event_store::LlmModelRetryEvidence {
+                        owner_scope: sentinel_common::StateTransferScope::for_agent(
+                            binding.grant.authority.agent_id.to_string(),
+                        ),
+                        usage_event: usage.clone(),
+                        completion_payload_digest: sentinel_common::sha256_hex(
+                            completion_payload.as_bytes(),
+                        ),
+                        authority_binding: serde_json::to_value(&binding).unwrap(),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+        }
+        drop(api);
+        drop(store);
+        let store = sentinel_limbo::EventStore::open(events.to_str().unwrap()).unwrap();
+        let mut api = super::super::model_work::configured_test_api(&database);
+        api.event_store = Some(store.clone());
+        api.subscription_allowance_id = Some(binding.grant.provider_allowance_id.clone());
+        if tamper_usage {
+            let mut changed = usage_payload.clone();
+            changed["assignment_id"] = "foreign-assignment".into();
+            rusqlite::Connection::open(&events)
+                .unwrap()
+                .execute(
+                    "UPDATE events SET payload=?1 WHERE operation_id=?2",
+                    rusqlite::params![changed.to_string(), format!("llm_usage_{request_id}")],
+                )
+                .unwrap();
+        }
+        let project = api
+            .store
+            .company_project(
+                &binding.grant.authority.tenant_id,
+                &binding.grant.authority.project_id,
+            )
+            .unwrap()
+            .unwrap();
+        if tamper_usage {
+            assert!(api.recover_rejected_first_adaptive_model(&project).is_err());
+            let session = api
+                .core
+                .adaptive_session(binding.grant.session_id, &binding.grant.authority)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                session.cursor,
+                AdaptiveCursorV1::ModelPending { .. }
+            ));
+            assert_eq!(
+                store.get_llm_completion(&request_id).unwrap().is_some(),
+                !resolved_before_restart
+            );
+            continue;
+        }
+        assert!(api.recover_rejected_first_adaptive_model(&project).unwrap());
+        assert!(!api.recover_rejected_first_adaptive_model(&project).unwrap());
+        let session = api
+            .core
+            .adaptive_session(binding.grant.session_id, &binding.grant.authority)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            session.cursor,
+            AdaptiveCursorV1::ModelRejected { .. }
+        ));
+        assert!(store.get_llm_completion(&request_id).unwrap().is_none());
     }
 }
 
