@@ -1,5 +1,8 @@
 # Changelog
 
+- Separate breaking Cargo updates, including pre-1.0 minor changes, from the
+  compatible update group; require review instead of automatic merge (#856).
+
 - Give automated dependency proposals the repository's seven-section PR body
   with pending verification claims instead of bypassing the quality gate
   (#856).
