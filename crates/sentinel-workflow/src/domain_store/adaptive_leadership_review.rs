@@ -141,7 +141,9 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
         {
             return Err(corrupt());
         }
-        let expected = if self.decision.is_some() {
+        let expected = if self.retired_at_unix_ms.is_some() {
+            4
+        } else if self.decision.is_some() {
             3
         } else if self.dispatch.is_some() {
             2
@@ -150,6 +152,13 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
         };
         if self.version != expected
             || self.decision.is_some() != self.model_response_digest.is_some()
+            || self.retired_at_unix_ms.is_some_and(|at| {
+                at != self.updated_at_unix_ms
+                    || at < self.grant_issued_at_unix_ms
+                    || self.decision.is_some()
+                    || self.model_response_digest.is_some()
+                    || self.resolution_event_id.is_some()
+            })
         {
             return Err(corrupt());
         }
@@ -224,6 +233,7 @@ impl WorkflowStore {
             }
             if prior.dispatch.is_some()
                 || prior.decision.is_some()
+                || prior.retired_at_unix_ms.is_some()
                 || now_ms < prior.grant.expires_at_unix_ms
             {
                 return Err(transition());
@@ -245,7 +255,9 @@ impl WorkflowStore {
             .filter(|call| call.grant.expected_session_version == grant.expected_session_version)
             .collect();
         if same_head.len() >= ADAPTIVE_LEADERSHIP_MAX_REVIEWS
-            || same_head.iter().any(|call| call.decision.is_none())
+            || same_head
+                .iter()
+                .any(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none())
         {
             return Err(transition());
         }
@@ -264,6 +276,7 @@ impl WorkflowStore {
             decision: None,
             model_response_digest: None,
             resolution_event_id: None,
+            retired_at_unix_ms: None,
         };
         require_current_source(&transaction, &call)?;
         store_call(&transaction, &call, "adaptive_leadership_review_authorized")?;
@@ -293,6 +306,75 @@ impl WorkflowStore {
         calls_for_session(&connection, tenant, session_id)
     }
 
+    /// Retire stale input without fabricating a model decision or releasing its allowance.
+    pub fn retire_stale_adaptive_leadership_review_call(
+        &self,
+        leader: &AuthenticatedCompanyPrincipalV1,
+        review_id: Uuid,
+        expected_version: u64,
+        now_ms: u64,
+    ) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
+        leader.validate()?;
+        if review_id.is_nil() {
+            return Err(invalid("invalid leadership review identity"));
+        }
+        let mut connection = self.connection.lock().map_err(|_| persistence())?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut call: AdaptiveLeadershipReviewCallV1 = get_entity(
+            &transaction,
+            &leader.tenant_id,
+            KIND,
+            &review_id.to_string(),
+        )?
+        .ok_or_else(not_found)?;
+        if leader != &call.grant.leadership_principal {
+            return Err(unauthorized());
+        }
+        if call.retired_at_unix_ms.is_some() {
+            if !matches!(expected_version, 1 | 2 | 4) {
+                return Err(transition());
+            }
+            return Ok(call);
+        }
+        if call.version != expected_version
+            || call.decision.is_some()
+            || now_ms < call.updated_at_unix_ms
+        {
+            return Err(transition());
+        }
+        let project: ProjectV1 = get_entity(
+            &transaction,
+            &leader.tenant_id,
+            "project",
+            &call.grant.project_id.0,
+        )?
+        .ok_or_else(not_found)?;
+        let (session, _) = crate::store::adaptive::load(&transaction, call.grant.session_id)?
+            .ok_or_else(not_found)?;
+        crate::store::adaptive::require_head(&transaction, &session)?;
+        // A committed resolution needs receipt recovery, not retirement.
+        if session.version
+            == call
+                .grant
+                .expected_session_version
+                .checked_add(1)
+                .ok_or_else(transition)?
+            && session.grant == call.context.source_session.grant
+            && matches!(session.cursor, AdaptiveCursorV1::BlockedResolved { .. })
+        {
+            return Err(transition());
+        }
+        if project == call.context.source_project && session == call.context.source_session {
+            return Err(transition());
+        }
+        call.retired_at_unix_ms = Some(now_ms);
+        call.version = 4;
+        call.updated_at_unix_ms = now_ms;
+        store_call(&transaction, &call, "adaptive_leadership_review_retired")?;
+        transaction.commit()?;
+        Ok(call)
+    }
+
     pub fn claim_adaptive_leadership_review_call(
         &self,
         leader: &AuthenticatedCompanyPrincipalV1,
@@ -315,6 +397,7 @@ impl WorkflowStore {
             || claim.allowance_id != call.allowance_id
             || claim.request_id != call.request_id()
             || call.dispatch.is_some()
+            || call.retired_at_unix_ms.is_some()
             || claim.context_digest != call.context_digest()?
             || now_ms < call.updated_at_unix_ms
             || now_ms >= call.grant.expires_at_unix_ms
@@ -356,6 +439,7 @@ impl WorkflowStore {
         result.decision.validate(&call.context.evidence_refs)?;
         if leader != &call.grant.leadership_principal
             || result.allowance_id != call.allowance_id
+            || call.retired_at_unix_ms.is_some()
             || call
                 .dispatch
                 .as_ref()

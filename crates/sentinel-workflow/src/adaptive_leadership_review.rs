@@ -75,6 +75,8 @@ pub struct AdaptiveLeadershipReviewCallV1 {
     pub decision: Option<AdaptiveLeadershipReviewDecisionV1>,
     pub model_response_digest: Option<String>,
     pub resolution_event_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at_unix_ms: Option<u64>,
 }
 
 impl AdaptiveLeadershipReviewCallV1 {
