@@ -57,6 +57,7 @@ LoadCredential=workflow-designer-shift3:/etc/sentinel/credentials/workflow-desig
 LoadCredential=workflow-developer-shift3:/etc/sentinel/credentials/workflow-developer-shift3
 LoadCredential=workflow-qa-shift3:/etc/sentinel/credentials/workflow-qa-shift3
 LoadCredential=workflow-release-manager-shift3:/etc/sentinel/credentials/workflow-release-manager-shift3
+LoadCredential=workflow-internal-customer:/etc/sentinel/credentials/workflow-internal-customer
 Environment=SENTINEL_AGENT_RUNTIME_CREDENTIAL_FILE=%d/caller-agent-runtime
 Environment=SENTINEL_PLATFORM_CREDENTIAL_FILE=%d/caller-platform
 Environment=SENTINEL_EVOLUTION_CREDENTIAL_FILE=%d/caller-evolution
