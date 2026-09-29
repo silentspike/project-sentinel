@@ -2173,6 +2173,51 @@ impl EventStore {
         Ok(scope)
     }
 
+    /// Seal a reservation whose provider outcome is unknown without allowing replay.
+    pub fn mark_llm_provider_outcome_unknown(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            matches!(reason,
+                "UnknownOutcome: bridge_task_ended_without_durable_response"
+                | "UnknownOutcome: provider_transport_deadline_elapsed"),
+            "invalid provider outcome reason"
+        );
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
+        let stored_digest: String = conn.query_row(
+            "SELECT request_digest FROM llm_completion_outbox WHERE request_id = ?1",
+            params![request_id], |row| row.get(0),
+        )?;
+        anyhow::ensure!(stored_digest == request_digest, "LLM completion digest conflict for {request_id}");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        let changed = conn.execute(
+            "UPDATE llm_completion_outbox SET status = 'failed', last_error = ?3, updated_at = ?4
+             WHERE request_id = ?1 AND request_digest = ?2
+               AND status = 'provider_in_flight' AND payload = ''",
+            params![request_id, request_digest, reason, now_ms],
+        )?;
+        conn.commit()?;
+        Ok(changed == 1)
+    }
+
+    /// Observe bounded ambiguous reservations; callers must not redispatch them.
+    pub fn poll_llm_provider_in_flight(&self, limit: usize) -> anyhow::Result<Vec<LlmCompletionEntry>> {
+        anyhow::ensure!((1..=256).contains(&limit), "invalid provider reservation scan limit");
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut statement = conn.prepare(
+            "SELECT request_id, request_digest, owner_scope, payload, status, attempt_count, last_error,
+                    created_at, updated_at FROM llm_completion_outbox
+             WHERE status = 'provider_in_flight' ORDER BY created_at, request_id LIMIT ?1",
+        )?;
+        let entries = statement.query_map(params![limit as i64], llm_completion_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(entries.into_iter().filter(|entry| self.owner_registry.issue(entry.owner_scope.clone()).is_ok()).collect())
+    }
+
     /// Return one durable completion by its stable request ID.
     pub fn get_llm_completion(
         &self,
@@ -2370,6 +2415,14 @@ impl EventStore {
             "LLM completion digest conflict for {request_id}"
         );
         if status != "failed" || last_error.as_deref() != Some(expected_error) {
+            conn.commit()?;
+            return Ok(false);
+        }
+        let has_response: bool = conn.query_row(
+            "SELECT payload != '' FROM llm_completion_outbox WHERE request_id = ?1",
+            params![request_id], |row| row.get(0),
+        )?;
+        if !has_response {
             conn.commit()?;
             return Ok(false);
         }
@@ -4683,6 +4736,50 @@ mod tests {
         assert!(!store
             .reserve_llm_request(request_id, digest, "AGENT-07")
             .unwrap());
+    }
+
+    #[test]
+    fn unknown_provider_outcome_survives_restart_without_replay_or_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown-provider.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let id = "unknown-request";
+        let digest = "exact-request";
+        let reason = "UnknownOutcome: provider_transport_deadline_elapsed";
+        assert!(store.reserve_llm_request(id, digest, "AGENT-07").unwrap());
+        assert_eq!(store.poll_llm_provider_in_flight(1).unwrap().len(), 1);
+        assert!(store.mark_llm_provider_outcome_unknown(id, "wrong", reason).is_err());
+        assert!(store.mark_llm_provider_outcome_unknown(id, digest, "arbitrary error").is_err());
+        assert!(store.mark_llm_provider_outcome_unknown(id, digest, reason).unwrap());
+        assert!(!store.mark_llm_provider_outcome_unknown(id, digest, reason).unwrap());
+        drop(store);
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let entry = store.get_llm_completion(id).unwrap().unwrap();
+        assert_eq!(entry.status, "failed");
+        assert_eq!(entry.last_error.as_deref(), Some(reason));
+        assert!(entry.payload.is_empty());
+        assert!(!store.reserve_llm_request(id, digest, "AGENT-07").unwrap());
+        assert!(store.release_undispatched_llm_request(id, digest).is_err());
+        assert!(store.enqueue_llm_completion(id, digest, "late response").is_err());
+        assert!(!store.requeue_failed_llm_completion(id, digest, reason).unwrap());
+        assert!(!store.claim_llm_completion_actions(id, digest).unwrap());
+        assert!(store.poll_llm_completions(10).unwrap().is_empty());
+        assert!(store.poll_llm_provider_in_flight(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn durable_response_wins_before_unknown_outcome_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known-provider.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        assert!(store.reserve_llm_request("known", "digest", "AGENT-07").unwrap());
+        store.enqueue_llm_completion("known", "digest", "durable response").unwrap();
+        assert!(!store.mark_llm_provider_outcome_unknown("known", "digest",
+            "UnknownOutcome: bridge_task_ended_without_durable_response").unwrap());
+        let entry = store.get_llm_completion("known").unwrap().unwrap();
+        assert_eq!(entry.status, "pending_usage");
+        assert_eq!(entry.payload, "durable response");
+        assert!(entry.last_error.is_none());
     }
 
     #[test]
