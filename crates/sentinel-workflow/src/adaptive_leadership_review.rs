@@ -116,6 +116,13 @@ impl AdaptiveLeadershipReviewCallV1 {
         deadline_ms: u64,
         additional_model_calls: u16,
     ) -> Result<crate::SubscriptionCallAllowanceV1, WorkflowError> {
+        let window_ms = deadline_ms.checked_sub(issued_at_ms).ok_or_else(invalid)?;
+        if issued_at_ms == 0
+            || !(1_000..=ADAPTIVE_LEADERSHIP_MAX_GRANT_MS).contains(&window_ms)
+            || !(1..=crate::ADAPTIVE_SESSION_MAX_CALLS).contains(&additional_model_calls)
+        {
+            return Err(invalid());
+        }
         Ok(crate::SubscriptionCallAllowanceV1 {
             allowance_id: crate::domain::stable_domain_id(
                 "subscription",
@@ -133,7 +140,12 @@ impl AdaptiveLeadershipReviewCallV1 {
                 catalog_digest: self.grant.catalog_digest.clone(),
                 max_calls: additional_model_calls,
                 max_concurrent: 1,
-                max_duration_ms: self.context.source_session.grant.max_call_duration_ms,
+                max_duration_ms: self
+                    .context
+                    .source_session
+                    .grant
+                    .max_call_duration_ms
+                    .min(window_ms),
                 token_policy: self.grant.token_policy,
                 expires_at_unix_ms: deadline_ms,
             },

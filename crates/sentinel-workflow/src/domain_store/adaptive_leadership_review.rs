@@ -17,12 +17,17 @@ mod tests {
     const CONTINUATION_AT: u64 = 900_002;
 
     fn continuation_fixture(unknown: bool, resolved: bool) -> Fixture {
+        continuation_fixture_with_calls(unknown, resolved, 4)
+    }
+
+    fn continuation_fixture_with_calls(unknown: bool, resolved: bool, max_model_calls: u16) -> Fixture {
         let mut f = fixture();
         resolve(&f, Uuid::new_v4(), 21);
         let mut project = f.context.source_project.clone();
         let mut session_grant = f.context.source_session.grant.clone();
         session_grant.session_id = Uuid::new_v4();
-        session_grant.max_model_calls = 4;
+        session_grant.max_model_calls = max_model_calls;
+        session_grant.max_tool_calls = max_model_calls;
         session_grant.created_at_ms = 600_001;
         session_grant.deadline_ms = 900_001;
         let original = crate::SubscriptionCallGrantV1 {
@@ -34,7 +39,7 @@ mod tests {
             provider: f.grant.provider.clone(),
             model: f.grant.model.clone(),
             catalog_digest: f.grant.catalog_digest.clone(),
-            max_calls: 4,
+            max_calls: max_model_calls,
             max_concurrent: 1,
             max_duration_ms: 120_000,
             token_policy: f.grant.token_policy,
@@ -212,6 +217,83 @@ mod tests {
         result.continuation = continue_result(&call).continuation;
         assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 3).is_err());
         assert_eq!(rows(&f.store), durable);
+    }
+
+    #[test]
+    fn schema2_allowance_duration_is_capped_by_exact_window_without_effects() {
+        let f = continuation_fixture(true, false);
+        let call = dispatch_continuation(&f);
+        let before = rows(&f.store);
+        let issued = CONTINUATION_AT + 2;
+        for (window, expected) in [(1_000, 1_000), (60_000, 60_000), (120_000, 120_000), (300_000, 120_000)] {
+            let allowance = call.continuation_allowance(issued, issued + window, 1).unwrap();
+            assert_eq!(allowance.grant.max_duration_ms, expected);
+            assert_eq!(allowance.grant.max_calls, 1);
+            assert_eq!(allowance.grant.expires_at_unix_ms, issued + window);
+        }
+        for deadline in [issued - 1, issued, issued + 999, issued + 300_001] {
+            assert!(call.continuation_allowance(issued, deadline, 1).is_err());
+        }
+        assert!(call.continuation_allowance(0, 1_000, 1).is_err());
+        assert!(call.continuation_allowance(u64::MAX, 1_000, 1).is_err());
+        assert!(call.continuation_allowance(issued, issued + 1_000, 0).is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+
+    #[test]
+    fn schema2_short_window_commits_a_single_call_with_matching_effective_duration() {
+        let f = continuation_fixture(true, false);
+        let call = dispatch_continuation(&f);
+        let mut result = continue_result(&call);
+        let window = 60_000;
+        if let AdaptiveLeadershipReviewDecisionKindV1::Continue { window_ms, .. } = &mut result.decision.decision {
+            *window_ms = window;
+        }
+        let audit = adaptive_leadership_continuation_audit_id(call.grant.review_id,
+            &result.request_digest, &result.model_response_digest, &result.decision).unwrap();
+        let authorization = result.continuation.as_mut().unwrap();
+        authorization.deadline_ms = authorization.issued_at_ms + window;
+        authorization.resolution_event_id = audit;
+        let allowance = call.continuation_allowance(authorization.issued_at_ms, authorization.deadline_ms, 1).unwrap();
+        authorization.provider_authority_digest = adaptive_leadership_continuation_provider_authority_digest(
+            &allowance, &call.grant.assignee_authority).unwrap();
+        result.resolution_event_id = Some(audit);
+        f.store.complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 2).unwrap();
+        let current = session(&f);
+        assert_eq!(current.grant, f.context.source_session.grant);
+        assert_eq!(current.model_calls, f.context.source_session.model_calls);
+        assert_eq!(current.active_model_ceiling(), current.model_calls + 1);
+        assert_eq!(current.effective_grant().max_call_duration_ms, window);
+        assert!(current.requires_fresh_observation());
+        let project = f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap().unwrap();
+        assert_eq!(project.subscription_call.as_ref(), Some(&allowance));
+        assert_eq!(allowance.grant.max_calls, 1);
+        assert_eq!(allowance.grant.max_duration_ms, window);
+        let before = rows(&f.store);
+        f.store.complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 3).unwrap();
+        assert_eq!(rows(&f.store), before);
+    }
+
+    #[test]
+    fn schema2_exhausted_single_call_source_does_not_reset_original_budget() {
+        let f = continuation_fixture_with_calls(true, false, 1);
+        let call = dispatch_continuation(&f);
+        assert_eq!(call.context.source_session.grant.max_model_calls, 1);
+        assert_eq!(call.context.source_session.model_calls, 1);
+        let before = rows(&f.store);
+        assert!(f.store.complete_adaptive_leadership_review_call(&f.leader, &continue_result(&call), CONTINUATION_AT + 2).is_err());
+        assert_eq!(rows(&f.store), before);
+        assert_eq!(session(&f), f.context.source_session);
+        let mut keep = completion(&call, false);
+        keep.decision = AdaptiveLeadershipReviewDecisionV1 {
+            schema_version: 2,
+            decision: AdaptiveLeadershipReviewDecisionKindV1::KeepUnknown {
+                rationale: "The original model budget is exhausted".into(),
+                evidence_refs: vec![f.context.evidence_refs[0].clone()],
+            },
+        };
+        f.store.complete_adaptive_leadership_review_call(&f.leader, &keep, CONTINUATION_AT + 3).unwrap();
+        assert_eq!(session(&f), f.context.source_session);
     }
 
     #[test]
@@ -711,7 +793,7 @@ fn commit_continuation_allowance(
         || prior.grant.provider != allowance.grant.provider
         || prior.grant.model != allowance.grant.model
         || prior.grant.catalog_digest != allowance.grant.catalog_digest
-        || prior.grant.max_duration_ms != allowance.grant.max_duration_ms
+        || prior.grant.max_duration_ms != call.context.source_session.effective_grant().max_call_duration_ms
         || prior.grant.token_policy != allowance.grant.token_policy
         || project.abandoned_subscription_calls.iter().any(|entry|
             entry.allowance.allowance_id == allowance.allowance_id)
