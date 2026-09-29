@@ -1,5 +1,10 @@
 # Changelog
 
+- Recognize the exact already dispatched project-planning call before checking
+  fresh provider allowance or employee shift readiness. Preserve durable pending
+  outcomes, reject changed project lineage and retain strict on-duty admission
+  for undispatched planning without repeating the provider effect (#856).
+
 - Recognize exact recorded project policies and sealed, already issued delivery
   outcomes before fresh model or execution-profile admission. Keep new work
   bound to current profiles, preserve customer history and independent QA,
