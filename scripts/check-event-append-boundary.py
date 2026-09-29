@@ -24,7 +24,10 @@ RUST_SCHEMA_AUTHORITY_PATHS = {
 }
 
 RUST_SCHEMA_OPEN = re.compile(r"(?:sentinel_limbo::)?EventStore::open\s*\(")
-RUST_TEST_MODULE = re.compile(r"(?m)^\s*#\[cfg\(test\)\]\s*\n\s*mod\s+tests\s*\{")
+RUST_TEST_MODULE = re.compile(
+    r"(?m)^\s*#\[cfg\(test\)\]\s*\n\s*"
+    r"(?:pub(?:\s*\((?:crate|super|self)\))?\s+)?mod\s+tests\s*\{"
+)
 
 # Every production V1 compatibility writer is frozen here until its owning
 # domain migrates to EventAppendGateway V2.  The count is intentional: adding a
