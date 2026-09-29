@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use uuid::Uuid;
 
+mod adaptive_leadership_review;
 mod project_planning;
 mod request_provider;
 mod source_review_rework;

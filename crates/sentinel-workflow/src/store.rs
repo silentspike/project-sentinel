@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 3;
-mod adaptive;
+pub(crate) mod adaptive;
 mod revisions;
 pub(crate) use revisions::require_completed_source;
 pub use revisions::ExecutionRevisionV1;
