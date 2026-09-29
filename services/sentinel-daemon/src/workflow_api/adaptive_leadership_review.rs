@@ -106,8 +106,11 @@ impl WorkflowApi {
             && matches!(work.spec.required_role, CompanyRoleV1::Developer | CompanyRoleV1::Designer)) {
             let assignments: Vec<_> = work.assignments.iter().filter(|a| a.active).collect();
             if assignments.len() != 1 { continue; }
+            // Discovery verifies lineage, not serving duty. Exact dispatch and
+            // resolution still require a healthy, on-duty assignee snapshot.
             let authority = self.authority.as_ref().ok_or("leadership runtime unavailable")?
-                .snapshot(&project.tenant_id, &project.project_id, &work.spec.work_item_id, assignments[0].agent_id)
+                .snapshot_for_admission(&project.tenant_id, &project.project_id,
+                    &work.spec.work_item_id, assignments[0].agent_id, false)
                 .map_err(|_| "leadership assignee authority unavailable")?;
             if let Some(session) = self.store.adaptive_session_for_authority(&authority)
                 .map_err(|_| "leadership session unavailable")? { sessions.push(session); }
@@ -197,6 +200,12 @@ impl WorkflowApi {
     pub(super) fn leadership_review_for_agent(&self, agent: AgentId) -> Result<Option<AdaptiveLeadershipReviewCallV1>, &'static str> {
         let now = now_unix_ms();
         for project in self.store.company_projects().map_err(|_| "leadership projects unavailable")? {
+            if !project.governance.participants.iter().any(|participant| {
+                participant.agent_id == agent
+                    && matches!(participant.role, CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead)
+            }) {
+                continue;
+            }
             for session in self.review_sessions(&project)? {
                 for call in self.store.adaptive_leadership_review_calls(&project.tenant_id, session.grant.session_id)
                     .map_err(|_| "leadership calls unavailable")? {
@@ -478,6 +487,75 @@ pub(crate) mod tests {
             assert!(api.store.adaptive_leadership_review_calls(&project.tenant_id, ready.grant.session_id).unwrap().is_empty());
             assert_eq!(api.store.company_project(&project.tenant_id, &project.project_id).unwrap(), Some(project));
         }
+    }
+
+    #[test]
+    fn off_duty_discovery_preserves_unknown_detection_and_record_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let company_path = temp.path().join("company.sqlite");
+        let event_path = temp.path().join("events.sqlite");
+        let (api, ready) = super::super::adaptive_recovery::tests::fixture(
+            &company_path, &event_path, false,
+        );
+        let effect = AdaptiveEffectV1 { id: Uuid::new_v4(), request_digest: "c".repeat(64) };
+        let (_, pending) = api.store.advance_adaptive_session(
+            ready.grant.session_id, ready.version, Uuid::new_v4(),
+            &AdaptiveTransitionV1::ClaimModel { effect: effect.clone(), previous_observation_digest: None },
+            &ready.grant.authority, now_unix_ms(),
+        ).unwrap();
+        let project = api.store.company_project(&ready.grant.authority.tenant_id,
+            &ready.grant.authority.project_id).unwrap().unwrap();
+        let request_id = format!("company-adaptive-{}-{}", ready.grant.session_id, effect.id);
+        api.event_store.as_ref().unwrap().reserve_llm_request(
+            &request_id, &effect.request_digest, &ready.grant.authority.agent_id.to_string(),
+        ).unwrap();
+        sentinel_limbo::rusqlite::Connection::open(&event_path).unwrap().execute(
+            "UPDATE llm_completion_outbox SET status='failed',payload='',last_error='UnknownOutcome: provider disconnected' WHERE request_id=?1",
+            sentinel_limbo::rusqlite::params![request_id],
+        ).unwrap();
+        api.authority.as_ref().unwrap().runtime_health.write().unwrap().agents.iter_mut()
+            .find(|agent| agent.agent_id == ready.grant.authority.agent_id.0).unwrap().expected_active = false;
+        assert_eq!(api.review_sessions(&project).unwrap(), vec![pending.clone()]);
+        assert!(api.adaptive_models_have_unknown_outcome().unwrap());
+        {
+            let _fence = api.mutation_fence.write().unwrap();
+            api.reconcile_unknown_adaptive_models(&project).unwrap();
+            api.reconcile_unknown_adaptive_models(&project).unwrap();
+            assert!(!api.reconcile_adaptive_leadership_reviews(&project).unwrap());
+        }
+        let current = api.store.adaptive_session_for_authority(&ready.grant.authority).unwrap().unwrap();
+        assert_eq!(current.cursor, AdaptiveCursorV1::ModelUnknown { effect });
+        assert_eq!(current.version, pending.version + 1);
+        assert_eq!(current.grant, pending.grant);
+        assert_eq!(current.model_calls, pending.model_calls);
+        assert!(api.store.adaptive_leadership_review_calls(&project.tenant_id, ready.grant.session_id).unwrap().is_empty());
+        sentinel_limbo::rusqlite::Connection::open(&company_path).unwrap().execute(
+            "UPDATE workflow_adaptive_heads SET version=version+1 WHERE session_id=?1",
+            sentinel_limbo::rusqlite::params![ready.grant.session_id.to_string()],
+        ).unwrap();
+        assert!(api.review_sessions(&project).is_err());
+        assert!(api.adaptive_models_have_unknown_outcome().is_err());
+    }
+
+    #[test]
+    fn off_duty_actual_review_target_remains_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, context) = fixture(&temp.path().join("company.sqlite"), &temp.path().join("events.sqlite"));
+        let (id, digest) = reserve_and_claim(&api, &context);
+        let completion = make_completion(&context, "keep_blocked");
+        persist(&api, &completion, &context, &id, &digest, true);
+        api.authority.as_ref().unwrap().runtime_health.write().unwrap().agents.iter_mut()
+            .find(|agent| agent.agent_id == context.binding.grant.assignee_authority.agent_id.0)
+            .unwrap().expected_active = false;
+        assert_eq!(api.review_sessions(&context.source.source_project).unwrap(), vec![context.source.source_session.clone()]);
+        assert!(api.prepare_leadership_review(&context.binding).is_err());
+        assert!(api.accept_leadership_review(&completion, &context, &id, &digest).is_err());
+        let call = api.store.adaptive_leadership_review_call(
+            &context.binding.grant.leadership_principal.tenant_id, context.binding.grant.review_id,
+        ).unwrap().unwrap();
+        assert!(call.decision.is_none());
+        assert_eq!(api.store.adaptive_session_for_authority(&context.binding.grant.assignee_authority).unwrap(),
+            Some(context.source.source_session));
     }
 
     #[test]
