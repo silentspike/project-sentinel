@@ -16,17 +16,19 @@
   },
   "packageRules": [
     {
-      "description": "Rust minor/patch updates grouped",
+      "description": "Compatible Rust minor/patch updates grouped",
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["minor", "patch"],
+      "matchIsBreaking": false,
       "groupName": "rust-minor",
       "commitMessagePrefix": "deps(rust):",
       "automerge": true
     },
     {
-      "description": "Rust major updates separate",
+      "description": "Breaking Rust updates, including 0.x minor changes, require separate review",
       "matchManagers": ["cargo"],
-      "matchUpdateTypes": ["major"],
+      "matchIsBreaking": true,
+      "groupName": null,
       "commitMessagePrefix": "deps(rust):",
       "automerge": false
     },
