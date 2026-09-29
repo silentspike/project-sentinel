@@ -286,9 +286,15 @@ fn intersect_rules(suite: &CommandRule, command: &CommandRule) -> Option<Command
     if suite.program != command.program {
         return None;
     }
-    let prefix = if suite.required_arg_prefix.starts_with(&command.required_arg_prefix) {
+    let prefix = if suite
+        .required_arg_prefix
+        .starts_with(&command.required_arg_prefix)
+    {
         &suite.required_arg_prefix
-    } else if command.required_arg_prefix.starts_with(&suite.required_arg_prefix) {
+    } else if command
+        .required_arg_prefix
+        .starts_with(&suite.required_arg_prefix)
+    {
         &command.required_arg_prefix
     } else {
         return None;
@@ -330,7 +336,9 @@ fn charge(bytes: &mut usize, additional: usize) -> Result<(), &'static str> {
 fn identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
-        && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
 #[cfg(test)]
@@ -377,11 +385,21 @@ mod tests {
     }
 
     fn names(catalog: &Value) -> BTreeSet<&str> {
-        catalog["tools"].as_array().unwrap().iter().map(|entry| entry["tool"].as_str().unwrap()).collect()
+        catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["tool"].as_str().unwrap())
+            .collect()
     }
 
     fn entry<'a>(catalog: &'a Value, name: &str) -> &'a Value {
-        catalog["tools"].as_array().unwrap().iter().find(|entry| entry["tool"] == name).unwrap()
+        catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["tool"] == name)
+            .unwrap()
     }
 
     #[test]
@@ -398,12 +416,29 @@ mod tests {
                     assert!(profile.capabilities.contains(tool.required_capability()));
                     assert!(authority.capabilities.contains(tool.required_capability()));
                     match &tool {
-                        WorkbenchTool::RunCommand { program, args } => assert!(profile.command_rules.iter().any(|r| r.allows(program, args))),
-                        WorkbenchTool::RunTests { suite_id, program, args } => {
-                            assert!(profile.command_rules.iter().any(|r| r.allows(program, args)));
-                            assert!(profile.test_suites.iter().any(|s| s.id == *suite_id && s.program == *program && args.starts_with(&s.required_arg_prefix) && args.len() <= usize::from(s.max_args)));
+                        WorkbenchTool::RunCommand { program, args } => assert!(profile
+                            .command_rules
+                            .iter()
+                            .any(|r| r.allows(program, args))),
+                        WorkbenchTool::RunTests {
+                            suite_id,
+                            program,
+                            args,
+                        } => {
+                            assert!(profile
+                                .command_rules
+                                .iter()
+                                .any(|r| r.allows(program, args)));
+                            assert!(profile.test_suites.iter().any(|s| s.id == *suite_id
+                                && s.program == *program
+                                && args.starts_with(&s.required_arg_prefix)
+                                && args.len() <= usize::from(s.max_args)));
                         }
-                        WorkbenchTool::PackageArtifact { artifact_kind, media_type, .. } => {
+                        WorkbenchTool::PackageArtifact {
+                            artifact_kind,
+                            media_type,
+                            ..
+                        } => {
                             assert!(profile.output_artifact_kinds.contains(artifact_kind));
                             assert_eq!(media_type, &task.outputs[0].media_type);
                         }
@@ -419,18 +454,42 @@ mod tests {
         let (profile, mut authority, task) = fixture(PROFILES[0]);
         authority.capabilities.insert("internet.search".to_owned());
         let catalog = adaptive_tool_catalog(&profile, &authority, &task).unwrap();
-        assert_eq!(names(&catalog), BTreeSet::from(["list_directory", "inspect_file", "write_file", "apply_patch", "run_command", "run_tests", "package_artifact"]));
-        assert_eq!(entry(&catalog, "package_artifact")["output_contract"]["artifact_kind"], "source_tree");
-        assert_ne!(entry(&catalog, "package_artifact")["output_contract"]["artifact_kind"], task.outputs[0].name);
+        assert_eq!(
+            names(&catalog),
+            BTreeSet::from([
+                "list_directory",
+                "inspect_file",
+                "write_file",
+                "apply_patch",
+                "run_command",
+                "run_tests",
+                "package_artifact"
+            ])
+        );
+        assert_eq!(
+            entry(&catalog, "package_artifact")["output_contract"]["artifact_kind"],
+            "source_tree"
+        );
+        assert_ne!(
+            entry(&catalog, "package_artifact")["output_contract"]["artifact_kind"],
+            task.outputs[0].name
+        );
     }
 
     #[test]
     fn capabilities_are_the_exact_intersection_in_both_directions() {
         let (mut profile, mut authority, task) = fixture(PROFILES[0]);
-        authority.capabilities = BTreeSet::from(["file.inspect".to_owned(), "command.run_allowlisted".to_owned(), "foreign.tool".to_owned()]);
+        authority.capabilities = BTreeSet::from([
+            "file.inspect".to_owned(),
+            "command.run_allowlisted".to_owned(),
+            "foreign.tool".to_owned(),
+        ]);
         profile.capabilities.remove("command.run_allowlisted");
         let catalog = adaptive_tool_catalog(&profile, &authority, &task).unwrap();
-        assert_eq!(names(&catalog), BTreeSet::from(["list_directory", "inspect_file"]));
+        assert_eq!(
+            names(&catalog),
+            BTreeSet::from(["list_directory", "inspect_file"])
+        );
         profile.capabilities.clear();
         assert!(names(&adaptive_tool_catalog(&profile, &authority, &task).unwrap()).is_empty());
     }
@@ -438,13 +497,25 @@ mod tests {
     #[test]
     fn filtered_command_metadata_and_environment_never_leak() {
         let (mut profile, mut authority, mut task) = fixture(PROFILES[0]);
-        profile.environment.insert("TOKEN".to_owned(), "secret-token-value".to_owned());
-        profile.environment.insert("HOME".to_owned(), "/sensitive/host/path".to_owned());
+        profile
+            .environment
+            .insert("TOKEN".to_owned(), "secret-token-value".to_owned());
+        profile
+            .environment
+            .insert("HOME".to_owned(), "/sensitive/host/path".to_owned());
         task.objective = "/sensitive/task/path secret-task-value".to_owned();
         profile.command_rules[0].program = "filtered-program".to_owned();
         authority.capabilities = BTreeSet::from(["file.inspect".to_owned()]);
-        let encoded = serde_json::to_string(&adaptive_tool_catalog(&profile, &authority, &task).unwrap()).unwrap();
-        for forbidden in ["secret-token-value", "/sensitive/host/path", "secret-task-value", "filtered-program", &authority.principal.authority_digest] {
+        let encoded =
+            serde_json::to_string(&adaptive_tool_catalog(&profile, &authority, &task).unwrap())
+                .unwrap();
+        for forbidden in [
+            "secret-token-value",
+            "/sensitive/host/path",
+            "secret-task-value",
+            "filtered-program",
+            &authority.principal.authority_digest,
+        ] {
             assert!(!encoded.contains(forbidden));
         }
     }
@@ -483,10 +554,15 @@ mod tests {
         let contract = &entry(&catalog, "package_artifact")["output_contract"];
         assert_eq!(contract["artifact_kind"], "design_specification");
         assert_eq!(contract["media_type"], task.outputs[0].media_type);
-        assert_ne!(contract["media_type"], "application/vnd.sentinel.source-tree+json");
+        assert_ne!(
+            contract["media_type"],
+            "application/vnd.sentinel.source-tree+json"
+        );
         profile.output_artifact_kinds.remove("design_specification");
         assert!(adaptive_tool_catalog(&profile, &authority, &task).is_err());
-        profile.output_artifact_kinds.insert("design_specification".to_owned());
+        profile
+            .output_artifact_kinds
+            .insert("design_specification".to_owned());
         task.outputs[0].media_type = "/sensitive/path with spaces".to_owned();
         assert!(adaptive_tool_catalog(&profile, &authority, &task).is_err());
         task.outputs.clear();
@@ -503,44 +579,93 @@ mod tests {
         // Serde/shape validity is not task authorization. Completion admission
         // must still reject the foreign media, as adaptive_package_tool does.
         tool.validate_shape().unwrap();
-        assert_ne!(foreign["media_type"], entry(&catalog, "package_artifact")["output_contract"]["media_type"]);
-        assert!(!entry(&catalog, "package_artifact")["syntax_examples"].as_array().unwrap().contains(&foreign));
+        assert_ne!(
+            foreign["media_type"],
+            entry(&catalog, "package_artifact")["output_contract"]["media_type"]
+        );
+        assert!(!entry(&catalog, "package_artifact")["syntax_examples"]
+            .as_array()
+            .unwrap()
+            .contains(&foreign));
     }
 
     #[test]
     fn report_only_profile_preserves_its_path_contract() {
         let (profile, authority, mut task) = fixture(PROFILES[5]);
         let catalog = adaptive_tool_catalog(&profile, &authority, &task).unwrap();
-        assert_eq!(names(&catalog), BTreeSet::from(["list_directory", "inspect_file", "write_file", "package_artifact"]));
-        assert_eq!(entry(&catalog, "write_file")["syntax_examples"][0]["path"], "review.json");
-        assert_eq!(entry(&catalog, "package_artifact")["output_contract"]["paths"], json!(["review.json"]));
+        assert_eq!(
+            names(&catalog),
+            BTreeSet::from([
+                "list_directory",
+                "inspect_file",
+                "write_file",
+                "package_artifact"
+            ])
+        );
+        assert_eq!(
+            entry(&catalog, "write_file")["syntax_examples"][0]["path"],
+            "review.json"
+        );
+        assert_eq!(
+            entry(&catalog, "package_artifact")["output_contract"]["paths"],
+            json!(["review.json"])
+        );
         task.outputs[0].media_type = "application/json".to_owned();
         assert!(adaptive_tool_catalog(&profile, &authority, &task).is_err());
     }
 
     #[test]
     fn serde_defaults_and_text_replacement_fields_match_the_reference() {
-        let list: WorkbenchTool = serde_json::from_value(json!({"tool": "list_directory", "path": ".", "max_entries": 1})).unwrap();
-        assert!(matches!(list, WorkbenchTool::ListDirectory { after: None, .. }));
-        let write: WorkbenchTool = serde_json::from_value(json!({"tool": "write_file", "path": "example.txt", "content": ""})).unwrap();
-        assert!(matches!(write, WorkbenchTool::WriteFile { expected_sha256: None, .. }));
-        let command: WorkbenchTool = serde_json::from_value(json!({"tool": "run_command", "program": "node"})).unwrap();
+        let list: WorkbenchTool = serde_json::from_value(
+            json!({"tool": "list_directory", "path": ".", "max_entries": 1}),
+        )
+        .unwrap();
+        assert!(matches!(
+            list,
+            WorkbenchTool::ListDirectory { after: None, .. }
+        ));
+        let write: WorkbenchTool = serde_json::from_value(
+            json!({"tool": "write_file", "path": "example.txt", "content": ""}),
+        )
+        .unwrap();
+        assert!(matches!(
+            write,
+            WorkbenchTool::WriteFile {
+                expected_sha256: None,
+                ..
+            }
+        ));
+        let command: WorkbenchTool =
+            serde_json::from_value(json!({"tool": "run_command", "program": "node"})).unwrap();
         assert!(command.command().unwrap().1.is_empty());
-        let test: WorkbenchTool = serde_json::from_value(json!({"tool": "run_tests", "suite_id": "suite", "program": "node"})).unwrap();
+        let test: WorkbenchTool = serde_json::from_value(
+            json!({"tool": "run_tests", "suite_id": "suite", "program": "node"}),
+        )
+        .unwrap();
         assert!(test.command().unwrap().1.is_empty());
-        let replacement: TextReplacement = serde_json::from_value(json!({"old": "old", "new": "new"})).unwrap();
+        let replacement: TextReplacement =
+            serde_json::from_value(json!({"old": "old", "new": "new"})).unwrap();
         assert_eq!(replacement.expected_occurrences, 1);
-        assert!(serde_json::from_value::<TextReplacement>(json!({"old": "old", "new": "new", "foreign": 1})).is_err());
+        assert!(serde_json::from_value::<TextReplacement>(
+            json!({"old": "old", "new": "new", "foreign": 1})
+        )
+        .is_err());
     }
 
     #[test]
     fn unsafe_profile_programs_and_argument_prefixes_fail_without_exposure() {
         let (mut profile, authority, task) = fixture(PROFILES[0]);
         profile.command_rules[0].program = "/sensitive/host/program".to_owned();
-        assert_eq!(adaptive_tool_catalog(&profile, &authority, &task).unwrap_err(), INVALID);
+        assert_eq!(
+            adaptive_tool_catalog(&profile, &authority, &task).unwrap_err(),
+            INVALID
+        );
         let (mut profile, authority, task) = fixture(PROFILES[0]);
         profile.test_suites[0].required_arg_prefix = vec!["../escape".to_owned()];
-        assert_eq!(adaptive_tool_catalog(&profile, &authority, &task).unwrap_err(), INVALID);
+        assert_eq!(
+            adaptive_tool_catalog(&profile, &authority, &task).unwrap_err(),
+            INVALID
+        );
     }
 
     #[test]
@@ -549,10 +674,25 @@ mod tests {
         profile.test_suites[0].program = "foreign-executable".to_owned();
         let catalog = adaptive_tool_catalog(&profile, &authority, &task).unwrap();
         let suites = entry(&catalog, "run_tests")["suites"].as_array().unwrap();
-        assert!(suites[0]["effective_command_rules"].as_array().unwrap().is_empty());
-        assert!(entry(&catalog, "run_tests")["syntax_examples"].as_array().unwrap().iter().all(|e| e["program"] != "foreign-executable"));
-        let command = CommandRule { program: "node".to_owned(), required_arg_prefix: vec!["--".to_owned()], max_args: 2 };
-        let suite = CommandRule { program: "node".to_owned(), required_arg_prefix: vec!["--".to_owned()], max_args: 32 };
+        assert!(suites[0]["effective_command_rules"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(entry(&catalog, "run_tests")["syntax_examples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["program"] != "foreign-executable"));
+        let command = CommandRule {
+            program: "node".to_owned(),
+            required_arg_prefix: vec!["--".to_owned()],
+            max_args: 2,
+        };
+        let suite = CommandRule {
+            program: "node".to_owned(),
+            required_arg_prefix: vec!["--".to_owned()],
+            max_args: 32,
+        };
         let effective = intersect_rules(&suite, &command).unwrap();
         assert_eq!(effective.max_args, 2);
         assert!(!effective.allows("node", &["--".to_owned(), "--foreign-option".to_owned()]));
@@ -591,12 +731,40 @@ mod tests {
         let (mut profile, authority, task) = fixture(PROFILES[0]);
         let rule = profile.command_rules[0].clone();
         profile.command_rules = vec![rule; MAX_RULES + 1];
-        assert_eq!(adaptive_tool_catalog(&profile, &authority, &task).unwrap_err(), TOO_LARGE);
-        profile.command_rules = vec![CommandRule { program: "node".to_owned(), required_arg_prefix: vec!["a".repeat(4096), "b".repeat(4096)], max_args: 2 }];
-        assert_eq!(adaptive_tool_catalog(&profile, &authority, &task).unwrap_err(), TOO_LARGE);
+        assert_eq!(
+            adaptive_tool_catalog(&profile, &authority, &task).unwrap_err(),
+            TOO_LARGE
+        );
+        profile.command_rules = vec![CommandRule {
+            program: "node".to_owned(),
+            required_arg_prefix: vec!["a".repeat(4096), "b".repeat(4096)],
+            max_args: 2,
+        }];
+        assert_eq!(
+            adaptive_tool_catalog(&profile, &authority, &task).unwrap_err(),
+            TOO_LARGE
+        );
         let (mut profile, authority, task) = fixture(PROFILES[0]);
-        profile.command_rules = vec![CommandRule { program: "node".to_owned(), required_arg_prefix: Vec::new(), max_args: 2 }; MAX_RULES];
-        profile.test_suites = vec![crate::workbench::WorkbenchTestSuite { id: "bounded-suite".to_owned(), program: "node".to_owned(), required_arg_prefix: Vec::new(), max_args: 2 }; MAX_RULES];
-        assert_eq!(adaptive_tool_catalog(&profile, &authority, &task).unwrap_err(), TOO_LARGE);
+        profile.command_rules = vec![
+            CommandRule {
+                program: "node".to_owned(),
+                required_arg_prefix: Vec::new(),
+                max_args: 2
+            };
+            MAX_RULES
+        ];
+        profile.test_suites = vec![
+            crate::workbench::WorkbenchTestSuite {
+                id: "bounded-suite".to_owned(),
+                program: "node".to_owned(),
+                required_arg_prefix: Vec::new(),
+                max_args: 2
+            };
+            MAX_RULES
+        ];
+        assert_eq!(
+            adaptive_tool_catalog(&profile, &authority, &task).unwrap_err(),
+            TOO_LARGE
+        );
     }
 }
