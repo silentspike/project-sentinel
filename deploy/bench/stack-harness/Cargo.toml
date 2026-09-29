@@ -11,7 +11,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-sha2 = "0.10"
+sha2 = "0.11"
 
 sentinel-common = { path = "../../../crates/sentinel-common" }
 sentinel-ecs = { path = "../../../crates/sentinel-ecs" }
@@ -21,4 +21,4 @@ sentinel-zenoh = { path = "../../../crates/sentinel-zenoh" }
 sentinel-ebpf = { path = "../../../crates/sentinel-ebpf" }
 sentinel-telemetry = { path = "../../../crates/sentinel-telemetry" }
 sentinel-inference = { path = "../../../crates/sentinel-inference" }
-bevy_ecs = "0.18"
+bevy_ecs = "0.19"
