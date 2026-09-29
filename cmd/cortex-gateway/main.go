@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -71,6 +72,15 @@ func main() {
 	logger.Info("cortex-gateway starting", "version", version)
 
 	// 2. Configuration from environment
+	salesAutonomousEnabled, err := requestSalesAutonomousEnabled()
+	if err != nil {
+		logger.Error("Sales autonomy configuration rejected", "error", err)
+		os.Exit(1)
+	}
+	if err := validateSalesAutonomyAnchor(salesAutonomousEnabled); err != nil {
+		logger.Error("Sales autonomy anchor rejected", "error", err)
+		os.Exit(1)
+	}
 	port := envOrDefault("CORTEX_PORT", "8080")
 	controlPort := envOrDefault("CORTEX_CONTROL_PORT", "8081")
 	proxyBind := envOrDefault("CORTEX_PROXY_BIND", "0.0.0.0")
@@ -110,8 +120,8 @@ func main() {
 			logger.Error("subscription operator credential rejected", "error", credentialErr)
 			os.Exit(1)
 		}
-		subscriptionAdmission, err = proxy.NewSubscriptionAdmission(allowanceID, catalog.Digest(),
-			envOrDefault("SENTINEL_OPERATOR_API_URL", "http://127.0.0.1:8084"), credential)
+		subscriptionAdmission, err = proxy.NewSubscriptionAdmissionWithSalesAutonomy(allowanceID, catalog.Digest(),
+			envOrDefault("SENTINEL_OPERATOR_API_URL", "http://127.0.0.1:8084"), credential, salesAutonomousEnabled)
 		if err != nil {
 			logger.Error("subscription dispatch configuration rejected", "error", err)
 			os.Exit(1)
@@ -935,6 +945,31 @@ func applyTrafficRuntimeConfig(
 	if forwardQueue != nil {
 		forwardQueue.SetMaxConcurrent(snap.MaxForwardConcurrency)
 	}
+}
+
+// Match the daemon's strict workflow flag contract, including rejecting an
+// explicitly empty value rather than silently enabling a different policy.
+func requestSalesAutonomousEnabled() (bool, error) {
+	const key = "SENTINEL_REQUEST_SALES_AUTONOMOUS_ENABLED"
+	value, present := os.LookupEnv(key)
+	if !present {
+		return false, nil
+	}
+	switch value {
+	case "1", "true", "TRUE":
+		return true, nil
+	case "0", "false", "FALSE":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be 1/true/TRUE or 0/false/FALSE", key)
+	}
+}
+
+func validateSalesAutonomyAnchor(enabled bool) error {
+	if enabled && strings.TrimSpace(os.Getenv("SENTINEL_MODEL_WORK_ALLOWANCE_ID")) == "" {
+		return fmt.Errorf("sales autonomy requires a configured model-work allowance")
+	}
+	return nil
 }
 
 func envBoolValue(key string) (bool, bool) {
