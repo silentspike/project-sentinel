@@ -99,76 +99,88 @@ func TestSalesSubscriptionDynamicAllowanceRequiresExplicitOptIn(t *testing.T) {
 	}
 }
 
+func autonomousSalesClaimMatches(claim subscriptionDispatch) bool {
+	wantSubject := customerRequestExecutionSubject{Kind: "customer_request", RequestID: "request-test", RequestVersion: 1}
+	return claim.SchemaVersion == 2 && claim.AllowanceID == "subscription-sales-request-test" && claim.AgentID == 5 &&
+		claim.RequestID == "company-provider-subscription-sales-request-test" && claim.Subject != nil &&
+		*claim.Subject == wantSubject && claim.Provider == CodexCLIProviderName && claim.Model == "model-a" &&
+		claim.CatalogDigest == strings.Repeat("c", 64) && claim.ContextDigest == strings.Repeat("b", 64) && claim.RequestDigest == strings.Repeat("d", 64)
+}
+
+func autonomousSalesTestReceipt(claim subscriptionDispatch, mode string) subscriptionDispatchReceipt {
+	receipt := subscriptionDispatchReceipt{SchemaVersion: claim.SchemaVersion, AllowanceID: claim.AllowanceID,
+		RequestID: claim.RequestID, RequestDigest: claim.RequestDigest, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli()}
+	switch mode {
+	case "schema-mismatch":
+		receipt.SchemaVersion = 1
+	case "allowance-mismatch":
+		receipt.AllowanceID = "subscription-test"
+	case "request-mismatch":
+		receipt.RequestID = "company-provider-subscription-test"
+	case "digest-mismatch":
+		receipt.RequestDigest = strings.Repeat("e", 64)
+	case "expired":
+		receipt.DeadlineUnixMS = time.Now().Add(-time.Second).UnixMilli()
+	}
+	return receipt
+}
+
+func autonomousSalesAuthorityHandler(t *testing.T, mode string, provider *subscriptionTestProvider, queue *forwardqueue.Manager, callbacks *atomic.Int32) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbacks.Add(1)
+		if provider.calls.Load() != 0 || queue.Stats().Active != 1 {
+			t.Error("authority claim must follow queue lease and precede provider I/O")
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/operator/workflow/subscription-dispatch" || r.Header.Get("Authorization") != "Bearer test-operator" {
+			t.Error("wrong authority transport or credential")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		var claim subscriptionDispatch
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&claim); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if !autonomousSalesClaimMatches(claim) {
+			if mode != "cross-subject" && mode != "forged-model" && mode != "forged-digest" {
+				t.Error("unexpected authority claim binding")
+			}
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		switch mode {
+		case "rejected":
+			w.WriteHeader(http.StatusForbidden)
+			return
+		case "claim-lost":
+			connection, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_ = connection.Close()
+			return
+		case "lost":
+			_, _ = io.WriteString(w, "{")
+			return
+		}
+		_ = json.NewEncoder(w).Encode(autonomousSalesTestReceipt(claim, mode))
+	})
+}
+
 func TestSalesSubscriptionAutonomousDispatchRequiresExactAuthorityReceipt(t *testing.T) {
 	for _, mode := range []string{"approved", "rejected", "cross-subject", "forged-model", "forged-digest", "schema-mismatch", "allowance-mismatch", "request-mismatch", "digest-mismatch", "expired", "lost", "claim-lost"} {
 		t.Run(mode, func(t *testing.T) {
 			provider := &subscriptionTestProvider{}
 			queue := forwardqueue.NewManager(1)
 			var callbacks atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				callbacks.Add(1)
-				if provider.calls.Load() != 0 || queue.Stats().Active != 1 {
-					t.Error("authority claim must follow queue lease and precede provider I/O")
-					w.WriteHeader(http.StatusForbidden)
-					return
-				}
-				if r.Method != http.MethodPost || r.URL.Path != "/operator/workflow/subscription-dispatch" || r.Header.Get("Authorization") != "Bearer test-operator" {
-					t.Error("wrong authority transport or credential")
-					w.WriteHeader(http.StatusUnauthorized)
-					return
-				}
-				var claim subscriptionDispatch
-				decoder := json.NewDecoder(r.Body)
-				decoder.DisallowUnknownFields()
-				if err := decoder.Decode(&claim); err != nil {
-					t.Error(err)
-					w.WriteHeader(http.StatusBadRequest)
-					return
-				}
-				wantSubject := customerRequestExecutionSubject{Kind: "customer_request", RequestID: "request-test", RequestVersion: 1}
-				if claim.SchemaVersion != 2 || claim.AllowanceID != "subscription-sales-request-test" || claim.AgentID != 5 ||
-					claim.RequestID != "company-provider-subscription-sales-request-test" || claim.Subject == nil ||
-					*claim.Subject != wantSubject || claim.Provider != CodexCLIProviderName || claim.Model != "model-a" ||
-					claim.CatalogDigest != strings.Repeat("c", 64) || claim.ContextDigest != strings.Repeat("b", 64) || claim.RequestDigest != strings.Repeat("d", 64) {
-					if mode != "cross-subject" && mode != "forged-model" && mode != "forged-digest" {
-						t.Error("unexpected authority claim binding")
-					}
-					w.WriteHeader(http.StatusForbidden)
-					return
-				}
-				if mode == "rejected" {
-					w.WriteHeader(http.StatusForbidden)
-					return
-				}
-				if mode == "claim-lost" {
-					connection, _, err := w.(http.Hijacker).Hijack()
-					if err != nil {
-						t.Error(err)
-						return
-					}
-					_ = connection.Close()
-					return
-				}
-				if mode == "lost" {
-					_, _ = io.WriteString(w, "{")
-					return
-				}
-				receipt := subscriptionDispatchReceipt{SchemaVersion: claim.SchemaVersion, AllowanceID: claim.AllowanceID,
-					RequestID: claim.RequestID, RequestDigest: claim.RequestDigest, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli()}
-				switch mode {
-				case "schema-mismatch":
-					receipt.SchemaVersion = 1
-				case "allowance-mismatch":
-					receipt.AllowanceID = "subscription-test"
-				case "request-mismatch":
-					receipt.RequestID = "company-provider-subscription-test"
-				case "digest-mismatch":
-					receipt.RequestDigest = strings.Repeat("e", 64)
-				case "expired":
-					receipt.DeadlineUnixMS = time.Now().Add(-time.Second).UnixMilli()
-				}
-				_ = json.NewEncoder(w).Encode(receipt)
-			}))
+			server := httptest.NewServer(autonomousSalesAuthorityHandler(t, mode, provider, queue, &callbacks))
 			defer server.Close()
 			admission, err := NewSubscriptionAdmissionWithSalesAutonomy("subscription-test", strings.Repeat("c", 64), server.URL, "test-operator", true)
 			if err != nil {

@@ -6,6 +6,261 @@ use tempfile::TempDir;
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 #[test]
+fn sales_intake_returns_oldest_128_without_changing_ui_inbox_limit() {
+    let f = fixture();
+    let mut expected = Vec::new();
+    for id in 1..=140 {
+        expected.push(submit_intake_request(&f, id, 1 + (id % 3) as u64));
+    }
+    expected.sort_by(|a, b| {
+        a.created_at_unix_ms
+            .cmp(&b.created_at_unix_ms)
+            .then_with(|| a.request_id.cmp(&b.request_id))
+    });
+    expected.truncate(MAX_AGGREGATE_ITEMS);
+    let cursor = f.store.company_event_cursor().unwrap();
+    assert_eq!(
+        f.store
+            .company_sales_intake_requests(&f.customer.tenant_id, "customer-test")
+            .unwrap(),
+        expected
+    );
+    assert_eq!(f.store.company_event_cursor().unwrap(), cursor);
+    assert_eq!(
+        f.store
+            .company_customer_requests(&f.customer.tenant_id, "customer-test")
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::InvalidInput
+    );
+}
+
+#[test]
+fn sales_intake_settled_waiting_and_granted_rows_do_not_starve_later_requests() {
+    let f = fixture();
+    for id in 1..=260 {
+        let request = submit_intake_request(&f, id, 1);
+        let (actor, command) = if id <= 130 && id % 2 == 0 {
+            (
+                &f.sales,
+                CompanyWorkflowCommandV1::QualifyCustomerRequest {
+                    request_id: request.request_id,
+                    expected_version: request.version,
+                    reason_ref: "Sales qualified".into(),
+                },
+            )
+        } else if id <= 130 {
+            (
+                &f.customer,
+                CompanyWorkflowCommandV1::CancelCustomerRequest {
+                    request_id: request.request_id,
+                    expected_version: request.version,
+                    reason_ref: "Customer cancelled".into(),
+                },
+            )
+        } else {
+            (
+                &f.sales,
+                CompanyWorkflowCommandV1::SendCustomerRequestMessage {
+                    request_id: request.request_id,
+                    expected_version: request.version,
+                    in_reply_to: None,
+                    content: "Which audience?".into(),
+                },
+            )
+        };
+        f.store
+            .apply_company_command(actor, Uuid::from_u128(1000 + id), &command, 2)
+            .unwrap();
+    }
+    for id in 300..303 {
+        let mut g = grant(&f, id, 10, 2);
+        g.expires_at_unix_ms = 5;
+        let call = f
+            .store
+            .authorize_request_provider_call(&f.operator, Uuid::from_u128(2000 + id), &g, 2)
+            .unwrap();
+        if id == 302 {
+            f.store
+                .claim_request_provider_call(&f.sales, &claim(&call), 3)
+                .unwrap();
+            f.store
+                .abandon_request_provider_call(
+                    &f.operator,
+                    &call.allowance_id,
+                    DIGEST,
+                    &Uuid::from_u128(3000 + id).to_string(),
+                    4,
+                )
+                .unwrap();
+        }
+    }
+    let mut expected: Vec<_> = (400..540)
+        .map(|id| submit_intake_request(&f, id, 6))
+        .collect();
+    expected.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+    expected.truncate(MAX_AGGREGATE_ITEMS);
+    assert_eq!(
+        f.store
+            .company_sales_intake_requests(&f.customer.tenant_id, "customer-test")
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn sales_intake_includes_answered_tail_and_only_excludes_exact_granted_version() {
+    let f = fixture();
+    let g = grant(&f, 1, 10, 2);
+    f.store
+        .authorize_request_provider_call(&f.operator, Uuid::from_u128(100), &g, 2)
+        .unwrap();
+    let question = f
+        .store
+        .apply_company_command(
+            &f.sales,
+            Uuid::from_u128(101),
+            &CompanyWorkflowCommandV1::SendCustomerRequestMessage {
+                request_id: g.request_id.clone(),
+                expected_version: 1,
+                in_reply_to: None,
+                content: "Which audience?".into(),
+            },
+            3,
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::CustomerRequest(question) = question.response else {
+        panic!()
+    };
+    assert!(f
+        .store
+        .company_sales_intake_requests(&f.customer.tenant_id, "customer-test")
+        .unwrap()
+        .is_empty());
+    let answer = f
+        .store
+        .apply_company_command(
+            &f.customer,
+            Uuid::from_u128(102),
+            &CompanyWorkflowCommandV1::SendCustomerRequestMessage {
+                request_id: g.request_id,
+                expected_version: question.version,
+                in_reply_to: Some(question.consultation.last().unwrap().message_id.clone()),
+                content: "Local businesses".into(),
+            },
+            4,
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::CustomerRequest(answer) = answer.response else {
+        panic!()
+    };
+    assert_eq!(
+        f.store
+            .company_sales_intake_requests(&f.customer.tenant_id, "customer-test")
+            .unwrap(),
+        vec![answer]
+    );
+}
+
+#[test]
+fn sales_intake_isolates_tenant_customer_and_grants() {
+    let mut f = fixture();
+    let local = submit_intake_request(&f, 1, 1);
+    f.customer.customer_id = Some("customer-other".into());
+    let other_customer = submit_intake_request(&f, 2, 1);
+    let local_tenant = f.customer.tenant_id.clone();
+    let foreign_tenant = TenantId::parse("tenant-other").unwrap();
+    f.customer.tenant_id = foreign_tenant.clone();
+    f.customer.customer_id = Some("customer-test".into());
+    f.sales.tenant_id = foreign_tenant.clone();
+    f.operator.tenant_id = foreign_tenant.clone();
+    let foreign = grant(&f, 1, 10, 2);
+    f.store
+        .authorize_request_provider_call(&f.operator, Uuid::from_u128(100), &foreign, 2)
+        .unwrap();
+    assert_ne!(foreign.request_id, local.request_id);
+    assert_eq!(
+        f.store
+            .company_sales_intake_requests(&local_tenant, "customer-test")
+            .unwrap(),
+        vec![local]
+    );
+    assert_eq!(
+        f.store
+            .company_sales_intake_requests(&local_tenant, "customer-other")
+            .unwrap(),
+        vec![other_customer]
+    );
+    assert!(f
+        .store
+        .company_sales_intake_requests(&foreign_tenant, "customer-test")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn sales_intake_rejects_selected_request_digest_semantics_and_ownership_corruption() {
+    for corruption in ["digest", "semantics", "ownership"] {
+        let f = fixture();
+        let mut request = submit_intake_request(&f, 1, 1);
+        let id = request.request_id.clone();
+        if corruption == "semantics" {
+            request.created_at_unix_ms = 0;
+        } else if corruption == "ownership" {
+            request.tenant_id = TenantId::parse("tenant-other").unwrap();
+        }
+        let mut connection = f.store.connection.lock().unwrap();
+        let tx = connection.transaction().unwrap();
+        put_entity(
+            &tx,
+            &f.customer.tenant_id,
+            "request",
+            &id,
+            request.version,
+            &request,
+        )
+        .unwrap();
+        if corruption == "digest" {
+            tx.execute(
+                "UPDATE company_entities SET payload_digest=?1 WHERE entity_kind='request'",
+                params!["b".repeat(64)],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        drop(connection);
+        assert_eq!(
+            f.store
+                .company_sales_intake_requests(&f.customer.tenant_id, "customer-test")
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore,
+            "{corruption}"
+        );
+    }
+}
+
+fn submit_intake_request(f: &Fixture, id: u128, now_ms: u64) -> CustomerRequestV1 {
+    let response = f
+        .store
+        .apply_company_command(
+            &f.customer,
+            Uuid::from_u128(id),
+            &CompanyWorkflowCommandV1::SubmitCustomerRequest {
+                summary_ref: "Customer website".into(),
+                desired_outcome: "Accessible pages".into(),
+                constraints: vec![],
+            },
+            now_ms,
+        )
+        .unwrap();
+    let CompanyWorkflowResponseV1::CustomerRequest(request) = response.response else {
+        panic!()
+    };
+    request
+}
+
+#[test]
 fn autonomous_admission_counts_foreign_reservations_and_unknown_dispatches() {
     for dispatched in [false, true] {
         let mut f = fixture();
@@ -681,6 +936,13 @@ fn request_provider_calls_enforces_store_wide_forty_row_bound_before_filtering()
             f.store.request_provider_calls(&tenant).unwrap_err().code,
             WorkflowErrorCode::CorruptStore
         );
+        assert_eq!(
+            f.store
+                .company_sales_intake_requests(&tenant, "customer-test")
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
     }
 }
 
@@ -706,6 +968,13 @@ fn request_provider_calls_rejects_row_digest_corruption_before_tenant_filtering(
     ] {
         assert_eq!(
             f.store.request_provider_calls(&tenant).unwrap_err().code,
+            WorkflowErrorCode::CorruptStore
+        );
+        assert_eq!(
+            f.store
+                .company_sales_intake_requests(&tenant, "customer-test")
+                .unwrap_err()
+                .code,
             WorkflowErrorCode::CorruptStore
         );
     }
@@ -1389,6 +1658,13 @@ fn semantic_call_corruption_is_rejected_even_with_recomputed_row_digest() {
     ] {
         assert_eq!(
             f.store.request_provider_calls(&tenant).unwrap_err().code,
+            WorkflowErrorCode::CorruptStore
+        );
+        assert_eq!(
+            f.store
+                .company_sales_intake_requests(&tenant, "customer-test")
+                .unwrap_err()
+                .code,
             WorkflowErrorCode::CorruptStore
         );
     }

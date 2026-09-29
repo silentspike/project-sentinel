@@ -274,6 +274,21 @@ fn disabling_sales_autonomy_keeps_bootstrap_selection_and_preserves_dynamic_hist
 fn autonomous_sales_exhaustion_does_not_block_an_accepted_project() {
     let temp = tempfile::tempdir().unwrap();
     let (mut api, context) = planning_fixture(&temp.path().join("workflow.sqlite"));
+    let anchor_request = additional_request(&api, 510);
+    let mut grant = api.request_sales_call().unwrap().unwrap().grant;
+    grant.request_id = anchor_request.request_id;
+    grant.expected_version = anchor_request.version;
+    grant.concurrent_call_limit = 2;
+    let anchor = api
+        .store
+        .authorize_request_provider_call(
+            &api.principals.principal("operator").unwrap().principal,
+            Uuid::from_u128(511),
+            &grant,
+            now_unix_ms(),
+        )
+        .unwrap();
+    api.subscription_allowance_id = Some(anchor.allowance_id.clone());
     additional_request(&api, 507);
     api.request_sales_autonomous_enabled = true;
     api.request_sales_total_limit = 1;
@@ -283,8 +298,9 @@ fn autonomous_sales_exhaustion_does_not_block_an_accepted_project() {
             .request_provider_calls(&context.binding.grant.planner_principal.tenant_id)
             .unwrap()
             .len(),
-        1
+        2
     );
+    assert_eq!(api.request_sales_call().unwrap().unwrap(), anchor);
     assert!(api
         .store
         .project_planning_call(
@@ -293,6 +309,105 @@ fn autonomous_sales_exhaustion_does_not_block_an_accepted_project() {
         )
         .unwrap()
         .is_some());
+}
+
+#[test]
+fn autonomous_sales_large_inbox_does_not_block_existing_projects() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut api, context) = planning_fixture(&temp.path().join("workflow.sqlite"));
+    for operation in 600..729 {
+        additional_request(&api, operation);
+    }
+    api.request_sales_autonomous_enabled = true;
+    api.reconcile_work_batch(&|| false).unwrap();
+    assert!(api
+        .store
+        .project_planning_call(
+            &context.binding.grant.planner_principal.tenant_id,
+            &context.binding.grant.project_id,
+        )
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        api.store
+            .request_provider_calls(&context.binding.grant.planner_principal.tenant_id)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn stale_sales_identity_preserves_failed_completion_without_blocking_recovery() {
+    for content in [
+        "malformed model content",
+        r#"{"schema_version":1,"kind":"ask_question","content":"Which format?"}"#,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut api, context) = fixture(&temp.path().join("company.sqlite"));
+        let request = dispatch(&api, &context);
+        assert_eq!(
+            api.subscription_dispatch(&serde_json::to_vec(&request).unwrap())
+                .status,
+            200
+        );
+        let id = request["request_id"].as_str().unwrap();
+        let digest = request["request_digest"].as_str().unwrap();
+        let completion = ModelExecutionCompletion {
+            context: ModelExecutionContext::RequestSales(Box::new(context.clone())),
+            content: content.into(),
+            admissible: true,
+        };
+        let event = DomainEvent::new("agent_llm_usage", &AgentId(3).to_string(), "{}", id, 1)
+            .with_operation_id(&format!("llm_usage_{id}"));
+        let store = api.event_store.as_ref().unwrap();
+        store
+            .enqueue_llm_completion(
+                id,
+                digest,
+                &serde_json::to_string(&serde_json::json!({
+                    "version":2,"request_id":id,"request_digest":digest,
+                    "usage_event":event,"actions":[],"tokens_used":10,"model_work":completion
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .persist_llm_completion_usage(id, digest, &event)
+            .unwrap();
+        assert_eq!(
+            store
+                .record_llm_completion_failure(id, digest, "Sales decision is not strict JSON", 1)
+                .unwrap(),
+            (1, true)
+        );
+        let failed = store.get_llm_completion(id).unwrap().unwrap();
+        let calls = api
+            .store
+            .request_provider_calls(&context.source_request.tenant_id)
+            .unwrap();
+        api.principals = Arc::new(PrincipalAuthenticator {
+            by_credential_digest: api.principals.by_credential_digest.clone(),
+            by_principal_id: api.principals.by_principal_id.clone(),
+        });
+        Arc::get_mut(&mut api.principals)
+            .unwrap()
+            .by_principal_id
+            .get_mut("sales")
+            .unwrap()
+            .principal
+            .authority_generation += 1;
+        assert!(!api.request_sales_autonomous_enabled);
+        assert!(!api.requeue_request_sales_schema_mismatch().unwrap());
+        assert_eq!(store.get_llm_completion(id).unwrap().unwrap(), failed);
+        assert_eq!(
+            api.store
+                .request_provider_calls(&context.source_request.tenant_id)
+                .unwrap(),
+            calls
+        );
+        assert!(api.prepare_request_sales(&context.binding).is_err());
+    }
 }
 
 pub(crate) fn fixture(path: &Path) -> (WorkflowApi, RequestSalesContext) {
