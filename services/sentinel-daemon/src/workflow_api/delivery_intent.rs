@@ -79,6 +79,11 @@ pub(super) fn reconcile_internal(
             reason: "delivery authority is unavailable".to_owned(),
         });
     };
+    // A sealed delivery is a durable outcome, not a request to rerun today's
+    // model review, toolchain, or execution-profile admission on every tick.
+    if settled_project_delivery(api, project)? {
+        return Ok(false);
+    }
     let material = load_material(api, &project.tenant_id, &project.project_id)?;
     let candidate_id = material.candidate.candidate_id.clone();
     let run_id = run_id(&material);
@@ -209,6 +214,87 @@ pub(super) fn reconcile_internal(
     Ok(true)
 }
 
+pub(super) fn settled_project_delivery(
+    api: &WorkflowApi,
+    observed: &sentinel_workflow::ProjectV1,
+) -> Result<bool, DeliveryError> {
+    let project = api
+        .store
+        .company_project(&observed.tenant_id, &observed.project_id)
+        .map_err(workflow_delivery_error)?
+        .ok_or_else(|| DeliveryError::NotFound("workflow project".to_owned()))?;
+    if project.version != observed.version
+        || project.lifecycle_state != ProjectLifecycleStateV1::DeliveryCandidate
+        || project.work_items.is_empty()
+        || project
+            .work_items
+            .values()
+            .any(|work| work.state != CompanyWorkStateV1::Done)
+    {
+        return Ok(false);
+    }
+    let Some(authority) = api.authority.as_ref() else {
+        return Ok(false);
+    };
+    // Recorded-policy recognition never grants present-day tool authority.
+    if authority
+        .project_profiles
+        .resolve_recorded(&project.governance.project_profile)
+        .is_err()
+    {
+        return Ok(false);
+    }
+    let Some(aggregate) = api
+        .delivery
+        .as_ref()
+        .ok_or_else(|| DeliveryError::AdapterUnavailable {
+            dependency: "delivery",
+            reason: "delivery authority is unavailable".to_owned(),
+        })?
+        .aggregate(&project.tenant_id.0, &project.project_id.0)?
+    else {
+        return Ok(false);
+    };
+    if aggregate.tenant_id != project.tenant_id.0 {
+        return Err(DeliveryError::CorruptStore(
+            "settled delivery tenant does not match its workflow".to_owned(),
+        ));
+    }
+    let agreement = api
+        .store
+        .company_agreement(&project.tenant_id, &project.agreement_id)
+        .map_err(workflow_delivery_error)?
+        .ok_or_else(|| DeliveryError::NotFound("workflow agreement".to_owned()))?;
+    if agreement.tenant_id != project.tenant_id
+        || agreement.proposal_digest != project.agreement_digest
+    {
+        return Err(DeliveryError::CorruptStore(
+            "settled delivery agreement differs from its workflow".to_owned(),
+        ));
+    }
+    let project_ref = VersionedRefV1 {
+        id: project.project_id.0.clone(),
+        generation: project.version,
+        digest: ContentDigest::of_domain("workflow-project", DELIVERY_SCHEMA_V1, &project)?,
+    };
+    let work_items_digest = ContentDigest::of_domain(
+        "workflow-work-items",
+        DELIVERY_SCHEMA_V1,
+        &project.work_items,
+    )?;
+    crate::delivery::settled_delivery_matches(
+        &aggregate,
+        &project_ref,
+        &VersionedRefV1 {
+            id: agreement.agreement_id,
+            generation: 1,
+            digest: ContentDigest::parse(agreement.proposal_digest)?,
+        },
+        &work_items_digest,
+        &agreement.accepted_by,
+    )
+}
+
 #[cfg(feature = "llm")]
 fn supersede_pending_review(
     delivery: &super::ProductDeliveryCore,
@@ -273,11 +359,13 @@ fn next_internal_intent(
     qa_state: Option<QaRunState>,
     delivery_exists: bool,
 ) -> Result<Option<DeliveryIntentV1>, DeliveryError> {
+    if delivery_exists {
+        return Err(DeliveryError::StaleEvidence(
+            "existing delivery has no verified settled lineage".to_owned(),
+        ));
+    }
     if !candidate_registered {
         return Ok(Some(DeliveryIntentV1::PrepareCandidate { project_id }));
-    }
-    if delivery_exists {
-        return Ok(None);
     }
     let Some(qa_state) = qa_state else {
         return Ok(Some(DeliveryIntentV1::AssignQa { project_id }));
@@ -2102,20 +2190,15 @@ mod tests {
             .unwrap(),
             Some(DeliveryIntentV1::Release { .. })
         ));
-        assert_eq!(
-            next_internal_intent(
-                project_id.clone(),
-                true,
-                Some(QaRunState::CompletedPass),
-                true,
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            next_internal_intent(project_id.clone(), true, None, true).unwrap(),
-            None
-        );
+        assert!(next_internal_intent(
+            project_id.clone(),
+            true,
+            Some(QaRunState::CompletedPass),
+            true,
+        )
+        .is_err());
+        assert!(next_internal_intent(project_id.clone(), true, None, true).is_err());
+        assert!(next_internal_intent(project_id.clone(), false, None, true).is_err());
         for state in [
             QaRunState::CompletedFail,
             QaRunState::NeedsHumanReview,

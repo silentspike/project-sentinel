@@ -4627,6 +4627,14 @@ impl WorkflowApi {
         self.publish_collaboration_backlog()
             .map_err(|_| workflow_unavailable())?;
         for project in self.store.company_projects()? {
+            if project.lifecycle_state
+                == sentinel_workflow::ProjectLifecycleStateV1::DeliveryCandidate
+                && delivery_intent::settled_project_delivery(self, &project).map_err(|error| {
+                    reconciliation_delivery_error(error, &project, "settled_lineage")
+                })?
+            {
+                continue;
+            }
             #[cfg(feature = "llm")]
             if self
                 .recover_failed_qa_schema_call(&project)
@@ -4671,8 +4679,9 @@ impl WorkflowApi {
                 continue;
             }
             if model_review::delivery_due(&project) {
-                delivery_intent::reconcile_internal(self, &project)
-                    .map_err(delivery_workflow_error)?;
+                delivery_intent::reconcile_internal(self, &project).map_err(|error| {
+                    reconciliation_delivery_error(error, &project, "delivery_intent")
+                })?;
                 continue;
             }
             if project.lifecycle_state == sentinel_workflow::ProjectLifecycleStateV1::Planning
@@ -5244,6 +5253,39 @@ fn delivery_workflow_error(error: crate::delivery::DeliveryError) -> WorkflowErr
     )
 }
 
+fn reconciliation_delivery_error(
+    error: crate::delivery::DeliveryError,
+    project: &sentinel_workflow::ProjectV1,
+    stage: &'static str,
+) -> WorkflowError {
+    static LAST_ERROR_MINUTE: AtomicU64 = AtomicU64::new(0);
+    let minute = now_unix_ms() / 60_000;
+    if LAST_ERROR_MINUTE.swap(minute, Ordering::AcqRel) != minute {
+        warn!(project_id = %project.project_id.0, stage,
+            error_class = delivery_error_class(&error), "delivery reconciliation is blocked");
+    }
+    delivery_workflow_error(error)
+}
+
+fn delivery_error_class(error: &crate::delivery::DeliveryError) -> &'static str {
+    use crate::delivery::DeliveryError;
+    match error {
+        DeliveryError::AdapterUnavailable { .. } => "adapter_unavailable",
+        DeliveryError::AuthorityDenied(_) => "authority_denied",
+        DeliveryError::Conflict(_) => "conflict",
+        DeliveryError::CorruptStore(_) => "corrupt_store",
+        DeliveryError::IdempotencyConflict { .. } => "idempotency_conflict",
+        DeliveryError::InvalidDigest(_) => "invalid_digest",
+        DeliveryError::InvalidState { .. } => "invalid_state",
+        DeliveryError::MissingEvidence(_) => "missing_evidence",
+        DeliveryError::NotFound(_) => "not_found",
+        DeliveryError::RevisionConflict { .. } => "revision_conflict",
+        DeliveryError::StaleEvidence(_) => "stale_evidence",
+        DeliveryError::Storage(_) => "storage",
+        DeliveryError::Validation(_) => "validation",
+    }
+}
+
 fn company_sync_authority_error(error: WorkflowPortError) -> WorkflowError {
     match error {
         WorkflowPortError::Unavailable => WorkflowError::new(
@@ -5617,6 +5659,40 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     use super::*;
+
+    #[test]
+    fn delivery_reconciliation_error_classes_never_embed_private_details() {
+        use crate::delivery::DeliveryError;
+        for (error, expected) in [
+            (
+                DeliveryError::MissingEvidence("private-prompt".to_owned()),
+                "missing_evidence",
+            ),
+            (
+                DeliveryError::Storage("private-database-path".to_owned()),
+                "storage",
+            ),
+            (
+                DeliveryError::CorruptStore("private-record".to_owned()),
+                "corrupt_store",
+            ),
+            (
+                DeliveryError::StaleEvidence("private-invocation".to_owned()),
+                "stale_evidence",
+            ),
+            (
+                DeliveryError::AuthorityDenied("private-credential".to_owned()),
+                "authority_denied",
+            ),
+        ] {
+            assert_eq!(delivery_error_class(&error), expected);
+            assert!(!delivery_error_class(&error).contains("private"));
+            assert_eq!(
+                delivery_workflow_error(error).code,
+                WorkflowErrorCode::PersistenceFailure
+            );
+        }
+    }
 
     #[test]
     fn failed_project_reconciliation_still_drains_publication_and_retains_failure() {
