@@ -40,7 +40,7 @@ redb = { workspace = true }
 rustix = { version = "1.1", features = ["fs", "process"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-base64 = "0.22.1"
+base64 = "0.23.0"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
@@ -50,7 +50,7 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false, optional = true }
+reqwest = { version = "0.13", features = ["json", "rustls-tls", "blocking"], default-features = false, optional = true }
 uuid = { workspace = true }
 bincode = { workspace = true }
 async-nats = { workspace = true, optional = true }
