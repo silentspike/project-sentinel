@@ -2247,6 +2247,20 @@ impl WorkflowApi {
         {
             return Err("project is not awaiting its first plan");
         }
+        if let Some(existing) = self
+            .store
+            .project_planning_call(&project.tenant_id, &project.project_id)
+            .map_err(|_| "project planning store unavailable")?
+        {
+            if existing.source_project != *project {
+                return Err("project planning source changed");
+            }
+            // A dispatched call belongs to durable recovery. Recognizing it
+            // must not renew authority or require the employee's next shift.
+            if existing.dispatch.is_some() {
+                return Ok(existing);
+            }
+        }
         let allowance_id = self
             .subscription_allowance_id
             .as_deref()
@@ -3666,6 +3680,112 @@ mod family_selection_tests {
             source_request: request,
             source_proposal: proposal,
         }
+    }
+
+    #[test]
+    fn dispatched_planning_replay_does_not_require_a_new_shift_or_allowance() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut api, sales) = tests::fixture(&temp.path().join("company.sqlite"));
+        let context = accepted_context(&api, &sales, "python-project-v1");
+        let original = api
+            .store
+            .project_planning_call(
+                &context.source_project.tenant_id,
+                &context.source_project.project_id,
+            )
+            .unwrap()
+            .unwrap();
+        let claim = sentinel_workflow::ClaimProjectPlanningCallV1 {
+            allowance_id: original.allowance_id.clone(),
+            project_id: original.grant.project_id.clone(),
+            request_id: original.request_id(),
+            request_digest: "a".repeat(64),
+            context_digest: "b".repeat(64),
+        };
+        let dispatched = api
+            .store
+            .claim_project_planning_call(&original.grant.planner_principal, &claim, now_unix_ms())
+            .unwrap();
+        api.authority
+            .as_ref()
+            .unwrap()
+            .runtime_health
+            .write()
+            .unwrap()
+            .agents
+            .clear();
+        api.subscription_allowance_id = None;
+        let cursor = api.store.company_event_cursor().unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                api.ensure_project_planning_call(&context.source_project)
+                    .unwrap(),
+                dispatched
+            );
+        }
+        assert_eq!(api.store.company_event_cursor().unwrap(), cursor);
+        assert!(api
+            .store
+            .claim_project_planning_call(&original.grant.planner_principal, &claim, now_unix_ms())
+            .is_err());
+        assert!(api
+            .project_planning_call(
+                original.grant.planner_principal.agent_id.unwrap(),
+                now_unix_ms()
+            )
+            .unwrap()
+            .is_none());
+        let mut changed = context.source_project.clone();
+        changed.version += 1;
+        assert_eq!(
+            api.ensure_project_planning_call(&changed).err(),
+            Some("project planning source changed")
+        );
+        assert_eq!(
+            api.store
+                .project_planning_call(
+                    &dispatched.grant.planner_principal.tenant_id,
+                    &dispatched.grant.project_id
+                )
+                .unwrap(),
+            Some(dispatched)
+        );
+    }
+
+    #[test]
+    fn undispatched_planning_still_requires_a_healthy_on_duty_employee() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, sales) = tests::fixture(&temp.path().join("company.sqlite"));
+        let context = accepted_context(&api, &sales, "node-project-v1");
+        let original = api
+            .store
+            .project_planning_call(
+                &context.source_project.tenant_id,
+                &context.source_project.project_id,
+            )
+            .unwrap();
+        api.authority
+            .as_ref()
+            .unwrap()
+            .runtime_health
+            .write()
+            .unwrap()
+            .agents
+            .clear();
+        assert_eq!(
+            api.ensure_project_planning_call(&context.source_project)
+                .err(),
+            Some("company employee is not healthy and on duty")
+        );
+        assert_eq!(
+            api.store
+                .project_planning_call(
+                    &context.source_project.tenant_id,
+                    &context.source_project.project_id
+                )
+                .unwrap(),
+            original
+        );
     }
 
     #[test]
