@@ -8,7 +8,7 @@ require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/nats-io/nats.go v1.48.0
 	github.com/prometheus/client_golang v1.23.2
-	github.com/silentspike/project-sentinel/pkg/sentinel-go v0.0.0-20260426185014-30c7fd621515
+	github.com/silentspike/project-sentinel/pkg/sentinel-go v0.0.0-20260929010847-b2b2b921258c
 	modernc.org/sqlite v1.45.0
 )
 
