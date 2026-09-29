@@ -1,5 +1,10 @@
 # Changelog
 
+- Bind the scheduled dependency updater to this repository explicitly instead
+  of returning success without inspecting any repository. Keep automatic
+  repository discovery disabled and existing upgrade/review policy unchanged
+  (#856).
+
 - Recognize the exact already dispatched project-planning call before checking
   fresh provider allowance or employee shift readiness. Preserve durable pending
   outcomes, reject changed project lineage and retain strict on-duty admission
