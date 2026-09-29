@@ -1543,7 +1543,7 @@ impl ProjectPlanningRole {
 impl WorkflowApi {
     fn bind_sales_offer(
         &self,
-        tenant: &TenantId,
+        sales_principal: &AuthenticatedCompanyPrincipalV1,
         action: SalesAction,
         now_ms: u64,
     ) -> Result<sentinel_workflow::ProposalBindingV1, &'static str> {
@@ -1566,6 +1566,16 @@ impl WorkflowApi {
         let project_profile = authority
             .project_profile_binding(&family_id)
             .map_err(|_| "Sales project family unavailable")?;
+        self.validate_sales_principal_identity(sales_principal)?;
+        let tenant = &sales_principal.tenant_id;
+        let family = authority
+            .project_profiles
+            .family(&project_profile)
+            .map_err(|_| "Sales project family unavailable")?;
+        let health = authority
+            .runtime_health
+            .read()
+            .map_err(|_| "company health unavailable")?;
         let roles = [
             CompanyRoleV1::Sales,
             CompanyRoleV1::ProjectManager,
@@ -1577,19 +1587,72 @@ impl WorkflowApi {
         ];
         let mut roster = BTreeMap::new();
         for role in roles {
-            let bound = self
+            let mut required_tools = match role {
+                CompanyRoleV1::Designer | CompanyRoleV1::Developer => authority
+                    .profile_for_binding(
+                        family
+                            .execution_profile(role)
+                            .map_err(|_| "Sales participant family profile unavailable")?,
+                    )
+                    .map_err(|_| "Sales participant family profile unavailable")?
+                    .0
+                    .capabilities
+                    .clone(),
+                CompanyRoleV1::Qa if family == ProjectFamily::Web => {
+                    authority.qa_profile_capabilities.clone()
+                }
+                CompanyRoleV1::Qa => authority
+                    .profile_for_binding(family.technical_qa_profile())
+                    .map_err(|_| "Sales participant family profile unavailable")?
+                    .0
+                    .capabilities
+                    .clone(),
+                _ => BTreeSet::new(),
+            };
+            if matches!(
+                role,
+                CompanyRoleV1::Designer | CompanyRoleV1::Developer | CompanyRoleV1::Qa
+            ) {
+                required_tools.insert("file.write".to_owned());
+                required_tools.insert("artifact.commit".to_owned());
+            }
+            if matches!(role, CompanyRoleV1::Developer | CompanyRoleV1::Qa) {
+                required_tools.insert("test.run_profile".to_owned());
+            }
+            // Resolve uniqueness only among employees eligible in this one snapshot.
+            // Sales is the durable caller, never a substitute from the current shift.
+            let mut eligible = self
                 .principals
-                .agent_for_role(tenant, role)
+                .agents_for_role(tenant, role)
+                .filter(|bound| {
+                    if role == CompanyRoleV1::Sales && &bound.principal != sales_principal {
+                        return false;
+                    }
+                    let Some(agent_id) = bound.principal.agent_id else {
+                        return false;
+                    };
+                    authority
+                        .agent_capabilities
+                        .get(&agent_id)
+                        .is_some_and(|available| required_tools.is_subset(available))
+                        && health
+                            .agents
+                            .iter()
+                            .find(|agent| agent.agent_id == agent_id.0)
+                            .is_some_and(|agent| {
+                                agent.expected_active
+                                    && crate::runtime_health::classify_runtime_agent(agent)
+                                        == crate::runtime_health::RuntimeAgentHealthClass::Healthy
+                            })
+                });
+            let bound = eligible
+                .next()
                 .ok_or("required company role is unavailable")?;
-            let agent_id = bound.principal.agent_id.ok_or("company agent is missing")?;
-            if roster.insert(role, (bound, agent_id)).is_some() {
+            if eligible.next().is_some() {
                 return Err("company role is ambiguous");
             }
-        }
-        for (_, agent_id) in roster.values() {
-            if !authority.agent_capabilities.contains_key(agent_id) {
-                return Err("required company employee is not configured");
-            }
+            let agent_id = bound.principal.agent_id.ok_or("company agent is missing")?;
+            roster.insert(role, (bound.clone(), agent_id));
         }
         let web = family_id == "web-project-v1";
         let project_manager = roster[&CompanyRoleV1::ProjectManager].1;
@@ -2056,6 +2119,7 @@ impl WorkflowApi {
                 .agents
                 .iter()
                 .find(|agent| agent.agent_id == agent_id.0)
+                .filter(|agent| agent.expected_active)
                 .map(crate::runtime_health::classify_runtime_agent)
                 != Some(crate::runtime_health::RuntimeAgentHealthClass::Healthy)
         {
@@ -2219,7 +2283,7 @@ impl WorkflowApi {
                 let binding = if let Some(response) = &call.proposal_response {
                     offer.replay_binding(&response.proposal.binding)?
                 } else {
-                    self.bind_sales_offer(&call.grant.sales_principal.tenant_id, offer, now_ms)?
+                    self.bind_sales_offer(&call.grant.sales_principal, offer, now_ms)?
                 };
                 self.store
                     .adopt_sales_proposal(
@@ -2342,7 +2406,7 @@ impl WorkflowApi {
             .map_err(|_| "project planning grant was rejected")
     }
 
-    fn validate_company_employee(
+    pub(super) fn validate_company_employee(
         &self,
         principal: &AuthenticatedCompanyPrincipalV1,
     ) -> Result<(), &'static str> {
@@ -2360,6 +2424,7 @@ impl WorkflowApi {
                 .agents
                 .iter()
                 .find(|agent| agent.agent_id == agent_id.0)
+                .filter(|agent| agent.expected_active)
                 .map(crate::runtime_health::classify_runtime_agent)
                 != Some(crate::runtime_health::RuntimeAgentHealthClass::Healthy)
         {
@@ -3441,16 +3506,381 @@ mod family_selection_tests {
             .unwrap()
     }
 
+    const SHIFT_ROSTERS: [[u16; 7]; 3] = [
+        [11, 9, 5, 3, 6, 55, 56],
+        [26, 24, 20, 18, 21, 57, 58],
+        [41, 39, 35, 33, 36, 59, 60],
+    ];
+    const ROSTER_ROLES: [CompanyRoleV1; 7] = [
+        CompanyRoleV1::Sales,
+        CompanyRoleV1::ProjectManager,
+        CompanyRoleV1::TechnicalLead,
+        CompanyRoleV1::Designer,
+        CompanyRoleV1::Developer,
+        CompanyRoleV1::Qa,
+        CompanyRoleV1::ReleaseManager,
+    ];
+
+    fn all_shift_api(path: &Path, shift: usize) -> WorkflowApi {
+        let mut api = super::super::model_work::configured_test_api(path);
+        let original = api.authority.as_ref().unwrap();
+        let template = original.runtime_health.read().unwrap().agents[0].clone();
+        let configured_agents = sentinel_common::agent_config::load_all_agents(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/agents"),
+        )
+        .unwrap();
+        let tools: HashMap<_, _> = configured_agents
+            .iter()
+            .map(|agent| {
+                (
+                    AgentId(agent.identity.id),
+                    super::super::company_tool_capabilities(&agent.capabilities.tools),
+                )
+            })
+            .collect();
+        let file: PrincipalBindingsFile =
+            serde_json::from_str(include_str!("../../../../config/company-principals.json"))
+                .unwrap();
+        let principals = Arc::new(
+            PrincipalAuthenticator::new(
+                file.bindings
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, binding)| {
+                        (
+                            format!("all-shift-credential-{index}-{}", "x".repeat(32)),
+                            binding,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let mut capabilities = HashMap::new();
+        let mut agents = Vec::new();
+        for bound in principals.by_principal_id.values() {
+            if let Some(id) = bound.principal.agent_id {
+                capabilities.insert(id, tools[&id].clone());
+                let mut agent = template.clone();
+                agent.agent_id = id.0;
+                agent.expected_active = SHIFT_ROSTERS[shift].contains(&id.0);
+                agents.push(agent);
+            }
+        }
+        let authority = Arc::make_mut(api.authority.as_mut().unwrap());
+        authority.principals = Arc::clone(&principals);
+        authority.agent_capabilities = Arc::new(capabilities);
+        let mut health = authority.runtime_health.write().unwrap();
+        health.current_shift = (shift + 1) as u8;
+        health.agents = agents;
+        drop(health);
+        api.principals = principals;
+        api
+    }
+
+    fn shift_sales(api: &WorkflowApi, shift: usize) -> AuthenticatedCompanyPrincipalV1 {
+        api.principals
+            .by_principal_id
+            .values()
+            .find(|bound| {
+                bound.principal.role == CompanyRoleV1::Sales
+                    && bound.principal.agent_id == Some(AgentId(SHIFT_ROSTERS[shift][0]))
+            })
+            .unwrap()
+            .principal
+            .clone()
+    }
+
+    fn set_on_duty(api: &WorkflowApi, id: u16, active: bool) {
+        api.authority
+            .as_ref()
+            .unwrap()
+            .runtime_health
+            .write()
+            .unwrap()
+            .agents
+            .iter_mut()
+            .find(|agent| agent.agent_id == id)
+            .unwrap()
+            .expected_active = active;
+    }
+
+    #[test]
+    fn all_three_shift_rosters_bind_healthy_capable_family_employees() {
+        for (shift, roster) in SHIFT_ROSTERS.iter().enumerate() {
+            let temp = tempfile::tempdir().unwrap();
+            let api = all_shift_api(&temp.path().join("company.sqlite"), shift);
+            let sales = shift_sales(&api, shift);
+            for family in ["web-project-v1", "python-project-v1", "node-project-v1"] {
+                let binding = api
+                    .bind_sales_offer(&sales, offer(Some(family)), 100)
+                    .unwrap();
+                assert_eq!(binding.governance.owner, AgentId(roster[1]));
+                for (role, &id) in ROSTER_ROLES.into_iter().zip(roster) {
+                    let employee = participant(&binding, role);
+                    assert_eq!(employee.agent_id, AgentId(id));
+                    assert_eq!(
+                        api.principals
+                            .principal(&employee.principal_id)
+                            .unwrap()
+                            .principal
+                            .agent_id,
+                        Some(AgentId(id))
+                    );
+                }
+            }
+            assert!(api.store.company_projects().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn roster_filters_inactive_unhealthy_and_missing_capability_before_uniqueness() {
+        for rejection in [
+            "inactive",
+            "unhealthy",
+            "missing-capability",
+            "unconfigured",
+            "missing-health",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut api = all_shift_api(&temp.path().join("company.sqlite"), 0);
+            let sales = shift_sales(&api, 0);
+            let alternate = SHIFT_ROSTERS[1][4];
+            set_on_duty(&api, alternate, true);
+            match rejection {
+                "inactive" => set_on_duty(&api, alternate, false),
+                "unhealthy" => {
+                    api.authority
+                        .as_ref()
+                        .unwrap()
+                        .runtime_health
+                        .write()
+                        .unwrap()
+                        .agents
+                        .iter_mut()
+                        .find(|agent| agent.agent_id == alternate)
+                        .unwrap()
+                        .security_runtime_present = false;
+                }
+                "missing-health" => {
+                    api.authority
+                        .as_ref()
+                        .unwrap()
+                        .runtime_health
+                        .write()
+                        .unwrap()
+                        .agents
+                        .retain(|agent| agent.agent_id != alternate);
+                }
+                _ => {
+                    let authority = Arc::make_mut(api.authority.as_mut().unwrap());
+                    let tools = Arc::make_mut(&mut authority.agent_capabilities);
+                    if rejection == "unconfigured" {
+                        tools.remove(&AgentId(alternate));
+                    } else {
+                        tools
+                            .get_mut(&AgentId(alternate))
+                            .unwrap()
+                            .remove("test.run_profile");
+                    }
+                }
+            }
+            let binding = api
+                .bind_sales_offer(&sales, offer(Some("python-project-v1")), 100)
+                .unwrap();
+            assert_eq!(
+                participant(&binding, CompanyRoleV1::Developer).agent_id,
+                AgentId(6)
+            );
+            set_on_duty(&api, 6, false);
+            assert_eq!(
+                api.bind_sales_offer(&sales, offer(Some("python-project-v1")), 100)
+                    .err(),
+                Some("required company role is unavailable"),
+                "{rejection}"
+            );
+        }
+    }
+
+    #[test]
+    fn roster_rejects_eligible_ambiguity_for_every_non_sales_role() {
+        for role_index in 1..7 {
+            let temp = tempfile::tempdir().unwrap();
+            let api = all_shift_api(&temp.path().join("company.sqlite"), 0);
+            let sales = shift_sales(&api, 0);
+            set_on_duty(&api, SHIFT_ROSTERS[1][role_index], true);
+            assert_eq!(
+                api.bind_sales_offer(&sales, offer(None), 100).err(),
+                Some("company role is ambiguous"),
+                "{:?}",
+                ROSTER_ROLES[role_index]
+            );
+        }
+    }
+
+    #[test]
+    fn roster_binds_exact_authenticated_sales_caller_without_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = all_shift_api(&temp.path().join("company.sqlite"), 0);
+        let sales = shift_sales(&api, 0);
+        let alternate = shift_sales(&api, 1);
+        set_on_duty(&api, 26, true);
+        for caller in [&sales, &alternate] {
+            let binding = api.bind_sales_offer(caller, offer(None), 100).unwrap();
+            assert_eq!(
+                participant(&binding, CompanyRoleV1::Sales).principal_id,
+                caller.principal_id
+            );
+        }
+        let mut changed = sales.clone();
+        changed.authority_generation += 1;
+        assert_eq!(
+            api.bind_sales_offer(&changed, offer(None), 100).err(),
+            Some("Sales principal changed")
+        );
+        changed = sales.clone();
+        changed.tenant_id = TenantId::parse("other-tenant").unwrap();
+        assert_eq!(
+            api.bind_sales_offer(&changed, offer(None), 100).err(),
+            Some("Sales principal changed")
+        );
+        set_on_duty(&api, 11, false);
+        assert_eq!(
+            api.bind_sales_offer(&sales, offer(None), 100).err(),
+            Some("required company role is unavailable")
+        );
+        assert!(api.bind_sales_offer(&alternate, offer(None), 100).is_ok());
+    }
+
+    #[test]
+    fn roster_requires_family_tools_and_explicit_authoring_and_test_capabilities() {
+        for family in ["web-project-v1", "python-project-v1", "node-project-v1"] {
+            for (role, id, tool) in [
+                (CompanyRoleV1::Designer, 3, "file.write"),
+                (CompanyRoleV1::Designer, 3, "artifact.commit"),
+                (CompanyRoleV1::Developer, 6, "file.write"),
+                (CompanyRoleV1::Developer, 6, "artifact.commit"),
+                (CompanyRoleV1::Developer, 6, "test.run_profile"),
+                (CompanyRoleV1::Qa, 55, "test.run_profile"),
+                (CompanyRoleV1::Qa, 55, "file.write"),
+                (CompanyRoleV1::Qa, 55, "artifact.commit"),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut api = all_shift_api(&temp.path().join("company.sqlite"), 0);
+                let sales = shift_sales(&api, 0);
+                let authority = Arc::make_mut(api.authority.as_mut().unwrap());
+                Arc::make_mut(&mut authority.agent_capabilities)
+                    .get_mut(&AgentId(id))
+                    .unwrap()
+                    .remove(tool);
+                // Narrow the profile too: these explicit role requirements must survive.
+                let profile = authority
+                    .participant_profile_for_family_role(family, role)
+                    .unwrap();
+                if profile.profile_id == authority.workbench_profile.id {
+                    authority.workbench_profile.capabilities.remove(tool);
+                } else if role == CompanyRoleV1::Qa && family == "web-project-v1" {
+                    authority.qa_profile_capabilities.remove(tool);
+                } else {
+                    authority
+                        .coding_profiles
+                        .get_mut(&profile.profile_id)
+                        .unwrap()
+                        .0
+                        .capabilities
+                        .remove(tool);
+                }
+                assert_eq!(
+                    api.bind_sales_offer(&sales, offer(Some(family)), 100).err(),
+                    Some("required company role is unavailable"),
+                    "{family} {role:?} {tool}"
+                );
+            }
+            for (id, tool) in [
+                (3, "patch.apply"),
+                (6, "command.run_allowlisted"),
+                (55, "file.inspect"),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut api = all_shift_api(&temp.path().join("company.sqlite"), 0);
+                let sales = shift_sales(&api, 0);
+                let authority = Arc::make_mut(api.authority.as_mut().unwrap());
+                Arc::make_mut(&mut authority.agent_capabilities)
+                    .get_mut(&AgentId(id))
+                    .unwrap()
+                    .remove(tool);
+                assert_eq!(
+                    api.bind_sales_offer(&sales, offer(Some(family)), 100).err(),
+                    Some("required company role is unavailable"),
+                    "{family} {tool}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn old_governance_replay_never_rebinds_to_the_next_shift() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut api = all_shift_api(&temp.path().join("company.sqlite"), 0);
+        let sales = shift_sales(&api, 0);
+        let original = api.bind_sales_offer(&sales, offer(None), 100).unwrap();
+        for id in SHIFT_ROSTERS[0] {
+            set_on_duty(&api, id, false);
+        }
+        for id in SHIFT_ROSTERS[1] {
+            set_on_duty(&api, id, true);
+        }
+        let next = api
+            .bind_sales_offer(&shift_sales(&api, 1), offer(None), 200)
+            .unwrap();
+        assert_ne!(next.governance.owner, original.governance.owner);
+        assert_ne!(
+            next.governance.participants,
+            original.governance.participants
+        );
+        api.authority = None;
+        api.principals = Arc::new(PrincipalAuthenticator::default());
+        assert_eq!(offer(None).replay_binding(&original).unwrap(), original);
+    }
+
+    #[test]
+    fn company_employee_rejects_healthy_but_off_duty_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = all_shift_api(&temp.path().join("company.sqlite"), 0);
+        let off_duty = shift_sales(&api, 1);
+        let health = api
+            .authority
+            .as_ref()
+            .unwrap()
+            .runtime_health
+            .read()
+            .unwrap();
+        let agent = health
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == 26)
+            .unwrap();
+        assert_eq!(
+            crate::runtime_health::classify_runtime_agent(agent),
+            crate::runtime_health::RuntimeAgentHealthClass::Healthy
+        );
+        drop(health);
+        assert_eq!(
+            api.validate_company_employee(&off_duty).err(),
+            Some("company employee is not healthy and on duty")
+        );
+    }
+
     #[test]
     fn old_sales_response_keeps_web_governance_and_topology() {
         let temp = tempfile::tempdir().unwrap();
         let api =
             super::super::model_work::configured_test_api(&temp.path().join("company.sqlite"));
-        let tenant = TenantId::parse("tenant-m0").unwrap();
-        let binding = api.bind_sales_offer(&tenant, offer(None), 100).unwrap();
+        let sales = api.principals.principal("sales").unwrap().principal;
+        let binding = api.bind_sales_offer(&sales, offer(None), 100).unwrap();
         assert_eq!(
             binding,
-            api.bind_sales_offer(&tenant, offer(Some("web-project-v1")), 100)
+            api.bind_sales_offer(&sales, offer(Some("web-project-v1")), 100)
                 .unwrap()
         );
         assert_eq!(binding.governance.participants.len(), 7);
@@ -3478,14 +3908,14 @@ mod family_selection_tests {
         let temp = tempfile::tempdir().unwrap();
         let api =
             super::super::model_work::configured_test_api(&temp.path().join("company.sqlite"));
-        let tenant = TenantId::parse("tenant-m0").unwrap();
+        let sales = api.principals.principal("sales").unwrap().principal;
         let authority = api.authority.as_ref().unwrap();
         for (family, developer_profile) in [
             ("python-project-v1", "python-coding-v1"),
             ("node-project-v1", "node-coding-v1"),
         ] {
             let binding = api
-                .bind_sales_offer(&tenant, offer(Some(family)), 100)
+                .bind_sales_offer(&sales, offer(Some(family)), 100)
                 .unwrap();
             assert_eq!(
                 binding.governance.project_profile,
@@ -3523,7 +3953,7 @@ mod family_selection_tests {
         let temp = tempfile::tempdir().unwrap();
         let mut api =
             super::super::model_work::configured_test_api(&temp.path().join("company.sqlite"));
-        let tenant = TenantId::parse("tenant-m0").unwrap();
+        let sales = api.principals.principal("sales").unwrap().principal;
         for family in [
             "ruby-project-v1",
             "python-project-v2",
@@ -3531,8 +3961,7 @@ mod family_selection_tests {
             "Python-project-v1",
         ] {
             assert_eq!(
-                api.bind_sales_offer(&tenant, offer(Some(family)), 100)
-                    .err(),
+                api.bind_sales_offer(&sales, offer(Some(family)), 100).err(),
                 Some("project family is unsupported")
             );
         }
@@ -3541,13 +3970,13 @@ mod family_selection_tests {
         api.authority = Some(Arc::new(unavailable));
         for family in ["python-project-v1", "node-project-v1"] {
             assert!(api
-                .bind_sales_offer(&tenant, offer(Some(family)), 100)
+                .bind_sales_offer(&sales, offer(Some(family)), 100)
                 .is_err());
         }
-        assert!(api.bind_sales_offer(&tenant, offer(None), 100).is_ok());
+        assert!(api.bind_sales_offer(&sales, offer(None), 100).is_ok());
         api.authority = None;
         assert_eq!(
-            api.bind_sales_offer(&tenant, offer(Some("python-project-v1")), 100)
+            api.bind_sales_offer(&sales, offer(Some("python-project-v1")), 100)
                 .err(),
             Some("company authority unavailable")
         );
@@ -3575,9 +4004,9 @@ mod family_selection_tests {
         let temp = tempfile::tempdir().unwrap();
         let mut api =
             super::super::model_work::configured_test_api(&temp.path().join("company.sqlite"));
-        let tenant = TenantId::parse("tenant-m0").unwrap();
+        let sales = api.principals.principal("sales").unwrap().principal;
         for family in [None, Some("python-project-v1"), Some("node-project-v1")] {
-            let binding = api.bind_sales_offer(&tenant, offer(family), 100).unwrap();
+            let binding = api.bind_sales_offer(&sales, offer(family), 100).unwrap();
             assert_eq!(offer(family).replay_binding(&binding).unwrap(), binding);
             assert_eq!(
                 offer(Some("ruby-project-v1"))
@@ -3595,7 +4024,7 @@ mod family_selection_tests {
                 Some("Sales proposal family changed on replay")
             );
         }
-        let web = api.bind_sales_offer(&tenant, offer(None), 100).unwrap();
+        let web = api.bind_sales_offer(&sales, offer(None), 100).unwrap();
         api.authority = None;
         assert_eq!(offer(None).replay_binding(&web).unwrap(), web);
     }
@@ -3607,7 +4036,11 @@ mod family_selection_tests {
     ) -> ProjectPlanningContext {
         let now = now_unix_ms();
         let binding = api
-            .bind_sales_offer(&sales.source_request.tenant_id, offer(Some(family)), now)
+            .bind_sales_offer(
+                &sales.binding.grant.sales_principal,
+                offer(Some(family)),
+                now,
+            )
             .unwrap();
         let response = api
             .store
@@ -3706,6 +4139,27 @@ mod family_selection_tests {
             .store
             .claim_project_planning_call(&original.grant.planner_principal, &claim, now_unix_ms())
             .unwrap();
+        for agent in &mut api
+            .authority
+            .as_ref()
+            .unwrap()
+            .runtime_health
+            .write()
+            .unwrap()
+            .agents
+        {
+            agent.expected_active = false;
+        }
+        assert_eq!(
+            api.validate_company_employee(&original.grant.planner_principal)
+                .err(),
+            Some("company employee is not healthy and on duty")
+        );
+        assert_eq!(
+            api.ensure_project_planning_call(&context.source_project)
+                .unwrap(),
+            dispatched
+        );
         api.authority
             .as_ref()
             .unwrap()
@@ -3776,6 +4230,96 @@ mod family_selection_tests {
             api.ensure_project_planning_call(&context.source_project)
                 .err(),
             Some("company employee is not healthy and on duty")
+        );
+        assert_eq!(
+            api.store
+                .project_planning_call(
+                    &context.source_project.tenant_id,
+                    &context.source_project.project_id
+                )
+                .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn accepted_project_never_switches_to_an_eligible_replacement_pm() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut api, sales) = tests::fixture(&temp.path().join("company.sqlite"));
+        let context = accepted_context(&api, &sales, "node-project-v1");
+        let original = api
+            .store
+            .project_planning_call(
+                &context.source_project.tenant_id,
+                &context.source_project.project_id,
+            )
+            .unwrap();
+        let alternate = PrincipalAuthenticator::new(vec![(
+            "replacement-pm-credential-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_owned(),
+            PrincipalBinding {
+                credential_name: "replacement-pm".to_owned(),
+                tenant_id: context.source_project.tenant_id.clone(),
+                principal_id: "replacement-pm".to_owned(),
+                kind: CompanyPrincipalKindV1::Agent,
+                role: CompanyRoleV1::ProjectManager,
+                customer_id: None,
+                agent_id: Some(AgentId(24)),
+                authority_generation: 1,
+            },
+        )])
+        .unwrap();
+        let replacement = alternate.principal("replacement-pm").unwrap().principal;
+        let mut principals = PrincipalAuthenticator {
+            by_credential_digest: api.principals.by_credential_digest.clone(),
+            by_principal_id: api.principals.by_principal_id.clone(),
+        };
+        principals
+            .by_credential_digest
+            .extend(alternate.by_credential_digest);
+        principals.by_principal_id.extend(alternate.by_principal_id);
+        api.principals = Arc::new(principals);
+        let authority = Arc::make_mut(api.authority.as_mut().unwrap());
+        authority.principals = Arc::clone(&api.principals);
+        Arc::make_mut(&mut authority.agent_capabilities).insert(AgentId(24), BTreeSet::new());
+        let mut health = authority.runtime_health.write().unwrap();
+        let mut next = health
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == 5)
+            .unwrap()
+            .clone();
+        next.agent_id = 24;
+        next.expected_active = true;
+        for agent in health.agents.iter_mut().filter(|agent| agent.agent_id == 5) {
+            agent.expected_active = false;
+        }
+        health.agents.push(next);
+        drop(health);
+        api.validate_company_employee(&replacement).unwrap();
+        let future = api
+            .bind_sales_offer(
+                &sales.binding.grant.sales_principal,
+                offer(Some("node-project-v1")),
+                now_unix_ms(),
+            )
+            .unwrap();
+        assert_eq!(future.governance.owner, AgentId(24));
+        let cursor = api.store.company_event_cursor().unwrap();
+        assert_eq!(
+            api.ensure_project_planning_call(&context.source_project)
+                .err(),
+            Some("company employee is not healthy and on duty")
+        );
+        assert_eq!(api.store.company_event_cursor().unwrap(), cursor);
+        assert_eq!(
+            api.store
+                .company_project(
+                    &context.source_project.tenant_id,
+                    &context.source_project.project_id
+                )
+                .unwrap()
+                .unwrap(),
+            context.source_project
         );
         assert_eq!(
             api.store

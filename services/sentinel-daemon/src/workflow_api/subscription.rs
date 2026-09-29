@@ -133,6 +133,13 @@ impl WorkflowApi {
         if format!("{:x}", Sha256::digest(context_bytes)) != request.context_digest {
             return Err("model context changed");
         }
+        self.validate_company_employee(
+            &self
+                .principals
+                .principal(&context.authority.principal.principal_id)
+                .ok_or("subscription principal unavailable")?
+                .principal,
+        )?;
         let event_store = self
             .event_store
             .as_ref()

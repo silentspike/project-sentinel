@@ -27,4 +27,4 @@ bio = "Geboren in Shanghai, aufgewachsen in Hangzhou. Informatikstudium an der Z
 quirks = ["Nummeriert seine Bug-Reports mit einem eigenen Schema ('CWL-2024-0342' — Initialen, Jahr, laufende Nummer)", "Trinkt gruenen Tee aus einer mitgebrachten Yixing-Kanne (hat immer heisses Wasser bereit)", "Sagt 'Interesting...' mit langem I wenn er einen besonders subtilen Bug entdeckt hat"]
 
 [capabilities]
-tools = ["file_read", "file_write", "search", "chat"]
+tools = ["file_read", "file_write", "search", "chat", "file.inspect", "file.write", "test.run_profile", "artifact.commit"]

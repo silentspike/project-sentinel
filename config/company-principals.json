@@ -90,6 +90,146 @@
       "customer_id": null,
       "agent_id": 56,
       "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-sales-shift2",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-26-sales",
+      "kind": "agent",
+      "role": "sales",
+      "customer_id": null,
+      "agent_id": 26,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-project-manager-shift2",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-24-project-manager",
+      "kind": "agent",
+      "role": "project_manager",
+      "customer_id": null,
+      "agent_id": 24,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-technical-lead-shift2",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-20-technical-lead",
+      "kind": "agent",
+      "role": "technical_lead",
+      "customer_id": null,
+      "agent_id": 20,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-designer-shift2",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-18-designer",
+      "kind": "agent",
+      "role": "designer",
+      "customer_id": null,
+      "agent_id": 18,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-developer-shift2",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-21-developer",
+      "kind": "agent",
+      "role": "developer",
+      "customer_id": null,
+      "agent_id": 21,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-qa-shift2",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-57-qa",
+      "kind": "agent",
+      "role": "qa",
+      "customer_id": null,
+      "agent_id": 57,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-release-manager-shift2",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-58-release-manager",
+      "kind": "agent",
+      "role": "release_manager",
+      "customer_id": null,
+      "agent_id": 58,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-sales-shift3",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-41-sales",
+      "kind": "agent",
+      "role": "sales",
+      "customer_id": null,
+      "agent_id": 41,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-project-manager-shift3",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-39-project-manager",
+      "kind": "agent",
+      "role": "project_manager",
+      "customer_id": null,
+      "agent_id": 39,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-technical-lead-shift3",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-35-technical-lead",
+      "kind": "agent",
+      "role": "technical_lead",
+      "customer_id": null,
+      "agent_id": 35,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-designer-shift3",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-33-designer",
+      "kind": "agent",
+      "role": "designer",
+      "customer_id": null,
+      "agent_id": 33,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-developer-shift3",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-36-developer",
+      "kind": "agent",
+      "role": "developer",
+      "customer_id": null,
+      "agent_id": 36,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-qa-shift3",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-59-qa",
+      "kind": "agent",
+      "role": "qa",
+      "customer_id": null,
+      "agent_id": 59,
+      "authority_generation": 1
+    },
+    {
+      "credential_name": "workflow-release-manager-shift3",
+      "tenant_id": "m0-company",
+      "principal_id": "agent-60-release-manager",
+      "kind": "agent",
+      "role": "release_manager",
+      "customer_id": null,
+      "agent_id": 60,
+      "authority_generation": 1
     }
   ]
 }
