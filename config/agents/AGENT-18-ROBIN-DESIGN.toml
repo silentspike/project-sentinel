@@ -34,4 +34,4 @@ Notizen in Markdown."""
 quirks = ["Dreht den silbernen Ring am Zeigefinger wenn Robin nachdenkt", "Trinkt Hafermilch-Latte (selbst mitgebracht, eigene Tasse)", "Macht sich waehrend Meetings minutioese Notizen in einer Markdown-Datei"]
 
 [capabilities]
-tools = ["file_read", "search", "chat"]
+tools = ["file_read", "search", "chat", "file.inspect", "file.write", "observation.retain_private", "patch.apply", "command.run_allowlisted", "test.run_profile", "artifact.commit"]

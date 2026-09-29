@@ -815,16 +815,25 @@ mod tests {
                 WorkbenchProfile::load(&profile_path).unwrap(),
             );
         }
+        let qa_capabilities =
+            BTreeSet::from(["file.inspect".to_owned(), "test.run_profile".to_owned()]);
+        let developer_capabilities = coding_profiles.values().fold(
+            profile.capabilities.clone(),
+            |mut tools, (profile, _)| {
+                tools.extend(profile.capabilities.iter().cloned());
+                tools
+            },
+        );
         let authority = Arc::new(CompanyAuthority {
             store: Arc::clone(&store),
             principals: Arc::clone(&principals),
             agent_capabilities: Arc::new(HashMap::from([
                 (AgentId(3), BTreeSet::new()),
-                (AgentId(4), BTreeSet::new()),
+                (AgentId(4), profile.capabilities.clone()),
                 (AgentId(5), BTreeSet::new()),
-                (AgentId(6), profile.capabilities.clone()),
+                (AgentId(6), developer_capabilities),
                 (AgentId(7), BTreeSet::new()),
-                (AgentId(8), BTreeSet::new()),
+                (AgentId(8), qa_capabilities.clone()),
                 (AgentId(9), BTreeSet::new()),
             ])),
             workbench_profile: profile,
@@ -838,8 +847,31 @@ mod tests {
             project_profiles: super::ProjectProfileCatalog::embedded(),
             coding_profiles,
             review_profile: None,
-            qa_profile_capabilities: BTreeSet::new(),
-            runtime_health: Arc::new(RwLock::new(Default::default())),
+            qa_profile_capabilities: qa_capabilities,
+            runtime_health: Arc::new(RwLock::new(crate::runtime_health::RuntimeHealthSnapshot {
+                current_shift: 1,
+                expected_active_agents: 7,
+                agents: [3, 4, 5, 6, 7, 8, 9]
+                    .map(
+                        |agent_id| crate::runtime_health::RuntimeHealthAgentSnapshot {
+                            agent_id,
+                            aggregate_id: AgentId(agent_id).to_string(),
+                            name: format!("Company agent {agent_id}"),
+                            expected_active: true,
+                            runtime_present: true,
+                            projection_present: true,
+                            security_runtime_present: true,
+                            adapter_handle_present: true,
+                            adapter_instance_matches: true,
+                            runtime_resources_healthy: true,
+                            adapter_health_state: Some(sentinel_common::NanoHealthState::Healthy),
+                            logical_status: Some(sentinel_runtime::AgentStatus::Active),
+                            ..Default::default()
+                        },
+                    )
+                    .to_vec(),
+                ..Default::default()
+            })),
             artifact_roots: Arc::new(HashMap::new()),
         });
         let workbench = Arc::new(WorkbenchExecutionAdapter {
@@ -1138,6 +1170,39 @@ mod tests {
                 .unwrap()
                 .reservation_id,
             binding.reservation_id
+        );
+    }
+
+    #[test]
+    fn fresh_work_authority_requires_duty_but_exact_lineage_replay_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = configured_test_api(&temp.path().join("company.sqlite"));
+        let binding = assign_test_work_mode(&api, true);
+        let authority = api.authority.as_ref().unwrap();
+        let project = ProjectId::parse(&binding.project_id).unwrap();
+        let work = WorkItemId::parse(&binding.work_item_id).unwrap();
+        let tenant = TenantId::parse(&binding.tenant_id).unwrap();
+        let original = authority
+            .snapshot(&tenant, &project, &work, AgentId(6))
+            .unwrap();
+        authority
+            .runtime_health
+            .write()
+            .unwrap()
+            .agents
+            .iter_mut()
+            .find(|agent| agent.agent_id == 6)
+            .unwrap()
+            .expected_active = false;
+        assert_eq!(
+            authority.snapshot(&tenant, &project, &work, AgentId(6)),
+            Err(WorkflowPortError::AuthorityConflict)
+        );
+        assert_eq!(
+            authority
+                .snapshot_for_admission(&tenant, &project, &work, AgentId(6), false)
+                .unwrap(),
+            original
         );
     }
 
