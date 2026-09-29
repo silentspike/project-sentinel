@@ -5,6 +5,15 @@
   Preserve consumed and unknown provider effects, current employee duty,
   immutable dispatch/result bindings and cumulative campaign limits (#856).
 
+- Give automated dependency proposals the repository's seven-section PR body
+  with pending verification claims instead of bypassing the quality gate
+  (#856).
+
+- Track Rust toolchain action digests on verified upstream master history while
+  retaining explicit Rust 1.97.1 inputs and human review for toolchain updates.
+  Cover both npm and Bun managers, serialize repository updater runs, and load
+  dependency policy once through repository configuration (#856).
+
 - Add an independent internal company Customer identity and protected workflow
   credential without changing the actual customer binding or the existing 23
   secrets. Preserve credential bytes during migration and reinitialization
