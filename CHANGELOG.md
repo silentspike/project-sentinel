@@ -1,5 +1,13 @@
 # Changelog
 
+- Recognize exact recorded project policies and sealed, already issued delivery
+  outcomes before fresh model or execution-profile admission. Keep new work
+  bound to current profiles, preserve customer history and independent QA,
+  and reject corrupt, stale, rolled-back or reworked delivery lineage (#856).
+  Revalidate complete historical QA semantics without renewing expired
+  dispositions; classify blocked reconciliation with bounded, public-safe
+  stage diagnostics instead of private error details.
+
 - Bootstrap native commands in a pinned, agent-parent cgroup namespace before
   controller delegation. Prepare a private agent-PID procfs behind the startup
   barrier for nested command namespaces without exposing host processes or

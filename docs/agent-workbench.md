@@ -559,6 +559,23 @@ profiles must match the exact installed release bytes, generation and digest;
 missing native profiles never fall back to the web profile. Existing accepted
 agreements retain their original binding.
 
+Autonomous recovery distinguishes a recorded policy from new execution
+authority. The release recognizes the exact committed pre-observation Web
+policy only to inspect an existing outcome; it never aliases that digest to
+the current tool grants. Before admitting another model review, recovery checks
+the persisted project/version, agreement, work inventory, independent passing
+QA, immutable manifest, active release and customer-bound delivery. Only a
+matching already-issued outcome is a no-op. Missing or changed lineage remains
+pending work, and corrupt references remain errors. This path neither renews
+an expired preview nor records customer acceptance, and delivery publication
+continues to drain independently. New tool execution still requires exact
+installed profile bytes and the current capability intersection.
+Recorded QA recognition retains complete required-case coverage, assertion and
+attempt bindings, independent authority and passing outcomes. It does not
+re-authorize a previously imported flake disposition at a later clock boundary;
+new evidence import still rejects expired dispositions. Impossible original
+gate validity windows never establish a settled outcome.
+
 The selected file SHA-256 is carried as `tool_profile_digest`. The daemon rejects
 requests whose runtime, capability set, artifact kinds, command rules, test suite,
 environment contract, or resource limits exceed that exact profile. Profile

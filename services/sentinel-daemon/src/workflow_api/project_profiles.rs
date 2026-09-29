@@ -4,6 +4,11 @@ use std::path::Path;
 
 use sentinel_workflow::{CompanyRoleV1, WorkProfileBindingV1, WorkflowPortError};
 
+const WEB_BEFORE_OBSERVATION_GENERATION: u64 = 1;
+const WEB_BEFORE_OBSERVATION_BYTES: &[u8] = include_bytes!(
+    "../../../../config/work-profiles/history/web-project-v1-before-observation.toml"
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum ProjectFamily {
     Web,
@@ -118,6 +123,23 @@ impl ProjectProfileCatalog {
         ProjectFamily::parse(&binding.profile_id)
     }
 
+    /// Recognizes recorded profiles only; execution admission must use `family()`.
+    pub(super) fn resolve_recorded(
+        &self,
+        binding: &WorkProfileBindingV1,
+    ) -> Result<ProjectFamily, WorkflowPortError> {
+        let installed = self.binding(&binding.profile_id)?;
+        let family = ProjectFamily::parse(&binding.profile_id)?;
+        if installed == *binding
+            || (family == ProjectFamily::Web
+                && binding.generation == WEB_BEFORE_OBSERVATION_GENERATION
+                && binding.digest == super::hex_sha256(WEB_BEFORE_OBSERVATION_BYTES))
+        {
+            return Ok(family);
+        }
+        Err(WorkflowPortError::AuthorityConflict)
+    }
+
     #[cfg(test)]
     pub(super) fn embedded() -> Self {
         Self {
@@ -140,6 +162,132 @@ impl ProjectProfileCatalog {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn historical_web_binding() -> WorkProfileBindingV1 {
+        WorkProfileBindingV1 {
+            profile_id: ProjectFamily::Web.id().to_owned(),
+            generation: WEB_BEFORE_OBSERVATION_GENERATION,
+            digest: super::super::hex_sha256(WEB_BEFORE_OBSERVATION_BYTES),
+        }
+    }
+
+    #[test]
+    fn recorded_project_catalog_recognizes_current_installed_bindings() {
+        let catalog = ProjectProfileCatalog::embedded();
+        for family in ProjectFamily::ALL {
+            let binding = catalog.binding(family.id()).unwrap();
+            assert_eq!(catalog.resolve_recorded(&binding).unwrap(), family);
+            assert_eq!(catalog.family(&binding).unwrap(), family);
+        }
+    }
+
+    #[test]
+    fn recorded_web_history_is_exact_and_not_execution_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("work-profiles");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("web-project-v1.toml");
+        fs::write(&path, ProjectFamily::Web.bytes()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let catalog = ProjectProfileCatalog::load(temp.path()).unwrap();
+        let historical = historical_web_binding();
+        assert_eq!(
+            historical.digest,
+            "8573b066e5b7205e3af66a58352c4c698387b6f17e657f7f57f6daa9edadb1c6"
+        );
+        assert_eq!(
+            catalog.resolve_recorded(&historical).unwrap(),
+            ProjectFamily::Web
+        );
+        assert!(matches!(
+            catalog.family(&historical),
+            Err(WorkflowPortError::AuthorityConflict)
+        ));
+        assert_eq!(
+            catalog.binding(ProjectFamily::Web.id()).unwrap().digest,
+            super::super::hex_sha256(ProjectFamily::Web.bytes())
+        );
+    }
+
+    #[test]
+    fn recorded_project_catalog_rejects_unknown_digest_generation_and_cross_family() {
+        let catalog = ProjectProfileCatalog::embedded();
+        for family in ProjectFamily::ALL {
+            let binding = catalog.binding(family.id()).unwrap();
+            let mut altered = binding.clone();
+            altered.digest = "0".repeat(64);
+            assert!(matches!(
+                catalog.resolve_recorded(&altered),
+                Err(WorkflowPortError::AuthorityConflict)
+            ));
+            altered = binding;
+            altered.generation += 1;
+            assert!(matches!(
+                catalog.resolve_recorded(&altered),
+                Err(WorkflowPortError::AuthorityConflict)
+            ));
+        }
+        let historical = historical_web_binding();
+        let mut altered = historical.clone();
+        altered.generation += 1;
+        assert!(matches!(
+            catalog.resolve_recorded(&altered),
+            Err(WorkflowPortError::AuthorityConflict)
+        ));
+        for id in [
+            ProjectFamily::Python.id(),
+            ProjectFamily::Node.id(),
+            "unknown-project-v1",
+            "web-project-v1-before-observation",
+        ] {
+            altered = historical.clone();
+            altered.profile_id = id.to_owned();
+            assert!(matches!(
+                catalog.resolve_recorded(&altered),
+                Err(WorkflowPortError::AuthorityConflict)
+            ));
+        }
+        let mut altered = catalog.binding(ProjectFamily::Python.id()).unwrap();
+        altered.profile_id = ProjectFamily::Node.id().to_owned();
+        assert!(matches!(
+            catalog.resolve_recorded(&altered),
+            Err(WorkflowPortError::AuthorityConflict)
+        ));
+    }
+
+    #[test]
+    fn recorded_project_catalog_requires_installed_family() {
+        let empty = ProjectProfileCatalog::default();
+        let embedded = ProjectProfileCatalog::embedded();
+        for family in ProjectFamily::ALL {
+            assert!(matches!(
+                empty.resolve_recorded(&embedded.binding(family.id()).unwrap()),
+                Err(WorkflowPortError::Unavailable)
+            ));
+        }
+        let historical = historical_web_binding();
+        assert!(matches!(
+            empty.resolve_recorded(&historical),
+            Err(WorkflowPortError::Unavailable)
+        ));
+        let without_web = ProjectProfileCatalog {
+            digests: BTreeMap::from([(
+                ProjectFamily::Python,
+                super::super::hex_sha256(ProjectFamily::Python.bytes()),
+            )]),
+        };
+        assert!(matches!(
+            without_web.resolve_recorded(&historical),
+            Err(WorkflowPortError::Unavailable)
+        ));
+        let web_only = ProjectProfileCatalog::test_web_digest(super::super::hex_sha256(
+            ProjectFamily::Web.bytes(),
+        ));
+        assert!(matches!(
+            web_only.resolve_recorded(&embedded.binding(ProjectFamily::Python.id()).unwrap()),
+            Err(WorkflowPortError::Unavailable)
+        ));
+    }
 
     #[test]
     fn installed_project_catalog_rejects_changed_and_linked_profiles() {
