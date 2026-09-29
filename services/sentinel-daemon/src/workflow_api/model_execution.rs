@@ -108,9 +108,11 @@ impl From<ProviderUsageAuthority> for ProviderExecutionAuthority {
 impl ProviderExecutionAuthority {
     pub fn agent_id(&self) -> AgentId {
         match self {
-            Self::AdaptiveLeadershipReview(value) => {
-                value.grant.leadership_principal.agent_id.unwrap_or(AgentId(0))
-            }
+            Self::AdaptiveLeadershipReview(value) => value
+                .grant
+                .leadership_principal
+                .agent_id
+                .unwrap_or(AgentId(0)),
             Self::Project(value) => value.agent_id,
             Self::Adaptive(value) => value.grant.authority.agent_id,
             Self::RequestSales(value) => value.grant.sales_principal.agent_id.unwrap_or(AgentId(0)),
@@ -480,7 +482,9 @@ impl ModelExecutionContext {
     pub fn binding(&self) -> ProviderExecutionAuthority {
         match self {
             Self::AdaptiveLeadershipReview(value) => {
-                ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(value.binding.clone()))
+                ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(
+                    value.binding.clone(),
+                ))
             }
             Self::Project(value) => value.binding.clone().into(),
             Self::Adaptive(value) => {
@@ -823,7 +827,10 @@ impl WorkflowApi {
         session: &AdaptiveSessionV1,
         effect: &AdaptiveEffectV1,
     ) -> Result<bool, &'static str> {
-        let request_id = format!("company-adaptive-{}-{}", session.grant.session_id, effect.id);
+        let request_id = format!(
+            "company-adaptive-{}-{}",
+            session.grant.session_id, effect.id
+        );
         let Some(events) = self.event_store.as_ref() else {
             return Ok(false);
         };
@@ -837,9 +844,10 @@ impl WorkflowApi {
             && entry.status == "failed"
             && entry.payload.is_empty()
             && entry.request_digest == effect.request_digest
-            && entry.owner_scope == sentinel_common::StateTransferScope::for_agent(
-                session.grant.authority.agent_id.to_string(),
-            )
+            && entry.owner_scope
+                == sentinel_common::StateTransferScope::for_agent(
+                    session.grant.authority.agent_id.to_string(),
+                )
             && entry
                 .last_error
                 .as_deref()
@@ -883,7 +891,10 @@ impl WorkflowApi {
             let AdaptiveCursorV1::ModelPending { effect } = &session.cursor else {
                 continue;
             };
-            let request_id = format!("company-adaptive-{}-{}", session.grant.session_id, effect.id);
+            let request_id = format!(
+                "company-adaptive-{}-{}",
+                session.grant.session_id, effect.id
+            );
             if self.adaptive_provider_outcome_unknown(&session, effect)? {
                 self.store
                     .advance_adaptive_session(
@@ -894,7 +905,9 @@ impl WorkflowApi {
                             &request_id,
                             session.version,
                         ),
-                        &AdaptiveTransitionV1::MarkUnknown { effect: effect.clone() },
+                        &AdaptiveTransitionV1::MarkUnknown {
+                            effect: effect.clone(),
+                        },
                         &session.grant.authority,
                         now_unix_ms().max(session.updated_at_ms),
                     )
@@ -1298,13 +1311,16 @@ impl WorkflowApi {
                 ),
             ),
             AdaptiveCursorV1::ModelPending { effect }
-                if !self.adaptive_provider_outcome_unknown(&session, effect)? => (
-                session
-                    .version
-                    .checked_sub(1)
-                    .ok_or("adaptive session version underflow")?,
-                effect.id,
-            ),
+                if !self.adaptive_provider_outcome_unknown(&session, effect)? =>
+            {
+                (
+                    session
+                        .version
+                        .checked_sub(1)
+                        .ok_or("adaptive session version underflow")?,
+                    effect.id,
+                )
+            }
             _ => return Ok(None),
         };
         Ok(Some(AdaptiveProviderAuthority {
@@ -4810,33 +4826,64 @@ mod family_selection_tests {
                 let (api, sales) = tests::fixture(&temp.path().join("company.sqlite"));
                 let expected = if planning {
                     ModelExecutionContext::ProjectPlanning(Box::new(accepted_context(
-                        &api, &sales, "python-project-v1",
+                        &api,
+                        &sales,
+                        "python-project-v1",
                     )))
                 } else {
                     ModelExecutionContext::RequestSales(Box::new(sales))
                 };
-                let unrelated = super::super::model_work::assign_test_work_from(&api, Some(8), 1_000);
+                let unrelated =
+                    super::super::model_work::assign_test_work_from(&api, Some(8), 1_000);
                 if has_session {
-                    assert!(api.adaptive_provider_authority(unrelated.agent_id).unwrap().is_some());
+                    assert!(api
+                        .adaptive_provider_authority(unrelated.agent_id)
+                        .unwrap()
+                        .is_some());
                 }
                 let leader = api.principals.principal("pm").unwrap();
-                let project = api.store.company_project(&leader.principal.tenant_id,
-                    &ProjectId::parse(&unrelated.project_id).unwrap()).unwrap().unwrap();
-                let response = api.store.apply_company_command(
-                    &leader.principal, Uuid::new_v4(),
-                    &CompanyWorkflowCommandV1::RecordDecision {
-                        project_id: project.project_id.clone(), expected_version: project.version,
-                        work_item_id: None, choice_ref: "Independent project decision".into(),
-                        rationale_ref: "No change to another project's inference authority".into(),
-                    }, now_unix_ms(),
-                ).unwrap();
+                let project = api
+                    .store
+                    .company_project(
+                        &leader.principal.tenant_id,
+                        &ProjectId::parse(&unrelated.project_id).unwrap(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let response = api
+                    .store
+                    .apply_company_command(
+                        &leader.principal,
+                        Uuid::new_v4(),
+                        &CompanyWorkflowCommandV1::RecordDecision {
+                            project_id: project.project_id.clone(),
+                            expected_version: project.version,
+                            work_item_id: None,
+                            choice_ref: "Independent project decision".into(),
+                            rationale_ref: "No change to another project's inference authority"
+                                .into(),
+                        },
+                        now_unix_ms(),
+                    )
+                    .unwrap();
                 let CompanyWorkflowResponseV1::Project(updated) = response.response else {
                     panic!("independent project decision");
                 };
-                api.authority.as_ref().unwrap().runtime_health.write().unwrap().agents
-                    .iter_mut().find(|agent| agent.agent_id == unrelated.agent_id.0)
-                    .unwrap().expected_active = false;
-                assert_eq!(api.review_sessions(&updated).unwrap().len(), usize::from(has_session));
+                api.authority
+                    .as_ref()
+                    .unwrap()
+                    .runtime_health
+                    .write()
+                    .unwrap()
+                    .agents
+                    .iter_mut()
+                    .find(|agent| agent.agent_id == unrelated.agent_id.0)
+                    .unwrap()
+                    .expected_active = false;
+                assert_eq!(
+                    api.review_sessions(&updated).unwrap().len(),
+                    usize::from(has_session)
+                );
                 {
                     let _fence = api.mutation_fence.write().unwrap();
                     api.reconcile_unknown_adaptive_models(&updated).unwrap();
@@ -4844,13 +4891,33 @@ mod family_selection_tests {
                 }
                 let target = expected.binding();
                 assert!(api.is_provider_usage_candidate(target.agent_id()).unwrap());
-                assert_eq!(api.resolve_provider_usage_authority(target.agent_id()).unwrap(), Some(target.clone()));
-                assert_eq!(api.model_work_context(&target).unwrap(), Some(expected.clone()));
-                assert_eq!(api.store.company_project(&updated.tenant_id, &updated.project_id).unwrap(), Some((*updated).clone()));
+                assert_eq!(
+                    api.resolve_provider_usage_authority(target.agent_id())
+                        .unwrap(),
+                    Some(target.clone())
+                );
+                assert_eq!(
+                    api.model_work_context(&target).unwrap(),
+                    Some(expected.clone())
+                );
+                assert_eq!(
+                    api.store
+                        .company_project(&updated.tenant_id, &updated.project_id)
+                        .unwrap(),
+                    Some((*updated).clone())
+                );
                 // Discovery must not make the actual target's duty check optional.
-                api.authority.as_ref().unwrap().runtime_health.write().unwrap().agents
-                    .iter_mut().find(|agent| agent.agent_id == target.agent_id().0)
-                    .unwrap().expected_active = false;
+                api.authority
+                    .as_ref()
+                    .unwrap()
+                    .runtime_health
+                    .write()
+                    .unwrap()
+                    .agents
+                    .iter_mut()
+                    .find(|agent| agent.agent_id == target.agent_id().0)
+                    .unwrap()
+                    .expected_active = false;
                 assert!(api.model_work_context(&target).is_err());
             }
         }

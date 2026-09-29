@@ -1,5 +1,13 @@
 # Changelog
 
+- Govern blocked coding work through bounded, model-driven project leadership
+  with immutable source context and independent provider allowances. Retire
+  stale reviews without fabricated decisions, recover exact committed resolution
+  receipts, isolate discovery from unrelated off-duty employees, and project
+  schema-6 leadership usage without granting developer or legacy actions.
+  Retain unknown provider outcomes as non-serving and account rejected oversized
+  responses without admitting their content (#856).
+
 - Bind adaptive model correction to durable usage, completion and assignment
   evidence across restart. Limit schema correction renewals, preserve monotonic
   journal time and provide the exact capability-filtered tool syntax. Resolve

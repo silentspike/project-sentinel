@@ -1,8 +1,8 @@
 //! Authenticated M0 company workflow and productive Workbench integration.
 
-mod adaptive_recovery;
 #[cfg(feature = "llm")]
 pub(crate) mod adaptive_leadership_review;
+mod adaptive_recovery;
 mod delivery_intent;
 mod delivery_runtime;
 #[cfg(feature = "llm")]
@@ -5259,9 +5259,11 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         match binding {
             model_execution::ProviderExecutionAuthority::AdaptiveLeadershipReview(binding) => {
                 self.prepare_leadership_review(binding).map(|context| {
-                    Some(model_execution::ModelExecutionContext::AdaptiveLeadershipReview(
-                        Box::new(context),
-                    ))
+                    Some(
+                        model_execution::ModelExecutionContext::AdaptiveLeadershipReview(Box::new(
+                            context,
+                        )),
+                    )
                 })
             }
             model_execution::ProviderExecutionAuthority::Project(binding) => self
@@ -5380,7 +5382,9 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
             let binding = adaptive_leadership_review::LeadershipAuthority::from_call(&call);
             self.prepare_leadership_review(&binding)?;
             return Ok(Some(
-                model_execution::ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(binding)),
+                model_execution::ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(
+                    binding,
+                )),
             ));
         }
         if let Some(call) = self.fresh_request_sales_call(agent_id, now_unix_ms())? {

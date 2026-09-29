@@ -85,37 +85,65 @@ impl WorkflowApi {
         source: &AdaptiveSessionV1,
         assignment_id: &str,
     ) -> Result<bool, &'static str> {
-        let session = self.store.adaptive_session_for_authority(&source.grant.authority)
-            .map_err(|_| "leadership resolution head unavailable")?.ok_or("leadership resolution head missing")?;
+        let session = self
+            .store
+            .adaptive_session_for_authority(&source.grant.authority)
+            .map_err(|_| "leadership resolution head unavailable")?
+            .ok_or("leadership resolution head missing")?;
         let event_id = resolution_event_id(request.operation_id);
         if !matches!(&session.cursor, AdaptiveCursorV1::BlockedResolved { reason_code, resolution_event_id }
-            if reason_code == &request.expected_reason_code && resolution_event_id == &event_id.to_string()) {
+            if reason_code == &request.expected_reason_code && resolution_event_id == &event_id.to_string())
+        {
             return Ok(false);
         }
         if request.expected_session_version.checked_add(1) != Some(session.version)
-            || session.grant != source.grant {
+            || session.grant != source.grant
+        {
             return Err("leadership committed resolution head changed");
         }
         let mut expected_session = source.clone();
         expected_session.version = session.version;
         expected_session.cursor = session.cursor.clone();
         expected_session.updated_at_ms = session.updated_at_ms;
-        if session != expected_session { return Err("leadership committed resolution evidence changed"); }
-        let event = self.event_store.as_ref().ok_or("leadership EventStore missing")?
-            .event_v2_by_id(&event_id.to_string()).map_err(|_| "leadership resolution audit unavailable")?
+        if session != expected_session {
+            return Err("leadership committed resolution evidence changed");
+        }
+        let event = self
+            .event_store
+            .as_ref()
+            .ok_or("leadership EventStore missing")?
+            .event_v2_by_id(&event_id.to_string())
+            .map_err(|_| "leadership resolution audit unavailable")?
             .ok_or("leadership resolution audit missing")?;
         let recorded: BlockedResolutionDecisionV1 = serde_json::from_slice(&event.payload)
             .map_err(|_| "leadership resolution audit invalid")?;
-        let expected = BlockedResolutionDecisionV1 { schema_version: 1, request: request.clone(),
-            leadership_principal: principal.principal.clone(), leadership_authority: principal.execution_authority.clone(),
-            assignment_id: assignment_id.to_owned(), assignee_authority: source.grant.authority.clone() };
-        if recorded != expected { return Err("leadership resolution audit binding changed"); }
-        let proposal = resolution_proposal(&recorded).map_err(|_| "leadership resolution audit invalid")?;
-        if event.event_id != event_id.to_string() || event.event_type != EVENT_TYPE || event.producer != PRODUCER
-            || event.schema_version != proposal.schema_version || event.payload_codec != proposal.payload_codec
-            || event.payload != proposal.payload || event.payload_digest != proposal.payload_digest
-            || event.causal_context != proposal.causal_context || event.durability != proposal.requested_durability
-            || event.canonical_request_digest != proposal.canonical_request_digest().map_err(|_| "leadership resolution audit invalid")? {
+        let expected = BlockedResolutionDecisionV1 {
+            schema_version: 1,
+            request: request.clone(),
+            leadership_principal: principal.principal.clone(),
+            leadership_authority: principal.execution_authority.clone(),
+            assignment_id: assignment_id.to_owned(),
+            assignee_authority: source.grant.authority.clone(),
+        };
+        if recorded != expected {
+            return Err("leadership resolution audit binding changed");
+        }
+        let proposal =
+            resolution_proposal(&recorded).map_err(|_| "leadership resolution audit invalid")?;
+        if event.event_id != event_id.to_string()
+            || event.event_type != EVENT_TYPE
+            || event.producer != PRODUCER
+            || event.schema_version != proposal.schema_version
+            || event.payload_codec != proposal.payload_codec
+            || event.payload != proposal.payload
+            || event.payload_digest != proposal.payload_digest
+            || event.causal_context != proposal.causal_context
+            || event.durability != proposal.requested_durability
+            || event.canonical_request_digest
+                != proposal
+                    .canonical_request_digest()
+                    .map_err(|_| "leadership resolution audit invalid")?
+        {
             return Err("leadership resolution audit envelope changed");
         }
         Ok(true)
@@ -600,7 +628,11 @@ pub(super) mod tests {
         (next, effect)
     }
 
-    pub(crate) fn fixture(path: &Path, events: &Path, blocked: bool) -> (WorkflowApi, AdaptiveSessionV1) {
+    pub(crate) fn fixture(
+        path: &Path,
+        events: &Path,
+        blocked: bool,
+    ) -> (WorkflowApi, AdaptiveSessionV1) {
         let (api, binding, _) = model_work::configured_adaptive_test_api(path, events);
         let session = api
             .store

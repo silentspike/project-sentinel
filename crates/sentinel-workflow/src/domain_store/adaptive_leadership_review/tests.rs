@@ -463,6 +463,36 @@ fn committed_resolution_cannot_be_retired_after_project_drift() {
 }
 
 #[test]
+fn resolution_receipt_rechecks_relevant_project_lineage_in_its_transaction() {
+    let f = fixture();
+    let call = authorize(&f);
+    f.store
+        .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), 21)
+        .unwrap();
+    let resolution = Uuid::new_v4();
+    resolve(&f, resolution, 22);
+    let mut project = f.context.source_project.clone();
+    project
+        .work_items
+        .get_mut(&f.grant.work_item_id)
+        .unwrap()
+        .spec
+        .objective
+        .push_str(" with changed scope");
+    project.version += 1;
+    project.updated_at_unix_ms = 23;
+    persist_entity(&f.store, &project);
+    let before = rows(&f.store);
+    let mut result = completion(&call, true);
+    result.resolution_event_id = Some(resolution);
+    assert!(f
+        .store
+        .complete_adaptive_leadership_review_call(&f.leader, &result, 24)
+        .is_err());
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
 fn retired_reviews_free_pending_barrier_but_count_towards_head_limit() {
     let f = fixture();
     let original = session(&f);
