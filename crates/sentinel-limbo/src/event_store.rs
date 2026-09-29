@@ -384,6 +384,38 @@ pub struct LlmCompletionEntry {
     pub updated_at: u64,
 }
 
+/// Validated local evidence retained after a rejected result leaves the outbox.
+#[derive(Debug, Clone)]
+pub struct LlmModelRetryEvidence {
+    pub owner_scope: StateTransferScope,
+    pub usage_event: DomainEvent,
+    pub completion_payload_digest: String,
+    pub authority_binding: serde_json::Value,
+}
+
+impl LlmModelRetryEvidence {
+    fn receipt(&self) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            matches!(self.owner_scope, StateTransferScope::NanoContainer(_))
+                && is_canonical_sha256(&self.completion_payload_digest),
+            "invalid model retry evidence"
+        );
+        let binding = serde_json::to_vec(&self.authority_binding)?;
+        anyhow::ensure!(
+            binding.len() <= 32 * 1024,
+            "model retry binding exceeds its bound"
+        );
+        Ok(serde_json::json!({
+            "schema_version": 1,
+            "owner_scope": self.owner_scope,
+            "usage_event_id": self.usage_event.event_id,
+            "usage_event_digest": format!("{:x}", Sha256::digest(serde_json::to_vec(&self.usage_event)?)),
+            "completion_payload_digest": self.completion_payload_digest,
+            "authority_binding": self.authority_binding,
+        }))
+    }
+}
+
 fn llm_completion_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmCompletionEntry> {
     let owner_scope_wire: String = row.get(2)?;
     let owner_scope = StateTransferScope::from_wire(&owner_scope_wire).ok_or_else(|| {
@@ -2544,6 +2576,41 @@ impl EventStore {
         expected_error: &str,
         reason: &str,
     ) -> anyhow::Result<Option<String>> {
+        self.resolve_failed_model_retry(request_id, request_digest, expected_error, reason, None)
+    }
+
+    pub fn resolve_failed_llm_completion_with_evidence(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        expected_error: &str,
+        reason: &str,
+        evidence: &LlmModelRetryEvidence,
+    ) -> anyhow::Result<Option<String>> {
+        self.resolve_failed_model_retry(
+            request_id,
+            request_digest,
+            expected_error,
+            reason,
+            Some(evidence),
+        )
+    }
+
+    fn resolve_failed_model_retry(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        expected_error: &str,
+        reason: &str,
+        evidence: Option<&LlmModelRetryEvidence>,
+    ) -> anyhow::Result<Option<String>> {
+        if let Some(evidence) = evidence {
+            anyhow::ensure!(
+                evidence.usage_event.operation_id == format!("llm_usage_{request_id}"),
+                "model retry usage operation changed"
+            );
+        }
+        let receipt = evidence.map(LlmModelRetryEvidence::receipt).transpose()?;
         let expected_error = expected_error.trim();
         let reason = reason.trim();
         anyhow::ensure!(
@@ -2583,6 +2650,12 @@ impl EventStore {
                         == Some("model_schema_correction"),
                 "LLM completion resolution conflict for {request_id}"
             );
+            if let Some(receipt) = receipt.as_ref() {
+                anyhow::ensure!(
+                    payload.get("validated_evidence") == Some(receipt),
+                    "LLM completion resolution evidence changed for {request_id}"
+                );
+            }
             Ok(event_id)
         };
         let existing_event = {
@@ -2635,6 +2708,28 @@ impl EventStore {
             "LLM completion {request_id} is not the expected failed model result"
         );
         let scope = self.llm_completion_scope_from_wire(&owner_scope)?;
+        if let Some(evidence) = evidence {
+            anyhow::ensure!(scope == evidence.owner_scope, "model retry owner changed");
+            let payload: String = conn.query_row(
+                "SELECT payload FROM llm_completion_outbox WHERE request_id=?1",
+                params![request_id],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                format!("{:x}", Sha256::digest(payload.as_bytes()))
+                    == evidence.completion_payload_digest,
+                "model retry completion changed"
+            );
+            let usage = &evidence.usage_event;
+            let matches: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE operation_id=?1 AND event_id=?2 AND event_type=?3 AND aggregate_id=?4 AND payload=?5 AND correlation_id=?6 AND schema_version=?7 AND timestamp_ms=?8 AND tick=?9 AND causation_id IS ?10 AND compensation_type=?11)",
+                params![format!("llm_usage_{request_id}"), usage.event_id, usage.event_type,
+                    usage.aggregate_id, usage.payload, usage.correlation_id, usage.schema_version,
+                    usage.timestamp_ms as i64, usage.tick as i64, usage.causation_id, usage.compensation_type],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(matches, "model retry usage changed");
+        }
         let aggregate_id = match scope {
             StateTransferScope::NanoContainer(agent_id) => agent_id,
             StateTransferScope::World => unreachable!("validated agent scope"),
@@ -2666,6 +2761,7 @@ impl EventStore {
                 "resolution": "model_schema_correction",
                 "prior_error": expected_error,
                 "reason": reason,
+                "validated_evidence": receipt,
             })
             .to_string(),
             request_id,
@@ -4755,6 +4851,102 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn failed_model_retry_evidence_survives_reopen_and_rejects_changed_bindings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.sqlite");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let request_id = "adaptive-evidence-1";
+        let digest = "d".repeat(64);
+        let payload = "invalid-adaptive-tool";
+        let error = "adaptive tool is invalid";
+        let reason = "adaptive-schema-correction";
+        store
+            .reserve_llm_request(request_id, &digest, "AGENT-55")
+            .unwrap();
+        store
+            .enqueue_llm_completion(request_id, &digest, payload)
+            .unwrap();
+        let mut usage = test_event("agent_llm_usage", "AGENT-55");
+        usage.operation_id = format!("llm_usage_{request_id}");
+        store
+            .persist_llm_completion_usage(request_id, &digest, &usage)
+            .unwrap();
+        store
+            .record_llm_completion_failure(request_id, &digest, error, 1)
+            .unwrap();
+        let evidence = LlmModelRetryEvidence {
+            owner_scope: StateTransferScope::NanoContainer("AGENT-55".into()),
+            usage_event: usage,
+            completion_payload_digest: format!("{:x}", Sha256::digest(payload.as_bytes())),
+            authority_binding: serde_json::json!({"assignment_id": "assignment-1", "session_version": 1}),
+        };
+        for field in ["owner", "usage", "usage_operation", "completion"] {
+            let mut changed = evidence.clone();
+            match field {
+                "owner" => {
+                    changed.owner_scope = StateTransferScope::NanoContainer("AGENT-07".into())
+                }
+                "usage" => changed.usage_event.payload = "changed".into(),
+                "usage_operation" => changed.usage_event.operation_id = "foreign-operation".into(),
+                _ => changed.completion_payload_digest = "a".repeat(64),
+            }
+            assert!(store
+                .resolve_failed_llm_completion_with_evidence(
+                    request_id, &digest, error, reason, &changed,
+                )
+                .is_err());
+            assert!(store.get_llm_completion(request_id).unwrap().is_some());
+            assert!(store
+                .event_by_operation_id(&format!("llm_resolution_{request_id}"))
+                .unwrap()
+                .is_none());
+        }
+        let event_id = store
+            .resolve_failed_llm_completion_with_evidence(
+                request_id, &digest, error, reason, &evidence,
+            )
+            .unwrap()
+            .unwrap();
+        drop(store);
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .resolve_failed_llm_completion_with_evidence(
+                    request_id, &digest, error, reason, &evidence,
+                )
+                .unwrap(),
+            Some(event_id)
+        );
+        assert!(store.get_llm_completion(request_id).unwrap().is_none());
+        for field in [
+            "owner",
+            "usage",
+            "usage_operation",
+            "completion",
+            "authority",
+        ] {
+            let mut changed = evidence.clone();
+            match field {
+                "owner" => {
+                    changed.owner_scope = StateTransferScope::NanoContainer("AGENT-07".into())
+                }
+                "usage" => changed.usage_event.payload = "changed".into(),
+                "usage_operation" => changed.usage_event.operation_id = "foreign-operation".into(),
+                "completion" => changed.completion_payload_digest = "a".repeat(64),
+                _ => changed.authority_binding["assignment_id"] = "foreign-assignment".into(),
+            }
+            assert!(store
+                .resolve_failed_llm_completion_with_evidence(
+                    request_id, &digest, error, reason, &changed,
+                )
+                .is_err());
+        }
+        assert!(!store
+            .reserve_llm_request(request_id, &digest, "AGENT-55")
+            .unwrap());
     }
 
     #[test]

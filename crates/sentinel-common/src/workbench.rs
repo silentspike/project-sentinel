@@ -32,6 +32,7 @@ pub const WORKBENCH_MAX_CALLER_RESULT_BYTES: usize = 224 * 1024;
 /// remains below the caller-result budget even when every byte uses the longest
 /// JSON escape form.
 pub const WORKBENCH_MAX_INSPECT_BYTES: u64 = 32 * 1024;
+pub const WORKBENCH_MAX_DIRECTORY_ENTRIES: u16 = 128;
 /// A native QA invocation binds one family selector plus up to 64 input files.
 /// Individual immutable profiles may grant a smaller argument budget.
 pub const WORKBENCH_MAX_COMMAND_ARGUMENTS: usize = 65;
@@ -104,6 +105,12 @@ pub struct WorkbenchResourceLimits {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "tool", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkbenchTool {
+    ListDirectory {
+        path: String,
+        #[serde(default)]
+        after: Option<String>,
+        max_entries: u16,
+    },
     InspectFile {
         path: String,
         max_bytes: u64,
@@ -151,7 +158,7 @@ impl WorkbenchTool {
 
     pub fn required_capability(&self) -> &'static str {
         match self {
-            Self::InspectFile { .. } => "file.inspect",
+            Self::ListDirectory { .. } | Self::InspectFile { .. } => "file.inspect",
             Self::WriteFile { .. } => "file.write",
             Self::ApplyPatch { .. } => "patch.apply",
             Self::RunCommand { .. } => "command.run_allowlisted",
@@ -431,6 +438,24 @@ impl WorkbenchResourceLimits {
 
 fn validate_tool_paths(tool: &WorkbenchTool) -> Result<(), WorkbenchValidationError> {
     match tool {
+        WorkbenchTool::ListDirectory {
+            path,
+            after,
+            max_entries,
+        } => {
+            if path != "." {
+                validate_relative_path(path)?;
+            }
+            if after.as_ref().is_some_and(|name| {
+                name.is_empty() || name.contains('/') || !is_canonical_relative_path(name)
+            }) {
+                return Err(WorkbenchValidationError::InvalidPath);
+            }
+            if *max_entries == 0 || *max_entries > WORKBENCH_MAX_DIRECTORY_ENTRIES {
+                return Err(WorkbenchValidationError::InvalidResourceLimits);
+            }
+            Ok(())
+        }
         WorkbenchTool::InspectFile { path, max_bytes } => {
             validate_relative_path(path)?;
             if *max_bytes == 0 || *max_bytes > WORKBENCH_MAX_INSPECT_BYTES {
