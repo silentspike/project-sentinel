@@ -330,7 +330,7 @@ pub mod bridge {
         tokens_used: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_work: Option<ModelWorkCompletion>,
-        // Digest of the retained, bounded content, including inadmissible content.
+        // Digest of raw response content, even when oversized content is discarded.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_response_digest: Option<String>,
     }
@@ -1226,6 +1226,10 @@ pub mod bridge {
             gateway_resp,
             usage_v2_enabled,
         )?;
+        let model_response_digest = model_work.and_then(|context| {
+            matches!(context, ModelWorkContext::AdaptiveLeadershipReview(_))
+                .then(|| format!("{:x}", Sha256::digest(gateway_resp.content.as_bytes())))
+        });
         let model_completion = if let Some(context) = model_work {
             if authority != Some(&context.binding()) {
                 return Err("model work response authority mismatch".to_owned());
@@ -1262,10 +1266,7 @@ pub mod bridge {
             usage_event,
             actions,
             tokens_used: gateway_resp.tokens_used.max(0) as u64,
-            model_response_digest: model_completion.as_ref().and_then(|completion| {
-                matches!(completion.context, ModelWorkContext::AdaptiveLeadershipReview(_))
-                    .then(|| format!("{:x}", Sha256::digest(completion.content.as_bytes())))
-            }),
+            model_response_digest,
             model_work: model_completion,
         };
         let payload = serde_json::to_string(&completed).map_err(|error| error.to_string())?;
@@ -2904,7 +2905,7 @@ pub mod bridge {
         }
 
         #[test]
-        fn leadership_response_digest_fences_recovery_and_preserves_oversized_usage() {
+        fn leadership_raw_response_digest_fences_recovery_including_oversized_results() {
             let dir = tempfile::tempdir().unwrap();
             let (_api, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
                 &dir.path().join("company.sqlite"), &dir.path().join("events.sqlite"),
@@ -2912,7 +2913,15 @@ pub mod bridge {
             let context = ModelWorkContext::AdaptiveLeadershipReview(Box::new(review));
             let binding = context.binding();
             let id = binding.request_id();
-            for content in ["{}".to_owned(), "x".repeat(MAX_MODEL_WORK_BYTES + 1)] {
+            let empty_digest = format!("{:x}", Sha256::digest(b""));
+            let mut oversized_digests = Vec::new();
+            for content in [
+                "{}".to_owned(),
+                "x".repeat(MAX_MODEL_WORK_BYTES + 1),
+                "y".repeat(MAX_MODEL_WORK_BYTES + 1),
+            ] {
+                let oversized = content.len() > MAX_MODEL_WORK_BYTES;
+                let raw_digest = format!("{:x}", Sha256::digest(content.as_bytes()));
                 let resolver = ModelWorkResolver {
                     context: context.clone(), admissions: Mutex::new(Vec::new()), fail_next: AtomicBool::new(true),
                 };
@@ -2929,14 +2938,20 @@ pub mod bridge {
                     request_id: &id, request_digest: "digest", agent_id: binding.agent_id(), tick: 1,
                     requested_model: "gpt-5.4", authority: Some(&binding), authority_resolver: Some(&resolver),
                     gateway_response: &response, usage_v2_enabled: true, model_work: Some(&context),
-                }, 3).unwrap();
+                }, if oversized { 1 } else { 3 }).unwrap();
                 let entry = store.get_completion(&id).unwrap().unwrap();
-                assert_eq!(entry.status, "ready_for_action");
-                assert!(store.has_operation(&format!("llm_usage_{id}")).unwrap());
+                assert_eq!(entry.status, if oversized { "failed" } else { "ready_for_action" });
+                assert_eq!(store.has_operation(&format!("llm_usage_{id}")).unwrap(), !oversized);
                 let mut completed: CompletedLlmResponse = serde_json::from_str(&entry.payload).unwrap();
-                let retained = &completed.model_work.as_ref().unwrap().content;
-                assert_eq!(completed.model_response_digest, Some(format!("{:x}", Sha256::digest(retained.as_bytes()))));
-                assert_eq!(completed.model_work.as_ref().unwrap().admissible, content.len() <= MAX_MODEL_WORK_BYTES);
+                assert_eq!(completed.model_response_digest.as_deref(), Some(raw_digest.as_str()));
+                assert_eq!(completed.model_work.as_ref().unwrap().admissible, !oversized);
+                if oversized {
+                    assert!(completed.model_work.as_ref().unwrap().content.is_empty());
+                    assert_ne!(raw_digest, empty_digest);
+                    assert_eq!(entry.last_error.as_deref(), Some("completion identity mismatch"));
+                    assert!(!store.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
+                    oversized_digests.push(raw_digest);
+                }
                 completed.model_work.as_mut().unwrap().content.push_str("tampered");
                 let corrupted = EventStore::open(":memory:").unwrap();
                 assert!(corrupted.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
@@ -2947,6 +2962,8 @@ pub mod bridge {
                 assert!(resolver.admissions.lock().unwrap().is_empty());
                 assert!(rx.try_recv().is_err());
             }
+            assert_eq!(oversized_digests.len(), 2);
+            assert_ne!(oversized_digests[0], oversized_digests[1]);
         }
 
         #[test]
