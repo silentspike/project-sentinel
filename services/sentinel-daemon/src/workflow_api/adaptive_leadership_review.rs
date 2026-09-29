@@ -488,7 +488,11 @@ pub(crate) mod tests {
         let completion = make_completion(&context, "keep_blocked");
         persist(&api, &completion, &context, &id, &digest, false);
         assert!(api.accept_leadership_review(&completion, &context, &id, &digest).is_err());
-        api.event_store.as_ref().unwrap().persist_llm_completion_usage(&id, &digest, &usage(&context)).unwrap();
+        let events = api.event_store.as_ref().unwrap();
+        let queued = events.get_llm_completion(&id).unwrap().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&queued.payload).unwrap();
+        let exact_usage: DomainEvent = serde_json::from_value(payload["usage_event"].clone()).unwrap();
+        events.persist_llm_completion_usage(&id, &digest, &exact_usage).unwrap();
         api.accept_leadership_review(&completion, &context, &id, &digest).unwrap();
         api.accept_leadership_review(&completion, &context, &id, &digest).unwrap();
         let session = api.store.adaptive_session_for_authority(&context.binding.grant.assignee_authority).unwrap().unwrap();
