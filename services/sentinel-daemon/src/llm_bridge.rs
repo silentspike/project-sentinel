@@ -910,6 +910,24 @@ pub mod bridge {
         Ok(event)
     }
 
+    fn leadership_response_digest_matches(
+        model_work: &ModelWorkCompletion,
+        digest: Option<&str>,
+    ) -> bool {
+        let Some(digest) = digest else {
+            return false;
+        };
+        if digest.len() != 64
+            || !digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return false;
+        }
+        // Oversized raw content is discarded, but its usage and raw digest remain
+        // durable. Discarded content can never authorize model-work admission.
+        (!model_work.admissible && model_work.content.is_empty())
+            || digest == format!("{:x}", Sha256::digest(model_work.content.as_bytes()))
+    }
+
     fn recover_completion<S: CompletionStore>(
         store: &S,
         entry: LlmCompletionEntry,
@@ -941,8 +959,9 @@ pub mod bridge {
             || completed.model_work.as_ref().is_some_and(|model_work| {
                 !completed.actions.is_empty()
                     || (matches!(model_work.context, ModelWorkContext::AdaptiveLeadershipReview(_))
-                        && completed.model_response_digest.as_deref()
-                            != Some(format!("{:x}", Sha256::digest(model_work.content.as_bytes())).as_str()))
+                        && !leadership_response_digest_matches(
+                            model_work, completed.model_response_digest.as_deref(),
+                        ))
                     || entry.owner_scope
                         != sentinel_common::StateTransferScope::for_agent(
                             model_work.context.binding().agent_id().to_string(),
@@ -2905,7 +2924,7 @@ pub mod bridge {
         }
 
         #[test]
-        fn leadership_raw_response_digest_fences_recovery_including_oversized_results() {
+        fn leadership_raw_response_digest_fences_recovery_and_accounts_oversized_results() {
             let dir = tempfile::tempdir().unwrap();
             let (_api, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
                 &dir.path().join("company.sqlite"), &dir.path().join("events.sqlite"),
@@ -2923,7 +2942,7 @@ pub mod bridge {
                 let oversized = content.len() > MAX_MODEL_WORK_BYTES;
                 let raw_digest = format!("{:x}", Sha256::digest(content.as_bytes()));
                 let resolver = ModelWorkResolver {
-                    context: context.clone(), admissions: Mutex::new(Vec::new()), fail_next: AtomicBool::new(true),
+                    context: context.clone(), admissions: Mutex::new(Vec::new()), fail_next: AtomicBool::new(!oversized),
                 };
                 let store = EventStore::open(":memory:").unwrap();
                 assert!(store.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
@@ -2941,15 +2960,47 @@ pub mod bridge {
                 }, if oversized { 1 } else { 3 }).unwrap();
                 let entry = store.get_completion(&id).unwrap().unwrap();
                 assert_eq!(entry.status, if oversized { "failed" } else { "ready_for_action" });
-                assert_eq!(store.has_operation(&format!("llm_usage_{id}")).unwrap(), !oversized);
+                let usage = store.event_by_operation_id(&format!("llm_usage_{id}")).unwrap().unwrap();
                 let mut completed: CompletedLlmResponse = serde_json::from_str(&entry.payload).unwrap();
+                assert_eq!(usage.schema_version, 6);
+                assert_eq!(usage.payload, completed.usage_event.payload);
+                assert_eq!(usage.operation_id, completed.usage_event.operation_id);
                 assert_eq!(completed.model_response_digest.as_deref(), Some(raw_digest.as_str()));
                 assert_eq!(completed.model_work.as_ref().unwrap().admissible, !oversized);
                 if oversized {
                     assert!(completed.model_work.as_ref().unwrap().content.is_empty());
                     assert_ne!(raw_digest, empty_digest);
-                    assert_eq!(entry.last_error.as_deref(), Some("completion identity mismatch"));
+                    let mut falsely_admissible = completed.model_work.as_ref().unwrap().clone();
+                    falsely_admissible.admissible = true;
+                    assert!(!leadership_response_digest_matches(&falsely_admissible, Some(&raw_digest)));
+                    assert_eq!(entry.last_error.as_deref(), Some("provider response is not admissible"));
                     assert!(!store.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
+                    // Recover the durable payload from pending_usage without any
+                    // provider I/O, and retain exact accounting despite rejection.
+                    let recovered = EventStore::open(":memory:").unwrap();
+                    assert!(recovered.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
+                    recovered.enqueue_completion(&id, "digest", &entry.payload).unwrap();
+                    let pending = recovered.get_completion(&id).unwrap().unwrap();
+                    assert_eq!(pending.status, "pending_usage");
+                    recover_completion(&recovered, pending, &tx, 1, Some(&resolver));
+                    let recovered_usage = recovered.event_by_operation_id(&format!("llm_usage_{id}")).unwrap().unwrap();
+                    assert_eq!(recovered_usage.payload, completed.usage_event.payload);
+                    assert_eq!(recovered_usage.schema_version, completed.usage_event.schema_version);
+                    let failed = recovered.get_completion(&id).unwrap().unwrap();
+                    assert_eq!(failed.status, "failed");
+                    assert_eq!(failed.last_error.as_deref(), Some("provider response is not admissible"));
+                    recover_completion(&recovered, failed, &tx, 1, Some(&resolver));
+                    assert!(!recovered.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
+                    for invalid_digest in [None, Some(String::new()), Some("a".repeat(63)), Some("g".repeat(64))] {
+                        let mut invalid: CompletedLlmResponse = serde_json::from_str(&entry.payload).unwrap();
+                        invalid.model_response_digest = invalid_digest;
+                        let rejected = EventStore::open(":memory:").unwrap();
+                        assert!(rejected.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
+                        rejected.enqueue_completion(&id, "digest", &serde_json::to_string(&invalid).unwrap()).unwrap();
+                        recover_completion(&rejected, rejected.get_completion(&id).unwrap().unwrap(), &tx, 1, Some(&resolver));
+                        assert_eq!(rejected.get_completion(&id).unwrap().unwrap().last_error.as_deref(), Some("completion identity mismatch"));
+                        assert!(!rejected.has_operation(&format!("llm_usage_{id}")).unwrap());
+                    }
                     oversized_digests.push(raw_digest);
                 }
                 completed.model_work.as_mut().unwrap().content.push_str("tampered");
