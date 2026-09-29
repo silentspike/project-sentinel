@@ -1,5 +1,10 @@
 # Changelog
 
+- Bind the scheduled dependency updater to this repository explicitly instead
+  of returning success without inspecting any repository. Keep automatic
+  repository discovery disabled and existing upgrade/review policy unchanged
+  (#856).
+
 - Bind fresh company projects to the healthy, locally owned on-duty employees
   across all three shifts, with distinct credentials and required Python/Node
   tool capabilities. Keep the exact Sales caller, reject ambiguous eligible
