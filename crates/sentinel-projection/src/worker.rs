@@ -350,15 +350,17 @@ impl ProjectionWorker {
                                 || provider.as_deref() != Some("codex-cli")
                                 || effective_model != requested_model
                                 || cost_source == Some(sentinel_common::CostSource::NonProviderZero)
-                                || !uuid::Uuid::parse_str(reservation).is_ok_and(|id| {
-                                    !id.is_nil() && id.to_string() == reservation
-                                })
+                                || !uuid::Uuid::parse_str(reservation)
+                                    .is_ok_and(|id| !id.is_nil() && id.to_string() == reservation)
                                 || event.aggregate_id != agent_id.to_string()
-                                || event.correlation_id != format!("company-leadership-{reservation}")
+                                || event.correlation_id
+                                    != format!("company-leadership-{reservation}")
                                 || event.operation_id
                                     != format!("llm_usage_{}", event.correlation_id)
                             {
-                                anyhow::bail!("v6 agent_llm_usage has invalid leadership authority");
+                                anyhow::bail!(
+                                    "v6 agent_llm_usage has invalid leadership authority"
+                                );
                             }
                         }
                         if event.schema_version == 5
@@ -822,13 +824,20 @@ mod tests {
                 assert_hierarchy_usage_rejected(&event, "invalid leadership authority");
             }
         }
-        for value in [None, Some(serde_json::Value::Null), Some(serde_json::json!(0))] {
+        for value in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(0)),
+        ] {
             let mut event = leadership_usage_event();
             let mut payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
             if let Some(value) = value {
                 payload["assignment_version"] = value;
             } else {
-                payload.as_object_mut().unwrap().remove("assignment_version");
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("assignment_version");
             }
             event.payload = payload.to_string();
             assert_hierarchy_usage_rejected(&event, "invalid leadership authority");
@@ -879,8 +888,7 @@ mod tests {
                 }
                 3 => event.operation_id = "llm_usage_borrowed-request".into(),
                 _ => {
-                    event.correlation_id =
-                        "company-provider-borrowed-developer-reservation".into();
+                    event.correlation_id = "company-provider-borrowed-developer-reservation".into();
                     event.operation_id = format!("llm_usage_{}", event.correlation_id);
                 }
             }
@@ -982,7 +990,11 @@ mod tests {
                 serde_json::Value::Null,
                 "missing hierarchy_tier",
             ),
-            ("cost_source", serde_json::Value::Null, "missing cost_source"),
+            (
+                "cost_source",
+                serde_json::Value::Null,
+                "missing cost_source",
+            ),
             (
                 "effective_model",
                 serde_json::json!("  "),

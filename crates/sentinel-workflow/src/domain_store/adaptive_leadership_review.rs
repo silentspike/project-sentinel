@@ -465,6 +465,26 @@ impl WorkflowStore {
         }
         if result.decision.resolves_blocked() {
             let resolution = result.resolution_event_id.ok_or_else(transition)?;
+            let mut project: ProjectV1 = get_entity(
+                &transaction,
+                &leader.tenant_id,
+                "project",
+                &call.grant.project_id.0,
+            )?
+            .ok_or_else(not_found)?;
+            // Receipt recovery permits append-only discussion, never changed work authority.
+            if !project
+                .decisions
+                .starts_with(&call.context.source_project.decisions)
+            {
+                return Err(transition());
+            }
+            project.decisions = call.context.source_project.decisions.clone();
+            project.version = call.context.source_project.version;
+            project.updated_at_unix_ms = call.context.source_project.updated_at_unix_ms;
+            if project != call.context.source_project {
+                return Err(transition());
+            }
             let (session, _) = crate::store::adaptive::load(&transaction, call.grant.session_id)?
                 .ok_or_else(not_found)?;
             crate::store::adaptive::require_head(&transaction, &session)?;

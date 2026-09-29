@@ -553,7 +553,9 @@ pub mod bridge {
     ) {
         // Age bounds orphaned transport only. Live tasks have the reqwest deadline
         // and their drop guard; local durable persistence must not be interrupted.
-        let active = active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let age = u64::try_from(request_timeout.as_millis())
             .unwrap_or(u64::MAX)
             .saturating_add(10_000);
@@ -570,10 +572,14 @@ pub mod bridge {
                             &entry.request_digest,
                             "UnknownOutcome: provider_transport_deadline_elapsed",
                         ) {
-                            let unresolved = store.get_completion(&entry.request_id)
-                                .map(|current| current.is_some_and(|current| {
-                                    current.status == "provider_in_flight" && current.payload.is_empty()
-                                }))
+                            let unresolved = store
+                                .get_completion(&entry.request_id)
+                                .map(|current| {
+                                    current.is_some_and(|current| {
+                                        current.status == "provider_in_flight"
+                                            && current.payload.is_empty()
+                                    })
+                                })
                                 .unwrap_or(true);
                             if unresolved {
                                 error!(request_id = %entry.request_id, error = %error, "Stale provider classification failed closed");
@@ -918,7 +924,9 @@ pub mod bridge {
             return false;
         };
         if digest.len() != 64
-            || !digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            || !digest
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         {
             return false;
         }
@@ -958,10 +966,13 @@ pub mod bridge {
             || completed.request_digest != entry.request_digest
             || completed.model_work.as_ref().is_some_and(|model_work| {
                 !completed.actions.is_empty()
-                    || (matches!(model_work.context, ModelWorkContext::AdaptiveLeadershipReview(_))
-                        && !leadership_response_digest_matches(
-                            model_work, completed.model_response_digest.as_deref(),
-                        ))
+                    || (matches!(
+                        model_work.context,
+                        ModelWorkContext::AdaptiveLeadershipReview(_)
+                    ) && !leadership_response_digest_matches(
+                        model_work,
+                        completed.model_response_digest.as_deref(),
+                    ))
                     || entry.owner_scope
                         != sentinel_common::StateTransferScope::for_agent(
                             model_work.context.binding().agent_id().to_string(),
@@ -2371,8 +2382,12 @@ pub mod bridge {
         let binding = context.binding();
         let forbidden = match binding {
             ProviderExecutionAuthority::AdaptiveLeadershipReview(_) => &[
-                "customer_request_id", "customer_request_version", "adaptive_session_id",
-                "adaptive_effect_id", "adaptive_session_version", "project_version",
+                "customer_request_id",
+                "customer_request_version",
+                "adaptive_session_id",
+                "adaptive_effect_id",
+                "adaptive_session_version",
+                "project_version",
             ][..],
             ProviderExecutionAuthority::Project(_) | ProviderExecutionAuthority::Adaptive(_) => &[
                 "company_execution_subject",
@@ -2463,7 +2478,10 @@ pub mod bridge {
                 "adaptive_decision".to_owned(),
             );
         } else if matches!(context, ModelWorkContext::AdaptiveLeadershipReview(_)) {
-            request.metadata.insert("company_execution_output_kind".to_owned(), "leadership_decision".to_owned());
+            request.metadata.insert(
+                "company_execution_output_kind".to_owned(),
+                "leadership_decision".to_owned(),
+            );
         }
         if let Some(grant) = binding
             .project()
@@ -2516,8 +2534,14 @@ pub mod bridge {
         }
         if let ProviderExecutionAuthority::AdaptiveLeadershipReview(review) = &binding {
             request.model = review.grant.model.clone();
-            request.metadata.insert("subscription_allowance_id".to_owned(), review.allowance_id.clone());
-            request.metadata.insert("subscription_catalog_digest".to_owned(), review.grant.catalog_digest.clone());
+            request.metadata.insert(
+                "subscription_allowance_id".to_owned(),
+                review.allowance_id.clone(),
+            );
+            request.metadata.insert(
+                "subscription_catalog_digest".to_owned(),
+                review.grant.catalog_digest.clone(),
+            );
         }
         request.messages = vec![GatewayMessage {
             role: "user".to_owned(),
@@ -2544,12 +2568,31 @@ pub mod bridge {
         ]);
         match binding {
             ProviderExecutionAuthority::AdaptiveLeadershipReview(value) => values.extend([
-                ("company_execution_subject".to_owned(), "adaptive_leadership_review".to_owned()),
-                ("leadership_review_id".to_owned(), value.grant.review_id.to_string()),
+                (
+                    "company_execution_subject".to_owned(),
+                    "adaptive_leadership_review".to_owned(),
+                ),
+                (
+                    "leadership_review_id".to_owned(),
+                    value.grant.review_id.to_string(),
+                ),
                 ("project_id".to_owned(), value.grant.project_id.0.clone()),
-                ("work_item_id".to_owned(), value.grant.work_item_id.0.clone()),
-                ("assignment_id".to_owned(), value.grant.assignment_id.clone()),
-                ("assignment_version".to_owned(), value.grant.assignee_authority.assignment_version.to_string()),
+                (
+                    "work_item_id".to_owned(),
+                    value.grant.work_item_id.0.clone(),
+                ),
+                (
+                    "assignment_id".to_owned(),
+                    value.grant.assignment_id.clone(),
+                ),
+                (
+                    "assignment_version".to_owned(),
+                    value
+                        .grant
+                        .assignee_authority
+                        .assignment_version
+                        .to_string(),
+                ),
             ]),
             ProviderExecutionAuthority::Project(value) => values.extend([
                 ("project_id".to_owned(), value.project_id.clone()),
@@ -2714,8 +2757,11 @@ pub mod bridge {
             active: &ActiveProviderRequests,
             id: &str,
         ) -> ProviderOutcomeGuard<EventStore> {
-            let mut guard = ProviderOutcomeGuard::new(Arc::clone(store), Arc::clone(active), id, "digest");
-            assert!(store.reserve_request(id, "digest", &AgentId(6).to_string()).unwrap());
+            let mut guard =
+                ProviderOutcomeGuard::new(Arc::clone(store), Arc::clone(active), id, "digest");
+            assert!(store
+                .reserve_request(id, "digest", &AgentId(6).to_string())
+                .unwrap());
             guard.armed = true;
             guard
         }
@@ -2723,89 +2769,168 @@ pub mod bridge {
         #[test]
         fn overdue_orphan_is_unknown_without_retry_or_late_response() {
             let dir = tempfile::tempdir().unwrap();
-            let store = EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap();
+            let store =
+                EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap();
             let active = Arc::new(Mutex::new(HashMap::new()));
-            assert!(store.reserve_request("orphan", "digest", &AgentId(6).to_string()).unwrap());
+            assert!(store
+                .reserve_request("orphan", "digest", &AgentId(6).to_string())
+                .unwrap());
             let created_at = store.get_completion("orphan").unwrap().unwrap().created_at;
-            classify_stale_provider_requests(&store, &active, created_at + 44_999, Duration::from_secs(35));
-            assert_eq!(store.get_completion("orphan").unwrap().unwrap().status, "provider_in_flight");
-            classify_stale_provider_requests(&store, &active, created_at + 45_000, Duration::from_secs(35));
+            classify_stale_provider_requests(
+                &store,
+                &active,
+                created_at + 44_999,
+                Duration::from_secs(35),
+            );
+            assert_eq!(
+                store.get_completion("orphan").unwrap().unwrap().status,
+                "provider_in_flight"
+            );
+            classify_stale_provider_requests(
+                &store,
+                &active,
+                created_at + 45_000,
+                Duration::from_secs(35),
+            );
             let entry = store.get_completion("orphan").unwrap().unwrap();
             assert_eq!(entry.status, "failed");
-            assert_eq!(entry.last_error.as_deref(), Some("UnknownOutcome: provider_transport_deadline_elapsed"));
+            assert_eq!(
+                entry.last_error.as_deref(),
+                Some("UnknownOutcome: provider_transport_deadline_elapsed")
+            );
             assert_eq!(entry.attempt_count, 0);
-            classify_stale_provider_requests(&store, &active, created_at + 21 * 60_000, Duration::from_secs(35));
-            assert!(!store.reserve_request("orphan", "digest", &AgentId(6).to_string()).unwrap());
-            assert!(store.enqueue_completion("orphan", "digest", "late response").is_err());
+            classify_stale_provider_requests(
+                &store,
+                &active,
+                created_at + 21 * 60_000,
+                Duration::from_secs(35),
+            );
+            assert!(!store
+                .reserve_request("orphan", "digest", &AgentId(6).to_string())
+                .unwrap());
+            assert!(store
+                .enqueue_completion("orphan", "digest", "late response")
+                .is_err());
             let (tx, rx) = mpsc::channel();
             recover_completion(&store, entry, &tx, 3, None);
             assert!(rx.try_recv().is_err());
-            assert_eq!(store.get_completion("orphan").unwrap().unwrap().last_error.as_deref(),
-                Some("UnknownOutcome: provider_transport_deadline_elapsed"));
+            assert_eq!(
+                store
+                    .get_completion("orphan")
+                    .unwrap()
+                    .unwrap()
+                    .last_error
+                    .as_deref(),
+                Some("UnknownOutcome: provider_transport_deadline_elapsed")
+            );
         }
 
         #[test]
         fn healthy_live_task_is_not_classified_by_reservation_age() {
             let dir = tempfile::tempdir().unwrap();
-            let store = Arc::new(EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap());
+            let store = Arc::new(
+                EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap(),
+            );
             let active = Arc::new(Mutex::new(HashMap::new()));
             let guard = reserved_guard(&store, &active, "live");
             let created_at = store.get_completion("live").unwrap().unwrap().created_at;
-            classify_stale_provider_requests(store.as_ref(), &active, created_at + 21 * 60_000, Duration::from_secs(35));
-            assert_eq!(store.get_completion("live").unwrap().unwrap().status, "provider_in_flight");
+            classify_stale_provider_requests(
+                store.as_ref(),
+                &active,
+                created_at + 21 * 60_000,
+                Duration::from_secs(35),
+            );
+            assert_eq!(
+                store.get_completion("live").unwrap().unwrap().status,
+                "provider_in_flight"
+            );
             drop(guard);
             let entry = store.get_completion("live").unwrap().unwrap();
             assert_eq!(entry.status, "failed");
-            assert_eq!(entry.last_error.as_deref(), Some("UnknownOutcome: bridge_task_ended_without_durable_response"));
+            assert_eq!(
+                entry.last_error.as_deref(),
+                Some("UnknownOutcome: bridge_task_ended_without_durable_response")
+            );
             assert!(active.lock().unwrap().is_empty());
         }
 
         #[test]
         fn duplicate_guard_does_not_abandon_the_original_task() {
             let dir = tempfile::tempdir().unwrap();
-            let store = Arc::new(EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap());
+            let store = Arc::new(
+                EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap(),
+            );
             let active = Arc::new(Mutex::new(HashMap::new()));
             let original = reserved_guard(&store, &active, "live");
-            let duplicate = ProviderOutcomeGuard::new(Arc::clone(&store), Arc::clone(&active), "live", "digest");
-            assert!(!store.reserve_request("live", "digest", &AgentId(6).to_string()).unwrap());
+            let duplicate = ProviderOutcomeGuard::new(
+                Arc::clone(&store),
+                Arc::clone(&active),
+                "live",
+                "digest",
+            );
+            assert!(!store
+                .reserve_request("live", "digest", &AgentId(6).to_string())
+                .unwrap());
             drop(duplicate);
             assert_eq!(active.lock().unwrap().get("live"), Some(&1));
-            assert_eq!(store.get_completion("live").unwrap().unwrap().status, "provider_in_flight");
+            assert_eq!(
+                store.get_completion("live").unwrap().unwrap().status,
+                "provider_in_flight"
+            );
             drop(original);
         }
 
         #[test]
         fn guard_preserves_durable_response_even_before_disarm() {
             let dir = tempfile::tempdir().unwrap();
-            let store = Arc::new(EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap());
+            let store = Arc::new(
+                EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap(),
+            );
             let active = Arc::new(Mutex::new(HashMap::new()));
             let guard = reserved_guard(&store, &active, "durable");
-            store.enqueue_completion("durable", "digest", "durable response").unwrap();
+            store
+                .enqueue_completion("durable", "digest", "durable response")
+                .unwrap();
             drop(guard);
             let entry = store.get_completion("durable").unwrap().unwrap();
             assert_eq!(entry.status, "pending_usage");
             assert_eq!(entry.payload, "durable response");
             assert!(entry.last_error.is_none());
-            classify_stale_provider_requests(store.as_ref(), &active, entry.created_at + 21 * 60_000, Duration::from_secs(35));
-            assert_eq!(store.get_completion("durable").unwrap().unwrap().status, "pending_usage");
+            classify_stale_provider_requests(
+                store.as_ref(),
+                &active,
+                entry.created_at + 21 * 60_000,
+                Duration::from_secs(35),
+            );
+            assert_eq!(
+                store.get_completion("durable").unwrap().unwrap().status,
+                "pending_usage"
+            );
         }
 
         #[test]
         fn guard_disarms_for_released_and_removed_completion_rows() {
             let dir = tempfile::tempdir().unwrap();
-            let store = Arc::new(EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap());
+            let store = Arc::new(
+                EventStore::open(dir.path().join("events.sqlite").to_str().unwrap()).unwrap(),
+            );
             let active = Arc::new(Mutex::new(HashMap::new()));
             let mut guard = reserved_guard(&store, &active, "released");
-            assert!(store.release_undispatched_request("released", "digest").unwrap());
+            assert!(store
+                .release_undispatched_request("released", "digest")
+                .unwrap());
             guard.disarm_if_resolved();
             assert!(!guard.armed);
             drop(guard);
             assert!(store.get_completion("released").unwrap().is_none());
             let mut removed = reserved_guard(&store, &active, "removed");
-            store.enqueue_completion("removed", "digest", "durable response").unwrap();
+            store
+                .enqueue_completion("removed", "digest", "durable response")
+                .unwrap();
             let response: GatewayResponse = serde_json::from_value(serde_json::json!({
                 "request_id": "removed", "tokens_used": 1
-            })).unwrap();
+            }))
+            .unwrap();
             let usage = build_usage_event(AgentId(6), 1, "", None, &response, false).unwrap();
             store.persist_usage("removed", "digest", &usage).unwrap();
             assert!(store.claim_actions("removed", "digest").unwrap());
@@ -2857,7 +2982,8 @@ pub mod bridge {
             let dir = tempfile::tempdir().unwrap();
             let event_path = dir.path().join("events.sqlite");
             let (api, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
-                &dir.path().join("company.sqlite"), &event_path,
+                &dir.path().join("company.sqlite"),
+                &event_path,
             );
             let context = ModelWorkContext::AdaptiveLeadershipReview(Box::new(review.clone()));
             let binding = context.binding();
@@ -2868,24 +2994,58 @@ pub mod bridge {
             let mut request = build_gateway_request(&perception, &state, &id, Some(&binding));
             bind_model_work_request(&mut request, &context).unwrap();
             assert_eq!(request.metadata["company_execution_schema"], "5");
-            assert_eq!(request.metadata["company_execution_subject"], "adaptive_leadership_review");
-            assert_eq!(request.metadata["company_execution_output_kind"], "leadership_decision");
-            assert_eq!(request.metadata["company_execution_context_digest"], review.context_digest);
-            assert_eq!(request.metadata["leadership_review_id"], review.binding.grant.review_id.to_string());
-            assert_eq!(request.metadata["subscription_allowance_id"], review.binding.allowance_id);
-            assert_eq!(request.metadata["assignment_version"], review.binding.grant.assignee_authority.assignment_version.to_string());
+            assert_eq!(
+                request.metadata["company_execution_subject"],
+                "adaptive_leadership_review"
+            );
+            assert_eq!(
+                request.metadata["company_execution_output_kind"],
+                "leadership_decision"
+            );
+            assert_eq!(
+                request.metadata["company_execution_context_digest"],
+                review.context_digest
+            );
+            assert_eq!(
+                request.metadata["leadership_review_id"],
+                review.binding.grant.review_id.to_string()
+            );
+            assert_eq!(
+                request.metadata["subscription_allowance_id"],
+                review.binding.allowance_id
+            );
+            assert_eq!(
+                request.metadata["assignment_version"],
+                review
+                    .binding
+                    .grant
+                    .assignee_authority
+                    .assignment_version
+                    .to_string()
+            );
             assert_eq!(request.model, review.binding.grant.model);
-            for key in ["adaptive_session_id", "adaptive_effect_id", "adaptive_session_version",
-                "customer_request_id", "customer_request_version", "project_version"] {
+            for key in [
+                "adaptive_session_id",
+                "adaptive_effect_id",
+                "adaptive_session_version",
+                "customer_request_id",
+                "customer_request_version",
+                "project_version",
+            ] {
                 let mut mixed = build_gateway_request(&perception, &state, &id, Some(&binding));
                 mixed.metadata.insert(key.to_owned(), "foreign".to_owned());
-                assert!(bind_model_work_request(&mut mixed, &context).is_err(), "{key}");
+                assert!(
+                    bind_model_work_request(&mut mixed, &context).is_err(),
+                    "{key}"
+                );
             }
             let digest = gateway_request_digest(&request).unwrap();
             let store = Arc::new(EventStore::open(event_path.to_str().unwrap()).unwrap());
             let active = Arc::new(Mutex::new(HashMap::new()));
             let mut guard = ProviderOutcomeGuard::new(Arc::clone(&store), active, &id, &digest);
-            assert!(store.reserve_request(&id, &digest, &agent.to_string()).unwrap());
+            assert!(store
+                .reserve_request(&id, &digest, &agent.to_string())
+                .unwrap());
             guard.armed = true;
             let dispatch = serde_json::json!({
                 "schema_version": 5, "allowance_id": review.binding.allowance_id,
@@ -2894,32 +3054,56 @@ pub mod bridge {
                 "model": request.model, "catalog_digest": review.binding.grant.catalog_digest,
                 "subject": {"kind": "adaptive_leadership_review", "review_id": review.binding.grant.review_id}
             });
-            assert_eq!(api.subscription_dispatch(&serde_json::to_vec(&dispatch).unwrap()).status, 200);
+            assert_eq!(
+                api.subscription_dispatch(&serde_json::to_vec(&dispatch).unwrap())
+                    .status,
+                200
+            );
             // Fixture inference, not live provider evidence.
             let content = serde_json::json!({"schema_version": 1, "decision": {
                 "kind": "keep_blocked", "rationale": "Supplied evidence still shows a dependency.",
                 "evidence_refs": review.source.evidence_refs
-            }}).to_string();
+            }})
+            .to_string();
             let response: GatewayResponse = serde_json::from_value(serde_json::json!({
                 "content": content, "decision": "forward", "request_id": id,
                 "provider": review.binding.grant.provider, "effective_model": request.model,
                 "tokens_used": 15, "input_tokens": 5, "output_tokens": 10, "tier": "mid",
                 "hierarchy_tier": 2, "cost_source": "provider_reported", "cost_usd": 0.0,
                 "actions": [{"type": "tool_use", "content": "must never execute"}]
-            })).unwrap();
+            }))
+            .unwrap();
             let (tx, rx) = mpsc::channel();
-            store_gateway_completion(store.as_ref(), &tx, GatewayCompletionContext {
-                request_id: &id, request_digest: &digest, agent_id: agent, tick: 1,
-                requested_model: &request.model, authority: Some(&binding), authority_resolver: Some(&api),
-                gateway_response: &response, usage_v2_enabled: true, model_work: Some(&context),
-            }, 3).unwrap();
-            let usage = store.event_by_operation_id(&format!("llm_usage_{id}")).unwrap().unwrap();
+            store_gateway_completion(
+                store.as_ref(),
+                &tx,
+                GatewayCompletionContext {
+                    request_id: &id,
+                    request_digest: &digest,
+                    agent_id: agent,
+                    tick: 1,
+                    requested_model: &request.model,
+                    authority: Some(&binding),
+                    authority_resolver: Some(&api),
+                    gateway_response: &response,
+                    usage_v2_enabled: true,
+                    model_work: Some(&context),
+                },
+                3,
+            )
+            .unwrap();
+            let usage = store
+                .event_by_operation_id(&format!("llm_usage_{id}"))
+                .unwrap()
+                .unwrap();
             assert_eq!(usage.schema_version, 6);
             assert!(store.get_completion(&id).unwrap().is_none());
             guard.disarm_if_resolved();
             assert!(!guard.armed);
             drop(guard);
-            assert!(!store.reserve_request(&id, &digest, &agent.to_string()).unwrap());
+            assert!(!store
+                .reserve_request(&id, &digest, &agent.to_string())
+                .unwrap());
             assert!(rx.try_recv().is_err());
         }
 
@@ -2927,7 +3111,8 @@ pub mod bridge {
         fn leadership_raw_response_digest_fences_recovery_and_accounts_oversized_results() {
             let dir = tempfile::tempdir().unwrap();
             let (_api, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
-                &dir.path().join("company.sqlite"), &dir.path().join("events.sqlite"),
+                &dir.path().join("company.sqlite"),
+                &dir.path().join("events.sqlite"),
             );
             let context = ModelWorkContext::AdaptiveLeadershipReview(Box::new(review));
             let binding = context.binding();
@@ -2942,73 +3127,177 @@ pub mod bridge {
                 let oversized = content.len() > MAX_MODEL_WORK_BYTES;
                 let raw_digest = format!("{:x}", Sha256::digest(content.as_bytes()));
                 let resolver = ModelWorkResolver {
-                    context: context.clone(), admissions: Mutex::new(Vec::new()), fail_next: AtomicBool::new(!oversized),
+                    context: context.clone(),
+                    admissions: Mutex::new(Vec::new()),
+                    fail_next: AtomicBool::new(!oversized),
                 };
                 let store = EventStore::open(":memory:").unwrap();
-                assert!(store.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
+                assert!(store
+                    .reserve_request(&id, "digest", &binding.agent_id().to_string())
+                    .unwrap());
                 let response: GatewayResponse = serde_json::from_value(serde_json::json!({
                     "content": content, "decision": "forward", "request_id": id,
                     "provider": binding.provider(), "effective_model": "gpt-5.4", "tokens_used": 15,
                     "input_tokens": 5, "output_tokens": 10, "tier": "mid", "hierarchy_tier": 2,
                     "cost_source": "provider_reported", "cost_usd": 0.0
-                })).unwrap();
+                }))
+                .unwrap();
                 let (tx, rx) = mpsc::channel();
-                store_gateway_completion(&store, &tx, GatewayCompletionContext {
-                    request_id: &id, request_digest: "digest", agent_id: binding.agent_id(), tick: 1,
-                    requested_model: "gpt-5.4", authority: Some(&binding), authority_resolver: Some(&resolver),
-                    gateway_response: &response, usage_v2_enabled: true, model_work: Some(&context),
-                }, if oversized { 1 } else { 3 }).unwrap();
+                store_gateway_completion(
+                    &store,
+                    &tx,
+                    GatewayCompletionContext {
+                        request_id: &id,
+                        request_digest: "digest",
+                        agent_id: binding.agent_id(),
+                        tick: 1,
+                        requested_model: "gpt-5.4",
+                        authority: Some(&binding),
+                        authority_resolver: Some(&resolver),
+                        gateway_response: &response,
+                        usage_v2_enabled: true,
+                        model_work: Some(&context),
+                    },
+                    if oversized { 1 } else { 3 },
+                )
+                .unwrap();
                 let entry = store.get_completion(&id).unwrap().unwrap();
-                assert_eq!(entry.status, if oversized { "failed" } else { "ready_for_action" });
-                let usage = store.event_by_operation_id(&format!("llm_usage_{id}")).unwrap().unwrap();
-                let mut completed: CompletedLlmResponse = serde_json::from_str(&entry.payload).unwrap();
+                assert_eq!(
+                    entry.status,
+                    if oversized {
+                        "failed"
+                    } else {
+                        "ready_for_action"
+                    }
+                );
+                let usage = store
+                    .event_by_operation_id(&format!("llm_usage_{id}"))
+                    .unwrap()
+                    .unwrap();
+                let mut completed: CompletedLlmResponse =
+                    serde_json::from_str(&entry.payload).unwrap();
                 assert_eq!(usage.schema_version, 6);
                 assert_eq!(usage.payload, completed.usage_event.payload);
                 assert_eq!(usage.operation_id, completed.usage_event.operation_id);
-                assert_eq!(completed.model_response_digest.as_deref(), Some(raw_digest.as_str()));
-                assert_eq!(completed.model_work.as_ref().unwrap().admissible, !oversized);
+                assert_eq!(
+                    completed.model_response_digest.as_deref(),
+                    Some(raw_digest.as_str())
+                );
+                assert_eq!(
+                    completed.model_work.as_ref().unwrap().admissible,
+                    !oversized
+                );
                 if oversized {
                     assert!(completed.model_work.as_ref().unwrap().content.is_empty());
                     assert_ne!(raw_digest, empty_digest);
                     let mut falsely_admissible = completed.model_work.as_ref().unwrap().clone();
                     falsely_admissible.admissible = true;
-                    assert!(!leadership_response_digest_matches(&falsely_admissible, Some(&raw_digest)));
-                    assert_eq!(entry.last_error.as_deref(), Some("provider response is not admissible"));
-                    assert!(!store.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
+                    assert!(!leadership_response_digest_matches(
+                        &falsely_admissible,
+                        Some(&raw_digest)
+                    ));
+                    assert_eq!(
+                        entry.last_error.as_deref(),
+                        Some("provider response is not admissible")
+                    );
+                    assert!(!store
+                        .reserve_request(&id, "digest", &binding.agent_id().to_string())
+                        .unwrap());
                     // Recover the durable payload from pending_usage without any
                     // provider I/O, and retain exact accounting despite rejection.
                     let recovered = EventStore::open(":memory:").unwrap();
-                    assert!(recovered.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
-                    recovered.enqueue_completion(&id, "digest", &entry.payload).unwrap();
+                    assert!(recovered
+                        .reserve_request(&id, "digest", &binding.agent_id().to_string())
+                        .unwrap());
+                    recovered
+                        .enqueue_completion(&id, "digest", &entry.payload)
+                        .unwrap();
                     let pending = recovered.get_completion(&id).unwrap().unwrap();
                     assert_eq!(pending.status, "pending_usage");
                     recover_completion(&recovered, pending, &tx, 1, Some(&resolver));
-                    let recovered_usage = recovered.event_by_operation_id(&format!("llm_usage_{id}")).unwrap().unwrap();
+                    let recovered_usage = recovered
+                        .event_by_operation_id(&format!("llm_usage_{id}"))
+                        .unwrap()
+                        .unwrap();
                     assert_eq!(recovered_usage.payload, completed.usage_event.payload);
-                    assert_eq!(recovered_usage.schema_version, completed.usage_event.schema_version);
+                    assert_eq!(
+                        recovered_usage.schema_version,
+                        completed.usage_event.schema_version
+                    );
                     let failed = recovered.get_completion(&id).unwrap().unwrap();
                     assert_eq!(failed.status, "failed");
-                    assert_eq!(failed.last_error.as_deref(), Some("provider response is not admissible"));
+                    assert_eq!(
+                        failed.last_error.as_deref(),
+                        Some("provider response is not admissible")
+                    );
                     recover_completion(&recovered, failed, &tx, 1, Some(&resolver));
-                    assert!(!recovered.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
-                    for invalid_digest in [None, Some(String::new()), Some("a".repeat(63)), Some("g".repeat(64))] {
-                        let mut invalid: CompletedLlmResponse = serde_json::from_str(&entry.payload).unwrap();
+                    assert!(!recovered
+                        .reserve_request(&id, "digest", &binding.agent_id().to_string())
+                        .unwrap());
+                    for invalid_digest in [
+                        None,
+                        Some(String::new()),
+                        Some("a".repeat(63)),
+                        Some("g".repeat(64)),
+                    ] {
+                        let mut invalid: CompletedLlmResponse =
+                            serde_json::from_str(&entry.payload).unwrap();
                         invalid.model_response_digest = invalid_digest;
                         let rejected = EventStore::open(":memory:").unwrap();
-                        assert!(rejected.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
-                        rejected.enqueue_completion(&id, "digest", &serde_json::to_string(&invalid).unwrap()).unwrap();
-                        recover_completion(&rejected, rejected.get_completion(&id).unwrap().unwrap(), &tx, 1, Some(&resolver));
-                        assert_eq!(rejected.get_completion(&id).unwrap().unwrap().last_error.as_deref(), Some("completion identity mismatch"));
+                        assert!(rejected
+                            .reserve_request(&id, "digest", &binding.agent_id().to_string())
+                            .unwrap());
+                        rejected
+                            .enqueue_completion(
+                                &id,
+                                "digest",
+                                &serde_json::to_string(&invalid).unwrap(),
+                            )
+                            .unwrap();
+                        recover_completion(
+                            &rejected,
+                            rejected.get_completion(&id).unwrap().unwrap(),
+                            &tx,
+                            1,
+                            Some(&resolver),
+                        );
+                        assert_eq!(
+                            rejected
+                                .get_completion(&id)
+                                .unwrap()
+                                .unwrap()
+                                .last_error
+                                .as_deref(),
+                            Some("completion identity mismatch")
+                        );
                         assert!(!rejected.has_operation(&format!("llm_usage_{id}")).unwrap());
                     }
                     oversized_digests.push(raw_digest);
                 }
-                completed.model_work.as_mut().unwrap().content.push_str("tampered");
+                completed
+                    .model_work
+                    .as_mut()
+                    .unwrap()
+                    .content
+                    .push_str("tampered");
                 let corrupted = EventStore::open(":memory:").unwrap();
-                assert!(corrupted.reserve_request(&id, "digest", &binding.agent_id().to_string()).unwrap());
-                corrupted.enqueue_completion(&id, "digest", &serde_json::to_string(&completed).unwrap()).unwrap();
-                recover_completion(&corrupted, corrupted.get_completion(&id).unwrap().unwrap(), &tx, 1, Some(&resolver));
-                assert_eq!(corrupted.get_completion(&id).unwrap().unwrap().status, "failed");
+                assert!(corrupted
+                    .reserve_request(&id, "digest", &binding.agent_id().to_string())
+                    .unwrap());
+                corrupted
+                    .enqueue_completion(&id, "digest", &serde_json::to_string(&completed).unwrap())
+                    .unwrap();
+                recover_completion(
+                    &corrupted,
+                    corrupted.get_completion(&id).unwrap().unwrap(),
+                    &tx,
+                    1,
+                    Some(&resolver),
+                );
+                assert_eq!(
+                    corrupted.get_completion(&id).unwrap().unwrap().status,
+                    "failed"
+                );
                 assert!(!corrupted.has_operation(&format!("llm_usage_{id}")).unwrap());
                 assert!(resolver.admissions.lock().unwrap().is_empty());
                 assert!(rx.try_recv().is_err());
@@ -3872,12 +4161,21 @@ pub mod bridge {
         }
 
         impl CompletionStore for FailFirstCompletionStore {
-            fn poll_provider_in_flight(&self, limit: usize) -> anyhow::Result<Vec<LlmCompletionEntry>> {
+            fn poll_provider_in_flight(
+                &self,
+                limit: usize,
+            ) -> anyhow::Result<Vec<LlmCompletionEntry>> {
                 self.inner.poll_llm_provider_in_flight(limit)
             }
 
-            fn mark_provider_unknown(&self, request_id: &str, request_digest: &str, reason: &str) -> anyhow::Result<bool> {
-                self.inner.mark_llm_provider_outcome_unknown(request_id, request_digest, reason)
+            fn mark_provider_unknown(
+                &self,
+                request_id: &str,
+                request_digest: &str,
+                reason: &str,
+            ) -> anyhow::Result<bool> {
+                self.inner
+                    .mark_llm_provider_outcome_unknown(request_id, request_digest, reason)
             }
             fn reserve_request(
                 &self,
