@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "integer", "enum": [1] },
+    "decision": {
+      "type": "object",
+      "properties": {
+        "kind": { "type": "string", "enum": ["resolve_blocked", "keep_blocked"] },
+        "rationale": { "type": "string", "minLength": 1, "maxLength": 2048, "pattern": "\\S" },
+        "evidence_refs": { "type": "array", "maxItems": 8, "uniqueItems": true, "items": { "type": "string" } }
+      },
+      "required": ["kind", "rationale", "evidence_refs"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["schema_version", "decision"],
+  "additionalProperties": false
+}

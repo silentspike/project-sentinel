@@ -13,6 +13,7 @@ import (
 )
 
 var adaptiveRequestID = regexp.MustCompile(`^company-adaptive-([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})-([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$`)
+var leadershipRequestID = regexp.MustCompile(`^company-leadership-([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$`)
 
 const (
 	maxModelWorkResponseBytes = 128 * 1024
@@ -23,6 +24,9 @@ const (
 // derives and revalidates the actual workflow authority before admitting tools.
 func classifyModelWorkRequest(req *LLMRequest, requestID string) (bool, error) {
 	schema, present := req.Metadata["company_execution_schema"]
+	if schema != "5" && hasLeadershipReviewMetadata(req.Metadata) {
+		return false, errors.New("mixed leadership review execution subject")
+	}
 	if !present {
 		if hasCustomerRequestMetadata(req.Metadata) {
 			return false, errors.New("customer request execution schema is missing")
@@ -56,6 +60,9 @@ func companyExecutionRequestIdentity(requestID string, metadata map[string]strin
 		return adaptiveRequestIdentity(requestID, metadata)
 	case "4":
 		return requestID == "company-planning-"+metadata["reservation_id"]+"-"+metadata["project_id"]
+	case "5":
+		parts := leadershipRequestID.FindStringSubmatch(requestID)
+		return len(parts) == 2 && parts[1] == metadata["leadership_review_id"] && parts[1] == metadata["reservation_id"]
 	default:
 		return requestID == "company-provider-"+metadata["reservation_id"]
 	}
@@ -71,6 +78,9 @@ func metadataValuesPresent(metadata map[string]string, keys ...string) bool {
 }
 
 func validCompanyExecutionSubject(metadata map[string]string, requestID, schema string) bool {
+	if schema != "5" && hasLeadershipReviewMetadata(metadata) {
+		return false
+	}
 	projectBinding := []string{"project_id", "work_item_id", "assignment_id", "assignment_version"}
 	switch schema {
 	case "1":
@@ -84,6 +94,9 @@ func validCompanyExecutionSubject(metadata map[string]string, requestID, schema 
 			!hasCustomerRequestMetadata(metadata) && adaptiveRequestIdentity(requestID, metadata)
 	case "4":
 		_, err := projectPlanningSubject(metadata)
+		return err == nil
+	case "5":
+		_, err := leadershipReviewSubject(metadata)
 		return err == nil
 	default:
 		return false
@@ -107,6 +120,37 @@ type customerRequestExecutionSubject struct {
 	SessionVersion uint64 `json:"session_version,omitempty"`
 	ProjectID      string `json:"project_id,omitempty"`
 	ProjectVersion uint64 `json:"project_version,omitempty"`
+	ReviewID       string `json:"review_id,omitempty"`
+}
+
+func hasLeadershipReviewMetadata(metadata map[string]string) bool {
+	_, present := metadata["leadership_review_id"]
+	return present || metadata["company_execution_subject"] == "adaptive_leadership_review" || metadata["company_execution_output_kind"] == "leadership_decision"
+}
+
+func leadershipReviewSubject(metadata map[string]string) (*customerRequestExecutionSubject, error) {
+	invalid := errors.New("invalid leadership review execution subject")
+	if metadata["company_execution_schema"] != "5" || metadata["company_execution_subject"] != "adaptive_leadership_review" ||
+		metadata["company_execution_output_kind"] != "leadership_decision" ||
+		!companyExecutionRequestIdentity(metadata["request_id"], metadata, "5") {
+		return nil, invalid
+	}
+	for _, key := range []string{"customer_request_id", "customer_request_version", "project_version", "adaptive_session_id", "adaptive_effect_id", "adaptive_session_version"} {
+		if _, present := metadata[key]; present {
+			return nil, invalid
+		}
+	}
+	for _, key := range []string{"tenant_id", "project_id", "work_item_id", "assignment_id"} {
+		if !subscriptionIdentifier.MatchString(metadata[key]) {
+			return nil, invalid
+		}
+	}
+	versionText := metadata["assignment_version"]
+	version, err := strconv.ParseUint(versionText, 10, 64)
+	if err != nil || version == 0 || strconv.FormatUint(version, 10) != versionText {
+		return nil, invalid
+	}
+	return &customerRequestExecutionSubject{Kind: "adaptive_leadership_review", ReviewID: metadata["leadership_review_id"]}, nil
 }
 
 func projectPlanningSubject(metadata map[string]string) (*customerRequestExecutionSubject, error) {
