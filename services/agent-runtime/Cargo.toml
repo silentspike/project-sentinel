@@ -7,7 +7,7 @@ publish = false
 description = "Lightweight sandbox process for sentinel agents (runs inside bwrap)"
 
 [dependencies]
-nix = { version = "0.30", features = ["feature", "fs", "process", "resource", "signal"] }
+nix = { version = "0.31", features = ["feature", "fs", "process", "resource", "signal"] }
 landlock = "0.4"
 sentinel-common = { path = "../../crates/sentinel-common" }
 serde = { workspace = true }

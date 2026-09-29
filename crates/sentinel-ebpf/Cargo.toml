@@ -26,7 +26,7 @@ tracing-subscriber = { workspace = true }
 aya = { git = "https://github.com/aya-rs/aya", default-features = false, optional = true }
 aya-log = { git = "https://github.com/aya-rs/aya", default-features = false, optional = true }
 libc = { version = "0.2", optional = true }
-object = { version = "0.38", optional = true, default-features = false, features = ["elf", "read_core"] }
+object = { version = "0.40", optional = true, default-features = false, features = ["elf", "read_core"] }
 
 [[bin]]
 name = "ebpf-verify"

@@ -19,7 +19,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-rcgen = "0.13"
+rcgen = "0.14"
 quinn = { version = "0.11", default-features = false, features = [
     "runtime-tokio",
     "rustls-ring",

@@ -13,4 +13,4 @@ path = "src/lib.rs"
 [dependencies]
 sentinel-fs = { path = "../sentinel-fs" }
 serde = { workspace = true }
-zstd = "0.13"
+zstd = "0.14"
