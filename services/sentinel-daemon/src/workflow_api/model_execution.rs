@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 pub(crate) mod tests;
-mod tool_catalog;
+pub(super) mod tool_catalog;
 
 use super::*;
 use crate::llm_bridge::bridge::ProviderUsageAuthority;
@@ -92,6 +92,7 @@ impl AdaptiveProviderAuthority {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ProviderExecutionAuthority {
+    AdaptiveLeadershipReview(Box<super::adaptive_leadership_review::LeadershipAuthority>),
     RequestSales(Box<RequestSalesAuthority>),
     ProjectPlanning(Box<ProjectPlanningAuthority>),
     Adaptive(Box<AdaptiveProviderAuthority>),
@@ -107,6 +108,9 @@ impl From<ProviderUsageAuthority> for ProviderExecutionAuthority {
 impl ProviderExecutionAuthority {
     pub fn agent_id(&self) -> AgentId {
         match self {
+            Self::AdaptiveLeadershipReview(value) => {
+                value.grant.leadership_principal.agent_id.unwrap_or(AgentId(0))
+            }
             Self::Project(value) => value.agent_id,
             Self::Adaptive(value) => value.grant.authority.agent_id,
             Self::RequestSales(value) => value.grant.sales_principal.agent_id.unwrap_or(AgentId(0)),
@@ -118,6 +122,7 @@ impl ProviderExecutionAuthority {
 
     pub fn tenant_id(&self) -> &str {
         match self {
+            Self::AdaptiveLeadershipReview(value) => &value.grant.leadership_principal.tenant_id.0,
             Self::Project(value) => &value.tenant_id,
             Self::Adaptive(value) => &value.grant.authority.tenant_id.0,
             Self::RequestSales(value) => &value.grant.sales_principal.tenant_id.0,
@@ -127,6 +132,7 @@ impl ProviderExecutionAuthority {
 
     pub fn reservation_id(&self) -> &str {
         match self {
+            Self::AdaptiveLeadershipReview(value) => &value.reservation_id,
             Self::Project(value) => &value.reservation_id,
             Self::Adaptive(value) => &value.grant.provider_allowance_id,
             Self::RequestSales(value) => &value.allowance_id,
@@ -136,6 +142,7 @@ impl ProviderExecutionAuthority {
 
     pub fn provider(&self) -> &str {
         match self {
+            Self::AdaptiveLeadershipReview(value) => &value.grant.provider,
             Self::Project(value) => &value.provider,
             Self::Adaptive(value) => &value.grant.provider,
             Self::RequestSales(value) => &value.grant.provider,
@@ -146,12 +153,18 @@ impl ProviderExecutionAuthority {
     pub fn project(&self) -> Option<&ProviderUsageAuthority> {
         match self {
             Self::Project(value) => Some(value),
-            Self::RequestSales(_) | Self::ProjectPlanning(_) | Self::Adaptive(_) => None,
+            Self::RequestSales(_)
+            | Self::ProjectPlanning(_)
+            | Self::Adaptive(_)
+            | Self::AdaptiveLeadershipReview(_) => None,
         }
     }
 
     pub fn request_id(&self) -> String {
         match self {
+            Self::AdaptiveLeadershipReview(value) => {
+                format!("company-leadership-{}", value.grant.review_id)
+            }
             Self::Adaptive(value) => value.request_id(),
             Self::ProjectPlanning(value) => format!(
                 "company-planning-{}-{}",
@@ -450,6 +463,7 @@ impl AdaptiveModelContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ModelExecutionContext {
+    AdaptiveLeadershipReview(Box<super::adaptive_leadership_review::LeadershipContext>),
     RequestSales(Box<RequestSalesContext>),
     ProjectPlanning(Box<ProjectPlanningContext>),
     Adaptive(Box<AdaptiveModelContext>),
@@ -465,6 +479,9 @@ impl From<super::model_work::ModelWorkContext> for ModelExecutionContext {
 impl ModelExecutionContext {
     pub fn binding(&self) -> ProviderExecutionAuthority {
         match self {
+            Self::AdaptiveLeadershipReview(value) => {
+                ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(value.binding.clone()))
+            }
             Self::Project(value) => value.binding.clone().into(),
             Self::Adaptive(value) => {
                 ProviderExecutionAuthority::Adaptive(Box::new(value.binding.clone()))
@@ -480,6 +497,7 @@ impl ModelExecutionContext {
 
     pub fn validate_dispatch(&self, now_ms: u64) -> Result<(), &'static str> {
         match self {
+            Self::AdaptiveLeadershipReview(value) => value.validate_dispatch(now_ms),
             Self::Project(value) => value.validate_dispatch(now_ms),
             Self::Adaptive(value) => value.validate_dispatch(now_ms),
             Self::RequestSales(value) => value.validate_dispatch(now_ms),
@@ -489,6 +507,7 @@ impl ModelExecutionContext {
 
     pub fn prompt(&self) -> Result<String, &'static str> {
         match self {
+            Self::AdaptiveLeadershipReview(value) => value.prompt(),
             Self::Project(value) => value.prompt(),
             Self::Adaptive(value) => value.prompt(),
             Self::RequestSales(value) => value.prompt(),
@@ -508,6 +527,9 @@ pub struct ModelExecutionCompletion {
 impl ModelExecutionCompletion {
     pub(crate) fn validate_usage(&self, event: &DomainEvent) -> Result<(), &'static str> {
         match &self.context {
+            ModelExecutionContext::AdaptiveLeadershipReview(context) => {
+                context.validate_usage(self.admissible, event)
+            }
             ModelExecutionContext::Project(context) => super::model_work::ModelWorkCompletion {
                 context: context.as_ref().clone(),
                 content: self.content.clone(),
@@ -796,6 +818,92 @@ fn validate_adaptive_usage_binding(
 }
 
 impl WorkflowApi {
+    fn adaptive_provider_outcome_unknown(
+        &self,
+        session: &AdaptiveSessionV1,
+        effect: &AdaptiveEffectV1,
+    ) -> Result<bool, &'static str> {
+        let request_id = format!("company-adaptive-{}-{}", session.grant.session_id, effect.id);
+        let Some(events) = self.event_store.as_ref() else {
+            return Ok(false);
+        };
+        let Some(entry) = events
+            .get_llm_completion(&request_id)
+            .map_err(|_| "adaptive provider outcome unavailable")?
+        else {
+            return Ok(false);
+        };
+        Ok(entry.request_id == request_id
+            && entry.status == "failed"
+            && entry.payload.is_empty()
+            && entry.request_digest == effect.request_digest
+            && entry.owner_scope == sentinel_common::StateTransferScope::for_agent(
+                session.grant.authority.agent_id.to_string(),
+            )
+            && entry
+                .last_error
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("UnknownOutcome:")))
+    }
+
+    pub(super) fn adaptive_models_have_unknown_outcome(&self) -> Result<bool, &'static str> {
+        if !self.model_work_enabled {
+            return Ok(false);
+        }
+        for project in self
+            .store
+            .company_projects()
+            .map_err(|_| "adaptive projects unavailable")?
+        {
+            for session in self.review_sessions(&project)? {
+                match &session.cursor {
+                    AdaptiveCursorV1::ModelUnknown { .. } => return Ok(true),
+                    AdaptiveCursorV1::ModelPending { effect }
+                        if self.adaptive_provider_outcome_unknown(&session, effect)? =>
+                    {
+                        return Ok(true);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    // Reconciliation owns the exclusive fence. Unknown is not blocked and can
+    // never enter leadership resolution or ordinary provider grant rollover.
+    pub(super) fn reconcile_unknown_adaptive_models(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+    ) -> Result<(), &'static str> {
+        if !self.model_work_enabled {
+            return Ok(());
+        }
+        for session in self.review_sessions(project)? {
+            let AdaptiveCursorV1::ModelPending { effect } = &session.cursor else {
+                continue;
+            };
+            let request_id = format!("company-adaptive-{}-{}", session.grant.session_id, effect.id);
+            if self.adaptive_provider_outcome_unknown(&session, effect)? {
+                self.store
+                    .advance_adaptive_session(
+                        session.grant.session_id,
+                        session.version,
+                        stable_operation_id(
+                            "sentinel.workflow.provider-unknown.v1",
+                            &request_id,
+                            session.version,
+                        ),
+                        &AdaptiveTransitionV1::MarkUnknown { effect: effect.clone() },
+                        &session.grant.authority,
+                        now_unix_ms().max(session.updated_at_ms),
+                    )
+                    .map_err(|_| "adaptive unknown outcome journal failed")?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn recover_rejected_first_adaptive_model(
         &self,
         project: &sentinel_workflow::ProjectV1,
@@ -1045,8 +1153,11 @@ impl WorkflowApi {
             | AdaptiveCursorV1::Cancelled
             | AdaptiveCursorV1::CompletionProposed { .. }
             | AdaptiveCursorV1::CollaborationProposed { .. } => Ok(None),
-            AdaptiveCursorV1::ModelPending { effect }
-            | AdaptiveCursorV1::ModelUnknown { effect } => {
+            AdaptiveCursorV1::ModelUnknown { .. } => Ok(None),
+            AdaptiveCursorV1::ModelPending { effect } => {
+                if self.adaptive_provider_outcome_unknown(&session, effect)? {
+                    return Ok(None);
+                }
                 let request_id = format!(
                     "company-adaptive-{}-{}",
                     session.grant.session_id, effect.id
@@ -1187,7 +1298,7 @@ impl WorkflowApi {
                 ),
             ),
             AdaptiveCursorV1::ModelPending { effect }
-            | AdaptiveCursorV1::ModelUnknown { effect } => (
+                if !self.adaptive_provider_outcome_unknown(&session, effect)? => (
                 session
                     .version
                     .checked_sub(1)

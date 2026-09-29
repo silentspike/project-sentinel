@@ -1,6 +1,8 @@
 //! Authenticated M0 company workflow and productive Workbench integration.
 
 mod adaptive_recovery;
+#[cfg(feature = "llm")]
+pub(crate) mod adaptive_leadership_review;
 mod delivery_intent;
 mod delivery_runtime;
 #[cfg(feature = "llm")]
@@ -4793,6 +4795,16 @@ impl WorkflowApi {
         #[cfg(feature = "llm")]
         self.reconcile_sales_intake()?;
         for project in self.store.company_projects()? {
+            #[cfg(feature = "llm")]
+            self.reconcile_unknown_adaptive_models(&project)
+                .map_err(|_| workflow_unavailable())?;
+            #[cfg(feature = "llm")]
+            if self
+                .reconcile_adaptive_leadership_reviews(&project)
+                .map_err(|_| workflow_unavailable())?
+            {
+                continue;
+            }
             if project.lifecycle_state
                 == sentinel_workflow::ProjectLifecycleStateV1::DeliveryCandidate
                 && delivery_intent::settled_project_delivery(self, &project).map_err(|error| {
@@ -5150,6 +5162,12 @@ impl WorkflowApi {
         let pending_completion = self.store.pending_completion_evidence(MAX_RECONCILE_BATCH);
         let pending_gate = self.store.pending_gate_evidence(MAX_RECONCILE_BATCH);
         let last_error = self.last_error.lock().ok().and_then(|value| value.clone());
+        #[cfg(feature = "llm")]
+        let last_error = match self.adaptive_models_have_unknown_outcome() {
+            Ok(true) => Some("UnknownOutcome".to_owned()),
+            Err(reason) => Some(reason.to_owned()),
+            Ok(false) => last_error,
+        };
         let canonical_event_cursor = self.store.company_event_cursor();
         let delivery_ready = self
             .delivery
@@ -5211,6 +5229,9 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
     }
 
     fn is_provider_usage_candidate(&self, agent_id: AgentId) -> Result<bool, &'static str> {
+        if self.leadership_review_for_agent(agent_id)?.is_some() {
+            return Ok(true);
+        }
         if self.request_sales_tenant.is_none() && self.subscription_allowance_id.is_none() {
             return Ok(true);
         }
@@ -5236,6 +5257,13 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         binding: &model_execution::ProviderExecutionAuthority,
     ) -> Result<Option<model_execution::ModelExecutionContext>, &'static str> {
         match binding {
+            model_execution::ProviderExecutionAuthority::AdaptiveLeadershipReview(binding) => {
+                self.prepare_leadership_review(binding).map(|context| {
+                    Some(model_execution::ModelExecutionContext::AdaptiveLeadershipReview(
+                        Box::new(context),
+                    ))
+                })
+            }
             model_execution::ProviderExecutionAuthority::Project(binding) => self
                 .prepare_model_work(binding)
                 .map(|value| value.map(Into::into)),
@@ -5320,6 +5348,9 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         request_digest: &str,
     ) -> Result<(), &'static str> {
         match &completion.context {
+            model_execution::ModelExecutionContext::AdaptiveLeadershipReview(context) => {
+                self.accept_leadership_review(completion, context, request_id, request_digest)
+            }
             model_execution::ModelExecutionContext::Project(context) => self.accept_model_work(
                 &model_work::ModelWorkCompletion {
                     context: context.as_ref().clone(),
@@ -5345,6 +5376,13 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         &self,
         agent_id: AgentId,
     ) -> Result<Option<model_execution::ProviderExecutionAuthority>, &'static str> {
+        if let Some(call) = self.leadership_review_for_agent(agent_id)? {
+            let binding = adaptive_leadership_review::LeadershipAuthority::from_call(&call);
+            self.prepare_leadership_review(&binding)?;
+            return Ok(Some(
+                model_execution::ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(binding)),
+            ));
+        }
         if let Some(call) = self.fresh_request_sales_call(agent_id, now_unix_ms())? {
             let binding = model_execution::RequestSalesAuthority {
                 schema_version: 2,

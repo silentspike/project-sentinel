@@ -20,6 +20,7 @@ struct DispatchRequest {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RequestSubject {
+    AdaptiveLeadershipReview { review_id: Uuid },
     CustomerRequest {
         request_id: String,
         request_version: u64,
@@ -81,7 +82,7 @@ impl WorkflowApi {
         let now_ms = now_unix_ms();
         if !self.enabled
             || !self.model_work_enabled
-            || !matches!(request.schema_version, 1..=4)
+            || !matches!(request.schema_version, 1..=5)
             || ((request.schema_version == 4
                 || (request.schema_version == 2 && !self.request_sales_autonomous_enabled))
                 && self.subscription_allowance_id.as_deref() != Some(request.allowance_id.as_str()))
@@ -96,6 +97,9 @@ impl WorkflowApi {
         }
         if request.schema_version == 4 {
             return self.claim_project_planning_dispatch(request, now_ms);
+        }
+        if request.schema_version == 5 {
+            return self.claim_leadership_dispatch(request, now_ms);
         }
         if request.subject.is_some() {
             return Err("subscription subject mismatch");
@@ -189,6 +193,39 @@ impl WorkflowApi {
         Ok(grant
             .expires_at_unix_ms
             .min(now_ms.saturating_add(grant.max_duration_ms)))
+    }
+
+    fn claim_leadership_dispatch(&self, request: &DispatchRequest, now: u64) -> Result<u64, &'static str> {
+        let Some(RequestSubject::AdaptiveLeadershipReview { review_id }) = request.subject.as_ref() else {
+            return Err("leadership subject missing");
+        };
+        let call = self.leadership_review_for_agent(AgentId(request.agent_id))?.ok_or("leadership grant unavailable")?;
+        let grant = &call.grant;
+        if grant.review_id != *review_id || request.allowance_id != call.allowance_id
+            || request.request_id != call.request_id() || request.provider != grant.provider
+            || request.model != grant.model || request.catalog_digest != grant.catalog_digest {
+            return Err("leadership dispatch binding mismatch");
+        }
+        let binding = super::adaptive_leadership_review::LeadershipAuthority::from_call(&call);
+        let context = super::model_execution::ModelExecutionContext::AdaptiveLeadershipReview(Box::new(self.prepare_leadership_review(&binding)?));
+        context.validate_dispatch(now)?;
+        if call.context_digest().map_err(|_| "leadership context invalid")? != request.context_digest {
+            return Err("leadership dispatch context mismatch");
+        }
+        let pending = self.event_store.as_ref().ok_or("leadership EventStore missing")?
+            .get_llm_completion(&request.request_id).map_err(|_| "leadership reservation unavailable")?.ok_or("leadership reservation missing")?;
+        if pending.request_digest != request.request_digest || pending.status != "provider_in_flight" || !pending.payload.is_empty()
+            || pending.owner_scope != sentinel_common::StateTransferScope::for_agent(AgentId(request.agent_id).to_string()) {
+            return Err("leadership reservation mismatch");
+        }
+        let now = now_unix_ms();
+        context.validate_dispatch(now)?;
+        self.store.claim_adaptive_leadership_review_call(&grant.leadership_principal,
+            &sentinel_workflow::ClaimAdaptiveLeadershipReviewCallV1 { review_id: *review_id,
+                allowance_id: call.allowance_id.clone(), request_id: request.request_id.clone(),
+                request_digest: request.request_digest.clone(), context_digest: request.context_digest.clone() }, now)
+            .map_err(|_| "leadership dispatch consumed or denied")?;
+        Ok(grant.expires_at_unix_ms.min(now.saturating_add(grant.max_duration_ms)))
     }
 
     fn claim_project_planning_dispatch(

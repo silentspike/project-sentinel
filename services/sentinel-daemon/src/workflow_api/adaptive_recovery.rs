@@ -11,15 +11,15 @@ const PRODUCER: &str = "sentinel-daemon-adaptive-recovery";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResolveBlockedAdaptiveWorkV1 {
-    schema_version: u16,
-    operation_id: Uuid,
-    project_id: ProjectId,
-    work_item_id: WorkItemId,
-    session_id: Uuid,
-    expected_session_version: u64,
-    expected_reason_code: String,
-    reason_ref: String,
+pub(super) struct ResolveBlockedAdaptiveWorkV1 {
+    pub(super) schema_version: u16,
+    pub(super) operation_id: Uuid,
+    pub(super) project_id: ProjectId,
+    pub(super) work_item_id: WorkItemId,
+    pub(super) session_id: Uuid,
+    pub(super) expected_session_version: u64,
+    pub(super) expected_reason_code: String,
+    pub(super) reason_ref: String,
 }
 
 impl ResolveBlockedAdaptiveWorkV1 {
@@ -92,6 +92,22 @@ impl WorkflowApi {
         principal: &BoundPrincipal,
         body: &[u8],
     ) -> Result<WorkflowHttpResponse, WorkflowHttpResponse> {
+        let request: ResolveBlockedAdaptiveWorkV1 = decode_body(body)?;
+        request.validate()?;
+        let _guard = self
+            .mutation_fence
+            .write()
+            .map_err(|_| recovery_unavailable())?;
+        self.resolve_blocked_adaptive_work_fenced(principal, &request)
+    }
+
+    // The caller owns the exclusive mutation fence for this whole transition.
+    pub(super) fn resolve_blocked_adaptive_work_fenced(
+        &self,
+        principal: &BoundPrincipal,
+        request: &ResolveBlockedAdaptiveWorkV1,
+    ) -> Result<WorkflowHttpResponse, WorkflowHttpResponse> {
+        request.validate()?;
         if principal.principal.kind != CompanyPrincipalKindV1::Agent
             || !matches!(
                 principal.principal.role,
@@ -113,12 +129,6 @@ impl WorkflowApi {
                 false,
             ));
         }
-        let request: ResolveBlockedAdaptiveWorkV1 = decode_body(body)?;
-        request.validate()?;
-        let _guard = self
-            .mutation_fence
-            .write()
-            .map_err(|_| recovery_unavailable())?;
         let project = self
             .store
             .company_project(&principal.principal.tenant_id, &request.project_id)
@@ -246,7 +256,7 @@ impl WorkflowApi {
         // Only an exact committed decision may reach the store's atomic replay path.
         // An event without the transition must still match the blocked precondition.
         if prior.is_none() || session.version == request.expected_session_version {
-            require_blocked(&session, &request)?;
+            require_blocked(&session, request)?;
         } else if request.expected_session_version.checked_add(1) != Some(session.version)
             || !matches!(&session.cursor, AdaptiveCursorV1::BlockedResolved { .. })
         {
@@ -350,7 +360,7 @@ fn require_blocked(
     }
 }
 
-fn resolution_event_id(operation_id: Uuid) -> Uuid {
+pub(super) fn resolution_event_id(operation_id: Uuid) -> Uuid {
     let digest = Sha256::digest(
         format!("sentinel.adaptive-blocked-resolution-event.v1:{operation_id}").as_bytes(),
     );
@@ -504,7 +514,7 @@ fn resolution_proposal(
 
 #[cfg(feature = "llm")]
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use sentinel_limbo::rusqlite;
     use sentinel_workflow::{adaptive_tool_digest, AdaptiveModelDecisionV1};
@@ -546,7 +556,7 @@ mod tests {
         (next, effect)
     }
 
-    fn fixture(path: &Path, events: &Path, blocked: bool) -> (WorkflowApi, AdaptiveSessionV1) {
+    pub(crate) fn fixture(path: &Path, events: &Path, blocked: bool) -> (WorkflowApi, AdaptiveSessionV1) {
         let (api, binding, _) = model_work::configured_adaptive_test_api(path, events);
         let session = api
             .store
