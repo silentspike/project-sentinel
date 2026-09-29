@@ -502,7 +502,8 @@ fn resolution_proposal(
     })
 }
 
-#[cfg(all(test, feature = "llm"))]
+#[cfg(feature = "llm")]
+#[cfg(test)]
 mod tests {
     use super::*;
     use sentinel_limbo::rusqlite;
