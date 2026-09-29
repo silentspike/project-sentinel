@@ -343,6 +343,9 @@ and proposed-completion/collaboration cursors do not monopolize the next job.
 Ready states with no remaining call budget are skipped, while a final already
 consumed effect remains recoverable. Adaptive completion priority requires the
 exact effect digest and employee owner scope, not just a matching request ID.
+An exactly validated but inactive adaptive grant returns no provider work,
+not an authorization error or a legacy execution fallback. An employee without
+the matching project subscription authority remains rejected.
 Each saved result is revalidated against its own exact allowance, even when
 another job is next. This does not authorize a fresh unselected provider call:
 the dispatch callback still requires the current selection and exact pending

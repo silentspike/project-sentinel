@@ -4,6 +4,8 @@
   age and stable identity, prioritizing local completion recovery and consumed
   calls before new work. Keep each grant separately authorized and reject
   duplicate authority instead of treating a valid work queue as ambiguous (#856).
+  Treat an exactly authorized inactive adaptive campaign as idle without
+  admitting foreign employees or falling back to legacy execution.
 
 - Admit customer Sales work through an explicit opt-in bounded Operator policy
   and durable per-request grants instead of a single process-global request.
