@@ -2537,6 +2537,24 @@ pub mod bridge {
         }
     }
 
+    fn leadership_review_kind(
+        grant: &serde_json::Value,
+    ) -> Result<Option<&'static str>, &'static str> {
+        // Use the authoritative grant wire shape across additive schema versions.
+        // Request metadata cannot select a review subject.
+        match grant.get("schema_version").and_then(serde_json::Value::as_u64) {
+            Some(1) if grant.get("subject").is_none_or(serde_json::Value::is_null) => Ok(None),
+            Some(2) => match grant.get("subject").and_then(|subject| subject.get("kind"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("unknown_model") => Ok(Some("unknown_model")),
+                Some("blocked_continuation") => Ok(Some("blocked_continuation")),
+                _ => Err("unsupported leadership review subject"),
+            },
+            _ => Err("unsupported leadership review grant schema"),
+        }
+    }
+
     fn bind_model_work_request(
         request: &mut GatewayRequest,
         context: &ModelWorkContext,
@@ -2704,6 +2722,11 @@ pub mod bridge {
                 "subscription_catalog_digest".to_owned(),
                 review.grant.catalog_digest.clone(),
             );
+            let grant = serde_json::to_value(&review.grant)
+                .map_err(|_| "leadership review grant encoding failed")?;
+            if let Some(kind) = leadership_review_kind(&grant)? {
+                request.metadata.insert("leadership_review_kind".to_owned(), kind.to_owned());
+            }
         }
         request.messages = vec![GatewayMessage {
             role: "user".to_owned(),
@@ -3137,6 +3160,40 @@ pub mod bridge {
                 self.admissions.lock().unwrap().push(id.to_owned());
                 Ok(())
             }
+        }
+
+        #[test]
+        fn leadership_review_kind_is_grant_derived_and_legacy_wire_stays_absent() {
+            assert_eq!(leadership_review_kind(&serde_json::json!({"schema_version": 1})), Ok(None));
+            assert_eq!(leadership_review_kind(&serde_json::json!({"schema_version": 1, "subject": null})), Ok(None));
+            for kind in ["unknown_model", "blocked_continuation"] {
+                assert_eq!(leadership_review_kind(&serde_json::json!({
+                    "schema_version": 2, "subject": {"kind": kind}
+                })), Ok(Some(kind)));
+            }
+            for grant in [
+                serde_json::json!({"schema_version": 2}),
+                serde_json::json!({"schema_version": 2, "subject": null}),
+                serde_json::json!({"schema_version": 2, "subject": {"kind": "tool"}}),
+                serde_json::json!({"schema_version": 1, "subject": {"kind": "unknown_model"}}),
+                serde_json::json!({"schema_version": 3, "subject": {"kind": "unknown_model"}}),
+            ] {
+                assert!(leadership_review_kind(&grant).is_err());
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let (_, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
+                &dir.path().join("company.sqlite"), &dir.path().join("events.sqlite"),
+            );
+            let context = ModelWorkContext::AdaptiveLeadershipReview(Box::new(review));
+            let binding = context.binding();
+            let state = StateStore::open(dir.path().join("state.redb").to_str().unwrap()).unwrap();
+            let perception = make_perception(binding.agent_id().0, "Review supplied evidence", true);
+            let mut request = build_gateway_request(&perception, &state, &binding.request_id(), Some(&binding));
+            request.metadata.insert("leadership_review_kind".to_owned(), "unknown_model".to_owned());
+            bind_model_work_request(&mut request, &context).unwrap();
+            assert!(!request.metadata.contains_key("leadership_review_kind"));
+            assert_eq!(request.metadata["company_execution_schema"], "5");
+            assert_eq!(request.metadata["company_execution_subject"], "adaptive_leadership_review");
         }
 
         #[test]
