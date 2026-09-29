@@ -5,6 +5,7 @@
 
 mod adaptive;
 mod adaptive_core;
+mod adaptive_leadership_review;
 mod admission;
 mod collaboration;
 mod digest;
@@ -20,6 +21,7 @@ mod store;
 
 pub use adaptive::*;
 pub use adaptive_core::*;
+pub use adaptive_leadership_review::*;
 pub use admission::*;
 pub use collaboration::*;
 pub use domain::*;
