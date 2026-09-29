@@ -2233,6 +2233,15 @@ fn map_execution_tool(
     profile: &WorkbenchProfile,
 ) -> Result<WorkbenchTool, WorkflowPortError> {
     Ok(match tool {
+        ExecutionToolV1::ListDirectory {
+            path,
+            after,
+            max_entries,
+        } => WorkbenchTool::ListDirectory {
+            path: path.clone(),
+            after: after.clone(),
+            max_entries: *max_entries,
+        },
         ExecutionToolV1::InspectFile { path, max_bytes } => WorkbenchTool::InspectFile {
             path: path.clone(),
             max_bytes: *max_bytes,
