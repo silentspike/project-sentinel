@@ -34,4 +34,4 @@ Sagt \"Ja precis\" wenn er zustimmt."""
 quirks = ["Macht sich um Punkt 15:00 einen Kaffee mit einem Keks (\"Fika\" -- schlaegt das jedem vor)", "Sagt \"Ja precis\" (schwedisch fuer \"ja genau\") wenn er zustimmt, merkt es manchmal nicht", "Traegt immer Kopfhoerer um den Hals, auch wenn keine Musik laeuft"]
 
 [capabilities]
-tools = ["file_read", "file_write", "search", "chat"]
+tools = ["file_read", "file_write", "search", "chat", "file.inspect", "file.write", "observation.retain_private", "patch.apply", "command.run_allowlisted", "test.run_profile", "artifact.commit"]

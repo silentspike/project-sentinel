@@ -815,16 +815,29 @@ mod tests {
                 WorkbenchProfile::load(&profile_path).unwrap(),
             );
         }
+        let qa_capabilities = BTreeSet::from([
+            "file.inspect".to_owned(),
+            "file.write".to_owned(),
+            "artifact.commit".to_owned(),
+            "test.run_profile".to_owned(),
+        ]);
+        let developer_capabilities = coding_profiles.values().fold(
+            profile.capabilities.clone(),
+            |mut tools, (profile, _)| {
+                tools.extend(profile.capabilities.iter().cloned());
+                tools
+            },
+        );
         let authority = Arc::new(CompanyAuthority {
             store: Arc::clone(&store),
             principals: Arc::clone(&principals),
             agent_capabilities: Arc::new(HashMap::from([
                 (AgentId(3), BTreeSet::new()),
-                (AgentId(4), BTreeSet::new()),
+                (AgentId(4), profile.capabilities.clone()),
                 (AgentId(5), BTreeSet::new()),
-                (AgentId(6), profile.capabilities.clone()),
+                (AgentId(6), developer_capabilities),
                 (AgentId(7), BTreeSet::new()),
-                (AgentId(8), BTreeSet::new()),
+                (AgentId(8), qa_capabilities.clone()),
                 (AgentId(9), BTreeSet::new()),
             ])),
             workbench_profile: profile,
@@ -838,8 +851,31 @@ mod tests {
             project_profiles: super::ProjectProfileCatalog::embedded(),
             coding_profiles,
             review_profile: None,
-            qa_profile_capabilities: BTreeSet::new(),
-            runtime_health: Arc::new(RwLock::new(Default::default())),
+            qa_profile_capabilities: qa_capabilities,
+            runtime_health: Arc::new(RwLock::new(crate::runtime_health::RuntimeHealthSnapshot {
+                current_shift: 1,
+                expected_active_agents: 7,
+                agents: [3, 4, 5, 6, 7, 8, 9]
+                    .map(
+                        |agent_id| crate::runtime_health::RuntimeHealthAgentSnapshot {
+                            agent_id,
+                            aggregate_id: AgentId(agent_id).to_string(),
+                            name: format!("Company agent {agent_id}"),
+                            expected_active: true,
+                            runtime_present: true,
+                            projection_present: true,
+                            security_runtime_present: true,
+                            adapter_handle_present: true,
+                            adapter_instance_matches: true,
+                            runtime_resources_healthy: true,
+                            adapter_health_state: Some(sentinel_common::NanoHealthState::Healthy),
+                            logical_status: Some(sentinel_runtime::AgentStatus::Active),
+                            ..Default::default()
+                        },
+                    )
+                    .to_vec(),
+                ..Default::default()
+            })),
             artifact_roots: Arc::new(HashMap::new()),
         });
         let workbench = Arc::new(WorkbenchExecutionAdapter {
@@ -1142,6 +1178,114 @@ mod tests {
     }
 
     #[test]
+    fn fresh_work_authority_requires_duty_but_exact_lineage_replay_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = configured_test_api(&temp.path().join("company.sqlite"));
+        let binding = assign_test_work_mode(&api, true);
+        let authority = api.authority.as_ref().unwrap();
+        let project = ProjectId::parse(&binding.project_id).unwrap();
+        let work = WorkItemId::parse(&binding.work_item_id).unwrap();
+        let tenant = TenantId::parse(&binding.tenant_id).unwrap();
+        let original = authority
+            .snapshot(&tenant, &project, &work, AgentId(6))
+            .unwrap();
+        authority
+            .runtime_health
+            .write()
+            .unwrap()
+            .agents
+            .iter_mut()
+            .find(|agent| agent.agent_id == 6)
+            .unwrap()
+            .expected_active = false;
+        assert_eq!(
+            authority.snapshot(&tenant, &project, &work, AgentId(6)),
+            Err(WorkflowPortError::AuthorityConflict)
+        );
+        assert_eq!(
+            authority
+                .snapshot_for_admission(&tenant, &project, &work, AgentId(6), false)
+                .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn raw_plan_replay_preserves_exact_admitted_work_after_shift_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = configured_test_api(&temp.path().join("company.sqlite"));
+        let binding = assign_test_work_mode(&api, true);
+        let principal = api.principals.principal("developer-6").unwrap();
+        let operation = Uuid::new_v4();
+        let intent: ExecutionIntentV1 = serde_json::from_value(serde_json::json!({
+            "project_id":binding.project_id, "work_item_id":binding.work_item_id,
+            "tools":[{"kind":"write_file","path":"index.js","content":"console.log(42);","expected_sha256":null},
+                {"kind":"package_artifact","artifact_kind":"source_tree","media_type":"application/vnd.sentinel.source-tree","paths":["index.js"]}]
+        })).unwrap();
+        let admission = api
+            .authority
+            .as_ref()
+            .unwrap()
+            .plan_from_intent(&principal, operation, &intent, now_unix_ms())
+            .unwrap();
+        let body = serde_json::to_vec(
+            &serde_json::json!({"operation_id":operation,"plan":admission.plan}),
+        )
+        .unwrap();
+        api.authority
+            .as_ref()
+            .unwrap()
+            .runtime_health
+            .write()
+            .unwrap()
+            .agents
+            .iter_mut()
+            .find(|agent| agent.agent_id == 6)
+            .unwrap()
+            .expected_active = false;
+        let denied = api.agent_command(&principal, &body);
+        assert_eq!(denied.status, 403);
+        let denied_body: serde_json::Value = serde_json::from_slice(&denied.body).unwrap();
+        assert_eq!(denied_body["code"], "authority_conflict");
+        assert!(api.store.pending_executions(10).unwrap().is_empty());
+        api.authority
+            .as_ref()
+            .unwrap()
+            .runtime_health
+            .write()
+            .unwrap()
+            .agents
+            .iter_mut()
+            .find(|agent| agent.agent_id == 6)
+            .unwrap()
+            .expected_active = true;
+        assert_eq!(api.agent_command(&principal, &body).status, 200);
+        let pending = api.store.pending_executions(10).unwrap();
+        api.authority
+            .as_ref()
+            .unwrap()
+            .runtime_health
+            .write()
+            .unwrap()
+            .agents
+            .iter_mut()
+            .find(|agent| agent.agent_id == 6)
+            .unwrap()
+            .expected_active = false;
+        assert_eq!(api.agent_command(&principal, &body).status, 200);
+        assert_eq!(api.store.pending_executions(10).unwrap(), pending);
+        let mut changed = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        changed["plan"]["deadline_unix_ms"] =
+            serde_json::json!(admission.plan.deadline_unix_ms + 1);
+        assert_ne!(
+            api.agent_command(&principal, &serde_json::to_vec(&changed).unwrap())
+                .status,
+            200
+        );
+        assert_eq!(api.store.pending_executions(10).unwrap(), pending);
+    }
+
+    #[test]
     fn subscription_selection_ignores_unfunded_siblings_but_rejects_duplicate_authority() {
         let temp = tempfile::tempdir().unwrap();
         let api = configured_test_api(&temp.path().join("company.sqlite"));
@@ -1311,6 +1455,33 @@ mod tests {
                 "{key}"
             );
         }
+        api.authority
+            .as_ref()
+            .unwrap()
+            .runtime_health
+            .write()
+            .unwrap()
+            .agents
+            .iter_mut()
+            .find(|agent| agent.agent_id == 6)
+            .unwrap()
+            .expected_active = false;
+        assert_eq!(api.subscription_dispatch(&bytes).status, 403);
+        assert_eq!(api.prepare_model_work(&binding).unwrap().unwrap(), context);
+        assert!(crate::llm_bridge::bridge::ProviderUsageAuthorityResolver::provider_dispatch_is_definitively_absent(
+            &api, &execution_authority, &id, &digest,
+        ).unwrap());
+        api.authority
+            .as_ref()
+            .unwrap()
+            .runtime_health
+            .write()
+            .unwrap()
+            .agents
+            .iter_mut()
+            .find(|agent| agent.agent_id == 6)
+            .unwrap()
+            .expected_active = true;
         assert_eq!(api.subscription_dispatch(&bytes).status, 200);
         assert!(!crate::llm_bridge::bridge::ProviderUsageAuthorityResolver::provider_dispatch_is_definitively_absent(
             &api,
