@@ -20,6 +20,7 @@ struct Fixture {
     leader: AuthenticatedCompanyPrincipalV1,
     grant: AdaptiveLeadershipReviewGrantV1,
     context: AdaptiveLeadershipReviewContextV1,
+    pending_planning: crate::ProjectPlanningCallV1,
 }
 
 fn fixture() -> Fixture {
@@ -58,7 +59,7 @@ fn fixture() -> Fixture {
             2,
         )
         .unwrap();
-    store
+    let pending_planning = store
         .claim_project_planning_call(
             &leader,
             &crate::ClaimProjectPlanningCallV1 {
@@ -291,7 +292,45 @@ fn fixture() -> Fixture {
         leader,
         grant,
         context,
+        pending_planning,
     }
+}
+
+// Use the production row writer so tampering retains a legitimate entity checksum.
+fn persist_entity<T: serde::Serialize + CompanyEntity>(store: &WorkflowStore, value: &T) {
+    value.validate_entity().unwrap();
+    let (tenant, kind, id, version) = value.row_binding();
+    let mut connection = store.connection.lock().unwrap();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    put_entity(&transaction, tenant, kind, id, version, value).unwrap();
+    transaction.commit().unwrap();
+}
+
+fn planning(f: &Fixture) -> crate::ProjectPlanningCallV1 {
+    f.store
+        .project_planning_call(&f.leader.tenant_id, &f.grant.project_id)
+        .unwrap()
+        .unwrap()
+}
+
+fn tamper_planning_policy(f: &Fixture, change_model: bool) -> crate::ProjectPlanningCallV1 {
+    let mut changed = planning(f);
+    assert_eq!(changed.version, 3);
+    assert!(changed.planned_project.is_some());
+    assert!(changed.model_response_digest.is_some());
+    if change_model {
+        changed.grant.model = "different-model".into();
+        assert_ne!(changed.grant.model, f.grant.model);
+    } else {
+        changed.grant.catalog_digest = "b".repeat(64);
+        assert_ne!(changed.grant.catalog_digest, f.grant.catalog_digest);
+    }
+    persist_entity(&f.store, &changed);
+    // A verified read must succeed: rejection below must come from lineage, not corruption.
+    assert_eq!(planning(f), changed);
+    changed
 }
 
 fn authorize(f: &Fixture) -> AdaptiveLeadershipReviewCallV1 {
@@ -665,6 +704,389 @@ fn leadership_policy_must_match_completed_project_planning() {
             .unwrap()
             .is_empty());
     }
+}
+
+#[test]
+fn renewal_rechecks_completed_planning_policy_after_checksum_valid_tamper() {
+    for change_model in [false, true] {
+        let mut f = fixture();
+        f.grant.expires_at_unix_ms = 30;
+        let call = authorize(&f);
+        let original_planning = planning(&f);
+        let changed = tamper_planning_policy(&f, change_model);
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert_eq!(
+            reopened
+                .project_planning_call(&f.leader.tenant_id, &f.grant.project_id)
+                .unwrap(),
+            Some(changed)
+        );
+        let mut renewed_grant = call.grant.clone();
+        renewed_grant.expires_at_unix_ms = 200_000;
+        renewed_grant.validate(31).unwrap();
+        let before = rows(&reopened);
+        assert_eq!(
+            reopened
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    call.operation_id,
+                    &call.allowance_id,
+                    &renewed_grant,
+                    &call.context,
+                    31,
+                )
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::AuthorityConflict
+        );
+        assert_eq!(rows(&reopened), before);
+        assert_eq!(
+            reopened
+                .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                .unwrap(),
+            Some(call.clone())
+        );
+        assert_eq!(session(&f), f.context.source_session);
+        persist_entity(&reopened, &original_planning);
+        let renewed = reopened
+            .authorize_adaptive_leadership_review_call(
+                &f.leader,
+                call.operation_id,
+                &call.allowance_id,
+                &renewed_grant,
+                &call.context,
+                31,
+            )
+            .unwrap();
+        assert_eq!(renewed.version, call.version);
+        assert_eq!(renewed.grant_issued_at_unix_ms, 31);
+        assert_eq!(renewed.grant, renewed_grant);
+        assert!(renewed.dispatch.is_none());
+    }
+}
+
+#[test]
+fn claim_rechecks_completed_planning_policy_after_checksum_valid_tamper() {
+    for change_model in [false, true] {
+        let f = fixture();
+        let call = authorize(&f);
+        let original_planning = planning(&f);
+        let changed = tamper_planning_policy(&f, change_model);
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert_eq!(
+            reopened
+                .project_planning_call(&f.leader.tenant_id, &f.grant.project_id)
+                .unwrap(),
+            Some(changed)
+        );
+        let before = rows(&reopened);
+        assert_eq!(
+            reopened
+                .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), 21)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::AuthorityConflict
+        );
+        assert_eq!(rows(&reopened), before);
+        assert_eq!(
+            reopened
+                .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                .unwrap(),
+            Some(call.clone())
+        );
+        assert_eq!(session(&f), f.context.source_session);
+        persist_entity(&reopened, &original_planning);
+        let dispatched = reopened
+            .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), 21)
+            .unwrap();
+        assert_eq!(dispatched.version, 2);
+        assert_eq!(dispatched.dispatch.unwrap().request_id, call.request_id());
+    }
+}
+
+#[test]
+fn review_duration_above_canonical_planning_bound_is_invalid_without_reservation() {
+    let mut f = fixture();
+    assert_eq!(planning(&f).grant.max_duration_ms, 120_000);
+    assert_eq!(f.grant.max_duration_ms, 120_000);
+    f.grant.validate(AUTHORIZED_AT).unwrap();
+    f.grant.max_duration_ms = 120_001;
+    // Canonical planning cannot have a smaller bound; this exceeds review validation too.
+    assert_eq!(
+        f.grant.validate(AUTHORIZED_AT).unwrap_err().code,
+        WorkflowErrorCode::InvalidInput
+    );
+    let before = rows(&f.store);
+    assert_eq!(
+        f.store
+            .authorize_adaptive_leadership_review_call(
+                &f.leader,
+                Uuid::from_u128(100),
+                "leadership-a",
+                &f.grant,
+                &f.context,
+                AUTHORIZED_AT,
+            )
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::InvalidInput
+    );
+    assert_eq!(rows(&f.store), before);
+    assert!(f
+        .store
+        .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+        .unwrap()
+        .is_empty());
+    assert_eq!(session(&f), f.context.source_session);
+    f.grant.max_duration_ms = 120_000;
+    let call = authorize(&f);
+    assert_eq!(call.grant.max_duration_ms, 120_000);
+}
+
+#[test]
+fn absent_or_incomplete_planning_rejects_authorization_renewal_and_claim_without_effects() {
+    for absent in [false, true] {
+        for stage in 0..3 {
+            let mut f = fixture();
+            f.grant.expires_at_unix_ms = 30;
+            let call = (stage != 0).then(|| authorize(&f));
+            let original_planning = planning(&f);
+            if absent {
+                assert_eq!(
+                    f.store.connection.lock().unwrap().execute(
+                        "DELETE FROM company_entities WHERE tenant_id=?1 AND entity_kind='project_planning_call' AND entity_id=?2",
+                        rusqlite::params![f.leader.tenant_id.0, f.grant.project_id.0],
+                    ).unwrap(),
+                    1
+                );
+            } else {
+                // This is the real dispatched-but-incomplete row captured by the fixture.
+                assert_eq!(f.pending_planning.version, 2);
+                assert!(f.pending_planning.dispatch.is_some());
+                assert!(f.pending_planning.planned_project.is_none());
+                assert!(f.pending_planning.model_response_digest.is_none());
+                persist_entity(&f.store, &f.pending_planning);
+            }
+            let reopened = WorkflowStore::open(&f.path).unwrap();
+            assert_eq!(
+                reopened
+                    .project_planning_call(&f.leader.tenant_id, &f.grant.project_id)
+                    .unwrap(),
+                if absent {
+                    None
+                } else {
+                    Some(f.pending_planning.clone())
+                }
+            );
+            let mut renewed_grant = f.grant.clone();
+            renewed_grant.expires_at_unix_ms = 200_000;
+            let before = rows(&reopened);
+            let result = match &call {
+                None => reopened.authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::from_u128(100),
+                    "leadership-a",
+                    &f.grant,
+                    &f.context,
+                    AUTHORIZED_AT,
+                ),
+                Some(call) if stage == 1 => reopened.authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    call.operation_id,
+                    &call.allowance_id,
+                    &renewed_grant,
+                    &call.context,
+                    31,
+                ),
+                Some(call) => {
+                    reopened.claim_adaptive_leadership_review_call(&f.leader, &claim(call), 21)
+                }
+            };
+            assert_eq!(
+                result.unwrap_err().code,
+                if absent {
+                    WorkflowErrorCode::NotFound
+                } else {
+                    WorkflowErrorCode::InvalidTransition
+                }
+            );
+            assert_eq!(rows(&reopened), before);
+            assert_eq!(
+                reopened
+                    .adaptive_leadership_review_call(&f.leader.tenant_id, f.grant.review_id)
+                    .unwrap(),
+                call
+            );
+            assert_eq!(session(&f), f.context.source_session);
+            persist_entity(&reopened, &original_planning);
+            let accepted = match stage {
+                0 => authorize(&f),
+                1 => reopened
+                    .authorize_adaptive_leadership_review_call(
+                        &f.leader,
+                        Uuid::from_u128(100),
+                        "leadership-a",
+                        &renewed_grant,
+                        &f.context,
+                        31,
+                    )
+                    .unwrap(),
+                _ => reopened
+                    .claim_adaptive_leadership_review_call(&f.leader, &claim(&call.unwrap()), 21)
+                    .unwrap(),
+            };
+            assert_eq!(accepted.version, if stage == 2 { 2 } else { 1 });
+        }
+    }
+}
+
+#[test]
+fn corrupt_real_different_session_review_fails_closed_before_authorization() {
+    let f = fixture();
+    let other = fixture();
+    let other_call = authorize(&other);
+    assert_eq!(f.leader.tenant_id, other.leader.tenant_id);
+    assert_ne!(f.grant.session_id, other_call.grant.session_id);
+    // Seed a valid review produced by the production helpers for another real session.
+    persist_entity(&f.store, &other_call);
+    assert!(f
+        .store
+        .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        f.store
+            .adaptive_leadership_review_calls(&f.leader.tenant_id, other_call.grant.session_id)
+            .unwrap(),
+        vec![other_call.clone()]
+    );
+    let mut tampered = other_call.clone();
+    tampered.allowance_id = "tampered-other-session".into();
+    tampered.validate_entity().unwrap();
+    let payload = serde_json::to_vec(&tampered).unwrap();
+    // Keep a readable, different-session payload but preserve its original checksum.
+    assert_eq!(f.store.connection.lock().unwrap().execute(
+        "UPDATE company_entities SET payload=?1 WHERE tenant_id=?2 AND entity_kind=?3 AND entity_id=?4",
+        rusqlite::params![payload, f.leader.tenant_id.0, KIND, other_call.review_key],
+    ).unwrap(), 1);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    let before = rows(&reopened);
+    for session_id in [f.grant.session_id, other_call.grant.session_id] {
+        assert_eq!(
+            reopened
+                .adaptive_leadership_review_calls(&f.leader.tenant_id, session_id)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::CorruptStore
+        );
+    }
+    assert_eq!(
+        reopened
+            .authorize_adaptive_leadership_review_call(
+                &f.leader,
+                Uuid::from_u128(100),
+                "leadership-a",
+                &f.grant,
+                &f.context,
+                AUTHORIZED_AT,
+            )
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::CorruptStore
+    );
+    assert_eq!(rows(&reopened), before);
+    assert_eq!(
+        reopened
+            .adaptive_leadership_review_call(&f.leader.tenant_id, f.grant.review_id)
+            .unwrap(),
+        None
+    );
+    assert_eq!(session(&f), f.context.source_session);
+    persist_entity(&reopened, &other_call);
+    assert_eq!(authorize(&f).grant, f.grant);
+}
+
+#[test]
+fn foreign_tenant_cannot_claim_or_renew_and_its_corruption_is_scan_isolated() {
+    let mut f = fixture();
+    f.grant.expires_at_unix_ms = 30;
+    let call = authorize(&f);
+    let mut foreign = f.leader.clone();
+    foreign.tenant_id = TenantId::parse("tenant-foreign").unwrap();
+    let mut renewed_grant = f.grant.clone();
+    renewed_grant.expires_at_unix_ms = 200_000;
+    let before = rows(&f.store);
+    assert_eq!(
+        f.store
+            .adaptive_leadership_review_call(&foreign.tenant_id, call.grant.review_id)
+            .unwrap(),
+        None
+    );
+    assert!(f
+        .store
+        .adaptive_leadership_review_calls(&foreign.tenant_id, f.grant.session_id)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        f.store
+            .claim_adaptive_leadership_review_call(&foreign, &claim(&call), 21)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::NotFound
+    );
+    assert_eq!(
+        f.store
+            .authorize_adaptive_leadership_review_call(
+                &foreign,
+                call.operation_id,
+                &call.allowance_id,
+                &renewed_grant,
+                &call.context,
+                31,
+            )
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::AuthorityConflict
+    );
+    assert_eq!(rows(&f.store), before);
+    // Deliberately corrupt row binding in another tenant must not poison this tenant's scan.
+    assert_eq!(f.store.connection.lock().unwrap().execute(
+        "INSERT INTO company_entities(tenant_id,entity_kind,entity_id,version,payload,payload_digest)
+         SELECT ?1,entity_kind,entity_id,version,payload,payload_digest FROM company_entities
+         WHERE tenant_id=?2 AND entity_kind=?3 AND entity_id=?4",
+        rusqlite::params![foreign.tenant_id.0, f.leader.tenant_id.0, KIND, call.review_key],
+    ).unwrap(), 1);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    let before = rows(&reopened);
+    assert_eq!(
+        reopened
+            .adaptive_leadership_review_calls(&foreign.tenant_id, f.grant.session_id)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::CorruptStore
+    );
+    assert_eq!(
+        reopened
+            .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+            .unwrap(),
+        vec![call.clone()]
+    );
+    assert_eq!(rows(&reopened), before);
+    let renewed = reopened
+        .authorize_adaptive_leadership_review_call(
+            &f.leader,
+            call.operation_id,
+            &call.allowance_id,
+            &renewed_grant,
+            &call.context,
+            31,
+        )
+        .unwrap();
+    let dispatched = reopened
+        .claim_adaptive_leadership_review_call(&f.leader, &claim(&renewed), 32)
+        .unwrap();
+    assert_eq!(dispatched.version, 2);
+    assert_eq!(session(&f), f.context.source_session);
 }
 
 #[test]
