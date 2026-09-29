@@ -33,19 +33,72 @@ impl WorkflowStore {
             if existing.grant != *grant {
                 return Err(idempotency_conflict());
             }
-            require_head(&tx, &existing)?;
-            return Ok((true, existing));
-        }
-        if let Some(existing) = read_head(&tx, current)? {
-            if existing.session_id != grant.session_id {
+            if read_head(&tx, current)?.is_some_and(|head| head.session_id != grant.session_id) {
                 return Err(idempotency_conflict());
             }
-            return Err(corrupt_store());
+            require_head(&tx, &existing)?;
+            return Ok((true, existing));
         }
         if now_ms != grant.created_at_ms || now_ms >= grant.deadline_ms {
             return Err(authority_conflict());
         }
+        let previous = if let Some(head) = read_head(&tx, current)? {
+            if head.session_id == grant.session_id {
+                return Err(corrupt_store());
+            }
+            let (previous, previous_digest) =
+                load(&tx, head.session_id)?.ok_or_else(corrupt_store)?;
+            authorize(&previous.grant, current)?;
+            validate_head(&head, &previous)?;
+            // A renewed allowance may replace only a session that never claimed
+            // a provider or tool effect. All other cursors need explicit recovery.
+            if previous.version != 1
+                || previous.model_calls != 0
+                || previous.tool_calls != 0
+                || !matches!(previous.cursor, crate::AdaptiveCursorV1::ReadyForModel)
+                || previous.last_observation.is_some()
+                || previous.last_model_result_digest.is_some()
+                || !previous.effect_ids.is_empty()
+                || previous.grant.provider_allowance_id == grant.provider_allowance_id
+                || previous.grant.deadline_ms > now_ms
+            {
+                return Err(idempotency_conflict());
+            }
+            Some((previous, previous_digest))
+        } else {
+            None
+        };
         let session = AdaptiveSessionV1::initial(grant.clone())?;
+        if let Some((previous, previous_digest)) = previous {
+            let cancelled = previous.transition(&AdaptiveTransitionV1::Cancel, now_ms)?;
+            append(
+                &tx,
+                &self::namespace(previous.grant.session_id),
+                &Entry {
+                    previous_digest: Some(previous_digest),
+                    command: Some(AdaptiveTransitionV1::Cancel),
+                    session: cancelled,
+                },
+            )?;
+            let changed = tx
+                .execute(
+                    "UPDATE workflow_adaptive_heads SET session_id=?1,version=?2,updated_at_ms=?3 WHERE session_id=?4 AND version=?5 AND updated_at_ms=?6",
+                    params![
+                        session.grant.session_id.to_string(),
+                        sql_u64(session.version)?,
+                        sql_u64(session.updated_at_ms)?,
+                        previous.grant.session_id.to_string(),
+                        sql_u64(previous.version)?,
+                        sql_u64(previous.updated_at_ms)?,
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+            if changed != 1 {
+                return Err(corrupt_store());
+            }
+        } else {
+            insert_head(&tx, &session)?;
+        }
         append(
             &tx,
             &namespace,
@@ -55,7 +108,6 @@ impl WorkflowStore {
                 session: session.clone(),
             },
         )?;
-        insert_head(&tx, &session)?;
         tx.commit().map_err(map_sqlite_error)?;
         Ok((false, session))
     }

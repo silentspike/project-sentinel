@@ -697,6 +697,131 @@ fn authority_head_is_unique_atomic_and_detects_tampering() {
 }
 
 #[test]
+fn expired_effect_free_session_rolls_to_renewed_grant_atomically() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("workflow.sqlite");
+    let auth = authority();
+    let old = grant(auth.clone(), 2);
+    let store = WorkflowStore::open(&database).unwrap();
+    let (_, initial) = store.begin_adaptive_session(&old, &auth, NOW).unwrap();
+    let mut renewed = old.clone();
+    renewed.session_id = Uuid::from_u128(0x01991c34e03c70c2b97e0591f4be2212);
+    renewed.provider_allowance_id = "subscription-renewed".into();
+    renewed.provider_authority_digest = "8".repeat(64);
+    renewed.created_at_ms = old.deadline_ms;
+    renewed.deadline_ms = renewed.created_at_ms + 60_000;
+
+    let (replayed, next) = store
+        .begin_adaptive_session(&renewed, &auth, renewed.created_at_ms)
+        .unwrap();
+    assert!(!replayed);
+    assert_eq!(next.version, 1);
+    assert_eq!(
+        store.adaptive_session_for_authority(&auth).unwrap(),
+        Some(next.clone())
+    );
+    assert_eq!(
+        store
+            .begin_adaptive_session(&renewed, &auth, renewed.created_at_ms)
+            .unwrap(),
+        (true, next.clone())
+    );
+    assert_eq!(
+        store
+            .begin_adaptive_session(&old, &auth, NOW)
+            .unwrap_err()
+            .code,
+        WorkflowErrorCode::IdempotencyConflict
+    );
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let cancelled: Vec<u8> = connection
+        .query_row(
+            "SELECT response FROM workflow_operations WHERE operation_namespace=?1 AND operation_id=?2",
+            (format!("adaptive-session-v1:{}", old.session_id), "00000000000000000002"),
+            |row| row.get(0),
+        )
+        .unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&cancelled).unwrap();
+    assert_eq!(record["session"]["cursor"]["kind"], "cancelled");
+    assert_eq!(initial.model_calls, 0);
+    drop(connection);
+    drop(store);
+    let reopened = WorkflowStore::open(&database).unwrap();
+    assert_eq!(
+        reopened.adaptive_session_for_authority(&auth).unwrap(),
+        Some(next)
+    );
+}
+
+#[test]
+fn renewal_never_replaces_claimed_or_blocked_session() {
+    for claimed in [true, false] {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("workflow.sqlite");
+        let auth = authority();
+        let old = grant(auth.clone(), 2);
+        let store = WorkflowStore::open(&database).unwrap();
+        let (_, initial) = store.begin_adaptive_session(&old, &auth, NOW).unwrap();
+        let pending = store
+            .advance_adaptive_session(
+                old.session_id,
+                initial.version,
+                Uuid::from_u128(0x01991c34e03c70c2b97e0591f4be2213),
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect("01991c34-e03c-70c2-b97e-0591f4be2214", 'a'),
+                    previous_observation_digest: None,
+                },
+                &auth,
+                NOW + 1,
+            )
+            .unwrap()
+            .1;
+        let current = if claimed {
+            pending
+        } else {
+            let AdaptiveCursorV1::ModelPending { effect } = &pending.cursor else {
+                panic!("expected pending model");
+            };
+            store
+                .advance_adaptive_session(
+                    old.session_id,
+                    pending.version,
+                    Uuid::from_u128(0x01991c34e03c70c2b97e0591f4be2215),
+                    &AdaptiveTransitionV1::ResolveModel {
+                        effect: effect.clone(),
+                        result_digest: "b".repeat(64),
+                        decision: AdaptiveModelDecisionV1::Blocked {
+                            reason_code: "needs_input".into(),
+                        },
+                    },
+                    &auth,
+                    NOW + 2,
+                )
+                .unwrap()
+                .1
+        };
+        let before = persisted_adaptive_rows(&database);
+        let mut renewed = old.clone();
+        renewed.session_id = Uuid::from_u128(0x01991c34e03c70c2b97e0591f4be2216);
+        renewed.provider_allowance_id = "subscription-renewed".into();
+        renewed.created_at_ms = old.deadline_ms;
+        renewed.deadline_ms = renewed.created_at_ms + 60_000;
+        assert_eq!(
+            store
+                .begin_adaptive_session(&renewed, &auth, renewed.created_at_ms)
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::IdempotencyConflict
+        );
+        assert_eq!(persisted_adaptive_rows(&database), before);
+        assert_eq!(
+            store.adaptive_session_for_authority(&auth).unwrap(),
+            Some(current)
+        );
+    }
+}
+
+#[test]
 fn replay_is_exact_but_revocation_limits_and_unknown_effects_fail_closed() {
     let directory = tempdir().unwrap();
     let store = WorkflowStore::open(directory.path().join("workflow.sqlite")).unwrap();

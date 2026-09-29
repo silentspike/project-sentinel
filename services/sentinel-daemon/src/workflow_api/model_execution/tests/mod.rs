@@ -2579,6 +2579,21 @@ fn adaptive_collaboration_recovers_after_company_commit_without_duplicate_questi
 }
 
 #[test]
+fn first_adaptive_model_prompt_does_not_require_a_prior_tool_observation() {
+    let root = tempfile::tempdir().unwrap();
+    let database = root.path().join("company.sqlite");
+    let events = root.path().join("events.sqlite");
+    let (api, binding, _) =
+        super::super::model_work::configured_adaptive_test_api(&database, &events);
+    let context = api.prepare_adaptive_model(&binding).unwrap();
+    assert!(context.observation.is_none());
+    let prompt = context.prompt().unwrap();
+    assert!(prompt.contains("No private tool observation exists yet"));
+    assert!(prompt.contains("choose an inspect tool first"));
+    assert!(!prompt.contains("Continue the assigned work using"));
+}
+
+#[test]
 fn adaptive_completion_requires_an_observed_successful_artifact() {
     let digest = "a".repeat(64);
     let result = sentinel_common::WorkbenchMessage::Result {
