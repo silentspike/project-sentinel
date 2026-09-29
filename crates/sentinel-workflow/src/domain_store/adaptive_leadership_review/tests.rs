@@ -201,7 +201,7 @@ fn claim(call: &AdaptiveLeadershipReviewCallV1) -> ClaimAdaptiveLeadershipReview
         allowance_id: call.allowance_id.clone(),
         request_id: call.request_id(),
         request_digest: DIGEST.into(),
-        context_digest: "b".repeat(64),
+        context_digest: call.context_digest().unwrap(),
     }
 }
 
@@ -268,6 +268,9 @@ fn durable_reopen_claim_is_single_use_and_exactly_bound() {
     let f = fixture();
     let call = authorize(&f);
     assert_eq!(call.review_key, f.grant.review_id.to_string());
+    assert_eq!(call.context_digest().unwrap(), crate::digest::canonical_sha256(
+        "sentinel.workflow.adaptive-leadership-context.v1", &(&call.grant, &call.context),
+    ).unwrap());
     let reopened = WorkflowStore::open(&f.path).unwrap();
     assert_eq!(reopened.adaptive_leadership_review_call(&f.leader.tenant_id, f.grant.review_id).unwrap(), Some(call.clone()));
     assert_eq!(reopened.adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id).unwrap(), vec![call.clone()]);
@@ -291,6 +294,14 @@ fn durable_reopen_claim_is_single_use_and_exactly_bound() {
     let mut wrong = claim(&call);
     wrong.context_digest = "not-a-digest".into();
     bad_claims.push(wrong);
+    let mut wrong = claim(&call);
+    // A syntactically valid digest is still not the authorized context binding.
+    wrong.context_digest = if wrong.context_digest == "b".repeat(64) {
+        "d".repeat(64)
+    } else {
+        "b".repeat(64)
+    };
+    bad_claims.push(wrong);
     for wrong in bad_claims {
         let before = rows(&reopened);
         assert!(reopened.claim_adaptive_leadership_review_call(&f.leader, &wrong, 21).is_err());
@@ -299,6 +310,11 @@ fn durable_reopen_claim_is_single_use_and_exactly_bound() {
     let mut stale_leader = f.leader.clone();
     stale_leader.authority_generation += 1;
     assert!(reopened.claim_adaptive_leadership_review_call(&stale_leader, &claim(&call), 21).is_err());
+    let mut wrong_authority = f.leader.clone();
+    wrong_authority.authority_digest = "d".repeat(64);
+    let before = rows(&reopened);
+    assert!(reopened.claim_adaptive_leadership_review_call(&wrong_authority, &claim(&call), 21).is_err());
+    assert_eq!(rows(&reopened), before);
     let dispatched = reopened.claim_adaptive_leadership_review_call(&f.leader, &claim(&call), 21).unwrap();
     assert_eq!(dispatched.version, call.version + 1);
     assert_eq!(dispatched.dispatch.as_ref().unwrap().context_digest, claim(&call).context_digest);
@@ -342,9 +358,79 @@ fn renewal_requires_expired_undispatched_identical_context_and_grant() {
             assert_eq!(renewed.grant_issued_at_unix_ms, 31);
             assert_eq!(renewed.grant, renewed_grant);
             assert_eq!(renewed.context, call.context);
+            assert_ne!(renewed.context_digest().unwrap(), call.context_digest().unwrap());
+            let before = rows(&reopened);
+            assert!(reopened.claim_adaptive_leadership_review_call(&f.leader, &claim(&call), 32).is_err());
+            assert_eq!(rows(&reopened), before);
             reopened.claim_adaptive_leadership_review_call(&f.leader, &claim(&renewed), 32).unwrap();
         }
     }
+}
+
+#[test]
+fn fresh_grant_rejects_leadership_authority_digest_mismatch_without_reservation() {
+    let f = fixture();
+    let mut grant = f.grant.clone();
+    grant.leadership_authority.authority_digest = "d".repeat(64);
+    grant.leadership_authority.validate().unwrap();
+    assert_eq!(grant.leadership_authority.principal_id, f.leader.principal_id);
+    assert_eq!(grant.leadership_authority.principal_generation, f.leader.authority_generation);
+    assert_ne!(grant.leadership_authority.authority_digest, f.leader.authority_digest);
+    let before = rows(&f.store);
+    assert_eq!(f.store.authorize_adaptive_leadership_review_call(
+        &f.leader, Uuid::from_u128(100), "leadership-a", &grant, &f.context, AUTHORIZED_AT,
+    ).unwrap_err().code, WorkflowErrorCode::InvalidInput);
+    assert_eq!(rows(&f.store), before);
+    assert!(f.store.adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id).unwrap().is_empty());
+    // Rejection did not consume the operation, allowance, or blocked-head slot.
+    let accepted = authorize(&f);
+    assert_eq!(accepted.grant, f.grant);
+}
+
+#[test]
+fn tampered_payload_session_id_cannot_hide_prior_review_from_verified_scan() {
+    let f = fixture();
+    let call = authorize(&f);
+    let hidden_session_id = Uuid::new_v4();
+    let mut payload = serde_json::to_value(&call).unwrap();
+    payload["grant"]["session_id"] = serde_json::json!(hidden_session_id);
+    let payload = serde_json::to_vec(&payload).unwrap();
+    // Preserve the original row digest: filtering unverified JSON first used
+    // to hide this corrupt row from the genuine source session's review budget.
+    assert_eq!(f.store.connection.lock().unwrap().execute(
+        "UPDATE company_entities SET payload=?1 WHERE tenant_id=?2 AND entity_kind=?3 AND entity_id=?4",
+        rusqlite::params![payload, f.leader.tenant_id.0, KIND, call.review_key],
+    ).unwrap(), 1);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    let before = rows(&reopened);
+    assert_eq!(reopened.adaptive_leadership_review_call(
+        &f.leader.tenant_id, call.grant.review_id,
+    ).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+    for session_id in [f.grant.session_id, hidden_session_id, Uuid::new_v4()] {
+        assert_eq!(reopened.adaptive_leadership_review_calls(
+            &f.leader.tenant_id, session_id,
+        ).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+    }
+    let mut context = f.context.clone();
+    context.tool_catalog = serde_json::json!({"tools": [{"name": "file.inspect", "catalog_version": 2}]});
+    let mut grant = f.grant.clone();
+    grant.evidence_fingerprint = adaptive_leadership_evidence_fingerprint(
+        &context.tool_catalog, &context.evidence_refs,
+    ).unwrap();
+    grant.review_id = adaptive_leadership_review_id(
+        grant.session_id, grant.expected_session_version, &grant.evidence_fingerprint,
+    ).unwrap();
+    assert_ne!(grant.review_id, call.grant.review_id);
+    grant.validate(21).unwrap();
+    context.validate(&grant).unwrap();
+    assert_eq!(reopened.authorize_adaptive_leadership_review_call(
+        &f.leader, Uuid::from_u128(101), "leadership-hidden-prior", &grant, &context, 21,
+    ).unwrap_err().code, WorkflowErrorCode::CorruptStore);
+    assert_eq!(rows(&reopened), before);
+    assert_eq!(reopened.adaptive_leadership_review_call(
+        &f.leader.tenant_id, grant.review_id,
+    ).unwrap(), None);
+    assert_eq!(session(&f), f.context.source_session);
 }
 
 #[test]
