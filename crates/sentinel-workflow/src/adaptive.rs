@@ -403,7 +403,7 @@ impl AdaptiveSessionV1 {
                 next.continuation = Some(AdaptiveContinuationStateV1 {
                     authorizations,
                     model_ceiling: self.model_calls + authorization.additional_model_calls,
-                    observation_required: self.requires_fresh_observation() || authorization.abandoned_model_effect.is_some(),
+                    observation_required: true,
                 });
                 Cursor::ReadyForModel
             }
@@ -945,5 +945,74 @@ pub(crate) mod continuation_tests {
         assert_eq!(blocked.model_calls, 2);
         assert_eq!(blocked.active_model_ceiling(), 2);
         assert_eq!(blocked.grant.max_model_calls, 16);
+    }
+
+    #[test]
+    fn blocked_continuation_requires_new_inspection_despite_retained_observation() {
+        for resolved in [false, true] {
+            let mut source = unknown();
+            let old_event = Uuid::from_u128(900).to_string();
+            source.cursor = if resolved {
+                AdaptiveCursorV1::BlockedResolved {
+                    reason_code: "needs_review".into(), resolution_event_id: old_event.clone(),
+                }
+            } else {
+                AdaptiveCursorV1::Blocked { reason_code: "needs_review".into() }
+            };
+            source.last_observation = Some(AdaptiveObservationRefV1 {
+                effect: effect(99), observation_digest: "c".repeat(64),
+            });
+            source.tool_calls = 4;
+            assert!(!source.requires_fresh_observation());
+            let mut auth = authorization(&source);
+            auth.abandoned_model_effect = None;
+            auth.source = if resolved {
+                AdaptiveContinuationSourceV1::BlockedResolved {
+                    reason_code: "needs_review".into(), resolution_event_id: old_event,
+                }
+            } else {
+                AdaptiveContinuationSourceV1::Blocked { reason_code: "needs_review".into() }
+            };
+            let ready = continue_with(&source, auth.clone()).unwrap();
+            assert!(ready.requires_fresh_observation());
+            assert_eq!(ready.grant, source.grant);
+            assert_eq!((ready.model_calls, ready.tool_calls), (source.model_calls, source.tool_calls));
+            assert_eq!(ready.effect_ids, source.effect_ids);
+            assert_eq!(ready.last_observation, source.last_observation);
+            assert_eq!(ready.continuation.as_ref().unwrap().authorizations, vec![auth.clone()]);
+            let pending = ready.transition(&AdaptiveTransitionV1::ClaimModel {
+                effect: effect(104), previous_observation_digest: Some("c".repeat(64)),
+            }, auth.issued_at_ms).unwrap();
+            for tool in [
+                WorkbenchTool::WriteFile { path: "src/main.rs".into(), content: "new".into(), expected_sha256: None },
+                WorkbenchTool::RunCommand { program: "node".into(), args: vec!["--version".into()] },
+            ] {
+                assert!(pending.transition(&AdaptiveTransitionV1::ResolveModel {
+                    effect: effect(104), result_digest: "b".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Tool { tool_digest: adaptive_tool_digest(&tool).unwrap(), tool },
+                }, auth.issued_at_ms).is_err());
+            }
+            assert!(pending.transition(&AdaptiveTransitionV1::ResolveModel {
+                effect: effect(104), result_digest: "b".repeat(64),
+                decision: AdaptiveModelDecisionV1::ProposeCompletion { artifact_digest: "a".repeat(64) },
+            }, auth.issued_at_ms).is_err());
+            let inspect = WorkbenchTool::InspectFile { path: "src/main.rs".into(), max_bytes: 1024 };
+            let tool_digest = adaptive_tool_digest(&inspect).unwrap();
+            let tool_ready = pending.transition(&AdaptiveTransitionV1::ResolveModel {
+                effect: effect(104), result_digest: "b".repeat(64),
+                decision: AdaptiveModelDecisionV1::Tool { tool: inspect, tool_digest: tool_digest.clone() },
+            }, auth.issued_at_ms).unwrap();
+            assert!(tool_ready.requires_fresh_observation());
+            let tool_pending = tool_ready.transition(&AdaptiveTransitionV1::ClaimTool {
+                effect: effect(105), tool_digest,
+            }, auth.issued_at_ms).unwrap();
+            assert!(tool_pending.requires_fresh_observation());
+            let observed = tool_pending.transition(&AdaptiveTransitionV1::ObserveTool {
+                observation: AdaptiveObservationRefV1 { effect: effect(105), observation_digest: "d".repeat(64) },
+            }, auth.issued_at_ms).unwrap();
+            assert!(!observed.requires_fresh_observation());
+            assert_eq!(observed.grant, source.grant);
+            assert_eq!((observed.model_calls, observed.tool_calls), (2, 5));
+        }
     }
 }
