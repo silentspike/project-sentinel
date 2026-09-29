@@ -250,7 +250,7 @@ func TestLeadershipBoundaryOutputSchemaAndLegacy(t *testing.T) {
 				}
 				return
 			}
-			got, err := os.ReadFile(path)
+			got, err := os.ReadFile(path) // #nosec G304 -- provider-generated fixture inside t.TempDir.
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -274,7 +274,7 @@ func TestLeadershipBoundaryOutputSchemaAndLegacy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(path)
+	got, err := os.ReadFile(path) // #nosec G304 -- provider-generated fixture inside t.TempDir.
 	if err != nil || !bytes.Equal(got, codexCLIReviewSchema) {
 		t.Fatal("legacy source review changed")
 	}
@@ -307,6 +307,52 @@ func TestLeadershipBoundaryResponseBytes(t *testing.T) {
 	}
 }
 
+func leadershipReceiptFixture(mode string, receipt subscriptionDispatchReceipt) []byte {
+	switch mode {
+	case "schema":
+		receipt.SchemaVersion = 1
+	case "allowance":
+		receipt.AllowanceID = "foreign"
+	case "request":
+		receipt.RequestID = "foreign"
+	case "digest":
+		receipt.RequestDigest = strings.Repeat("e", 64)
+	case "expired":
+		receipt.DeadlineUnixMS = time.Now().Add(-time.Second).UnixMilli()
+	case "zero_deadline":
+		receipt.DeadlineUnixMS = 0
+	}
+	body, _ := json.Marshal(receipt)
+	switch mode {
+	case "missing":
+		body = []byte(strings.Replace(string(body), `"schema_version":5,`, "", 1))
+	case "null":
+		body = []byte(strings.Replace(string(body), `"schema_version":5`, `"schema_version":null`, 1))
+	case "duplicate":
+		body = append([]byte(`{"schema_version":1,`), body[1:]...)
+	case "case":
+		body = []byte(strings.Replace(string(body), "schema_version", "SCHEMA_VERSION", 1))
+	case "unknown":
+		body = append([]byte(`{"extra":true,`), body[1:]...)
+	case "suffix":
+		body = append(body, []byte(` {}`)...)
+	case "oversized":
+		body = append(body, bytes.Repeat([]byte(" "), 4097)...)
+	case "exact_byte_bound":
+		body = append(body, bytes.Repeat([]byte(" "), 4096-len(body))...)
+	case "truncated":
+		body = body[:len(body)-1]
+	}
+	return body
+}
+
+func checkLeadershipAuthorityTransport(t *testing.T, r *http.Request) {
+	t.Helper()
+	if r.Method != http.MethodPost || r.URL.Path != "/operator/workflow/subscription-dispatch" || r.Header.Get("Authorization") != "Bearer credential" {
+		t.Error("incorrect authority transport")
+	}
+}
+
 func TestLeadershipBoundaryExactReceipt(t *testing.T) {
 	for _, mode := range []string{"approved", "exact_byte_bound", "schema", "allowance", "request", "digest", "expired", "zero_deadline", "missing", "null", "duplicate", "case", "unknown", "suffix", "oversized", "truncated", "rejected", "claim_lost"} {
 		t.Run(mode, func(t *testing.T) {
@@ -321,9 +367,7 @@ func TestLeadershipBoundaryExactReceipt(t *testing.T) {
 				if queue.Stats().Active != 1 {
 					t.Error("claim preceded queue lease")
 				}
-				if r.Method != http.MethodPost || r.URL.Path != "/operator/workflow/subscription-dispatch" || r.Header.Get("Authorization") != "Bearer credential" {
-					t.Error("incorrect authority transport")
-				}
+				checkLeadershipAuthorityTransport(t, r)
 				var claim subscriptionDispatch
 				if err := json.NewDecoder(r.Body).Decode(&claim); err != nil {
 					t.Error(err)
@@ -337,18 +381,6 @@ func TestLeadershipBoundaryExactReceipt(t *testing.T) {
 				}
 				receipt := subscriptionDispatchReceipt{SchemaVersion: 5, AllowanceID: claim.AllowanceID, RequestID: claim.RequestID, RequestDigest: claim.RequestDigest, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli()}
 				switch mode {
-				case "schema":
-					receipt.SchemaVersion = 1
-				case "allowance":
-					receipt.AllowanceID = "foreign"
-				case "request":
-					receipt.RequestID = "foreign"
-				case "digest":
-					receipt.RequestDigest = strings.Repeat("e", 64)
-				case "expired":
-					receipt.DeadlineUnixMS = time.Now().Add(-time.Second).UnixMilli()
-				case "zero_deadline":
-					receipt.DeadlineUnixMS = 0
 				case "rejected":
 					w.WriteHeader(http.StatusForbidden)
 					return
@@ -361,27 +393,7 @@ func TestLeadershipBoundaryExactReceipt(t *testing.T) {
 					_ = conn.Close()
 					return
 				}
-				body, _ := json.Marshal(receipt)
-				switch mode {
-				case "missing":
-					body = []byte(strings.Replace(string(body), `"schema_version":5,`, "", 1))
-				case "null":
-					body = []byte(strings.Replace(string(body), `"schema_version":5`, `"schema_version":null`, 1))
-				case "duplicate":
-					body = append([]byte(`{"schema_version":1,`), body[1:]...)
-				case "case":
-					body = []byte(strings.Replace(string(body), "schema_version", "SCHEMA_VERSION", 1))
-				case "unknown":
-					body = append([]byte(`{"extra":true,`), body[1:]...)
-				case "suffix":
-					body = append(body, []byte(` {}`)...)
-				case "oversized":
-					body = append(body, bytes.Repeat([]byte(" "), 4097)...)
-				case "exact_byte_bound":
-					body = append(body, bytes.Repeat([]byte(" "), 4096-len(body))...)
-				case "truncated":
-					body = body[:len(body)-1]
-				}
+				body := leadershipReceiptFixture(mode, receipt)
 				_, _ = w.Write(body)
 			}))
 			defer server.Close()
