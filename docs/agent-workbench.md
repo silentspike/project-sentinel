@@ -329,8 +329,25 @@ each employee task. Project work carries its durable allowance ID in the exact
 request metadata; the Gateway validates that ID and forwards it to the daemon,
 which resolves it against the current project, assignment and grant before
 claiming dispatch. A dynamic work ID cannot be used for planning; Sales accepts
-its own exact request grant only under the explicit autonomous policy above, and
-multiple project grants for one employee fail closed as ambiguous. The daemon
+its own exact request grant only under the explicit autonomous policy above.
+Multiple independently authorized project grants form one employee work queue:
+persisted local completions take priority, then still-live consumed calls, then
+undispatched work. Within each class, persisted grant creation time and stable
+tenant/project/allowance identity determine the order independently of store
+iteration. Duplicate allowance authority, changed assignments and conflicting
+reservations still fail closed; scheduling never combines project permissions.
+Adaptive coding observes its persisted session cursor without starting tools
+or creating sessions during selection. Pending model/tool effects stay ahead
+of fresh work; saved model completions get recovery priority. Blocked, cancelled
+and proposed-completion/collaboration cursors do not monopolize the next job.
+Ready states with no remaining call budget are skipped, while a final already
+consumed effect remains recoverable. Adaptive completion priority requires the
+exact effect digest and employee owner scope, not just a matching request ID.
+Each saved result is revalidated against its own exact allowance, even when
+another job is next. This does not authorize a fresh unselected provider call:
+the dispatch callback still requires the current selection and exact pending
+request/context digest. Expiry and unresolved provider-outcome rules are unchanged.
+The daemon
 also requires model work and usage-v2. The Gateway requires its existing protected
 operator credential and a loopback-only `SENTINEL_OPERATOR_API_URL`. A
 subscription-marked request without the Gateway mode fails closed.

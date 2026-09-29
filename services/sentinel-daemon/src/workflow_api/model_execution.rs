@@ -749,6 +749,86 @@ fn validate_adaptive_usage(
 }
 
 impl WorkflowApi {
+    pub(super) fn adaptive_subscription_queue_priority(
+        &self,
+        binding: &ProviderUsageBinding,
+    ) -> Result<Option<u8>, &'static str> {
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or("adaptive authority unavailable")?;
+        let current = authority
+            .snapshot_for_admission(
+                &TenantId::parse(&binding.tenant_id).map_err(|_| "invalid adaptive tenant")?,
+                &ProjectId::parse(&binding.project_id).map_err(|_| "invalid adaptive project")?,
+                &WorkItemId::parse(&binding.work_item_id)
+                    .map_err(|_| "invalid adaptive work item")?,
+                binding.agent_id,
+                false,
+            )
+            .map_err(|_| "adaptive runtime authority unavailable")?;
+        let Some(session) = self
+            .core
+            .adaptive_session_for_authority(&current)
+            .map_err(|_| "adaptive queue session unavailable")?
+        else {
+            return Ok(Some(2));
+        };
+        if session.grant.provider_allowance_id != binding.reservation_id {
+            return Ok(Some(2));
+        }
+        // Selection observes persisted state only: no new session, tool I/O or
+        // mutation is allowed while considering the employee's other projects.
+        match &session.cursor {
+            AdaptiveCursorV1::ReadyForModel
+                if session.model_calls >= session.grant.max_model_calls =>
+            {
+                Ok(None)
+            }
+            AdaptiveCursorV1::ReadyForTool { .. }
+                if session.tool_calls >= session.grant.max_tool_calls =>
+            {
+                Ok(None)
+            }
+            AdaptiveCursorV1::Blocked { .. }
+            | AdaptiveCursorV1::Cancelled
+            | AdaptiveCursorV1::CompletionProposed { .. }
+            | AdaptiveCursorV1::CollaborationProposed { .. } => Ok(None),
+            AdaptiveCursorV1::ModelPending { effect }
+            | AdaptiveCursorV1::ModelUnknown { effect } => {
+                let request_id = format!(
+                    "company-adaptive-{}-{}",
+                    session.grant.session_id, effect.id
+                );
+                let completion = self
+                    .event_store
+                    .as_ref()
+                    .map(|store| store.get_llm_completion(&request_id))
+                    .transpose()
+                    .map_err(|_| "adaptive queue completion unavailable")?
+                    .flatten();
+                Ok(Some(
+                    if completion.is_some_and(|entry| {
+                        entry.request_digest == effect.request_digest
+                            && entry.owner_scope
+                                == sentinel_common::StateTransferScope::for_agent(
+                                    binding.agent_id.to_string(),
+                                )
+                            && matches!(entry.status.as_str(), "pending_usage" | "ready_for_action")
+                    }) {
+                        0
+                    } else {
+                        1
+                    },
+                ))
+            }
+            AdaptiveCursorV1::ReadyForTool { .. }
+            | AdaptiveCursorV1::ToolPending { .. }
+            | AdaptiveCursorV1::ToolUnknown { .. } => Ok(Some(1)),
+            AdaptiveCursorV1::ReadyForModel => Ok(Some(if session.version > 1 { 1 } else { 2 })),
+        }
+    }
+
     pub(super) fn adaptive_provider_authority(
         &self,
         agent_id: AgentId,

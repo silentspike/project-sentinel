@@ -310,9 +310,22 @@ impl WorkflowApi {
             .get(&work_id)
             .ok_or("model work item missing")?;
         artifact_kind(work.spec.required_role)?;
-        let current = self
-            .provider_usage_binding_for_agent(binding.agent_id)?
-            .ok_or("model work reservation missing")?;
+        // Revalidate the bound result, not the scheduler's next independent job.
+        // Fresh provider dispatch still checks queue selection in subscription.rs.
+        let current = if binding.subscription_grant.is_some() {
+            let projects = self
+                .store
+                .company_projects()
+                .map_err(|_| "model work store unavailable")?;
+            select_provider_usage_binding(
+                &projects,
+                binding.agent_id,
+                Some(&binding.reservation_id),
+            )?
+        } else {
+            self.provider_usage_binding_for_agent(binding.agent_id)?
+        }
+        .ok_or("model work reservation missing")?;
         if current.reservation_id != binding.reservation_id
             || current.assignment_id != binding.assignment_id
             || current.assignment_version != binding.assignment_version
@@ -1339,9 +1352,32 @@ mod tests {
         let now = now_unix_ms();
         let mut projects = api.store.company_projects().unwrap();
 
+        let oldest = projects
+            .iter()
+            .min_by_key(|project| {
+                let allowance = project.subscription_call.as_ref().unwrap();
+                (
+                    allowance.created_at_unix_ms,
+                    &project.tenant_id.0,
+                    &project.project_id.0,
+                    &allowance.allowance_id,
+                )
+            })
+            .unwrap()
+            .subscription_call
+            .as_ref()
+            .unwrap()
+            .allowance_id
+            .clone();
         assert_eq!(
             select_actionable_subscription_allowance_id(&projects, AgentId(6), now, |_| Ok(false),),
-            Err("agent has ambiguous subscription work authority")
+            Ok(Some(oldest.as_str()))
+        );
+        projects.reverse();
+        assert_eq!(
+            select_actionable_subscription_allowance_id(&projects, AgentId(6), now, |_| Ok(false),),
+            Ok(Some(oldest.as_str())),
+            "store iteration order must not change the selected employee task"
         );
 
         let old_project = projects
@@ -1384,6 +1420,377 @@ mod tests {
             select_actionable_subscription_allowance_id(&projects, AgentId(6), now, |_| Ok(false),),
             Ok(None),
             "expired subscription work must not fall back to unbounded selection"
+        );
+    }
+
+    #[test]
+    fn adaptive_work_queue_retains_final_effect_but_skips_exhausted_session() {
+        use sentinel_workflow::{
+            adaptive_tool_digest, AdaptiveEffectV1, AdaptiveModelDecisionV1,
+            AdaptiveObservationRefV1, AdaptiveTransitionV1,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let (api, binding, _) = configured_adaptive_test_api(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+        );
+        let other = assign_test_work_from(&api, Some(1), 100);
+        let selected = api
+            .provider_usage_binding_for_agent(AgentId(6))
+            .unwrap()
+            .unwrap();
+        let mut session = api
+            .core
+            .adaptive_session(binding.grant.session_id, &binding.grant.authority)
+            .unwrap()
+            .unwrap();
+        let tool = WorkbenchTool::InspectFile {
+            path: "src/main.rs".to_owned(),
+            max_bytes: 16,
+        };
+        let advance = |session: &sentinel_workflow::AdaptiveSessionV1, command| {
+            api.store
+                .advance_adaptive_session(
+                    binding.grant.session_id,
+                    session.version,
+                    Uuid::new_v4(),
+                    &command,
+                    &binding.grant.authority,
+                    now_unix_ms(),
+                )
+                .unwrap()
+                .1
+        };
+        for _ in 0..session.grant.max_model_calls {
+            let effect = AdaptiveEffectV1 {
+                id: Uuid::new_v4(),
+                request_digest: "d".repeat(64),
+            };
+            let previous_observation_digest = session
+                .last_observation
+                .as_ref()
+                .map(|o| o.observation_digest.clone());
+            session = advance(
+                &session,
+                AdaptiveTransitionV1::ClaimModel {
+                    effect: effect.clone(),
+                    previous_observation_digest,
+                },
+            );
+            assert_eq!(
+                api.adaptive_subscription_queue_priority(&selected).unwrap(),
+                Some(1),
+                "an already consumed final call must stay recoverable"
+            );
+            let tool_digest = adaptive_tool_digest(&tool).unwrap();
+            session = advance(
+                &session,
+                AdaptiveTransitionV1::ResolveModel {
+                    effect,
+                    result_digest: "e".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Tool {
+                        tool: tool.clone(),
+                        tool_digest: tool_digest.clone(),
+                    },
+                },
+            );
+            let tool_effect = AdaptiveEffectV1 {
+                id: Uuid::new_v4(),
+                request_digest: "f".repeat(64),
+            };
+            session = advance(
+                &session,
+                AdaptiveTransitionV1::ClaimTool {
+                    effect: tool_effect.clone(),
+                    tool_digest,
+                },
+            );
+            assert_eq!(
+                api.adaptive_subscription_queue_priority(&selected).unwrap(),
+                Some(1)
+            );
+            session = advance(
+                &session,
+                AdaptiveTransitionV1::ObserveTool {
+                    observation: AdaptiveObservationRefV1 {
+                        effect: tool_effect,
+                        observation_digest: "a".repeat(64),
+                    },
+                },
+            );
+        }
+        assert_eq!(
+            api.adaptive_subscription_queue_priority(&selected).unwrap(),
+            None
+        );
+        assert_eq!(
+            api.provider_usage_binding_for_agent(AgentId(6))
+                .unwrap()
+                .unwrap()
+                .reservation_id,
+            other.reservation_id
+        );
+        assert_eq!(
+            api.core
+                .adaptive_session(binding.grant.session_id, &binding.grant.authority)
+                .unwrap()
+                .unwrap(),
+            session
+        );
+    }
+
+    #[test]
+    fn adaptive_work_queue_reads_session_state_and_skips_blocked_head() {
+        use sentinel_workflow::{AdaptiveEffectV1, AdaptiveModelDecisionV1, AdaptiveTransitionV1};
+        let temp = tempfile::tempdir().unwrap();
+        let (api, binding, _) = configured_adaptive_test_api(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+        );
+        let other = assign_test_work_from(&api, Some(1), 100);
+        let selected = api
+            .provider_usage_binding_for_agent(AgentId(6))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.reservation_id, binding.grant.provider_allowance_id);
+        let before = api
+            .core
+            .adaptive_session(binding.grant.session_id, &binding.grant.authority)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            api.adaptive_subscription_queue_priority(&selected).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            api.core
+                .adaptive_session(binding.grant.session_id, &binding.grant.authority)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        let effect = AdaptiveEffectV1 {
+            id: binding.effect_id,
+            request_digest: "d".repeat(64),
+        };
+        let (_, pending) = api
+            .store
+            .advance_adaptive_session(
+                binding.grant.session_id,
+                before.version,
+                Uuid::new_v4(),
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect.clone(),
+                    previous_observation_digest: None,
+                },
+                &binding.grant.authority,
+                now_unix_ms(),
+            )
+            .unwrap();
+        assert_eq!(
+            api.adaptive_subscription_queue_priority(&selected).unwrap(),
+            Some(1)
+        );
+        let (_, blocked) = api
+            .store
+            .advance_adaptive_session(
+                binding.grant.session_id,
+                pending.version,
+                Uuid::new_v4(),
+                &AdaptiveTransitionV1::ResolveModel {
+                    effect,
+                    result_digest: "e".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Blocked {
+                        reason_code: "dependency_unavailable".to_owned(),
+                    },
+                },
+                &binding.grant.authority,
+                now_unix_ms(),
+            )
+            .unwrap();
+        assert_eq!(
+            api.adaptive_subscription_queue_priority(&selected).unwrap(),
+            None
+        );
+        assert_eq!(
+            api.provider_usage_binding_for_agent(AgentId(6))
+                .unwrap()
+                .unwrap()
+                .reservation_id,
+            other.reservation_id
+        );
+        assert_eq!(
+            api.core
+                .adaptive_session(binding.grant.session_id, &binding.grant.authority)
+                .unwrap()
+                .unwrap(),
+            blocked,
+            "queue selection must not reconcile tools or modify a blocked session"
+        );
+    }
+
+    #[test]
+    fn subscription_work_context_is_exact_across_other_jobs_and_store_reopen() {
+        use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let mut api = configured_test_api(&path);
+        api.event_store = Some(
+            sentinel_limbo::EventStore::open(temp.path().join("events.sqlite").to_str().unwrap())
+                .unwrap(),
+        );
+        let first = assign_test_work_from(&api, Some(1), 0);
+        let before = api.prepare_model_work(&first).unwrap().unwrap();
+        let second = assign_test_work_from(&api, Some(1), 100);
+        let other = api.prepare_model_work(&second).unwrap().unwrap();
+        let selected = api
+            .provider_usage_binding_for_agent(AgentId(6))
+            .unwrap()
+            .unwrap();
+        let unselected = if selected.reservation_id == first.reservation_id {
+            &second
+        } else {
+            &first
+        };
+        let request_id = format!("company-provider-{}", unselected.reservation_id);
+        assert!(api
+            .provider_dispatch_is_definitively_absent(
+                &unselected.clone().into(),
+                &request_id,
+                &"d".repeat(64)
+            )
+            .unwrap());
+        let unselected_context = api.prepare_model_work(unselected).unwrap().unwrap();
+        api.event_store
+            .as_ref()
+            .unwrap()
+            .reserve_llm_request(&request_id, &"d".repeat(64), &AgentId(6).to_string())
+            .unwrap();
+        let grant = unselected.subscription_grant.as_ref().unwrap();
+        let dispatch = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1, "allowance_id": unselected.reservation_id,
+            "agent_id": 6, "request_id": request_id, "request_digest": "d".repeat(64),
+            "context_digest": format!("{:x}", Sha256::digest(serde_json::to_vec(&unselected_context).unwrap())),
+            "provider": grant.provider, "model": grant.model, "catalog_digest": grant.catalog_digest,
+        })).unwrap();
+        assert_eq!(
+            api.subscription_dispatch(&dispatch).status,
+            403,
+            "exact context preparation is not permission to dispatch unselected work"
+        );
+        assert!(api
+            .provider_dispatch_is_definitively_absent(
+                &unselected.clone().into(),
+                &request_id,
+                &"d".repeat(64)
+            )
+            .unwrap());
+        assert_eq!(api.prepare_model_work(&first).unwrap().unwrap(), before);
+        drop(api);
+        let restored = configured_test_api(&path);
+        assert_eq!(
+            restored.prepare_model_work(&first).unwrap().unwrap(),
+            before
+        );
+        assert_eq!(
+            restored.prepare_model_work(&second).unwrap().unwrap(),
+            other
+        );
+        let mut tampered = second;
+        tampered.assignment_version += 1;
+        assert_eq!(
+            restored.prepare_model_work(&tampered).unwrap_err(),
+            "model work reservation changed"
+        );
+    }
+
+    #[test]
+    fn subscription_work_queue_retains_consumed_work_and_orders_recovery_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = configured_test_api(&temp.path().join("company.sqlite"));
+        let first = assign_test_work_from(&api, Some(1), 0);
+        let second = assign_test_work_from(&api, Some(1), 100);
+        let now = now_unix_ms();
+        let mut projects = api.store.company_projects().unwrap();
+        for project in &mut projects {
+            let allowance = project.subscription_call.as_mut().unwrap();
+            allowance.created_at_unix_ms = if project.project_id.0 == first.project_id {
+                1
+            } else {
+                2
+            };
+            allowance.grant.expires_at_unix_ms = now + 60_000;
+        }
+        let second_project = projects
+            .iter_mut()
+            .find(|project| project.project_id.0 == second.project_id)
+            .unwrap();
+        let second_allowance = second_project.subscription_call.as_mut().unwrap();
+        let second_request = format!("company-provider-{}", second.reservation_id);
+        second_allowance.dispatch = Some(sentinel_workflow::SubscriptionCallDispatchV1 {
+            request_id: second_request.clone(),
+            request_digest: "d".repeat(64),
+            dispatched_at_unix_ms: now,
+        });
+        let before = serde_json::to_vec(&projects).unwrap();
+        assert_eq!(
+            select_actionable_subscription_allowance_id(&projects, AgentId(6), now, |_| Ok(false)),
+            Ok(Some(second.reservation_id.as_str())),
+            "a consumed call keeps its identity ahead of undispatched work"
+        );
+        assert_eq!(serde_json::to_vec(&projects).unwrap(), before);
+        projects
+            .iter_mut()
+            .find(|project| project.project_id.0 == first.project_id)
+            .unwrap()
+            .subscription_call
+            .as_mut()
+            .unwrap()
+            .dispatch = Some(sentinel_workflow::SubscriptionCallDispatchV1 {
+            request_id: "first-recovery".to_owned(),
+            request_digest: "e".repeat(64),
+            dispatched_at_unix_ms: now,
+        });
+        for project in &mut projects {
+            project
+                .subscription_call
+                .as_mut()
+                .unwrap()
+                .grant
+                .expires_at_unix_ms = now - 1;
+        }
+        let expected = projects
+            .iter()
+            .min_by_key(|project| {
+                project
+                    .subscription_call
+                    .as_ref()
+                    .unwrap()
+                    .created_at_unix_ms
+            })
+            .unwrap()
+            .subscription_call
+            .as_ref()
+            .unwrap()
+            .allowance_id
+            .clone();
+        projects.reverse();
+        assert_eq!(
+            select_actionable_subscription_allowance_id(&projects, AgentId(6), now, |_| Ok(true)),
+            Ok(Some(expected.as_str())),
+            "multiple persisted completions are drained deterministically, including after expiry"
+        );
+        assert_eq!(
+            select_actionable_subscription_allowance_id(&projects, AgentId(6), now, |_| Err(
+                "recovery store unavailable"
+            )),
+            Err("recovery store unavailable")
+        );
+        projects.push(projects[0].clone());
+        assert_eq!(
+            select_actionable_subscription_allowance_id(&projects, AgentId(6), now, |_| Ok(true)),
+            Err("agent has ambiguous provider usage authority"),
+            "queue ordering never authorizes duplicated grants"
         );
     }
 
