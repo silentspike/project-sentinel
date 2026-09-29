@@ -3569,6 +3569,27 @@ pub fn validate_qa_evidence_graph(
     qa_authority: &PrincipalV1,
     now_ms: u64,
 ) -> Result<(), DeliveryError> {
+    validate_qa_graph(plan, run_ref, graph, qa_authority, Some(now_ms))
+}
+
+// Only for immutable, already admitted outcomes. Original import admission
+// checked expiry; recognition is not another authorization or clock boundary.
+pub(super) fn validate_recorded_qa_evidence_graph(
+    plan: &QaEvaluationPlanV1,
+    run_ref: &VersionedRefV1,
+    graph: &QaEvidenceGraphV1,
+    qa_authority: &PrincipalV1,
+) -> Result<(), DeliveryError> {
+    validate_qa_graph(plan, run_ref, graph, qa_authority, None)
+}
+
+fn validate_qa_graph(
+    plan: &QaEvaluationPlanV1,
+    run_ref: &VersionedRefV1,
+    graph: &QaEvidenceGraphV1,
+    qa_authority: &PrincipalV1,
+    admission_time_ms: Option<u64>,
+) -> Result<(), DeliveryError> {
     validate_qa_plan(plan)?;
     if graph.schema_version != DELIVERY_SCHEMA_V1
         || graph.run != *run_ref
@@ -3799,7 +3820,8 @@ pub fn validate_qa_evidence_graph(
             || !canonical_id(&disposition.disposition_id)
             || disposition.owner != *qa_authority
             || disposition.policy_revision != plan.generation
-            || disposition.expires_at_ms <= now_ms
+            || disposition.expires_at_ms == 0
+            || admission_time_ms.is_some_and(|now_ms| disposition.expires_at_ms <= now_ms)
             || result.disposition.as_ref().map(|value| value.id.as_str())
                 != Some(disposition.disposition_id.as_str())
             || !legal_flake_disposition(result.outcome, disposition)
@@ -3852,7 +3874,7 @@ pub fn qa_case_result_binding_digest(
     ContentDigest::of_domain("qa-case-result-binding", DELIVERY_SCHEMA_V1, &binding)
 }
 
-fn validate_evidence_outcome(
+pub(super) fn validate_evidence_outcome(
     receipt: &WorkbenchEvidenceReceiptV1,
     graph: &QaEvidenceGraphV1,
 ) -> Result<(), DeliveryError> {

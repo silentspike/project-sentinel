@@ -1394,6 +1394,1074 @@ fn preview_receipt(
     .unwrap()
 }
 
+fn settled_delivery_fixture(state: DeliveryState) -> DeliveryAggregateV1 {
+    let (mut aggregate, release) = active_release_aggregate();
+    aggregate.revision = 1;
+    aggregate.candidates.get_mut("candidate-5").unwrap().state = CandidateState::Promoted;
+    let qa_run = aggregate.qa_runs.get_mut("run-release-preview").unwrap();
+    qa_run.durable_event_generation = 1;
+    qa_run.started_at_ms = Some(100);
+    qa_run.finished_at_ms = Some(150);
+    qa_run.attempts = 1;
+    qa_run.case_attempt_history_digest = Some(digest("case-history"));
+    qa_run.harness_outcome = Some(QaHarnessOutcome::Pass);
+    qa_run.cleanup_receipt = Some(reference("cleanup-settled", 1));
+    qa_run.aggregate_outcomes = Some(QaAggregateOutcomesV1 {
+        required_cases_complete: true,
+        contaminated: false,
+        needs_human_review: false,
+        flaky_unresolved: false,
+    });
+    let run_ref = VersionedRefV1 {
+        id: qa_run.run_id.clone(),
+        generation: qa_run.generation,
+        digest: qa_run.request_digest.clone(),
+    };
+    let mut workbench = WorkbenchEvidenceReceiptV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        invocation: reference("invocation-settled", 1),
+        assignment: run_ref.clone(),
+        qa_run: run_ref.clone(),
+        assigned_qa: principal("qa-1", AuthorityRole::Qa),
+        authority_receipt_digest: digest("historical-qa-authority"),
+        authority_identity_digest: digest("historical-qa-identity"),
+        input_digest: digest("settled-input"),
+        output_digest: digest("settled-output"),
+        artifact_ownership_digest: digest("settled-ownership"),
+        result_inventory_digest: ContentDigest::zero(),
+        logs_digest: digest("settled-logs"),
+        screenshots_digest: None,
+        failure_classification_digest: digest("settled-failures"),
+        harness_outcome: QaHarnessOutcome::Pass,
+        required_cases_complete: true,
+        contaminated: false,
+        needs_human_review: false,
+        flaky_unresolved: false,
+        cleanup_receipt: reference("cleanup-settled", 1),
+        receipt_digest: ContentDigest::zero(),
+    };
+    let plan_digest = &aggregate.qa_plans["plan-release-preview"].plan_digest;
+    workbench.result_inventory_digest =
+        qa_evidence_inventory_digest(&evidence_graph(&run_ref, plan_digest, &workbench)).unwrap();
+    workbench = workbench.seal().unwrap();
+    let graph = evidence_graph(&run_ref, plan_digest, &workbench);
+    aggregate
+        .qa_runs
+        .get_mut("run-release-preview")
+        .unwrap()
+        .case_attempt_history_digest = Some(qa_case_attempt_history_digest(&graph).unwrap());
+    let gate = aggregate.gates.get_mut("gate-release-preview").unwrap();
+    gate.case_inventory_digest = qa_case_inventory_digest(&graph).unwrap();
+    gate.deterministic_evidence_digest = qa_deterministic_evidence_digest(&graph).unwrap();
+    gate.source_evidence_digest = qa_source_evidence_digest(&graph).unwrap();
+    aggregate
+        .manifests
+        .get_mut("manifest-preview")
+        .unwrap()
+        .qa_evidence_digest = graph.graph_digest.clone();
+    aggregate
+        .workbench_receipts
+        .insert(workbench.invocation.id.clone(), workbench);
+    aggregate
+        .evidence_graphs
+        .insert(graph.run.id.clone(), graph);
+    if state == DeliveryState::Accepted {
+        insert_accepted_delivery_fixture(
+            &mut aggregate,
+            &release,
+            "delivery-settled",
+            "acceptance-settled",
+        );
+    } else {
+        let mut receipt = preview_receipt("delivery-settled", &release, 100, 1_000);
+        receipt.state = DeliveryState::Delivered;
+        receipt = receipt.seal().unwrap();
+        receipt.state = state;
+        aggregate
+            .deliveries
+            .insert(receipt.delivery_id.clone(), receipt);
+    }
+    aggregate
+        .deliveries
+        .get_mut("delivery-settled")
+        .unwrap()
+        .preview_digest = ContentDigest::of_domain(
+        "m0-preview",
+        DELIVERY_SCHEMA_V1,
+        &aggregate.manifests["manifest-preview"].source_digest,
+    )
+    .unwrap();
+    reseal_settled_fixture(&mut aggregate);
+    validate_delivery_aggregate_references(&aggregate).unwrap();
+    aggregate
+}
+
+// Keep deliberately nonmatching records internally sealed and references current,
+// so negative proof cases are distinct from the corruption cases below.
+fn reseal_settled_fixture(aggregate: &mut DeliveryAggregateV1) {
+    let previous_graph_digests: BTreeSet<_> = aggregate
+        .evidence_graphs
+        .values()
+        .map(|graph| graph.graph_digest.clone())
+        .collect();
+    for candidate in aggregate.candidates.values_mut() {
+        let state = candidate.state;
+        candidate.state = CandidateState::Draft;
+        candidate.candidate_digest = candidate.computed_digest().unwrap();
+        candidate.state = state;
+    }
+    for plan in aggregate.qa_plans.values_mut() {
+        let candidate = &aggregate.candidates[&plan.candidate.id];
+        plan.candidate = VersionedRefV1 {
+            id: candidate.candidate_id.clone(),
+            generation: candidate.generation,
+            digest: candidate.candidate_digest.clone(),
+        };
+        plan.plan_digest = plan.computed_digest().unwrap();
+    }
+    for receipt in aggregate.workbench_receipts.values_mut() {
+        receipt.receipt_digest = receipt.computed_digest().unwrap();
+    }
+    for graph in aggregate.evidence_graphs.values_mut() {
+        let receipt = &aggregate.workbench_receipts[&graph.workbench_receipt.id];
+        graph.workbench_receipt.digest = receipt.receipt_digest.clone();
+        graph.graph_digest = graph.computed_digest().unwrap();
+    }
+    for gate in aggregate.gates.values_mut() {
+        let candidate = &aggregate.candidates[&gate.candidate.id];
+        gate.candidate = VersionedRefV1 {
+            id: candidate.candidate_id.clone(),
+            generation: candidate.generation,
+            digest: candidate.candidate_digest.clone(),
+        };
+        let plan = &aggregate.qa_plans[&gate.plan.id];
+        gate.plan = VersionedRefV1 {
+            id: plan.plan_id.clone(),
+            generation: plan.generation,
+            digest: plan.plan_digest.clone(),
+        };
+    }
+    for manifest in aggregate.manifests.values_mut() {
+        let candidate = &aggregate.candidates[&manifest.candidate.id];
+        manifest.candidate = VersionedRefV1 {
+            id: candidate.candidate_id.clone(),
+            generation: candidate.generation,
+            digest: candidate.candidate_digest.clone(),
+        };
+        let gate = aggregate.gates.get_mut(&manifest.qa_gate.id).unwrap();
+        if previous_graph_digests.contains(&manifest.qa_evidence_digest) {
+            if let Some(graph) = aggregate.evidence_graphs.values().find(|graph| {
+                aggregate.qa_runs.get(&graph.run.id).is_some_and(|run| {
+                    run.gate_receipt
+                        .as_ref()
+                        .is_some_and(|reference| reference.id == manifest.qa_gate.id)
+                })
+            }) {
+                manifest.qa_evidence_digest = graph.graph_digest.clone();
+            }
+        }
+        gate.release_manifest_digest = manifest.gate_input_digest().unwrap();
+        manifest.qa_gate = VersionedRefV1 {
+            id: gate.gate_id.clone(),
+            generation: gate.generation,
+            digest: ContentDigest::of_domain("qa-release-gate", DELIVERY_SCHEMA_V1, gate).unwrap(),
+        };
+        manifest.manifest_digest = manifest.computed_digest().unwrap();
+    }
+    for run in aggregate.qa_runs.values_mut() {
+        let plan = &aggregate.qa_plans[&run.plan.id];
+        run.plan = VersionedRefV1 {
+            id: plan.plan_id.clone(),
+            generation: plan.generation,
+            digest: plan.plan_digest.clone(),
+        };
+        if let Some(reference) = &mut run.gate_receipt {
+            let gate = &aggregate.gates[&reference.id];
+            *reference = VersionedRefV1 {
+                id: gate.gate_id.clone(),
+                generation: gate.generation,
+                digest: ContentDigest::of_domain("qa-release-gate", DELIVERY_SCHEMA_V1, gate)
+                    .unwrap(),
+            };
+        }
+    }
+    for release in aggregate.releases.values_mut() {
+        let manifest = &aggregate.manifests[&release.manifest.id];
+        release.manifest = VersionedRefV1 {
+            id: manifest.manifest_id.clone(),
+            generation: manifest.generation,
+            digest: manifest.manifest_digest.clone(),
+        };
+    }
+    for receipt in aggregate.deliveries.values_mut() {
+        receipt.release = versioned_release(&aggregate.releases[&receipt.release.id]);
+        let state = receipt.state;
+        receipt.state = DeliveryState::Delivered;
+        receipt.receipt_digest = receipt.computed_digest().unwrap();
+        receipt.state = state;
+    }
+    for acceptance in aggregate.acceptances.values_mut() {
+        let receipt = &aggregate.deliveries[&acceptance.delivery.id];
+        acceptance.delivery = VersionedRefV1 {
+            id: receipt.delivery_id.clone(),
+            generation: receipt.generation,
+            digest: receipt.receipt_digest.clone(),
+        };
+        acceptance.release = receipt.release.clone();
+        acceptance.acceptance_digest = acceptance.computed_digest().unwrap();
+    }
+}
+
+#[test]
+fn settled_delivery_proof_is_pure_for_delivered_and_accepted_lineage() {
+    for state in [DeliveryState::Delivered, DeliveryState::Accepted] {
+        let aggregate = settled_delivery_fixture(state);
+        let before = aggregate.clone();
+        // No store, runner, integration/effect port, model, clock, or admission
+        // exists in this test. Repeated recognition cannot execute new work.
+        for _ in 0..3 {
+            assert!(settled_delivery_matches(
+                &aggregate,
+                &reference("project-1", 4),
+                &reference("agreement-1", 3),
+                &digest("work-items"),
+                "customer-1",
+            )
+            .unwrap());
+            assert_eq!(aggregate, before);
+        }
+        assert_eq!(
+            aggregate.acceptances.is_empty(),
+            state == DeliveryState::Delivered
+        );
+    }
+}
+
+#[test]
+fn settled_delivery_stays_settled_after_preview_access_and_gate_expiry() {
+    let mut aggregate = settled_delivery_fixture(DeliveryState::Delivered);
+    let receipt = &aggregate.deliveries["delivery-settled"];
+    let release = &aggregate.releases["release-preview"];
+    let access = PreviewAccessV1 {
+        schema_version: DELIVERY_SCHEMA_V1,
+        access_id: "expired-access".to_string(),
+        generation: 1,
+        tenant_id: aggregate.tenant_id.clone(),
+        project_id: aggregate.project_id.clone(),
+        delivery: VersionedRefV1 {
+            id: receipt.delivery_id.clone(),
+            generation: receipt.generation,
+            digest: receipt.receipt_digest.clone(),
+        },
+        release: receipt.release.clone(),
+        manifest: release.manifest.clone(),
+        customer: principal("customer-1", AuthorityRole::Customer),
+        preview_digest: receipt.preview_digest.clone(),
+        preview_ttl_policy_version: DELIVERY_PREVIEW_TTL_POLICY_V1,
+        issued_at_ms: 100,
+        expires_at_ms: 1_000,
+        access_digest: ContentDigest::zero(),
+    }
+    .seal()
+    .unwrap();
+    let delivery_ref = access.delivery.clone();
+    let release_ref = access.release.clone();
+    let access_ref = access.reference();
+    aggregate
+        .preview_access
+        .insert("delivery-settled".to_string(), access);
+    let before = aggregate.clone();
+    assert!(authorize_delivery_preview(
+        &aggregate,
+        &principal("customer-1", AuthorityRole::Customer),
+        &delivery_ref,
+        &release_ref,
+        Some(&access_ref),
+        2_000,
+    )
+    .is_err());
+    assert!(settled_delivery_matches(
+        &aggregate,
+        &reference("project-1", 4),
+        &reference("agreement-1", 3),
+        &digest("work-items"),
+        "customer-1",
+    )
+    .unwrap());
+    assert_eq!(aggregate, before);
+    assert_eq!(
+        aggregate.deliveries["delivery-settled"].state,
+        DeliveryState::Delivered
+    );
+    assert!(aggregate.acceptances.is_empty());
+}
+
+#[test]
+fn settled_delivery_rejects_nonmatching_expected_lineage() {
+    type Mutation = fn(&mut VersionedRefV1, &mut VersionedRefV1, &mut ContentDigest, &mut String);
+    let cases: &[(&str, Mutation)] = &[
+        ("project ID", |project, _, _, _| {
+            project.id = "other-project".to_string()
+        }),
+        ("project version", |project, _, _, _| {
+            project.generation += 1
+        }),
+        ("project digest", |project, _, _, _| {
+            project.digest = digest("other-project")
+        }),
+        ("project zero version", |project, _, _, _| {
+            project.generation = 0
+        }),
+        ("project overflow", |project, _, _, _| {
+            project.generation = u64::MAX
+        }),
+        ("agreement ID", |_, agreement, _, _| {
+            agreement.id = "other-agreement".to_string()
+        }),
+        ("agreement version", |_, agreement, _, _| {
+            agreement.generation += 1
+        }),
+        ("agreement digest", |_, agreement, _, _| {
+            agreement.digest = digest("other-agreement")
+        }),
+        ("work items", |_, _, work, _| *work = digest("other-work")),
+        ("customer", |_, _, _, customer| {
+            *customer = "other-customer".to_string()
+        }),
+        ("missing customer", |_, _, _, customer| customer.clear()),
+    ];
+    let aggregate = settled_delivery_fixture(DeliveryState::Delivered);
+    let before = aggregate.clone();
+    for (label, mutate) in cases {
+        let mut project = reference("project-1", 4);
+        let mut agreement = reference("agreement-1", 3);
+        let mut work = digest("work-items");
+        let mut customer = "customer-1".to_string();
+        mutate(&mut project, &mut agreement, &mut work, &mut customer);
+        assert!(
+            !settled_delivery_matches(&aggregate, &project, &agreement, &work, &customer).unwrap(),
+            "{label}"
+        );
+        assert_eq!(aggregate, before, "{label}");
+    }
+    let empty = DeliveryAggregateV1::new("tenant-a", "project-1");
+    assert!(!settled_delivery_matches(
+        &empty,
+        &reference("project-1", 4),
+        &reference("agreement-1", 3),
+        &digest("work-items"),
+        "customer-1",
+    )
+    .unwrap());
+}
+
+#[test]
+fn settled_delivery_rejects_unsettled_or_differently_bound_records() {
+    type Mutation = fn(&mut DeliveryAggregateV1);
+    let cases: &[(&str, Mutation)] = &[
+        ("missing delivery", |a| a.deliveries.clear()),
+        ("missing active release", |a| a.active_release_id = None),
+        ("preview only", |a| {
+            a.deliveries.get_mut("delivery-settled").unwrap().state = DeliveryState::PreviewReady
+        }),
+        ("rejected", |a| {
+            a.deliveries.get_mut("delivery-settled").unwrap().state = DeliveryState::Rejected
+        }),
+        ("rework", |a| {
+            a.deliveries.get_mut("delivery-settled").unwrap().state =
+                DeliveryState::ChangesRequested
+        }),
+        ("expired receipt", |a| {
+            a.deliveries.get_mut("delivery-settled").unwrap().state = DeliveryState::Expired
+        }),
+        ("unpromoted", |a| {
+            a.candidates.get_mut("candidate-5").unwrap().state = CandidateState::GatePassed
+        }),
+        ("superseded candidate", |a| {
+            a.candidates.get_mut("candidate-5").unwrap().state = CandidateState::Superseded
+        }),
+        ("candidate generation", |a| {
+            a.candidates.get_mut("candidate-5").unwrap().generation = 6
+        }),
+        ("candidate agreement", |a| {
+            a.candidates.get_mut("candidate-5").unwrap().agreement = reference("other-agreement", 3)
+        }),
+        ("candidate work", |a| {
+            a.candidates
+                .get_mut("candidate-5")
+                .unwrap()
+                .work_items_digest = digest("other-work")
+        }),
+        ("manifest project version", |a| {
+            a.manifests
+                .get_mut("manifest-preview")
+                .unwrap()
+                .project
+                .generation += 1
+        }),
+        ("manifest project digest", |a| {
+            a.manifests
+                .get_mut("manifest-preview")
+                .unwrap()
+                .project
+                .digest = digest("other-project")
+        }),
+        ("manifest agreement", |a| {
+            a.manifests.get_mut("manifest-preview").unwrap().agreement =
+                reference("other-agreement", 3)
+        }),
+        ("manifest work", |a| {
+            a.manifests
+                .get_mut("manifest-preview")
+                .unwrap()
+                .work_items_digest = digest("other-work")
+        }),
+        ("QA plan project", |a| {
+            a.qa_plans
+                .get_mut("plan-release-preview")
+                .unwrap()
+                .project
+                .generation += 1
+        }),
+        ("QA plan work", |a| {
+            a.qa_plans
+                .get_mut("plan-release-preview")
+                .unwrap()
+                .work_items_digest = digest("other-work")
+        }),
+        ("QA plan agreement", |a| {
+            a.qa_plans
+                .get_mut("plan-release-preview")
+                .unwrap()
+                .agreement = reference("other-agreement", 3)
+        }),
+        ("QA unassigned", |a| {
+            a.qa_runs
+                .get_mut("run-release-preview")
+                .unwrap()
+                .actors
+                .clear()
+        }),
+        ("QA differently assigned", |a| {
+            a.qa_runs.get_mut("run-release-preview").unwrap().actors =
+                vec![principal("other-qa", AuthorityRole::Qa)]
+        }),
+        ("QA multiple assigned", |a| {
+            a.qa_runs
+                .get_mut("run-release-preview")
+                .unwrap()
+                .actors
+                .push(principal("other-qa", AuthorityRole::Qa))
+        }),
+        ("QA authority generation", |a| {
+            a.gates
+                .get_mut("gate-release-preview")
+                .unwrap()
+                .actor
+                .authority_generation = 0
+        }),
+        ("QA role", |a| {
+            a.gates
+                .get_mut("gate-release-preview")
+                .unwrap()
+                .actor
+                .roles
+                .clear()
+        }),
+        ("QA incomplete", |a| {
+            a.qa_runs.get_mut("run-release-preview").unwrap().state = QaRunState::Running
+        }),
+        ("QA failed", |a| {
+            a.qa_runs.get_mut("run-release-preview").unwrap().state = QaRunState::CompletedFail
+        }),
+        ("QA harness fail", |a| {
+            a.qa_runs
+                .get_mut("run-release-preview")
+                .unwrap()
+                .harness_outcome = Some(QaHarnessOutcome::Fail)
+        }),
+        ("QA incomplete cases", |a| {
+            a.qa_runs
+                .get_mut("run-release-preview")
+                .unwrap()
+                .aggregate_outcomes
+                .as_mut()
+                .unwrap()
+                .required_cases_complete = false
+        }),
+        ("QA cleanup missing", |a| {
+            a.qa_runs
+                .get_mut("run-release-preview")
+                .unwrap()
+                .cleanup_receipt = None
+        }),
+        ("QA missing graph", |a| a.evidence_graphs.clear()),
+        ("QA manifest evidence", |a| {
+            a.manifests
+                .get_mut("manifest-preview")
+                .unwrap()
+                .qa_evidence_digest = digest("other-graph")
+        }),
+        ("QA case inventory", |a| {
+            a.gates
+                .get_mut("gate-release-preview")
+                .unwrap()
+                .case_inventory_digest = digest("other-cases")
+        }),
+        ("QA deterministic inventory", |a| {
+            a.gates
+                .get_mut("gate-release-preview")
+                .unwrap()
+                .deterministic_evidence_digest = digest("other-deterministic")
+        }),
+        ("QA source inventory", |a| {
+            a.gates
+                .get_mut("gate-release-preview")
+                .unwrap()
+                .source_evidence_digest = digest("other-sources")
+        }),
+        ("QA workbench inventory", |a| {
+            a.workbench_receipts
+                .get_mut("invocation-settled")
+                .unwrap()
+                .result_inventory_digest = digest("other-inventory")
+        }),
+        ("QA workbench assignment", |a| {
+            a.workbench_receipts
+                .get_mut("invocation-settled")
+                .unwrap()
+                .assigned_qa = principal("other-qa", AuthorityRole::Qa)
+        }),
+        ("gate failed", |a| {
+            a.gates.get_mut("gate-release-preview").unwrap().passed = false
+        }),
+        ("gate zero validity window", |a| {
+            let gate = a.gates.get_mut("gate-release-preview").unwrap();
+            gate.expires_at_ms = gate.issued_at_ms;
+        }),
+        ("gate negative validity window", |a| {
+            let gate = a.gates.get_mut("gate-release-preview").unwrap();
+            gate.expires_at_ms = gate.issued_at_ms - 1;
+        }),
+        ("release approved", |a| {
+            a.releases.get_mut("release-preview").unwrap().state = ReleaseState::Approved
+        }),
+        ("release superseded", |a| {
+            a.releases.get_mut("release-preview").unwrap().state = ReleaseState::Superseded
+        }),
+        ("rollback", |a| {
+            a.releases.get_mut("release-preview").unwrap().state = ReleaseState::RolledBack
+        }),
+        ("receipt customer", |a| {
+            a.deliveries
+                .get_mut("delivery-settled")
+                .unwrap()
+                .customer_principal_id = "other-customer".to_string()
+        }),
+    ];
+    for (label, mutate) in cases {
+        let mut aggregate = settled_delivery_fixture(DeliveryState::Delivered);
+        mutate(&mut aggregate);
+        reseal_settled_fixture(&mut aggregate);
+        validate_delivery_aggregate_references(&aggregate).unwrap();
+        let before = aggregate.clone();
+        assert!(
+            !settled_delivery_matches(
+                &aggregate,
+                &reference("project-1", 4),
+                &reference("agreement-1", 3),
+                &digest("work-items"),
+                "customer-1",
+            )
+            .unwrap(),
+            "{label}"
+        );
+        assert_eq!(aggregate, before, "{label}");
+    }
+}
+
+#[test]
+fn settled_delivery_rejects_resealed_incomplete_or_false_pass_evidence() {
+    type Mutation = fn(&mut QaEvidenceGraphV1);
+    let cases: &[(&str, Mutation)] = &[
+        ("empty pass inventory", |graph| {
+            graph.case_results.clear();
+            graph.deterministic_results.clear();
+        }),
+        ("missing required result", |graph| {
+            graph.case_results.pop();
+        }),
+        ("pass without assertion", |graph| {
+            let result = &mut graph.case_results[0];
+            result.assertion_refs.clear();
+            let attempt = &mut result.attempt_history[0];
+            attempt.assertion_refs.clear();
+            attempt.attempt_digest = attempt.computed_digest().unwrap();
+        }),
+        ("assertion oracle substitution", |graph| {
+            let assertion = &mut graph.deterministic_results[0];
+            assertion.oracle_digest = digest("foreign-oracle");
+            let assertion_digest =
+                ContentDigest::of_domain("qa-deterministic-result", DELIVERY_SCHEMA_V1, assertion)
+                    .unwrap();
+            let result = &mut graph.case_results[0];
+            result.assertion_refs[0].digest = assertion_digest.clone();
+            let attempt = &mut result.attempt_history[0];
+            attempt.assertion_refs[0].digest = assertion_digest;
+            attempt.attempt_digest = attempt.computed_digest().unwrap();
+        }),
+        ("failed case under pass flags", |graph| {
+            let assertion = &mut graph.deterministic_results[0];
+            assertion.passed = false;
+            let assertion_digest =
+                ContentDigest::of_domain("qa-deterministic-result", DELIVERY_SCHEMA_V1, assertion)
+                    .unwrap();
+            let result = &mut graph.case_results[0];
+            result.outcome = QaCaseOutcome::Fail;
+            result.reason_code = QaCaseReasonCode::AssertionFailed;
+            result.assertion_refs[0].digest = assertion_digest.clone();
+            let attempt = &mut result.attempt_history[0];
+            attempt.outcome = QaCaseOutcome::Fail;
+            attempt.reason_code = QaCaseReasonCode::AssertionFailed;
+            attempt.assertion_refs[0].digest = assertion_digest;
+            attempt.attempt_digest = attempt.computed_digest().unwrap();
+        }),
+    ];
+    for (label, mutate) in cases {
+        let mut aggregate = settled_delivery_fixture(DeliveryState::Delivered);
+        let graph = aggregate
+            .evidence_graphs
+            .get_mut("run-release-preview")
+            .unwrap();
+        mutate(graph);
+        // Keep every digest and summary flag mutually consistent. Rejection
+        // must come from required coverage and result semantics, not stale seals.
+        aggregate
+            .workbench_receipts
+            .get_mut("invocation-settled")
+            .unwrap()
+            .result_inventory_digest = qa_evidence_inventory_digest(graph).unwrap();
+        aggregate
+            .qa_runs
+            .get_mut("run-release-preview")
+            .unwrap()
+            .case_attempt_history_digest = Some(qa_case_attempt_history_digest(graph).unwrap());
+        let gate = aggregate.gates.get_mut("gate-release-preview").unwrap();
+        gate.case_inventory_digest = qa_case_inventory_digest(graph).unwrap();
+        gate.deterministic_evidence_digest = qa_deterministic_evidence_digest(graph).unwrap();
+        gate.source_evidence_digest = qa_source_evidence_digest(graph).unwrap();
+        reseal_settled_fixture(&mut aggregate);
+        validate_delivery_aggregate_references(&aggregate).unwrap();
+        assert_eq!(
+            aggregate.manifests["manifest-preview"].qa_evidence_digest,
+            aggregate.evidence_graphs["run-release-preview"].graph_digest,
+            "{label}"
+        );
+        let before = aggregate.clone();
+        assert!(
+            settled_delivery_matches(
+                &aggregate,
+                &reference("project-1", 4),
+                &reference("agreement-1", 3),
+                &digest("work-items"),
+                "customer-1",
+            )
+            .is_err(),
+            "{label}"
+        );
+        assert_eq!(aggregate, before, "{label}");
+    }
+}
+
+#[test]
+fn settled_delivery_retains_resolved_flake_after_original_import_expiry() {
+    let mut aggregate = settled_delivery_fixture(DeliveryState::Delivered);
+    let plan = aggregate.qa_plans["plan-release-preview"].clone();
+    let graph = resolved_retry_graph(
+        aggregate.evidence_graphs["run-release-preview"].clone(),
+        &plan,
+    );
+    let qa = principal("qa-1", AuthorityRole::Qa);
+    // This exact graph was admissible before its disposition expired, but
+    // cannot be imported again at the later gate/recovery boundary.
+    validate_qa_evidence_graph(&plan, &graph.run, &graph, &qa, 150).unwrap();
+    assert!(matches!(
+        validate_qa_evidence_graph(&plan, &graph.run, &graph, &qa, 250),
+        Err(DeliveryError::StaleEvidence(_))
+    ));
+    aggregate
+        .workbench_receipts
+        .get_mut("invocation-settled")
+        .unwrap()
+        .result_inventory_digest = qa_evidence_inventory_digest(&graph).unwrap();
+    aggregate
+        .qa_runs
+        .get_mut("run-release-preview")
+        .unwrap()
+        .case_attempt_history_digest = Some(qa_case_attempt_history_digest(&graph).unwrap());
+    let gate = aggregate.gates.get_mut("gate-release-preview").unwrap();
+    gate.issued_at_ms = 250;
+    gate.case_inventory_digest = qa_case_inventory_digest(&graph).unwrap();
+    gate.deterministic_evidence_digest = qa_deterministic_evidence_digest(&graph).unwrap();
+    gate.flake_disposition_digest = qa_flake_disposition_digest(&graph).unwrap();
+    gate.source_evidence_digest = qa_source_evidence_digest(&graph).unwrap();
+    aggregate
+        .manifests
+        .get_mut("manifest-preview")
+        .unwrap()
+        .qa_evidence_digest = graph.graph_digest.clone();
+    aggregate
+        .evidence_graphs
+        .insert(graph.run.id.clone(), graph);
+    reseal_settled_fixture(&mut aggregate);
+    validate_delivery_aggregate_references(&aggregate).unwrap();
+    let before = aggregate.clone();
+    assert!(settled_delivery_matches(
+        &aggregate,
+        &reference("project-1", 4),
+        &reference("agreement-1", 3),
+        &digest("work-items"),
+        "customer-1",
+    )
+    .unwrap());
+    assert_eq!(aggregate, before);
+}
+
+#[test]
+fn settled_delivery_requires_independent_historical_qa() {
+    let mut aggregate = settled_delivery_fixture(DeliveryState::Delivered);
+    let self_qa = principal("developer", AuthorityRole::Qa);
+    aggregate
+        .qa_runs
+        .get_mut("run-release-preview")
+        .unwrap()
+        .actors = vec![self_qa.clone()];
+    aggregate
+        .gates
+        .get_mut("gate-release-preview")
+        .unwrap()
+        .actor = self_qa.clone();
+    aggregate
+        .workbench_receipts
+        .get_mut("invocation-settled")
+        .unwrap()
+        .assigned_qa = self_qa;
+    reseal_settled_fixture(&mut aggregate);
+    // Repair the graph/manifest binding as well: the only missing proof is
+    // separation of the implementer from the consistently assigned QA actor.
+    aggregate
+        .manifests
+        .get_mut("manifest-preview")
+        .unwrap()
+        .qa_evidence_digest = aggregate.evidence_graphs["run-release-preview"]
+        .graph_digest
+        .clone();
+    reseal_settled_fixture(&mut aggregate);
+    validate_delivery_aggregate_references(&aggregate).unwrap();
+    let before = aggregate.clone();
+    assert!(!settled_delivery_matches(
+        &aggregate,
+        &reference("project-1", 4),
+        &reference("agreement-1", 3),
+        &digest("work-items"),
+        "customer-1",
+    )
+    .unwrap());
+    assert_eq!(aggregate, before);
+}
+
+#[test]
+fn settled_delivery_requires_exact_acceptance_for_accepted_state() {
+    type Mutation = fn(&mut DeliveryAggregateV1);
+    let cases: &[(&str, Mutation)] = &[
+        ("no acceptance", |a| a.acceptances.clear()),
+        ("other customer", |a| {
+            a.acceptances
+                .get_mut("acceptance-settled")
+                .unwrap()
+                .customer
+                .principal_id = "other-customer".to_string()
+        }),
+        ("other tenant", |a| {
+            a.acceptances
+                .get_mut("acceptance-settled")
+                .unwrap()
+                .customer
+                .tenant_id = "other-tenant".to_string()
+        }),
+        ("no customer role", |a| {
+            a.acceptances
+                .get_mut("acceptance-settled")
+                .unwrap()
+                .customer
+                .roles
+                .clear()
+        }),
+        ("no customer authority", |a| {
+            a.acceptances
+                .get_mut("acceptance-settled")
+                .unwrap()
+                .customer
+                .authority_generation = 0
+        }),
+        ("other release", |a| {
+            a.acceptances.get_mut("acceptance-settled").unwrap().release =
+                versioned_release(&a.releases["release-other"])
+        }),
+        ("other receipt", |a| {
+            let receipt = &a.deliveries["delivery-other"];
+            a.acceptances
+                .get_mut("acceptance-settled")
+                .unwrap()
+                .delivery = VersionedRefV1 {
+                id: receipt.delivery_id.clone(),
+                generation: receipt.generation,
+                digest: receipt.receipt_digest.clone(),
+            };
+        }),
+    ];
+    for (label, mutate) in cases {
+        let mut aggregate = settled_delivery_fixture(DeliveryState::Accepted);
+        let (_, _, other) = insert_complete_release_fixture(
+            &mut aggregate,
+            candidate(6, &["developer"]),
+            "manifest-other",
+            "release-other",
+            2,
+            ReleaseState::Superseded,
+            Some(100),
+            "rollout-other",
+        );
+        let mut receipt = preview_receipt("delivery-other", &other, 100, 1_000);
+        receipt.state = DeliveryState::Delivered;
+        receipt = receipt.seal().unwrap();
+        receipt.state = DeliveryState::Rejected;
+        aggregate
+            .deliveries
+            .insert(receipt.delivery_id.clone(), receipt);
+        mutate(&mut aggregate);
+        for acceptance in aggregate.acceptances.values_mut() {
+            acceptance.acceptance_digest = acceptance.computed_digest().unwrap();
+        }
+        validate_delivery_aggregate_references(&aggregate).unwrap();
+        let before = aggregate.clone();
+        assert!(
+            !settled_delivery_matches(
+                &aggregate,
+                &reference("project-1", 4),
+                &reference("agreement-1", 3),
+                &digest("work-items"),
+                "customer-1",
+            )
+            .unwrap(),
+            "{label}"
+        );
+        assert_eq!(aggregate, before, "{label}");
+    }
+}
+
+#[test]
+fn settled_delivery_excludes_both_rollback_endpoints() {
+    for selected_is_source in [true, false] {
+        let mut aggregate = settled_delivery_fixture(DeliveryState::Delivered);
+        let (_, _, other) = insert_complete_release_fixture(
+            &mut aggregate,
+            candidate(6, &["developer"]),
+            "manifest-other",
+            "release-other",
+            2,
+            ReleaseState::RolledBack,
+            Some(100),
+            "rollout-other",
+        );
+        let selected_ref = versioned_release(&aggregate.releases["release-preview"]);
+        let other_ref = versioned_release(&other);
+        let (from_release, to_release) = if selected_is_source {
+            (selected_ref, other_ref)
+        } else {
+            (other_ref, selected_ref)
+        };
+        aggregate.rollbacks.insert(
+            "rollback-settled".to_string(),
+            RollbackV1 {
+                schema_version: DELIVERY_SCHEMA_V1,
+                rollback_id: "rollback-settled".to_string(),
+                generation: 1,
+                from_release,
+                to_release,
+                actor: principal("release-manager", AuthorityRole::ReleaseManager),
+                reason_digest: digest("rollback-reason"),
+                effect_receipt: Some(reference("rollback-effect", 1)),
+                created_at_ms: 200,
+            },
+        );
+        validate_delivery_aggregate_references(&aggregate).unwrap();
+        let before = aggregate.clone();
+        assert!(!settled_delivery_matches(
+            &aggregate,
+            &reference("project-1", 4),
+            &reference("agreement-1", 3),
+            &digest("work-items"),
+            "customer-1",
+        )
+        .unwrap());
+        assert_eq!(aggregate, before);
+    }
+}
+
+#[test]
+fn settled_delivery_requires_same_candidate_plan_run_and_manifest() {
+    type Mutation = fn(&mut DeliveryAggregateV1);
+    let cases: &[(&str, Mutation)] = &[
+        ("gate candidate", |a| {
+            a.gates
+                .get_mut("gate-release-preview")
+                .unwrap()
+                .candidate
+                .id = "candidate-6".to_string()
+        }),
+        ("gate plan", |a| {
+            a.gates.get_mut("gate-release-preview").unwrap().plan.id =
+                "plan-release-other".to_string()
+        }),
+        ("run plan", |a| {
+            a.qa_runs.get_mut("run-release-preview").unwrap().plan.id =
+                "plan-release-other".to_string()
+        }),
+        ("manifest candidate", |a| {
+            let artifacts = a.candidates["candidate-6"].artifacts.clone();
+            let manifest = a.manifests.get_mut("manifest-preview").unwrap();
+            manifest.candidate.id = "candidate-6".to_string();
+            manifest.artifacts = artifacts;
+        }),
+        ("release manifest", |a| {
+            a.releases.get_mut("release-preview").unwrap().manifest.id =
+                "manifest-other".to_string()
+        }),
+        ("receipt release", |a| {
+            a.deliveries.get_mut("delivery-settled").unwrap().release.id =
+                "release-other".to_string()
+        }),
+    ];
+    for (label, mutate) in cases {
+        let mut aggregate = settled_delivery_fixture(DeliveryState::Delivered);
+        insert_complete_release_fixture(
+            &mut aggregate,
+            candidate(6, &["developer"]),
+            "manifest-other",
+            "release-other",
+            2,
+            ReleaseState::Superseded,
+            Some(100),
+            "rollout-other",
+        );
+        mutate(&mut aggregate);
+        reseal_settled_fixture(&mut aggregate);
+        validate_delivery_aggregate_references(&aggregate).unwrap();
+        let before = aggregate.clone();
+        assert!(
+            !settled_delivery_matches(
+                &aggregate,
+                &reference("project-1", 4),
+                &reference("agreement-1", 3),
+                &digest("work-items"),
+                "customer-1",
+            )
+            .unwrap(),
+            "{label}"
+        );
+        assert_eq!(aggregate, before, "{label}");
+    }
+}
+
+#[test]
+fn settled_delivery_reports_corruption_even_for_nonmatching_requests() {
+    type Mutation = fn(&mut DeliveryAggregateV1);
+    let cases: &[(&str, Mutation)] = &[
+        ("aggregate schema", |a| a.schema_version += 1),
+        ("aggregate tenant", |a| {
+            a.tenant_id = "other-tenant".to_string()
+        }),
+        ("aggregate project", |a| {
+            a.project_id = "other-project".to_string()
+        }),
+        ("candidate tenant", |a| {
+            a.candidates.get_mut("candidate-5").unwrap().tenant_id = "other-tenant".to_string()
+        }),
+        ("manifest tenant", |a| {
+            a.manifests.get_mut("manifest-preview").unwrap().tenant_id = "other-tenant".to_string()
+        }),
+        ("delivery tenant", |a| {
+            a.deliveries.get_mut("delivery-settled").unwrap().tenant_id = "other-tenant".to_string()
+        }),
+        ("candidate schema", |a| {
+            a.candidates.get_mut("candidate-5").unwrap().schema_version += 1
+        }),
+        ("run schema", |a| {
+            a.qa_runs
+                .get_mut("run-release-preview")
+                .unwrap()
+                .schema_version += 1
+        }),
+        ("run generation", |a| {
+            a.qa_runs.get_mut("run-release-preview").unwrap().generation = 0
+        }),
+        ("candidate seal", |a| {
+            a.candidates
+                .get_mut("candidate-5")
+                .unwrap()
+                .candidate_digest = digest("corrupt")
+        }),
+        ("manifest seal", |a| {
+            a.manifests
+                .get_mut("manifest-preview")
+                .unwrap()
+                .manifest_digest = digest("corrupt")
+        }),
+        ("receipt seal", |a| {
+            a.deliveries
+                .get_mut("delivery-settled")
+                .unwrap()
+                .receipt_digest = digest("corrupt")
+        }),
+        ("missing release endpoint", |a| a.releases.clear()),
+        ("missing QA endpoint", |a| a.qa_plans.clear()),
+        ("orphan gate", |a| a.qa_runs.clear()),
+        ("stale canonical release", |a| {
+            a.deliveries
+                .get_mut("delivery-settled")
+                .unwrap()
+                .release
+                .digest = digest("noncanonical")
+        }),
+        ("corrupt map key", |a| {
+            let run = a.qa_runs.remove("run-release-preview").unwrap();
+            a.qa_runs.insert("wrong-key".to_string(), run);
+        }),
+    ];
+    for (label, mutate) in cases {
+        let mut aggregate = settled_delivery_fixture(DeliveryState::Delivered);
+        mutate(&mut aggregate);
+        let before = aggregate.clone();
+        for project in [reference("project-1", 4), reference("other-project", 4)] {
+            assert!(
+                matches!(
+                    settled_delivery_matches(
+                        &aggregate,
+                        &project,
+                        &reference("agreement-1", 3),
+                        &digest("work-items"),
+                        "customer-1",
+                    ),
+                    Err(DeliveryError::CorruptStore(_))
+                ),
+                "{label}"
+            );
+            assert_eq!(aggregate, before, "{label}");
+        }
+    }
+}
+
 #[test]
 fn unavailable_integration_fails_closed_without_preventing_store_startup() {
     let temp = TempDir::new().unwrap();
