@@ -1,5 +1,14 @@
 # Changelog
 
+- Give automated dependency proposals the repository's seven-section PR body
+  with pending verification claims instead of bypassing the quality gate
+  (#856).
+
+- Track Rust toolchain action digests on verified upstream master history while
+  retaining explicit Rust 1.97.1 inputs and human review for toolchain updates.
+  Cover both npm and Bun managers, serialize repository updater runs, and load
+  dependency policy once through repository configuration (#856).
+
 - Bind the scheduled dependency updater to this repository explicitly instead
   of returning success without inspecting any repository. Keep automatic
   repository discovery disabled and existing upgrade/review policy unchanged
