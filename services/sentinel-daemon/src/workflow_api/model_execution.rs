@@ -4801,6 +4801,62 @@ mod family_selection_tests {
     }
 
     #[test]
+    fn off_duty_unrelated_work_and_project_decisions_do_not_mask_sales_or_planning() {
+        use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
+
+        for planning in [false, true] {
+            for has_session in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let (api, sales) = tests::fixture(&temp.path().join("company.sqlite"));
+                let expected = if planning {
+                    ModelExecutionContext::ProjectPlanning(Box::new(accepted_context(
+                        &api, &sales, "python-project-v1",
+                    )))
+                } else {
+                    ModelExecutionContext::RequestSales(Box::new(sales))
+                };
+                let unrelated = super::super::model_work::assign_test_work_from(&api, Some(8), 1_000);
+                if has_session {
+                    assert!(api.adaptive_provider_authority(unrelated.agent_id).unwrap().is_some());
+                }
+                let leader = api.principals.principal("pm").unwrap();
+                let project = api.store.company_project(&leader.principal.tenant_id,
+                    &ProjectId::parse(&unrelated.project_id).unwrap()).unwrap().unwrap();
+                let response = api.store.apply_company_command(
+                    &leader.principal, Uuid::new_v4(),
+                    &CompanyWorkflowCommandV1::RecordDecision {
+                        project_id: project.project_id.clone(), expected_version: project.version,
+                        work_item_id: None, choice_ref: "Independent project decision".into(),
+                        rationale_ref: "No change to another project's inference authority".into(),
+                    }, now_unix_ms(),
+                ).unwrap();
+                let CompanyWorkflowResponseV1::Project(updated) = response.response else {
+                    panic!("independent project decision");
+                };
+                api.authority.as_ref().unwrap().runtime_health.write().unwrap().agents
+                    .iter_mut().find(|agent| agent.agent_id == unrelated.agent_id.0)
+                    .unwrap().expected_active = false;
+                assert_eq!(api.review_sessions(&updated).unwrap().len(), usize::from(has_session));
+                {
+                    let _fence = api.mutation_fence.write().unwrap();
+                    api.reconcile_unknown_adaptive_models(&updated).unwrap();
+                    assert!(!api.reconcile_adaptive_leadership_reviews(&updated).unwrap());
+                }
+                let target = expected.binding();
+                assert!(api.is_provider_usage_candidate(target.agent_id()).unwrap());
+                assert_eq!(api.resolve_provider_usage_authority(target.agent_id()).unwrap(), Some(target.clone()));
+                assert_eq!(api.model_work_context(&target).unwrap(), Some(expected.clone()));
+                assert_eq!(api.store.company_project(&updated.tenant_id, &updated.project_id).unwrap(), Some((*updated).clone()));
+                // Discovery must not make the actual target's duty check optional.
+                api.authority.as_ref().unwrap().runtime_health.write().unwrap().agents
+                    .iter_mut().find(|agent| agent.agent_id == target.agent_id().0)
+                    .unwrap().expected_active = false;
+                assert!(api.model_work_context(&target).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn dispatched_planning_replay_does_not_require_a_new_shift_or_allowance() {
         let temp = tempfile::tempdir().unwrap();
         let (mut api, sales) = tests::fixture(&temp.path().join("company.sqlite"));
