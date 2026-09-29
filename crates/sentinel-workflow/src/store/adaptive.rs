@@ -3,7 +3,8 @@
 use super::*;
 use crate::{
     adaptive_collaboration_digest, adaptive_continuation_provider_digest, AdaptiveContinuationAuthorizationV1, AdaptiveContinuationSourceV1,
-    AdaptiveEffectV1, AdaptiveLeadershipReviewCallV1, AdaptiveModelDecisionV1,
+    AdaptiveEffectV1, AdaptiveFirstUnknownModelJournalEvidenceV1, AdaptiveLeadershipReviewCallV1,
+    AdaptiveModelDecisionV1, AdaptiveModelJournalRecordEvidenceV1,
     AdaptiveRecoveryFeedbackV1, AdaptiveSessionGrantV1, AdaptiveSessionV1, AdaptiveTransitionV1,
     ADAPTIVE_SCHEMA_MAX_CORRECTIONS,
 };
@@ -195,6 +196,120 @@ impl WorkflowStore {
         authorize(&session.grant, current)?;
         validate_head(&head, &session)?;
         Ok(Some(session))
+    }
+
+    /// Read-only journal provenance for the original first model's sealed unknown.
+    /// Historical facts do not authorize importing, adopting or retrying a result.
+    pub fn first_unknown_model_journal_evidence(
+        &self,
+        session_id: Uuid,
+        current: &RuntimeAuthoritySnapshotV1,
+    ) -> Result<Option<AdaptiveFirstUnknownModelJournalEvidenceV1>, WorkflowError> {
+        current.validate()?;
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(map_sqlite_error)?;
+        let Some((head, head_digest)) = load(&tx, session_id)? else {
+            return Ok(None);
+        };
+        authorize(&head.grant, current)?;
+        require_head(&tx, &head)?;
+        if head.version < 3 {
+            return Ok(None);
+        }
+        let ns = namespace(head.grant.session_id);
+        let (root_digest, root) = evidence_entry(&tx, &ns, 1)?;
+        let (claim_digest, claim) = evidence_entry(&tx, &ns, 2)?;
+        let (seal_digest, seal) = evidence_entry(&tx, &ns, 3)?;
+        let effect = match (&claim.command, &seal.command) {
+            (Some(AdaptiveTransitionV1::ClaimModel { effect, previous_observation_digest: None }),
+                Some(AdaptiveTransitionV1::MarkUnknown { effect: sealed })) if effect == sealed => effect.clone(),
+            _ => return Ok(None),
+        };
+        if root.recovery_feedback.is_some()
+            || root.session.model_calls != 0 || root.session.tool_calls != 0
+            || root.session.last_observation.is_some() || root.session.last_model_result_digest.is_some()
+            || root.session.continuation.is_some()
+            || claim.session.model_calls != 1 || seal.session.model_calls != 1
+            || claim.session.tool_calls != 0 || seal.session.tool_calls != 0
+            || claim.session.last_observation.is_some() || seal.session.last_observation.is_some()
+            || claim.session.last_model_result_digest.is_some() || seal.session.last_model_result_digest.is_some()
+            || claim.session.continuation.is_some() || seal.session.continuation.is_some()
+            || claim.session.effect_ids != std::collections::BTreeSet::from([effect.id])
+            || seal.session.effect_ids != claim.session.effect_ids
+            || !matches!(&claim.session.cursor, crate::AdaptiveCursorV1::ModelPending { effect: pending } if pending == &effect)
+            || !matches!(&seal.session.cursor, crate::AdaptiveCursorV1::ModelUnknown { effect: sealed } if sealed == &effect) {
+            return Ok(None);
+        }
+        // Full replay above validates every journal entry. Also bind every command
+        // operation to that journal; neither a caller UUID nor an ambiguous alias
+        // can be substituted for the original claim/seal operation identity.
+        let mut statement = tx.prepare(
+            "SELECT operation_id,request_digest,response,created_at_ms FROM workflow_operations WHERE operation_namespace=?1 ORDER BY operation_id LIMIT ?2"
+        ).map_err(map_sqlite_error)?;
+        let mut rows = statement.query(params![format!("{ns}:operations"), (MAX_JOURNAL_ENTRIES + 1) as i64])
+            .map_err(map_sqlite_error)?;
+        let mut claim_record = None;
+        let mut seal_record = None;
+        let mut versions = std::collections::BTreeSet::new();
+        let mut count = 0;
+        let mut adopted = false;
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            count += 1;
+            let operation_key: String = row.get(0).map_err(map_sqlite_error)?;
+            let operation_id = Uuid::parse_str(&operation_key).map_err(|_| corrupt_store())?;
+            let digest: String = row.get(1).map_err(map_sqlite_error)?;
+            let bytes: Vec<u8> = row.get(2).map_err(map_sqlite_error)?;
+            let created: i64 = row.get(3).map_err(map_sqlite_error)?;
+            let response: AdaptiveSessionV1 = decode(&bytes)?;
+            if count > MAX_JOURNAL_ENTRIES || operation_id.is_nil()
+                || operation_key != operation_id.to_string() || response.version <= 1
+                || response.version > head.version || !versions.insert(response.version) {
+                return Err(corrupt_store());
+            }
+            let (entry_digest, entry) = evidence_entry(&tx, &ns, response.version)?;
+            let command = entry.command.as_ref().ok_or_else(corrupt_store)?;
+            let expected_digest = canonical_sha256("sentinel.workflow.adaptive-command.v1",
+                &(head.grant.session_id, response.version - 1, command))?;
+            if response != entry.session || !constant_time_eq(&digest, &expected_digest)
+                || stored_u64(created)? != entry.session.updated_at_ms {
+                return Err(corrupt_store());
+            }
+            let record = AdaptiveModelJournalRecordEvidenceV1 {
+                session_version: entry.session.version, entry_digest, operation_id,
+                command_digest: digest, recorded_at_ms: entry.session.updated_at_ms,
+            };
+            if response.version == 2 { claim_record = Some(record); }
+            else if response.version == 3 { seal_record = Some(record); }
+            if matches!(command, AdaptiveTransitionV1::ResolveModel { effect: resolved, .. }
+                | AdaptiveTransitionV1::RejectModel { effect: resolved, .. }
+                | AdaptiveTransitionV1::CommitCollaboration { effect: resolved, .. } if resolved.id == effect.id) {
+                adopted = true;
+            }
+        }
+        // Scan the journal too: historical cancellation can legitimately lack an
+        // operation row, but missing adoption rows must never hide an adoption.
+        for version in 4..=head.version {
+            let (_, entry) = evidence_entry(&tx, &ns, version)?;
+            if matches!(entry.command.as_ref(), Some(AdaptiveTransitionV1::ResolveModel { effect: resolved, .. }
+                | AdaptiveTransitionV1::RejectModel { effect: resolved, .. }
+                | AdaptiveTransitionV1::CommitCollaboration { effect: resolved, .. }) if resolved.id == effect.id) {
+                adopted = true;
+            }
+        }
+        let claim_record = claim_record.ok_or_else(corrupt_store)?;
+        let seal_record = seal_record.ok_or_else(corrupt_store)?;
+        if claim_record.entry_digest != claim_digest || seal_record.entry_digest != seal_digest {
+            return Err(corrupt_store());
+        }
+        if adopted { return Ok(None); }
+        Ok(Some(AdaptiveFirstUnknownModelJournalEvidenceV1 {
+            schema_version: 1, root_grant: root.session.grant, root_entry_digest: root_digest,
+            root_recorded_at_ms: root.session.updated_at_ms, effect,
+            claim: claim_record, seal: seal_record,
+            sealed_model_calls: seal.session.model_calls, sealed_tool_calls: seal.session.tool_calls,
+            observed_head_version: head.version, observed_head_entry_digest: head_digest,
+        }))
     }
 
     /// Latest bounded rejection context on one exact-authority read snapshot.
@@ -403,6 +518,17 @@ fn command_effect(command: &AdaptiveTransitionV1) -> Option<&AdaptiveEffectV1> {
     }
 }
 
+fn evidence_entry(connection: &Connection, ns: &str, version: u64) -> Result<(String, Entry), WorkflowError> {
+    let (digest, bytes, created) = read_operation(connection, ns, &format!("{version:020}"))?
+        .ok_or_else(corrupt_store)?;
+    let entry: Entry = decode(&bytes)?;
+    if entry.session.version != version || stored_u64(created)? != entry.session.updated_at_ms
+        || !constant_time_eq(&digest, &canonical_sha256("sentinel.workflow.adaptive-entry.v1", &entry)?) {
+        return Err(corrupt_store());
+    }
+    Ok((digest, entry))
+}
+
 /// Lane C validates the real result/audit, calls this before changing the project,
 /// and issues the allowance/finalizes the receipt in this same transaction.
 pub(crate) fn continue_adaptive_session_in_transaction(
@@ -545,6 +671,111 @@ mod continuation_tests {
         store.advance_adaptive_session(root.session_id, 2, Uuid::from_u128(11),
             &AdaptiveTransitionV1::MarkUnknown { effect: effect(102) },
             &root.authority, NOW + 2).unwrap().1
+    }
+
+    fn operation_rows(store: &WorkflowStore) -> Vec<(String, String, String, Vec<u8>, i64)> {
+        let connection = store.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT operation_namespace,operation_id,request_digest,response,created_at_ms FROM workflow_operations ORDER BY operation_namespace,operation_id"
+        ).unwrap();
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+            .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        rows
+    }
+
+    #[test]
+    fn first_unknown_evidence_is_exact_read_only_and_survives_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workflow.sqlite");
+        let store = WorkflowStore::open(&path).unwrap();
+        let source = persisted_unknown(&store);
+        let before = operation_rows(&store);
+        let evidence = store.first_unknown_model_journal_evidence(source.grant.session_id, &source.grant.authority)
+            .unwrap().unwrap();
+        assert_eq!(evidence.root_grant, source.grant);
+        assert_eq!(evidence.effect, effect(102));
+        assert_eq!((evidence.sealed_model_calls, evidence.sealed_tool_calls), (1, 0));
+        assert_eq!((evidence.claim.session_version, evidence.seal.session_version), (2, 3));
+        assert_eq!((evidence.claim.operation_id, evidence.seal.operation_id), (Uuid::from_u128(10), Uuid::from_u128(11)));
+        assert_eq!((evidence.claim.recorded_at_ms, evidence.seal.recorded_at_ms), (NOW + 1, NOW + 2));
+        assert_eq!(evidence.root_recorded_at_ms, NOW);
+        assert_eq!(evidence.observed_head_version, 3);
+        assert_eq!(evidence.observed_head_entry_digest, evidence.seal.entry_digest);
+        {
+            let connection = store.lock().unwrap();
+            let ns = namespace(source.grant.session_id);
+            assert_eq!(evidence.root_entry_digest, evidence_entry(&connection, &ns, 1).unwrap().0);
+            assert_eq!(evidence.claim.entry_digest, evidence_entry(&connection, &ns, 2).unwrap().0);
+            assert_eq!(evidence.seal.entry_digest, evidence_entry(&connection, &ns, 3).unwrap().0);
+            assert_eq!(evidence.claim.command_digest, read_operation(&connection, &format!("{ns}:operations"),
+                &Uuid::from_u128(10).to_string()).unwrap().unwrap().0);
+        }
+        assert_eq!(operation_rows(&store), before);
+        assert_eq!(store.adaptive_session(source.grant.session_id, &source.grant.authority).unwrap(), Some(source.clone()));
+        drop(store);
+        let reopened = WorkflowStore::open(&path).unwrap();
+        assert_eq!(reopened.first_unknown_model_journal_evidence(source.grant.session_id, &source.grant.authority)
+            .unwrap(), Some(evidence));
+        assert_eq!(operation_rows(&reopened), before);
+    }
+
+    #[test]
+    fn first_unknown_evidence_rejects_operation_tampering_and_aliases() {
+        for sql in [
+            "DELETE FROM workflow_operations WHERE operation_namespace=?1 AND operation_id=?2",
+            "UPDATE workflow_operations SET request_digest='invalid' WHERE operation_namespace=?1 AND operation_id=?2",
+            "UPDATE workflow_operations SET created_at_ms=created_at_ms+1 WHERE operation_namespace=?1 AND operation_id=?2",
+            "UPDATE workflow_operations SET response=x'7b7d' WHERE operation_namespace=?1 AND operation_id=?2",
+            "UPDATE workflow_operations SET operation_id='00000000-0000-0000-0000-000000000000' WHERE operation_namespace=?1 AND operation_id=?2",
+            "UPDATE workflow_operations SET operation_namespace=operation_namespace||':foreign' WHERE operation_namespace=?1 AND operation_id=?2",
+            "INSERT INTO workflow_operations SELECT operation_namespace,'00000000-0000-0000-0000-00000000ffff',request_digest,response,created_at_ms FROM workflow_operations WHERE operation_namespace=?1 AND operation_id=?2",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();
+            let source = persisted_unknown(&store);
+            let ns = format!("{}:operations", namespace(source.grant.session_id));
+            store.lock().unwrap().execute(sql, params![ns, Uuid::from_u128(11).to_string()]).unwrap();
+            let before = operation_rows(&store);
+            assert!(store.first_unknown_model_journal_evidence(source.grant.session_id, &source.grant.authority).is_err(), "{sql}");
+            assert_eq!(operation_rows(&store), before);
+        }
+    }
+
+    #[test]
+    fn first_unknown_evidence_requires_current_authority_and_entire_chain_head() {
+        for corrupt_head in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();
+            let source = persisted_unknown(&store);
+            let mut stale = source.grant.authority.clone(); stale.policy_generation += 1;
+            assert!(store.first_unknown_model_journal_evidence(source.grant.session_id, &stale).is_err());
+            assert!(store.first_unknown_model_journal_evidence(Uuid::from_u128(999), &source.grant.authority).unwrap().is_none());
+            if corrupt_head {
+                store.lock().unwrap().execute("UPDATE workflow_adaptive_heads SET version=version+1", []).unwrap();
+            } else {
+                store.lock().unwrap().execute("UPDATE workflow_operations SET request_digest='invalid' WHERE operation_namespace=?1 AND operation_id=?2",
+                    params![namespace(source.grant.session_id), format!("{:020}", 1)]).unwrap();
+            }
+            assert!(store.first_unknown_model_journal_evidence(source.grant.session_id, &source.grant.authority).is_err());
+        }
+    }
+
+    #[test]
+    fn first_unknown_evidence_does_not_infer_unknown_from_pending_or_blocked() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();
+        let root = grant();
+        store.begin_adaptive_session(&root, &root.authority, NOW).unwrap();
+        assert!(store.first_unknown_model_journal_evidence(root.session_id, &root.authority).unwrap().is_none());
+        store.advance_adaptive_session(root.session_id, 1, Uuid::from_u128(10),
+            &AdaptiveTransitionV1::ClaimModel { effect: effect(102), previous_observation_digest: None },
+            &root.authority, NOW + 1).unwrap();
+        assert!(store.first_unknown_model_journal_evidence(root.session_id, &root.authority).unwrap().is_none());
+        store.advance_adaptive_session(root.session_id, 2, Uuid::from_u128(11),
+            &AdaptiveTransitionV1::ResolveModel { effect: effect(102), result_digest: "a".repeat(64),
+                decision: AdaptiveModelDecisionV1::Blocked { reason_code: "needs_review".into() } },
+            &root.authority, NOW + 2).unwrap();
+        assert!(store.first_unknown_model_journal_evidence(root.session_id, &root.authority).unwrap().is_none());
     }
 
     #[test]
@@ -758,6 +989,10 @@ mod continuation_tests {
         drop(store);
         let reopened = WorkflowStore::open(&path).unwrap();
         assert_eq!(reopened.adaptive_session(auth.session_id, &source.grant.authority).unwrap(), Some(next.clone()));
+        let evidence = reopened.first_unknown_model_journal_evidence(auth.session_id, &source.grant.authority).unwrap().unwrap();
+        assert_eq!(evidence.root_grant, source.grant);
+        assert_eq!(evidence.observed_head_version, next.version);
+        assert_eq!(evidence.seal.session_version, 3);
         assert!(reopened.advance_adaptive_session(auth.session_id, 1, Uuid::from_u128(10),
             &AdaptiveTransitionV1::ClaimModel { effect: effect(102), previous_observation_digest: None },
             &source.grant.authority, auth.issued_at_ms).is_err());
@@ -791,6 +1026,7 @@ mod continuation_tests {
             tx.commit().unwrap();
         }
         assert_eq!(store.adaptive_session(source.grant.session_id, &source.grant.authority).unwrap(), Some(historical));
+        assert!(store.first_unknown_model_journal_evidence(source.grant.session_id, &source.grant.authority).unwrap().is_none());
     }
 }
 

@@ -178,6 +178,33 @@ pub struct AdaptiveEffectV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AdaptiveModelJournalRecordEvidenceV1 {
+    pub session_version: u64,
+    pub entry_digest: String,
+    pub operation_id: Uuid,
+    pub command_digest: String,
+    pub recorded_at_ms: u64,
+}
+
+/// Journal facts only: not proof of provider purity, usage or retry authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveFirstUnknownModelJournalEvidenceV1 {
+    pub schema_version: u16,
+    pub root_grant: AdaptiveSessionGrantV1,
+    pub root_entry_digest: String,
+    pub root_recorded_at_ms: u64,
+    pub effect: AdaptiveEffectV1,
+    pub claim: AdaptiveModelJournalRecordEvidenceV1,
+    pub seal: AdaptiveModelJournalRecordEvidenceV1,
+    pub sealed_model_calls: u16,
+    pub sealed_tool_calls: u16,
+    pub observed_head_version: u64,
+    pub observed_head_entry_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdaptiveObservationRefV1 {
     pub effect: AdaptiveEffectV1,
     pub observation_digest: String,
