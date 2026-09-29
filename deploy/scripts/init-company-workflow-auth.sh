@@ -31,6 +31,7 @@ NAMES=(
   workflow-developer-shift3
   workflow-qa-shift3
   workflow-release-manager-shift3
+  workflow-internal-customer
 )
 
 fail() {
