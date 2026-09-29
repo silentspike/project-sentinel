@@ -36,6 +36,7 @@ pub mod bridge {
     use sentinel_limbo::{
         EventStore, LlmCompletionEntry, LlmModelReservationV1, LlmModelSubjectV1,
         LlmModelUsageBindingV1, LlmSealedUnknownModelEvidenceV1,
+        LlmRetrospectiveUnknownModelEvidenceV1,
     };
     use sentinel_redb::StateStore;
 
@@ -826,6 +827,60 @@ pub mod bridge {
             .ok_or_else(|| anyhow::anyhow!("no sealed unknown model reservation"))?;
         validate_sealed_model_usage(context, event).map_err(anyhow::Error::msg)?;
         store.persist_sealed_unknown_llm_model_usage(&evidence, event)
+    }
+
+    /// Trusted historical verifier supplied the provenance at import. This
+    /// matches the original authority, without reconstructing prompts or grants.
+    /// It does not authorize continuation or assert no provider-private activity.
+    pub fn retrospective_unknown_model_evidence(
+        store: &EventStore,
+        authority: &ProviderExecutionAuthority,
+        request_id: &str,
+        request_digest: &str,
+    ) -> anyhow::Result<Option<LlmRetrospectiveUnknownModelEvidenceV1>> {
+        let ProviderExecutionAuthority::Adaptive(value) = authority
+            else { anyhow::bail!("unsupported retrospective model authority"); };
+        anyhow::ensure!(authority.request_id() == request_id, "historical model request changed");
+        let grant = &value.grant;
+        let owner = sentinel_common::StateTransferScope::for_agent(grant.authority.agent_id.to_string());
+        let evidence = store.retrospective_unknown_llm_model_evidence(request_id, request_digest, &owner)?;
+        if let Some(evidence) = &evidence {
+            let expected_subject = LlmModelSubjectV1::Adaptive {
+                session_id: grant.session_id, effect_id: value.effect_id, session_version: value.session_version,
+            };
+            let expected_usage = LlmModelUsageBindingV1 {
+                agent_id: grant.authority.agent_id, tenant_id: grant.authority.tenant_id.0.clone(),
+                project_id: grant.authority.project_id.0.clone(), work_item_id: grant.authority.work_item_id.0.clone(),
+                reservation_id: grant.provider_allowance_id.clone(), assignment_id: value.assignment_id.clone(),
+                assignment_version: grant.authority.assignment_version, provider: grant.provider.clone(),
+                model: grant.model.clone(),
+            };
+            let authority_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(authority)?));
+            let sentinel_limbo::LlmRetrospectiveModelProvenanceV1::JournalAndPinnedInferenceBoundary {
+                original_allowance_digest, ..
+            } = &evidence.binding.provenance;
+            anyhow::ensure!(evidence.binding.subject == expected_subject
+                && evidence.binding.allowance_id == grant.provider_allowance_id
+                && evidence.binding.usage_binding == expected_usage
+                && evidence.binding.authority_digest == authority_digest
+                && original_allowance_digest == &grant.provider_authority_digest,
+                "retrospective model authority changed");
+        }
+        Ok(evidence)
+    }
+
+    /// Authenticated accounting-only evidence. No historical context is invented
+    /// or required; Limbo rechecks the exact imported seal in the append transaction.
+    pub fn retain_retrospective_unknown_model_usage(
+        store: &EventStore,
+        authority: &ProviderExecutionAuthority,
+        request_id: &str,
+        request_digest: &str,
+        event: &DomainEvent,
+    ) -> anyhow::Result<bool> {
+        let evidence = retrospective_unknown_model_evidence(store, authority, request_id, request_digest)?
+            .ok_or_else(|| anyhow::anyhow!("no retrospective unknown model evidence"))?;
+        store.persist_retrospective_unknown_llm_model_usage(&evidence, event)
     }
 
     fn validate_sealed_model_usage(
@@ -3398,6 +3453,107 @@ pub mod bridge {
                 assert!(resolver.admissions.lock().unwrap().is_empty());
                 assert!(rx.try_recv().is_err());
             }
+        }
+
+        #[test]
+        fn retrospective_model_accounting_requires_original_authority_not_prompt_reconstruction() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_, adaptive, _) = crate::workflow_api::model_work::configured_adaptive_test_api(
+                &dir.path().join("company.sqlite"), &dir.path().join("events.sqlite"),
+            );
+            let authority = ProviderExecutionAuthority::Adaptive(Box::new(adaptive));
+            let ProviderExecutionAuthority::Adaptive(value) = &authority else { unreachable!() };
+            let grant = &value.grant;
+            let id = authority.request_id();
+            let digest = "a".repeat(64);
+            let store = EventStore::open(":memory:").unwrap();
+            store.reserve_llm_request(&id, &digest, &authority.agent_id().to_string()).unwrap();
+            store.mark_llm_provider_outcome_unknown(&id, &digest,
+                "UnknownOutcome: provider_transport_deadline_elapsed").unwrap();
+            let original = store.get_llm_completion(&id).unwrap().unwrap();
+            assert!(retrospective_unknown_model_evidence(&store, &authority, &id, &digest).unwrap().is_none());
+            // Synthetic reviewed descriptors exercise the API, not deployment proof.
+            let receipt = |version, entry_digest: &str, time| serde_json::json!({
+                "session_id": grant.session_id, "effect_id": value.effect_id, "request_digest": digest,
+                "session_version": version, "operation_id": uuid::Uuid::new_v4(),
+                "entry_digest": entry_digest.repeat(64), "timestamp_ms": time,
+            });
+            let binding: sentinel_limbo::LlmRetrospectiveModelBindingV1 = serde_json::from_value(serde_json::json!({
+                "schema_version": 1, "request_id": id, "request_digest": digest,
+                "owner_scope": original.owner_scope,
+                "subject": {"kind": "adaptive", "session_id": grant.session_id,
+                    "effect_id": value.effect_id, "session_version": value.session_version},
+                "allowance_id": grant.provider_allowance_id, "historical_context_digest": null,
+                "authority_digest": format!("{:x}", Sha256::digest(serde_json::to_vec(&authority).unwrap())),
+                "usage_binding": {
+                    "agent_id": grant.authority.agent_id, "tenant_id": grant.authority.tenant_id.0,
+                    "project_id": grant.authority.project_id.0, "work_item_id": grant.authority.work_item_id.0,
+                    "reservation_id": grant.provider_allowance_id, "assignment_id": value.assignment_id,
+                    "assignment_version": grant.authority.assignment_version, "provider": grant.provider, "model": grant.model,
+                },
+                "provenance": {
+                    "kind": "journal_and_pinned_inference_boundary",
+                    "claim_model": receipt(2, "b", original.created_at),
+                    "mark_unknown": receipt(3, "c", original.updated_at),
+                    "journal_head_digest": "c".repeat(64), "model_claims": 1, "tool_claims": 0,
+                    "collaboration_claims": 0, "original_allowance_digest": grant.provider_authority_digest,
+                    "boundary": {"release_git_sha": "a".repeat(40), "release_manifest_sha256": "b".repeat(64),
+                        "gateway_binary_sha256": "c".repeat(64), "cli_binary_sha256": "d".repeat(64),
+                        "cli_profile_sha256": "e".repeat(64), "boundary_receipt_sha256": "f".repeat(64),
+                        "valid_from_ms": original.created_at, "valid_until_ms": original.created_at + 1},
+                },
+            })).unwrap();
+            store.import_retrospective_unknown_llm_model_binding(&binding).unwrap();
+            let evidence = retrospective_unknown_model_evidence(&store, &authority, &id, &digest).unwrap().unwrap();
+            assert!(evidence.binding.historical_context_digest.is_none());
+            assert!(sealed_unknown_model_evidence(&store, &authority, &id, &digest).unwrap().is_none());
+            let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+                "content": "discarded proposal", "decision": "forward", "request_id": id,
+                "provider": grant.provider, "effective_model": grant.model, "tokens_used": 15,
+                "input_tokens": 5, "output_tokens": 10, "tier": "mid", "hierarchy_tier": 2,
+                "cost_source": "provider_reported", "cost_usd": 0.125,
+                "actions": [{"type": "tool_use", "content": "must not execute"}],
+            })).unwrap();
+            let usage = build_usage_event(authority.agent_id(), 1, &grant.model, Some(&authority), &response, true).unwrap();
+            assert!(retain_retrospective_unknown_model_usage(&store, &authority, &id, &digest, &usage).unwrap());
+            assert!(!retain_retrospective_unknown_model_usage(&store, &authority, &id, &digest, &usage).unwrap());
+            let mut conflict = usage.clone();
+            conflict.event_id = uuid::Uuid::new_v4().to_string();
+            assert!(retain_retrospective_unknown_model_usage(&store, &authority, &id, &digest, &conflict).is_err());
+            for field in ["assignment", "allowance", "original_allowance", "effect"] {
+                let mut changed = authority.clone();
+                let ProviderExecutionAuthority::Adaptive(value) = &mut changed else { unreachable!() };
+                match field {
+                    "assignment" => value.assignment_id = "current-assignment".into(),
+                    "allowance" => value.grant.provider_allowance_id = "fresh-allowance".into(),
+                    "original_allowance" => value.grant.provider_authority_digest = "f".repeat(64),
+                    _ => value.effect_id = uuid::Uuid::new_v4(),
+                }
+                assert!(retrospective_unknown_model_evidence(&store, &changed, &id, &digest).is_err(), "{field}");
+                assert!(retain_retrospective_unknown_model_usage(&store, &changed, &id, &digest, &usage).is_err());
+            }
+            assert_eq!(store.get_llm_completion(&id).unwrap().unwrap(), original);
+            assert!(store.poll_llm_completions(10).unwrap().is_empty());
+            assert_eq!(store.get_all_events().unwrap().len(), 1);
+            let separate = EventStore::open(":memory:").unwrap();
+            separate.reserve_llm_request(&id, &digest, &authority.agent_id().to_string()).unwrap();
+            separate.mark_llm_provider_outcome_unknown(&id, &digest,
+                "UnknownOutcome: provider_transport_deadline_elapsed").unwrap();
+            let entry = separate.get_llm_completion(&id).unwrap().unwrap();
+            let mut inconsistent = binding;
+            let sentinel_limbo::LlmRetrospectiveModelProvenanceV1::JournalAndPinnedInferenceBoundary {
+                claim_model, mark_unknown, original_allowance_digest, boundary, ..
+            } = &mut inconsistent.provenance;
+            claim_model.timestamp_ms = entry.created_at;
+            mark_unknown.timestamp_ms = entry.updated_at;
+            boundary.valid_from_ms = entry.created_at;
+            boundary.valid_until_ms = entry.created_at + 1;
+            *original_allowance_digest = "a".repeat(64);
+            assert_ne!(original_allowance_digest.as_str(), grant.provider_authority_digest.as_str());
+            separate.import_retrospective_unknown_llm_model_binding(&inconsistent).unwrap();
+            assert!(retrospective_unknown_model_evidence(&separate, &authority, &id, &digest).is_err());
+            assert!(retain_retrospective_unknown_model_usage(&separate, &authority, &id, &digest, &usage).is_err());
+            assert!(separate.get_all_events().unwrap().is_empty());
         }
 
         #[test]
