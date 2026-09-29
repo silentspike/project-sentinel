@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::{
-    adaptive_collaboration_digest, AdaptiveEffectV1, AdaptiveModelDecisionV1,
+    adaptive_collaboration_digest, adaptive_continuation_provider_digest, AdaptiveContinuationAuthorizationV1, AdaptiveContinuationSourceV1,
+    AdaptiveEffectV1, AdaptiveLeadershipReviewCallV1, AdaptiveModelDecisionV1,
     AdaptiveRecoveryFeedbackV1, AdaptiveSessionGrantV1, AdaptiveSessionV1, AdaptiveTransitionV1,
     ADAPTIVE_SCHEMA_MAX_CORRECTIONS,
 };
@@ -76,7 +77,8 @@ impl WorkflowStore {
                 previous.cursor,
                 crate::AdaptiveCursorV1::BlockedResolved { .. }
             );
-            if !(never_claimed || rejected_first_model || blocked_resolved)
+            if previous.continuation.is_some()
+                || !(never_claimed || rejected_first_model || blocked_resolved)
                 || previous.grant.provider_allowance_id == grant.provider_allowance_id
                 || previous.grant.deadline_ms > now_ms
             {
@@ -245,10 +247,11 @@ impl WorkflowStore {
             .map_err(map_sqlite_error)?;
         let (session, _) = load(&tx, grant.session_id)?.ok_or_else(not_found)?;
         authorize(&session.grant, &grant.authority)?;
-        if session.grant != *grant {
+        if session.effective_grant() != *grant {
             return Err(idempotency_conflict());
         }
         require_head(&tx, &session)?;
+        if session.is_abandoned_model_effect(effect) { return Err(authority_conflict()); }
 
         let mut statement = tx
             .prepare(
@@ -305,7 +308,7 @@ impl WorkflowStore {
         now_ms: u64,
     ) -> Result<(bool, AdaptiveSessionV1), WorkflowError> {
         current.validate()?;
-        if operation_id.is_nil() {
+        if operation_id.is_nil() || matches!(command, AdaptiveTransitionV1::ContinueGoverned { .. }) {
             return Err(authority_conflict());
         }
         let ns = namespace(session_id);
@@ -319,6 +322,15 @@ impl WorkflowStore {
         let (session, prior_digest) = load(&tx, session_id)?.ok_or_else(not_found)?;
         authorize(&session.grant, current)?;
         require_head(&tx, &session)?;
+        if command_effect(command).is_some_and(|effect| session.is_abandoned_model_effect(effect)) {
+            return Err(authority_conflict());
+        }
+        if let (crate::AdaptiveCursorV1::ModelUnknown { effect: sealed },
+            AdaptiveTransitionV1::ClaimModel { effect: claimed, .. }) = (&session.cursor, command) {
+            if sealed.id == claimed.id {
+                return Err(authority_conflict());
+            }
+        }
         // Replay is checked before expiry/version, but never before current authorization.
         if let Some((stored_digest, bytes, created)) =
             read_operation(&tx, &operations, &operation_id.to_string())?
@@ -347,6 +359,12 @@ impl WorkflowStore {
                 "adaptive session version changed",
             ));
         }
+        // Historical journal replay still accepts old transitions. New writes
+        // cannot reinterpret a sealed unknown model result as a late response.
+        if matches!(session.cursor, crate::AdaptiveCursorV1::ModelUnknown { .. })
+            && matches!(command, AdaptiveTransitionV1::ResolveModel { .. } | AdaptiveTransitionV1::RejectModel { .. }) {
+            return Err(authority_conflict());
+        }
         let next = session.transition(command, now_ms)?;
         append(
             &tx,
@@ -369,6 +387,410 @@ impl WorkflowStore {
         update_head(&tx, &session, &next)?;
         tx.commit().map_err(map_sqlite_error)?;
         Ok((false, next))
+    }
+}
+
+fn command_effect(command: &AdaptiveTransitionV1) -> Option<&AdaptiveEffectV1> {
+    match command {
+        AdaptiveTransitionV1::ClaimModel { effect, .. }
+        | AdaptiveTransitionV1::ResolveModel { effect, .. }
+        | AdaptiveTransitionV1::ClaimTool { effect, .. }
+        | AdaptiveTransitionV1::CommitCollaboration { effect, .. }
+        | AdaptiveTransitionV1::MarkUnknown { effect }
+        | AdaptiveTransitionV1::RejectModel { effect, .. } => Some(effect),
+        AdaptiveTransitionV1::ObserveTool { observation } => Some(&observation.effect),
+        _ => None,
+    }
+}
+
+/// Lane C validates the real result/audit, calls this before changing the project,
+/// and issues the allowance/finalizes the receipt in this same transaction.
+pub(crate) fn continue_adaptive_session_in_transaction(
+    tx: &Transaction<'_>,
+    authorization: &AdaptiveContinuationAuthorizationV1,
+    review: &AdaptiveLeadershipReviewCallV1,
+    fresh_allowance: &crate::SubscriptionCallAllowanceV1,
+    current: &RuntimeAuthoritySnapshotV1,
+    now_ms: u64,
+) -> Result<(bool, AdaptiveSessionV1), WorkflowError> {
+    authorization.validate()?;
+    current.validate()?;
+    review.grant.validate(review.grant_issued_at_unix_ms)?;
+    review.context.validate(&review.grant)?;
+    let stored_review: AdaptiveLeadershipReviewCallV1 = read_company_entity(tx,
+        &current.tenant_id.0, "adaptive_leadership_review_call", &review.grant.review_id.to_string(), review.version)?;
+    if stored_review != *review || review.retired_at_unix_ms.is_some()
+        || review.dispatch.is_none() || authorization.review_id != review.grant.review_id
+        || authorization.session_id != review.grant.session_id
+        || authorization.source_session_version != review.grant.expected_session_version
+        || review.grant.assignee_authority != *current
+        || review.context.source_session.grant.authority != *current {
+        return Err(authority_conflict());
+    }
+    let dispatch = review.dispatch.as_ref().ok_or_else(authority_conflict)?;
+    if dispatch.request_id != review.request_id()
+        || dispatch.context_digest != review.context_digest()?
+        || !crate::digest::validate_sha256(&dispatch.request_digest)
+        || dispatch.dispatched_at_unix_ms < review.grant_issued_at_unix_ms
+        || dispatch.dispatched_at_unix_ms >= review.grant.expires_at_unix_ms
+        || authorization.issued_at_ms < dispatch.dispatched_at_unix_ms {
+        return Err(authority_conflict());
+    }
+    let (session, prior_digest) = load(tx, authorization.session_id)?.ok_or_else(not_found)?;
+    authorize(&session.grant, current)?;
+    require_head(tx, &session)?;
+    let ns = namespace(authorization.session_id);
+    let operations = format!("{ns}:operations");
+    let command = AdaptiveTransitionV1::ContinueGoverned { authorization: authorization.clone() };
+    let digest = canonical_sha256("sentinel.workflow.adaptive-command.v1",
+        &(authorization.session_id, authorization.source_session_version, &command))?;
+    if let Some((stored_digest, bytes, created)) = read_operation(tx, &operations, &authorization.operation_id.to_string())? {
+        let response: AdaptiveSessionV1 = decode(&bytes)?;
+        let (_, entry_bytes, _) = read_operation(tx, &ns, &format!("{:020}", response.version))?.ok_or_else(corrupt_store)?;
+        let entry: Entry = decode(&entry_bytes)?;
+        if !constant_time_eq(&stored_digest, &digest) || response != entry.session
+            || entry.command.as_ref() != Some(&command)
+            || authorization.source_session_version.checked_add(1) != Some(response.version)
+            || stored_u64(created)? != response.updated_at_ms {
+            return Err(idempotency_conflict());
+        }
+        if review.resolution_event_id != Some(authorization.resolution_event_id) {
+            return Err(authority_conflict());
+        }
+        return Ok((true, response));
+    }
+    if review.decision.is_some() || session != review.context.source_session
+        || session.version != authorization.source_session_version {
+        return Err(authority_conflict());
+    }
+    let fresh = &fresh_allowance.grant;
+    let source_work = review.context.source_project.work_items.get(&current.work_item_id).ok_or_else(not_found)?;
+    let assignment = source_work.assignments.iter().find(|assignment| assignment.active
+        && assignment.agent_id == current.agent_id).ok_or_else(authority_conflict)?;
+    if fresh_allowance.allowance_id != authorization.provider_allowance_id
+        || fresh_allowance.allowance_id == review.allowance_id
+        || fresh_allowance.created_at_unix_ms != authorization.issued_at_ms
+        || fresh_allowance.created_by != review.grant.leadership_principal.principal_id
+        || fresh_allowance.dispatch.is_some() || fresh.schema_version != 1
+        || fresh.work_item_id != current.work_item_id || fresh.agent_id != current.agent_id
+        || fresh.assignment_id != assignment.assignment_id
+        || fresh.assignment_version != current.assignment_version
+        || fresh.provider != session.grant.provider || fresh.model != session.grant.model
+        || fresh.catalog_digest != session.grant.catalog_digest
+        || fresh.token_policy != review.grant.token_policy
+        || fresh.max_calls != authorization.additional_model_calls || fresh.max_concurrent != 1
+        || fresh.max_duration_ms != session.grant.max_call_duration_ms
+            .min(authorization.deadline_ms - authorization.issued_at_ms)
+        || fresh.expires_at_unix_ms != authorization.deadline_ms
+        || adaptive_continuation_provider_digest(fresh_allowance, current)? != authorization.provider_authority_digest {
+        return Err(authority_conflict());
+    }
+    // The project row is digest-bound; full equality retains governance, work,
+    // assignment and policy checks without interpreting an unverified snapshot.
+    let project: crate::ProjectV1 = read_company_entity(tx, &current.tenant_id.0, "project",
+        &current.project_id.0, review.context.source_project.version)?;
+    if project != review.context.source_project || project.tenant_id != current.tenant_id
+        || project.project_id != current.project_id
+        || project.subscription_call.as_ref().is_some_and(|allowance|
+            allowance.allowance_id == fresh_allowance.allowance_id)
+        || !project.governance.participants.iter().any(|participant|
+            participant.principal_id == review.grant.leadership_principal.principal_id
+                && Some(participant.agent_id) == review.grant.leadership_principal.agent_id
+                && participant.role == review.grant.leadership_principal.role)
+        || !matches!(review.grant.leadership_principal.role,
+            crate::CompanyRoleV1::ProjectManager | crate::CompanyRoleV1::TechnicalLead) {
+        return Err(authority_conflict());
+    }
+    if matches!(authorization.source, AdaptiveContinuationSourceV1::ModelUnknown)
+        && authorization.abandoned_model_effect.is_none() {
+        return Err(authority_conflict());
+    }
+    let next = session.transition(&command, now_ms)?;
+    append(tx, &ns, &Entry { previous_digest: Some(prior_digest), command: Some(command),
+        session: next.clone(), recovery_feedback: None })?;
+    insert_operation(tx, &operations, &authorization.operation_id.to_string(), &digest, &next, now_ms)?;
+    update_head(tx, &session, &next)?;
+    Ok((false, next))
+}
+
+fn read_company_entity<T: DeserializeOwned>(
+    connection: &Connection, tenant: &str, kind: &str, id: &str, version: u64,
+) -> Result<T, WorkflowError> {
+    let (stored_version, payload, digest): (i64, Vec<u8>, String) = connection.query_row(
+        "SELECT version,payload,payload_digest FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3",
+        params![tenant, kind, id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional().map_err(map_sqlite_error)?.ok_or_else(not_found)?;
+    if !constant_time_eq(&canonical_sha256("sentinel.workflow.company-entity-row.v1", &payload)?, &digest) {
+        return Err(corrupt_store());
+    }
+    if stored_u64(stored_version)? != version {
+        return Err(WorkflowError::new(WorkflowErrorCode::VersionConflict, false,
+            "adaptive continuation source row changed"));
+    }
+    decode(&payload)
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use crate::adaptive::continuation_tests::{authorization, effect, grant, NOW};
+    use crate::{AdaptiveCursorV1, AdaptiveLeadershipReviewContextV1, AdaptiveLeadershipReviewGrantV1};
+
+    fn persisted_unknown(store: &WorkflowStore) -> AdaptiveSessionV1 {
+        let root = grant();
+        store.begin_adaptive_session(&root, &root.authority, NOW).unwrap();
+        store.advance_adaptive_session(root.session_id, 1, Uuid::from_u128(10),
+            &AdaptiveTransitionV1::ClaimModel { effect: effect(102), previous_observation_digest: None },
+            &root.authority, NOW + 1).unwrap();
+        store.advance_adaptive_session(root.session_id, 2, Uuid::from_u128(11),
+            &AdaptiveTransitionV1::MarkUnknown { effect: effect(102) },
+            &root.authority, NOW + 2).unwrap().1
+    }
+
+    #[test]
+    fn generic_advance_rejects_privileged_command_and_late_unknown_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();
+        let source = persisted_unknown(&store);
+        let auth = authorization(&source);
+        assert!(store.advance_adaptive_session(source.grant.session_id, source.version, auth.operation_id,
+            &AdaptiveTransitionV1::ContinueGoverned { authorization: auth.clone() },
+            &source.grant.authority, auth.issued_at_ms).is_err());
+        assert!(store.advance_adaptive_session(source.grant.session_id, 1, Uuid::from_u128(10),
+            &AdaptiveTransitionV1::ClaimModel { effect: effect(102), previous_observation_digest: None },
+            &source.grant.authority, NOW + 3).is_err());
+        assert!(store.advance_adaptive_session(source.grant.session_id, source.version, Uuid::from_u128(12),
+            &AdaptiveTransitionV1::ResolveModel { effect: effect(102), result_digest: "a".repeat(64),
+                decision: AdaptiveModelDecisionV1::Blocked { reason_code: "late_result".into() } },
+            &source.grant.authority, NOW + 3).is_err());
+        assert_eq!(store.adaptive_session(source.grant.session_id, &source.grant.authority).unwrap(), Some(source));
+    }
+
+    fn put_test_entity<T: Serialize>(tx: &Transaction<'_>, tenant: &str, kind: &str, id: &str, version: u64, value: &T) {
+        let payload = encode(value).unwrap();
+        let digest = canonical_sha256("sentinel.workflow.company-entity-row.v1", &payload).unwrap();
+        tx.execute("INSERT OR REPLACE INTO company_entities (tenant_id,entity_kind,entity_id,version,payload,payload_digest) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![tenant, kind, id, version as i64, payload, digest]).unwrap();
+    }
+
+    // This fixture supplies the already dispatched review. Lane C owns proof of
+    // actual model output and the cross-store audit, not this journal helper.
+    fn blocked_review(store: &WorkflowStore) -> (AdaptiveLeadershipReviewCallV1, AdaptiveContinuationAuthorizationV1, crate::SubscriptionCallAllowanceV1) {
+        let mut root = grant();
+        let profile = crate::WorkProfileBindingV1 { profile_id: root.authority.profile_id.clone(),
+            generation: root.authority.profile_generation, digest: root.authority.profile_digest.clone() };
+        let assignment = crate::AssignmentV1 {
+            assignment_id: "assignment-01".into(), agent_id: root.authority.agent_id,
+            role: crate::CompanyRoleV1::Developer, specialties: std::collections::BTreeSet::from(["rust".into()]),
+            profile: profile.clone(), organization_generation: root.authority.organization_generation,
+            organization_digest: root.authority.organization_digest.clone(), assignment_version: root.authority.assignment_version,
+            delegated_by: None, reason_ref: "assigned".into(), active: true, assigned_by: "pm-01".into(),
+            created_at_unix_ms: NOW, ended_at_unix_ms: None,
+        };
+        root.authority.assignment_digest = assignment.canonical_digest().unwrap();
+        store.begin_adaptive_session(&root, &root.authority, NOW).unwrap();
+        store.advance_adaptive_session(root.session_id, 1, Uuid::from_u128(10),
+            &AdaptiveTransitionV1::ClaimModel { effect: effect(102), previous_observation_digest: None },
+            &root.authority, NOW + 1).unwrap();
+        let source = store.advance_adaptive_session(root.session_id, 2, Uuid::from_u128(11),
+            &AdaptiveTransitionV1::ResolveModel { effect: effect(102), result_digest: "a".repeat(64),
+                decision: AdaptiveModelDecisionV1::Blocked { reason_code: "needs_review".into() } },
+            &root.authority, NOW + 2).unwrap().1;
+        let leader_authority = crate::PrincipalAuthorityV1::derive("pm-01", 1, &[1; 32]).unwrap();
+        let leader = crate::AuthenticatedCompanyPrincipalV1 {
+            schema_version: 1, tenant_id: root.authority.tenant_id.clone(), principal_id: "pm-01".into(),
+            kind: crate::CompanyPrincipalKindV1::Agent, role: crate::CompanyRoleV1::ProjectManager,
+            customer_id: None, agent_id: Some(crate::AgentId(1)), authority_generation: 1,
+            authority_digest: leader_authority.authority_digest.clone(),
+        };
+        let work = serde_json::json!({
+            "spec": {"work_item_id": root.authority.work_item_id, "title": "Source", "objective": "Build source",
+                "required_role": "developer", "required_specialties": ["rust"], "dependency_ids": [],
+                "owner": root.authority.agent_id, "inputs": [], "outputs": [],
+                "quality_gate": {"gate_id": "qa-v1", "generation": 1, "digest": "a".repeat(64)}, "budget_micros": 100},
+            "state": "assigned", "version": 1, "assignments": [assignment], "output_receipts": [],
+            "gate_receipt": null, "transition_history": []
+        });
+        let project: crate::ProjectV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "tenant_id": root.authority.tenant_id, "project_id": root.authority.project_id,
+            "agreement_id": "agreement-01", "agreement_digest": "a".repeat(64),
+            "governance": {"owner": 1, "project_profile": profile,
+                "participants": [{"agent_id": 1, "principal_id": "pm-01", "role": "project_manager",
+                    "specialties": ["coordination"], "reports_to": null, "profile": profile}]},
+            "cost_ceiling_micros": 100, "provider_cost_ceilings_micros": {}, "lifecycle_state": "active",
+            "reserved_cost_micros": 0, "committed_cost_micros": 0,
+            "work_items": {"work-01": work}, "decisions": [], "handoffs": [], "blockers": [],
+            "approvals": [], "reservations": [], "rooms": [], "questions": [], "actions": [],
+            "version": 1, "created_at_unix_ms": NOW, "updated_at_unix_ms": NOW
+        })).unwrap();
+        let context = AdaptiveLeadershipReviewContextV1 { source_project: project, source_session: source,
+            tool_catalog: serde_json::json!({"tools": ["file.inspect"]}), evidence_refs: vec!["retained-source".into()] };
+        let fingerprint = crate::adaptive_leadership_evidence_fingerprint(&context.tool_catalog, &context.evidence_refs).unwrap();
+        let review_grant = AdaptiveLeadershipReviewGrantV1 {
+            schema_version: 1, review_id: crate::adaptive_leadership_review_id(root.session_id, 3, &fingerprint).unwrap(),
+            project_id: root.authority.project_id.clone(), expected_project_version: 1,
+            work_item_id: root.authority.work_item_id.clone(), session_id: root.session_id, expected_session_version: 3,
+            expected_reason_code: "needs_review".into(), evidence_fingerprint: fingerprint,
+            leadership_principal: leader, leadership_authority: leader_authority,
+            assignment_id: "assignment-01".into(), assignee_authority: root.authority.clone(),
+            provider: root.provider.clone(), model: root.model.clone(), catalog_digest: root.catalog_digest.clone(),
+            max_duration_ms: 120_000, token_policy: crate::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+            expires_at_unix_ms: NOW + 100_000,
+        };
+        let mut review = AdaptiveLeadershipReviewCallV1 {
+            schema_version: 1, review_key: review_grant.review_id.to_string(), allowance_id: "review-allowance".into(),
+            operation_id: Uuid::from_u128(20), grant: review_grant, context, version: 2,
+            created_at_unix_ms: NOW + 3, grant_issued_at_unix_ms: NOW + 3, updated_at_unix_ms: NOW + 4,
+            dispatch: None, decision: None, model_response_digest: None, resolution_event_id: None, retired_at_unix_ms: None,
+        };
+        review.dispatch = Some(crate::RequestProviderDispatchV1 { request_id: review.request_id(),
+            request_digest: "b".repeat(64), context_digest: review.context_digest().unwrap(), dispatched_at_unix_ms: NOW + 4 });
+        let mut auth = authorization(&review.context.source_session);
+        auth.review_id = review.grant.review_id;
+        auth.source = crate::AdaptiveContinuationSourceV1::Blocked { reason_code: "needs_review".into() };
+        auth.abandoned_model_effect = None;
+        let allowance = crate::SubscriptionCallAllowanceV1 {
+            allowance_id: auth.provider_allowance_id.clone(), created_by: "pm-01".into(),
+            created_at_unix_ms: auth.issued_at_ms, dispatch: None,
+            grant: crate::SubscriptionCallGrantV1 {
+                schema_version: 1, work_item_id: root.authority.work_item_id.clone(), assignment_id: "assignment-01".into(),
+                assignment_version: root.authority.assignment_version, agent_id: root.authority.agent_id,
+                provider: root.provider, model: root.model, catalog_digest: root.catalog_digest,
+                max_calls: auth.additional_model_calls, max_concurrent: 1, max_duration_ms: 10_000,
+                token_policy: review.grant.token_policy, expires_at_unix_ms: auth.deadline_ms,
+            },
+        };
+        auth.provider_authority_digest = adaptive_continuation_provider_digest(&allowance, &root.authority).unwrap();
+        let mut connection = store.lock().unwrap();
+        let tx = immediate(&mut connection).unwrap();
+        put_test_entity(&tx, &root.authority.tenant_id.0, "project", &root.authority.project_id.0, 1, &review.context.source_project);
+        put_test_entity(&tx, &root.authority.tenant_id.0, "adaptive_leadership_review_call", &review.grant.review_id.to_string(), 2, &review);
+        tx.commit().unwrap();
+        (review, auth, allowance)
+    }
+
+    #[test]
+    fn continuation_transaction_rolls_back_then_recovers_exact_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workflow.sqlite");
+        let store = WorkflowStore::open(&path).unwrap();
+        let (mut review, auth, allowance) = blocked_review(&store);
+        let current = review.grant.assignee_authority.clone();
+        {
+            let mut connection = store.lock().unwrap();
+            let tx = immediate(&mut connection).unwrap();
+            assert!(!continue_adaptive_session_in_transaction(&tx, &auth, &review, &allowance, &current, auth.issued_at_ms).unwrap().0);
+            // Simulate a crash before lane C attaches allowance and final receipt.
+        }
+        assert_eq!(store.adaptive_session(auth.session_id, &current).unwrap(), Some(review.context.source_session.clone()));
+        let continued;
+        {
+            let mut connection = store.lock().unwrap();
+            let tx = immediate(&mut connection).unwrap();
+            continued = continue_adaptive_session_in_transaction(&tx, &auth, &review, &allowance, &current, auth.issued_at_ms).unwrap().1;
+            review.version = 3;
+            review.decision = Some(crate::AdaptiveLeadershipReviewDecisionV1 {
+                schema_version: 1,
+                decision: crate::AdaptiveLeadershipReviewDecisionKindV1::ResolveBlocked {
+                    rationale: "Fixture-only lane C receipt".into(), evidence_refs: review.context.evidence_refs.clone(),
+                },
+            });
+            review.model_response_digest = Some("c".repeat(64));
+            review.updated_at_unix_ms = auth.issued_at_ms;
+            review.resolution_event_id = Some(auth.resolution_event_id);
+            put_test_entity(&tx, &current.tenant_id.0, "adaptive_leadership_review_call", &auth.review_id.to_string(), 3, &review);
+            tx.commit().unwrap();
+        }
+        drop(store);
+        let reopened = WorkflowStore::open(&path).unwrap();
+        let mut connection = reopened.lock().unwrap();
+        let tx = immediate(&mut connection).unwrap();
+        assert_eq!(continue_adaptive_session_in_transaction(&tx, &auth, &review, &allowance, &current, auth.deadline_ms + 1).unwrap(), (true, continued));
+        let mut different = auth.clone(); different.additional_model_calls += 1;
+        assert!(continue_adaptive_session_in_transaction(&tx, &different, &review, &allowance, &current, auth.issued_at_ms).is_err());
+    }
+
+    #[test]
+    fn continuation_transaction_rejects_stale_head_authority_allowance_and_retirement() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();
+        let (review, auth, allowance) = blocked_review(&store);
+        let current = review.grant.assignee_authority.clone();
+        let mut connection = store.lock().unwrap();
+        let tx = immediate(&mut connection).unwrap();
+        let mut changed = current.clone(); changed.policy_generation += 1;
+        assert!(continue_adaptive_session_in_transaction(&tx, &auth, &review, &allowance, &changed, auth.issued_at_ms).is_err());
+        let mut stale = auth.clone(); stale.source_session_version += 1;
+        assert!(continue_adaptive_session_in_transaction(&tx, &stale, &review, &allowance, &current, auth.issued_at_ms).is_err());
+        let mut too_many = allowance.clone(); too_many.grant.max_calls = 16;
+        assert!(continue_adaptive_session_in_transaction(&tx, &auth, &review, &too_many, &current, auth.issued_at_ms).is_err());
+        let mut project = review.context.source_project.clone();
+        project.version += 1;
+        put_test_entity(&tx, &current.tenant_id.0, "project", &current.project_id.0, project.version, &project);
+        assert!(continue_adaptive_session_in_transaction(&tx, &auth, &review, &allowance, &current, auth.issued_at_ms).is_err());
+        let mut retired = review.clone(); retired.retired_at_unix_ms = Some(auth.issued_at_ms);
+        put_test_entity(&tx, &current.tenant_id.0, "adaptive_leadership_review_call", &auth.review_id.to_string(), 2, &retired);
+        assert!(continue_adaptive_session_in_transaction(&tx, &auth, &retired, &allowance, &current, auth.issued_at_ms).is_err());
+        assert_eq!(load(&tx, auth.session_id).unwrap().unwrap().0.cursor, AdaptiveCursorV1::Blocked { reason_code: "needs_review".into() });
+    }
+
+    #[test]
+    fn abandoned_effect_tombstone_blocks_old_claim_replay_and_adoption_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workflow.sqlite");
+        let store = WorkflowStore::open(&path).unwrap();
+        let source = persisted_unknown(&store);
+        let auth = authorization(&source);
+        // Seed only the validated journal transition: V2 ModelUnknown review
+        // eligibility is lane C's integration test, not this tombstone unit test.
+        let next = source.transition(&AdaptiveTransitionV1::ContinueGoverned { authorization: auth.clone() }, auth.issued_at_ms).unwrap();
+        {
+            let mut connection = store.lock().unwrap();
+            let tx = immediate(&mut connection).unwrap();
+            let (_, previous_digest) = load(&tx, auth.session_id).unwrap().unwrap();
+            append(&tx, &namespace(auth.session_id), &Entry {
+                previous_digest: Some(previous_digest), command: Some(AdaptiveTransitionV1::ContinueGoverned { authorization: auth.clone() }),
+                session: next.clone(), recovery_feedback: None,
+            }).unwrap();
+            update_head(&tx, &source, &next).unwrap();
+            tx.commit().unwrap();
+        }
+        drop(store);
+        let reopened = WorkflowStore::open(&path).unwrap();
+        assert_eq!(reopened.adaptive_session(auth.session_id, &source.grant.authority).unwrap(), Some(next.clone()));
+        assert!(reopened.advance_adaptive_session(auth.session_id, 1, Uuid::from_u128(10),
+            &AdaptiveTransitionV1::ClaimModel { effect: effect(102), previous_observation_digest: None },
+            &source.grant.authority, auth.issued_at_ms).is_err());
+        assert!(reopened.adaptive_model_result_is_adopted(&next.effective_grant(), &effect(102), &"a".repeat(64),
+            &AdaptiveModelDecisionV1::Blocked { reason_code: "late_result".into() }).is_err());
+        let mut rollover = source.grant.clone(); rollover.session_id = Uuid::from_u128(999);
+        rollover.provider_allowance_id = "new-root".into();
+        rollover.created_at_ms = auth.deadline_ms; rollover.deadline_ms = auth.deadline_ms + 1_000;
+        assert!(reopened.begin_adaptive_session(&rollover, &rollover.authority, auth.deadline_ms).is_err());
+    }
+
+    #[test]
+    fn historical_unknown_resolution_journal_still_loads_without_new_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap();
+        let source = persisted_unknown(&store);
+        let command = AdaptiveTransitionV1::ResolveModel {
+            effect: effect(102), result_digest: "a".repeat(64),
+            decision: AdaptiveModelDecisionV1::Blocked { reason_code: "historical_result".into() },
+        };
+        let historical = source.transition(&command, NOW + 3).unwrap();
+        {
+            let mut connection = store.lock().unwrap();
+            let tx = immediate(&mut connection).unwrap();
+            let (_, previous_digest) = load(&tx, source.grant.session_id).unwrap().unwrap();
+            append(&tx, &namespace(source.grant.session_id), &Entry {
+                previous_digest: Some(previous_digest), command: Some(command),
+                session: historical.clone(), recovery_feedback: None,
+            }).unwrap();
+            update_head(&tx, &source, &historical).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(store.adaptive_session(source.grant.session_id, &source.grant.authority).unwrap(), Some(historical));
     }
 }
 
