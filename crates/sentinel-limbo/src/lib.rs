@@ -21,6 +21,9 @@ pub use event_gateway::{
 pub use event_store::{
     runtime_config_apply_digest, EventStore, LlmCompletionEntry, LlmModelReservationV1,
     LlmModelSubjectV1, LlmModelUsageBindingV1, LlmSealedUnknownModelEvidenceV1,
+    LlmHistoricalModelJournalReceiptV1, LlmHistoricalInferenceBoundaryV1,
+    LlmRetrospectiveModelProvenanceV1, LlmRetrospectiveModelBindingV1,
+    LlmRetrospectiveUnknownModelEvidenceV1,
     MonotonicityError, OutboxEntry,
     OutboxTransport, RuntimeConfigApplyDecision, RuntimeConfigApplyPhase,
     RuntimeConfigApplyRecoveryMarker, RuntimeConfigApplyRecoveryStart, RuntimeConfigRecoveryMarker,
