@@ -3,7 +3,9 @@
 - Admit customer Sales work through an explicit opt-in bounded Operator policy
   and durable per-request grants instead of a single process-global request.
   Preserve consumed and unknown provider effects, current employee duty,
-  immutable dispatch/result bindings and cumulative campaign limits (#856).
+  immutable dispatch/result bindings and cumulative campaign limits. Bound
+  intake without inbox-overflow starvation, clamp reduced concurrency limits,
+  and retain revoked historical failures without blocking startup (#856).
 
 - Separate breaking Cargo updates, including pre-1.0 minor changes, from the
   compatible update group; require review instead of automatic merge (#856).

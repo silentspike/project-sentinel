@@ -248,11 +248,15 @@ it cannot be enabled by a customer request or model output. The daemon uses the
 immutable configured grant only as the policy anchor: its granting Operator
 must still match the authenticated principal registry exactly, and its provider,
 model, catalog, concurrency and duration remain binding. New intake uses the
-smaller of the configured total ceiling and the anchor's total ceiling. Enabling
+smaller of the configured total ceiling and the anchor's total ceiling, and
+never reserves more concurrency than that effective total. Enabling
 intake does not revive or dispatch the anchor's consumed call.
 
-Periodic reconciliation inspects validated inboxes for registered customers in
-the configured tenant. It admits the oldest eligible request version to the
+Periodic reconciliation inspects a bounded selection of validated, ungranted
+requests for registered customers in the configured tenant. Settled requests,
+already granted versions and questions awaiting a customer reply do not fill
+that selection; an inbox larger than the customer-list API's page bound does
+not stop reconciliation of existing projects. It admits the oldest eligible request version to the
 unique healthy on-duty Sales employee, at most one grant per turn and only when
 pending/unknown Sales calls leave capacity. An unanswered customer question
 waits for the customer's reply. The operation derives from the anchor, request
@@ -271,6 +275,11 @@ Catalog/model, subject, request/context digests, expiry and caller checks remain
 mandatory. Project planning retains its separate bootstrap policy and accepted
 agreement/proposal lineage. These source contracts need live employee-journey
 evidence; configuration and tests alone are not company acceptance.
+
+Historical rejected completions whose Sales identity has been revoked remain
+failed and immutable. They are not requeued under a replacement identity and
+do not prevent daemon startup; corrupt completion envelopes and altered context
+bindings still fail closed. This does not resolve or refund an unknown effect.
 
 Every grant counts toward the store-wide cumulative ceiling, including legacy
 project grants and expired unsent grants. Unknown dispatched outcomes retain

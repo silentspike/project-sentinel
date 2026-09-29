@@ -967,7 +967,7 @@ func requestSalesAutonomousEnabled() (bool, error) {
 
 func validateSalesAutonomyAnchor(enabled bool) error {
 	if enabled && strings.TrimSpace(os.Getenv("SENTINEL_MODEL_WORK_ALLOWANCE_ID")) == "" {
-		return fmt.Errorf("Sales autonomy requires a configured model-work allowance")
+		return fmt.Errorf("sales autonomy requires a configured model-work allowance")
 	}
 	return nil
 }

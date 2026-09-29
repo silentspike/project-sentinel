@@ -2147,7 +2147,10 @@ impl WorkflowApi {
                 .customer_id
                 .as_deref()
                 .ok_or_else(principal_unavailable)?;
-            requests.extend(self.store.company_customer_requests(tenant, customer_id)?);
+            requests.extend(
+                self.store
+                    .company_sales_intake_requests(tenant, customer_id)?,
+            );
         }
         requests.sort_by(|left, right| {
             (left.created_at_unix_ms, &left.request_id)
@@ -2195,7 +2198,10 @@ impl WorkflowApi {
                         model: anchor.grant.model,
                         catalog_digest: anchor.grant.catalog_digest,
                         total_call_limit,
-                        concurrent_call_limit: anchor.grant.concurrent_call_limit,
+                        concurrent_call_limit: anchor
+                            .grant
+                            .concurrent_call_limit
+                            .min(total_call_limit),
                         max_duration_ms: anchor.grant.max_duration_ms,
                         token_policy: anchor.grant.token_policy,
                         expires_at_unix_ms: now_ms
@@ -3621,7 +3627,6 @@ impl WorkflowApi {
             allowance_id: call.allowance_id.clone(),
             grant: call.grant.clone(),
         };
-        self.validate_sales_principal_identity(&call.grant.sales_principal)?;
         let expected_context = RequestSalesContext {
             binding,
             source_request: call.source_request.clone(),
@@ -3631,6 +3636,14 @@ impl WorkflowApi {
             || completion.context != ModelExecutionContext::RequestSales(Box::new(expected_context))
         {
             return Err("Sales completion context changed");
+        }
+        // Historical rejected effects remain immutable after revocation. They
+        // cannot be re-adopted, but are not a prerequisite for daemon startup.
+        if self
+            .validate_sales_principal_identity(&call.grant.sales_principal)
+            .is_err()
+        {
+            return Ok(false);
         }
         let Ok(decision) = serde_json::from_str::<SalesDecision>(&completion.content) else {
             return Ok(false);

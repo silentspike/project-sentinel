@@ -363,6 +363,71 @@ fn owned_call(
 }
 
 impl WorkflowStore {
+    /// Oldest bounded Sales candidates; query hints never confer authority.
+    /// Any exact-version grant permanently excludes that request version.
+    pub fn company_sales_intake_requests(
+        &self,
+        tenant_id: &TenantId,
+        customer_id: &str,
+    ) -> Result<Vec<CustomerRequestV1>, WorkflowError> {
+        tenant_id.validate()?;
+        validate_identifier(customer_id)?;
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        // Validate global bounded history before using any grant as a search hint.
+        let calls = all_calls(&connection)?;
+        let granted_versions: Vec<_> = calls
+            .iter()
+            .filter(|call| &call.granted_by.tenant_id == tenant_id)
+            .map(|call| (&call.grant.request_id, call.grant.expected_version))
+            .collect();
+        let mut statement = connection.prepare(
+            "SELECT request.entity_id FROM company_entities AS request
+             WHERE request.tenant_id=?1 AND request.entity_kind='request'
+               AND json_extract(request.payload,'$.customer_id')=?2
+               AND json_extract(request.payload,'$.state') IN ('submitted','clarifying')
+               AND COALESCE(json_extract(request.payload,'$.consultation[#-1].role'),'')<>'sales'
+               AND NOT EXISTS (
+                   SELECT 1 FROM json_each(?3) AS granted
+                   WHERE json_extract(granted.value,'$[0]')=request.entity_id
+                     AND json_extract(granted.value,'$[1]')=request.version
+               )
+             ORDER BY json_extract(request.payload,'$.created_at_unix_ms'),request.entity_id
+             LIMIT ?4",
+        )?;
+        let ids = statement
+            .query_map(
+                params![
+                    tenant_id.0,
+                    customer_id,
+                    encode(&granted_versions)?,
+                    MAX_AGGREGATE_ITEMS as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                let request: CustomerRequestV1 =
+                    get_entity(&connection, tenant_id, "request", &id)?.ok_or_else(corrupt)?;
+                validate_customer_request(&request)?;
+                if &request.tenant_id != tenant_id
+                    || request.customer_id != customer_id
+                    || !matches!(
+                        request.state,
+                        CustomerRequestStateV1::Submitted | CustomerRequestStateV1::Clarifying
+                    )
+                    || request_has_unanswered_question(&request)
+                    || granted_versions.iter().any(|(request_id, version)| {
+                        *request_id == &request.request_id && *version == request.version
+                    })
+                {
+                    return Err(corrupt());
+                }
+                Ok(request)
+            })
+            .collect()
+    }
+
     /// Trusted daemon admission only; never expose grant creation to an agent.
     /// Existing grants, including expired/unknown ones, permanently count.
     pub fn authorize_request_provider_call(
