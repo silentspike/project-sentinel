@@ -7,7 +7,7 @@ toolchain go1.26.6
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/nats-io/nats.go v1.48.0
-	github.com/silentspike/project-sentinel/pkg/sentinel-go v0.0.0-20260528210141-be607cd65df5
+	github.com/silentspike/project-sentinel/pkg/sentinel-go v0.0.0-20260929010847-b2b2b921258c
 )
 
 require (
