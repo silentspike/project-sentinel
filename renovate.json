@@ -9,6 +9,7 @@
   "schedule": ["* * * * *"],
   "timezone": "Europe/Berlin",
   "platformCommit": "enabled",
+  "prBodyTemplate": "## Summary\n\nAutomated dependency update proposal. Compatibility, security and applicable exact-head CI must be reviewed before integration; no deployment is claimed.\n\n## Changes\n\n{{{table}}}\n\n## Linked Issues\n\nPartially addresses #621. No issue closure is requested.\n\n## Test Plan\n\n- [ ] Review the upstream delta and existing dependency ownership contract.\n- [ ] Applicable exact-head CI and policy checks.\n- [ ] Affected runtime validation where required by the change.\n\n## Benchmarks\n\nN/A for this automated proposal. No performance claim; affected runtime performance requires separate evidence.\n\n## Evidence (AC Mapping)\n\n```text\nPublication state: update proposal, verification NOT RUN here.\nRead the exact-head check results: gh pr checks <PR-number>\nNo runtime deployment, acceptance or benchmark is claimed.\n```\n\n| Criterion | Required owner verification | Status |\n|---|---|---|\n| AC-6 | Preserve the existing dependency policy and registry checks; this proposal does not complete the governance epic | PENDING |\n\n## Checklist\n\n- [ ] Upstream delta and ownership reviewed.\n- [ ] Relevant gates and acceptance evidenced before merge.\n- [ ] <!-- rebase-check --> Refresh this proposal against the current base.\n",
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": ["* * * * *"]
@@ -45,7 +46,7 @@
     },
     {
       "description": "npm/bun minor/patch updates grouped",
-      "matchManagers": ["npm"],
+      "matchManagers": ["npm", "bun"],
       "matchUpdateTypes": ["minor", "patch"],
       "groupName": "bun-minor",
       "commitMessagePrefix": "deps(bun):",
@@ -56,6 +57,12 @@
       "matchManagers": ["github-actions"],
       "commitMessagePrefix": "ci:",
       "automerge": true
+    },
+    {
+      "description": "Explicit GitHub Actions Rust toolchain updates require review",
+      "matchManagers": ["github-actions"],
+      "matchDatasources": ["rust-version"],
+      "automerge": false
     }
   ],
   "prConcurrentLimit": 10,
