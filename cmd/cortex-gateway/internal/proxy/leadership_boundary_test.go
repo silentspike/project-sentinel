@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -219,10 +220,226 @@ func TestLeadershipBoundaryDecisionSchemaContract(t *testing.T) {
 	assertJSON(decision["additionalProperties"], `false`)
 	assertJSON(decision["required"], `["kind","rationale","evidence_refs"]`)
 	assertJSON(fields["kind"], `{"enum":["resolve_blocked","keep_blocked"],"type":"string"}`)
-	assertJSON(fields["rationale"], `{"maxLength":2048,"minLength":1,"pattern":"\\S","type":"string"}`)
-	assertJSON(fields["evidence_refs"], `{"items":{"type":"string"},"maxItems":8,"type":"array","uniqueItems":true}`)
+	rationale := fields["rationale"].(map[string]any)
+	assertJSON(rationale, `{"maxLength":2048,"minLength":1,"pattern":"\\S","type":"string"}`)
+	refs := fields["evidence_refs"].(map[string]any)
+	assertJSON(refs["type"], `"array"`)
+	assertJSON(refs["items"], `{"type":"string"}`)
+	assertJSON(refs["maxItems"], `8`)
+	if _, present := refs["uniqueItems"]; present {
+		t.Fatal("generation schema must not use uniqueItems")
+	}
+	if description, _ := refs["description"].(string); !strings.Contains(strings.ToLower(description), "unique") {
+		t.Fatal("generation schema must describe evidence reference uniqueness")
+	}
 	if len(properties) != 2 || len(fields) != 3 {
 		t.Fatal("unexpected decision fields")
+	}
+}
+
+// Bounded fixture checks, not a vendor-certified validator or response validator.
+// String lengths remain unchanged for the non-fine-tuned route; their mention in
+// fine-tuned exclusions alone is not an explicit general support guarantee.
+// Canonical Rust decision.validate/validate_refs remains authoritative.
+func nativeGenerationSchemaIssues(value any, path string) []string {
+	schema, ok := value.(map[string]any)
+	if !ok {
+		return []string{path + ": schema must be an object"}
+	}
+	var issues []string
+	if _, present := schema["uniqueItems"]; present {
+		issues = append(issues, path+".uniqueItems: unsupported generation keyword")
+	}
+	if path == "$" {
+		if schema["type"] != "object" {
+			issues = append(issues, path+".type: root must be an object")
+		}
+		if _, present := schema["anyOf"]; present {
+			issues = append(issues, path+".anyOf: root alternatives are unsupported")
+		}
+	}
+	if alternatives, present := schema["anyOf"]; present {
+		branches, ok := alternatives.([]any)
+		if !ok || len(branches) == 0 {
+			issues = append(issues, path+".anyOf: expected nonempty alternatives")
+		}
+		for i, branch := range branches {
+			issues = append(issues, nativeGenerationSchemaIssues(branch, fmt.Sprintf("%s.anyOf[%d]", path, i))...)
+		}
+	}
+	if enum, present := schema["enum"]; present {
+		values, ok := enum.([]any)
+		if !ok || len(values) == 0 {
+			issues = append(issues, path+".enum: expected nonempty values")
+		}
+	}
+	_, hasProperties := schema["properties"]
+	if schema["type"] == "object" || hasProperties {
+		issues = append(issues, nativeGenerationObjectIssues(schema, path)...)
+	}
+	if items, present := schema["items"]; present {
+		issues = append(issues, nativeGenerationSchemaIssues(items, path+".items")...)
+	} else if schema["type"] == "array" {
+		issues = append(issues, path+".items: expected an item schema")
+	}
+	return issues
+}
+
+func nativeGenerationObjectIssues(schema map[string]any, path string) []string {
+	var issues []string
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		issues = append(issues, path+".properties: expected an object")
+	}
+	if schema["additionalProperties"] != false {
+		issues = append(issues, path+".additionalProperties: must be false")
+	}
+	required, ok := schema["required"].([]any)
+	if !ok {
+		issues = append(issues, path+".required: expected all property names")
+	}
+	seen := make(map[string]bool)
+	for i, value := range required {
+		name, ok := value.(string)
+		if !ok {
+			issues = append(issues, fmt.Sprintf("%s.required[%d]: expected a property name", path, i))
+			continue
+		}
+		if _, exists := properties[name]; !exists || seen[name] {
+			issues = append(issues, path+".required: unknown or duplicate property "+name)
+		}
+		seen[name] = true
+	}
+	names := make([]string, 0, len(properties))
+	for name := range properties {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if !seen[name] {
+			issues = append(issues, path+".required: missing property "+name)
+		}
+		issues = append(issues, nativeGenerationSchemaIssues(properties[name], path+".properties."+name)...)
+	}
+	return issues
+}
+
+func TestNativeGenerationSchemaConformance(t *testing.T) {
+	for _, fixture := range []struct {
+		name string
+		body []byte
+	}{
+		{"work", codexCLIWorkSchema},
+		{"review", codexCLIReviewSchema},
+		{"adaptive", codexCLIAdaptiveSchema},
+		{"leadership", codexCLILeadershipSchema},
+		{"unknown_leadership", codexCLIUnknownLeadershipSchema},
+		{"continuation_leadership", codexCLIContinuationLeadershipSchema},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			var schema any
+			if err := json.Unmarshal(fixture.body, &schema); err != nil {
+				t.Fatal(err)
+			}
+			for _, issue := range nativeGenerationSchemaIssues(schema, "$") {
+				t.Error(issue)
+			}
+		})
+	}
+}
+
+func TestNativeGenerationSchemaConformanceChecker(t *testing.T) {
+	for _, tc := range []struct {
+		name, schema, want string
+	}{
+		{"supported_constraints", `{"type":"object","properties":{"value":{"type":"number","minimum":-1,"maximum":2,"enum":[-1,2]},"refs":{"type":"array","minItems":1,"maxItems":8,"description":"Unique references","items":{"type":"string","pattern":"\\S"}},"nullable":{"type":["string","null"]}},"required":["value","refs","nullable"],"additionalProperties":false}`, ""},
+		{"unique_false", `{"type":"array","uniqueItems":false,"items":{"type":"string"}}`, "$.uniqueItems: unsupported generation keyword"},
+		{"nested_unique", `{"anyOf":[{"type":"string","enum":["keep"]},{"type":"array","items":{"type":"array","uniqueItems":true,"items":{"type":"string"}}}]}`, "$.anyOf[1].items.uniqueItems: unsupported generation keyword"},
+		{"missing_required", `{"type":"object","properties":{"a":{"type":"string"}},"required":[],"additionalProperties":false}`, "$.required: missing property a"},
+		{"extra_required", `{"type":"object","properties":{},"required":["a"],"additionalProperties":false}`, "$.required: unknown or duplicate property a"},
+		{"duplicate_required", `{"type":"object","properties":{"a":{"type":"string"}},"required":["a","a"],"additionalProperties":false}`, "$.required: unknown or duplicate property a"},
+		{"open_object", `{"type":"object","properties":{},"required":[],"additionalProperties":true}`, "$.additionalProperties: must be false"},
+		{"empty_anyof", `{"anyOf":[]}`, "$.anyOf: expected nonempty alternatives"},
+		{"invalid_alternative", `{"anyOf":[{"type":"string"},false]}`, "$.anyOf[1]: schema must be an object"},
+		{"empty_enum", `{"type":"string","enum":[]}`, "$.enum: expected nonempty values"},
+		{"missing_items", `{"type":"array"}`, "$.items: expected an item schema"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var schema any
+			if err := json.Unmarshal([]byte(tc.schema), &schema); err != nil {
+				t.Fatal(err)
+			}
+			// Nested schemas may be arrays or anyOf; only fixture roots require objects.
+			path := "$.nested"
+			want := strings.Replace(tc.want, "$", path, 1)
+			for attempt := 0; attempt < 3; attempt++ {
+				if got := strings.Join(nativeGenerationSchemaIssues(schema, path), "\n"); got != want {
+					t.Fatalf("got %q want %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestLeadershipBoundaryContinuationSchemaContracts(t *testing.T) {
+	for _, tc := range []struct {
+		name, keep string
+		body       []byte
+	}{
+		{"unknown_leadership", "keep_unknown", codexCLIUnknownLeadershipSchema},
+		{"continuation_leadership", "keep_blocked", codexCLIContinuationLeadershipSchema},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var schema map[string]any
+			if err := json.Unmarshal(tc.body, &schema); err != nil {
+				t.Fatal(err)
+			}
+			assertJSON := func(got any, want string) {
+				t.Helper()
+				encoded, err := json.Marshal(got)
+				if err != nil || string(encoded) != want {
+					t.Fatalf("got %s want %s", encoded, want)
+				}
+			}
+			properties := schema["properties"].(map[string]any)
+			assertJSON(properties["schema_version"], `{"enum":[2],"type":"integer"}`)
+			decision := properties["decision"].(map[string]any)
+			alternatives, ok := decision["anyOf"].([]any)
+			if !ok || len(alternatives) != 2 || len(decision) != 1 {
+				t.Fatal("expected exactly the keep and continue alternatives")
+			}
+			if len(properties) != 2 {
+				t.Fatal("unexpected envelope fields")
+			}
+			for i, alternative := range alternatives {
+				branch := alternative.(map[string]any)
+				fields := branch["properties"].(map[string]any)
+				kind := tc.keep
+				wantFields := 3
+				if i == 1 {
+					kind = "continue"
+					wantFields = 5
+					assertJSON(fields["additional_model_calls"], `{"maximum":64,"minimum":1,"type":"integer"}`)
+					assertJSON(fields["window_ms"], `{"maximum":300000,"minimum":1000,"type":"integer"}`)
+				}
+				assertJSON(fields["kind"], fmt.Sprintf(`{"enum":[%q],"type":"string"}`, kind))
+				assertJSON(fields["rationale"], `{"maxLength":2048,"minLength":1,"pattern":"\\S","type":"string"}`)
+				refs := fields["evidence_refs"].(map[string]any)
+				assertJSON(refs["type"], `"array"`)
+				assertJSON(refs["items"], `{"type":"string"}`)
+				assertJSON(refs["minItems"], `1`)
+				assertJSON(refs["maxItems"], `8`)
+				if _, present := refs["uniqueItems"]; present {
+					t.Errorf("alternative %d must not use uniqueItems", i)
+				}
+				if description, _ := refs["description"].(string); !strings.Contains(strings.ToLower(description), "unique") {
+					t.Errorf("alternative %d must describe evidence reference uniqueness", i)
+				}
+				if len(fields) != wantFields {
+					t.Errorf("alternative %d has unexpected fields", i)
+				}
+			}
+		})
 	}
 }
 
