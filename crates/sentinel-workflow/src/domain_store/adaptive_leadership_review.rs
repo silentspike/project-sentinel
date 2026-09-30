@@ -1,4 +1,6 @@
 use super::*;
+#[path = "adaptive_leadership_recovery.rs"]
+mod recovery;
 use crate::{
     adaptive_leadership_continuation_audit_id, AdaptiveCursorV1,
     AdaptiveLeadershipAbandonedAllowanceV2, AdaptiveLeadershipReviewCallV1,
@@ -551,6 +553,10 @@ impl CompanyEntity for ExpiredAdaptiveContinuationRetirementV1 {
 }
 
 impl AdaptiveLeadershipReviewCallV1 {
+    pub(crate) fn validate_recovery_history_entity(&self) -> Result<(), WorkflowError> {
+        <Self as CompanyEntity>::validate_entity(self)
+    }
+
     /// Validate immutable audit inputs before external persistence. This does not
     /// renew time authority or replace the transaction's current-source checks.
     pub fn validate_completion_proposal(
@@ -702,6 +708,10 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
         require_subject_time(self, self.grant_issued_at_unix_ms)?;
         Ok(())
     }
+
+    fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
+        WorkflowStore::require_recovery_epoch_review(connection, self)
+    }
 }
 
 impl WorkflowStore {
@@ -796,6 +806,9 @@ impl WorkflowStore {
             store_call(&transaction, &prior, "adaptive_leadership_review_renewed")?;
             transaction.commit()?;
             return Ok(prior);
+        }
+        if grant.recovery_epoch.is_some() {
+            return Err(unauthorized());
         }
         grant.validate(now_ms)?;
         context.validate(grant)?;
@@ -1105,6 +1118,7 @@ impl WorkflowStore {
         }
         require_current_source(&transaction, &call)?;
         require_subject_time(&call, now_ms)?;
+        recovery::require_epoch_time(&transaction, &call, now_ms)?;
         call.dispatch = Some(RequestProviderDispatchV1 {
             request_id: claim.request_id.clone(),
             request_digest: claim.request_digest.clone(),
@@ -1143,6 +1157,15 @@ impl WorkflowStore {
         if call.decision.is_some() {
             return Ok(call);
         }
+        recovery::require_epoch_time(
+            &transaction,
+            &call,
+            result
+                .continuation
+                .as_ref()
+                .map_or(now_ms, |authorization| authorization.issued_at_ms),
+        )?;
+        recovery::require_epoch_completion(&transaction, &call, result)?;
         if call.grant.schema_version == 2
             && result.continuation.is_none()
             && now_ms >= call.grant.expires_at_unix_ms
@@ -1246,6 +1269,9 @@ impl WorkflowStore {
 #[cfg(test)]
 mod tests {
     include!("adaptive_leadership_review/tests.rs");
+    mod recovery_tests {
+        include!("adaptive_leadership_review/recovery_tests.rs");
+    }
 
     const CONTINUATION_AT: u64 = 900_002;
 

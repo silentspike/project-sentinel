@@ -699,7 +699,11 @@ func codexCLIProcessError(diagnostic string) error {
 	case strings.Contains(lower, "forbidden"), strings.Contains(lower, "access denied"), strings.Contains(lower, "permission denied"), strings.Contains(lower, "status 403"):
 		return &ProviderError{StatusCode: http.StatusServiceUnavailable, Message: "codex-cli access unavailable"}
 	case strings.Contains(lower, "invalid schema"), strings.Contains(lower, "invalid_json_schema"), strings.Contains(lower, "schema") && strings.Contains(lower, "not permitted"):
-		return &ProviderError{StatusCode: http.StatusBadGateway, Message: "codex-cli output schema rejected"}
+		return &ProviderError{
+			StatusCode: http.StatusBadGateway,
+			Message:    "codex-cli output schema rejected",
+			Diagnostic: ProviderDiagnosticCodexOutputSchemaRejected,
+		}
 	case strings.Contains(lower, "bad request"), strings.Contains(lower, "invalid request"), strings.Contains(lower, "status 400"):
 		return &ProviderError{StatusCode: http.StatusBadGateway, Message: "codex-cli request rejected"}
 	case strings.Contains(lower, "connection failed"), strings.Contains(lower, "connection error"), strings.Contains(lower, "error sending request"), strings.Contains(lower, "request failed"), strings.Contains(lower, "backend request failed"), strings.Contains(lower, "service unavailable"):

@@ -8,6 +8,10 @@ mod adaptive_continuation_tests;
 #[cfg(feature = "llm")]
 pub(crate) mod adaptive_leadership_review;
 mod adaptive_recovery;
+#[cfg(feature = "llm")]
+mod adaptive_recovery_release;
+#[cfg(feature = "llm")]
+mod adaptive_review_epoch;
 mod delivery_intent;
 mod delivery_runtime;
 #[cfg(feature = "llm")]
@@ -97,6 +101,7 @@ pub const PROJECT_PROVIDER_ABANDON_PATH: &str = "/operator/workflow/project-prov
 pub const AGENT_COMMAND_PATH: &str = "/agent/workflow/commands";
 pub const WORK_CORRECTION_PATH: &str = "/agent/workflow/corrections";
 pub const ADAPTIVE_RECOVERY_PATH: &str = "/agent/workflow/adaptive-recovery";
+pub const ADAPTIVE_REVIEW_EPOCH_PATH: &str = "/operator/workflow/adaptive-review-epochs";
 pub const SOURCE_REVIEW_PATH: &str = "/agent/workflow/source-reviews";
 pub const OPERATOR_PROJECT_PATH: &str = "/operator/workflow/projects";
 pub const OPERATOR_WORK_ITEM_PATH: &str = "/operator/workflow/work-items";
@@ -3360,6 +3365,10 @@ impl WorkflowApi {
             ("POST", ADAPTIVE_RECOVERY_PATH) => {
                 self.resolve_blocked_adaptive_work(&principal, body)
             }
+            #[cfg(feature = "llm")]
+            ("GET" | "POST", ADAPTIVE_REVIEW_EPOCH_PATH) => {
+                self.review_recovery_epoch(&principal, method, path, body)
+            }
             ("POST", SOURCE_REVIEW_PATH) => self.append_source_review(&principal, body),
             ("GET", CUSTOMER_REQUEST_PATH) => self.customer_request(&principal, path),
             ("GET", CUSTOMER_IDENTITY_PATH) => customer_identity(&principal),
@@ -5843,6 +5852,7 @@ fn is_workflow_path(path: &str) -> bool {
             | REQUEST_PROVIDER_PATH
             | WORK_CORRECTION_PATH
             | ADAPTIVE_RECOVERY_PATH
+            | ADAPTIVE_REVIEW_EPOCH_PATH
             | SOURCE_REVIEW_PATH
             | REQUEST_PROVIDER_ABANDON_PATH
             | PROJECT_PROVIDER_ABANDON_PATH
