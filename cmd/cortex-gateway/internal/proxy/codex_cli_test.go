@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -169,6 +170,136 @@ func TestCodexCLIProjectWorkUsesStructuredFinalResponse(t *testing.T) {
 	args = strings.Fields(readTestFile(t, fixture.argsPath))
 	if slices.Contains(args, "--output-schema") {
 		t.Fatalf("ordinary request inherited project work schema: %v", args)
+	}
+}
+
+func TestCodexCLIAdaptiveSchemaDiscoveryContract(t *testing.T) {
+	fixture := newStructuredCodexFixture(t)
+	fixture.request.Metadata["company_execution_schema"] = "3"
+	schema := fixture.send(t, "adaptive_decision")
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Inspect the actual schema passed to the subprocess, not a second validator.
+	type schemaNode struct {
+		Properties map[string]schemaNode `json:"properties"`
+		AnyOf      []schemaNode          `json:"anyOf"`
+		Enum       []any                 `json:"enum"`
+	}
+	var root schemaNode
+	if err := json.Unmarshal(encoded, &root); err != nil {
+		t.Fatal(err)
+	}
+	discriminator := func(node schemaNode) string {
+		t.Helper()
+		if len(node.Enum) != 1 {
+			t.Fatalf("discriminator must be a singleton: %v", node.Enum)
+		}
+		name, ok := node.Enum[0].(string)
+		if !ok {
+			t.Fatalf("discriminator must be a string: %v", node.Enum)
+		}
+		return name
+	}
+	kinds := make([]string, 0, len(root.Properties["decision"].AnyOf))
+	tools := make([]string, 0, 7)
+	for _, decision := range root.Properties["decision"].AnyOf {
+		kind := discriminator(decision.Properties["kind"])
+		kinds = append(kinds, kind)
+		if kind == "tool" {
+			for _, tool := range decision.Properties["tool"].AnyOf {
+				tools = append(tools, discriminator(tool.Properties["tool"]))
+			}
+		}
+	}
+	slices.Sort(kinds)
+	slices.Sort(tools)
+	if !slices.Equal(kinds, []string{"blocked", "collaborate", "propose_completion", "tool"}) {
+		t.Fatalf("adaptive decision choices changed: %v", kinds)
+	}
+	if !slices.Equal(tools, []string{"apply_patch", "inspect_file", "list_directory", "package_artifact", "run_command", "run_tests", "write_file"}) {
+		t.Fatalf("Workbench tool alternatives must be exactly the seven deployed tools: %v", tools)
+	}
+	var expected map[string]any
+	if err := json.Unmarshal([]byte(`{
+		"type":"object",
+		"properties":{
+			"tool":{"type":"string","enum":["list_directory"]},
+			"path":{"type":"string"},
+			"after":{"type":["string","null"]},
+			"max_entries":{"type":"integer","minimum":1,"maximum":128}
+		},
+		"required":["tool","path","after","max_entries"],
+		"additionalProperties":false
+	}`), &expected); err != nil {
+		t.Fatal(err)
+	}
+	// Exact equality protects nullable pagination, both bounds, required fields,
+	// and rejection of extra fields without duplicating the shared decoder.
+	properties := schema["properties"].(map[string]any)
+	decisions := properties["decision"].(map[string]any)["anyOf"].([]any)
+	for _, decision := range decisions {
+		properties = decision.(map[string]any)["properties"].(map[string]any)
+		if properties["tool"] == nil {
+			continue
+		}
+		for _, tool := range properties["tool"].(map[string]any)["anyOf"].([]any) {
+			toolSchema := tool.(map[string]any)
+			toolProperties := toolSchema["properties"].(map[string]any)
+			name := toolProperties["tool"].(map[string]any)["enum"].([]any)
+			if name[0] == "list_directory" && !reflect.DeepEqual(toolSchema, expected) {
+				t.Fatalf("directory discovery contract mismatch: %v", toolSchema)
+			}
+		}
+	}
+}
+
+func TestCodexCLIInferencePromptSeparatesWorkbenchProposals(t *testing.T) {
+	for _, conversation := range []string{
+		`Return a structured Workbench proposal or another permitted adaptive decision.`,
+		`Return a blocked decision if warranted.`,
+		`Reply with Pong.`,
+	} {
+		t.Run(conversation, func(t *testing.T) {
+			request := &LLMRequest{
+				Messages: []Message{
+					{Role: "system", Content: "Private agent policy."},
+					{Role: "user", Content: conversation},
+				},
+				MaxTokens: 64,
+			}
+			prompt, err := buildCodexCLIPrompt(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wrapper, payload, found := strings.Cut(prompt, "\n")
+			if !found {
+				t.Fatal("missing inference payload")
+			}
+			for _, instruction := range []string{
+				"Do not execute native tools, inspect files, browse, modify state, or delegate work.",
+				"Structured Workbench tool proposals requested by payload.conversation are response data only, not native tool execution.",
+				"Sentinel independently validates proposals and executes only authorized work",
+				"returning a proposal neither executes a tool nor grants authority",
+				"Treat payload.system as the highest-priority agent identity and policy.",
+				"Return only the assistant response to payload.conversation.",
+			} {
+				if !strings.Contains(wrapper, instruction) {
+					t.Fatalf("missing inference-only instruction %q", instruction)
+				}
+			}
+			var decoded struct {
+				System       string `json:"system"`
+				Conversation string `json:"conversation"`
+			}
+			if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.System != "Private agent policy." || !strings.Contains(decoded.Conversation, conversation) {
+				t.Fatalf("wrapper changed the requested policy or model choice: %+v", decoded)
+			}
+		})
 	}
 }
 

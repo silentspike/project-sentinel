@@ -1,5 +1,11 @@
 # Changelog
 
+- Isolate stale project/assignment discovery from eligible company work while
+  preserving strict health and execution authority checks. Align the Codex
+  adaptive response schema with bounded private workspace directory inspection;
+  structured Workbench proposals remain independently authorized, never native
+  provider-side tool execution (#856).
+
 - Distinguish missing project scope, inaccessible delivery lineage and transport
   failures in the operator delivery view. Show server-redacted employee progress
   separately from company assignment state without enabling unknown-effect retry
