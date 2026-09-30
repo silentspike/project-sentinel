@@ -19,6 +19,34 @@ func testConfig() BreakerConfig {
 	}
 }
 
+func TestAdmissionRejectionIsNotProviderRecoveryEvidence(t *testing.T) {
+	cb := NewCircuitBreaker(testConfig())
+	now := time.Now()
+	cb.now = func() time.Time { return now }
+	cb.Record(errors.New("transport failure"))
+	cb.Record(providerAdmissionError(&ProviderError{StatusCode: 429, Message: "quota"}))
+	if cb.consecutive != 1 || len(cb.records) != 1 {
+		t.Fatalf("admission changed provider history: consecutive=%d records=%d", cb.consecutive, len(cb.records))
+	}
+	cb.Record(errors.New("transport failure"))
+	cb.Record(errors.New("transport failure"))
+	now = now.Add(6 * time.Second)
+	if !cb.Allow() || cb.State() != "half-open" {
+		t.Fatal("expected half-open probe")
+	}
+	for i := 0; i < 3; i++ {
+		cb.Record(providerAdmissionError(errors.New("claim rejected")))
+	}
+	if cb.State() != "half-open" || cb.probeCount != 0 {
+		t.Fatalf("admission falsely proved recovery: state=%s probes=%d", cb.State(), cb.probeCount)
+	}
+	cb.Record(nil)
+	cb.Record(nil)
+	if cb.State() != "closed" {
+		t.Fatal("actual successful probes should still close the breaker")
+	}
+}
+
 func TestCircuitBreakerStartsClosed(t *testing.T) {
 	cb := NewCircuitBreaker(testConfig())
 	if got := cb.State(); got != "closed" {

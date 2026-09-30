@@ -149,6 +149,11 @@ func (cb *CircuitBreaker) Allow() bool {
 // Record meldet das Ergebnis eines Requests.
 // err == nil → Erfolg. err != nil → wird auf Failure-Klasse geprueft.
 func (cb *CircuitBreaker) Record(err error) {
+	// A rejected admission has no provider result and cannot prove recovery.
+	var admissionErr *ProviderAdmissionError
+	if errors.As(err, &admissionErr) {
+		return
+	}
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 

@@ -802,6 +802,225 @@ func TestCodexCLIProviderSanitizesAuthenticationFailure(t *testing.T) {
 	}
 }
 
+func newCodexCLIFailureFixture(t *testing.T, stdout, diagnostic string, exitCode int) (structuredCodexFixture, string) {
+	t.Helper()
+	fixture := newStructuredCodexFixture(t)
+	fixture.request.Metadata = nil
+	callsPath := filepath.Join(t.TempDir(), "calls")
+	script := fmt.Sprintf("#!/bin/sh\nset -eu\nprintf 'called\\n' >> %q\ncat >/dev/null\nprintf '%%b\\n' %q\nprintf '%%s\\n' %q >&2\nexit %d\n",
+		callsPath, stdout, diagnostic, exitCode)
+	if err := os.WriteFile(fixture.provider.binary, []byte(script), 0o700); err != nil { //nolint:gosec // executable test fixture
+		t.Fatal(err)
+	}
+	return fixture, callsPath
+}
+
+func assertCodexCLIQuotaError(t *testing.T, err error) {
+	t.Helper()
+	var providerErr *ProviderError
+	var admissionErr *ProviderAdmissionError
+	if !errors.As(err, &providerErr) || providerErr.StatusCode != http.StatusTooManyRequests ||
+		providerErr.Message != "codex-cli usage limit active" || errors.As(err, &admissionErr) {
+		t.Fatalf("want raw sanitized provider quota error, got %T: %v", err, err)
+	}
+}
+
+func TestCodexCLIQuotaCachesOnlyActualSendFailures(t *testing.T) {
+	for _, test := range []struct {
+		name, stdout, diagnostic string
+		exitCode                 int
+	}{
+		{name: "stderr", diagnostic: "usage limit reached; private-secret; resets tomorrow", exitCode: 1},
+		{name: "error event", stdout: `{"type":"error","message":"rate limit private-secret"}`},
+		{name: "turn failure", stdout: "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n{\"type\":\"turn.started\"}\n" +
+			`{"type":"turn.failed","error":{"message":"usage limit private-secret"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, callsPath := newCodexCLIFailureFixture(t, test.stdout, test.diagnostic, test.exitCode)
+			if err := fixture.provider.CurrentProviderError(); err != nil {
+				t.Fatalf("new provider has cached status: %v", err)
+			}
+			if _, err := os.Stat(callsPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("status check spawned a subprocess: %v", err)
+			}
+			_, err := fixture.provider.Send(context.Background(), fixture.request)
+			assertCodexCLIQuotaError(t, err)
+			assertCodexCLIQuotaError(t, fixture.provider.CurrentProviderError())
+			_, err = fixture.provider.Send(context.Background(), fixture.request)
+			assertCodexCLIQuotaError(t, err)
+			if got := readTestFile(t, callsPath); got != "called\n" {
+				t.Fatalf("known quota spawned another subprocess: %q", got)
+			}
+		})
+	}
+}
+
+func TestCodexCLIQuotaConcurrencyAndExpiry(t *testing.T) {
+	fixture, callsPath := newCodexCLIFailureFixture(t, "", "usage limit", 1)
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	fixture.provider.now = func() time.Time { return now }
+	_, err := fixture.provider.Send(context.Background(), fixture.request)
+	assertCodexCLIQuotaError(t, err)
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			assertCodexCLIQuotaError(t, fixture.provider.CurrentProviderError())
+			_, err := fixture.provider.Send(context.Background(), fixture.request)
+			assertCodexCLIQuotaError(t, err)
+		}()
+	}
+	wg.Wait()
+	if got := readTestFile(t, callsPath); got != "called\n" {
+		t.Fatalf("concurrent cached calls spawned a subprocess: %q", got)
+	}
+	now = now.Add(codexCLIUsageLimitCooldown - time.Nanosecond)
+	assertCodexCLIQuotaError(t, fixture.provider.CurrentProviderError())
+	now = now.Add(time.Nanosecond)
+	if err := fixture.provider.CurrentProviderError(); err != nil {
+		t.Fatalf("local cooldown did not expire at its boundary: %v", err)
+	}
+	if got := readTestFile(t, callsPath); got != "called\n" {
+		t.Fatalf("expiry check spawned a subprocess: %q", got)
+	}
+	_, err = fixture.provider.Send(context.Background(), fixture.request)
+	assertCodexCLIQuotaError(t, err)
+	if got := readTestFile(t, callsPath); got != "called\ncalled\n" {
+		t.Fatalf("expiry did not permit exactly one new attempt: %q", got)
+	}
+	assertCodexCLIQuotaError(t, fixture.provider.CurrentProviderError())
+}
+
+func TestCodexCLIQuotaRechecksAfterSemaphoreWait(t *testing.T) {
+	fixture, callsPath := newCodexCLIFailureFixture(t, "", "usage limit", 1)
+	// An expired prior failure lets the request pass the first status check.
+	fixture.provider.cooldownUntil = time.Unix(1, 0)
+	checked := make(chan struct{}, 1)
+	fixture.provider.now = func() time.Time {
+		select {
+		case checked <- struct{}{}:
+		default:
+		}
+		return time.Unix(2, 0)
+	}
+	fixture.provider.sem <- struct{}{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := fixture.provider.Send(ctx, fixture.request)
+		done <- err
+	}()
+	select {
+	case <-checked:
+	case <-ctx.Done():
+		t.Fatal("request did not check status before semaphore wait")
+	}
+	// Model the preceding in-flight Send recording its final classified error.
+	fixture.provider.rememberUsageLimit(codexCLIProcessError("usage limit"))
+	<-fixture.provider.sem
+	assertCodexCLIQuotaError(t, <-done)
+	if _, err := os.Stat(callsPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("quota learned during semaphore wait spawned a subprocess: %v", err)
+	}
+}
+
+func TestCodexCLIQuotaSuccessfulInflightSendPreservesNewerCooldown(t *testing.T) {
+	fixture := newStructuredCodexFixture(t)
+	fixture.request.Metadata = nil
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	fixture.provider.now = func() time.Time { return now }
+	barrierDir := t.TempDir()
+	startedPath := filepath.Join(barrierDir, "started")
+	releasePath := filepath.Join(barrierDir, "release")
+	script := readTestFile(t, fixture.provider.binary)
+	barrier := fmt.Sprintf("set -eu\nprintf 'started\\n' > %q\nwhile [ ! -f %q ]; do sleep 0.01; done\n", startedPath, releasePath)
+	script = strings.Replace(script, "set -eu\n", barrier, 1)
+	if err := os.WriteFile(fixture.provider.binary, []byte(script), 0o700); err != nil { //nolint:gosec // executable test fixture
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	type result struct {
+		response *LLMResponse
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		response, err := fixture.provider.Send(ctx, fixture.request)
+		done <- result{response: response, err: err}
+	}()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(startedPath); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		select {
+		case completed := <-done:
+			t.Fatalf("Send completed before reaching the barrier: %+v", completed)
+		case <-ctx.Done():
+			t.Fatal("Send did not reach the subprocess barrier")
+		case <-ticker.C:
+		}
+	}
+	// Independently establish newer status after the successful attempt has
+	// started, while the barrier prevents its completion defer from running.
+	fixture.provider.rememberUsageLimit(codexCLIProcessError("usage limit"))
+	assertCodexCLIQuotaError(t, fixture.provider.CurrentProviderError())
+	if err := os.WriteFile(releasePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case completed := <-done:
+		if completed.err != nil || completed.response == nil || completed.response.Content != "Pong" {
+			t.Fatalf("in-flight Send did not actually succeed: %+v", completed)
+		}
+	case <-ctx.Done():
+		t.Fatal("in-flight Send did not complete after barrier release")
+	}
+	assertCodexCLIQuotaError(t, fixture.provider.CurrentProviderError())
+	fixture.provider.cooldownMu.Lock()
+	until := fixture.provider.cooldownUntil
+	fixture.provider.cooldownMu.Unlock()
+	if !until.Equal(now.Add(codexCLIUsageLimitCooldown)) {
+		t.Fatalf("successful Send changed independently established cooldown: %v", until)
+	}
+}
+
+func TestCodexCLIQuotaDoesNotCacheOtherFailures(t *testing.T) {
+	for _, diagnostic := range []string{
+		"Not logged in: private-secret", "model_not_found: private-secret",
+		"error sending request: private-secret", "unsupported reasoning: private-secret", "private-secret",
+	} {
+		t.Run(diagnostic, func(t *testing.T) {
+			fixture, callsPath := newCodexCLIFailureFixture(t, "", diagnostic, 1)
+			expected := codexCLIProcessError(diagnostic)
+			var providerErr *ProviderError
+			if !errors.As(expected, &providerErr) {
+				// Existing Send preserves the parse error when stderr has no
+				// classified ProviderError; cooldown must not change this order.
+				expected = errors.New("codex-cli stream ended before a complete response")
+			}
+			for range 2 {
+				_, err := fixture.provider.Send(context.Background(), fixture.request)
+				if err == nil || err.Error() != expected.Error() {
+					t.Fatalf("nonquota error changed: %v", err)
+				}
+				if err := fixture.provider.CurrentProviderError(); err != nil {
+					t.Fatalf("nonquota failure entered cooldown: %v", err)
+				}
+			}
+			if got := readTestFile(t, callsPath); got != "called\ncalled\n" {
+				t.Fatalf("nonquota failures suppressed a subsequent attempt: %q", got)
+			}
+		})
+	}
+}
+
 func TestNewProviderFromConfigCodexCLI(t *testing.T) {
 	provider, err := NewProviderFromConfig(ProviderConfig{Name: CodexCLIProviderName, Type: CodexCLIProviderName})
 	if err != nil {

@@ -443,6 +443,8 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	if ph.breakerCfg.Enabled && !isUrgent && !breaker.Allow() {
 		ph.logger.Warn("provider circuit-broken", "provider", providerName)
 		ph.updateBreakerGauge(providerName, breaker)
+		// This branch returns before any provider or subscription dispatch.
+		w.Header().Set("X-Sentinel-Provider-Io", "not-started")
 		if reporter, ok := provider.(ProviderStatusReporter); ok {
 			if err := reporter.CurrentProviderError(); err != nil {
 				var provErr *ProviderError
@@ -454,7 +456,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 					case http.StatusServiceUnavailable:
 						errMsg = "provider unavailable"
 					}
-					http.Error(w, errMsg, provErr.StatusCode)
+					ph.writeRequestError(w, &req, errMsg, provErr.StatusCode)
 					return
 				}
 			}
