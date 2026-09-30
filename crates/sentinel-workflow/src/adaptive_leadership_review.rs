@@ -11,9 +11,9 @@ use crate::digest::canonical_sha256;
 use crate::model::{validate_digest, validate_identifier};
 use crate::{
     AdaptiveCursorV1, AdaptiveEffectV1, AdaptiveSessionV1, AuthenticatedCompanyPrincipalV1,
-    CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkStateV1, PrincipalAuthorityV1, ProjectId, ProjectV1,
-    RequestProviderDispatchV1, RuntimeAuthoritySnapshotV1, SubscriptionTokenPolicyV1, WorkItemId,
-    WorkflowError, WorkflowErrorCode,
+    CompanyPrincipalKindV1, CompanyRoleV1, CompanyWorkStateV1, PrincipalAuthorityV1, ProjectId,
+    ProjectV1, RequestProviderDispatchV1, RuntimeAuthoritySnapshotV1, SubscriptionTokenPolicyV1,
+    WorkItemId, WorkflowError, WorkflowErrorCode,
 };
 
 pub const ADAPTIVE_LEADERSHIP_MAX_REVIEWS: usize = 3;
@@ -296,17 +296,22 @@ impl AdaptiveLeadershipReviewDecisionV1 {
         if self.schema_version != grant.schema_version {
             return Err(invalid());
         }
-        let valid = match (&grant.subject, &self.decision) {
-            (None, AdaptiveLeadershipReviewDecisionKindV1::ResolveBlocked { .. }
-                | AdaptiveLeadershipReviewDecisionKindV1::KeepBlocked { .. }) => true,
-            (Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. }),
+        let valid = matches!(
+            (&grant.subject, &self.decision),
+            (
+                None,
+                AdaptiveLeadershipReviewDecisionKindV1::ResolveBlocked { .. }
+                    | AdaptiveLeadershipReviewDecisionKindV1::KeepBlocked { .. },
+            ) | (
+                Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. }),
                 AdaptiveLeadershipReviewDecisionKindV1::KeepUnknown { .. }
-                | AdaptiveLeadershipReviewDecisionKindV1::Continue { .. }) => true,
-            (Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation { .. }),
+                    | AdaptiveLeadershipReviewDecisionKindV1::Continue { .. },
+            ) | (
+                Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation { .. }),
                 AdaptiveLeadershipReviewDecisionKindV1::KeepBlocked { .. }
-                | AdaptiveLeadershipReviewDecisionKindV1::Continue { .. }) => true,
-            _ => false,
-        };
+                    | AdaptiveLeadershipReviewDecisionKindV1::Continue { .. },
+            )
+        );
         if !valid {
             return Err(invalid());
         }
@@ -324,7 +329,10 @@ pub fn adaptive_leadership_continuation_audit_id(
     validate_digest(request_digest)?;
     validate_digest(model_response_digest)?;
     if review_id.is_nil()
-        || !matches!(decision.decision, AdaptiveLeadershipReviewDecisionKindV1::Continue { .. })
+        || !matches!(
+            decision.decision,
+            AdaptiveLeadershipReviewDecisionKindV1::Continue { .. }
+        )
     {
         return Err(invalid());
     }
@@ -395,14 +403,29 @@ impl AdaptiveLeadershipReviewGrantV1 {
         let leader = &self.leadership_principal;
         let valid_subject = match (&self.subject, self.schema_version) {
             (None, 1) => valid_reason(&self.expected_reason_code),
-            (Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { effect, sealed_unknown_proof_digest }), 2) => {
+            (
+                Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel {
+                    effect,
+                    sealed_unknown_proof_digest,
+                }),
+                2,
+            ) => {
                 validate_digest(&effect.request_digest)?;
                 validate_digest(sealed_unknown_proof_digest)?;
                 !effect.id.is_nil() && self.expected_reason_code.is_empty()
             }
-            (Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation { reason_code, resolution_event_id }), 2) => {
-                valid_reason(reason_code) && reason_code == &self.expected_reason_code
-                    && resolution_event_id.as_ref().is_none_or(|id| Uuid::parse_str(id).is_ok_and(|id| !id.is_nil()))
+            (
+                Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
+                    reason_code,
+                    resolution_event_id,
+                }),
+                2,
+            ) => {
+                valid_reason(reason_code)
+                    && reason_code == &self.expected_reason_code
+                    && resolution_event_id
+                        .as_ref()
+                        .is_none_or(|id| Uuid::parse_str(id).is_ok_and(|id| !id.is_nil()))
             }
             _ => false,
         };
@@ -456,20 +479,50 @@ impl AdaptiveLeadershipReviewContextV1 {
         let assignment = assignments.first().ok_or_else(invalid)?;
         let authority = &grant.assignee_authority;
         let valid_subject = match &grant.subject {
-            None => matches!(&session.cursor, AdaptiveCursorV1::Blocked { reason_code }
-                if reason_code == &grant.expected_reason_code) && session.last_model_result_digest.is_some(),
-            Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { effect, sealed_unknown_proof_digest }) => {
-                matches!(&session.cursor, AdaptiveCursorV1::ModelUnknown { effect: actual } if actual == effect)
-                    && self.evidence_refs.contains(&format!("adaptive-model-unknown:{}:{}", effect.id, effect.request_digest))
-                    && self.evidence_refs.contains(&format!("sealed-provider-unknown:{sealed_unknown_proof_digest}"))
+            None => {
+                matches!(&session.cursor, AdaptiveCursorV1::Blocked { reason_code }
+                if reason_code == &grant.expected_reason_code)
+                    && session.last_model_result_digest.is_some()
             }
-            Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation { reason_code, resolution_event_id }) => {
+            Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel {
+                effect,
+                sealed_unknown_proof_digest,
+            }) => {
+                matches!(&session.cursor, AdaptiveCursorV1::ModelUnknown { effect: actual } if actual == effect)
+                    && self.evidence_refs.contains(&format!(
+                        "adaptive-model-unknown:{}:{}",
+                        effect.id, effect.request_digest
+                    ))
+                    && self.evidence_refs.contains(&format!(
+                        "sealed-provider-unknown:{sealed_unknown_proof_digest}"
+                    ))
+            }
+            Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
+                reason_code,
+                resolution_event_id,
+            }) => {
                 session.last_model_result_digest.is_some()
-                    && session.last_model_result_digest.as_ref().is_some_and(|digest|
-                        self.evidence_refs.contains(&format!("adaptive-model-result:{digest}")))
+                    && session
+                        .last_model_result_digest
+                        .as_ref()
+                        .is_some_and(|digest| {
+                            self.evidence_refs
+                                .contains(&format!("adaptive-model-result:{digest}"))
+                        })
                     && match (&session.cursor, resolution_event_id) {
-                        (AdaptiveCursorV1::Blocked { reason_code: actual }, None) => actual == reason_code,
-                        (AdaptiveCursorV1::BlockedResolved { reason_code: actual, resolution_event_id: actual_id }, Some(id)) => actual == reason_code && actual_id == id,
+                        (
+                            AdaptiveCursorV1::Blocked {
+                                reason_code: actual,
+                            },
+                            None,
+                        ) => actual == reason_code,
+                        (
+                            AdaptiveCursorV1::BlockedResolved {
+                                reason_code: actual,
+                                resolution_event_id: actual_id,
+                            },
+                            Some(id),
+                        ) => actual == reason_code && actual_id == id,
                         _ => false,
                     }
             }

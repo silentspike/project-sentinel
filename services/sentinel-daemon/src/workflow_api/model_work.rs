@@ -702,7 +702,10 @@ pub(crate) fn test_context() -> ModelWorkContext {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{assign_test_work_from, configured_adaptive_test_api, configured_test_api};
+pub(crate) use tests::{
+    assign_test_work_from, assign_test_work_from_at, configured_adaptive_test_api,
+    configured_test_api,
+};
 
 #[cfg(test)]
 mod tests {
@@ -940,10 +943,18 @@ mod tests {
     pub(crate) fn assign_test_work_from(
         api: &WorkflowApi,
         subscription_calls: Option<u16>,
+        operation: u128,
+    ) -> ProviderUsageAuthority {
+        assign_test_work_from_at(api, subscription_calls, operation, now_unix_ms())
+    }
+
+    pub(crate) fn assign_test_work_from_at(
+        api: &WorkflowApi,
+        subscription_calls: Option<u16>,
         mut operation: u128,
+        now: u64,
     ) -> ProviderUsageAuthority {
         use sentinel_workflow::{CompanyWorkflowResponseV1 as Response, WorkProfileBindingV1};
-        let now = now_unix_ms();
         let mut apply = |actor: &str, command| {
             operation += 1;
             api.store

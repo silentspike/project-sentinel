@@ -1,5 +1,13 @@
 # Changelog
 
+- Continue the same blocked or sealed model-unknown employee session only through
+  a bounded model-selected leadership decision. Retain root history, spending
+  and effect tombstones; require fresh private inspection before further work.
+  Bind audit replay to the complete immutable event envelope, preserve its
+  original clock across crash recovery, and retire expired continuations without
+  renewing authority or discarding accounted provider usage. Validate pinned
+  historical inference-only provenance without inventing prior outcomes (#856).
+
 - Govern blocked coding work through bounded, model-driven project leadership
   with immutable source context and independent provider allowances. Retire
   stale reviews without fabricated decisions, recover exact committed resolution

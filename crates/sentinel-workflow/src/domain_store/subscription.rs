@@ -131,10 +131,18 @@ pub(super) fn grant_governed_continuation(
         return Err(unauthorized());
     }
     let principal = &receipt.grant.leadership_principal;
-    require_role(principal, &[CompanyRoleV1::ProjectManager, CompanyRoleV1::TechnicalLead])?;
+    require_role(
+        principal,
+        &[CompanyRoleV1::ProjectManager, CompanyRoleV1::TechnicalLead],
+    )?;
     validate_grant_shape(&allowance.grant, allowance.created_at_unix_ms)?;
-    grant_validated(project, principal, receipt.operation_id, &allowance.grant,
-        allowance.created_at_unix_ms)
+    grant_validated(
+        project,
+        principal,
+        receipt.operation_id,
+        &allowance.grant,
+        allowance.created_at_unix_ms,
+    )
 }
 
 fn grant_validated(
@@ -427,13 +435,27 @@ pub(super) fn validate_persisted(
     connection: &Connection,
     project: &ProjectV1,
 ) -> Result<(), WorkflowError> {
-    for allowance in project.subscription_call.iter()
+    for allowance in project
+        .subscription_call
+        .iter()
         .chain(project.source_review_previous_call.iter())
-        .chain(project.abandoned_subscription_calls.iter().map(|entry| &entry.allowance))
-        .chain(project.work_corrections.iter().filter_map(|record| record.previous_subscription_call.as_ref()))
+        .chain(
+            project
+                .abandoned_subscription_calls
+                .iter()
+                .map(|entry| &entry.allowance),
+        )
+        .chain(
+            project
+                .work_corrections
+                .iter()
+                .filter_map(|record| record.previous_subscription_call.as_ref()),
+        )
     {
         if allowance.grant.max_duration_ms != 120_000 {
-            adaptive_leadership_review::validate_persisted_governed_allowance(connection, project, allowance)?;
+            adaptive_leadership_review::validate_persisted_governed_allowance(
+                connection, project, allowance,
+            )?;
         }
     }
     Ok(())

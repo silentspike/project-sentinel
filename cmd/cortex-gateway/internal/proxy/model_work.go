@@ -121,11 +121,13 @@ type customerRequestExecutionSubject struct {
 	ProjectID      string `json:"project_id,omitempty"`
 	ProjectVersion uint64 `json:"project_version,omitempty"`
 	ReviewID       string `json:"review_id,omitempty"`
+	ReviewKind     string `json:"review_kind,omitempty"`
 }
 
 func hasLeadershipReviewMetadata(metadata map[string]string) bool {
 	_, present := metadata["leadership_review_id"]
-	return present || metadata["company_execution_subject"] == "adaptive_leadership_review" || metadata["company_execution_output_kind"] == "leadership_decision"
+	_, kindPresent := metadata["leadership_review_kind"]
+	return present || kindPresent || metadata["company_execution_subject"] == "adaptive_leadership_review" || metadata["company_execution_output_kind"] == "leadership_decision"
 }
 
 func leadershipReviewSubject(metadata map[string]string) (*customerRequestExecutionSubject, error) {
@@ -150,7 +152,11 @@ func leadershipReviewSubject(metadata map[string]string) (*customerRequestExecut
 	if err != nil || version == 0 || strconv.FormatUint(version, 10) != versionText {
 		return nil, invalid
 	}
-	return &customerRequestExecutionSubject{Kind: "adaptive_leadership_review", ReviewID: metadata["leadership_review_id"]}, nil
+	reviewKind, kindPresent := metadata["leadership_review_kind"]
+	if kindPresent && reviewKind != "unknown_model" && reviewKind != "blocked_continuation" {
+		return nil, invalid
+	}
+	return &customerRequestExecutionSubject{Kind: "adaptive_leadership_review", ReviewID: metadata["leadership_review_id"], ReviewKind: reviewKind}, nil
 }
 
 func projectPlanningSubject(metadata map[string]string) (*customerRequestExecutionSubject, error) {

@@ -1,10 +1,16 @@
 //! Authenticated M0 company workflow and productive Workbench integration.
 
 #[cfg(feature = "llm")]
+mod adaptive_continuation;
+#[cfg(all(test, feature = "llm"))]
+mod adaptive_continuation_tests;
+#[cfg(feature = "llm")]
 pub(crate) mod adaptive_leadership_review;
 mod adaptive_recovery;
 mod delivery_intent;
 mod delivery_runtime;
+#[cfg(feature = "llm")]
+mod historical_model_boundary;
 #[cfg(feature = "llm")]
 pub mod model_execution;
 mod model_review;
@@ -13,6 +19,8 @@ pub mod model_work;
 mod project_profiles;
 #[cfg(feature = "llm")]
 mod subscription;
+#[cfg(feature = "llm")]
+mod unknown_model_evidence;
 mod work_correction;
 
 use std::collections::{BTreeSet, HashMap};
@@ -2074,7 +2082,7 @@ impl WorkbenchExecutionAdapter {
             inputs: Vec::new(),
             command_policy,
             resource_limits: profile.resource_ceilings.clone(),
-            deadline_unix_ms: session.grant.deadline_ms,
+            deadline_unix_ms: session.active_deadline_ms(),
             attempt: 1,
             tool: tool.clone(),
             input_digest: String::new(),
@@ -2702,13 +2710,8 @@ where
         else {
             continue;
         };
-        let adaptive_rank = if allowance.grant.max_calls > 1 {
-            let Some(rank) = adaptive_priority(&binding)? else {
-                continue;
-            };
-            rank
-        } else {
-            2
+        let Some(adaptive_rank) = adaptive_priority(&binding)? else {
+            continue;
         };
         let has_local_completion = match &allowance.dispatch {
             Some(dispatch) => locally_recoverable(&dispatch.request_id)?,
@@ -4003,8 +4006,15 @@ impl WorkflowApi {
                 }
                 #[cfg(not(feature = "llm"))]
                 {
-                    let _ = binding;
-                    Err("adaptive model work unavailable")
+                    if binding
+                        .subscription_grant
+                        .as_ref()
+                        .is_some_and(|grant| grant.max_calls > 1)
+                    {
+                        Err("adaptive model work unavailable")
+                    } else {
+                        Ok(Some(2))
+                    }
                 }
             },
         )?;
@@ -5414,32 +5424,31 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
                 Box::new(binding),
             )));
         }
-        self.provider_usage_binding_for_agent(agent_id)
-            .map(|binding| {
-                binding.and_then(|binding| {
-                    if binding
-                        .subscription_grant
-                        .as_ref()
-                        .is_some_and(|grant| grant.max_calls > 1)
-                    {
-                        return None;
-                    }
-                    Some(
-                        crate::llm_bridge::bridge::ProviderUsageAuthority {
-                            tenant_id: binding.tenant_id,
-                            project_id: binding.project_id,
-                            work_item_id: binding.work_item_id,
-                            reservation_id: binding.reservation_id,
-                            assignment_id: binding.assignment_id,
-                            assignment_version: binding.assignment_version,
-                            agent_id: binding.agent_id,
-                            provider: binding.provider,
-                            subscription_grant: binding.subscription_grant,
-                        }
-                        .into(),
-                    )
-                })
-            })
+        let Some(binding) = self.provider_usage_binding_for_agent(agent_id)? else {
+            return Ok(None);
+        };
+        if binding
+            .subscription_grant
+            .as_ref()
+            .is_some_and(|grant| grant.max_calls > 1)
+            || self.binding_has_continued_adaptive_session(&binding)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            crate::llm_bridge::bridge::ProviderUsageAuthority {
+                tenant_id: binding.tenant_id,
+                project_id: binding.project_id,
+                work_item_id: binding.work_item_id,
+                reservation_id: binding.reservation_id,
+                assignment_id: binding.assignment_id,
+                assignment_version: binding.assignment_version,
+                agent_id: binding.agent_id,
+                provider: binding.provider,
+                subscription_grant: binding.subscription_grant,
+            }
+            .into(),
+        ))
     }
 }
 

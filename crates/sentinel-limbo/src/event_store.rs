@@ -9,12 +9,12 @@
 //! rusqlite unterstuetzt keine INSTEAD OF Trigger auf normalen Tabellen.
 
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use sentinel_common::{
     agent_config::AgentConfig, nano_runtime::NanoSnapshot, room::BuildingConfig, AgentId,
     CostSource, DomainEvent, DomainEventPayload, FencedStore, OwnerRegistry, OwnerWriteGuard,
     StateTransferScope,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
@@ -524,9 +524,20 @@ fn sealed_unknown_reason(reason: Option<&str>) -> bool {
 
 impl LlmModelReservationV1 {
     fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(is_canonical_sha256(&self.context_digest), "invalid model context digest");
-        validate_model_binding(self.schema_version, &self.request_id, &self.request_digest,
-            &self.owner_scope, &self.subject, &self.allowance_id, &self.authority_digest, &self.usage_binding)
+        anyhow::ensure!(
+            is_canonical_sha256(&self.context_digest),
+            "invalid model context digest"
+        );
+        validate_model_binding(
+            self.schema_version,
+            &self.request_id,
+            &self.request_digest,
+            &self.owner_scope,
+            &self.subject,
+            &self.allowance_id,
+            &self.authority_digest,
+            &self.usage_binding,
+        )
     }
 
     fn validate_usage(&self, event: &DomainEvent) -> anyhow::Result<()> {
@@ -536,61 +547,116 @@ impl LlmModelReservationV1 {
 }
 
 fn validate_model_binding(
-    schema_version: u16, request_id: &str, request_digest: &str, owner_scope: &StateTransferScope,
-    subject: &LlmModelSubjectV1, allowance_id: &str, authority_digest: &str,
+    schema_version: u16,
+    request_id: &str,
+    request_digest: &str,
+    owner_scope: &StateTransferScope,
+    subject: &LlmModelSubjectV1,
+    allowance_id: &str,
+    authority_digest: &str,
     binding: &LlmModelUsageBindingV1,
 ) -> anyhow::Result<()> {
-        let expected_request_id = match subject {
-            LlmModelSubjectV1::Adaptive { session_id, effect_id, session_version } => {
-                anyhow::ensure!(!session_id.is_nil() && !effect_id.is_nil() && *session_version > 0,
-                    "invalid adaptive model subject");
-                anyhow::ensure!(allowance_id == binding.reservation_id,
-                    "adaptive allowance binding changed");
-                format!("company-adaptive-{session_id}-{effect_id}")
-            }
-            LlmModelSubjectV1::AdaptiveLeadershipReview { review_id } => {
-                anyhow::ensure!(!review_id.is_nil() && binding.reservation_id == review_id.to_string(),
-                    "invalid leadership model subject");
-                format!("company-leadership-{review_id}")
-            }
-        };
-        anyhow::ensure!(schema_version == 1 && request_id == expected_request_id
+    let expected_request_id = match subject {
+        LlmModelSubjectV1::Adaptive {
+            session_id,
+            effect_id,
+            session_version,
+        } => {
+            anyhow::ensure!(
+                !session_id.is_nil() && !effect_id.is_nil() && *session_version > 0,
+                "invalid adaptive model subject"
+            );
+            anyhow::ensure!(
+                allowance_id == binding.reservation_id,
+                "adaptive allowance binding changed"
+            );
+            format!("company-adaptive-{session_id}-{effect_id}")
+        }
+        LlmModelSubjectV1::AdaptiveLeadershipReview { review_id } => {
+            anyhow::ensure!(
+                !review_id.is_nil() && binding.reservation_id == review_id.to_string(),
+                "invalid leadership model subject"
+            );
+            format!("company-leadership-{review_id}")
+        }
+    };
+    anyhow::ensure!(
+        schema_version == 1
+            && request_id == expected_request_id
             && *owner_scope == StateTransferScope::for_agent(binding.agent_id.to_string())
             && is_canonical_sha256(request_digest)
             && is_canonical_sha256(authority_digest)
-            && binding.assignment_version > 0 && binding.provider == "codex-cli",
-            "invalid model reservation binding");
-        for identifier in [allowance_id, &binding.tenant_id, &binding.project_id,
-            &binding.work_item_id, &binding.reservation_id, &binding.assignment_id, &binding.model] {
-            anyhow::ensure!(!identifier.is_empty() && identifier.len() <= 128
+            && binding.assignment_version > 0
+            && binding.provider == "codex-cli",
+        "invalid model reservation binding"
+    );
+    for identifier in [
+        allowance_id,
+        &binding.tenant_id,
+        &binding.project_id,
+        &binding.work_item_id,
+        &binding.reservation_id,
+        &binding.assignment_id,
+        &binding.model,
+    ] {
+        anyhow::ensure!(
+            !identifier.is_empty()
+                && identifier.len() <= 128
                 && identifier.bytes().all(|byte| byte.is_ascii_alphanumeric()
                     || matches!(byte, b'_' | b'.' | b':' | b'-')),
-                "invalid model reservation identifier");
-        }
-        Ok(())
+            "invalid model reservation identifier"
+        );
+    }
+    Ok(())
 }
 
 fn validate_model_usage(
-    subject: &LlmModelSubjectV1, request_id: &str, binding: &LlmModelUsageBindingV1, event: &DomainEvent,
+    subject: &LlmModelSubjectV1,
+    request_id: &str,
+    binding: &LlmModelUsageBindingV1,
+    event: &DomainEvent,
 ) -> anyhow::Result<()> {
-        anyhow::ensure!(event.payload.len() <= 32 * 1024, "late model usage exceeds its bound");
-        let payload: DomainEventPayload = serde_json::from_str(&event.payload)?;
-        let DomainEventPayload::AgentLlmUsage { agent_id, tenant_id, project_id, work_item_id,
-            reservation_id, assignment_id, assignment_version, provider, requested_model,
-            effective_model, caller_role, tier, hierarchy_tier, cost_source, cost_usd, .. } = payload
-        else { anyhow::bail!("late model usage type is invalid"); };
-        let schema = match subject {
-            LlmModelSubjectV1::Adaptive { .. } => 3,
-            LlmModelSubjectV1::AdaptiveLeadershipReview { .. } => 6,
-        };
-        anyhow::ensure!(event.schema_version == schema && event.event_type == "agent_llm_usage"
+    anyhow::ensure!(
+        event.payload.len() <= 32 * 1024,
+        "late model usage exceeds its bound"
+    );
+    let payload: DomainEventPayload = serde_json::from_str(&event.payload)?;
+    let DomainEventPayload::AgentLlmUsage {
+        agent_id,
+        tenant_id,
+        project_id,
+        work_item_id,
+        reservation_id,
+        assignment_id,
+        assignment_version,
+        provider,
+        requested_model,
+        effective_model,
+        caller_role,
+        tier,
+        hierarchy_tier,
+        cost_source,
+        cost_usd,
+        ..
+    } = payload
+    else {
+        anyhow::bail!("late model usage type is invalid");
+    };
+    let schema = match subject {
+        LlmModelSubjectV1::Adaptive { .. } => 3,
+        LlmModelSubjectV1::AdaptiveLeadershipReview { .. } => 6,
+    };
+    anyhow::ensure!(
+        event.schema_version == schema
+            && event.event_type == "agent_llm_usage"
             && event.aggregate_id == binding.agent_id.to_string()
             && event.correlation_id == request_id
             && event.operation_id == format!("llm_usage_{request_id}")
-            && uuid::Uuid::parse_str(&event.event_id).is_ok_and(|id|
-                !id.is_nil() && id.to_string() == event.event_id)
+            && uuid::Uuid::parse_str(&event.event_id)
+                .is_ok_and(|id| !id.is_nil() && id.to_string() == event.event_id)
             && event.compensation_type == "none"
-            && agent_id == binding.agent_id && tenant_id.as_ref() == Some(&binding.tenant_id)
+            && agent_id == binding.agent_id
+            && tenant_id.as_ref() == Some(&binding.tenant_id)
             && project_id.as_ref() == Some(&binding.project_id)
             && work_item_id.as_ref() == Some(&binding.work_item_id)
             && reservation_id.as_ref() == Some(&binding.reservation_id)
@@ -599,50 +665,103 @@ fn validate_model_usage(
             && provider.as_ref() == Some(&binding.provider)
             && requested_model.as_ref() == Some(&binding.model)
             && effective_model.as_ref() == Some(&binding.model)
-            && caller_role.as_deref() == Some("agent_runtime") && !tier.trim().is_empty()
-            && hierarchy_tier.is_some() && cost_source.is_some()
+            && caller_role.as_deref() == Some("agent_runtime")
+            && !tier.trim().is_empty()
+            && hierarchy_tier.is_some()
+            && cost_source.is_some()
             && cost_source != Some(CostSource::NonProviderZero)
-            && cost_usd.is_finite() && cost_usd >= 0.0,
-            "late model usage authority mismatch");
-        i64::try_from(event.tick)?;
-        i64::try_from(event.timestamp_ms)?;
-        Ok(())
+            && cost_usd.is_finite()
+            && cost_usd >= 0.0,
+        "late model usage authority mismatch"
+    );
+    i64::try_from(event.tick)?;
+    i64::try_from(event.timestamp_ms)?;
+    Ok(())
 }
 
 impl LlmRetrospectiveModelBindingV1 {
     fn validate(&self) -> anyhow::Result<()> {
-        validate_model_binding(self.schema_version, &self.request_id, &self.request_digest,
-            &self.owner_scope, &self.subject, &self.allowance_id, &self.authority_digest, &self.usage_binding)?;
-        anyhow::ensure!(self.historical_context_digest.as_deref().is_none_or(is_canonical_sha256),
-            "invalid historical context digest");
-        let LlmModelSubjectV1::Adaptive { session_id, effect_id, session_version } = &self.subject
-            else { anyhow::bail!("retrospective import only supports the first adaptive model"); };
+        validate_model_binding(
+            self.schema_version,
+            &self.request_id,
+            &self.request_digest,
+            &self.owner_scope,
+            &self.subject,
+            &self.allowance_id,
+            &self.authority_digest,
+            &self.usage_binding,
+        )?;
+        anyhow::ensure!(
+            self.historical_context_digest
+                .as_deref()
+                .is_none_or(is_canonical_sha256),
+            "invalid historical context digest"
+        );
+        let LlmModelSubjectV1::Adaptive {
+            session_id,
+            effect_id,
+            session_version,
+        } = &self.subject
+        else {
+            anyhow::bail!("retrospective import only supports the first adaptive model");
+        };
         let LlmRetrospectiveModelProvenanceV1::JournalAndPinnedInferenceBoundary {
-            claim_model, mark_unknown, journal_head_digest, model_claims, tool_claims,
-            collaboration_claims, original_allowance_digest, boundary,
+            claim_model,
+            mark_unknown,
+            journal_head_digest,
+            model_claims,
+            tool_claims,
+            collaboration_claims,
+            original_allowance_digest,
+            boundary,
         } = &self.provenance;
-        anyhow::ensure!(*session_version == 1 && *model_claims == 1 && *tool_claims == 0
-            && *collaboration_claims == 0 && claim_model.session_version == 2
-            && mark_unknown.session_version == 3 && claim_model.operation_id != mark_unknown.operation_id
-            && claim_model.entry_digest != mark_unknown.entry_digest
-            && journal_head_digest == &mark_unknown.entry_digest
-            && is_canonical_sha256(original_allowance_digest), "invalid retrospective journal proof");
+        anyhow::ensure!(
+            *session_version == 1
+                && *model_claims == 1
+                && *tool_claims == 0
+                && *collaboration_claims == 0
+                && claim_model.session_version == 2
+                && mark_unknown.session_version == 3
+                && claim_model.operation_id != mark_unknown.operation_id
+                && claim_model.entry_digest != mark_unknown.entry_digest
+                && journal_head_digest == &mark_unknown.entry_digest
+                && is_canonical_sha256(original_allowance_digest),
+            "invalid retrospective journal proof"
+        );
         for receipt in [claim_model, mark_unknown] {
-            anyhow::ensure!(receipt.session_id == *session_id && receipt.effect_id == *effect_id
-                && receipt.request_digest == self.request_digest && !receipt.operation_id.is_nil()
-                && is_canonical_sha256(&receipt.entry_digest), "historical model receipt identity changed");
+            anyhow::ensure!(
+                receipt.session_id == *session_id
+                    && receipt.effect_id == *effect_id
+                    && receipt.request_digest == self.request_digest
+                    && !receipt.operation_id.is_nil()
+                    && is_canonical_sha256(&receipt.entry_digest),
+                "historical model receipt identity changed"
+            );
             i64::try_from(receipt.timestamp_ms)?;
         }
-        anyhow::ensure!(claim_model.timestamp_ms <= mark_unknown.timestamp_ms
-            && boundary.valid_from_ms <= claim_model.timestamp_ms
-            && claim_model.timestamp_ms < boundary.valid_until_ms
-            && boundary.valid_from_ms < boundary.valid_until_ms
-            && boundary.release_git_sha.len() == 40
-            && boundary.release_git_sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-            "invalid historical inference interval");
-        for digest in [&boundary.release_manifest_sha256, &boundary.gateway_binary_sha256,
-            &boundary.cli_binary_sha256, &boundary.cli_profile_sha256, &boundary.boundary_receipt_sha256] {
-            anyhow::ensure!(is_canonical_sha256(digest), "invalid historical inference proof descriptor");
+        anyhow::ensure!(
+            claim_model.timestamp_ms <= mark_unknown.timestamp_ms
+                && boundary.valid_from_ms <= claim_model.timestamp_ms
+                && claim_model.timestamp_ms < boundary.valid_until_ms
+                && boundary.valid_from_ms < boundary.valid_until_ms
+                && boundary.release_git_sha.len() == 40
+                && boundary
+                    .release_git_sha
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid historical inference interval"
+        );
+        for digest in [
+            &boundary.release_manifest_sha256,
+            &boundary.gateway_binary_sha256,
+            &boundary.cli_binary_sha256,
+            &boundary.cli_profile_sha256,
+            &boundary.boundary_receipt_sha256,
+        ] {
+            anyhow::ensure!(
+                is_canonical_sha256(digest),
+                "invalid historical inference proof descriptor"
+            );
         }
         i64::try_from(boundary.valid_from_ms)?;
         i64::try_from(boundary.valid_until_ms)?;
@@ -656,8 +775,11 @@ fn sealed_model_evidence(
     request_digest: &str,
     owner: &StateTransferScope,
 ) -> anyhow::Result<Option<LlmSealedUnknownModelEvidenceV1>> {
-    anyhow::ensure!(is_canonical_sha256(request_digest)
-        && matches!(owner, StateTransferScope::NanoContainer(_)), "invalid model evidence identity");
+    anyhow::ensure!(
+        is_canonical_sha256(request_digest)
+            && matches!(owner, StateTransferScope::NanoContainer(_)),
+        "invalid model evidence identity"
+    );
     let state = conn.query_row(
         "SELECT request_id, request_digest, owner_scope, payload, status, attempt_count, last_error,
             created_at, updated_at, model_binding, retrospective_model_binding FROM llm_completion_outbox WHERE request_id=?1",
@@ -666,34 +788,51 @@ fn sealed_model_evidence(
     let Some((entry, encoded, retrospective)) = state else {
         return Ok(None);
     };
-    anyhow::ensure!(entry.request_digest == request_digest && &entry.owner_scope == owner,
-        "sealed model reservation identity changed");
+    anyhow::ensure!(
+        entry.request_digest == request_digest && &entry.owner_scope == owner,
+        "sealed model reservation identity changed"
+    );
     if encoded.is_empty() {
         return Ok(None);
     }
     anyhow::ensure!(retrospective.is_empty(), "conflicting model provenance");
     let reservation: LlmModelReservationV1 = serde_json::from_str(&encoded)?;
     reservation.validate()?;
-    anyhow::ensure!(reservation.request_id == request_id && reservation.request_digest == request_digest
-        && &reservation.owner_scope == owner, "sealed model binding changed");
+    anyhow::ensure!(
+        reservation.request_id == request_id
+            && reservation.request_digest == request_digest
+            && &reservation.owner_scope == owner,
+        "sealed model binding changed"
+    );
     if entry.status != "failed"
         || !entry.payload.is_empty()
         || !sealed_unknown_reason(entry.last_error.as_deref())
     {
         return Ok(None);
     }
-    anyhow::ensure!(entry.updated_at >= entry.created_at, "invalid model reservation time");
+    anyhow::ensure!(
+        entry.updated_at >= entry.created_at,
+        "invalid model reservation time"
+    );
     Ok(Some(LlmSealedUnknownModelEvidenceV1 {
-        reservation, reason: entry.last_error.unwrap(),
-        reserved_at_ms: entry.created_at, sealed_at_ms: entry.updated_at,
+        reservation,
+        reason: entry.last_error.unwrap(),
+        reserved_at_ms: entry.created_at,
+        sealed_at_ms: entry.updated_at,
     }))
 }
 
 fn retrospective_model_evidence(
-    conn: &Connection, request_id: &str, request_digest: &str, owner: &StateTransferScope,
+    conn: &Connection,
+    request_id: &str,
+    request_digest: &str,
+    owner: &StateTransferScope,
 ) -> anyhow::Result<Option<LlmRetrospectiveUnknownModelEvidenceV1>> {
-    anyhow::ensure!(is_canonical_sha256(request_digest)
-        && matches!(owner, StateTransferScope::NanoContainer(_)), "invalid retrospective model identity");
+    anyhow::ensure!(
+        is_canonical_sha256(request_digest)
+            && matches!(owner, StateTransferScope::NanoContainer(_)),
+        "invalid retrospective model identity"
+    );
     let state = conn.query_row(
         "SELECT request_id, request_digest, owner_scope, payload, status, attempt_count, last_error,
             created_at, updated_at, retrospective_model_binding, model_binding
@@ -701,38 +840,58 @@ fn retrospective_model_evidence(
         params![request_id], |row| Ok((llm_completion_from_row(row)?,
             row.get::<_, String>(9)?, row.get::<_, String>(10)?)),
     ).optional()?;
-    let Some((entry, encoded, before_send)) = state else { return Ok(None); };
-    anyhow::ensure!(entry.request_digest == request_digest && &entry.owner_scope == owner,
-        "retrospective model identity changed");
-    if encoded.is_empty() { return Ok(None); }
+    let Some((entry, encoded, before_send)) = state else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        entry.request_digest == request_digest && &entry.owner_scope == owner,
+        "retrospective model identity changed"
+    );
+    if encoded.is_empty() {
+        return Ok(None);
+    }
     anyhow::ensure!(before_send.is_empty(), "conflicting model provenance");
     let binding: LlmRetrospectiveModelBindingV1 = serde_json::from_str(&encoded)?;
     validate_retrospective_seal(&binding, &entry)?;
     Ok(Some(LlmRetrospectiveUnknownModelEvidenceV1 {
-        binding, reason: entry.last_error.unwrap(),
-        reserved_at_ms: entry.created_at, sealed_at_ms: entry.updated_at,
+        binding,
+        reason: entry.last_error.unwrap(),
+        reserved_at_ms: entry.created_at,
+        sealed_at_ms: entry.updated_at,
     }))
 }
 
 fn validate_retrospective_seal(
-    binding: &LlmRetrospectiveModelBindingV1, entry: &LlmCompletionEntry,
+    binding: &LlmRetrospectiveModelBindingV1,
+    entry: &LlmCompletionEntry,
 ) -> anyhow::Result<()> {
     binding.validate()?;
     let LlmRetrospectiveModelProvenanceV1::JournalAndPinnedInferenceBoundary {
-        claim_model, mark_unknown, ..
+        claim_model,
+        mark_unknown,
+        ..
     } = &binding.provenance;
-    anyhow::ensure!(binding.request_id == entry.request_id && binding.request_digest == entry.request_digest
-        && binding.owner_scope == entry.owner_scope && entry.status == "failed"
-        && entry.payload.is_empty() && sealed_unknown_reason(entry.last_error.as_deref())
-        && entry.created_at <= claim_model.timestamp_ms && claim_model.timestamp_ms <= entry.updated_at
-        && entry.updated_at <= mark_unknown.timestamp_ms, "historical model seal or receipt changed");
+    anyhow::ensure!(
+        binding.request_id == entry.request_id
+            && binding.request_digest == entry.request_digest
+            && binding.owner_scope == entry.owner_scope
+            && entry.status == "failed"
+            && entry.payload.is_empty()
+            && sealed_unknown_reason(entry.last_error.as_deref())
+            && entry.created_at <= claim_model.timestamp_ms
+            && claim_model.timestamp_ms <= entry.updated_at
+            && entry.updated_at <= mark_unknown.timestamp_ms,
+        "historical model seal or receipt changed"
+    );
     Ok(())
 }
 
 /// Caller has validated identity and holds the exact owner-fenced transaction.
 fn append_exact_model_usage(conn: &Connection, event: &DomainEvent) -> anyhow::Result<bool> {
     let operation_exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM events WHERE operation_id=?1)", params![event.operation_id], |row| row.get(0),
+        "SELECT EXISTS(SELECT 1 FROM events WHERE operation_id=?1)",
+        params![event.operation_id],
+        |row| row.get(0),
     )?;
     if operation_exists {
         let exact: bool = conn.query_row(
@@ -2564,9 +2723,14 @@ impl EventStore {
             "SELECT request_digest, owner_scope, payload, status, model_binding, retrospective_model_binding FROM llm_completion_outbox WHERE request_id=?1",
             params![reservation.request_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )?;
-        anyhow::ensure!(digest == reservation.request_digest && owner == reservation.owner_scope.to_wire()
-            && payload.is_empty() && status == "provider_in_flight" && retrospective.is_empty(),
-            "model reservation is not bindable");
+        anyhow::ensure!(
+            digest == reservation.request_digest
+                && owner == reservation.owner_scope.to_wire()
+                && payload.is_empty()
+                && status == "provider_in_flight"
+                && retrospective.is_empty(),
+            "model reservation is not bindable"
+        );
         if !encoded.is_empty() {
             let prior: LlmModelReservationV1 = serde_json::from_str(&encoded)?;
             anyhow::ensure!(&prior == reservation, "model reservation binding conflict");
@@ -2590,7 +2754,10 @@ impl EventStore {
         request_digest: &str,
         owner: &StateTransferScope,
     ) -> anyhow::Result<Option<LlmSealedUnknownModelEvidenceV1>> {
-        let conn = self.conn.lock().map_err(|error| anyhow::anyhow!("Lock poisoned: {error}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("Lock poisoned: {error}"))?;
         sealed_model_evidence(&conn, request_id, request_digest, owner)
     }
 
@@ -2605,9 +2772,16 @@ impl EventStore {
         let reservation = &evidence.reservation;
         reservation.validate_usage(event)?;
         let conn = self.begin_fenced_write_for_llm_completion(&reservation.request_id)?;
-        let current = sealed_model_evidence(&conn, &reservation.request_id,
-            &reservation.request_digest, &reservation.owner_scope)?;
-        anyhow::ensure!(current.as_ref() == Some(evidence), "sealed model evidence changed");
+        let current = sealed_model_evidence(
+            &conn,
+            &reservation.request_id,
+            &reservation.request_digest,
+            &reservation.owner_scope,
+        )?;
+        anyhow::ensure!(
+            current.as_ref() == Some(evidence),
+            "sealed model evidence changed"
+        );
         let inserted = append_exact_model_usage(&conn, event)?;
         conn.commit()?;
         Ok(inserted)
@@ -2617,7 +2791,8 @@ impl EventStore {
     /// journal/deployment receipts; this checks typed correlation under the fence.
     /// Imports neither a before-send reservation nor permission to adopt/retry.
     pub fn import_retrospective_unknown_llm_model_binding(
-        &self, binding: &LlmRetrospectiveModelBindingV1,
+        &self,
+        binding: &LlmRetrospectiveModelBindingV1,
     ) -> anyhow::Result<bool> {
         binding.validate()?;
         let conn = self.begin_fenced_write_for_llm_completion(&binding.request_id)?;
@@ -2629,7 +2804,10 @@ impl EventStore {
                 row.get::<_, String>(9)?, row.get::<_, String>(10)?)),
         )?;
         validate_retrospective_seal(binding, &entry)?;
-        anyhow::ensure!(before_send.is_empty(), "before-send model binding cannot be reclassified");
+        anyhow::ensure!(
+            before_send.is_empty(),
+            "before-send model binding cannot be reclassified"
+        );
         if !encoded.is_empty() {
             let prior: LlmRetrospectiveModelBindingV1 = serde_json::from_str(&encoded)?;
             anyhow::ensure!(&prior == binding, "retrospective model binding conflict");
@@ -2645,30 +2823,53 @@ impl EventStore {
                 binding.owner_scope.to_wire(), entry.last_error, i64::try_from(entry.created_at)?,
                 i64::try_from(entry.updated_at)?],
         )?;
-        anyhow::ensure!(changed == 1, "historical model seal changed while importing");
+        anyhow::ensure!(
+            changed == 1,
+            "historical model seal changed while importing"
+        );
         conn.commit()?;
         Ok(true)
     }
 
     pub fn retrospective_unknown_llm_model_evidence(
-        &self, request_id: &str, request_digest: &str, owner: &StateTransferScope,
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        owner: &StateTransferScope,
     ) -> anyhow::Result<Option<LlmRetrospectiveUnknownModelEvidenceV1>> {
-        let conn = self.conn.lock().map_err(|error| anyhow::anyhow!("Lock poisoned: {error}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("Lock poisoned: {error}"))?;
         retrospective_model_evidence(&conn, request_id, request_digest, owner)
     }
 
     /// Authenticated late Gateway usage only, with the same immutable event and
     /// cost provenance validation as before-send evidence. No context is invented.
     pub fn persist_retrospective_unknown_llm_model_usage(
-        &self, evidence: &LlmRetrospectiveUnknownModelEvidenceV1, event: &DomainEvent,
+        &self,
+        evidence: &LlmRetrospectiveUnknownModelEvidenceV1,
+        event: &DomainEvent,
     ) -> anyhow::Result<bool> {
         let binding = &evidence.binding;
         binding.validate()?;
-        validate_model_usage(&binding.subject, &binding.request_id, &binding.usage_binding, event)?;
+        validate_model_usage(
+            &binding.subject,
+            &binding.request_id,
+            &binding.usage_binding,
+            event,
+        )?;
         let conn = self.begin_fenced_write_for_llm_completion(&binding.request_id)?;
-        let current = retrospective_model_evidence(&conn, &binding.request_id,
-            &binding.request_digest, &binding.owner_scope)?;
-        anyhow::ensure!(current.as_ref() == Some(evidence), "retrospective model evidence changed");
+        let current = retrospective_model_evidence(
+            &conn,
+            &binding.request_id,
+            &binding.request_digest,
+            &binding.owner_scope,
+        )?;
+        anyhow::ensure!(
+            current.as_ref() == Some(evidence),
+            "retrospective model evidence changed"
+        );
         let inserted = append_exact_model_usage(&conn, event)?;
         conn.commit()?;
         Ok(inserted)
@@ -3294,7 +3495,10 @@ impl EventStore {
                 FROM llm_completion_outbox WHERE request_id=?1",
             params![request_id], |row| row.get(0),
         )?;
-        anyhow::ensure!(!protected, "sealed unknown model history is not a schema correction");
+        anyhow::ensure!(
+            !protected,
+            "sealed unknown model history is not a schema correction"
+        );
         anyhow::ensure!(
             status == "failed" && last_error.as_deref() == Some(expected_error),
             "LLM completion {request_id} is not the expected failed model result"
@@ -5350,14 +5554,24 @@ mod tests {
             request_id: format!("company-adaptive-{session_id}-{effect_id}"),
             request_digest: "a".repeat(64),
             owner_scope: StateTransferScope::for_agent("AGENT-07"),
-            subject: LlmModelSubjectV1::Adaptive { session_id, effect_id, session_version: 1 },
-            allowance_id: "original-allowance".into(), context_digest: "b".repeat(64),
+            subject: LlmModelSubjectV1::Adaptive {
+                session_id,
+                effect_id,
+                session_version: 1,
+            },
+            allowance_id: "original-allowance".into(),
+            context_digest: "b".repeat(64),
             authority_digest: "c".repeat(64),
             usage_binding: LlmModelUsageBindingV1 {
-                agent_id: AgentId(7), tenant_id: "tenant".into(), project_id: "project".into(),
-                work_item_id: "work".into(), reservation_id: "original-allowance".into(),
-                assignment_id: "assignment".into(), assignment_version: 1,
-                provider: "codex-cli".into(), model: "gpt-5.4".into(),
+                agent_id: AgentId(7),
+                tenant_id: "tenant".into(),
+                project_id: "project".into(),
+                work_item_id: "work".into(),
+                reservation_id: "original-allowance".into(),
+                assignment_id: "assignment".into(),
+                assignment_version: 1,
+                provider: "codex-cli".into(),
+                model: "gpt-5.4".into(),
             },
         }
     }
@@ -5375,52 +5589,103 @@ mod tests {
             "input_tokens": 5, "output_tokens": 10, "cache_read": 1, "cache_creation": 2,
             "cost_usd": 0.125,
         });
-        DomainEvent::new("agent_llm_usage", &binding.agent_id.to_string(),
-            &payload.to_string(), &reservation.request_id, 1)
-            .with_operation_id(&format!("llm_usage_{}", reservation.request_id))
-            .with_schema_version(match &reservation.subject {
-                LlmModelSubjectV1::Adaptive { .. } => 3,
-                LlmModelSubjectV1::AdaptiveLeadershipReview { .. } => 6,
-            })
+        DomainEvent::new(
+            "agent_llm_usage",
+            &binding.agent_id.to_string(),
+            &payload.to_string(),
+            &reservation.request_id,
+            1,
+        )
+        .with_operation_id(&format!("llm_usage_{}", reservation.request_id))
+        .with_schema_version(match &reservation.subject {
+            LlmModelSubjectV1::Adaptive { .. } => 3,
+            LlmModelSubjectV1::AdaptiveLeadershipReview { .. } => 6,
+        })
     }
 
     fn retrospective_binding_fixture(
-        reservation: &LlmModelReservationV1, reserved: u64, sealed: u64,
+        reservation: &LlmModelReservationV1,
+        reserved: u64,
+        sealed: u64,
     ) -> LlmRetrospectiveModelBindingV1 {
-        let LlmModelSubjectV1::Adaptive { session_id, effect_id, .. } = &reservation.subject else { unreachable!() };
+        let LlmModelSubjectV1::Adaptive {
+            session_id,
+            effect_id,
+            ..
+        } = &reservation.subject
+        else {
+            unreachable!()
+        };
         LlmRetrospectiveModelBindingV1 {
-            schema_version: 1, request_id: reservation.request_id.clone(),
-            request_digest: reservation.request_digest.clone(), owner_scope: reservation.owner_scope.clone(),
-            subject: reservation.subject.clone(), allowance_id: reservation.allowance_id.clone(),
-            historical_context_digest: None, authority_digest: reservation.authority_digest.clone(),
+            schema_version: 1,
+            request_id: reservation.request_id.clone(),
+            request_digest: reservation.request_digest.clone(),
+            owner_scope: reservation.owner_scope.clone(),
+            subject: reservation.subject.clone(),
+            allowance_id: reservation.allowance_id.clone(),
+            historical_context_digest: None,
+            authority_digest: reservation.authority_digest.clone(),
             usage_binding: reservation.usage_binding.clone(),
             provenance: LlmRetrospectiveModelProvenanceV1::JournalAndPinnedInferenceBoundary {
                 claim_model: LlmHistoricalModelJournalReceiptV1 {
-                    session_id: *session_id, effect_id: *effect_id, request_digest: reservation.request_digest.clone(),
-                    session_version: 2, operation_id: uuid::Uuid::new_v4(), entry_digest: "d".repeat(64), timestamp_ms: reserved,
+                    session_id: *session_id,
+                    effect_id: *effect_id,
+                    request_digest: reservation.request_digest.clone(),
+                    session_version: 2,
+                    operation_id: uuid::Uuid::new_v4(),
+                    entry_digest: "d".repeat(64),
+                    timestamp_ms: reserved,
                 },
                 mark_unknown: LlmHistoricalModelJournalReceiptV1 {
-                    session_id: *session_id, effect_id: *effect_id, request_digest: reservation.request_digest.clone(),
-                    session_version: 3, operation_id: uuid::Uuid::new_v4(), entry_digest: "e".repeat(64), timestamp_ms: sealed,
+                    session_id: *session_id,
+                    effect_id: *effect_id,
+                    request_digest: reservation.request_digest.clone(),
+                    session_version: 3,
+                    operation_id: uuid::Uuid::new_v4(),
+                    entry_digest: "e".repeat(64),
+                    timestamp_ms: sealed,
                 },
-                journal_head_digest: "e".repeat(64), model_claims: 1, tool_claims: 0, collaboration_claims: 0,
+                journal_head_digest: "e".repeat(64),
+                model_claims: 1,
+                tool_claims: 0,
+                collaboration_claims: 0,
                 original_allowance_digest: "f".repeat(64),
                 boundary: LlmHistoricalInferenceBoundaryV1 {
-                    release_git_sha: "a".repeat(40), release_manifest_sha256: "b".repeat(64),
-                    gateway_binary_sha256: "c".repeat(64), cli_binary_sha256: "d".repeat(64),
-                    cli_profile_sha256: "e".repeat(64), boundary_receipt_sha256: "f".repeat(64),
-                    valid_from_ms: reserved, valid_until_ms: reserved + 1,
+                    release_git_sha: "a".repeat(40),
+                    release_manifest_sha256: "b".repeat(64),
+                    gateway_binary_sha256: "c".repeat(64),
+                    cli_binary_sha256: "d".repeat(64),
+                    cli_profile_sha256: "e".repeat(64),
+                    boundary_receipt_sha256: "f".repeat(64),
+                    valid_from_ms: reserved,
+                    valid_until_ms: reserved + 1,
                 },
             },
         }
     }
 
-    fn reserve_and_seal_legacy_model(store: &EventStore, reservation: &LlmModelReservationV1) -> LlmRetrospectiveModelBindingV1 {
-        store.reserve_llm_request(&reservation.request_id, &reservation.request_digest,
-            &reservation.usage_binding.agent_id.to_string()).unwrap();
-        store.mark_llm_provider_outcome_unknown(&reservation.request_id, &reservation.request_digest,
-            "UnknownOutcome: provider_transport_deadline_elapsed").unwrap();
-        let entry = store.get_llm_completion(&reservation.request_id).unwrap().unwrap();
+    fn reserve_and_seal_legacy_model(
+        store: &EventStore,
+        reservation: &LlmModelReservationV1,
+    ) -> LlmRetrospectiveModelBindingV1 {
+        store
+            .reserve_llm_request(
+                &reservation.request_id,
+                &reservation.request_digest,
+                &reservation.usage_binding.agent_id.to_string(),
+            )
+            .unwrap();
+        store
+            .mark_llm_provider_outcome_unknown(
+                &reservation.request_id,
+                &reservation.request_digest,
+                "UnknownOutcome: provider_transport_deadline_elapsed",
+            )
+            .unwrap();
+        let entry = store
+            .get_llm_completion(&reservation.request_id)
+            .unwrap()
+            .unwrap();
         retrospective_binding_fixture(reservation, entry.created_at, entry.updated_at)
     }
 
@@ -5431,46 +5696,131 @@ mod tests {
         let reservation = model_reservation_fixture();
         let store = EventStore::open(path.to_str().unwrap()).unwrap();
         let binding = reserve_and_seal_legacy_model(&store, &reservation);
-        let original = store.get_llm_completion(&binding.request_id).unwrap().unwrap();
-        assert!(store.import_retrospective_unknown_llm_model_binding(&binding).unwrap());
-        assert!(!store.import_retrospective_unknown_llm_model_binding(&binding).unwrap());
-        assert!(store.sealed_unknown_llm_model_evidence(&binding.request_id,
-            &binding.request_digest, &binding.owner_scope).unwrap().is_none());
-        let evidence = store.retrospective_unknown_llm_model_evidence(&binding.request_id,
-            &binding.request_digest, &binding.owner_scope).unwrap().unwrap();
+        let original = store
+            .get_llm_completion(&binding.request_id)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .import_retrospective_unknown_llm_model_binding(&binding)
+            .unwrap());
+        assert!(!store
+            .import_retrospective_unknown_llm_model_binding(&binding)
+            .unwrap());
+        assert!(store
+            .sealed_unknown_llm_model_evidence(
+                &binding.request_id,
+                &binding.request_digest,
+                &binding.owner_scope
+            )
+            .unwrap()
+            .is_none());
+        let evidence = store
+            .retrospective_unknown_llm_model_evidence(
+                &binding.request_id,
+                &binding.request_digest,
+                &binding.owner_scope,
+            )
+            .unwrap()
+            .unwrap();
         assert!(evidence.binding.historical_context_digest.is_none());
         drop(store);
         let store = EventStore::open(path.to_str().unwrap()).unwrap();
-        assert_eq!(store.retrospective_unknown_llm_model_evidence(&binding.request_id,
-            &binding.request_digest, &binding.owner_scope).unwrap(), Some(evidence.clone()));
+        assert_eq!(
+            store
+                .retrospective_unknown_llm_model_evidence(
+                    &binding.request_id,
+                    &binding.request_digest,
+                    &binding.owner_scope
+                )
+                .unwrap(),
+            Some(evidence.clone())
+        );
         let usage = late_model_usage_fixture(&reservation);
-        assert!(store.persist_retrospective_unknown_llm_model_usage(&evidence, &usage).unwrap());
-        assert!(!store.persist_retrospective_unknown_llm_model_usage(&evidence, &usage).unwrap());
-        assert_eq!(store.get_llm_completion(&binding.request_id).unwrap().unwrap(), original);
-        assert!(store.resolve_llm_completion_terminal(&binding.request_id, &binding.request_digest, "abandon").is_err());
-        assert!(store.resolve_failed_llm_completion_for_model_retry(&binding.request_id,
-            &binding.request_digest, &evidence.reason, "retry").is_err());
-        assert!(store.release_undispatched_llm_request(&binding.request_id, &binding.request_digest).is_err());
-        assert!(!store.requeue_failed_llm_completion(&binding.request_id, &binding.request_digest, &evidence.reason).unwrap());
-        assert!(!store.claim_llm_completion_actions(&binding.request_id, &binding.request_digest).unwrap());
-        assert!(store.enqueue_llm_completion(&binding.request_id, &binding.request_digest, "late result").is_err());
-        assert!(!store.reserve_llm_request(&binding.request_id, &binding.request_digest, "AGENT-07").unwrap());
+        assert!(store
+            .persist_retrospective_unknown_llm_model_usage(&evidence, &usage)
+            .unwrap());
+        assert!(!store
+            .persist_retrospective_unknown_llm_model_usage(&evidence, &usage)
+            .unwrap());
+        assert_eq!(
+            store
+                .get_llm_completion(&binding.request_id)
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        assert!(store
+            .resolve_llm_completion_terminal(
+                &binding.request_id,
+                &binding.request_digest,
+                "abandon"
+            )
+            .is_err());
+        assert!(store
+            .resolve_failed_llm_completion_for_model_retry(
+                &binding.request_id,
+                &binding.request_digest,
+                &evidence.reason,
+                "retry"
+            )
+            .is_err());
+        assert!(store
+            .release_undispatched_llm_request(&binding.request_id, &binding.request_digest)
+            .is_err());
+        assert!(!store
+            .requeue_failed_llm_completion(
+                &binding.request_id,
+                &binding.request_digest,
+                &evidence.reason
+            )
+            .unwrap());
+        assert!(!store
+            .claim_llm_completion_actions(&binding.request_id, &binding.request_digest)
+            .unwrap());
+        assert!(store
+            .enqueue_llm_completion(&binding.request_id, &binding.request_digest, "late result")
+            .is_err());
+        assert!(!store
+            .reserve_llm_request(&binding.request_id, &binding.request_digest, "AGENT-07")
+            .unwrap());
         let mut conflict = binding.clone();
         conflict.historical_context_digest = Some("a".repeat(64));
-        assert!(store.import_retrospective_unknown_llm_model_binding(&conflict).is_err());
+        assert!(store
+            .import_retrospective_unknown_llm_model_binding(&conflict)
+            .is_err());
         assert!(store.bind_llm_model_reservation(&reservation).is_err());
         assert_eq!(store.get_all_events().unwrap().len(), 1);
         drop(store);
         let store = EventStore::open(path.to_str().unwrap()).unwrap();
-        assert!(!store.persist_retrospective_unknown_llm_model_usage(&evidence, &usage).unwrap());
-        assert_eq!(store.get_llm_completion(&binding.request_id).unwrap().unwrap(), original);
+        assert!(!store
+            .persist_retrospective_unknown_llm_model_usage(&evidence, &usage)
+            .unwrap());
+        assert_eq!(
+            store
+                .get_llm_completion(&binding.request_id)
+                .unwrap()
+                .unwrap(),
+            original
+        );
         let separate = EventStore::open(":memory:").unwrap();
         let mut with_context = reserve_and_seal_legacy_model(&separate, &reservation);
         with_context.historical_context_digest = Some("a".repeat(64));
-        assert!(separate.import_retrospective_unknown_llm_model_binding(&with_context).unwrap());
-        assert_eq!(separate.retrospective_unknown_llm_model_evidence(&with_context.request_id,
-            &with_context.request_digest, &with_context.owner_scope).unwrap().unwrap()
-            .binding.historical_context_digest, Some("a".repeat(64)));
+        assert!(separate
+            .import_retrospective_unknown_llm_model_binding(&with_context)
+            .unwrap());
+        assert_eq!(
+            separate
+                .retrospective_unknown_llm_model_evidence(
+                    &with_context.request_id,
+                    &with_context.request_digest,
+                    &with_context.owner_scope
+                )
+                .unwrap()
+                .unwrap()
+                .binding
+                .historical_context_digest,
+            Some("a".repeat(64))
+        );
     }
 
     #[test]
@@ -5478,61 +5828,143 @@ mod tests {
         let store = EventStore::open(":memory:").unwrap();
         let reservation = model_reservation_fixture();
         let binding = reserve_and_seal_legacy_model(&store, &reservation);
-        let original = store.get_llm_completion(&binding.request_id).unwrap().unwrap();
+        let original = store
+            .get_llm_completion(&binding.request_id)
+            .unwrap()
+            .unwrap();
         for (pointer, replacement) in [
             ("/schema_version", serde_json::json!(2)),
             ("/request_digest", serde_json::json!("b".repeat(64))),
-            ("/subject/effect_id", serde_json::json!(uuid::Uuid::new_v4())),
+            (
+                "/subject/effect_id",
+                serde_json::json!(uuid::Uuid::new_v4()),
+            ),
             ("/subject/session_version", serde_json::json!(2)),
             ("/allowance_id", serde_json::json!("fresh-allowance")),
             ("/historical_context_digest", serde_json::json!("")),
             ("/provenance/model_claims", serde_json::json!(2)),
             ("/provenance/tool_claims", serde_json::json!(1)),
             ("/provenance/collaboration_claims", serde_json::json!(1)),
-            ("/provenance/claim_model/session_id", serde_json::json!(uuid::Uuid::new_v4())),
-            ("/provenance/claim_model/effect_id", serde_json::json!(uuid::Uuid::new_v4())),
-            ("/provenance/claim_model/request_digest", serde_json::json!("b".repeat(64))),
-            ("/provenance/claim_model/session_version", serde_json::json!(3)),
-            ("/provenance/claim_model/operation_id", serde_json::json!(uuid::Uuid::nil())),
+            (
+                "/provenance/claim_model/session_id",
+                serde_json::json!(uuid::Uuid::new_v4()),
+            ),
+            (
+                "/provenance/claim_model/effect_id",
+                serde_json::json!(uuid::Uuid::new_v4()),
+            ),
+            (
+                "/provenance/claim_model/request_digest",
+                serde_json::json!("b".repeat(64)),
+            ),
+            (
+                "/provenance/claim_model/session_version",
+                serde_json::json!(3),
+            ),
+            (
+                "/provenance/claim_model/operation_id",
+                serde_json::json!(uuid::Uuid::nil()),
+            ),
             ("/provenance/claim_model/timestamp_ms", serde_json::json!(0)),
-            ("/provenance/mark_unknown/session_version", serde_json::json!(4)),
-            ("/provenance/mark_unknown/timestamp_ms", serde_json::json!(0)),
-            ("/provenance/journal_head_digest", serde_json::json!("a".repeat(64))),
-            ("/provenance/original_allowance_digest", serde_json::json!("missing")),
-            ("/provenance/boundary/release_git_sha", serde_json::json!("latest")),
-            ("/provenance/boundary/cli_profile_sha256", serde_json::json!("unreviewed")),
-            ("/provenance/boundary/boundary_receipt_sha256", serde_json::json!("")),
+            (
+                "/provenance/mark_unknown/session_version",
+                serde_json::json!(4),
+            ),
+            (
+                "/provenance/mark_unknown/timestamp_ms",
+                serde_json::json!(0),
+            ),
+            (
+                "/provenance/journal_head_digest",
+                serde_json::json!("a".repeat(64)),
+            ),
+            (
+                "/provenance/original_allowance_digest",
+                serde_json::json!("missing"),
+            ),
+            (
+                "/provenance/boundary/release_git_sha",
+                serde_json::json!("latest"),
+            ),
+            (
+                "/provenance/boundary/cli_profile_sha256",
+                serde_json::json!("unreviewed"),
+            ),
+            (
+                "/provenance/boundary/boundary_receipt_sha256",
+                serde_json::json!(""),
+            ),
             ("/provenance/boundary/valid_until_ms", serde_json::json!(0)),
         ] {
             let mut json = serde_json::to_value(&binding).unwrap();
             *json.pointer_mut(pointer).unwrap() = replacement;
             let invalid: LlmRetrospectiveModelBindingV1 = serde_json::from_value(json).unwrap();
-            assert!(store.import_retrospective_unknown_llm_model_binding(&invalid).is_err(), "{pointer}");
+            assert!(
+                store
+                    .import_retrospective_unknown_llm_model_binding(&invalid)
+                    .is_err(),
+                "{pointer}"
+            );
         }
         let mut foreign = binding.clone();
         foreign.usage_binding.agent_id = AgentId(8);
         foreign.owner_scope = StateTransferScope::for_agent("AGENT-08");
-        assert!(store.import_retrospective_unknown_llm_model_binding(&foreign).is_err());
-        assert!(store.retrospective_unknown_llm_model_evidence(&binding.request_id,
-            &"b".repeat(64), &binding.owner_scope).is_err());
+        assert!(store
+            .import_retrospective_unknown_llm_model_binding(&foreign)
+            .is_err());
+        assert!(store
+            .retrospective_unknown_llm_model_evidence(
+                &binding.request_id,
+                &"b".repeat(64),
+                &binding.owner_scope
+            )
+            .is_err());
         let mut json = serde_json::to_value(&binding).unwrap();
         json["provenance"]["kind"] = serde_json::json!("operator_assertion");
         assert!(serde_json::from_value::<LlmRetrospectiveModelBindingV1>(json).is_err());
         let mut json = serde_json::to_value(&binding).unwrap();
         json["subject"]["kind"] = serde_json::json!("tool");
         assert!(serde_json::from_value::<LlmRetrospectiveModelBindingV1>(json).is_err());
-        assert_eq!(store.get_llm_completion(&binding.request_id).unwrap().unwrap(), original);
-        assert!(store.retrospective_unknown_llm_model_evidence(&binding.request_id,
-            &binding.request_digest, &binding.owner_scope).unwrap().is_none());
+        assert_eq!(
+            store
+                .get_llm_completion(&binding.request_id)
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        assert!(store
+            .retrospective_unknown_llm_model_evidence(
+                &binding.request_id,
+                &binding.request_digest,
+                &binding.owner_scope
+            )
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn retrospective_model_import_never_classifies_completed_tool_or_unsealed_rows() {
         for (status, payload, reason) in [
-            ("provider_in_flight", "", "UnknownOutcome: provider_transport_deadline_elapsed"),
-            ("action_claimed", "", "UnknownOutcome: provider_transport_deadline_elapsed"),
-            ("pending_usage", "durable", "UnknownOutcome: provider_transport_deadline_elapsed"),
-            ("failed", "durable", "UnknownOutcome: provider_transport_deadline_elapsed"),
+            (
+                "provider_in_flight",
+                "",
+                "UnknownOutcome: provider_transport_deadline_elapsed",
+            ),
+            (
+                "action_claimed",
+                "",
+                "UnknownOutcome: provider_transport_deadline_elapsed",
+            ),
+            (
+                "pending_usage",
+                "durable",
+                "UnknownOutcome: provider_transport_deadline_elapsed",
+            ),
+            (
+                "failed",
+                "durable",
+                "UnknownOutcome: provider_transport_deadline_elapsed",
+            ),
             ("failed", "", "ordinary failure"),
             ("failed", "", "UnknownOutcome: operator asserted"),
         ] {
@@ -5541,18 +5973,40 @@ mod tests {
             let binding = reserve_and_seal_legacy_model(&store, &reservation);
             store.conn().execute("UPDATE llm_completion_outbox SET status=?2,payload=?3,last_error=?4 WHERE request_id=?1",
                 params![binding.request_id, status, payload, reason]).unwrap();
-            let original = store.get_llm_completion(&binding.request_id).unwrap().unwrap();
-            assert!(store.import_retrospective_unknown_llm_model_binding(&binding).is_err());
-            assert_eq!(store.get_llm_completion(&binding.request_id).unwrap().unwrap(), original);
+            let original = store
+                .get_llm_completion(&binding.request_id)
+                .unwrap()
+                .unwrap();
+            assert!(store
+                .import_retrospective_unknown_llm_model_binding(&binding)
+                .is_err());
+            assert_eq!(
+                store
+                    .get_llm_completion(&binding.request_id)
+                    .unwrap()
+                    .unwrap(),
+                original
+            );
         }
         let store = EventStore::open(":memory:").unwrap();
         let reservation = model_reservation_fixture();
         let evidence = bind_and_seal_model(&store, &reservation);
-        let binding = retrospective_binding_fixture(&reservation, evidence.reserved_at_ms, evidence.sealed_at_ms);
-        assert!(store.import_retrospective_unknown_llm_model_binding(&binding).is_err());
+        let binding = retrospective_binding_fixture(
+            &reservation,
+            evidence.reserved_at_ms,
+            evidence.sealed_at_ms,
+        );
+        assert!(store
+            .import_retrospective_unknown_llm_model_binding(&binding)
+            .is_err());
         let missing = EventStore::open(":memory:").unwrap();
-        assert!(missing.import_retrospective_unknown_llm_model_binding(&binding).is_err());
-        assert!(missing.get_llm_completion(&binding.request_id).unwrap().is_none());
+        assert!(missing
+            .import_retrospective_unknown_llm_model_binding(&binding)
+            .is_err());
+        assert!(missing
+            .get_llm_completion(&binding.request_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -5560,9 +6014,17 @@ mod tests {
         let store = EventStore::open(":memory:").unwrap();
         let reservation = model_reservation_fixture();
         let binding = reserve_and_seal_legacy_model(&store, &reservation);
-        store.import_retrospective_unknown_llm_model_binding(&binding).unwrap();
-        let evidence = store.retrospective_unknown_llm_model_evidence(&binding.request_id,
-            &binding.request_digest, &binding.owner_scope).unwrap().unwrap();
+        store
+            .import_retrospective_unknown_llm_model_binding(&binding)
+            .unwrap();
+        let evidence = store
+            .retrospective_unknown_llm_model_evidence(
+                &binding.request_id,
+                &binding.request_digest,
+                &binding.owner_scope,
+            )
+            .unwrap()
+            .unwrap();
         let usage = late_model_usage_fixture(&reservation);
         for (field, replacement) in [
             ("reservation_id", serde_json::json!("new-allowance")),
@@ -5571,19 +6033,37 @@ mod tests {
             ("agent_id", serde_json::json!(AgentId(8))),
             ("provider", serde_json::json!("other")),
             ("caller_role", serde_json::json!("operator")),
-            ("cost_source", serde_json::to_value(CostSource::NonProviderZero).unwrap()),
+            (
+                "cost_source",
+                serde_json::to_value(CostSource::NonProviderZero).unwrap(),
+            ),
             ("cost_usd", serde_json::json!(-1.0)),
         ] {
             let mut invalid = usage.clone();
             let mut payload: serde_json::Value = serde_json::from_str(&usage.payload).unwrap();
             payload[field] = replacement;
             invalid.payload = payload.to_string();
-            assert!(store.persist_retrospective_unknown_llm_model_usage(&evidence, &invalid).is_err(), "{field}");
+            assert!(
+                store
+                    .persist_retrospective_unknown_llm_model_usage(&evidence, &invalid)
+                    .is_err(),
+                "{field}"
+            );
         }
         let mut forged = evidence.clone();
         forged.binding.historical_context_digest = Some("a".repeat(64));
-        assert!(store.persist_retrospective_unknown_llm_model_usage(&forged, &usage).is_err());
-        for field in ["schema", "event_type", "aggregate", "correlation", "operation", "event_id", "compensation"] {
+        assert!(store
+            .persist_retrospective_unknown_llm_model_usage(&forged, &usage)
+            .is_err());
+        for field in [
+            "schema",
+            "event_type",
+            "aggregate",
+            "correlation",
+            "operation",
+            "event_id",
+            "compensation",
+        ] {
             let mut invalid = usage.clone();
             match field {
                 "schema" => invalid.schema_version = 6,
@@ -5594,21 +6074,39 @@ mod tests {
                 "event_id" => invalid.event_id = uuid::Uuid::nil().to_string(),
                 _ => invalid.compensation_type = "refund".into(),
             }
-            assert!(store.persist_retrospective_unknown_llm_model_usage(&evidence, &invalid).is_err(), "{field}");
+            assert!(
+                store
+                    .persist_retrospective_unknown_llm_model_usage(&evidence, &invalid)
+                    .is_err(),
+                "{field}"
+            );
         }
         let mut collision = usage.clone();
         collision.operation_id = "other-operation".into();
         store.append_event(&collision).unwrap();
-        assert!(store.persist_retrospective_unknown_llm_model_usage(&evidence, &usage).is_err());
+        assert!(store
+            .persist_retrospective_unknown_llm_model_usage(&evidence, &usage)
+            .is_err());
         let mut usage = usage;
         usage.event_id = uuid::Uuid::new_v4().to_string();
-        assert!(store.persist_retrospective_unknown_llm_model_usage(&evidence, &usage).unwrap());
+        assert!(store
+            .persist_retrospective_unknown_llm_model_usage(&evidence, &usage)
+            .unwrap());
         let mut conflict = usage.clone();
         conflict.tick += 1;
-        assert!(store.persist_retrospective_unknown_llm_model_usage(&evidence, &conflict).is_err());
-        store.conn().execute("UPDATE llm_completion_outbox SET updated_at=updated_at+1 WHERE request_id=?1",
-            params![binding.request_id]).unwrap();
-        assert!(store.persist_retrospective_unknown_llm_model_usage(&evidence, &usage).is_err());
+        assert!(store
+            .persist_retrospective_unknown_llm_model_usage(&evidence, &conflict)
+            .is_err());
+        store
+            .conn()
+            .execute(
+                "UPDATE llm_completion_outbox SET updated_at=updated_at+1 WHERE request_id=?1",
+                params![binding.request_id],
+            )
+            .unwrap();
+        assert!(store
+            .persist_retrospective_unknown_llm_model_usage(&evidence, &usage)
+            .is_err());
         assert_eq!(store.get_all_events().unwrap().len(), 2);
     }
 
@@ -5621,17 +6119,35 @@ mod tests {
         let reservation = model_reservation_fixture();
         let binding = reserve_and_seal_legacy_model(&store, &reservation);
         let copy = binding.clone();
-        let thread = std::thread::spawn(move || other.import_retrospective_unknown_llm_model_binding(&copy).unwrap());
-        let inserted = store.import_retrospective_unknown_llm_model_binding(&binding).unwrap();
+        let thread = std::thread::spawn(move || {
+            other
+                .import_retrospective_unknown_llm_model_binding(&copy)
+                .unwrap()
+        });
+        let inserted = store
+            .import_retrospective_unknown_llm_model_binding(&binding)
+            .unwrap();
         assert_ne!(inserted, thread.join().unwrap());
-        let evidence = store.retrospective_unknown_llm_model_evidence(&binding.request_id,
-            &binding.request_digest, &binding.owner_scope).unwrap().unwrap();
+        let evidence = store
+            .retrospective_unknown_llm_model_evidence(
+                &binding.request_id,
+                &binding.request_digest,
+                &binding.owner_scope,
+            )
+            .unwrap()
+            .unwrap();
         let usage = late_model_usage_fixture(&reservation);
         let other = EventStore::open(path.to_str().unwrap()).unwrap();
         let copy = evidence.clone();
         let duplicate = usage.clone();
-        let thread = std::thread::spawn(move || other.persist_retrospective_unknown_llm_model_usage(&copy, &duplicate).unwrap());
-        let inserted = store.persist_retrospective_unknown_llm_model_usage(&evidence, &usage).unwrap();
+        let thread = std::thread::spawn(move || {
+            other
+                .persist_retrospective_unknown_llm_model_usage(&copy, &duplicate)
+                .unwrap()
+        });
+        let inserted = store
+            .persist_retrospective_unknown_llm_model_usage(&evidence, &usage)
+            .unwrap();
         assert_ne!(inserted, thread.join().unwrap());
         assert_eq!(store.get_all_events().unwrap().len(), 1);
     }
@@ -5643,40 +6159,83 @@ mod tests {
         let store = EventStore::open_with_owner_registry(":memory:", registry).unwrap();
         let reservation = model_reservation_fixture();
         let binding = reserve_and_seal_legacy_model(&store, &reservation);
-        assert!(store.import_retrospective_unknown_llm_model_binding(&binding).unwrap());
-        let evidence = store.retrospective_unknown_llm_model_evidence(&binding.request_id,
-            &binding.request_digest, &binding.owner_scope).unwrap().unwrap();
-        assert!(store.persist_retrospective_unknown_llm_model_usage(&evidence,
-            &late_model_usage_fixture(&reservation)).unwrap());
+        assert!(store
+            .import_retrospective_unknown_llm_model_binding(&binding)
+            .unwrap());
+        let evidence = store
+            .retrospective_unknown_llm_model_evidence(
+                &binding.request_id,
+                &binding.request_digest,
+                &binding.owner_scope,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .persist_retrospective_unknown_llm_model_usage(
+                &evidence,
+                &late_model_usage_fixture(&reservation)
+            )
+            .unwrap());
         let mut foreign = binding;
         foreign.usage_binding.agent_id = AgentId(8);
         foreign.owner_scope = StateTransferScope::for_agent("AGENT-08");
         // Replicated, already reviewed descriptors do not confer local write ownership.
         store.conn().execute("UPDATE llm_completion_outbox SET owner_scope=?2,retrospective_model_binding=?3 WHERE request_id=?1",
             params![foreign.request_id, foreign.owner_scope.to_wire(), serde_json::to_string(&foreign).unwrap()]).unwrap();
-        let evidence = store.retrospective_unknown_llm_model_evidence(&foreign.request_id,
-            &foreign.request_digest, &foreign.owner_scope).unwrap().unwrap();
-        assert!(store.import_retrospective_unknown_llm_model_binding(&foreign)
-            .unwrap_err().downcast_ref::<sentinel_common::OwnerIssueError>().is_some());
+        let evidence = store
+            .retrospective_unknown_llm_model_evidence(
+                &foreign.request_id,
+                &foreign.request_digest,
+                &foreign.owner_scope,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .import_retrospective_unknown_llm_model_binding(&foreign)
+            .unwrap_err()
+            .downcast_ref::<sentinel_common::OwnerIssueError>()
+            .is_some());
         let mut usage = late_model_usage_fixture(&reservation);
         let mut payload: serde_json::Value = serde_json::from_str(&usage.payload).unwrap();
         payload["agent_id"] = serde_json::json!(AgentId(8));
         usage.payload = payload.to_string();
         usage.aggregate_id = AgentId(8).to_string();
-        assert!(store.persist_retrospective_unknown_llm_model_usage(&evidence, &usage)
-            .unwrap_err().downcast_ref::<sentinel_common::OwnerIssueError>().is_some());
+        assert!(store
+            .persist_retrospective_unknown_llm_model_usage(&evidence, &usage)
+            .unwrap_err()
+            .downcast_ref::<sentinel_common::OwnerIssueError>()
+            .is_some());
         assert_eq!(store.get_all_events().unwrap().len(), 1);
     }
 
-    fn bind_and_seal_model(store: &EventStore, reservation: &LlmModelReservationV1) -> LlmSealedUnknownModelEvidenceV1 {
-        assert!(store.reserve_llm_request(&reservation.request_id, &reservation.request_digest,
-            &reservation.usage_binding.agent_id.to_string()).unwrap());
+    fn bind_and_seal_model(
+        store: &EventStore,
+        reservation: &LlmModelReservationV1,
+    ) -> LlmSealedUnknownModelEvidenceV1 {
+        assert!(store
+            .reserve_llm_request(
+                &reservation.request_id,
+                &reservation.request_digest,
+                &reservation.usage_binding.agent_id.to_string()
+            )
+            .unwrap());
         store.bind_llm_model_reservation(reservation).unwrap();
         store.bind_llm_model_reservation(reservation).unwrap();
-        assert!(store.mark_llm_provider_outcome_unknown(&reservation.request_id,
-            &reservation.request_digest, "UnknownOutcome: provider_transport_deadline_elapsed").unwrap());
-        store.sealed_unknown_llm_model_evidence(&reservation.request_id,
-            &reservation.request_digest, &reservation.owner_scope).unwrap().unwrap()
+        assert!(store
+            .mark_llm_provider_outcome_unknown(
+                &reservation.request_id,
+                &reservation.request_digest,
+                "UnknownOutcome: provider_transport_deadline_elapsed"
+            )
+            .unwrap());
+        store
+            .sealed_unknown_llm_model_evidence(
+                &reservation.request_id,
+                &reservation.request_digest,
+                &reservation.owner_scope,
+            )
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
@@ -5686,34 +6245,109 @@ mod tests {
         let reservation = model_reservation_fixture();
         let store = EventStore::open(path.to_str().unwrap()).unwrap();
         let evidence = bind_and_seal_model(&store, &reservation);
-        let original = store.get_llm_completion(&reservation.request_id).unwrap().unwrap();
+        let original = store
+            .get_llm_completion(&reservation.request_id)
+            .unwrap()
+            .unwrap();
         let usage = late_model_usage_fixture(&reservation);
         drop(store);
         let store = EventStore::open(path.to_str().unwrap()).unwrap();
-        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &usage).unwrap());
-        assert!(!store.persist_sealed_unknown_llm_model_usage(&evidence, &usage).unwrap());
-        assert_eq!(store.get_llm_completion(&reservation.request_id).unwrap().unwrap(), original);
-        assert!(store.resolve_llm_completion_terminal(&reservation.request_id,
-            &reservation.request_digest, "generic abandonment").is_err());
-        assert!(store.resolve_failed_llm_completion_for_model_retry(&reservation.request_id,
-            &reservation.request_digest, &evidence.reason, "schema correction").is_err());
-        assert!(store.release_undispatched_llm_request(&reservation.request_id, &reservation.request_digest).is_err());
-        assert!(!store.requeue_failed_llm_completion(&reservation.request_id,
-            &reservation.request_digest, &evidence.reason).unwrap());
-        assert!(!store.claim_llm_completion_actions(&reservation.request_id, &reservation.request_digest).unwrap());
-        assert!(store.enqueue_llm_completion(&reservation.request_id, &reservation.request_digest, "late content").is_err());
-        assert!(!store.reserve_llm_request(&reservation.request_id, &reservation.request_digest, "AGENT-07").unwrap());
+        assert!(store
+            .persist_sealed_unknown_llm_model_usage(&evidence, &usage)
+            .unwrap());
+        assert!(!store
+            .persist_sealed_unknown_llm_model_usage(&evidence, &usage)
+            .unwrap());
+        assert_eq!(
+            store
+                .get_llm_completion(&reservation.request_id)
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        assert!(store
+            .resolve_llm_completion_terminal(
+                &reservation.request_id,
+                &reservation.request_digest,
+                "generic abandonment"
+            )
+            .is_err());
+        assert!(store
+            .resolve_failed_llm_completion_for_model_retry(
+                &reservation.request_id,
+                &reservation.request_digest,
+                &evidence.reason,
+                "schema correction"
+            )
+            .is_err());
+        assert!(store
+            .release_undispatched_llm_request(&reservation.request_id, &reservation.request_digest)
+            .is_err());
+        assert!(!store
+            .requeue_failed_llm_completion(
+                &reservation.request_id,
+                &reservation.request_digest,
+                &evidence.reason
+            )
+            .unwrap());
+        assert!(!store
+            .claim_llm_completion_actions(&reservation.request_id, &reservation.request_digest)
+            .unwrap());
+        assert!(store
+            .enqueue_llm_completion(
+                &reservation.request_id,
+                &reservation.request_digest,
+                "late content"
+            )
+            .is_err());
+        assert!(!store
+            .reserve_llm_request(
+                &reservation.request_id,
+                &reservation.request_digest,
+                "AGENT-07"
+            )
+            .unwrap());
         drop(store);
         let store = EventStore::open(path.to_str().unwrap()).unwrap();
-        assert_eq!(store.sealed_unknown_llm_model_evidence(&reservation.request_id,
-            &reservation.request_digest, &reservation.owner_scope).unwrap(), Some(evidence));
-        assert!(!store.persist_sealed_unknown_llm_model_usage(
-            &store.sealed_unknown_llm_model_evidence(&reservation.request_id,
-                &reservation.request_digest, &reservation.owner_scope).unwrap().unwrap(), &usage).unwrap());
-        let durable = store.event_by_operation_id(&usage.operation_id).unwrap().unwrap();
-        assert_eq!(serde_json::to_value(durable).unwrap(), serde_json::to_value(usage).unwrap());
+        assert_eq!(
+            store
+                .sealed_unknown_llm_model_evidence(
+                    &reservation.request_id,
+                    &reservation.request_digest,
+                    &reservation.owner_scope
+                )
+                .unwrap(),
+            Some(evidence)
+        );
+        assert!(!store
+            .persist_sealed_unknown_llm_model_usage(
+                &store
+                    .sealed_unknown_llm_model_evidence(
+                        &reservation.request_id,
+                        &reservation.request_digest,
+                        &reservation.owner_scope
+                    )
+                    .unwrap()
+                    .unwrap(),
+                &usage
+            )
+            .unwrap());
+        let durable = store
+            .event_by_operation_id(&usage.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(durable).unwrap(),
+            serde_json::to_value(usage).unwrap()
+        );
         assert_eq!(store.get_all_events().unwrap().len(), 1);
-        assert_eq!(store.get_llm_completion(&reservation.request_id).unwrap().unwrap(), original);
+        assert_eq!(
+            store
+                .get_llm_completion(&reservation.request_id)
+                .unwrap()
+                .unwrap(),
+            original
+        );
     }
 
     #[test]
@@ -5728,13 +6362,28 @@ mod tests {
             params![reservation.request_id, reservation.request_digest, reservation.owner_scope.to_wire()]).unwrap();
         drop(conn);
         let store = EventStore::open(path.to_str().unwrap()).unwrap();
-        let original = store.get_llm_completion(&reservation.request_id).unwrap().unwrap();
-        assert!(store.sealed_unknown_llm_model_evidence(&reservation.request_id,
-            &reservation.request_digest, &reservation.owner_scope).unwrap().is_none());
+        let original = store
+            .get_llm_completion(&reservation.request_id)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .sealed_unknown_llm_model_evidence(
+                &reservation.request_id,
+                &reservation.request_digest,
+                &reservation.owner_scope
+            )
+            .unwrap()
+            .is_none());
         assert!(store.bind_llm_model_reservation(&reservation).is_err());
         drop(store);
         let store = EventStore::open(path.to_str().unwrap()).unwrap();
-        assert_eq!(store.get_llm_completion(&reservation.request_id).unwrap().unwrap(), original);
+        assert_eq!(
+            store
+                .get_llm_completion(&reservation.request_id)
+                .unwrap()
+                .unwrap(),
+            original
+        );
         assert!(store.get_all_events().unwrap().is_empty());
     }
 
@@ -5742,31 +6391,76 @@ mod tests {
     fn sealed_model_evidence_requires_registration_and_exact_identity_not_empty_output() {
         let store = EventStore::open(":memory:").unwrap();
         let reservation = model_reservation_fixture();
-        assert!(store.reserve_llm_request(&reservation.request_id, &reservation.request_digest, "AGENT-07").unwrap());
-        store.mark_llm_provider_outcome_unknown(&reservation.request_id, &reservation.request_digest,
-            "UnknownOutcome: provider_transport_deadline_elapsed").unwrap();
-        assert!(store.sealed_unknown_llm_model_evidence(&reservation.request_id,
-            &reservation.request_digest, &reservation.owner_scope).unwrap().is_none());
+        assert!(store
+            .reserve_llm_request(
+                &reservation.request_id,
+                &reservation.request_digest,
+                "AGENT-07"
+            )
+            .unwrap());
+        store
+            .mark_llm_provider_outcome_unknown(
+                &reservation.request_id,
+                &reservation.request_digest,
+                "UnknownOutcome: provider_transport_deadline_elapsed",
+            )
+            .unwrap();
+        assert!(store
+            .sealed_unknown_llm_model_evidence(
+                &reservation.request_id,
+                &reservation.request_digest,
+                &reservation.owner_scope
+            )
+            .unwrap()
+            .is_none());
         assert!(store.bind_llm_model_reservation(&reservation).is_err());
         let reservation = model_reservation_fixture();
         let evidence = bind_and_seal_model(&store, &reservation);
-        assert!(store.sealed_unknown_llm_model_evidence(&reservation.request_id, &"d".repeat(64),
-            &reservation.owner_scope).is_err());
-        assert!(store.sealed_unknown_llm_model_evidence(&reservation.request_id, &reservation.request_digest,
-            &StateTransferScope::for_agent("AGENT-08")).is_err());
-        assert!(store.sealed_unknown_llm_model_evidence(&reservation.request_id, &reservation.request_digest,
-            &StateTransferScope::World).is_err());
+        assert!(store
+            .sealed_unknown_llm_model_evidence(
+                &reservation.request_id,
+                &"d".repeat(64),
+                &reservation.owner_scope
+            )
+            .is_err());
+        assert!(store
+            .sealed_unknown_llm_model_evidence(
+                &reservation.request_id,
+                &reservation.request_digest,
+                &StateTransferScope::for_agent("AGENT-08")
+            )
+            .is_err());
+        assert!(store
+            .sealed_unknown_llm_model_evidence(
+                &reservation.request_id,
+                &reservation.request_digest,
+                &StateTransferScope::World
+            )
+            .is_err());
         for (status, payload, reason) in [
             ("action_claimed", "", evidence.reason.as_str()),
-            ("pending_usage", "response", ""), ("ready_for_action", "response", ""),
+            ("pending_usage", "response", ""),
+            ("ready_for_action", "response", ""),
             ("failed", "response", evidence.reason.as_str()),
-            ("failed", "", "UnknownOutcome: unapproved reason"), ("failed", "", "ordinary failure"),
+            ("failed", "", "UnknownOutcome: unapproved reason"),
+            ("failed", "", "ordinary failure"),
         ] {
             store.conn().execute("UPDATE llm_completion_outbox SET status=?2,payload=?3,last_error=?4 WHERE request_id=?1",
                 params![reservation.request_id, status, payload, reason]).unwrap();
-            assert!(store.sealed_unknown_llm_model_evidence(&reservation.request_id,
-                &reservation.request_digest, &reservation.owner_scope).unwrap().is_none());
-            assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &late_model_usage_fixture(&reservation)).is_err());
+            assert!(store
+                .sealed_unknown_llm_model_evidence(
+                    &reservation.request_id,
+                    &reservation.request_digest,
+                    &reservation.owner_scope
+                )
+                .unwrap()
+                .is_none());
+            assert!(store
+                .persist_sealed_unknown_llm_model_usage(
+                    &evidence,
+                    &late_model_usage_fixture(&reservation)
+                )
+                .is_err());
         }
         let mut tool = serde_json::to_value(&reservation).unwrap();
         tool["subject"]["kind"] = serde_json::json!("tool");
@@ -5780,58 +6474,116 @@ mod tests {
         let evidence = bind_and_seal_model(&store, &reservation);
         let usage = late_model_usage_fixture(&reservation);
         let original = store.get_llm_completion(&reservation.request_id).unwrap();
-        for field in ["tenant_id", "project_id", "work_item_id", "reservation_id", "assignment_id",
-            "provider", "requested_model", "effective_model", "caller_role"] {
+        for field in [
+            "tenant_id",
+            "project_id",
+            "work_item_id",
+            "reservation_id",
+            "assignment_id",
+            "provider",
+            "requested_model",
+            "effective_model",
+            "caller_role",
+        ] {
             let mut invalid = usage.clone();
             let mut payload: serde_json::Value = serde_json::from_str(&invalid.payload).unwrap();
             payload[field] = serde_json::json!("wrong");
             invalid.payload = payload.to_string();
-            assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &invalid).is_err(), "{field}");
+            assert!(
+                store
+                    .persist_sealed_unknown_llm_model_usage(&evidence, &invalid)
+                    .is_err(),
+                "{field}"
+            );
         }
         for (field, value) in [
-            ("agent_id", serde_json::json!(8)), ("assignment_version", serde_json::json!(2)),
-            ("cost_usd", serde_json::json!(-1)), ("cost_source", serde_json::json!("non_provider_zero")),
-            ("cost_source", serde_json::Value::Null), ("hierarchy_tier", serde_json::Value::Null),
+            ("agent_id", serde_json::json!(8)),
+            ("assignment_version", serde_json::json!(2)),
+            ("cost_usd", serde_json::json!(-1)),
+            ("cost_source", serde_json::json!("non_provider_zero")),
+            ("cost_source", serde_json::Value::Null),
+            ("hierarchy_tier", serde_json::Value::Null),
         ] {
             let mut invalid = usage.clone();
             let mut payload: serde_json::Value = serde_json::from_str(&invalid.payload).unwrap();
             payload[field] = value;
             invalid.payload = payload.to_string();
-            assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &invalid).is_err(), "{field}");
+            assert!(
+                store
+                    .persist_sealed_unknown_llm_model_usage(&evidence, &invalid)
+                    .is_err(),
+                "{field}"
+            );
         }
-        for field in ["event_id", "event_type", "aggregate_id", "correlation_id", "operation_id", "compensation_type"] {
+        for field in [
+            "event_id",
+            "event_type",
+            "aggregate_id",
+            "correlation_id",
+            "operation_id",
+            "compensation_type",
+        ] {
             let mut encoded = serde_json::to_value(&usage).unwrap();
             encoded[field] = serde_json::json!("wrong");
             let invalid: DomainEvent = serde_json::from_value(encoded).unwrap();
-            assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &invalid).is_err(), "{field}");
+            assert!(
+                store
+                    .persist_sealed_unknown_llm_model_usage(&evidence, &invalid)
+                    .is_err(),
+                "{field}"
+            );
         }
         let mut invalid = usage.clone();
         invalid.schema_version = 6;
-        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &invalid).is_err());
+        assert!(store
+            .persist_sealed_unknown_llm_model_usage(&evidence, &invalid)
+            .is_err());
         invalid = usage.clone();
         invalid.tick = u64::MAX;
-        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &invalid).is_err());
+        assert!(store
+            .persist_sealed_unknown_llm_model_usage(&evidence, &invalid)
+            .is_err());
         let mut forged = evidence.clone();
         forged.sealed_at_ms += 1;
-        assert!(store.persist_sealed_unknown_llm_model_usage(&forged, &usage).is_err());
+        assert!(store
+            .persist_sealed_unknown_llm_model_usage(&forged, &usage)
+            .is_err());
         assert!(store.get_all_events().unwrap().is_empty());
-        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &usage).unwrap());
-        for field in ["event_id", "tick", "timestamp_ms", "causation_id", "payload"] {
+        assert!(store
+            .persist_sealed_unknown_llm_model_usage(&evidence, &usage)
+            .unwrap());
+        for field in [
+            "event_id",
+            "tick",
+            "timestamp_ms",
+            "causation_id",
+            "payload",
+        ] {
             let mut altered = usage.clone();
             match field {
                 "event_id" => altered.event_id = uuid::Uuid::new_v4().to_string(),
-                "tick" => altered.tick += 1, "timestamp_ms" => altered.timestamp_ms += 1,
+                "tick" => altered.tick += 1,
+                "timestamp_ms" => altered.timestamp_ms += 1,
                 "causation_id" => altered.causation_id = Some("other".into()),
                 _ => {
-                    let mut payload: serde_json::Value = serde_json::from_str(&altered.payload).unwrap();
+                    let mut payload: serde_json::Value =
+                        serde_json::from_str(&altered.payload).unwrap();
                     payload["cost_usd"] = serde_json::json!(0.25);
                     altered.payload = payload.to_string();
                 }
             }
-            assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &altered).is_err(), "{field}");
+            assert!(
+                store
+                    .persist_sealed_unknown_llm_model_usage(&evidence, &altered)
+                    .is_err(),
+                "{field}"
+            );
         }
         assert_eq!(store.get_all_events().unwrap().len(), 1);
-        assert_eq!(store.get_llm_completion(&reservation.request_id).unwrap(), original);
+        assert_eq!(
+            store.get_llm_completion(&reservation.request_id).unwrap(),
+            original
+        );
     }
 
     #[test]
@@ -5839,7 +6591,13 @@ mod tests {
         for _ in 0..8 {
             let store = Arc::new(EventStore::open(":memory:").unwrap());
             let reservation = model_reservation_fixture();
-            store.reserve_llm_request(&reservation.request_id, &reservation.request_digest, "AGENT-07").unwrap();
+            store
+                .reserve_llm_request(
+                    &reservation.request_id,
+                    &reservation.request_digest,
+                    "AGENT-07",
+                )
+                .unwrap();
             store.bind_llm_model_reservation(&reservation).unwrap();
             let mut conflicting = reservation.clone();
             conflicting.context_digest = "d".repeat(64);
@@ -5850,27 +6608,63 @@ mod tests {
             let model = reservation.clone();
             let response = std::thread::spawn(move || {
                 started.wait();
-                other.enqueue_llm_completion(&model.request_id, &model.request_digest, "durable response").is_ok()
+                other
+                    .enqueue_llm_completion(
+                        &model.request_id,
+                        &model.request_digest,
+                        "durable response",
+                    )
+                    .is_ok()
             });
             barrier.wait();
-            let sealed = store.mark_llm_provider_outcome_unknown(&reservation.request_id,
-                &reservation.request_digest, "UnknownOutcome: provider_transport_deadline_elapsed").unwrap();
+            let sealed = store
+                .mark_llm_provider_outcome_unknown(
+                    &reservation.request_id,
+                    &reservation.request_digest,
+                    "UnknownOutcome: provider_transport_deadline_elapsed",
+                )
+                .unwrap();
             assert_ne!(sealed, response.join().unwrap());
-            let evidence = store.sealed_unknown_llm_model_evidence(&reservation.request_id,
-                &reservation.request_digest, &reservation.owner_scope).unwrap();
+            let evidence = store
+                .sealed_unknown_llm_model_evidence(
+                    &reservation.request_id,
+                    &reservation.request_digest,
+                    &reservation.owner_scope,
+                )
+                .unwrap();
             assert_eq!(evidence.is_some(), sealed);
             if let Some(evidence) = evidence {
                 let usage = late_model_usage_fixture(&reservation);
                 let other = Arc::clone(&store);
                 let copy = evidence.clone();
                 let duplicate = usage.clone();
-                let append = std::thread::spawn(move || other.persist_sealed_unknown_llm_model_usage(&copy, &duplicate).unwrap());
-                let inserted = store.persist_sealed_unknown_llm_model_usage(&evidence, &usage).unwrap();
+                let append = std::thread::spawn(move || {
+                    other
+                        .persist_sealed_unknown_llm_model_usage(&copy, &duplicate)
+                        .unwrap()
+                });
+                let inserted = store
+                    .persist_sealed_unknown_llm_model_usage(&evidence, &usage)
+                    .unwrap();
                 assert_ne!(inserted, append.join().unwrap());
                 assert_eq!(store.get_all_events().unwrap().len(), 1);
-                assert_eq!(store.get_llm_completion(&reservation.request_id).unwrap().unwrap().status, "failed");
+                assert_eq!(
+                    store
+                        .get_llm_completion(&reservation.request_id)
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "failed"
+                );
             } else {
-                assert_eq!(store.get_llm_completion(&reservation.request_id).unwrap().unwrap().payload, "durable response");
+                assert_eq!(
+                    store
+                        .get_llm_completion(&reservation.request_id)
+                        .unwrap()
+                        .unwrap()
+                        .payload,
+                    "durable response"
+                );
                 assert!(store.get_all_events().unwrap().is_empty());
             }
         }
@@ -5887,10 +6681,20 @@ mod tests {
         let evidence = bind_and_seal_model(&store, &reservation);
         let usage = late_model_usage_fixture(&reservation);
         assert_eq!(usage.schema_version, 6);
-        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &usage).unwrap());
+        assert!(store
+            .persist_sealed_unknown_llm_model_usage(&evidence, &usage)
+            .unwrap());
         assert_eq!(evidence.reservation.allowance_id, "original-allowance");
-        assert_eq!(store.sealed_unknown_llm_model_evidence(&reservation.request_id,
-            &reservation.request_digest, &reservation.owner_scope).unwrap(), Some(evidence));
+        assert_eq!(
+            store
+                .sealed_unknown_llm_model_evidence(
+                    &reservation.request_id,
+                    &reservation.request_digest,
+                    &reservation.owner_scope
+                )
+                .unwrap(),
+            Some(evidence)
+        );
     }
 
     #[test]
@@ -5904,23 +6708,45 @@ mod tests {
         let mut unrelated = usage.clone();
         unrelated.operation_id = "unrelated".into();
         store.append_event(&unrelated).unwrap();
-        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &usage).is_err());
+        assert!(store
+            .persist_sealed_unknown_llm_model_usage(&evidence, &usage)
+            .is_err());
         assert!(!store.has_event_operation_id(&usage.operation_id).unwrap());
         let mut fresh = usage;
         fresh.event_id = uuid::Uuid::new_v4().to_string();
-        assert!(store.persist_sealed_unknown_llm_model_usage(&evidence, &fresh).unwrap());
+        assert!(store
+            .persist_sealed_unknown_llm_model_usage(&evidence, &fresh)
+            .unwrap());
         let mut foreign = reservation.clone();
         foreign.usage_binding.agent_id = AgentId(8);
         foreign.owner_scope = StateTransferScope::for_agent("AGENT-08");
-        let foreign_evidence = LlmSealedUnknownModelEvidenceV1 { reservation: foreign.clone(),
-            reason: evidence.reason.clone(), reserved_at_ms: 1, sealed_at_ms: 2 };
+        let foreign_evidence = LlmSealedUnknownModelEvidenceV1 {
+            reservation: foreign.clone(),
+            reason: evidence.reason.clone(),
+            reserved_at_ms: 1,
+            sealed_at_ms: 2,
+        };
         // A follower may hold replicated evidence but cannot append accounting.
         store.conn().execute("UPDATE llm_completion_outbox SET owner_scope=?2,model_binding=?3,created_at=1,updated_at=2 WHERE request_id=?1",
             params![foreign.request_id, foreign.owner_scope.to_wire(), serde_json::to_string(&foreign).unwrap()]).unwrap();
-        assert_eq!(store.sealed_unknown_llm_model_evidence(&foreign.request_id, &foreign.request_digest,
-            &foreign.owner_scope).unwrap(), Some(foreign_evidence.clone()));
-        assert!(store.persist_sealed_unknown_llm_model_usage(&foreign_evidence, &late_model_usage_fixture(&foreign))
-            .unwrap_err().downcast_ref::<sentinel_common::OwnerIssueError>().is_some());
+        assert_eq!(
+            store
+                .sealed_unknown_llm_model_evidence(
+                    &foreign.request_id,
+                    &foreign.request_digest,
+                    &foreign.owner_scope
+                )
+                .unwrap(),
+            Some(foreign_evidence.clone())
+        );
+        assert!(store
+            .persist_sealed_unknown_llm_model_usage(
+                &foreign_evidence,
+                &late_model_usage_fixture(&foreign)
+            )
+            .unwrap_err()
+            .downcast_ref::<sentinel_common::OwnerIssueError>()
+            .is_some());
         assert_eq!(store.get_all_events().unwrap().len(), 2);
     }
 

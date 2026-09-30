@@ -2195,16 +2195,11 @@ fn project_planning_reconcile_grants_existing_assigned_project_once() {
             renewal_time,
         )
         .unwrap();
-    let renewed_allowance = renewed.subscription_call.as_ref().unwrap();
-    let mut expected_grant = allowance.grant.clone();
-    expected_grant.expires_at_unix_ms = renewal_time + 300_000;
-    assert_eq!(renewed_allowance.grant, expected_grant);
-    assert_ne!(renewed_allowance.allowance_id, allowance.allowance_id);
-    assert_eq!(renewed.version, granted.version + 1);
-    assert!(!WorkflowApi::model_work_grant_due(
-        &renewed,
-        renewal_time + 1,
-    ));
+    assert!(allowance.grant.max_calls > 1);
+    // An absent one-shot dispatch does not prove an unspent adaptive campaign.
+    // Expiry must not mint a fresh Project allowance outside leader governance.
+    assert_eq!(renewed.subscription_call.as_ref(), Some(&allowance));
+    assert_eq!(renewed, granted);
 
     let replayed_renewal = api
         .grant_model_work_at(

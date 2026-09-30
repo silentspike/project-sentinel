@@ -18,8 +18,13 @@ pub const ADAPTIVE_CONTINUATION_MAX_WINDOW_MS: u64 = 300_000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdaptiveContinuationSourceV1 {
-    Blocked { reason_code: String },
-    BlockedResolved { reason_code: String, resolution_event_id: String },
+    Blocked {
+        reason_code: String,
+    },
+    BlockedResolved {
+        reason_code: String,
+        resolution_event_id: String,
+    },
     ModelUnknown,
 }
 
@@ -44,22 +49,35 @@ pub struct AdaptiveContinuationAuthorizationV1 {
 
 impl AdaptiveContinuationAuthorizationV1 {
     pub fn validate(&self) -> Result<(), WorkflowError> {
-        if self.schema_version != 1 || self.operation_id.is_nil() || self.review_id.is_nil()
-            || self.resolution_event_id.is_nil() || self.session_id.is_nil()
-            || self.source_session_version == 0 || !valid_identifier(&self.provider_allowance_id)
+        if self.schema_version != 1
+            || self.operation_id.is_nil()
+            || self.review_id.is_nil()
+            || self.resolution_event_id.is_nil()
+            || self.session_id.is_nil()
+            || self.source_session_version == 0
+            || !valid_identifier(&self.provider_allowance_id)
             || !validate_sha256(&self.provider_authority_digest)
-            || self.issued_at_ms == 0 || self.deadline_ms <= self.issued_at_ms
+            || self.issued_at_ms == 0
+            || self.deadline_ms <= self.issued_at_ms
             || self.deadline_ms - self.issued_at_ms < 1_000
             || self.deadline_ms - self.issued_at_ms > ADAPTIVE_CONTINUATION_MAX_WINDOW_MS
             || !(1..=ADAPTIVE_SESSION_MAX_CALLS).contains(&self.additional_model_calls)
-            || self.abandoned_model_effect.as_ref().is_some_and(|effect|
-                effect.id.is_nil() || !validate_sha256(&effect.request_digest)) {
+            || self.abandoned_model_effect.as_ref().is_some_and(|effect| {
+                effect.id.is_nil() || !validate_sha256(&effect.request_digest)
+            })
+        {
             return Err(invalid());
         }
         match (&self.source, &self.abandoned_model_effect) {
-            (AdaptiveContinuationSourceV1::Blocked { reason_code }, None) if valid_reason(reason_code) => {}
-            (AdaptiveContinuationSourceV1::BlockedResolved { reason_code, resolution_event_id }, None)
-                if valid_reason(reason_code) && valid_resolution(resolution_event_id) => {}
+            (AdaptiveContinuationSourceV1::Blocked { reason_code }, None)
+                if valid_reason(reason_code) => {}
+            (
+                AdaptiveContinuationSourceV1::BlockedResolved {
+                    reason_code,
+                    resolution_event_id,
+                },
+                None,
+            ) if valid_reason(reason_code) && valid_resolution(resolution_event_id) => {}
             (AdaptiveContinuationSourceV1::ModelUnknown, Some(_)) => {}
             _ => return Err(invalid()),
         }
@@ -398,31 +416,66 @@ impl AdaptiveSessionV1 {
         }
         let mut next = self.clone();
         next.cursor = match (&self.cursor, command) {
-            (Cursor::Blocked { .. } | Cursor::BlockedResolved { .. } | Cursor::ModelUnknown { .. },
-                Command::ContinueGoverned { authorization }) => {
+            (
+                Cursor::Blocked { .. }
+                | Cursor::BlockedResolved { .. }
+                | Cursor::ModelUnknown { .. },
+                Command::ContinueGoverned { authorization },
+            ) => {
                 authorization.validate()?;
-                let history = self.continuation.as_ref().map(|state| state.authorizations.as_slice()).unwrap_or(&[]);
+                let history = self
+                    .continuation
+                    .as_ref()
+                    .map(|state| state.authorizations.as_slice())
+                    .unwrap_or(&[]);
                 if authorization.session_id != self.grant.session_id
                     || authorization.source_session_version != self.version
-                    || now_ms < authorization.issued_at_ms || now_ms >= authorization.deadline_ms
+                    || now_ms < authorization.issued_at_ms
+                    || now_ms >= authorization.deadline_ms
                     || authorization.issued_at_ms < self.active_deadline_ms()
                     || history.len() >= ADAPTIVE_CONTINUATION_MAX_WINDOWS
                     || authorization.provider_allowance_id == self.grant.provider_allowance_id
-                    || history.iter().any(|prior| prior.operation_id == authorization.operation_id
-                        || prior.review_id == authorization.review_id
-                        || prior.resolution_event_id == authorization.resolution_event_id
-                        || prior.provider_allowance_id == authorization.provider_allowance_id)
-                    || self.model_calls.checked_add(authorization.additional_model_calls)
-                        .is_none_or(|ceiling| ceiling > self.grant.max_model_calls) {
+                    || history.iter().any(|prior| {
+                        prior.operation_id == authorization.operation_id
+                            || prior.review_id == authorization.review_id
+                            || prior.resolution_event_id == authorization.resolution_event_id
+                            || prior.provider_allowance_id == authorization.provider_allowance_id
+                    })
+                    || self
+                        .model_calls
+                        .checked_add(authorization.additional_model_calls)
+                        .is_none_or(|ceiling| ceiling > self.grant.max_model_calls)
+                {
                     return Err(invalid());
                 }
-                match (&self.cursor, &authorization.source, &authorization.abandoned_model_effect) {
-                    (Cursor::Blocked { reason_code }, AdaptiveContinuationSourceV1::Blocked { reason_code: expected }, None)
-                        if reason_code == expected => {}
-                    (Cursor::BlockedResolved { reason_code, resolution_event_id },
-                        AdaptiveContinuationSourceV1::BlockedResolved { reason_code: expected, resolution_event_id: expected_event }, None)
-                        if reason_code == expected && resolution_event_id == expected_event => {}
-                    (Cursor::ModelUnknown { effect }, AdaptiveContinuationSourceV1::ModelUnknown, Some(abandoned)) if effect == abandoned => {}
+                match (
+                    &self.cursor,
+                    &authorization.source,
+                    &authorization.abandoned_model_effect,
+                ) {
+                    (
+                        Cursor::Blocked { reason_code },
+                        AdaptiveContinuationSourceV1::Blocked {
+                            reason_code: expected,
+                        },
+                        None,
+                    ) if reason_code == expected => {}
+                    (
+                        Cursor::BlockedResolved {
+                            reason_code,
+                            resolution_event_id,
+                        },
+                        AdaptiveContinuationSourceV1::BlockedResolved {
+                            reason_code: expected,
+                            resolution_event_id: expected_event,
+                        },
+                        None,
+                    ) if reason_code == expected && resolution_event_id == expected_event => {}
+                    (
+                        Cursor::ModelUnknown { effect },
+                        AdaptiveContinuationSourceV1::ModelUnknown,
+                        Some(abandoned),
+                    ) if effect == abandoned => {}
                     _ => return Err(invalid()),
                 }
                 let mut authorizations = history.to_vec();
@@ -465,10 +518,18 @@ impl AdaptiveSessionV1 {
                     decision,
                 },
             ) if effect == resolved => {
-                if !validate_sha256(result_digest) || self.is_abandoned_model_effect(resolved)
-                    || (self.requires_fresh_observation() && !matches!(decision,
-                        AdaptiveModelDecisionV1::Tool { tool: WorkbenchTool::ListDirectory { .. } | WorkbenchTool::InspectFile { .. }, .. }
-                        | AdaptiveModelDecisionV1::Blocked { .. })) {
+                if !validate_sha256(result_digest)
+                    || self.is_abandoned_model_effect(resolved)
+                    || (self.requires_fresh_observation()
+                        && !matches!(
+                            decision,
+                            AdaptiveModelDecisionV1::Tool {
+                                tool: WorkbenchTool::ListDirectory { .. }
+                                    | WorkbenchTool::InspectFile { .. },
+                                ..
+                            } | AdaptiveModelDecisionV1::Blocked { .. }
+                        ))
+                {
                     return Err(invalid());
                 }
                 next.last_model_result_digest = Some(result_digest.clone());
@@ -513,9 +574,13 @@ impl AdaptiveSessionV1 {
                     tool_digest: proposed,
                 },
             ) if tool_digest == proposed => {
-                if now_ms >= self.active_deadline_ms() || self.tool_calls >= self.grant.max_tool_calls
-                    || (self.requires_fresh_observation() && !matches!(tool,
-                        WorkbenchTool::ListDirectory { .. } | WorkbenchTool::InspectFile { .. }))
+                if now_ms >= self.active_deadline_ms()
+                    || self.tool_calls >= self.grant.max_tool_calls
+                    || (self.requires_fresh_observation()
+                        && !matches!(
+                            tool,
+                            WorkbenchTool::ListDirectory { .. } | WorkbenchTool::InspectFile { .. }
+                        ))
                 {
                     return Err(invalid());
                 }
@@ -536,8 +601,13 @@ impl AdaptiveSessionV1 {
                 }
                 // A failed command's confirmed output is feedback, not a failed work item.
                 next.last_observation = Some(observation.clone());
-                if matches!(tool, WorkbenchTool::ListDirectory { .. } | WorkbenchTool::InspectFile { .. }) {
-                    if let Some(state) = next.continuation.as_mut() { state.observation_required = false; }
+                if matches!(
+                    tool,
+                    WorkbenchTool::ListDirectory { .. } | WorkbenchTool::InspectFile { .. }
+                ) {
+                    if let Some(state) = next.continuation.as_mut() {
+                        state.observation_required = false;
+                    }
                 }
                 Cursor::ReadyForModel
             }
@@ -624,40 +694,63 @@ impl AdaptiveSessionV1 {
     }
 
     pub fn active_provider_allowance_id(&self) -> &str {
-        self.continuation.as_ref().and_then(|state| state.authorizations.last())
-            .map_or(self.grant.provider_allowance_id.as_str(), |authorization| authorization.provider_allowance_id.as_str())
+        self.continuation
+            .as_ref()
+            .and_then(|state| state.authorizations.last())
+            .map_or(self.grant.provider_allowance_id.as_str(), |authorization| {
+                authorization.provider_allowance_id.as_str()
+            })
     }
 
     pub fn effective_grant(&self) -> AdaptiveSessionGrantV1 {
         let mut grant = self.grant.clone();
-        if let Some(authorization) = self.continuation.as_ref().and_then(|state| state.authorizations.last()) {
+        if let Some(authorization) = self
+            .continuation
+            .as_ref()
+            .and_then(|state| state.authorizations.last())
+        {
             grant.provider_allowance_id = authorization.provider_allowance_id.clone();
             grant.provider_authority_digest = authorization.provider_authority_digest.clone();
             grant.created_at_ms = authorization.issued_at_ms;
             grant.deadline_ms = authorization.deadline_ms;
             grant.max_model_calls = self.active_model_ceiling();
-            grant.max_call_duration_ms = grant.max_call_duration_ms
+            grant.max_call_duration_ms = grant
+                .max_call_duration_ms
                 .min(authorization.deadline_ms - authorization.issued_at_ms);
         }
         grant
     }
 
     pub fn active_deadline_ms(&self) -> u64 {
-        self.continuation.as_ref().and_then(|state| state.authorizations.last())
-            .map_or(self.grant.deadline_ms, |authorization| authorization.deadline_ms)
+        self.continuation
+            .as_ref()
+            .and_then(|state| state.authorizations.last())
+            .map_or(self.grant.deadline_ms, |authorization| {
+                authorization.deadline_ms
+            })
     }
 
     pub fn active_model_ceiling(&self) -> u16 {
-        self.continuation.as_ref().map_or(self.grant.max_model_calls, |state| state.model_ceiling)
+        self.continuation
+            .as_ref()
+            .map_or(self.grant.max_model_calls, |state| state.model_ceiling)
     }
 
     pub fn requires_fresh_observation(&self) -> bool {
-        self.continuation.as_ref().is_some_and(|state| state.observation_required)
+        self.continuation
+            .as_ref()
+            .is_some_and(|state| state.observation_required)
     }
 
     pub fn is_abandoned_model_effect(&self, effect: &AdaptiveEffectV1) -> bool {
-        self.continuation.as_ref().is_some_and(|state| state.authorizations.iter()
-            .any(|authorization| authorization.abandoned_model_effect.as_ref().is_some_and(|old| old.id == effect.id)))
+        self.continuation.as_ref().is_some_and(|state| {
+            state.authorizations.iter().any(|authorization| {
+                authorization
+                    .abandoned_model_effect
+                    .as_ref()
+                    .is_some_and(|old| old.id == effect.id)
+            })
+        })
     }
 }
 
@@ -749,7 +842,9 @@ fn invalid() -> WorkflowError {
 #[cfg(test)]
 pub(crate) mod continuation_tests {
     use super::*;
-    use crate::{AgentId, PrincipalAuthorityV1, ProjectId, TenantId, WorkItemId, WORKFLOW_SCHEMA_VERSION};
+    use crate::{
+        AgentId, PrincipalAuthorityV1, ProjectId, TenantId, WorkItemId, WORKFLOW_SCHEMA_VERSION,
+    };
 
     pub(crate) const NOW: u64 = 1_900_000_000_000;
 
@@ -762,50 +857,99 @@ pub(crate) mod continuation_tests {
                 tenant_id: TenantId::parse("tenant-01").unwrap(),
                 project_id: ProjectId::parse("project-01").unwrap(),
                 work_item_id: WorkItemId::parse("work-01").unwrap(),
-                agent_id: AgentId(7), assignment_version: 3,
-                assignment_digest: "1".repeat(64), organization_generation: 9,
+                agent_id: AgentId(7),
+                assignment_version: 3,
+                assignment_digest: "1".repeat(64),
+                organization_generation: 9,
                 organization_digest: "2".repeat(64),
                 principal: PrincipalAuthorityV1::derive("agent-07", 4, &[0x5a; 32]).unwrap(),
-                profile_id: "coding-agent-v1".into(), profile_generation: 2,
-                profile_digest: "3".repeat(64), runtime_key: "bwrap-coding-v1".into(),
-                runtime_generation: 2, runtime_digest: "4".repeat(64),
-                policy_generation: 6, policy_digest: "5".repeat(64), active: true,
-                capabilities: BTreeSet::from(["file.inspect".into(), "observation.retain_private".into()]),
+                profile_id: "coding-agent-v1".into(),
+                profile_generation: 2,
+                profile_digest: "3".repeat(64),
+                runtime_key: "bwrap-coding-v1".into(),
+                runtime_generation: 2,
+                runtime_digest: "4".repeat(64),
+                policy_generation: 6,
+                policy_digest: "5".repeat(64),
+                active: true,
+                capabilities: BTreeSet::from([
+                    "file.inspect".into(),
+                    "observation.retain_private".into(),
+                ]),
             },
-            provider_allowance_id: "root-allowance".into(), provider_authority_digest: "6".repeat(64),
-            provider: "codex-cli".into(), model: "gpt-5.6-luna".into(), catalog_digest: "7".repeat(64),
-            max_output_tokens: 4096, max_call_duration_ms: 120_000,
-            max_model_calls: 16, max_tool_calls: 16,
-            created_at_ms: NOW, deadline_ms: NOW + 1_000,
+            provider_allowance_id: "root-allowance".into(),
+            provider_authority_digest: "6".repeat(64),
+            provider: "codex-cli".into(),
+            model: "gpt-5.6-luna".into(),
+            catalog_digest: "7".repeat(64),
+            max_output_tokens: 4096,
+            max_call_duration_ms: 120_000,
+            max_model_calls: 16,
+            max_tool_calls: 16,
+            created_at_ms: NOW,
+            deadline_ms: NOW + 1_000,
         }
     }
 
     pub(crate) fn effect(id: u128) -> AdaptiveEffectV1 {
-        AdaptiveEffectV1 { id: Uuid::from_u128(id), request_digest: "8".repeat(64) }
+        AdaptiveEffectV1 {
+            id: Uuid::from_u128(id),
+            request_digest: "8".repeat(64),
+        }
     }
 
     pub(crate) fn unknown() -> AdaptiveSessionV1 {
         let initial = AdaptiveSessionV1::initial(grant()).unwrap();
-        let pending = initial.transition(&AdaptiveTransitionV1::ClaimModel {
-            effect: effect(102), previous_observation_digest: None,
-        }, NOW + 1).unwrap();
-        pending.transition(&AdaptiveTransitionV1::MarkUnknown { effect: effect(102) }, NOW + 2).unwrap()
+        let pending = initial
+            .transition(
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect(102),
+                    previous_observation_digest: None,
+                },
+                NOW + 1,
+            )
+            .unwrap();
+        pending
+            .transition(
+                &AdaptiveTransitionV1::MarkUnknown {
+                    effect: effect(102),
+                },
+                NOW + 2,
+            )
+            .unwrap()
     }
 
-    pub(crate) fn authorization(session: &AdaptiveSessionV1) -> AdaptiveContinuationAuthorizationV1 {
+    pub(crate) fn authorization(
+        session: &AdaptiveSessionV1,
+    ) -> AdaptiveContinuationAuthorizationV1 {
         AdaptiveContinuationAuthorizationV1 {
-            schema_version: 1, operation_id: Uuid::from_u128(201), review_id: Uuid::from_u128(202),
-            resolution_event_id: Uuid::from_u128(203), session_id: session.grant.session_id,
-            source_session_version: session.version, source: AdaptiveContinuationSourceV1::ModelUnknown,
-            abandoned_model_effect: Some(effect(102)), provider_allowance_id: "continued-allowance".into(),
-            provider_authority_digest: "9".repeat(64), issued_at_ms: NOW + 1_000,
-            deadline_ms: NOW + 11_000, additional_model_calls: 3,
+            schema_version: 1,
+            operation_id: Uuid::from_u128(201),
+            review_id: Uuid::from_u128(202),
+            resolution_event_id: Uuid::from_u128(203),
+            session_id: session.grant.session_id,
+            source_session_version: session.version,
+            source: AdaptiveContinuationSourceV1::ModelUnknown,
+            abandoned_model_effect: Some(effect(102)),
+            provider_allowance_id: "continued-allowance".into(),
+            provider_authority_digest: "9".repeat(64),
+            issued_at_ms: NOW + 1_000,
+            deadline_ms: NOW + 11_000,
+            additional_model_calls: 3,
         }
     }
 
-    fn continue_with(session: &AdaptiveSessionV1, auth: AdaptiveContinuationAuthorizationV1) -> Result<AdaptiveSessionV1, WorkflowError> {
+    fn continue_with(
+        session: &AdaptiveSessionV1,
+        auth: AdaptiveContinuationAuthorizationV1,
+    ) -> Result<AdaptiveSessionV1, WorkflowError> {
         let now = auth.issued_at_ms;
-        session.transition(&AdaptiveTransitionV1::ContinueGoverned { authorization: auth }, now)
+        session.transition(
+            &AdaptiveTransitionV1::ContinueGoverned {
+                authorization: auth,
+            },
+            now,
+        )
     }
 
     #[test]
@@ -817,9 +961,15 @@ pub(crate) mod continuation_tests {
         assert_eq!((next.model_calls, next.tool_calls), (1, 0));
         assert_eq!(next.effect_ids, source.effect_ids);
         assert_eq!(next.last_observation, source.last_observation);
-        assert_eq!(next.last_model_result_digest, source.last_model_result_digest);
+        assert_eq!(
+            next.last_model_result_digest,
+            source.last_model_result_digest
+        );
         assert_eq!(next.active_model_ceiling(), 4);
-        assert_eq!(next.active_provider_allowance_id(), auth.provider_allowance_id);
+        assert_eq!(
+            next.active_provider_allowance_id(),
+            auth.provider_allowance_id
+        );
         assert_eq!(next.active_deadline_ms(), auth.deadline_ms);
         let effective = next.effective_grant();
         effective.validate().unwrap();
@@ -827,15 +977,24 @@ pub(crate) mod continuation_tests {
         assert_eq!(effective.max_tool_calls, 16);
         assert_eq!(effective.authority, source.grant.authority);
         assert_eq!(effective.session_id, source.grant.session_id);
-        assert_eq!(effective.provider_authority_digest, auth.provider_authority_digest);
+        assert_eq!(
+            effective.provider_authority_digest,
+            auth.provider_authority_digest
+        );
         assert!(next.requires_fresh_observation());
         assert!(next.is_abandoned_model_effect(&effect(102)));
         let mut changed_digest = effect(102);
         changed_digest.request_digest = "a".repeat(64);
         assert!(next.is_abandoned_model_effect(&changed_digest));
-        assert!(next.transition(&AdaptiveTransitionV1::ClaimModel {
-            effect: effect(102), previous_observation_digest: None,
-        }, auth.issued_at_ms).is_err());
+        assert!(next
+            .transition(
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect(102),
+                    previous_observation_digest: None,
+                },
+                auth.issued_at_ms
+            )
+            .is_err());
     }
 
     #[test]
@@ -843,21 +1002,47 @@ pub(crate) mod continuation_tests {
         let source = unknown();
         let original = authorization(&source);
         let mut invalids = Vec::new();
-        let mut a = original.clone(); a.additional_model_calls = 16; invalids.push(a);
-        let mut a = original.clone(); a.additional_model_calls = 0; invalids.push(a);
-        let mut a = original.clone(); a.deadline_ms = a.issued_at_ms + 300_001; invalids.push(a);
-        let mut a = original.clone(); a.deadline_ms = a.issued_at_ms + 999; invalids.push(a);
-        let mut a = original.clone(); a.issued_at_ms -= 1; invalids.push(a);
-        let mut a = original.clone(); a.source_session_version -= 1; invalids.push(a);
-        let mut a = original.clone(); a.abandoned_model_effect = Some(effect(103)); invalids.push(a);
-        let mut a = original.clone(); a.provider_allowance_id = source.grant.provider_allowance_id.clone(); invalids.push(a);
-        let mut a = original.clone(); a.source = AdaptiveContinuationSourceV1::Blocked { reason_code: "blocked".into() }; invalids.push(a);
-        for auth in invalids { assert!(continue_with(&source, auth).is_err()); }
+        let mut a = original.clone();
+        a.additional_model_calls = 16;
+        invalids.push(a);
+        let mut a = original.clone();
+        a.additional_model_calls = 0;
+        invalids.push(a);
+        let mut a = original.clone();
+        a.deadline_ms = a.issued_at_ms + 300_001;
+        invalids.push(a);
+        let mut a = original.clone();
+        a.deadline_ms = a.issued_at_ms + 999;
+        invalids.push(a);
+        let mut a = original.clone();
+        a.issued_at_ms -= 1;
+        invalids.push(a);
+        let mut a = original.clone();
+        a.source_session_version -= 1;
+        invalids.push(a);
+        let mut a = original.clone();
+        a.abandoned_model_effect = Some(effect(103));
+        invalids.push(a);
+        let mut a = original.clone();
+        a.provider_allowance_id = source.grant.provider_allowance_id.clone();
+        invalids.push(a);
+        let mut a = original.clone();
+        a.source = AdaptiveContinuationSourceV1::Blocked {
+            reason_code: "blocked".into(),
+        };
+        invalids.push(a);
+        for auth in invalids {
+            assert!(continue_with(&source, auth).is_err());
+        }
         let mut next = continue_with(&source, original).unwrap();
         for window in 2..=4 {
-            next.cursor = AdaptiveCursorV1::Blocked { reason_code: "needs_review".into() };
+            next.cursor = AdaptiveCursorV1::Blocked {
+                reason_code: "needs_review".into(),
+            };
             let mut auth = authorization(&next);
-            auth.source = AdaptiveContinuationSourceV1::Blocked { reason_code: "needs_review".into() };
+            auth.source = AdaptiveContinuationSourceV1::Blocked {
+                reason_code: "needs_review".into(),
+            };
             auth.abandoned_model_effect = None;
             auth.operation_id = Uuid::from_u128(300 + window);
             auth.review_id = Uuid::from_u128(400 + window);
@@ -865,8 +1050,11 @@ pub(crate) mod continuation_tests {
             auth.provider_allowance_id = format!("window-{window}");
             auth.issued_at_ms = next.active_deadline_ms();
             auth.deadline_ms = auth.issued_at_ms + 10_000;
-            if window == 4 { assert!(continue_with(&next, auth).is_err()); }
-            else { next = continue_with(&next, auth).unwrap(); }
+            if window == 4 {
+                assert!(continue_with(&next, auth).is_err());
+            } else {
+                next = continue_with(&next, auth).unwrap();
+            }
         }
         assert_eq!(next.continuation.as_ref().unwrap().authorizations.len(), 3);
         assert_eq!(next.model_calls, 1);
@@ -878,34 +1066,92 @@ pub(crate) mod continuation_tests {
         let source = unknown();
         let ready = continue_with(&source, authorization(&source)).unwrap();
         let model = effect(104);
-        let pending = ready.transition(&AdaptiveTransitionV1::ClaimModel {
-            effect: model.clone(), previous_observation_digest: None,
-        }, NOW + 1_001).unwrap();
-        let write = WorkbenchTool::WriteFile { path: "src/main.rs".into(), content: "new".into(), expected_sha256: None };
-        let command = WorkbenchTool::RunCommand { program: "node".into(), args: vec!["--version".into()] };
+        let pending = ready
+            .transition(
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: model.clone(),
+                    previous_observation_digest: None,
+                },
+                NOW + 1_001,
+            )
+            .unwrap();
+        let write = WorkbenchTool::WriteFile {
+            path: "src/main.rs".into(),
+            content: "new".into(),
+            expected_sha256: None,
+        };
+        let command = WorkbenchTool::RunCommand {
+            program: "node".into(),
+            args: vec!["--version".into()],
+        };
         for decision in [
-            AdaptiveModelDecisionV1::ProposeCompletion { artifact_digest: "a".repeat(64) },
-            AdaptiveModelDecisionV1::Collaborate { action: AdaptiveCollaborationActionV1::AskQuestion { question_ref: "question".into() } },
-            AdaptiveModelDecisionV1::Tool { tool_digest: adaptive_tool_digest(&write).unwrap(), tool: write },
-            AdaptiveModelDecisionV1::Tool { tool_digest: adaptive_tool_digest(&command).unwrap(), tool: command },
+            AdaptiveModelDecisionV1::ProposeCompletion {
+                artifact_digest: "a".repeat(64),
+            },
+            AdaptiveModelDecisionV1::Collaborate {
+                action: AdaptiveCollaborationActionV1::AskQuestion {
+                    question_ref: "question".into(),
+                },
+            },
+            AdaptiveModelDecisionV1::Tool {
+                tool_digest: adaptive_tool_digest(&write).unwrap(),
+                tool: write,
+            },
+            AdaptiveModelDecisionV1::Tool {
+                tool_digest: adaptive_tool_digest(&command).unwrap(),
+                tool: command,
+            },
         ] {
-            assert!(pending.transition(&AdaptiveTransitionV1::ResolveModel {
-                effect: model.clone(), result_digest: "b".repeat(64), decision,
-            }, NOW + 1_002).is_err());
+            assert!(pending
+                .transition(
+                    &AdaptiveTransitionV1::ResolveModel {
+                        effect: model.clone(),
+                        result_digest: "b".repeat(64),
+                        decision,
+                    },
+                    NOW + 1_002
+                )
+                .is_err());
         }
-        let inspect = WorkbenchTool::InspectFile { path: "src/main.rs".into(), max_bytes: 1024 };
+        let inspect = WorkbenchTool::InspectFile {
+            path: "src/main.rs".into(),
+            max_bytes: 1024,
+        };
         let digest = adaptive_tool_digest(&inspect).unwrap();
-        let tool_ready = pending.transition(&AdaptiveTransitionV1::ResolveModel {
-            effect: model, result_digest: "b".repeat(64),
-            decision: AdaptiveModelDecisionV1::Tool { tool: inspect, tool_digest: digest.clone() },
-        }, NOW + 1_002).unwrap();
+        let tool_ready = pending
+            .transition(
+                &AdaptiveTransitionV1::ResolveModel {
+                    effect: model,
+                    result_digest: "b".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Tool {
+                        tool: inspect,
+                        tool_digest: digest.clone(),
+                    },
+                },
+                NOW + 1_002,
+            )
+            .unwrap();
         assert!(tool_ready.requires_fresh_observation());
-        let tool_pending = tool_ready.transition(&AdaptiveTransitionV1::ClaimTool {
-            effect: effect(105), tool_digest: digest,
-        }, NOW + 1_003).unwrap();
-        let observed = tool_pending.transition(&AdaptiveTransitionV1::ObserveTool {
-            observation: AdaptiveObservationRefV1 { effect: effect(105), observation_digest: "c".repeat(64) },
-        }, NOW + 1_004).unwrap();
+        let tool_pending = tool_ready
+            .transition(
+                &AdaptiveTransitionV1::ClaimTool {
+                    effect: effect(105),
+                    tool_digest: digest,
+                },
+                NOW + 1_003,
+            )
+            .unwrap();
+        let observed = tool_pending
+            .transition(
+                &AdaptiveTransitionV1::ObserveTool {
+                    observation: AdaptiveObservationRefV1 {
+                        effect: effect(105),
+                        observation_digest: "c".repeat(64),
+                    },
+                },
+                NOW + 1_004,
+            )
+            .unwrap();
         assert!(!observed.requires_fresh_observation());
         assert_eq!(observed.model_calls, 2);
         assert_eq!(observed.tool_calls, 1);
@@ -916,10 +1162,15 @@ pub(crate) mod continuation_tests {
     fn old_serialized_session_omits_continuation_and_retains_hash() {
         let session = unknown();
         let bytes = serde_json::to_vec(&session).unwrap();
-        assert!(!String::from_utf8(bytes.clone()).unwrap().contains("continuation"));
+        assert!(!String::from_utf8(bytes.clone())
+            .unwrap()
+            .contains("continuation"));
         let restored: AdaptiveSessionV1 = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
-        assert_eq!(canonical_sha256("fixture", &session).unwrap(), canonical_sha256("fixture", &restored).unwrap());
+        assert_eq!(
+            canonical_sha256("fixture", &session).unwrap(),
+            canonical_sha256("fixture", &restored).unwrap()
+        );
     }
 
     #[test]
@@ -927,19 +1178,25 @@ pub(crate) mod continuation_tests {
         let mut source = unknown();
         let old_event = Uuid::from_u128(900).to_string();
         source.cursor = AdaptiveCursorV1::BlockedResolved {
-            reason_code: "needs_review".into(), resolution_event_id: old_event.clone(),
+            reason_code: "needs_review".into(),
+            resolution_event_id: old_event.clone(),
         };
         let mut auth = authorization(&source);
         auth.abandoned_model_effect = None;
         auth.source = AdaptiveContinuationSourceV1::BlockedResolved {
-            reason_code: "needs_review".into(), resolution_event_id: old_event,
+            reason_code: "needs_review".into(),
+            resolution_event_id: old_event,
         };
         let next = continue_with(&source, auth.clone()).unwrap();
         assert_eq!(next.grant, source.grant);
         assert_eq!(next.model_calls, source.model_calls);
-        assert_eq!(next.continuation.as_ref().unwrap().authorizations[0].source, auth.source);
+        assert_eq!(
+            next.continuation.as_ref().unwrap().authorizations[0].source,
+            auth.source
+        );
         auth.source = AdaptiveContinuationSourceV1::BlockedResolved {
-            reason_code: "different_reason".into(), resolution_event_id: Uuid::from_u128(901).to_string(),
+            reason_code: "different_reason".into(),
+            resolution_event_id: Uuid::from_u128(901).to_string(),
         };
         assert!(continue_with(&source, auth).is_err());
     }
@@ -948,7 +1205,8 @@ pub(crate) mod continuation_tests {
     fn old_observation_cannot_lift_fence_and_window_budget_is_cumulative() {
         let mut source = unknown();
         source.last_observation = Some(AdaptiveObservationRefV1 {
-            effect: effect(99), observation_digest: "c".repeat(64),
+            effect: effect(99),
+            observation_digest: "c".repeat(64),
         });
         source.tool_calls = 4;
         let mut auth = authorization(&source);
@@ -956,19 +1214,39 @@ pub(crate) mod continuation_tests {
         let next = continue_with(&source, auth.clone()).unwrap();
         assert_eq!(next.tool_calls, 4);
         assert!(next.requires_fresh_observation());
-        let pending = next.transition(&AdaptiveTransitionV1::ClaimModel {
-            effect: effect(104), previous_observation_digest: Some("c".repeat(64)),
-        }, auth.issued_at_ms).unwrap();
-        let blocked = pending.transition(&AdaptiveTransitionV1::ResolveModel {
-            effect: effect(104), result_digest: "b".repeat(64),
-            decision: AdaptiveModelDecisionV1::Blocked { reason_code: "needs_review".into() },
-        }, auth.issued_at_ms).unwrap();
+        let pending = next
+            .transition(
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect(104),
+                    previous_observation_digest: Some("c".repeat(64)),
+                },
+                auth.issued_at_ms,
+            )
+            .unwrap();
+        let blocked = pending
+            .transition(
+                &AdaptiveTransitionV1::ResolveModel {
+                    effect: effect(104),
+                    result_digest: "b".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Blocked {
+                        reason_code: "needs_review".into(),
+                    },
+                },
+                auth.issued_at_ms,
+            )
+            .unwrap();
         assert!(blocked.requires_fresh_observation());
         let mut at_ceiling = blocked.clone();
         at_ceiling.cursor = AdaptiveCursorV1::ReadyForModel;
-        assert!(at_ceiling.transition(&AdaptiveTransitionV1::ClaimModel {
-            effect: effect(105), previous_observation_digest: Some("c".repeat(64)),
-        }, auth.issued_at_ms).is_err());
+        assert!(at_ceiling
+            .transition(
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect(105),
+                    previous_observation_digest: Some("c".repeat(64)),
+                },
+                auth.issued_at_ms
+            )
+            .is_err());
         assert_eq!(blocked.model_calls, 2);
         assert_eq!(blocked.active_model_ceiling(), 2);
         assert_eq!(blocked.grant.max_model_calls, 16);
@@ -981,13 +1259,17 @@ pub(crate) mod continuation_tests {
             let old_event = Uuid::from_u128(900).to_string();
             source.cursor = if resolved {
                 AdaptiveCursorV1::BlockedResolved {
-                    reason_code: "needs_review".into(), resolution_event_id: old_event.clone(),
+                    reason_code: "needs_review".into(),
+                    resolution_event_id: old_event.clone(),
                 }
             } else {
-                AdaptiveCursorV1::Blocked { reason_code: "needs_review".into() }
+                AdaptiveCursorV1::Blocked {
+                    reason_code: "needs_review".into(),
+                }
             };
             source.last_observation = Some(AdaptiveObservationRefV1 {
-                effect: effect(99), observation_digest: "c".repeat(64),
+                effect: effect(99),
+                observation_digest: "c".repeat(64),
             });
             source.tool_calls = 4;
             assert!(!source.requires_fresh_observation());
@@ -995,48 +1277,113 @@ pub(crate) mod continuation_tests {
             auth.abandoned_model_effect = None;
             auth.source = if resolved {
                 AdaptiveContinuationSourceV1::BlockedResolved {
-                    reason_code: "needs_review".into(), resolution_event_id: old_event,
+                    reason_code: "needs_review".into(),
+                    resolution_event_id: old_event,
                 }
             } else {
-                AdaptiveContinuationSourceV1::Blocked { reason_code: "needs_review".into() }
+                AdaptiveContinuationSourceV1::Blocked {
+                    reason_code: "needs_review".into(),
+                }
             };
             let ready = continue_with(&source, auth.clone()).unwrap();
             assert!(ready.requires_fresh_observation());
             assert_eq!(ready.grant, source.grant);
-            assert_eq!((ready.model_calls, ready.tool_calls), (source.model_calls, source.tool_calls));
+            assert_eq!(
+                (ready.model_calls, ready.tool_calls),
+                (source.model_calls, source.tool_calls)
+            );
             assert_eq!(ready.effect_ids, source.effect_ids);
             assert_eq!(ready.last_observation, source.last_observation);
-            assert_eq!(ready.continuation.as_ref().unwrap().authorizations, vec![auth.clone()]);
-            let pending = ready.transition(&AdaptiveTransitionV1::ClaimModel {
-                effect: effect(104), previous_observation_digest: Some("c".repeat(64)),
-            }, auth.issued_at_ms).unwrap();
+            assert_eq!(
+                ready.continuation.as_ref().unwrap().authorizations,
+                vec![auth.clone()]
+            );
+            let pending = ready
+                .transition(
+                    &AdaptiveTransitionV1::ClaimModel {
+                        effect: effect(104),
+                        previous_observation_digest: Some("c".repeat(64)),
+                    },
+                    auth.issued_at_ms,
+                )
+                .unwrap();
             for tool in [
-                WorkbenchTool::WriteFile { path: "src/main.rs".into(), content: "new".into(), expected_sha256: None },
-                WorkbenchTool::RunCommand { program: "node".into(), args: vec!["--version".into()] },
+                WorkbenchTool::WriteFile {
+                    path: "src/main.rs".into(),
+                    content: "new".into(),
+                    expected_sha256: None,
+                },
+                WorkbenchTool::RunCommand {
+                    program: "node".into(),
+                    args: vec!["--version".into()],
+                },
             ] {
-                assert!(pending.transition(&AdaptiveTransitionV1::ResolveModel {
-                    effect: effect(104), result_digest: "b".repeat(64),
-                    decision: AdaptiveModelDecisionV1::Tool { tool_digest: adaptive_tool_digest(&tool).unwrap(), tool },
-                }, auth.issued_at_ms).is_err());
+                assert!(pending
+                    .transition(
+                        &AdaptiveTransitionV1::ResolveModel {
+                            effect: effect(104),
+                            result_digest: "b".repeat(64),
+                            decision: AdaptiveModelDecisionV1::Tool {
+                                tool_digest: adaptive_tool_digest(&tool).unwrap(),
+                                tool
+                            },
+                        },
+                        auth.issued_at_ms
+                    )
+                    .is_err());
             }
-            assert!(pending.transition(&AdaptiveTransitionV1::ResolveModel {
-                effect: effect(104), result_digest: "b".repeat(64),
-                decision: AdaptiveModelDecisionV1::ProposeCompletion { artifact_digest: "a".repeat(64) },
-            }, auth.issued_at_ms).is_err());
-            let inspect = WorkbenchTool::InspectFile { path: "src/main.rs".into(), max_bytes: 1024 };
+            assert!(pending
+                .transition(
+                    &AdaptiveTransitionV1::ResolveModel {
+                        effect: effect(104),
+                        result_digest: "b".repeat(64),
+                        decision: AdaptiveModelDecisionV1::ProposeCompletion {
+                            artifact_digest: "a".repeat(64)
+                        },
+                    },
+                    auth.issued_at_ms
+                )
+                .is_err());
+            let inspect = WorkbenchTool::InspectFile {
+                path: "src/main.rs".into(),
+                max_bytes: 1024,
+            };
             let tool_digest = adaptive_tool_digest(&inspect).unwrap();
-            let tool_ready = pending.transition(&AdaptiveTransitionV1::ResolveModel {
-                effect: effect(104), result_digest: "b".repeat(64),
-                decision: AdaptiveModelDecisionV1::Tool { tool: inspect, tool_digest: tool_digest.clone() },
-            }, auth.issued_at_ms).unwrap();
+            let tool_ready = pending
+                .transition(
+                    &AdaptiveTransitionV1::ResolveModel {
+                        effect: effect(104),
+                        result_digest: "b".repeat(64),
+                        decision: AdaptiveModelDecisionV1::Tool {
+                            tool: inspect,
+                            tool_digest: tool_digest.clone(),
+                        },
+                    },
+                    auth.issued_at_ms,
+                )
+                .unwrap();
             assert!(tool_ready.requires_fresh_observation());
-            let tool_pending = tool_ready.transition(&AdaptiveTransitionV1::ClaimTool {
-                effect: effect(105), tool_digest,
-            }, auth.issued_at_ms).unwrap();
+            let tool_pending = tool_ready
+                .transition(
+                    &AdaptiveTransitionV1::ClaimTool {
+                        effect: effect(105),
+                        tool_digest,
+                    },
+                    auth.issued_at_ms,
+                )
+                .unwrap();
             assert!(tool_pending.requires_fresh_observation());
-            let observed = tool_pending.transition(&AdaptiveTransitionV1::ObserveTool {
-                observation: AdaptiveObservationRefV1 { effect: effect(105), observation_digest: "d".repeat(64) },
-            }, auth.issued_at_ms).unwrap();
+            let observed = tool_pending
+                .transition(
+                    &AdaptiveTransitionV1::ObserveTool {
+                        observation: AdaptiveObservationRefV1 {
+                            effect: effect(105),
+                            observation_digest: "d".repeat(64),
+                        },
+                    },
+                    auth.issued_at_ms,
+                )
+                .unwrap();
             assert!(!observed.requires_fresh_observation());
             assert_eq!(observed.grant, source.grant);
             assert_eq!((observed.model_calls, observed.tool_calls), (2, 5));
