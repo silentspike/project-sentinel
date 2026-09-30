@@ -1834,7 +1834,10 @@ fn replay_is_exact_but_revocation_limits_and_unknown_effects_fail_closed() {
         reopened.adaptive_session(grant.session_id, &auth).unwrap(),
         Some(unknown.clone())
     );
-    assert_eq!(reopened.adaptive_recovery_feedback(&auth).unwrap(), feedback);
+    assert_eq!(
+        reopened.adaptive_recovery_feedback(&auth).unwrap(),
+        feedback
+    );
     assert_eq!(persisted_adaptive_rows(&database), before);
 
     // Known completion exercises its own pending head, never the sealed unknown head.
@@ -1933,7 +1936,10 @@ fn replay_is_exact_but_revocation_limits_and_unknown_effects_fail_closed() {
         reopened.adaptive_session(grant.session_id, &auth).unwrap(),
         Some(unknown)
     );
-    assert_eq!(reopened.adaptive_recovery_feedback(&auth).unwrap(), feedback);
+    assert_eq!(
+        reopened.adaptive_recovery_feedback(&auth).unwrap(),
+        feedback
+    );
 }
 
 #[test]
