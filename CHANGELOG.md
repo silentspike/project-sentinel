@@ -1,5 +1,11 @@
 # Changelog
 
+- Retire expired schema-2 leadership decision authority only against its exact
+  sealed unknown provider reservation, preserving the original dispatch and
+  accounting. Allow a distinct bounded review of the same employee session;
+  ready completions, pending recovery, stale evidence and exhausted session-wide
+  review budgets remain non-serving, without replaying unknown effects (#856).
+
 - Cache observed Codex usage-limit failures for a bounded local cooldown and
   reject known provider unavailability before queue admission and subscription
   dispatch. Preserve provider status through queue wrappers and keep the first
