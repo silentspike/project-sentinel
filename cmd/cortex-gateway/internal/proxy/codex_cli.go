@@ -32,6 +32,8 @@ const (
 	codexCLIMaxPromptBytes    = 4 * 1024 * 1024
 	codexCLIMaxDiagnosticSize = 8 * 1024
 	maxConcurrentCodexCLI     = 1
+	// Local retry policy, matching the subscription fallback; not a provider reset time.
+	codexCLIUsageLimitCooldown = 15 * time.Minute
 
 	codexCLIDisabledCodeModePrelude = "Code Mode is unavailable because code-mode host is disabled. " +
 		"Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`."
@@ -127,7 +129,13 @@ type CodexCLIProvider struct {
 	home      string
 	logger    *slog.Logger
 	sem       chan struct{}
+	now       func() time.Time
+
+	cooldownMu    sync.Mutex
+	cooldownUntil time.Time
 }
+
+var _ ProviderStatusReporter = (*CodexCLIProvider)(nil)
 
 func NewCodexCLIProvider(cfg ProviderConfig, logger *slog.Logger) *CodexCLIProvider {
 	binary := strings.TrimSpace(cfg.BaseURL)
@@ -162,12 +170,59 @@ func NewCodexCLIProvider(cfg ProviderConfig, logger *slog.Logger) *CodexCLIProvi
 		home:      home,
 		logger:    logger,
 		sem:       make(chan struct{}, maxConcurrentCodexCLI),
+		now:       time.Now,
 	}
 }
 
 func (p *CodexCLIProvider) Name() string { return p.name }
 
-func (p *CodexCLIProvider) Send(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+// CurrentProviderError reads only cached status; expiry permits a new attempt,
+// but is not evidence of provider recovery or refundable prior dispatches.
+func (p *CodexCLIProvider) CurrentProviderError() error {
+	p.cooldownMu.Lock()
+	defer p.cooldownMu.Unlock()
+	if p.cooldownUntil.IsZero() {
+		return nil
+	}
+	if !p.now().Before(p.cooldownUntil) {
+		p.cooldownUntil = time.Time{}
+		return nil
+	}
+	return &ProviderError{StatusCode: http.StatusTooManyRequests, Message: "codex-cli usage limit active"}
+}
+
+func (p *CodexCLIProvider) rememberUsageLimit(err error) {
+	var providerErr *ProviderError
+	if !errors.As(err, &providerErr) || providerErr.StatusCode != http.StatusTooManyRequests {
+		return
+	}
+	p.cooldownMu.Lock()
+	defer p.cooldownMu.Unlock()
+	until := p.now().Add(codexCLIUsageLimitCooldown)
+	if until.After(p.cooldownUntil) {
+		p.cooldownUntil = until
+	}
+}
+
+func (p *CodexCLIProvider) reserveInferenceSlot(ctx context.Context) error {
+	if err := p.CurrentProviderError(); err != nil {
+		return err
+	}
+	select {
+	case p.sem <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("codex-cli semaphore wait: %w", ctx.Err())
+	}
+	// A preceding in-flight attempt may have established quota while we waited.
+	// This remains a raw provider error: callers may already have dispatched.
+	if err := p.CurrentProviderError(); err != nil {
+		<-p.sem
+		return err
+	}
+	return nil
+}
+
+func (p *CodexCLIProvider) Send(ctx context.Context, req *LLMRequest) (response *LLMResponse, sendErr error) {
 	if req == nil {
 		return nil, fmt.Errorf("codex-cli request is nil")
 	}
@@ -176,13 +231,10 @@ func (p *CodexCLIProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespo
 		ctx, cancel = context.WithTimeout(ctx, req.ProviderTimeout)
 		defer cancel()
 	}
-
-	select {
-	case p.sem <- struct{}{}:
-		defer func() { <-p.sem }()
-	case <-ctx.Done():
-		return nil, fmt.Errorf("codex-cli semaphore wait: %w", ctx.Err())
+	if err := p.reserveInferenceSlot(ctx); err != nil {
+		return nil, err
 	}
+	defer func() { <-p.sem }()
 
 	if err := validateCodexCLIWorkdir(p.workdir); err != nil {
 		return nil, err
@@ -216,6 +268,9 @@ func (p *CodexCLIProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespo
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("codex-cli start: %w", err)
 	}
+	// Cache only the final classified failure after actual subprocess dispatch,
+	// without replacing that error or asserting that the attempt was nonbillable.
+	defer func() { p.rememberUsageLimit(sendErr) }()
 
 	response, parseErr := p.parseOutputStream(stdout, codexCLIResponseByteLimit(req))
 	if parseErr != nil {
