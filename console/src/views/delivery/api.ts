@@ -4,8 +4,22 @@ const MAX_LINEAGE_BYTES = 256 * 1024;
 export const DELIVERY_LINEAGE_DEADLINE_MS = 5_000;
 const JSON_CONTENT_TYPE = /^application\/json(?:\s*;[^\r\n]*)?$/i;
 
+export interface DeliveryScope {
+  tenantId: string;
+  projectId: string;
+}
+
+export function initialDeliveryScope(): DeliveryScope {
+  const search = new URLSearchParams(globalThis.location?.search ?? "");
+  return { tenantId: search.get("tenant_id") ?? "", projectId: search.get("project_id") ?? "" };
+}
+
+export function validDeliveryScope(scope: DeliveryScope): boolean {
+  return safeScope(scope.tenantId) && safeScope(scope.projectId);
+}
+
 export class DeliveryLineageUnavailable extends Error {
-  constructor() {
+  constructor(readonly kind: "unavailable" | "inaccessible" | "access" = "unavailable") {
     super("Delivery lineage is unavailable");
     this.name = "DeliveryLineageUnavailable";
   }
@@ -13,13 +27,12 @@ export class DeliveryLineageUnavailable extends Error {
 
 export async function fetchPublicDeliveryLineage(
   signal?: AbortSignal,
+  scope: DeliveryScope = initialDeliveryScope(),
 ): Promise<PublicDeliveryLineageDto> {
-  const search = new URLSearchParams(globalThis.location?.search ?? "");
-  const tenantId = search.get("tenant_id");
-  const projectId = search.get("project_id");
-  if (!safeScope(tenantId) || !safeScope(projectId)) {
+  if (!validDeliveryScope(scope) || signal?.aborted) {
     throw new DeliveryLineageUnavailable();
   }
+  const { tenantId, projectId } = scope;
   const endpoint = `/api/v1/delivery/lineage?tenant_id=${encodeURIComponent(tenantId)}&project_id=${encodeURIComponent(projectId)}`;
   const requestAbort = new AbortController();
   const abortFromCaller = () => requestAbort.abort(signal?.reason);
@@ -37,8 +50,13 @@ export async function fetchPublicDeliveryLineage(
       headers: { accept: "application/json" },
       signal: requestAbort.signal,
     });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new DeliveryLineageUnavailable(response.status === 404 ? "inaccessible"
+        : response.status === 401 || response.status === 403 ? "access" : "unavailable");
+    }
     const contentType = response.headers.get("content-type") ?? "";
-    if (!response.ok || !JSON_CONTENT_TYPE.test(contentType)) {
+    if (!JSON_CONTENT_TYPE.test(contentType)) {
       await response.body?.cancel();
       throw new DeliveryLineageUnavailable();
     }
@@ -53,7 +71,8 @@ export async function fetchPublicDeliveryLineage(
     const bytes = await readBoundedBody(response, requestAbort.signal);
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     return parsePublicDeliveryLineageDto(JSON.parse(text));
-  } catch {
+  } catch (error) {
+    if (error instanceof DeliveryLineageUnavailable) throw error;
     throw new DeliveryLineageUnavailable();
   } finally {
     clearTimeout(deadline);

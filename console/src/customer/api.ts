@@ -52,7 +52,17 @@ export function customerPreviewAvailable(delivery: CustomerDelivery, now: number
   return delivery.release_state === "active" && ["delivered", "accepted"].includes(delivery.state)
     && now >= window.issued_at_ms && now < window.expires_at_ms;
 }
-export interface ProjectProgress { project_id: string; request_id: string; state: string; version: number; work_items: { work_item_id: string; state: string }[]; deliveries?: CustomerDelivery[] }
+export type CustomerAdaptiveProgress =
+  | { status: "paused_internal_observation"; label: "Paused: awaiting internal observation." }
+  | { status: "model_outcome_unknown"; label: "Model outcome unknown." };
+export interface CustomerWorkProgress { work_item_id: string; state: string; adaptive_progress?: CustomerAdaptiveProgress }
+export interface ProjectProgress { project_id: string; request_id: string; state: string; version: number; work_items: CustomerWorkProgress[]; deliveries?: CustomerDelivery[] }
+
+export function customerAdaptiveProgressLabel(value: CustomerAdaptiveProgress | undefined): string | undefined {
+  if (value?.status === "paused_internal_observation" && value.label === "Paused: awaiting internal observation.") return value.label;
+  if (value?.status === "model_outcome_unknown" && value.label === "Model outcome unknown.") return value.label;
+  return undefined;
+}
 export interface Overview { requests: CustomerRequest[]; proposals: Proposal[]; projects?: ProjectProgress[] }
 export interface PendingCommand { operation_id: string; command: Record<string, unknown>; dispatched?: boolean }
 

@@ -72,6 +72,38 @@ function setDeliveryScope(): void {
 }
 
 describe("delivery lineage model", () => {
+  it("does not fetch missing, invalid, oversized or already cancelled scopes", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    for (const tenantId of ["", "a/b", "a".repeat(129)]) {
+      await expect(fetchPublicDeliveryLineage(undefined, { tenantId, projectId: "project-42" })).rejects.toThrow();
+    }
+    const cancelled = new AbortController();
+    cancelled.abort();
+    await expect(fetchPublicDeliveryLineage(cancelled.signal, { tenantId: "tenant", projectId: "project" })).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("uses explicit scope instead of URL scope with encoded query parameters", async () => {
+    setDeliveryScope();
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(snapshot()), {
+      headers: { "content-type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    await fetchPublicDeliveryLineage(undefined, { tenantId: "tenant.test_1", projectId: "project-2" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/v1/delivery/lineage?tenant_id=${encodeURIComponent("tenant.test_1")}&project_id=${encodeURIComponent("project-2")}`,
+      expect.objectContaining({ method: "GET", credentials: "include" }),
+    );
+  });
+
+  it.each([[404, "inaccessible"], [401, "access"], [403, "access"], [503, "unavailable"]])(
+    "classifies HTTP %s without exposing the response body", async (status, kind) => {
+      setDeliveryScope();
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("private upstream details", { status: Number(status) })));
+      await expect(fetchPublicDeliveryLineage()).rejects.toMatchObject({ kind, message: "Delivery lineage is unavailable" });
+    },
+  );
   it("validates the server-redacted digest-bound DTO", () => {
     const value = snapshot();
     expect(validateLineage(value)).toEqual([]);
@@ -291,14 +323,105 @@ describe("delivery lineage model", () => {
 });
 
 describe("DeliveryView", () => {
-  it("fails closed while the productive adapter is not connected", async () => {
+  it("distinguishes an injected loader read error from adapter readiness", async () => {
     const { getByTestId } = render(() =>
       DeliveryView({ load: async () => Promise.reject(new Error("unavailable")) }),
     );
     await waitFor(() =>
-      expect(getByTestId("delivery-adapter-state").textContent).toContain("Integration gated"),
+      expect(getByTestId("delivery-adapter-state").textContent).toContain("Read error"),
     );
-    expect(getByTestId("delivery-unavailable")).toBeTruthy();
+    expect(getByTestId("delivery-read-error")).toBeTruthy();
+  });
+
+  it.each(["/", "/?tenant_id=tenant&project_id=bad%2Fscope"])("requires valid explicit scope without GET at %s", async (url) => {
+    window.history.replaceState({}, "", url);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const view = render(() => DeliveryView({}));
+    expect(view.getByTestId("delivery-select-project").textContent).toBe(url === "/" ? "Select project" : "Invalid scope");
+    fireEvent.submit(view.getByRole("button", { name: "Load" }).closest("form")!);
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(view.queryByTestId("delivery-unavailable")).toBeNull();
+  });
+
+  it("loads only on explicit submission and supports initial URL scope", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify(snapshot()), {
+      headers: { "content-type": "application/json" },
+    })));
+    vi.stubGlobal("fetch", fetchMock);
+    const view = render(() => DeliveryView({}));
+    fireEvent.input(view.getByLabelText("Tenant"), { target: { value: "tenant.test" } });
+    fireEvent.input(view.getByLabelText("Project"), { target: { value: "project-42" } });
+    expect(view.getByTestId("delivery-adapter-state").textContent).toBe("Ready to load");
+    expect(view.getByRole("button", { name: "Load" }).hasAttribute("disabled")).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+    fireEvent.click(view.getByRole("button", { name: "Load" }));
+    await waitFor(() => expect(view.getByTestId("delivery-project")).toBeTruthy());
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/delivery/lineage?tenant_id=tenant.test&project_id=project-42", expect.anything());
+    view.unmount();
+    setDeliveryScope();
+    const initial = render(() => DeliveryView({}));
+    await waitFor(() => expect(initial.getByTestId("delivery-project")).toBeTruthy());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts superseded loads and ignores late results even if the loader ignores abort", async () => {
+    setDeliveryScope();
+    let first!: (value: PublicDeliveryLineageDto) => void;
+    let second!: (value: PublicDeliveryLineageDto) => void;
+    const signals: AbortSignal[] = [];
+    const load = vi.fn((signal: AbortSignal) => {
+      signals.push(signal);
+      return new Promise<PublicDeliveryLineageDto>((resolve) => {
+        if (signals.length === 1) first = resolve; else second = resolve;
+      });
+    });
+    const view = render(() => DeliveryView({ load }));
+    expect(view.getByTestId("delivery-loading")).toBeTruthy();
+    fireEvent.input(view.getByLabelText("Project"), { target: { value: "project-new" } });
+    expect(signals[0].aborted).toBe(true);
+    fireEvent.click(view.getByRole("button", { name: "Load" }));
+    second({ ...snapshot(), projectLabel: "project-new" });
+    await waitFor(() => expect(view.getByTestId("delivery-project").textContent).toBe("project-new"));
+    first(snapshot());
+    await Promise.resolve();
+    expect(view.getByTestId("delivery-project").textContent).toBe("project-new");
+    view.unmount();
+    expect(signals[1].aborted).toBe(true);
+  });
+
+  it("aborts pending requests on cleanup", () => {
+    let signal!: AbortSignal;
+    const view = render(() => DeliveryView({ load: (value) => {
+      signal = value;
+      return new Promise(() => undefined);
+    } }));
+    view.unmount();
+    expect(signal.aborted).toBe(true);
+  });
+
+  it.each([[404, "No accessible delivery lineage"], [401, "Access unavailable"], [403, "Access unavailable"], [503, "Read error"]])(
+    "shows fixed HTTP %s state and permits retry", async (status, label) => {
+      setDeliveryScope();
+      const fetchMock = vi.fn().mockResolvedValueOnce(new Response("secret upstream", { status: Number(status) }))
+        .mockResolvedValueOnce(new Response(JSON.stringify(snapshot()), { headers: { "content-type": "application/json" } }));
+      vi.stubGlobal("fetch", fetchMock);
+      const view = render(() => DeliveryView({}));
+      await waitFor(() => expect(view.getByTestId("delivery-read-error").textContent).toBe(label));
+      expect(view.container.textContent).not.toContain("secret upstream");
+      fireEvent.click(view.getByRole("button", { name: "Load" }));
+      await waitFor(() => expect(view.getByTestId("delivery-project")).toBeTruthy());
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("rejects empty lineage without treating it as an unavailable adapter", () => {
+    const view = render(() => DeliveryView({ snapshot: { ...snapshot(), nodes: [], edges: [] } }));
+    expect(view.getByTestId("delivery-invalid").textContent).toContain("empty lineage graph");
+    expect(view.queryByTestId("delivery-lineage")).toBeNull();
+    expect(view.getByTestId("delivery-adapter-state").textContent).toBe("Adapter ready");
+    expect(view.queryByTestId("delivery-unavailable")).toBeNull();
   });
 
   it("does not render a supplied snapshot when its adapter is not ready", () => {
@@ -386,14 +509,14 @@ describe("Delivery navigation", () => {
     App = (await import("../src/App")).default;
   });
 
-  it("opens the reachable product surface and fails closed on unavailable API", async () => {
+  it("opens the unscoped product surface with project selection", async () => {
     const { getByTestId } = render(() => App());
 
     await waitFor(() => expect(getByTestId("open-delivery")).toBeTruthy());
     fireEvent.click(getByTestId("open-delivery"));
     expect(getByTestId("delivery-product-surface")).toBeTruthy();
     await waitFor(() =>
-      expect(getByTestId("delivery-adapter-state").textContent).toContain("Integration gated"),
+      expect(getByTestId("delivery-adapter-state").textContent).toContain("Select project"),
     );
   });
 });
