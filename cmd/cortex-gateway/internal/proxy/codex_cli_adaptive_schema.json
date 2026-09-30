@@ -13,6 +13,17 @@
                 {
                   "type": "object",
                   "properties": {
+                    "tool": { "type": "string", "enum": ["list_directory"] },
+                    "path": { "type": "string" },
+                    "after": { "type": ["string", "null"] },
+                    "max_entries": { "type": "integer", "minimum": 1, "maximum": 128 }
+                  },
+                  "required": ["tool", "path", "after", "max_entries"],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
                     "tool": { "type": "string", "enum": ["inspect_file"] },
                     "path": { "type": "string" },
                     "max_bytes": { "type": "integer" }
