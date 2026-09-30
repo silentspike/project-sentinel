@@ -6505,11 +6505,19 @@ mod tests {
         allowance.grant.expires_at_unix_ms = 600_004;
         let current_before = current.clone();
         assert!(select_provider_usage_binding(
-            std::slice::from_ref(&current), AgentId(6), Some("original-allowance")
-        ).unwrap().is_none());
+            std::slice::from_ref(&current),
+            AgentId(6),
+            Some("original-allowance")
+        )
+        .unwrap()
+        .is_none());
         let original = select_provider_usage_binding(
-            std::slice::from_ref(&historical), AgentId(6), Some("original-allowance")
-        ).unwrap().unwrap();
+            std::slice::from_ref(&historical),
+            AgentId(6),
+            Some("original-allowance"),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(original.reservation_id, "original-allowance");
         assert_eq!(original.assignment_id, assignment.assignment_id);
         assert_eq!(current, current_before);

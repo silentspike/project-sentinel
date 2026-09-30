@@ -76,8 +76,7 @@ impl WorkflowStore {
                 .optional()?
                 .ok_or_else(corrupt)?;
             byte_budget.charge(payload_bytes)?;
-            let row = read_company_event_row(&transaction, sequence)?
-                .ok_or_else(corrupt)?;
+            let row = read_company_event_row(&transaction, sequence)?.ok_or_else(corrupt)?;
             let (_, project) = validate_project_snapshot_event_with_byte_budget(
                 &transaction,
                 &row,
@@ -149,14 +148,19 @@ fn historical_project_matches(
     };
     Ok(matches!(
         work.state,
-        CompanyWorkStateV1::Assigned | CompanyWorkStateV1::InProgress | CompanyWorkStateV1::InReview
+        CompanyWorkStateV1::Assigned
+            | CompanyWorkStateV1::InProgress
+            | CompanyWorkStateV1::InReview
     ) && work.spec.work_item_id == authority.work_item_id
         && work.spec.owner == authority.agent_id
         && assignment.assignment_id == grant.assignment_id
         && assignment.agent_id == authority.agent_id
         && assignment.role == work.spec.required_role
         && assignment.assignment_version == authority.assignment_version
-        && constant_time_eq(&assignment.canonical_digest()?, &authority.assignment_digest)
+        && constant_time_eq(
+            &assignment.canonical_digest()?,
+            &authority.assignment_digest,
+        )
         && assignment.profile.profile_id == authority.profile_id
         && assignment.profile.generation == authority.profile_generation
         && constant_time_eq(&assignment.profile.digest, &authority.profile_digest)
@@ -499,11 +503,12 @@ mod tests {
             Some(f.project)
         );
         let mut root = f.root;
-        root.provider_authority_digest = adaptive_leadership_continuation_provider_authority_digest(
-            dispatched.subscription_call.as_ref().unwrap(),
-            &root.authority,
-        )
-        .unwrap();
+        root.provider_authority_digest =
+            adaptive_leadership_continuation_provider_authority_digest(
+                dispatched.subscription_call.as_ref().unwrap(),
+                &root.authority,
+            )
+            .unwrap();
         assert_eq!(
             f.store
                 .historical_adaptive_provider_project(&root, CLAIMED_AT)
@@ -570,7 +575,9 @@ mod tests {
         let mut root = f.root.clone();
         root.created_at_ms = 5;
         assert_eq!(
-            f.store.historical_adaptive_provider_project(&root, 5).unwrap(),
+            f.store
+                .historical_adaptive_provider_project(&root, 5)
+                .unwrap(),
             None
         );
         for claimed_at in [0, f.root.created_at_ms - 1, f.root.deadline_ms] {
