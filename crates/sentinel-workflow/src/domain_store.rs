@@ -11,6 +11,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 mod adaptive_leadership_review;
+mod historical_allowance;
 mod project_planning;
 mod request_provider;
 mod source_review_rework;
@@ -327,6 +328,14 @@ fn validate_project_snapshot_event(
     connection: &Connection,
     row: &CompanyEventRow,
 ) -> Result<(u64, ProjectV1), WorkflowError> {
+    validate_project_snapshot_event_with_byte_budget(connection, row, None)
+}
+
+fn validate_project_snapshot_event_with_byte_budget(
+    connection: &Connection,
+    row: &CompanyEventRow,
+    byte_budget: Option<&mut historical_allowance::SnapshotByteBudget>,
+) -> Result<(u64, ProjectV1), WorkflowError> {
     let sequence = stored_u64(row.sequence)?;
     let created_at_ms = stored_u64(row.created_at_ms)?;
     let operation_id = Uuid::parse_str(&row.operation_id).map_err(|_| corrupt())?;
@@ -387,6 +396,18 @@ fn validate_project_snapshot_event(
     }
     validate_project(&project)?;
     subscription::validate_persisted(connection, &project)?;
+    if let Some(budget) = byte_budget {
+        let response_bytes = connection
+            .query_row(
+                "SELECT CASE WHEN typeof(response)='blob' THEN length(response) ELSE -1 END FROM company_operations WHERE authority_namespace=?1 AND operation_id=?2",
+                params![principal.namespace(), row.operation_id],
+                |operation| operation.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(WorkflowError::from)?
+            .ok_or_else(corrupt)?;
+        budget.charge(response_bytes)?;
+    }
     let operation = connection
         .query_row(
             "SELECT request_digest,authority_binding_digest,target_predecessor_digest,response,response_digest,created_at_ms FROM company_operations WHERE authority_namespace=?1 AND operation_id=?2",

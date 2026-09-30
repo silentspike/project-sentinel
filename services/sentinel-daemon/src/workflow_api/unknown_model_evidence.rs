@@ -17,12 +17,46 @@ impl WorkflowApi {
             .version
             .checked_sub(2)
             .ok_or("unknown model version invalid")?;
-        let binding = select_provider_usage_binding(
+        let current_binding = select_provider_usage_binding(
             std::slice::from_ref(project),
             session.grant.authority.agent_id,
             Some(session.active_provider_allowance_id()),
-        )?
-        .ok_or("unknown model original allowance unavailable")?;
+        )?;
+        // A later grant does not replace the original request's usage identity.
+        // Resolve only a verified historical project; never reset the live grant.
+        let retained_journal = if current_binding.is_none() {
+            self.store
+                .first_unknown_model_journal_evidence(
+                    session.grant.session_id,
+                    &session.grant.authority,
+                )
+                .map_err(|_| "historical model journal invalid")?
+        } else {
+            None
+        };
+        let mut historical_project = match retained_journal.as_ref() {
+            Some(journal) => self
+                .store
+                .historical_adaptive_provider_project(
+                    &journal.root_grant,
+                    journal.claim.recorded_at_ms,
+                )
+                .map_err(|_| "historical allowance provenance invalid")?,
+            None => None,
+        };
+        let binding = match current_binding {
+            Some(binding) => binding,
+            None => select_provider_usage_binding(
+                std::slice::from_ref(
+                    historical_project
+                        .as_ref()
+                        .ok_or("unknown model original allowance unavailable")?,
+                ),
+                session.grant.authority.agent_id,
+                Some(session.grant.provider_allowance_id.as_str()),
+            )?
+            .ok_or("unknown model original allowance unavailable")?,
+        };
         let authority = ProviderExecutionAuthority::Adaptive(Box::new(AdaptiveProviderAuthority {
             schema_version: 3,
             grant: session.effective_grant(),
@@ -46,13 +80,16 @@ impl WorkflowApi {
                 .map_err(|_| "unknown model evidence encoding failed")?;
             return Ok(Some(sentinel_common::sha256_hex(&bytes)));
         }
-        let Some(journal) = self
-            .store
-            .first_unknown_model_journal_evidence(
-                session.grant.session_id,
-                &session.grant.authority,
-            )
-            .map_err(|_| "historical model journal invalid")?
+        let Some(journal) = (match retained_journal {
+            Some(journal) => Some(journal),
+            None => self
+                .store
+                .first_unknown_model_journal_evidence(
+                    session.grant.session_id,
+                    &session.grant.authority,
+                )
+                .map_err(|_| "historical model journal invalid")?,
+        })
         else {
             return Ok(None);
         };
@@ -72,7 +109,18 @@ impl WorkflowApi {
         else {
             return Ok(None);
         };
-        let allowance = project
+        if historical_project.is_none() {
+            historical_project = self
+                .store
+                .historical_adaptive_provider_project(
+                    &journal.root_grant,
+                    journal.claim.recorded_at_ms,
+                )
+                .map_err(|_| "historical allowance provenance invalid")?;
+        }
+        let allowance = historical_project
+            .as_ref()
+            .ok_or("historical allowance missing")?
             .subscription_call
             .as_ref()
             .ok_or("historical allowance missing")?;
@@ -86,6 +134,24 @@ impl WorkflowApi {
         {
             return Err("historical allowance binding changed");
         }
+        let binding = select_provider_usage_binding(
+            std::slice::from_ref(
+                historical_project
+                    .as_ref()
+                    .ok_or("historical allowance missing")?,
+            ),
+            journal.root_grant.authority.agent_id,
+            Some(journal.root_grant.provider_allowance_id.as_str()),
+        )?
+        .ok_or("historical usage binding missing")?;
+        let authority = ProviderExecutionAuthority::Adaptive(Box::new(AdaptiveProviderAuthority {
+            schema_version: 3,
+            grant: session.effective_grant(),
+            session_version,
+            effect_id: effect.id,
+            assignment_id: binding.assignment_id.clone(),
+            previous_observation: session.last_observation.clone(),
+        }));
         let record = |entry: &sentinel_workflow::AdaptiveModelJournalRecordEvidenceV1| {
             sentinel_limbo::LlmHistoricalModelJournalReceiptV1 {
                 session_id: session.grant.session_id,
