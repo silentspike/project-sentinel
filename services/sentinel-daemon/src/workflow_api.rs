@@ -3,6 +3,7 @@
 #[cfg(feature = "llm")]
 mod adaptive_continuation;
 #[cfg(all(test, feature = "llm"))]
+#[path = "workflow_api/tests/adaptive_continuation.rs"]
 mod adaptive_continuation_tests;
 #[cfg(feature = "llm")]
 pub(crate) mod adaptive_leadership_review;

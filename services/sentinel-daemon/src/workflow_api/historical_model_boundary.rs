@@ -303,7 +303,7 @@ pub(super) fn verified_historical_boundary(
         || identity(
             &file
                 .metadata()
-                .map_err(|_| "historical boundary restat failed")?,
+                .map_err(|_| "historical boundary metadata read failed")?,
         ) != identity(&inspected)
         || identity(&fs::symlink_metadata(path).map_err(|_| "historical boundary vanished")?)
             != identity(&inspected)
