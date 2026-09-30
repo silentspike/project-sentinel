@@ -863,7 +863,7 @@ impl WorkflowApi {
             .company_projects()
             .map_err(|_| "adaptive projects unavailable")?
         {
-            for session in self.review_sessions(&project)? {
+            for session in self.review_sessions_for_health(&project)? {
                 match &session.cursor {
                     AdaptiveCursorV1::ModelUnknown { .. } => return Ok(true),
                     AdaptiveCursorV1::ModelPending { effect }
@@ -936,12 +936,11 @@ impl WorkflowApi {
         ) else {
             return Ok(false);
         };
-        let Some(session) = self
-            .core
-            .adaptive_session_for_authority(&current)
-            .map_err(|_| "adaptive recovery session unavailable")?
-        else {
-            return Ok(false);
+        let session = match self.core.adaptive_session_for_authority(&current) {
+            Ok(Some(session)) => session,
+            Ok(None) => return Ok(false),
+            Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => return Ok(false),
+            Err(_) => return Err("adaptive recovery session unavailable"),
         };
         let effect = match &session.cursor {
             AdaptiveCursorV1::ModelPending { effect }
@@ -1102,6 +1101,40 @@ impl WorkflowApi {
         Ok(true)
     }
 
+    pub(super) fn binding_has_continued_adaptive_session(
+        &self,
+        binding: &ProviderUsageBinding,
+    ) -> Result<bool, &'static str> {
+        if binding.subscription_grant.is_none() {
+            return Ok(false);
+        }
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or("adaptive runtime authority unavailable")?;
+        let current = authority
+            .snapshot_for_admission(
+                &TenantId::parse(&binding.tenant_id).map_err(|_| "invalid adaptive tenant")?,
+                &ProjectId::parse(&binding.project_id).map_err(|_| "invalid adaptive project")?,
+                &WorkItemId::parse(&binding.work_item_id)
+                    .map_err(|_| "invalid adaptive work item")?,
+                binding.agent_id,
+                false,
+            )
+            .map_err(|_| "adaptive runtime authority unavailable")?;
+        let session = self
+            .core
+            .adaptive_session_for_authority(&current)
+            .map_err(|_| "adaptive continuation head unavailable")?;
+        if session.as_ref().is_some_and(|session| {
+            session.continuation.is_some()
+                && session.active_provider_allowance_id() != binding.reservation_id
+        }) {
+            return Err("adaptive continuation allowance changed");
+        }
+        Ok(session.is_some_and(|session| session.continuation.is_some()))
+    }
+
     pub(super) fn adaptive_subscription_queue_priority(
         &self,
         binding: &ProviderUsageBinding,
@@ -1127,7 +1160,21 @@ impl WorkflowApi {
         else {
             return Ok(Some(2));
         };
-        if session.grant.provider_allowance_id != binding.reservation_id {
+        if session.continuation.is_some()
+            && session.active_provider_allowance_id() != binding.reservation_id
+        {
+            return Err("adaptive continuation allowance changed");
+        }
+        if binding
+            .subscription_grant
+            .as_ref()
+            .is_some_and(|grant| grant.max_calls == 1)
+            && !(session.continuation.is_some()
+                && session.active_provider_allowance_id() == binding.reservation_id)
+        {
+            return Ok(Some(2));
+        }
+        if session.active_provider_allowance_id() != binding.reservation_id {
             let rejected = matches!(session.version, 3 | 4)
                 && matches!(session.cursor, AdaptiveCursorV1::ModelRejected { .. });
             let corrections_available = if rejected {
@@ -1144,14 +1191,14 @@ impl WorkflowApi {
                 && matches!(session.cursor, AdaptiveCursorV1::ReadyForModel)
                 || rejected && corrections_available
                 || matches!(session.cursor, AdaptiveCursorV1::BlockedResolved { .. }))
-                && session.grant.deadline_ms <= now_unix_ms())
+                && session.active_deadline_ms() <= now_unix_ms())
             .then_some(2));
         }
         // Selection observes persisted state only: no new session, tool I/O or
         // mutation is allowed while considering the employee's other projects.
         match &session.cursor {
             AdaptiveCursorV1::ReadyForModel
-                if session.model_calls >= session.grant.max_model_calls =>
+                if session.model_calls >= session.active_model_ceiling() =>
             {
                 Ok(None)
             }
@@ -1229,7 +1276,7 @@ impl WorkflowApi {
         let Some(subscription) = binding
             .subscription_grant
             .as_ref()
-            .filter(|grant| grant.max_calls > 1)
+            .filter(|grant| grant.max_calls > 0)
         else {
             return Ok(None);
         };
@@ -1258,6 +1305,24 @@ impl WorkflowApi {
         let current = authority
             .snapshot_for_admission(&tenant, &project_id, &work_item_id, agent_id, false)
             .map_err(|_| "adaptive runtime authority unavailable")?;
+        let existing = self
+            .core
+            .adaptive_session_for_authority(&current)
+            .map_err(|_| "adaptive continuation head unavailable")?;
+        if existing.as_ref().is_some_and(|session| {
+            session.continuation.is_some()
+                && session.active_provider_allowance_id() != allowance.allowance_id
+        }) {
+            return Err("adaptive continuation allowance changed");
+        }
+        if subscription.max_calls == 1
+            && !existing.as_ref().is_some_and(|session| {
+                session.continuation.is_some()
+                    && session.active_provider_allowance_id() == allowance.allowance_id
+            })
+        {
+            return Ok(None);
+        }
         let authority_digest = current
             .canonical_digest()
             .map_err(|_| "adaptive authority digest failed")?;
@@ -1287,10 +1352,32 @@ impl WorkflowApi {
             created_at_ms: allowance.created_at_unix_ms,
             deadline_ms: subscription.expires_at_unix_ms,
         };
-        let (_, mut session) = self
-            .core
-            .begin_adaptive_session(&grant, allowance.created_at_unix_ms)
-            .map_err(|_| "adaptive session unavailable")?;
+        let mut session = match existing.filter(|session| {
+            session.continuation.is_some()
+                && session.active_provider_allowance_id() == allowance.allowance_id
+        }) {
+            Some(session) => {
+                let effective = session.effective_grant();
+                if effective.authority != current
+                    || effective.provider_authority_digest != grant.provider_authority_digest
+                    || effective.provider != grant.provider
+                    || effective.model != grant.model
+                    || effective.catalog_digest != grant.catalog_digest
+                    || effective.created_at_ms != grant.created_at_ms
+                    || effective.deadline_ms != grant.deadline_ms
+                    || effective.max_call_duration_ms != grant.max_call_duration_ms
+                {
+                    return Err("adaptive continuation allowance binding changed");
+                }
+                session
+            }
+            None => {
+                self.core
+                    .begin_adaptive_session(&grant, allowance.created_at_unix_ms)
+                    .map_err(|_| "adaptive session unavailable")?
+                    .1
+            }
+        };
         if reconcile_tools
             && matches!(
                 session.cursor,
@@ -1325,7 +1412,7 @@ impl WorkflowApi {
         };
         Ok(Some(AdaptiveProviderAuthority {
             schema_version: 3,
-            grant: session.grant.clone(),
+            grant: session.effective_grant(),
             session_version,
             effect_id,
             assignment_id: binding.assignment_id,
@@ -1408,7 +1495,7 @@ impl WorkflowApi {
             .adaptive_session(binding.grant.session_id, &binding.grant.authority)
             .map_err(|_| "adaptive session unavailable")?
             .ok_or("adaptive session missing")?;
-        if session.grant != binding.grant
+        if session.effective_grant() != binding.grant
             || session.last_observation != binding.previous_observation
         {
             return Err("adaptive session authority changed");
@@ -1584,7 +1671,7 @@ impl WorkflowApi {
             )
             .map_err(|_| "adaptive session unavailable")?
             .ok_or("adaptive session missing")?;
-        if session.grant != context.binding.grant {
+        if session.effective_grant() != context.binding.grant {
             return Err("adaptive provider grant changed");
         }
         if self
@@ -3931,6 +4018,33 @@ impl WorkflowApi {
             (allowance.dispatch.is_none() && now_ms >= allowance.grant.expires_at_unix_ms)
                 .then(|| allowance.clone())
         });
+        if let Some(allowance) = renewal.as_ref() {
+            // Adaptive spending is journaled independently of one-shot dispatch.
+            // Only a leader's durable continuation can extend that campaign.
+            if allowance.grant.max_calls > 1 {
+                return Ok(current);
+            }
+            let authority = self
+                .authority
+                .as_ref()
+                .ok_or("adaptive runtime authority unavailable")?
+                .snapshot_for_admission(
+                    &current.tenant_id,
+                    &current.project_id,
+                    &allowance.grant.work_item_id,
+                    allowance.grant.agent_id,
+                    false,
+                )
+                .map_err(|_| "adaptive renewal authority unavailable")?;
+            if self
+                .core
+                .adaptive_session_for_authority(&authority)
+                .map_err(|_| "adaptive renewal head unavailable")?
+                .is_some_and(|session| session.continuation.is_some())
+            {
+                return Ok(current);
+            }
+        }
         let completed = current.subscription_call.as_ref().filter(|allowance| {
             allowance.dispatch.is_some()
                 && current.source_review_previous_call.is_none()

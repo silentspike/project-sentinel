@@ -33,7 +33,11 @@ pub mod bridge {
         ActionType, AgentAction, AgentId, CostSource, DomainEvent, DomainEventPayload,
         HierarchyTier, Perception, Tick, Timestamp,
     };
-    use sentinel_limbo::{EventStore, LlmCompletionEntry};
+    use sentinel_limbo::{
+        EventStore, LlmCompletionEntry, LlmModelReservationV1, LlmModelSubjectV1,
+        LlmModelUsageBindingV1, LlmRetrospectiveUnknownModelEvidenceV1,
+        LlmSealedUnknownModelEvidenceV1,
+    };
     use sentinel_redb::StateStore;
 
     pub type SharedLlmActivityTicks = Arc<Mutex<HashMap<AgentId, u64>>>;
@@ -336,6 +340,19 @@ pub mod bridge {
     }
 
     trait CompletionStore: Send + Sync {
+        fn bind_model_reservation(&self, reservation: &LlmModelReservationV1)
+            -> anyhow::Result<()>;
+        fn sealed_model_evidence(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+            owner: &sentinel_common::StateTransferScope,
+        ) -> anyhow::Result<Option<LlmSealedUnknownModelEvidenceV1>>;
+        fn persist_sealed_model_usage(
+            &self,
+            evidence: &LlmSealedUnknownModelEvidenceV1,
+            event: &DomainEvent,
+        ) -> anyhow::Result<bool>;
         fn reserve_request(
             &self,
             request_id: &str,
@@ -381,6 +398,27 @@ pub mod bridge {
     }
 
     impl CompletionStore for EventStore {
+        fn bind_model_reservation(
+            &self,
+            reservation: &LlmModelReservationV1,
+        ) -> anyhow::Result<()> {
+            self.bind_llm_model_reservation(reservation)
+        }
+        fn sealed_model_evidence(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+            owner: &sentinel_common::StateTransferScope,
+        ) -> anyhow::Result<Option<LlmSealedUnknownModelEvidenceV1>> {
+            self.sealed_unknown_llm_model_evidence(request_id, request_digest, owner)
+        }
+        fn persist_sealed_model_usage(
+            &self,
+            evidence: &LlmSealedUnknownModelEvidenceV1,
+            event: &DomainEvent,
+        ) -> anyhow::Result<bool> {
+            self.persist_sealed_unknown_llm_model_usage(evidence, event)
+        }
         fn poll_provider_in_flight(&self, limit: usize) -> anyhow::Result<Vec<LlmCompletionEntry>> {
             self.poll_llm_provider_in_flight(limit)
         }
@@ -697,6 +735,250 @@ pub mod bridge {
                 false
             }
         }
+    }
+
+    fn model_reservation(
+        context: &ModelWorkContext,
+        request_id: &str,
+        request_digest: &str,
+    ) -> Result<Option<LlmModelReservationV1>, String> {
+        let context_digest = match context {
+            ModelWorkContext::AdaptiveLeadershipReview(value) => value.context_digest.clone(),
+            _ => format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(context).map_err(|error| error.to_string())?)
+            ),
+        };
+        model_reservation_for_authority(
+            &context.binding(),
+            request_id,
+            request_digest,
+            context_digest,
+        )
+    }
+
+    fn model_reservation_for_authority(
+        authority: &ProviderExecutionAuthority,
+        request_id: &str,
+        request_digest: &str,
+        context_digest: String,
+    ) -> Result<Option<LlmModelReservationV1>, String> {
+        let (subject, allowance_id, usage_binding) = match authority {
+            ProviderExecutionAuthority::Adaptive(value) => {
+                let grant = &value.grant;
+                (
+                    LlmModelSubjectV1::Adaptive {
+                        session_id: grant.session_id,
+                        effect_id: value.effect_id,
+                        session_version: value.session_version,
+                    },
+                    grant.provider_allowance_id.clone(),
+                    LlmModelUsageBindingV1 {
+                        agent_id: grant.authority.agent_id,
+                        tenant_id: grant.authority.tenant_id.0.clone(),
+                        project_id: grant.authority.project_id.0.clone(),
+                        work_item_id: grant.authority.work_item_id.0.clone(),
+                        reservation_id: grant.provider_allowance_id.clone(),
+                        assignment_id: value.assignment_id.clone(),
+                        assignment_version: grant.authority.assignment_version,
+                        provider: grant.provider.clone(),
+                        model: grant.model.clone(),
+                    },
+                )
+            }
+            ProviderExecutionAuthority::AdaptiveLeadershipReview(value) => {
+                let grant = &value.grant;
+                (
+                    LlmModelSubjectV1::AdaptiveLeadershipReview {
+                        review_id: grant.review_id,
+                    },
+                    value.allowance_id.clone(),
+                    LlmModelUsageBindingV1 {
+                        agent_id: authority.agent_id(),
+                        tenant_id: authority.tenant_id().to_owned(),
+                        project_id: grant.project_id.0.clone(),
+                        work_item_id: grant.work_item_id.0.clone(),
+                        reservation_id: value.reservation_id.clone(),
+                        assignment_id: grant.assignment_id.clone(),
+                        assignment_version: grant.assignee_authority.assignment_version,
+                        provider: grant.provider.clone(),
+                        model: grant.model.clone(),
+                    },
+                )
+            }
+            _ => return Ok(None),
+        };
+        if authority.request_id() != request_id {
+            return Err("model reservation request identity mismatch".to_owned());
+        }
+        Ok(Some(LlmModelReservationV1 {
+            schema_version: 1,
+            request_id: request_id.to_owned(),
+            request_digest: request_digest.to_owned(),
+            owner_scope: sentinel_common::StateTransferScope::for_agent(
+                authority.agent_id().to_string(),
+            ),
+            subject,
+            allowance_id,
+            context_digest,
+            authority_digest: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(authority).map_err(|error| error.to_string())?)
+            ),
+            usage_binding,
+        }))
+    }
+
+    fn exact_sealed_model_evidence<S: CompletionStore>(
+        store: &S,
+        context: &ModelWorkContext,
+        request_id: &str,
+        request_digest: &str,
+    ) -> anyhow::Result<Option<LlmSealedUnknownModelEvidenceV1>> {
+        let expected = model_reservation(context, request_id, request_digest)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("unsupported unknown model subject"))?;
+        let evidence =
+            store.sealed_model_evidence(request_id, request_digest, &expected.owner_scope)?;
+        if let Some(evidence) = &evidence {
+            anyhow::ensure!(
+                evidence.reservation == expected,
+                "sealed model authority or context changed"
+            );
+        }
+        Ok(evidence)
+    }
+
+    /// Exact bridge evidence, not authorization to abandon a domain effect.
+    /// Reads the sealed context digest without reconstructing historical prompts.
+    pub fn sealed_unknown_model_evidence(
+        store: &EventStore,
+        authority: &ProviderExecutionAuthority,
+        request_id: &str,
+        request_digest: &str,
+    ) -> anyhow::Result<Option<LlmSealedUnknownModelEvidenceV1>> {
+        anyhow::ensure!(
+            matches!(
+                authority,
+                ProviderExecutionAuthority::Adaptive(_)
+                    | ProviderExecutionAuthority::AdaptiveLeadershipReview(_)
+            ) && authority.request_id() == request_id,
+            "unsupported or changed model subject"
+        );
+        let owner =
+            sentinel_common::StateTransferScope::for_agent(authority.agent_id().to_string());
+        let evidence =
+            store.sealed_unknown_llm_model_evidence(request_id, request_digest, &owner)?;
+        if let Some(evidence) = &evidence {
+            let expected = model_reservation_for_authority(
+                authority,
+                request_id,
+                request_digest,
+                evidence.reservation.context_digest.clone(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                expected.as_ref() == Some(&evidence.reservation),
+                "sealed model authority changed"
+            );
+        }
+        Ok(evidence)
+    }
+
+    /// Internal authenticated Gateway evidence only; never admits a model result.
+    /// Historical usage validation deliberately does not renew current authority.
+    pub fn retain_sealed_unknown_model_usage(
+        store: &EventStore,
+        context: &ModelWorkContext,
+        request_id: &str,
+        request_digest: &str,
+        event: &DomainEvent,
+    ) -> anyhow::Result<bool> {
+        let evidence = exact_sealed_model_evidence(store, context, request_id, request_digest)?
+            .ok_or_else(|| anyhow::anyhow!("no sealed unknown model reservation"))?;
+        validate_sealed_model_usage(context, event).map_err(anyhow::Error::msg)?;
+        store.persist_sealed_unknown_llm_model_usage(&evidence, event)
+    }
+
+    /// Trusted historical verifier supplied the provenance at import. This
+    /// matches the original authority, without reconstructing prompts or grants.
+    /// It does not authorize continuation or assert no provider-private activity.
+    pub fn retrospective_unknown_model_evidence(
+        store: &EventStore,
+        authority: &ProviderExecutionAuthority,
+        request_id: &str,
+        request_digest: &str,
+    ) -> anyhow::Result<Option<LlmRetrospectiveUnknownModelEvidenceV1>> {
+        let ProviderExecutionAuthority::Adaptive(value) = authority else {
+            anyhow::bail!("unsupported retrospective model authority");
+        };
+        anyhow::ensure!(
+            authority.request_id() == request_id,
+            "historical model request changed"
+        );
+        let grant = &value.grant;
+        let owner =
+            sentinel_common::StateTransferScope::for_agent(grant.authority.agent_id.to_string());
+        let evidence =
+            store.retrospective_unknown_llm_model_evidence(request_id, request_digest, &owner)?;
+        if let Some(evidence) = &evidence {
+            let expected_subject = LlmModelSubjectV1::Adaptive {
+                session_id: grant.session_id,
+                effect_id: value.effect_id,
+                session_version: value.session_version,
+            };
+            let expected_usage = LlmModelUsageBindingV1 {
+                agent_id: grant.authority.agent_id,
+                tenant_id: grant.authority.tenant_id.0.clone(),
+                project_id: grant.authority.project_id.0.clone(),
+                work_item_id: grant.authority.work_item_id.0.clone(),
+                reservation_id: grant.provider_allowance_id.clone(),
+                assignment_id: value.assignment_id.clone(),
+                assignment_version: grant.authority.assignment_version,
+                provider: grant.provider.clone(),
+                model: grant.model.clone(),
+            };
+            let authority_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(authority)?));
+            let sentinel_limbo::LlmRetrospectiveModelProvenanceV1::JournalAndPinnedInferenceBoundary {
+                original_allowance_digest, ..
+            } = &evidence.binding.provenance;
+            anyhow::ensure!(
+                evidence.binding.subject == expected_subject
+                    && evidence.binding.allowance_id == grant.provider_allowance_id
+                    && evidence.binding.usage_binding == expected_usage
+                    && evidence.binding.authority_digest == authority_digest
+                    && original_allowance_digest == &grant.provider_authority_digest,
+                "retrospective model authority changed"
+            );
+        }
+        Ok(evidence)
+    }
+
+    /// Authenticated accounting-only evidence. No historical context is invented
+    /// or required; Limbo rechecks the exact imported seal in the append transaction.
+    pub fn retain_retrospective_unknown_model_usage(
+        store: &EventStore,
+        authority: &ProviderExecutionAuthority,
+        request_id: &str,
+        request_digest: &str,
+        event: &DomainEvent,
+    ) -> anyhow::Result<bool> {
+        let evidence =
+            retrospective_unknown_model_evidence(store, authority, request_id, request_digest)?
+                .ok_or_else(|| anyhow::anyhow!("no retrospective unknown model evidence"))?;
+        store.persist_retrospective_unknown_llm_model_usage(&evidence, event)
+    }
+
+    fn validate_sealed_model_usage(
+        context: &ModelWorkContext,
+        event: &DomainEvent,
+    ) -> Result<(), &'static str> {
+        ModelWorkCompletion {
+            context: context.clone(),
+            content: String::new(),
+            admissible: false,
+        }
+        .validate_usage(event)
     }
 
     fn recover_reserved_model_request<S: CompletionStore>(
@@ -1154,7 +1436,19 @@ pub mod bridge {
         model_work: Option<&ModelWorkContext>,
     ) -> Result<(), String> {
         let validation = validate_current_provider_usage_authority(resolver, expected, agent_id)
-            .and_then(|()| validate_model_work_context(resolver, model_work));
+            .and_then(|()| validate_model_work_context(resolver, model_work))
+            .and_then(|()| {
+                if let Some(context) = model_work {
+                    if let Some(reservation) =
+                        model_reservation(context, request_id, request_digest)?
+                    {
+                        store
+                            .bind_model_reservation(&reservation)
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+                Ok(())
+            });
         if let Err(reason) = validation {
             return match store.release_undispatched_request(request_id, request_digest) {
                 Ok(true) => Err(reason),
@@ -1300,9 +1594,29 @@ pub mod bridge {
             model_work: model_completion,
         };
         let payload = serde_json::to_string(&completed).map_err(|error| error.to_string())?;
-        store
-            .enqueue_completion(request_id, request_digest, &payload)
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = store.enqueue_completion(request_id, request_digest, &payload) {
+            if let Some(context) = model_work {
+                if matches!(
+                    context,
+                    ModelWorkContext::Adaptive(_) | ModelWorkContext::AdaptiveLeadershipReview(_)
+                ) {
+                    if let Some(evidence) =
+                        exact_sealed_model_evidence(store, context, request_id, request_digest)
+                            .map_err(|error| error.to_string())?
+                    {
+                        validate_sealed_model_usage(context, &completed.usage_event)
+                            .map_err(str::to_owned)?;
+                        store
+                            .persist_sealed_model_usage(&evidence, &completed.usage_event)
+                            .map_err(|error| error.to_string())?;
+                        // Enqueue and unknown sealing race under the same fence.
+                        // If sealing won, only accounting survives, never admission.
+                        return Ok(());
+                    }
+                }
+            }
+            return Err(error.to_string());
+        }
         let entry = store
             .get_completion(request_id)
             .map_err(|error| error.to_string())?
@@ -2375,6 +2689,29 @@ pub mod bridge {
         }
     }
 
+    fn leadership_review_kind(
+        grant: &serde_json::Value,
+    ) -> Result<Option<&'static str>, &'static str> {
+        // Use the authoritative grant wire shape across additive schema versions.
+        // Request metadata cannot select a review subject.
+        match grant
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+        {
+            Some(1) if grant.get("subject").is_none_or(serde_json::Value::is_null) => Ok(None),
+            Some(2) => match grant
+                .get("subject")
+                .and_then(|subject| subject.get("kind"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("unknown_model") => Ok(Some("unknown_model")),
+                Some("blocked_continuation") => Ok(Some("blocked_continuation")),
+                _ => Err("unsupported leadership review subject"),
+            },
+            _ => Err("unsupported leadership review grant schema"),
+        }
+    }
+
     fn bind_model_work_request(
         request: &mut GatewayRequest,
         context: &ModelWorkContext,
@@ -2542,6 +2879,13 @@ pub mod bridge {
                 "subscription_catalog_digest".to_owned(),
                 review.grant.catalog_digest.clone(),
             );
+            let grant = serde_json::to_value(&review.grant)
+                .map_err(|_| "leadership review grant encoding failed")?;
+            if let Some(kind) = leadership_review_kind(&grant)? {
+                request
+                    .metadata
+                    .insert("leadership_review_kind".to_owned(), kind.to_owned());
+            }
         }
         request.messages = vec![GatewayMessage {
             role: "user".to_owned(),
@@ -2978,6 +3322,58 @@ pub mod bridge {
         }
 
         #[test]
+        fn leadership_review_kind_is_grant_derived_and_legacy_wire_stays_absent() {
+            assert_eq!(
+                leadership_review_kind(&serde_json::json!({"schema_version": 1})),
+                Ok(None)
+            );
+            assert_eq!(
+                leadership_review_kind(&serde_json::json!({"schema_version": 1, "subject": null})),
+                Ok(None)
+            );
+            for kind in ["unknown_model", "blocked_continuation"] {
+                assert_eq!(
+                    leadership_review_kind(&serde_json::json!({
+                        "schema_version": 2, "subject": {"kind": kind}
+                    })),
+                    Ok(Some(kind))
+                );
+            }
+            for grant in [
+                serde_json::json!({"schema_version": 2}),
+                serde_json::json!({"schema_version": 2, "subject": null}),
+                serde_json::json!({"schema_version": 2, "subject": {"kind": "tool"}}),
+                serde_json::json!({"schema_version": 1, "subject": {"kind": "unknown_model"}}),
+                serde_json::json!({"schema_version": 3, "subject": {"kind": "unknown_model"}}),
+            ] {
+                assert!(leadership_review_kind(&grant).is_err());
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let (_, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
+                &dir.path().join("company.sqlite"),
+                &dir.path().join("events.sqlite"),
+            );
+            let context = ModelWorkContext::AdaptiveLeadershipReview(Box::new(review));
+            let binding = context.binding();
+            let state = StateStore::open(dir.path().join("state.redb").to_str().unwrap()).unwrap();
+            let perception =
+                make_perception(binding.agent_id().0, "Review supplied evidence", true);
+            let mut request =
+                build_gateway_request(&perception, &state, &binding.request_id(), Some(&binding));
+            request.metadata.insert(
+                "leadership_review_kind".to_owned(),
+                "unknown_model".to_owned(),
+            );
+            bind_model_work_request(&mut request, &context).unwrap();
+            assert!(!request.metadata.contains_key("leadership_review_kind"));
+            assert_eq!(request.metadata["company_execution_schema"], "5");
+            assert_eq!(
+                request.metadata["company_execution_subject"],
+                "adaptive_leadership_review"
+            );
+        }
+
+        #[test]
         fn leadership_dispatch_schema_five_adopts_usage_schema_six_without_legacy_actions() {
             let dir = tempfile::tempdir().unwrap();
             let event_path = dir.path().join("events.sqlite");
@@ -3104,6 +3500,385 @@ pub mod bridge {
             assert!(!store
                 .reserve_request(&id, &digest, &agent.to_string())
                 .unwrap());
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[test]
+        fn sealed_unknown_models_retain_late_usage_without_admission_or_legacy_actions() {
+            let dir = tempfile::tempdir().unwrap();
+            let (api, adaptive, _) = crate::workflow_api::model_work::configured_adaptive_test_api(
+                &dir.path().join("adaptive-company.sqlite"),
+                &dir.path().join("adaptive-events.sqlite"),
+            );
+            let adaptive_authority = ProviderExecutionAuthority::Adaptive(Box::new(adaptive));
+            let adaptive_context = api
+                .model_work_context(&adaptive_authority)
+                .unwrap()
+                .unwrap();
+            let (_, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
+                &dir.path().join("leadership-company.sqlite"),
+                &dir.path().join("leadership-events.sqlite"),
+            );
+            for context in [
+                adaptive_context,
+                ModelWorkContext::AdaptiveLeadershipReview(Box::new(review)),
+            ] {
+                let binding = context.binding();
+                let id = binding.request_id();
+                let digest = "a".repeat(64);
+                let store = EventStore::open(":memory:").unwrap();
+                let resolver = ModelWorkResolver {
+                    context: context.clone(),
+                    admissions: Mutex::new(Vec::new()),
+                    fail_next: AtomicBool::new(false),
+                };
+                assert!(store
+                    .reserve_request(&id, &digest, &binding.agent_id().to_string())
+                    .unwrap());
+                validate_pre_dispatch_provider_authority(
+                    &store,
+                    Some(&resolver),
+                    Some(&binding),
+                    binding.agent_id(),
+                    &id,
+                    &digest,
+                    Some(&context),
+                )
+                .unwrap();
+                assert!(
+                    sealed_unknown_model_evidence(&store, &binding, &id, &digest)
+                        .unwrap()
+                        .is_none()
+                );
+                store
+                    .mark_provider_unknown(
+                        &id,
+                        &digest,
+                        "UnknownOutcome: provider_transport_deadline_elapsed",
+                    )
+                    .unwrap();
+                let original = store.get_completion(&id).unwrap().unwrap();
+                let evidence = sealed_unknown_model_evidence(&store, &binding, &id, &digest)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    evidence.reservation,
+                    model_reservation(&context, &id, &digest).unwrap().unwrap()
+                );
+                let content = if matches!(&context, ModelWorkContext::Adaptive(_)) {
+                    "{}".to_owned()
+                } else {
+                    "x".repeat(MAX_MODEL_WORK_BYTES + 1)
+                };
+                let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+                    "content": content, "decision": "forward", "request_id": id,
+                    "provider": binding.provider(), "effective_model": evidence.reservation.usage_binding.model,
+                    "tokens_used": 15, "input_tokens": 5, "output_tokens": 10, "tier": "mid",
+                    "hierarchy_tier": 2, "cost_source": "provider_reported", "cost_usd": 0.125,
+                    "actions": [{"type": "tool_use", "content": "must never execute"}],
+                })).unwrap();
+                let (tx, rx) = mpsc::channel();
+                store_gateway_completion(
+                    &store,
+                    &tx,
+                    GatewayCompletionContext {
+                        request_id: &id,
+                        request_digest: &digest,
+                        agent_id: binding.agent_id(),
+                        tick: 1,
+                        requested_model: &evidence.reservation.usage_binding.model,
+                        authority: Some(&binding),
+                        authority_resolver: Some(&resolver),
+                        gateway_response: &response,
+                        usage_v2_enabled: true,
+                        model_work: Some(&context),
+                    },
+                    3,
+                )
+                .unwrap();
+                let usage = store
+                    .event_by_operation_id(&format!("llm_usage_{id}"))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    usage.schema_version,
+                    match &binding {
+                        ProviderExecutionAuthority::Adaptive(_) => 3,
+                        _ => 6,
+                    }
+                );
+                let payload: serde_json::Value = serde_json::from_str(&usage.payload).unwrap();
+                assert_eq!(payload["cost_usd"], serde_json::json!(0.125));
+                assert_eq!(payload["input_tokens"], serde_json::json!(5));
+                assert_eq!(payload["output_tokens"], serde_json::json!(10));
+                assert!(
+                    !retain_sealed_unknown_model_usage(&store, &context, &id, &digest, &usage)
+                        .unwrap()
+                );
+                let mut changed = usage.clone();
+                changed.event_id = uuid::Uuid::new_v4().to_string();
+                assert!(retain_sealed_unknown_model_usage(
+                    &store, &context, &id, &digest, &changed
+                )
+                .is_err());
+                let mut altered_context = context.clone();
+                match &mut altered_context {
+                    ModelWorkContext::Adaptive(value) => {
+                        value.binding.grant.authority.assignment_version += 1
+                    }
+                    ModelWorkContext::AdaptiveLeadershipReview(value) => {
+                        value.binding.grant.assignee_authority.assignment_version += 1
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(sealed_unknown_model_evidence(
+                    &store,
+                    &altered_context.binding(),
+                    &id,
+                    &digest
+                )
+                .is_err());
+                assert!(retain_sealed_unknown_model_usage(
+                    &store,
+                    &altered_context,
+                    &id,
+                    &digest,
+                    &usage
+                )
+                .is_err());
+                assert!(
+                    sealed_unknown_model_evidence(&store, &binding, &id, &"b".repeat(64)).is_err()
+                );
+                assert_eq!(store.get_completion(&id).unwrap().unwrap(), original);
+                assert_eq!(store.get_all_events().unwrap().len(), 1);
+                assert!(store.poll_completions(10).unwrap().is_empty());
+                assert!(resolver.admissions.lock().unwrap().is_empty());
+                assert!(rx.try_recv().is_err());
+            }
+        }
+
+        #[test]
+        fn retrospective_model_accounting_requires_original_authority_not_prompt_reconstruction() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_, adaptive, _) = crate::workflow_api::model_work::configured_adaptive_test_api(
+                &dir.path().join("company.sqlite"),
+                &dir.path().join("events.sqlite"),
+            );
+            let authority = ProviderExecutionAuthority::Adaptive(Box::new(adaptive));
+            let ProviderExecutionAuthority::Adaptive(value) = &authority else {
+                unreachable!()
+            };
+            let grant = &value.grant;
+            let id = authority.request_id();
+            let digest = "a".repeat(64);
+            let store = EventStore::open(":memory:").unwrap();
+            store
+                .reserve_llm_request(&id, &digest, &authority.agent_id().to_string())
+                .unwrap();
+            store
+                .mark_llm_provider_outcome_unknown(
+                    &id,
+                    &digest,
+                    "UnknownOutcome: provider_transport_deadline_elapsed",
+                )
+                .unwrap();
+            let original = store.get_llm_completion(&id).unwrap().unwrap();
+            assert!(
+                retrospective_unknown_model_evidence(&store, &authority, &id, &digest)
+                    .unwrap()
+                    .is_none()
+            );
+            // Synthetic reviewed descriptors exercise the API, not deployment proof.
+            let receipt = |version, entry_digest: &str, time| {
+                serde_json::json!({
+                    "session_id": grant.session_id, "effect_id": value.effect_id, "request_digest": digest,
+                    "session_version": version, "operation_id": uuid::Uuid::new_v4(),
+                    "entry_digest": entry_digest.repeat(64), "timestamp_ms": time,
+                })
+            };
+            let binding: sentinel_limbo::LlmRetrospectiveModelBindingV1 = serde_json::from_value(serde_json::json!({
+                "schema_version": 1, "request_id": id, "request_digest": digest,
+                "owner_scope": original.owner_scope,
+                "subject": {"kind": "adaptive", "session_id": grant.session_id,
+                    "effect_id": value.effect_id, "session_version": value.session_version},
+                "allowance_id": grant.provider_allowance_id, "historical_context_digest": null,
+                "authority_digest": format!("{:x}", Sha256::digest(serde_json::to_vec(&authority).unwrap())),
+                "usage_binding": {
+                    "agent_id": grant.authority.agent_id, "tenant_id": grant.authority.tenant_id.0,
+                    "project_id": grant.authority.project_id.0, "work_item_id": grant.authority.work_item_id.0,
+                    "reservation_id": grant.provider_allowance_id, "assignment_id": value.assignment_id,
+                    "assignment_version": grant.authority.assignment_version, "provider": grant.provider, "model": grant.model,
+                },
+                "provenance": {
+                    "kind": "journal_and_pinned_inference_boundary",
+                    "claim_model": receipt(2, "b", original.created_at),
+                    "mark_unknown": receipt(3, "c", original.updated_at),
+                    "journal_head_digest": "c".repeat(64), "model_claims": 1, "tool_claims": 0,
+                    "collaboration_claims": 0, "original_allowance_digest": grant.provider_authority_digest,
+                    "boundary": {"release_git_sha": "a".repeat(40), "release_manifest_sha256": "b".repeat(64),
+                        "gateway_binary_sha256": "c".repeat(64), "cli_binary_sha256": "d".repeat(64),
+                        "cli_profile_sha256": "e".repeat(64), "boundary_receipt_sha256": "f".repeat(64),
+                        "valid_from_ms": original.created_at, "valid_until_ms": original.created_at + 1},
+                },
+            })).unwrap();
+            store
+                .import_retrospective_unknown_llm_model_binding(&binding)
+                .unwrap();
+            let evidence = retrospective_unknown_model_evidence(&store, &authority, &id, &digest)
+                .unwrap()
+                .unwrap();
+            assert!(evidence.binding.historical_context_digest.is_none());
+            assert!(
+                sealed_unknown_model_evidence(&store, &authority, &id, &digest)
+                    .unwrap()
+                    .is_none()
+            );
+            let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+                "content": "discarded proposal", "decision": "forward", "request_id": id,
+                "provider": grant.provider, "effective_model": grant.model, "tokens_used": 15,
+                "input_tokens": 5, "output_tokens": 10, "tier": "mid", "hierarchy_tier": 2,
+                "cost_source": "provider_reported", "cost_usd": 0.125,
+                "actions": [{"type": "tool_use", "content": "must not execute"}],
+            }))
+            .unwrap();
+            let usage = build_usage_event(
+                authority.agent_id(),
+                1,
+                &grant.model,
+                Some(&authority),
+                &response,
+                true,
+            )
+            .unwrap();
+            assert!(retain_retrospective_unknown_model_usage(
+                &store, &authority, &id, &digest, &usage
+            )
+            .unwrap());
+            assert!(!retain_retrospective_unknown_model_usage(
+                &store, &authority, &id, &digest, &usage
+            )
+            .unwrap());
+            let mut conflict = usage.clone();
+            conflict.event_id = uuid::Uuid::new_v4().to_string();
+            assert!(retain_retrospective_unknown_model_usage(
+                &store, &authority, &id, &digest, &conflict
+            )
+            .is_err());
+            for field in ["assignment", "allowance", "original_allowance", "effect"] {
+                let mut changed = authority.clone();
+                let ProviderExecutionAuthority::Adaptive(value) = &mut changed else {
+                    unreachable!()
+                };
+                match field {
+                    "assignment" => value.assignment_id = "current-assignment".into(),
+                    "allowance" => value.grant.provider_allowance_id = "fresh-allowance".into(),
+                    "original_allowance" => value.grant.provider_authority_digest = "f".repeat(64),
+                    _ => value.effect_id = uuid::Uuid::new_v4(),
+                }
+                assert!(
+                    retrospective_unknown_model_evidence(&store, &changed, &id, &digest).is_err(),
+                    "{field}"
+                );
+                assert!(retain_retrospective_unknown_model_usage(
+                    &store, &changed, &id, &digest, &usage
+                )
+                .is_err());
+            }
+            assert_eq!(store.get_llm_completion(&id).unwrap().unwrap(), original);
+            assert!(store.poll_llm_completions(10).unwrap().is_empty());
+            assert_eq!(store.get_all_events().unwrap().len(), 1);
+            let separate = EventStore::open(":memory:").unwrap();
+            separate
+                .reserve_llm_request(&id, &digest, &authority.agent_id().to_string())
+                .unwrap();
+            separate
+                .mark_llm_provider_outcome_unknown(
+                    &id,
+                    &digest,
+                    "UnknownOutcome: provider_transport_deadline_elapsed",
+                )
+                .unwrap();
+            let entry = separate.get_llm_completion(&id).unwrap().unwrap();
+            let mut inconsistent = binding;
+            let sentinel_limbo::LlmRetrospectiveModelProvenanceV1::JournalAndPinnedInferenceBoundary {
+                claim_model, mark_unknown, original_allowance_digest, boundary, ..
+            } = &mut inconsistent.provenance;
+            claim_model.timestamp_ms = entry.created_at;
+            mark_unknown.timestamp_ms = entry.updated_at;
+            boundary.valid_from_ms = entry.created_at;
+            boundary.valid_until_ms = entry.created_at + 1;
+            *original_allowance_digest = "a".repeat(64);
+            assert_ne!(
+                original_allowance_digest.as_str(),
+                grant.provider_authority_digest.as_str()
+            );
+            separate
+                .import_retrospective_unknown_llm_model_binding(&inconsistent)
+                .unwrap();
+            assert!(
+                retrospective_unknown_model_evidence(&separate, &authority, &id, &digest).is_err()
+            );
+            assert!(retain_retrospective_unknown_model_usage(
+                &separate, &authority, &id, &digest, &usage
+            )
+            .is_err());
+            assert!(separate.get_all_events().unwrap().is_empty());
+        }
+
+        #[test]
+        fn unregistered_unknown_model_response_cannot_invent_accounting_authority() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
+                &dir.path().join("company.sqlite"),
+                &dir.path().join("events.sqlite"),
+            );
+            let context = ModelWorkContext::AdaptiveLeadershipReview(Box::new(review));
+            let binding = context.binding();
+            let id = binding.request_id();
+            let digest = "a".repeat(64);
+            let store = EventStore::open(":memory:").unwrap();
+            store
+                .reserve_request(&id, &digest, &binding.agent_id().to_string())
+                .unwrap();
+            store
+                .mark_provider_unknown(
+                    &id,
+                    &digest,
+                    "UnknownOutcome: provider_transport_deadline_elapsed",
+                )
+                .unwrap();
+            assert!(
+                sealed_unknown_model_evidence(&store, &binding, &id, &digest)
+                    .unwrap()
+                    .is_none()
+            );
+            let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+                "content": "{}", "decision": "forward", "request_id": id,
+                "provider": binding.provider(), "effective_model": "gpt-5.4", "tokens_used": 15,
+                "input_tokens": 5, "output_tokens": 10, "tier": "mid", "hierarchy_tier": 2,
+                "cost_source": "provider_reported", "cost_usd": 0.125,
+            }))
+            .unwrap();
+            let (tx, rx) = mpsc::channel();
+            assert!(store_gateway_completion(
+                &store,
+                &tx,
+                GatewayCompletionContext {
+                    request_id: &id,
+                    request_digest: &digest,
+                    agent_id: binding.agent_id(),
+                    tick: 1,
+                    requested_model: "gpt-5.4",
+                    authority: Some(&binding),
+                    authority_resolver: None,
+                    gateway_response: &response,
+                    usage_v2_enabled: true,
+                    model_work: Some(&context),
+                },
+                3
+            )
+            .is_err());
+            assert!(store.get_all_events().unwrap().is_empty());
             assert!(rx.try_recv().is_err());
         }
 
@@ -4161,6 +4936,29 @@ pub mod bridge {
         }
 
         impl CompletionStore for FailFirstCompletionStore {
+            fn bind_model_reservation(
+                &self,
+                reservation: &LlmModelReservationV1,
+            ) -> anyhow::Result<()> {
+                self.inner.bind_llm_model_reservation(reservation)
+            }
+            fn sealed_model_evidence(
+                &self,
+                request_id: &str,
+                request_digest: &str,
+                owner: &sentinel_common::StateTransferScope,
+            ) -> anyhow::Result<Option<LlmSealedUnknownModelEvidenceV1>> {
+                self.inner
+                    .sealed_unknown_llm_model_evidence(request_id, request_digest, owner)
+            }
+            fn persist_sealed_model_usage(
+                &self,
+                evidence: &LlmSealedUnknownModelEvidenceV1,
+                event: &DomainEvent,
+            ) -> anyhow::Result<bool> {
+                self.inner
+                    .persist_sealed_unknown_llm_model_usage(evidence, event)
+            }
             fn poll_provider_in_flight(
                 &self,
                 limit: usize,
