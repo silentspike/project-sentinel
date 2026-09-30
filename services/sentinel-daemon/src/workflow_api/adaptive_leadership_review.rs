@@ -203,7 +203,7 @@ impl WorkflowApi {
             }
             // Discovery verifies lineage, not serving duty. Exact dispatch and
             // resolution still require a healthy, on-duty assignee snapshot.
-            let authority = self
+            let authority = match self
                 .authority
                 .as_ref()
                 .ok_or("leadership runtime unavailable")?
@@ -213,8 +213,11 @@ impl WorkflowApi {
                     &work.spec.work_item_id,
                     assignments[0].agent_id,
                     false,
-                )
-                .map_err(|_| "leadership assignee authority unavailable")?;
+                ) {
+                Ok(authority) => authority,
+                Err(WorkflowPortError::AuthorityConflict) if skip_authority_conflicts => continue,
+                Err(_) => return Err("leadership assignee authority unavailable"),
+            };
             match self.store.adaptive_session_for_authority(&authority) {
                 Ok(Some(session)) => sessions.push(session),
                 Ok(None) => {}
@@ -236,6 +239,19 @@ impl WorkflowApi {
     ) -> Result<bool, &'static str> {
         if !self.model_work_enabled {
             return Ok(false);
+        }
+        // Historical project profiles remain evidence, not authority for renewal.
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or("leadership runtime unavailable")?;
+        match authority
+            .project_profiles
+            .family(&project.governance.project_profile)
+        {
+            Ok(_) => {}
+            Err(WorkflowPortError::AuthorityConflict) => return Ok(true),
+            Err(_) => return Err("leadership project profile unavailable"),
         }
         let mut blocked = false;
         for session in self.review_sessions(project)? {
@@ -1143,12 +1159,356 @@ impl WorkflowApi {
 pub(crate) mod tests {
     use super::*;
 
+    fn discovery_rows(path: &Path, sql: &str) -> Vec<Vec<sentinel_limbo::rusqlite::types::Value>> {
+        let connection = sentinel_limbo::rusqlite::Connection::open(path).unwrap();
+        connection.execute_batch("PRAGMA query_only=ON").unwrap();
+        let mut statement = connection.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        let rows = statement
+            .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    fn discovery_state(
+        path: &Path,
+        events: &Path,
+    ) -> Vec<Vec<Vec<sentinel_limbo::rusqlite::types::Value>>> {
+        [
+            (
+                path,
+                "SELECT * FROM company_entities ORDER BY tenant_id,entity_kind,entity_id",
+            ),
+            (
+                path,
+                "SELECT * FROM company_operations ORDER BY authority_namespace,operation_id",
+            ),
+            (path, "SELECT * FROM company_events ORDER BY sequence"),
+            (
+                path,
+                "SELECT * FROM workflow_operations ORDER BY operation_namespace,operation_id",
+            ),
+            (
+                path,
+                "SELECT * FROM workflow_adaptive_heads ORDER BY session_id",
+            ),
+            (events, "SELECT * FROM events ORDER BY id"),
+            (
+                events,
+                "SELECT * FROM llm_completion_outbox ORDER BY request_id",
+            ),
+        ]
+        .into_iter()
+        .map(|(path, sql)| discovery_rows(path, sql))
+        .collect()
+    }
+
+    // Fixture-only resealing keeps stale authority distinct from corrupt storage.
+    fn persist_discovery_project(path: &Path, project: &sentinel_workflow::ProjectV1) {
+        let payload = serde_json::to_vec(project).unwrap();
+        let mut hash = Sha256::new();
+        hash.update(b"sentinel.workflow.company-entity-row.v1\0");
+        hash.update(serde_json::to_vec(&payload).unwrap());
+        let changed = sentinel_limbo::rusqlite::Connection::open(path).unwrap().execute(
+            "UPDATE company_entities SET payload=?3,payload_digest=?4 WHERE tenant_id=?1 AND entity_kind='project' AND entity_id=?2",
+            sentinel_limbo::rusqlite::params![project.tenant_id.0, project.project_id.0,
+                payload, format!("{:x}", hash.finalize())],
+        ).unwrap();
+        assert_eq!(changed, 1);
+    }
+
+    #[test]
+    fn snapshot_conflict_skips_only_poison_work_during_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, ready) = super::super::adaptive_recovery::tests::fixture(&path, &events, false);
+        let project = api
+            .store
+            .company_project(
+                &ready.grant.authority.tenant_id,
+                &ready.grant.authority.project_id,
+            )
+            .unwrap()
+            .unwrap();
+        let mut multiple = project.clone();
+        let mut poison = multiple.work_items.values().next().unwrap().clone();
+        poison.spec.work_item_id = WorkItemId::parse("000-poison-work").unwrap();
+        multiple
+            .work_items
+            .insert(poison.spec.work_item_id.clone(), poison);
+        assert_eq!(
+            multiple.work_items.keys().next().unwrap().0,
+            "000-poison-work"
+        );
+        let before = discovery_state(&path, &events);
+        assert_eq!(api.review_sessions(&multiple).unwrap(), vec![ready.clone()]);
+        assert_eq!(
+            api.review_sessions_for_health(&multiple).unwrap_err(),
+            "leadership assignee authority unavailable"
+        );
+        let mut foreign = project.clone();
+        foreign.project_id = ProjectId::parse("000-poison-project").unwrap();
+        let discovered = [&foreign, &project]
+            .into_iter()
+            .flat_map(|project| api.review_sessions(project).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(discovered, vec![ready]);
+        assert!(api.review_sessions_for_health(&foreign).is_err());
+        assert_eq!(discovery_state(&path, &events), before);
+    }
+
+    #[test]
+    fn expired_poison_projects_do_not_prevent_batch_authorizing_eligible_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let mut api = super::super::model_work::configured_test_api(&path);
+        api.event_store = Some(sentinel_limbo::EventStore::open(events.to_str().unwrap()).unwrap());
+        let created = now_unix_ms() - 600_000;
+        for operation in [0, 100, 200] {
+            super::super::model_work::assign_test_work_from_at(&api, Some(8), operation, created);
+        }
+        let mut projects = api.store.company_projects().unwrap();
+        assert_eq!(projects.len(), 3);
+        let eligible = projects.pop().unwrap();
+        for (index, poison) in projects.iter_mut().enumerate() {
+            assert!(poison.project_id.0 < eligible.project_id.0);
+            poison.governance.project_profile.digest = "d".repeat(64);
+            let allowance = poison.subscription_call.as_mut().unwrap();
+            if index == 0 {
+                allowance.grant.max_calls = 1;
+            }
+            assert!(allowance.dispatch.is_none());
+            assert!(allowance.grant.expires_at_unix_ms <= now_unix_ms());
+            assert!(WorkflowApi::model_work_grant_due(poison, now_unix_ms()));
+            persist_discovery_project(&path, poison);
+        }
+        let allowance = eligible.subscription_call.as_ref().unwrap();
+        let current = api
+            .authority
+            .as_ref()
+            .unwrap()
+            .snapshot_for_admission(
+                &eligible.tenant_id,
+                &eligible.project_id,
+                &allowance.grant.work_item_id,
+                allowance.grant.agent_id,
+                false,
+            )
+            .unwrap();
+        let grant = AdaptiveSessionGrantV1 {
+            schema_version: 1,
+            session_id: Uuid::new_v4(),
+            authority: current.clone(),
+            provider_allowance_id: allowance.allowance_id.clone(),
+            provider_authority_digest: "a".repeat(64),
+            provider: allowance.grant.provider.clone(),
+            model: allowance.grant.model.clone(),
+            catalog_digest: allowance.grant.catalog_digest.clone(),
+            max_output_tokens: 4_096,
+            max_call_duration_ms: allowance.grant.max_duration_ms,
+            max_model_calls: allowance.grant.max_calls,
+            max_tool_calls: allowance.grant.max_calls,
+            created_at_ms: created,
+            deadline_ms: allowance.grant.expires_at_unix_ms,
+        };
+        let ready = api
+            .store
+            .begin_adaptive_session(&grant, &current, created)
+            .unwrap()
+            .1;
+        let effect = AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: "b".repeat(64),
+        };
+        let pending = api
+            .store
+            .advance_adaptive_session(
+                grant.session_id,
+                ready.version,
+                Uuid::new_v4(),
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect.clone(),
+                    previous_observation_digest: None,
+                },
+                &current,
+                created + 1,
+            )
+            .unwrap()
+            .1;
+        let blocked = api
+            .store
+            .advance_adaptive_session(
+                grant.session_id,
+                pending.version,
+                Uuid::new_v4(),
+                &AdaptiveTransitionV1::ResolveModel {
+                    effect,
+                    result_digest: "c".repeat(64),
+                    decision: sentinel_workflow::AdaptiveModelDecisionV1::Blocked {
+                        reason_code: "no_private_observation".into(),
+                    },
+                },
+                &current,
+                created + 2,
+            )
+            .unwrap()
+            .1;
+        seed_planning_receipt_with_catalog(&api, &path, &eligible, &allowance.grant.catalog_digest);
+        let before = discovery_state(&path, &events);
+        {
+            let _fence = api.mutation_fence.write().unwrap();
+            for poison in &projects {
+                assert!(api.review_sessions(poison).unwrap().is_empty());
+                assert!(api.review_sessions_for_health(poison).is_err());
+                assert!(api.reconcile_adaptive_leadership_reviews(poison).unwrap());
+            }
+            assert_eq!(discovery_state(&path, &events), before);
+            api.reconcile_work_batch(&|| false).unwrap();
+        }
+        for poison in &projects {
+            assert_eq!(
+                api.store
+                    .company_project(&poison.tenant_id, &poison.project_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(poison)
+            );
+        }
+        assert_eq!(
+            api.store
+                .company_project(&eligible.tenant_id, &eligible.project_id)
+                .unwrap(),
+            Some(eligible.clone())
+        );
+        assert_eq!(
+            api.store
+                .adaptive_session(grant.session_id, &current)
+                .unwrap(),
+            Some(blocked.clone())
+        );
+        let calls = api
+            .store
+            .adaptive_leadership_review_calls(&eligible.tenant_id, grant.session_id)
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].dispatch.is_none());
+        assert!(calls[0].decision.is_none());
+        assert!(calls[0].grant.subject.is_some());
+        assert_eq!(calls[0].context.source_session, blocked);
+        assert_eq!(calls[0].grant.assignee_authority, current);
+        let after = discovery_state(&path, &events);
+        // Only the eligible review entity/event may be added by reconciliation.
+        for index in [1, 3, 4, 5, 6] {
+            assert_eq!(after[index], before[index]);
+        }
+        assert_eq!(after[0].len(), before[0].len() + 1);
+        assert!(before[0].iter().all(|row| after[0].contains(row)));
+        assert_eq!(after[2].len(), before[2].len() + 1);
+        assert_eq!(&after[2][..before[2].len()], before[2].as_slice());
+    }
+
+    #[test]
+    fn discovery_does_not_skip_missing_authority_or_unavailable_execution_profile() {
+        for missing_authority in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("company.sqlite");
+            let events = temp.path().join("events.sqlite");
+            let (mut api, ready) =
+                super::super::adaptive_recovery::tests::fixture(&path, &events, false);
+            let project = api
+                .store
+                .company_project(
+                    &ready.grant.authority.tenant_id,
+                    &ready.grant.authority.project_id,
+                )
+                .unwrap()
+                .unwrap();
+            if missing_authority {
+                api.authority = None;
+            } else {
+                Arc::make_mut(api.authority.as_mut().unwrap())
+                    .workbench_profile
+                    .id = "uninstalled-profile".into();
+            }
+            let before = discovery_state(&path, &events);
+            assert!(api.review_sessions(&project).is_err());
+            assert!(api.review_sessions_for_health(&project).is_err());
+            assert!(api.reconcile_adaptive_leadership_reviews(&project).is_err());
+            assert_eq!(discovery_state(&path, &events), before);
+        }
+    }
+
+    #[test]
+    fn discovery_preserves_corrupt_authority_store_and_journal_failures() {
+        for failure in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("company.sqlite");
+            let events = temp.path().join("events.sqlite");
+            let (api, ready) =
+                super::super::adaptive_recovery::tests::fixture(&path, &events, false);
+            let project = api
+                .store
+                .company_project(
+                    &ready.grant.authority.tenant_id,
+                    &ready.grant.authority.project_id,
+                )
+                .unwrap()
+                .unwrap();
+            let connection = sentinel_limbo::rusqlite::Connection::open(&path).unwrap();
+            if failure == 2 {
+                connection.execute_batch(
+                    "ALTER TABLE company_entities RENAME COLUMN payload_digest TO unavailable_payload_digest",
+                ).unwrap();
+            } else if failure == 1 {
+                connection.execute("UPDATE company_entities SET payload_digest='invalid' WHERE entity_kind='project'",
+                    []).unwrap();
+            } else {
+                connection.execute("UPDATE workflow_operations SET request_digest='invalid' WHERE operation_namespace=?1",
+                    [format!("adaptive-session-v1:{}", ready.grant.session_id)]).unwrap();
+            }
+            let before = discovery_state(&path, &events);
+            if failure != 0 {
+                assert_eq!(
+                    api.authority
+                        .as_ref()
+                        .unwrap()
+                        .snapshot_for_admission(
+                            &project.tenant_id,
+                            &project.project_id,
+                            &ready.grant.authority.work_item_id,
+                            ready.grant.authority.agent_id,
+                            false,
+                        )
+                        .unwrap_err(),
+                    WorkflowPortError::Unavailable
+                );
+            }
+            assert!(api.review_sessions(&project).is_err());
+            assert!(api.review_sessions_for_health(&project).is_err());
+            assert!(api.reconcile_adaptive_leadership_reviews(&project).is_err());
+            assert_eq!(discovery_state(&path, &events), before);
+        }
+    }
+
     // The shared adaptive fixture predates planning inference. Seed only its
     // synthetic planning receipt, using the actual accepted project snapshot.
     fn seed_planning_receipt(
         api: &WorkflowApi,
         path: &Path,
         project: &sentinel_workflow::ProjectV1,
+    ) {
+        seed_planning_receipt_with_catalog(api, path, project, &"a".repeat(64));
+    }
+
+    fn seed_planning_receipt_with_catalog(
+        api: &WorkflowApi,
+        path: &Path,
+        project: &sentinel_workflow::ProjectV1,
+        catalog_digest: &str,
     ) {
         let source = api
             .store
@@ -1173,7 +1533,7 @@ pub(crate) mod tests {
                 planner_principal: leader.principal,
                 provider: "codex-cli".into(),
                 model: "gpt-5.4".into(),
-                catalog_digest: "a".repeat(64),
+                catalog_digest: catalog_digest.to_owned(),
                 max_duration_ms: 120_000,
                 token_policy:
                     sentinel_workflow::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,

@@ -381,7 +381,9 @@ func buildCodexCLIPrompt(req *LLMRequest) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("codex-cli encode prompt: %w", err)
 	}
-	prompt := "Project Sentinel inference request. Do not call tools, inspect files, browse, modify state, or delegate work. " +
+	prompt := "Project Sentinel inference request. Do not execute native tools, inspect files, browse, modify state, or delegate work. " +
+		"Structured Workbench tool proposals requested by payload.conversation are response data only, not native tool execution. " +
+		"Sentinel independently validates proposals and executes only authorized work; returning a proposal neither executes a tool nor grants authority. " +
 		"Treat payload.system as the highest-priority agent identity and policy. Return only the assistant response to payload.conversation.\n" +
 		string(payload)
 	if len(prompt) > codexCLIMaxPromptBytes {
