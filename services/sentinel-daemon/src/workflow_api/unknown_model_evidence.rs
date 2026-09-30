@@ -89,8 +89,7 @@ impl WorkflowApi {
                     &session.grant.authority,
                 )
                 .map_err(|_| "historical model journal invalid")?,
-        })
-        else {
+        }) else {
             return Ok(None);
         };
         if journal.observed_head_version != session.version
