@@ -62,6 +62,153 @@ func TestCodexCLIReasoningAndPrivateErrorClassification(t *testing.T) {
 	}
 }
 
+func TestCodexCLIOutputSchemaErrorClassification(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		diagnostic string
+		statusCode int
+		message    string
+	}{
+		{
+			name:       "invalid schema",
+			diagnostic: "Invalid schema for response_format: private-upstream; token=private-secret",
+			statusCode: http.StatusBadGateway,
+			message:    "codex-cli output schema rejected",
+		},
+		{
+			name:       "invalid_json_schema",
+			diagnostic: "HTTP status 400 bad request: INVALID_JSON_SCHEMA; private-upstream; token=private-secret",
+			statusCode: http.StatusBadGateway,
+			message:    "codex-cli output schema rejected",
+		},
+		{
+			name:       "schema keyword not permitted",
+			diagnostic: "Invalid request: output schema keyword uniqueItems is not permitted; private-upstream; token=private-secret",
+			statusCode: http.StatusBadGateway,
+			message:    "codex-cli output schema rejected",
+		},
+		{
+			name:       "quota",
+			diagnostic: "Usage limit reached; private-upstream; token=private-secret",
+			statusCode: http.StatusTooManyRequests,
+			message:    "codex-cli usage limit active",
+		},
+		{
+			name:       "authentication",
+			diagnostic: "Not logged in: authentication required; private-upstream; token=private-secret",
+			statusCode: http.StatusServiceUnavailable,
+			message:    "codex-cli authentication unavailable",
+		},
+		{
+			name:       "quota takes priority over schema",
+			diagnostic: "Invalid schema: usage limit reached; private-upstream; token=private-secret",
+			statusCode: http.StatusTooManyRequests,
+			message:    "codex-cli usage limit active",
+		},
+		{
+			name:       "authentication takes priority over schema",
+			diagnostic: "invalid_json_schema: authentication required; private-upstream; token=private-secret",
+			statusCode: http.StatusServiceUnavailable,
+			message:    "codex-cli authentication unavailable",
+		},
+		{
+			name:       "generic failure",
+			diagnostic: "Unrelated subprocess failure; private-upstream; token=private-secret",
+			message:    "codex-cli subprocess failed",
+		},
+		{
+			name:       "schema mention alone",
+			diagnostic: "Output schema processing failed; private-upstream; token=private-secret",
+			message:    "codex-cli subprocess failed",
+		},
+		{
+			name:       "not permitted without schema",
+			diagnostic: "Operation not permitted; private-upstream; token=private-secret",
+			message:    "codex-cli subprocess failed",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, route := range []string{"stderr helper", "error", "turn.failed"} {
+				t.Run(route, func(t *testing.T) {
+					var err error
+					if route == "stderr helper" {
+						err = codexCLIProcessError(test.diagnostic)
+					} else {
+						event := codexCLIEvent{Type: route, Message: test.diagnostic}
+						if route == "turn.failed" {
+							event.Message = ""
+							event.Error = &codexCLIError{Message: test.diagnostic}
+						}
+						encoded, marshalErr := json.Marshal(event)
+						if marshalErr != nil {
+							t.Fatal(marshalErr)
+						}
+						provider := NewCodexCLIProvider(ProviderConfig{Name: CodexCLIProviderName}, nil)
+						var response *LLMResponse
+						response, err = provider.parseOutputStream(strings.NewReader(string(encoded)), 1024)
+						if response != nil {
+							t.Fatalf("failure returned a response: %v", response)
+						}
+					}
+					if err == nil {
+						t.Fatal("diagnostic did not return an error")
+					}
+					var providerErr *ProviderError
+					isProviderError := errors.As(err, &providerErr)
+					expectedError := test.message
+					if test.statusCode == 0 {
+						if isProviderError {
+							t.Fatalf("generic failure classified as ProviderError: %v", err)
+						}
+					} else {
+						if !isProviderError || providerErr.StatusCode != test.statusCode || providerErr.Message != test.message {
+							t.Fatalf("want ProviderError HTTP %d message %q, got %T: %v", test.statusCode, test.message, err, err)
+						}
+						expectedError = fmt.Sprintf("provider error: HTTP %d: %s", test.statusCode, test.message)
+					}
+					if err.Error() != expectedError {
+						t.Fatalf("want fixed sanitized error %q, got %q", expectedError, err.Error())
+					}
+					if test.message == "codex-cli output schema rejected" {
+						var admissionErr *ProviderAdmissionError
+						if errors.As(err, &admissionErr) {
+							t.Fatalf("schema rejection classified as admission error: %v", err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestCodexCLIOutputSchemaStderrFailure(t *testing.T) {
+	// A complete stream leaves the nonzero process exit to classify stderr.
+	stdout := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"thread-1"}`,
+		`{"type":"turn.started"}`,
+		`{"type":"item.completed","item":{"id":"message-1","type":"agent_message","text":"Pong"}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`,
+	}, "\n")
+	fixture, callsPath := newCodexCLIFailureFixture(t, stdout,
+		"Invalid schema: keyword uniqueItems is not permitted; private-upstream; token=private-secret", 1)
+	response, err := fixture.provider.Send(context.Background(), fixture.request)
+	if response != nil {
+		t.Fatalf("failed subprocess returned a response: %v", response)
+	}
+	var providerErr *ProviderError
+	var admissionErr *ProviderAdmissionError
+	if !errors.As(err, &providerErr) || providerErr.StatusCode != http.StatusBadGateway ||
+		providerErr.Message != "codex-cli output schema rejected" || errors.As(err, &admissionErr) {
+		t.Fatalf("want raw sanitized schema ProviderError, got %T: %v", err, err)
+	}
+	if err.Error() != "provider error: HTTP 502: codex-cli output schema rejected" {
+		t.Fatalf("stderr diagnostic leaked or category changed: %v", err)
+	}
+	if got := readTestFile(t, callsPath); got != "called\n" {
+		t.Fatalf("want exactly one fake subprocess call, got %q", got)
+	}
+}
+
 type structuredCodexFixture struct {
 	provider   *CodexCLIProvider
 	request    *LLMRequest

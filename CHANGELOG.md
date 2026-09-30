@@ -1,5 +1,9 @@
 # Changelog
 
+- Keep native leadership output schemas within the supported generation subset
+  while retaining canonical decision validation, and classify schema rejection
+  using a fixed safe diagnostic rather than exposing provider text (#856).
+
 - Retire expired schema-2 leadership decision authority only against its exact
   sealed unknown provider reservation, preserving the original dispatch and
   accounting. Allow a distinct bounded review of the same employee session;
