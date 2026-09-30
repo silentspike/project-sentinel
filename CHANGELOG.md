@@ -1,5 +1,12 @@
 # Changelog
 
+- Authorize one immutable, operator-governed leadership recovery review after
+  an exhausted unknown-model session, bound to the original history and a
+  protected installed repair release. Preserve model-selected decisions,
+  root limits, fixed deadlines and unknown-effect tombstones. Persist a fixed
+  native output-schema diagnostic separately from outcome and accounting;
+  never infer retry permission or free usage from that diagnostic (#856).
+
 - Keep native leadership output schemas within the supported generation subset
   while retaining canonical decision validation, and classify schema rejection
   using a fixed safe diagnostic rather than exposing provider text (#856).

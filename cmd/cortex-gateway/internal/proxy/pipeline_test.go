@@ -238,6 +238,132 @@ func TestPipelineFirstQuotaFailureDoesNotClaimPreProviderIO(t *testing.T) {
 	}
 }
 
+func TestPipelineNativeModelWorkDiagnostic(t *testing.T) {
+	schemaErr := codexCLIProcessError("invalid_json_schema: private-secret")
+	for _, tc := range []struct {
+		name       string
+		err        error
+		provider   string
+		mode       string
+		status     int
+		body       string
+		diagnostic string
+		providerIO string
+	}{
+		{name: "schema", err: schemaErr, status: http.StatusBadGateway,
+			body: "provider request failed\n", diagnostic: "codex_output_schema_rejected"},
+		{name: "wrapped_schema", err: errors.Join(errors.New("private-secret"), schemaErr), status: http.StatusBadGateway,
+			body: "provider request failed\n", diagnostic: "codex_output_schema_rejected"},
+		{name: "typed_not_message", err: &ProviderError{StatusCode: http.StatusBadGateway,
+			Message: "private-secret arbitrary message", Diagnostic: ProviderDiagnosticCodexOutputSchemaRejected},
+			status: http.StatusBadGateway, body: "provider request failed\n", diagnostic: "codex_output_schema_rejected"},
+		{name: "foreign_provider", err: schemaErr, provider: "mock", status: http.StatusBadGateway, body: "provider request failed\n"},
+		{name: "generic", err: codexCLIProcessError("private-secret failure"), status: http.StatusBadGateway, body: "provider request failed\n"},
+		{name: "raw_schema_message", err: &ProviderError{StatusCode: http.StatusBadGateway,
+			Message: "codex-cli output schema rejected"}, status: http.StatusBadGateway, body: "provider request failed\n"},
+		{name: "raw_arbitrary_message", err: &ProviderError{StatusCode: http.StatusBadGateway,
+			Message: "invalid_json_schema private-secret"}, status: http.StatusBadGateway, body: "provider request failed\n"},
+		{name: "unknown_category", err: &ProviderError{StatusCode: http.StatusBadGateway,
+			Diagnostic: ProviderDiagnosticCategory(255)}, status: http.StatusBadGateway, body: "provider request failed\n"},
+		{name: "wrong_status", err: &ProviderError{StatusCode: http.StatusServiceUnavailable,
+			Diagnostic: ProviderDiagnosticCodexOutputSchemaRejected}, status: http.StatusServiceUnavailable, body: "provider unavailable\n"},
+		{name: "quota_status", err: &ProviderError{StatusCode: http.StatusTooManyRequests,
+			Diagnostic: ProviderDiagnosticCodexOutputSchemaRejected}, status: http.StatusTooManyRequests, body: "provider rate limited\n"},
+		{name: "missing_status", err: &ProviderError{Diagnostic: ProviderDiagnosticCodexOutputSchemaRejected},
+			status: http.StatusBadGateway, body: "provider request failed\n"},
+		{name: "admission_schema", err: providerAdmissionError(schemaErr), status: http.StatusBadGateway,
+			body: "provider admission rejected\n", providerIO: "not-started"},
+		{name: "admission_generic", err: providerAdmissionError(errors.New("private-secret")), status: http.StatusConflict,
+			body: "provider admission rejected\n", providerIO: "not-started"},
+		{name: "quota_precedence", err: codexCLIProcessError("invalid schema usage limit reached private-secret"),
+			status: http.StatusTooManyRequests, body: "provider rate limited\n"},
+		{name: "authentication_precedence", err: codexCLIProcessError("invalid_json_schema authentication required private-secret"),
+			status: http.StatusServiceUnavailable, body: "provider unavailable\n"},
+		{name: "reasoning_precedence", err: codexCLIProcessError("invalid schema unsupported reasoning private-secret"),
+			status: http.StatusBadGateway, body: "provider request failed\n"},
+		{name: "non_model_work", err: schemaErr, mode: "non_model_work", status: http.StatusBadGateway, body: "provider request failed\n"},
+		{name: "public", err: schemaErr, mode: "public", status: http.StatusBadGateway, body: "provider request failed\n"},
+		{name: "internal_other", err: schemaErr, mode: "internal_other", status: http.StatusBadGateway, body: "provider request failed\n"},
+		{name: "unauthenticated", err: schemaErr, mode: "unauthenticated", status: http.StatusUnauthorized,
+			body: "authenticated caller context required\n"},
+		{name: "success", status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			providerName := tc.provider
+			if providerName == "" {
+				providerName = CodexCLIProviderName
+			}
+			provider := &pipelineMockProvider{name: providerName, err: tc.err,
+				resp: &LLMResponse{Content: "{}", Model: "model-a", InputTokens: 1, OutputTokens: 1, TokensUsed: 2}}
+			registry := NewRegistry()
+			registry.Register(providerName, provider)
+			handler := newTestPipelineHandler(registry, control.NewConfig(providerName))
+			request := newPipelineDiagnosticRequest(t, tc.mode)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != tc.status {
+				t.Fatalf("status=%d want=%d body=%s", recorder.Code, tc.status, recorder.Body.String())
+			}
+			if tc.body != "" && recorder.Body.String() != tc.body {
+				t.Fatalf("body=%q want=%q", recorder.Body.String(), tc.body)
+			}
+			values := recorder.Header().Values("X-Sentinel-Provider-Diagnostic")
+			if tc.diagnostic == "" {
+				if len(values) != 0 {
+					t.Fatalf("unexpected diagnostic header: %q", values)
+				}
+			} else if len(values) != 1 || values[0] != tc.diagnostic {
+				t.Fatalf("diagnostic=%q want exactly %q", values, tc.diagnostic)
+			}
+			if got := recorder.Header().Get("X-Sentinel-Provider-Io"); got != tc.providerIO {
+				t.Fatalf("provider I/O=%q want=%q", got, tc.providerIO)
+			}
+			wantCalls := 1
+			if tc.mode == "unauthenticated" {
+				wantCalls = 0
+			}
+			if provider.calls != wantCalls {
+				t.Fatalf("provider calls=%d want=%d", provider.calls, wantCalls)
+			}
+		})
+	}
+}
+
+func newPipelineDiagnosticRequest(t *testing.T, mode string) *http.Request {
+	t.Helper()
+	request := leadershipReviewTestRequest()
+	if mode == "non_model_work" || mode == "public" {
+		request = &LLMRequest{Model: "model-a", MaxTokens: 128, Metadata: map[string]string{"agent_id": "6"}}
+	}
+	if mode == "internal_other" {
+		request = &LLMRequest{Model: "model-a", MaxTokens: 128, Metadata: map[string]string{}}
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpRequest := newAgentRuntimeTestRequest(t, string(encoded))
+	httpRequest.Header.Set("X-Request-ID", request.Metadata["request_id"])
+	// Caller-supplied diagnostics must never be reflected into a response.
+	httpRequest.Header.Set("X-Sentinel-Provider-Diagnostic", "private-secret")
+	switch mode {
+	case "public":
+		httpRequest.URL.Path = "/v1/chat/completions"
+		httpRequest = httpRequest.WithContext(context.Background())
+	case "unauthenticated":
+		httpRequest = httpRequest.WithContext(context.Background())
+	case "internal_other":
+		// The runtime helper adds agent claims; service requests must not carry them.
+		encoded, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		httpRequest = httptest.NewRequest(http.MethodPost, "/internal/llm", strings.NewReader(string(encoded)))
+		httpRequest = httpRequest.WithContext(callerRoleContext(httpRequest.Context(), CallerRoleEvolution))
+	}
+	return httpRequest
+}
+
 func TestPipelineFullFlow(t *testing.T) {
 	reg := NewRegistry()
 	mock := &pipelineMockProvider{

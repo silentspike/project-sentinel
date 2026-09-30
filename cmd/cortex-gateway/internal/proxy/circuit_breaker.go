@@ -240,10 +240,20 @@ func (cb *CircuitBreaker) tripOpen(now time.Time) {
 	cb.probeCount = 0
 }
 
+// ProviderDiagnosticCategory is fixed internal metadata, not provider text or
+// evidence that an attempted dispatch is safe to repeat.
+type ProviderDiagnosticCategory uint8
+
+const (
+	ProviderDiagnosticNone ProviderDiagnosticCategory = iota
+	ProviderDiagnosticCodexOutputSchemaRejected
+)
+
 // ProviderError repraesentiert einen Fehler mit HTTP-Statuscode.
 type ProviderError struct {
 	StatusCode int
 	Message    string
+	Diagnostic ProviderDiagnosticCategory
 }
 
 func (e *ProviderError) Error() string {

@@ -199,6 +199,9 @@ impl WorkflowApi {
         call: &AdaptiveLeadershipReviewCallV1,
         proposed: &CompleteAdaptiveLeadershipReviewCallV1,
     ) -> Result<CompleteAdaptiveLeadershipReviewCallV1, &'static str> {
+        self.store
+            .validate_adaptive_leadership_recovery_decision(call, &proposed.decision)
+            .map_err(|_| "recovery continuation exceeds immutable authority")?;
         let events = self
             .event_store
             .as_ref()

@@ -186,6 +186,22 @@ impl WorkflowStore {
         Ok(Some(session))
     }
 
+    /// Exact journal identity for a separately authorized recovery intervention.
+    pub fn adaptive_session_head_digest(
+        &self,
+        session_id: Uuid,
+        current: &RuntimeAuthoritySnapshotV1,
+    ) -> Result<Option<String>, WorkflowError> {
+        current.validate()?;
+        let connection = self.lock()?;
+        let Some((session, digest)) = load(&connection, session_id)? else {
+            return Ok(None);
+        };
+        authorize(&session.grant, current)?;
+        require_head(&connection, &session)?;
+        Ok(Some(digest))
+    }
+
     /// Resolves exact authority without hiding same-assignment campaigns after drift.
     pub fn adaptive_session_for_authority(
         &self,
@@ -674,6 +690,7 @@ pub(crate) fn continue_adaptive_session_in_transaction(
     current.validate()?;
     review.grant.validate(review.grant_issued_at_unix_ms)?;
     review.context.validate(&review.grant)?;
+    WorkflowStore::require_recovery_epoch_review(tx, review)?;
     let stored_review: AdaptiveLeadershipReviewCallV1 = read_company_entity(
         tx,
         &current.tenant_id.0,
@@ -1807,6 +1824,7 @@ mod continuation_tests {
         .unwrap();
         let review_grant = AdaptiveLeadershipReviewGrantV1 {
             schema_version: 1,
+            recovery_epoch: None,
             subject: None,
             review_id: crate::adaptive_leadership_review_id(root.session_id, 3, &fingerprint)
                 .unwrap(),
