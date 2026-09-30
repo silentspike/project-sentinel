@@ -1,5 +1,11 @@
 # Changelog
 
+- Cache observed Codex usage-limit failures for a bounded local cooldown and
+  reject known provider unavailability before queue admission and subscription
+  dispatch. Preserve provider status through queue wrappers and keep the first
+  post-dispatch rejection distinct from a proven pre-provider rejection;
+  unknown effects and consumed allowances are never refunded or replayed (#856).
+
 - Isolate stale project/assignment discovery from eligible company work while
   preserving strict health and execution authority checks. Align the Codex
   adaptive response schema with bounded private workspace directory inspection;
