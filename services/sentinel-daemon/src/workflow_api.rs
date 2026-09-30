@@ -4223,6 +4223,9 @@ impl WorkflowApi {
                 false,
             );
         };
+        let Ok(_guard) = self.mutation_fence.read() else {
+            return json_error(503, "workflow_busy", "workflow recovery is active", true);
+        };
         let requests = if let Some(id) = query_parameter(path, "request_id") {
             self.store
                 .company_customer_request(&principal.principal.tenant_id, id)
@@ -4301,15 +4304,25 @@ impl WorkflowApi {
             {
                 continue;
             }
-            let work: Vec<_> = project
-                .work_items
-                .iter()
-                .map(|(id, work)| {
-                    serde_json::json!({
-                        "work_item_id": id, "state": work.state,
-                    })
-                })
-                .collect();
+            let mut work_rows = Vec::new();
+            for (id, work) in &project.work_items {
+                let mut row = serde_json::json!({
+                    "work_item_id": id, "state": work.state,
+                });
+                match self.customer_adaptive_progress(&project, id, work) {
+                    Ok(Some(progress)) => row["adaptive_progress"] = progress,
+                    Ok(None) => {}
+                    Err(()) => {
+                        return json_error(
+                            503,
+                            "customer_progress_unavailable",
+                            "Customer progress is unavailable",
+                            true,
+                        )
+                    }
+                }
+                work_rows.push(row);
+            }
             let deliveries = if let Some(delivery) = &self.delivery {
                 let Some(caller) = delivery_principal(&principal.principal) else {
                     return json_error(
@@ -4335,7 +4348,7 @@ impl WorkflowApi {
             progress.push(serde_json::json!({
                 "project_id": project.project_id, "request_id": agreement.request_id,
                 "state": project.lifecycle_state, "version": project.version,
-                "work_items": work,
+                "work_items": work_rows,
                 "deliveries": deliveries,
             }));
         }
@@ -4343,6 +4356,96 @@ impl WorkflowApi {
             200,
             &serde_json::json!({"requests": requests, "proposals": proposals, "projects": progress}),
         )
+    }
+
+    // Only current, replay-verified heads contribute public progress, never history.
+    fn customer_adaptive_progress(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        id: &WorkItemId,
+        work: &sentinel_workflow::CompanyWorkItemV1,
+    ) -> Result<Option<serde_json::Value>, ()> {
+        if id != &work.spec.work_item_id
+            || !matches!(
+                work.spec.required_role,
+                CompanyRoleV1::Developer | CompanyRoleV1::Designer
+            )
+            || !matches!(
+                work.state,
+                sentinel_workflow::CompanyWorkStateV1::Assigned
+                    | sentinel_workflow::CompanyWorkStateV1::InProgress
+                    | sentinel_workflow::CompanyWorkStateV1::InReview
+            )
+        {
+            return Ok(None);
+        }
+        let mut assignments = work
+            .assignments
+            .iter()
+            .filter(|assignment| assignment.active);
+        let Some(assignment) = assignments.next() else {
+            return Ok(None);
+        };
+        if assignments.next().is_some() {
+            return Ok(None);
+        }
+        let Some(authority) = self.authority.as_ref() else {
+            return Ok(None);
+        };
+        let current = match authority.snapshot_for_admission(
+            &project.tenant_id,
+            &project.project_id,
+            id,
+            assignment.agent_id,
+            false,
+        ) {
+            Ok(current) => current,
+            Err(WorkflowPortError::AuthorityConflict) => return Ok(None),
+            Err(_) => return Err(()),
+        };
+        if current.tenant_id != project.tenant_id
+            || current.project_id != project.project_id
+            || current.work_item_id != *id
+            || current.agent_id != assignment.agent_id
+            || current.assignment_version != assignment.assignment_version
+            || current.assignment_digest != assignment.canonical_digest().map_err(|_| ())?
+            || current.policy_generation != project.governance.project_profile.generation
+            || current.policy_digest != project.governance.project_profile.digest
+        {
+            return Err(());
+        }
+        let session = match self.store.adaptive_session_for_authority(&current) {
+            Ok(session) => session,
+            Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => return Ok(None),
+            Err(_) => return Err(()),
+        };
+        if self
+            .store
+            .company_project(&project.tenant_id, &project.project_id)
+            .map_err(|_| ())?
+            .as_ref()
+            != Some(project)
+        {
+            return Err(());
+        }
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        let (status, label) = match &session.cursor {
+            AdaptiveCursorV1::Blocked { reason_code }
+                if reason_code == "no_private_observation" =>
+            {
+                (
+                    "paused_internal_observation",
+                    "Paused: awaiting internal observation.",
+                )
+            }
+            AdaptiveCursorV1::ModelUnknown { .. } => {
+                ("model_outcome_unknown", "Model outcome unknown.")
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(serde_json::json!({"status": status, "label": label})))
     }
 
     fn customer_request(&self, principal: &BoundPrincipal, path: &str) -> WorkflowHttpResponse {
@@ -6072,6 +6175,346 @@ mod tests {
         let body = String::from_utf8(identity.body).unwrap();
         assert!(!body.contains("01234567890123456789012345678901"));
         assert!(!body.contains("authority_digest"));
+    }
+
+    #[cfg(feature = "llm")]
+    fn customer_progress_advance(
+        api: &WorkflowApi,
+        session: &AdaptiveSessionV1,
+        command: AdaptiveTransitionV1,
+    ) -> AdaptiveSessionV1 {
+        api.store
+            .advance_adaptive_session(
+                session.grant.session_id,
+                session.version,
+                Uuid::new_v4(),
+                &command,
+                &session.grant.authority,
+                now_unix_ms().max(session.updated_at_ms),
+            )
+            .unwrap()
+            .1
+    }
+
+    #[cfg(feature = "llm")]
+    fn customer_progress_body(api: &WorkflowApi) -> serde_json::Value {
+        let customer = api.principals.principal("customer").unwrap();
+        let response = api.customer_overview(&customer, CUSTOMER_OVERVIEW_PATH);
+        assert_eq!(response.status, 200);
+        serde_json::from_slice(&response.body).unwrap()
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn customer_progress_exact_heads_use_only_fixed_labels_without_writes() {
+        for unknown in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (api, ready) = adaptive_recovery::tests::fixture(
+                &temp.path().join("company.sqlite"),
+                &temp.path().join("events.sqlite"),
+                false,
+            );
+            let effect = AdaptiveEffectV1 {
+                id: Uuid::new_v4(),
+                request_digest: "a".repeat(64),
+            };
+            let pending = customer_progress_advance(
+                &api,
+                &ready,
+                AdaptiveTransitionV1::ClaimModel {
+                    effect: effect.clone(),
+                    previous_observation_digest: None,
+                },
+            );
+            let session = customer_progress_advance(
+                &api,
+                &pending,
+                if unknown {
+                    AdaptiveTransitionV1::MarkUnknown { effect }
+                } else {
+                    AdaptiveTransitionV1::ResolveModel {
+                        effect,
+                        result_digest: "b".repeat(64),
+                        decision: sentinel_workflow::AdaptiveModelDecisionV1::Blocked {
+                            reason_code: "no_private_observation".into(),
+                        },
+                    }
+                },
+            );
+            let projects = api.store.company_projects().unwrap();
+            let cursor = api.store.company_event_cursor().unwrap();
+            let body = customer_progress_body(&api);
+            let work = &body["projects"][0]["work_items"][0];
+            assert_eq!(work["state"], "assigned");
+            assert_eq!(
+                work["adaptive_progress"],
+                if unknown {
+                    serde_json::json!({"status":"model_outcome_unknown", "label":"Model outcome unknown."})
+                } else {
+                    serde_json::json!({"status":"paused_internal_observation", "label":"Paused: awaiting internal observation."})
+                }
+            );
+            let bytes = body.to_string();
+            let session_id = session.grant.session_id.to_string();
+            for private in [
+                "no_private_observation",
+                "request_digest",
+                "reason_code",
+                "provider",
+                "credentials",
+                "workspace_root",
+                session_id.as_str(),
+            ] {
+                assert!(
+                    !bytes.contains(private),
+                    "unexpected private field: {private}"
+                );
+            }
+            assert_eq!(api.store.company_projects().unwrap(), projects);
+            assert_eq!(api.store.company_event_cursor().unwrap(), cursor);
+            assert_eq!(
+                api.store
+                    .adaptive_session(session.grant.session_id, &session.grant.authority)
+                    .unwrap(),
+                Some(session)
+            );
+            let mut foreign = api.principals.principal("customer").unwrap();
+            foreign.principal.tenant_id = TenantId::parse("foreign-tenant").unwrap();
+            let response = api.customer_overview(&foreign, CUSTOMER_OVERVIEW_PATH);
+            assert_eq!(response.status, 200);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["projects"], serde_json::json!([]));
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn customer_progress_omits_normal_work_and_unrecognized_private_reasons() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, ready) = adaptive_recovery::tests::fixture(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+            false,
+        );
+        assert!(customer_progress_body(&api)["projects"][0]["work_items"][0]
+            .get("adaptive_progress")
+            .is_none());
+        let effect = AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: "a".repeat(64),
+        };
+        let pending = customer_progress_advance(
+            &api,
+            &ready,
+            AdaptiveTransitionV1::ClaimModel {
+                effect: effect.clone(),
+                previous_observation_digest: None,
+            },
+        );
+        assert!(customer_progress_body(&api)["projects"][0]["work_items"][0]
+            .get("adaptive_progress")
+            .is_none());
+        customer_progress_advance(
+            &api,
+            &pending,
+            AdaptiveTransitionV1::ResolveModel {
+                effect,
+                result_digest: "b".repeat(64),
+                decision: sentinel_workflow::AdaptiveModelDecisionV1::Blocked {
+                    reason_code: "private_provider_secret".into(),
+                },
+            },
+        );
+        let body = customer_progress_body(&api);
+        assert!(body["projects"][0]["work_items"][0]
+            .get("adaptive_progress")
+            .is_none());
+        assert!(!body.to_string().contains("private_provider_secret"));
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn customer_progress_never_substitutes_a_prior_assignment_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, ready) = adaptive_recovery::tests::fixture(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+            false,
+        );
+        let effect = AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: "a".repeat(64),
+        };
+        let pending = customer_progress_advance(
+            &api,
+            &ready,
+            AdaptiveTransitionV1::ClaimModel {
+                effect: effect.clone(),
+                previous_observation_digest: None,
+            },
+        );
+        let old =
+            customer_progress_advance(&api, &pending, AdaptiveTransitionV1::MarkUnknown { effect });
+        let project = api
+            .store
+            .company_project(
+                &ready.grant.authority.tenant_id,
+                &ready.grant.authority.project_id,
+            )
+            .unwrap()
+            .unwrap();
+        let assignment = project.work_items[&ready.grant.authority.work_item_id]
+            .assignments
+            .iter()
+            .find(|assignment| assignment.active)
+            .unwrap();
+        api.store
+            .apply_company_command(
+                &api.principals.principal("pm").unwrap().principal,
+                Uuid::new_v4(),
+                &CompanyWorkflowCommandV1::ReassignWork {
+                    project_id: project.project_id.clone(),
+                    expected_version: project.version,
+                    work_item_id: ready.grant.authority.work_item_id.clone(),
+                    expected_assignment_version: assignment.assignment_version,
+                    agent_id: assignment.agent_id,
+                    organization_generation: assignment.organization_generation,
+                    organization_digest: assignment.organization_digest.clone(),
+                    reason_ref: "new_assignment".into(),
+                },
+                now_unix_ms(),
+            )
+            .unwrap();
+        assert!(customer_progress_body(&api)["projects"][0]["work_items"][0]
+            .get("adaptive_progress")
+            .is_none());
+        assert_eq!(
+            api.store
+                .adaptive_session(old.grant.session_id, &old.grant.authority)
+                .unwrap(),
+            Some(old)
+        );
+        assert!(api
+            .customer_adaptive_progress(
+                &project,
+                &ready.grant.authority.work_item_id,
+                &project.work_items[&ready.grant.authority.work_item_id]
+            )
+            .is_err());
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn customer_progress_ignores_other_scopes_and_rejects_a_stale_head_version() {
+        for scope in 0..4 {
+            let temp = tempfile::tempdir().unwrap();
+            let (api, ready) = adaptive_recovery::tests::fixture(
+                &temp.path().join("company.sqlite"),
+                &temp.path().join("events.sqlite"),
+                false,
+            );
+            let mut grant = ready.grant.clone();
+            grant.session_id = Uuid::new_v4();
+            match scope {
+                0 => grant.authority.tenant_id = TenantId::parse("foreign-tenant").unwrap(),
+                1 => grant.authority.project_id = ProjectId::parse("foreign-project").unwrap(),
+                2 => grant.authority.work_item_id = WorkItemId::parse("foreign-work").unwrap(),
+                _ => grant.authority.agent_id = AgentId(999),
+            }
+            let foreign = api
+                .store
+                .begin_adaptive_session(&grant, &grant.authority, grant.created_at_ms)
+                .unwrap()
+                .1;
+            let effect = AdaptiveEffectV1 {
+                id: Uuid::new_v4(),
+                request_digest: "a".repeat(64),
+            };
+            let pending = customer_progress_advance(
+                &api,
+                &foreign,
+                AdaptiveTransitionV1::ClaimModel {
+                    effect: effect.clone(),
+                    previous_observation_digest: None,
+                },
+            );
+            customer_progress_advance(&api, &pending, AdaptiveTransitionV1::MarkUnknown { effect });
+            assert!(customer_progress_body(&api)["projects"][0]["work_items"][0]
+                .get("adaptive_progress")
+                .is_none());
+        }
+        for missing_journal in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let company = temp.path().join("company.sqlite");
+            let (api, ready) = adaptive_recovery::tests::fixture(
+                &company,
+                &temp.path().join("events.sqlite"),
+                false,
+            );
+            let connection = sentinel_limbo::rusqlite::Connection::open(&company).unwrap();
+            if missing_journal {
+                connection
+                    .execute(
+                        "DELETE FROM workflow_operations WHERE operation_namespace=?1",
+                        [format!("adaptive-session-v1:{}", ready.grant.session_id)],
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute(
+                        "UPDATE workflow_adaptive_heads SET version=version+1 WHERE session_id=?1",
+                        [ready.grant.session_id.to_string()],
+                    )
+                    .unwrap();
+            }
+            let response = api.customer_overview(
+                &api.principals.principal("customer").unwrap(),
+                CUSTOMER_OVERVIEW_PATH,
+            );
+            assert_eq!(response.status, 503);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["code"], "customer_progress_unavailable");
+            assert_eq!(body["error"], "Customer progress is unavailable");
+            assert!(!body.to_string().contains(company.to_str().unwrap()));
+        }
+    }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn customer_progress_requires_exact_current_policy_not_just_scope_and_assignment_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, ready) = adaptive_recovery::tests::fixture(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+            false,
+        );
+        let mut grant = ready.grant.clone();
+        grant.session_id = Uuid::new_v4();
+        grant.authority.policy_generation += 1;
+        grant.authority.policy_digest = "c".repeat(64);
+        let foreign = api
+            .store
+            .begin_adaptive_session(&grant, &grant.authority, grant.created_at_ms)
+            .unwrap()
+            .1;
+        let effect = AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: "a".repeat(64),
+        };
+        let pending = customer_progress_advance(
+            &api,
+            &foreign,
+            AdaptiveTransitionV1::ClaimModel {
+                effect: effect.clone(),
+                previous_observation_digest: None,
+            },
+        );
+        customer_progress_advance(&api, &pending, AdaptiveTransitionV1::MarkUnknown { effect });
+        let body = customer_progress_body(&api);
+        assert_eq!(body["projects"][0]["work_items"][0]["state"], "assigned");
+        assert!(body["projects"][0]["work_items"][0]
+            .get("adaptive_progress")
+            .is_none());
     }
 
     fn collaboration_publication() -> CollaborationPublicationV1 {
