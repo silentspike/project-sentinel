@@ -765,6 +765,14 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 				errMsg = "provider unavailable"
 			}
 		}
+		// This private, allowlisted category carries no outcome or billing claim.
+		if authenticated && req.CallerRole == CallerRoleAgentRuntime &&
+			req.RequestClass == RequestClassAgentRuntime && req.Format == RequestFormatInternal &&
+			modelWork && providerName == CodexCLIProviderName && admissionErr == nil &&
+			provErr != nil && provErr.StatusCode == http.StatusBadGateway &&
+			provErr.Diagnostic == ProviderDiagnosticCodexOutputSchemaRejected {
+			w.Header().Set("X-Sentinel-Provider-Diagnostic", "codex_output_schema_rejected")
+		}
 		ph.writeRequestError(w, &req, errMsg, statusCode)
 		return
 	}

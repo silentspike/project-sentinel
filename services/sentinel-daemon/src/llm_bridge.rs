@@ -340,6 +340,13 @@ pub mod bridge {
     }
 
     trait CompletionStore: Send + Sync {
+        fn seal_output_schema_rejection(
+            &self,
+            _reservation: &LlmModelReservationV1,
+            _tick: u64,
+        ) -> anyhow::Result<bool> {
+            anyhow::bail!("store does not support durable provider diagnostics")
+        }
         fn bind_model_reservation(&self, reservation: &LlmModelReservationV1)
             -> anyhow::Result<()>;
         fn sealed_model_evidence(
@@ -398,6 +405,13 @@ pub mod bridge {
     }
 
     impl CompletionStore for EventStore {
+        fn seal_output_schema_rejection(
+            &self,
+            reservation: &LlmModelReservationV1,
+            tick: u64,
+        ) -> anyhow::Result<bool> {
+            self.seal_llm_model_output_schema_rejection(reservation, tick)
+        }
         fn bind_model_reservation(
             &self,
             reservation: &LlmModelReservationV1,
@@ -735,6 +749,86 @@ pub mod bridge {
                 false
             }
         }
+    }
+
+    fn is_output_schema_rejection(
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+    ) -> bool {
+        if status != reqwest::StatusCode::BAD_GATEWAY {
+            return false;
+        }
+        let mut diagnostic = headers.get_all("x-sentinel-provider-diagnostic").iter();
+        if diagnostic.next().and_then(|value| value.to_str().ok())
+            != Some("codex_output_schema_rejected")
+            || diagnostic.next().is_some()
+        {
+            return false;
+        }
+        // An admission rejection cannot attest a post-dispatch provider failure.
+        let mut provider_io = headers.get_all("x-sentinel-provider-io").iter();
+        matches!((provider_io.next(), provider_io.next()), (None, None))
+    }
+
+    fn persist_output_schema_rejection<S: CompletionStore>(
+        store: &S,
+        context: Option<&ModelWorkContext>,
+        request_id: &str,
+        request_digest: &str,
+        tick: u64,
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+    ) -> bool {
+        if !is_output_schema_rejection(status, headers) {
+            return false;
+        }
+        let Some(context) = context else {
+            return false;
+        };
+        match model_reservation(context, request_id, request_digest) {
+            Ok(Some(reservation)) => match store.seal_output_schema_rejection(&reservation, tick) {
+                Ok(_) => true,
+                Err(error) => {
+                    warn!(request_id, error = %error, "Provider diagnostic could not be sealed");
+                    false
+                }
+            },
+            _ => false,
+        }
+    }
+
+    fn handle_gateway_rejection<S: CompletionStore>(
+        store: &S,
+        context: Option<&ModelWorkContext>,
+        request_id: &str,
+        request_digest: &str,
+        tick: u64,
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+    ) -> bool {
+        let mut provider_io = headers.get_all("x-sentinel-provider-io").iter();
+        let first = provider_io.next();
+        let duplicate = provider_io.next().is_some();
+        if !headers.contains_key("x-sentinel-provider-diagnostic")
+            && !duplicate
+            && release_pre_provider_rejection(
+                store,
+                request_id,
+                request_digest,
+                first.and_then(|value| value.to_str().ok()),
+            )
+        {
+            return true;
+        }
+        persist_output_schema_rejection(
+            store,
+            context,
+            request_id,
+            request_digest,
+            tick,
+            status,
+            headers,
+        )
     }
 
     fn model_reservation(
@@ -2306,18 +2400,12 @@ pub mod bridge {
                                         }
                                     }
                                 } else {
-                                    let provider_io = response
-                                        .headers()
-                                        .get("x-sentinel-provider-io")
-                                        .and_then(|value| value.to_str().ok());
-                                    let reservation_released = release_pre_provider_rejection(
-                                        bridge_event_store.as_ref(),
-                                        &request_id,
-                                        &request_digest,
-                                        provider_io,
+                                    let rejection_resolved = handle_gateway_rejection(
+                                        bridge_event_store.as_ref(), model_work.as_ref(),
+                                        &request_id, &request_digest, current_tick, status, response.headers(),
                                     );
-                                    warn!(agent = %agent_id, status = status.as_u16(), reservation_released, "Gateway HTTP Fehler");
-                                    if reservation_released {
+                                    warn!(agent = %agent_id, status = status.as_u16(), rejection_resolved, "Gateway HTTP Fehler");
+                                    if rejection_resolved {
                                         outcome_guard.armed = false;
                                     }
                                     telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
@@ -2457,18 +2545,12 @@ pub mod bridge {
                                         }
                                     }
                                 } else {
-                                    let provider_io = response
-                                        .headers()
-                                        .get("x-sentinel-provider-io")
-                                        .and_then(|value| value.to_str().ok());
-                                    let reservation_released = release_pre_provider_rejection(
-                                        bridge_event_store.as_ref(),
-                                        &request_id,
-                                        &request_digest,
-                                        provider_io,
+                                    let rejection_resolved = handle_gateway_rejection(
+                                        bridge_event_store.as_ref(), model_work.as_ref(),
+                                        &request_id, &request_digest, current_tick, status, response.headers(),
                                     );
-                                    warn!(agent = %agent_id, status = status.as_u16(), reservation_released, "Gateway HTTP Fehler");
-                                    if reservation_released {
+                                    warn!(agent = %agent_id, status = status.as_u16(), rejection_resolved, "Gateway HTTP Fehler");
+                                    if rejection_resolved {
                                         outcome_guard.armed = false;
                                     }
                                     telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
@@ -3095,6 +3177,110 @@ pub mod bridge {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn output_schema_diagnostic_requires_exact_single_post_dispatch_header() {
+            use reqwest::header::{HeaderMap, HeaderValue};
+            let mut headers = HeaderMap::new();
+            let status = reqwest::StatusCode::BAD_GATEWAY;
+            assert!(!is_output_schema_rejection(status, &headers));
+            headers.insert(
+                "x-sentinel-provider-diagnostic",
+                HeaderValue::from_static("codex_output_schema_rejected"),
+            );
+            assert!(is_output_schema_rejection(status, &headers));
+            assert!(!is_output_schema_rejection(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                &headers
+            ));
+            headers.insert(
+                "x-sentinel-provider-io",
+                HeaderValue::from_static("not-started"),
+            );
+            assert!(!is_output_schema_rejection(status, &headers));
+            headers.remove("x-sentinel-provider-io");
+            headers.append(
+                "x-sentinel-provider-diagnostic",
+                HeaderValue::from_static("codex_output_schema_rejected"),
+            );
+            assert!(!is_output_schema_rejection(status, &headers));
+            headers.insert(
+                "x-sentinel-provider-diagnostic",
+                HeaderValue::from_static("unknown"),
+            );
+            assert!(!is_output_schema_rejection(status, &headers));
+            headers.insert(
+                "x-sentinel-provider-diagnostic",
+                HeaderValue::from_bytes(&[0xff]).unwrap(),
+            );
+            assert!(!is_output_schema_rejection(status, &headers));
+        }
+
+        #[test]
+        fn contradictory_schema_diagnostic_cannot_release_pre_provider_reservation() {
+            use reqwest::header::{HeaderMap, HeaderValue};
+            let store = EventStore::open(":memory:").unwrap();
+            store
+                .reserve_llm_request("diagnostic-contradiction", "digest", "AGENT-07")
+                .unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-sentinel-provider-io",
+                HeaderValue::from_static("not-started"),
+            );
+            headers.insert(
+                "x-sentinel-provider-diagnostic",
+                HeaderValue::from_static("codex_output_schema_rejected"),
+            );
+            assert!(!handle_gateway_rejection(
+                &store,
+                None,
+                "diagnostic-contradiction",
+                "digest",
+                7,
+                reqwest::StatusCode::BAD_GATEWAY,
+                &headers
+            ));
+            assert_eq!(
+                store
+                    .get_llm_completion("diagnostic-contradiction")
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "provider_in_flight"
+            );
+            headers.remove("x-sentinel-provider-diagnostic");
+            headers.append(
+                "x-sentinel-provider-io",
+                HeaderValue::from_static("not-started"),
+            );
+            assert!(!handle_gateway_rejection(
+                &store,
+                None,
+                "diagnostic-contradiction",
+                "digest",
+                7,
+                reqwest::StatusCode::BAD_GATEWAY,
+                &headers
+            ));
+            headers.insert(
+                "x-sentinel-provider-io",
+                HeaderValue::from_static("not-started"),
+            );
+            assert!(handle_gateway_rejection(
+                &store,
+                None,
+                "diagnostic-contradiction",
+                "digest",
+                7,
+                reqwest::StatusCode::BAD_GATEWAY,
+                &headers
+            ));
+            assert!(store
+                .get_llm_completion("diagnostic-contradiction")
+                .unwrap()
+                .is_none());
+        }
 
         fn reserved_guard(
             store: &Arc<EventStore>,

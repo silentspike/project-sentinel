@@ -73,6 +73,8 @@ pub struct AdaptiveLeadershipReviewGrantV1 {
     pub expires_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<AdaptiveLeadershipReviewSubjectV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_epoch: Option<crate::AdaptiveLeadershipRecoveryBindingV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +131,10 @@ impl AdaptiveLeadershipReviewCallV1 {
         if issued_at_ms == 0
             || !(1_000..=ADAPTIVE_LEADERSHIP_MAX_GRANT_MS).contains(&window_ms)
             || !(1..=crate::ADAPTIVE_SESSION_MAX_CALLS).contains(&additional_model_calls)
+            || self.grant.recovery_epoch.as_ref().is_some_and(|binding| {
+                additional_model_calls > binding.max_additional_model_calls
+                    || window_ms > binding.max_window_ms
+            })
         {
             return Err(invalid());
         }
@@ -296,6 +302,28 @@ impl AdaptiveLeadershipReviewDecisionV1 {
         if self.schema_version != grant.schema_version {
             return Err(invalid());
         }
+        if let Some(binding) = &grant.recovery_epoch {
+            binding.validate_for(
+                &grant.leadership_principal.tenant_id,
+                grant.session_id,
+                grant.review_id,
+            )?;
+            if grant.schema_version != 2
+                || !matches!(
+                    &grant.subject,
+                    Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. })
+                )
+                || matches!(
+                    &self.decision,
+                    AdaptiveLeadershipReviewDecisionKindV1::Continue {
+                        additional_model_calls, window_ms, ..
+                    } if *additional_model_calls > binding.max_additional_model_calls
+                        || *window_ms > binding.max_window_ms
+                )
+            {
+                return Err(invalid());
+            }
+        }
         let valid = matches!(
             (&grant.subject, &self.decision),
             (
@@ -401,6 +429,17 @@ impl AdaptiveLeadershipReviewGrantV1 {
         validate_identifier(&self.model)?;
         validate_digest(&self.catalog_digest)?;
         let leader = &self.leadership_principal;
+        if let Some(binding) = &self.recovery_epoch {
+            binding.validate_for(&leader.tenant_id, self.session_id, self.review_id)?;
+            if self.schema_version != 2
+                || !matches!(
+                    &self.subject,
+                    Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. })
+                )
+            {
+                return Err(invalid());
+            }
+        }
         let valid_subject = match (&self.subject, self.schema_version) {
             (None, 1) => valid_reason(&self.expected_reason_code),
             (

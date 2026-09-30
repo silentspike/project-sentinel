@@ -2914,6 +2914,134 @@ impl EventStore {
         Ok(changed == 1)
     }
 
+    /// Diagnostic metadata does not establish a result, usage or retry permission.
+    /// Seal and audit atomically using only a before-send registered model binding.
+    pub fn seal_llm_model_output_schema_rejection(
+        &self,
+        reservation: &LlmModelReservationV1,
+        tick: u64,
+    ) -> anyhow::Result<bool> {
+        reservation.validate()?;
+        anyhow::ensure!(
+            reservation.usage_binding.provider == "codex-cli" && tick <= i64::MAX as u64,
+            "invalid native model diagnostic"
+        );
+        let conn = self.begin_fenced_write_for_llm_completion(&reservation.request_id)?;
+        let (digest, owner, payload, status, binding, retrospective, reason, created): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+        ) = conn.query_row(
+            "SELECT request_digest,owner_scope,payload,status,model_binding,
+                 retrospective_model_binding,last_error,created_at FROM llm_completion_outbox
+                 WHERE request_id=?1",
+            params![reservation.request_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )?;
+        anyhow::ensure!(
+            digest == reservation.request_digest
+                && owner == reservation.owner_scope.to_wire()
+                && payload.is_empty()
+                && retrospective.is_empty()
+                && !binding.is_empty()
+                && (status == "provider_in_flight"
+                    || (status == "failed" && sealed_unknown_reason(reason.as_deref()))),
+            "model diagnostic reservation changed"
+        );
+        let stored: LlmModelReservationV1 = serde_json::from_str(&binding)?;
+        anyhow::ensure!(&stored == reservation, "model diagnostic binding conflict");
+        let operation = format!("llm_provider_diagnostic:{}", reservation.request_id);
+        let diagnostic = serde_json::to_string(&serde_json::json!({
+            "schema_version":1,"category":"codex_output_schema_rejected",
+            "http_status":502,"reservation":reservation
+        }))?;
+        let mut statement = conn.prepare(
+            "SELECT event_type,aggregate_id,payload,correlation_id,tick,schema_version,
+             compensation_type,causation_id,event_id,timestamp_ms FROM events
+             WHERE operation_id=?1 LIMIT 2",
+        )?;
+        let existing = statement
+            .query_map(params![operation], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if !existing.is_empty() {
+            anyhow::ensure!(existing.len() == 1, "duplicate model diagnostic operation");
+            let event = &existing[0];
+            anyhow::ensure!(
+                event.0 == "llm_provider_failure_diagnostic"
+                    && event.1 == owner
+                    && event.2 == diagnostic
+                    && event.3 == reservation.request_id
+                    && event.4 == tick as i64
+                    && event.5 == 1
+                    && event.6 == "none"
+                    && event.7.is_none()
+                    && uuid::Uuid::parse_str(&event.8).is_ok_and(|id| !id.is_nil())
+                    && event.9 >= created
+                    && status == "failed"
+                    && sealed_unknown_reason(reason.as_deref()),
+                "model diagnostic event conflict"
+            );
+            conn.commit()?;
+            return Ok(false);
+        }
+        let event = DomainEvent::new(
+            "llm_provider_failure_diagnostic",
+            &owner,
+            &diagnostic,
+            &reservation.request_id,
+            tick,
+        )
+        .with_operation_id(&operation);
+        anyhow::ensure!(
+            event.timestamp_ms <= i64::MAX as u64
+                && created >= 0
+                && event.timestamp_ms >= created as u64,
+            "model diagnostic clock invalid"
+        );
+        append_exact_model_usage(&conn, &event)?;
+        if status == "provider_in_flight" {
+            let changed = conn.execute(
+                "UPDATE llm_completion_outbox SET status='failed',last_error=?3,updated_at=?4
+                 WHERE request_id=?1 AND request_digest=?2 AND status='provider_in_flight' AND payload=''",
+                params![reservation.request_id,reservation.request_digest,
+                    "UnknownOutcome: bridge_task_ended_without_durable_response",event.timestamp_ms as i64],
+            )?;
+            anyhow::ensure!(changed == 1, "model diagnostic seal conflict");
+        }
+        conn.commit()?;
+        Ok(true)
+    }
+
     /// Observe bounded ambiguous reservations; callers must not redispatch them.
     pub fn poll_llm_provider_in_flight(
         &self,
@@ -5574,6 +5702,137 @@ mod tests {
                 model: "gpt-5.4".into(),
             },
         }
+    }
+
+    fn reserve_schema_diagnostic(store: &EventStore, reservation: &LlmModelReservationV1) {
+        assert!(store
+            .reserve_llm_request(
+                &reservation.request_id,
+                &reservation.request_digest,
+                &reservation.usage_binding.agent_id.to_string()
+            )
+            .unwrap());
+        store.bind_llm_model_reservation(reservation).unwrap();
+    }
+
+    #[test]
+    fn model_schema_diagnostic_is_atomic_durable_and_not_usage_or_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schema-diagnostic.db");
+        let reservation = model_reservation_fixture();
+        {
+            let store = EventStore::open(path.to_str().unwrap()).unwrap();
+            reserve_schema_diagnostic(&store, &reservation);
+            assert!(store
+                .seal_llm_model_output_schema_rejection(&reservation, 7)
+                .unwrap());
+        }
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        assert!(!store
+            .seal_llm_model_output_schema_rejection(&reservation, 7)
+            .unwrap());
+        let entry = store
+            .get_llm_completion(&reservation.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.status, "failed");
+        assert_eq!(
+            entry.last_error.as_deref(),
+            Some("UnknownOutcome: bridge_task_ended_without_durable_response")
+        );
+        assert!(entry.payload.is_empty());
+        assert_eq!(entry.attempt_count, 0);
+        let events = store.get_all_events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "llm_provider_failure_diagnostic");
+        assert!(!store
+            .reserve_llm_request(
+                &reservation.request_id,
+                &reservation.request_digest,
+                &reservation.usage_binding.agent_id.to_string()
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn model_schema_diagnostic_rejects_foreign_binding_and_rolls_back_failed_seal() {
+        let store = EventStore::open(":memory:").unwrap();
+        let reservation = model_reservation_fixture();
+        reserve_schema_diagnostic(&store, &reservation);
+        let mut foreign = reservation.clone();
+        foreign.context_digest = "d".repeat(64);
+        assert!(store
+            .seal_llm_model_output_schema_rejection(&foreign, 7)
+            .is_err());
+        foreign = reservation.clone();
+        foreign.usage_binding.provider = "other".into();
+        assert!(store
+            .seal_llm_model_output_schema_rejection(&foreign, 7)
+            .is_err());
+        assert!(store.get_all_events().unwrap().is_empty());
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_diagnostic_seal BEFORE UPDATE ON llm_completion_outbox
+            BEGIN SELECT RAISE(ABORT, 'injected seal failure'); END;",
+            )
+            .unwrap();
+        assert!(store
+            .seal_llm_model_output_schema_rejection(&reservation, 7)
+            .is_err());
+        assert!(store.get_all_events().unwrap().is_empty());
+        assert_eq!(
+            store
+                .get_llm_completion(&reservation.request_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "provider_in_flight"
+        );
+    }
+
+    #[test]
+    fn model_schema_diagnostic_preserves_existing_unknown_reason_and_known_response() {
+        let store = EventStore::open(":memory:").unwrap();
+        let reservation = model_reservation_fixture();
+        reserve_schema_diagnostic(&store, &reservation);
+        let reason = "UnknownOutcome: provider_transport_deadline_elapsed";
+        store
+            .mark_llm_provider_outcome_unknown(
+                &reservation.request_id,
+                &reservation.request_digest,
+                reason,
+            )
+            .unwrap();
+        let before = store
+            .get_llm_completion(&reservation.request_id)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .seal_llm_model_output_schema_rejection(&reservation, 7)
+            .unwrap());
+        let after = store
+            .get_llm_completion(&reservation.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.last_error, before.last_error);
+        let known = model_reservation_fixture();
+        reserve_schema_diagnostic(&store, &known);
+        store
+            .enqueue_llm_completion(&known.request_id, &known.request_digest, "durable response")
+            .unwrap();
+        assert!(store
+            .seal_llm_model_output_schema_rejection(&known, 7)
+            .is_err());
+        assert_eq!(
+            store
+                .get_llm_completion(&known.request_id)
+                .unwrap()
+                .unwrap()
+                .payload,
+            "durable response"
+        );
     }
 
     fn late_model_usage_fixture(reservation: &LlmModelReservationV1) -> DomainEvent {
