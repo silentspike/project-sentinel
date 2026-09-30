@@ -1134,17 +1134,6 @@ fn schema_corrections_are_bounded_across_restart_expiry_and_idle_renewal() {
             assert_eq!(store.adaptive_recovery_feedback(&auth).unwrap(), None);
             assert_eq!(persisted_adaptive_rows(&database), before);
         }
-        if count == 1 {
-            session = advance_at(
-                &store,
-                &current_grant,
-                session.version,
-                &AdaptiveTransitionV1::MarkUnknown {
-                    effect: model.clone(),
-                },
-                session.updated_at_ms + 1,
-            );
-        }
         let operation_id = Uuid::new_v4();
         let expected_version = session.version;
         let rejection = AdaptiveTransitionV1::RejectModel {
@@ -1711,7 +1700,8 @@ fn recovery_feedback_core_fences_stale_authority_and_unready_organization() {
 #[test]
 fn replay_is_exact_but_revocation_limits_and_unknown_effects_fail_closed() {
     let directory = tempdir().unwrap();
-    let store = WorkflowStore::open(directory.path().join("workflow.sqlite")).unwrap();
+    let database = directory.path().join("workflow.sqlite");
+    let store = WorkflowStore::open(&database).unwrap();
     let auth = authority();
     let grant = grant(auth.clone(), 1);
     let (_, initial) = store.begin_adaptive_session(&grant, &auth, NOW).unwrap();
@@ -1756,25 +1746,77 @@ fn replay_is_exact_but_revocation_limits_and_unknown_effects_fail_closed() {
             NOW + 2,
         )
         .unwrap();
-    assert!(matches!(
-        unknown.cursor,
-        AdaptiveCursorV1::ModelUnknown { .. }
-    ));
-    let duplicate = store.advance_adaptive_session(
-        grant.session_id,
-        unknown.version,
-        Uuid::parse_str("01991c34-e03c-70c2-b97e-0591f4be2415").unwrap(),
-        &AdaptiveTransitionV1::ClaimModel {
-            effect: model,
-            previous_observation_digest: None,
-        },
-        &auth,
-        NOW + 3,
-    );
     assert_eq!(
-        duplicate.unwrap_err().code,
-        WorkflowErrorCode::InvalidTransition
+        unknown.cursor,
+        AdaptiveCursorV1::ModelUnknown {
+            effect: model.clone()
+        }
     );
+    assert_eq!(unknown.model_calls, pending.model_calls);
+    assert_eq!(unknown.tool_calls, pending.tool_calls);
+    assert_eq!(unknown.model_calls, 1);
+    assert_eq!(unknown.tool_calls, 0);
+    let before = persisted_adaptive_rows(&database);
+    let feedback = store.adaptive_recovery_feedback(&auth).unwrap();
+    assert_eq!(feedback, None);
+    for now_ms in [NOW + 3, grant.deadline_ms + 1] {
+        for (command, expected_code) in [
+            (
+                AdaptiveTransitionV1::ClaimModel {
+                    effect: model.clone(),
+                    previous_observation_digest: None,
+                },
+                WorkflowErrorCode::AuthorityConflict,
+            ),
+            (
+                AdaptiveTransitionV1::ResolveModel {
+                    effect: model.clone(),
+                    result_digest: "e".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Tool {
+                        tool: inspect_tool(),
+                        tool_digest: adaptive_tool_digest(&inspect_tool()).unwrap(),
+                    },
+                },
+                WorkflowErrorCode::AuthorityConflict,
+            ),
+            (
+                AdaptiveTransitionV1::RejectModel {
+                    effect: model.clone(),
+                    resolution_event_id: Uuid::new_v4().to_string(),
+                    reason_code: "schema_error".into(),
+                },
+                WorkflowErrorCode::AuthorityConflict,
+            ),
+            (
+                AdaptiveTransitionV1::ClaimModel {
+                    effect: effect("01991c34-e03c-70c2-b97e-0591f4be2415", 'f'),
+                    previous_observation_digest: None,
+                },
+                WorkflowErrorCode::InvalidTransition,
+            ),
+        ] {
+            assert_eq!(
+                store
+                    .advance_adaptive_session(
+                        grant.session_id,
+                        unknown.version,
+                        Uuid::new_v4(),
+                        &command,
+                        &auth,
+                        now_ms,
+                    )
+                    .unwrap_err()
+                    .code,
+                expected_code
+            );
+            assert_eq!(persisted_adaptive_rows(&database), before);
+            assert_eq!(
+                store.adaptive_session(grant.session_id, &auth).unwrap(),
+                Some(unknown.clone())
+            );
+            assert_eq!(store.adaptive_recovery_feedback(&auth).unwrap(), feedback);
+        }
+    }
 
     let mut revoked = auth.clone();
     revoked.active = false;
@@ -1785,15 +1827,39 @@ fn replay_is_exact_but_revocation_limits_and_unknown_effects_fail_closed() {
             .code,
         WorkflowErrorCode::AuthorityConflict
     );
+    assert_eq!(persisted_adaptive_rows(&database), before);
+    drop(store);
+    let reopened = WorkflowStore::open(&database).unwrap();
+    assert_eq!(
+        reopened.adaptive_session(grant.session_id, &auth).unwrap(),
+        Some(unknown.clone())
+    );
+    assert_eq!(reopened.adaptive_recovery_feedback(&auth).unwrap(), feedback);
+    assert_eq!(persisted_adaptive_rows(&database), before);
+
+    // Known completion exercises its own pending head, never the sealed unknown head.
+    let known_database = directory.path().join("known-completion.sqlite");
+    let store = WorkflowStore::open(&known_database).unwrap();
+    let (_, initial) = store.begin_adaptive_session(&grant, &auth, NOW).unwrap();
+    let (_, pending) = store
+        .advance_adaptive_session(
+            grant.session_id,
+            initial.version,
+            operation,
+            &command,
+            &auth,
+            NOW + 1,
+        )
+        .unwrap();
 
     let resolved = store
         .advance_adaptive_session(
             grant.session_id,
-            unknown.version,
+            pending.version,
             Uuid::parse_str("01991c34-e03c-70c2-b97e-0591f4be2416").unwrap(),
             &AdaptiveTransitionV1::ResolveModel {
-                effect: match &unknown.cursor {
-                    AdaptiveCursorV1::ModelUnknown { effect } => effect.clone(),
+                effect: match &pending.cursor {
+                    AdaptiveCursorV1::ModelPending { effect } => effect.clone(),
                     _ => unreachable!(),
                 },
                 result_digest: "e".repeat(64),
@@ -1836,6 +1902,8 @@ fn replay_is_exact_but_revocation_limits_and_unknown_effects_fail_closed() {
             NOW + 6,
         )
         .unwrap();
+    let known_before = persisted_adaptive_rows(&known_database);
+    let known_feedback = store.adaptive_recovery_feedback(&auth).unwrap();
     let limit = store.advance_adaptive_session(
         grant.session_id,
         ready_again.version,
@@ -1851,6 +1919,21 @@ fn replay_is_exact_but_revocation_limits_and_unknown_effects_fail_closed() {
         limit.unwrap_err().code,
         WorkflowErrorCode::InvalidTransition
     );
+    assert_eq!(persisted_adaptive_rows(&known_database), known_before);
+    assert_eq!(
+        store.adaptive_session(grant.session_id, &auth).unwrap(),
+        Some(ready_again)
+    );
+    assert_eq!(
+        store.adaptive_recovery_feedback(&auth).unwrap(),
+        known_feedback
+    );
+    assert_eq!(persisted_adaptive_rows(&database), before);
+    assert_eq!(
+        reopened.adaptive_session(grant.session_id, &auth).unwrap(),
+        Some(unknown)
+    );
+    assert_eq!(reopened.adaptive_recovery_feedback(&auth).unwrap(), feedback);
 }
 
 #[test]
