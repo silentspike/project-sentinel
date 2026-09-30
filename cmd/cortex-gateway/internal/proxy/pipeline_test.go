@@ -187,6 +187,57 @@ func TestPipelineMarksAdmissionFailureAsPreProvider(t *testing.T) {
 	}
 }
 
+func TestPipelineKnownQuotaBlocksUrgentDispatchWithoutProviderIO(t *testing.T) {
+	registry := NewRegistry()
+	provider := &pipelineMockProvider{
+		name: "mock",
+		statusErr: &ProviderError{StatusCode: http.StatusTooManyRequests,
+			Message: "codex-cli usage limit active"},
+	}
+	queue := forwardqueue.NewManager(1)
+	registry.Register("mock", NewQueuedProvider(provider, queue))
+	handler := newTestPipelineHandler(registry, nil)
+	req := newAgentRuntimeTestRequest(t,
+		`{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"3","hierarchy_tier":"2","is_directly_addressed":"true"}}`,
+	)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("X-Sentinel-Provider-Io"); got != "not-started" {
+		t.Fatalf("provider I/O=%q, want not-started", got)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("urgent request bypassed quota: provider calls=%d", provider.calls)
+	}
+	if stats := queue.Stats(); stats.Active != 0 || stats.Depth != 0 {
+		t.Fatalf("quota rejection leaked queue capacity: %+v", stats)
+	}
+}
+
+func TestPipelineFirstQuotaFailureDoesNotClaimPreProviderIO(t *testing.T) {
+	registry := NewRegistry()
+	provider := &pipelineMockProvider{
+		name: "mock",
+		err: &ProviderError{StatusCode: http.StatusTooManyRequests,
+			Message: "codex-cli usage limit active"},
+	}
+	registry.Register("mock", NewQueuedProvider(provider, forwardqueue.NewManager(1)))
+	handler := newTestPipelineHandler(registry, nil)
+	req := newAgentRuntimeTestRequest(t,
+		`{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"3","hierarchy_tier":"2"}}`,
+	)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusTooManyRequests || provider.calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", recorder.Code, provider.calls, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("X-Sentinel-Provider-Io"); got != "" {
+		t.Fatalf("post-dispatch rejection incorrectly claims provider I/O=%q", got)
+	}
+}
+
 func TestPipelineFullFlow(t *testing.T) {
 	reg := NewRegistry()
 	mock := &pipelineMockProvider{
@@ -1839,6 +1890,9 @@ func TestPipelineBreakerOpenDoesNotFailover(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "circuit breaker open") {
 		t.Errorf("expected circuit breaker message, got %q", w.Body.String())
 	}
+	if got := w.Header().Get("X-Sentinel-Provider-Io"); got != "not-started" {
+		t.Fatalf("breaker rejection provider I/O=%q", got)
+	}
 }
 
 func TestPipelineBreakerOpenUsesProviderStatusError(t *testing.T) {
@@ -1873,6 +1927,9 @@ func TestPipelineBreakerOpenUsesProviderStatusError(t *testing.T) {
 	}
 	if mock.calls != 3 {
 		t.Fatalf("expected breaker-open request to avoid an extra provider send, got %d sends", mock.calls)
+	}
+	if got := w.Header().Get("X-Sentinel-Provider-Io"); got != "not-started" {
+		t.Fatalf("status rejection provider I/O=%q", got)
 	}
 }
 

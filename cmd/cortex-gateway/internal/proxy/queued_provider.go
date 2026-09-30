@@ -30,6 +30,32 @@ func NewSubscriptionQueuedProvider(wrapped Provider, queue *forwardqueue.Manager
 	}
 	_, inventoryCapable := wrapped.(ModelInventoryProvider)
 	_, readinessCapable := wrapped.(ProviderReadinessChecker)
+	if reporter, ok := wrapped.(ProviderStatusReporter); ok {
+		// Delegate only the cached status capability, without a readiness or
+		// health probe. Nonreporters retain their original optional interface set.
+		switch {
+		case inventoryCapable && readinessCapable:
+			return &struct {
+				*queuedInventoryReadinessProvider
+				ProviderStatusReporter
+			}{&queuedInventoryReadinessProvider{queuedProvider: queued}, reporter}
+		case inventoryCapable:
+			return &struct {
+				*queuedInventoryProvider
+				ProviderStatusReporter
+			}{&queuedInventoryProvider{queuedProvider: queued}, reporter}
+		case readinessCapable:
+			return &struct {
+				*queuedReadinessProvider
+				ProviderStatusReporter
+			}{&queuedReadinessProvider{queuedProvider: queued}, reporter}
+		default:
+			return &struct {
+				*queuedProvider
+				ProviderStatusReporter
+			}{queued, reporter}
+		}
+	}
 	switch {
 	case inventoryCapable && readinessCapable:
 		return &queuedInventoryReadinessProvider{queuedProvider: queued}
@@ -59,6 +85,9 @@ func (p *queuedProvider) Name() string {
 }
 
 func (p *queuedProvider) Send(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+	if err := p.knownProviderError(); err != nil {
+		return nil, providerAdmissionError(err)
+	}
 	release, err := p.queue.Acquire(ctx)
 	if err != nil {
 		return nil, providerAdmissionError(fmt.Errorf("forward queue wait: %w", err))
@@ -69,6 +98,9 @@ func (p *queuedProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 	if err := ctx.Err(); err != nil {
 		return nil, providerAdmissionError(fmt.Errorf("forward queue dispatch: %w", err))
 	}
+	if err := p.knownProviderError(); err != nil {
+		return nil, providerAdmissionError(err)
+	}
 	if p.subscription != nil {
 		return p.subscription.send(ctx, p.wrapped, req)
 	}
@@ -76,6 +108,13 @@ func (p *queuedProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 		return nil, providerAdmissionError(fmt.Errorf("subscription dispatch mode is not configured"))
 	}
 	return p.wrapped.Send(ctx, req)
+}
+
+func (p *queuedProvider) knownProviderError() error {
+	if reporter, ok := p.wrapped.(ProviderStatusReporter); ok {
+		return reporter.CurrentProviderError()
+	}
+	return nil
 }
 
 func (p *queuedProvider) HealthCheck(ctx context.Context) error {
