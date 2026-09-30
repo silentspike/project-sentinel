@@ -22,6 +22,8 @@ struct DispatchRequest {
 enum RequestSubject {
     AdaptiveLeadershipReview {
         review_id: Uuid,
+        #[serde(default)]
+        review_kind: Option<String>,
     },
     CustomerRequest {
         request_id: String,
@@ -202,7 +204,10 @@ impl WorkflowApi {
         request: &DispatchRequest,
         now: u64,
     ) -> Result<u64, &'static str> {
-        let Some(RequestSubject::AdaptiveLeadershipReview { review_id }) = request.subject.as_ref()
+        let Some(RequestSubject::AdaptiveLeadershipReview {
+            review_id,
+            review_kind,
+        }) = request.subject.as_ref()
         else {
             return Err("leadership subject missing");
         };
@@ -210,7 +215,17 @@ impl WorkflowApi {
             .leadership_review_for_agent(AgentId(request.agent_id))?
             .ok_or("leadership grant unavailable")?;
         let grant = &call.grant;
+        let expected_kind = match &grant.subject {
+            None => None,
+            Some(sentinel_workflow::AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. }) => {
+                Some("unknown_model")
+            }
+            Some(sentinel_workflow::AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
+                ..
+            }) => Some("blocked_continuation"),
+        };
         if grant.review_id != *review_id
+            || review_kind.as_deref() != expected_kind
             || request.allowance_id != call.allowance_id
             || request.request_id != call.request_id()
             || request.provider != grant.provider

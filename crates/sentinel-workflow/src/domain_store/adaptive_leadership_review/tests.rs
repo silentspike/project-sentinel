@@ -270,6 +270,7 @@ fn fixture() -> Fixture {
         max_duration_ms: 120_000,
         token_policy: crate::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
         expires_at_unix_ms: 200_000,
+        subject: None,
     };
     grant.validate(AUTHORIZED_AT).unwrap();
     context.validate(&grant).unwrap();
@@ -613,6 +614,7 @@ fn completion(
             },
         },
         resolution_event_id: None,
+        continuation: None,
     }
 }
 

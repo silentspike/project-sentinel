@@ -19,8 +19,11 @@ pub use event_gateway::{
     LegacyEventAppendGateway, LegacyEventProducer,
 };
 pub use event_store::{
-    runtime_config_apply_digest, EventStore, LlmCompletionEntry, MonotonicityError, OutboxEntry,
-    OutboxTransport, RuntimeConfigApplyDecision, RuntimeConfigApplyPhase,
+    runtime_config_apply_digest, EventStore, LlmCompletionEntry, LlmHistoricalInferenceBoundaryV1,
+    LlmHistoricalModelJournalReceiptV1, LlmModelReservationV1, LlmModelSubjectV1,
+    LlmModelUsageBindingV1, LlmRetrospectiveModelBindingV1, LlmRetrospectiveModelProvenanceV1,
+    LlmRetrospectiveUnknownModelEvidenceV1, LlmSealedUnknownModelEvidenceV1, MonotonicityError,
+    OutboxEntry, OutboxTransport, RuntimeConfigApplyDecision, RuntimeConfigApplyPhase,
     RuntimeConfigApplyRecoveryMarker, RuntimeConfigApplyRecoveryStart, RuntimeConfigRecoveryMarker,
     RuntimeConfigRecoveryPhase, SnapshotRow, IMMUTABLE_SNAPSHOT_MS,
     RUNTIME_CONFIG_APPLY_SCHEMA_VERSION,
