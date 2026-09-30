@@ -1,6 +1,6 @@
 import { batch, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { customerFetch, customerPreviewAvailable, CustomerApiError, dispatchReserved, pendingKey, readPending, reserveCommand, sendCustomerCommand,
+import { customerAdaptiveProgressLabel, customerFetch, customerPreviewAvailable, CustomerApiError, dispatchReserved, pendingKey, readPending, reserveCommand, sendCustomerCommand,
   type CustomerIdentity, type Overview, type PendingCommand } from "./api";
 import "./customer.css";
 import { CustomerPreview } from "./CustomerPreview";
@@ -10,6 +10,7 @@ export function CustomerWorkspace() {
   const [checking, setChecking] = createSignal(true);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
+  const [progressFresh, setProgressFresh] = createSignal(false);
   const [key, setKey] = createSignal("");
   const [overview, updateOverview] = createStore<Overview>({ requests: [], proposals: [], projects: [] });
   const data = () => overview;
@@ -55,11 +56,15 @@ export function CustomerWorkspace() {
     try {
       const value = await customerFetch<Overview>("overview");
       if (identity() !== actor) return;
-      setData(value);
+      batch(() => { setData(value); setProgressFresh(true); });
       if (!value.requests.some(request => request.request_id === selected())) setSelected(value.requests[0]?.request_id ?? "");
+    } catch (cause) {
+      if (identity() === actor) setProgressFresh(false);
+      throw cause;
     } finally { refreshing = false; }
   };
   const establish = async (value: CustomerIdentity) => {
+    setProgressFresh(false);
     setIdentity(value);
     setPending(readPending(localStorage, value));
     await refresh();
@@ -154,7 +159,7 @@ export function CustomerWorkspace() {
             <p>{request().desired_outcome}</p><ul><For each={request().constraints}>{value => <li>{value}</li>}</For></ul>
             <For each={(data().projects ?? []).filter(project => project.request_id === request().request_id)}>{project => <section class="customer-history">
               <h3>Projektfortschritt</h3><p>{project.state}</p>
-              <table><thead><tr><th>Arbeitspaket</th><th>Status</th></tr></thead><tbody><For each={project.work_items}>{work => <tr><td>{work.work_item_id}</td><td>{work.state}</td></tr>}</For></tbody></table>
+              <table><thead><tr><th>Arbeitspaket</th><th>Arbeitsstatus</th><th>Ausfuehrungsstatus</th></tr></thead><tbody><For each={project.work_items}>{work => <tr><td>{work.work_item_id}</td><td>{work.state}</td><td>{progressFresh() ? customerAdaptiveProgressLabel(work.adaptive_progress) : undefined}</td></tr>}</For></tbody></table>
               <Show when={project.deliveries?.length}><h3>Lieferungen</h3>
                 <table><thead><tr><th>Lieferung</th><th>Version</th><th>Status</th></tr></thead>
                   <tbody><For each={project.deliveries}>{delivery => <tr>

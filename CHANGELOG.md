@@ -1,5 +1,10 @@
 # Changelog
 
+- Distinguish missing project scope, inaccessible delivery lineage and transport
+  failures in the operator delivery view. Show server-redacted employee progress
+  separately from company assignment state without enabling unknown-effect retry
+  or disclosing private model diagnostics (#856).
+
 - Verify bounded schema-correction ancestry before attributing an original
   sealed model request after allowance rollover. Preserve rejected ancestor
   spending, current session ownership and effect identity; unsupported histories
