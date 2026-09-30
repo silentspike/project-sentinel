@@ -1,5 +1,11 @@
 # Changelog
 
+- Resolve original model-request allowance attribution from bounded, verified
+  immutable project history after allowance rollover. Preserve current authority,
+  journal ownership and consumed effects; never reset grants or replay unknown
+  calls. Reject oversized historical records before allocation and emit bounded
+  static reconciliation diagnostics without private model content (#856).
+
 - Continue the same blocked or sealed model-unknown employee session only through
   a bounded model-selected leadership decision. Retain root history, spending
   and effect tombstones; require fresh private inspection before further work.
