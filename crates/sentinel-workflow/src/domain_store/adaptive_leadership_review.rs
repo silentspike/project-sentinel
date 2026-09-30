@@ -3340,6 +3340,193 @@ mod tests {
     }
 
     #[test]
+    fn schema2_dispatched_expiry_successors_preserve_history_and_total_budget_across_heads() {
+        let mut f = continuation_fixture(false, false);
+        let project = f.context.source_project.clone();
+        let original_session = session(&f);
+        let mut retired_calls: Vec<AdaptiveLeadershipReviewCallV1> = Vec::new();
+        let mut now = CONTINUATION_AT;
+        for index in 0..ADAPTIVE_LEADERSHIP_MAX_REVIEWS {
+            if index == 2 {
+                // A real journal transition changes the head, not the session's review budget.
+                let event = Uuid::new_v4();
+                f.context.source_session = resolve(&f, event, now);
+                f.grant.expected_session_version = f.context.source_session.version;
+                f.grant.subject = Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
+                    reason_code: REASON.into(),
+                    resolution_event_id: Some(event.to_string()),
+                });
+                assert_ne!(f.context.source_session.version, original_session.version);
+                assert_eq!(
+                    f.context.source_session.model_calls,
+                    original_session.model_calls
+                );
+                assert_eq!(
+                    f.context.source_session.tool_calls,
+                    original_session.tool_calls
+                );
+            }
+            if let Some(prior) = retired_calls.last() {
+                f.context.evidence_refs.push(format!(
+                    "leadership-review-retired:{}:{}",
+                    prior.grant.review_id,
+                    prior.retired_at_unix_ms.unwrap()
+                ));
+            }
+            f.grant.evidence_fingerprint = adaptive_leadership_evidence_fingerprint(
+                &f.context.tool_catalog,
+                &f.context.evidence_refs,
+            )
+            .unwrap();
+            f.grant.review_id = adaptive_leadership_review_id(
+                f.grant.session_id,
+                f.grant.expected_session_version,
+                &f.grant.evidence_fingerprint,
+            )
+            .unwrap();
+            f.grant.expires_at_unix_ms = now + 120_000;
+            let authorized = f
+                .store
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    &format!("dispatched-expiry-successor-{index}"),
+                    &f.grant,
+                    &f.context,
+                    now,
+                )
+                .unwrap();
+            for prior in &retired_calls {
+                assert_ne!(authorized.grant.review_id, prior.grant.review_id);
+                assert_ne!(authorized.request_id(), prior.request_id());
+                assert_ne!(authorized.allowance_id, prior.allowance_id);
+                assert_ne!(authorized.operation_id, prior.operation_id);
+                assert_eq!(
+                    f.store
+                        .adaptive_leadership_review_call(&f.leader.tenant_id, prior.grant.review_id)
+                        .unwrap()
+                        .as_ref(),
+                    Some(prior)
+                );
+            }
+            let call = f
+                .store
+                .claim_adaptive_leadership_review_call(&f.leader, &claim(&authorized), now + 1)
+                .unwrap();
+            let expires = call.grant.expires_at_unix_ms;
+            let mut keep = completion(&call, false);
+            keep.decision.schema_version = 2;
+            let continuation = continue_result_with_window_at(&call, 2_000, expires - 1);
+            call.validate_completion_proposal(&keep).unwrap();
+            call.validate_completion_proposal(&continuation).unwrap();
+            let source = session(&f);
+            let before = rows(&f.store);
+            assert!(f
+                .store
+                .expire_adaptive_leadership_review_call(
+                    &f.leader,
+                    call.grant.review_id,
+                    call.version,
+                    expires - 1
+                )
+                .is_err());
+            assert_eq!(rows(&f.store), before);
+            let retired = f
+                .store
+                .expire_adaptive_leadership_review_call(
+                    &f.leader,
+                    call.grant.review_id,
+                    call.version,
+                    expires,
+                )
+                .unwrap();
+            let mut expected = call.clone();
+            expected.retired_at_unix_ms = Some(expires);
+            expected.updated_at_unix_ms = expires;
+            expected.version = 4;
+            assert_eq!(retired, expected);
+            assert_eq!(session(&f), source);
+            assert_eq!(
+                f.store
+                    .company_project(&f.leader.tenant_id, &f.grant.project_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(&project)
+            );
+            let before = rows(&f.store);
+            for result in [&keep, &continuation] {
+                assert!(f
+                    .store
+                    .complete_adaptive_leadership_review_call(&f.leader, result, expires + 1)
+                    .is_err());
+            }
+            assert!(f
+                .store
+                .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), expires + 1)
+                .is_err());
+            assert_eq!(rows(&f.store), before);
+            retired_calls.push(retired);
+            now = expires + 1;
+        }
+        let calls = f
+            .store
+            .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+            .unwrap();
+        assert_eq!(calls.len(), ADAPTIVE_LEADERSHIP_MAX_REVIEWS);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(
+                    |call| call.grant.expected_session_version == f.grant.expected_session_version
+                )
+                .count(),
+            1
+        );
+        let prior = retired_calls.last().unwrap();
+        f.context.evidence_refs.push(format!(
+            "leadership-review-retired:{}:{}",
+            prior.grant.review_id,
+            prior.retired_at_unix_ms.unwrap()
+        ));
+        f.grant.evidence_fingerprint = adaptive_leadership_evidence_fingerprint(
+            &f.context.tool_catalog,
+            &f.context.evidence_refs,
+        )
+        .unwrap();
+        f.grant.review_id = adaptive_leadership_review_id(
+            f.grant.session_id,
+            f.grant.expected_session_version,
+            &f.grant.evidence_fingerprint,
+        )
+        .unwrap();
+        f.grant.expires_at_unix_ms = now + 120_000;
+        f.grant.validate(now).unwrap();
+        f.context.validate(&f.grant).unwrap();
+        let before = rows(&f.store);
+        assert!(f
+            .store
+            .authorize_adaptive_leadership_review_call(
+                &f.leader,
+                Uuid::new_v4(),
+                "dispatched-expiry-over-total-budget",
+                &f.grant,
+                &f.context,
+                now
+            )
+            .is_err());
+        assert_eq!(rows(&f.store), before);
+        for prior in &retired_calls {
+            assert_eq!(
+                f.store
+                    .adaptive_leadership_review_call(&f.leader.tenant_id, prior.grant.review_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(prior)
+            );
+        }
+    }
+
+    #[test]
     fn schema2_expiry_retirements_count_against_root_review_bound() {
         let mut f = continuation_fixture(true, false);
         let mut now = CONTINUATION_AT;

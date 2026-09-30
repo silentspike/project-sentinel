@@ -3519,9 +3519,16 @@ pub mod bridge {
                 &dir.path().join("leadership-company.sqlite"),
                 &dir.path().join("leadership-events.sqlite"),
             );
-            for context in [
-                adaptive_context,
-                ModelWorkContext::AdaptiveLeadershipReview(Box::new(review)),
+            for (context, oversized) in [
+                (adaptive_context, false),
+                (
+                    ModelWorkContext::AdaptiveLeadershipReview(Box::new(review.clone())),
+                    false,
+                ),
+                (
+                    ModelWorkContext::AdaptiveLeadershipReview(Box::new(review)),
+                    true,
+                ),
             ] {
                 let binding = context.binding();
                 let id = binding.request_id();
@@ -3565,10 +3572,20 @@ pub mod bridge {
                     evidence.reservation,
                     model_reservation(&context, &id, &digest).unwrap().unwrap()
                 );
-                let content = if matches!(&context, ModelWorkContext::Adaptive(_)) {
-                    "{}".to_owned()
-                } else {
+                assert_eq!(original.status, "failed");
+                assert!(original.payload.is_empty());
+                let content = if oversized {
                     "x".repeat(MAX_MODEL_WORK_BYTES + 1)
+                } else if let ModelWorkContext::AdaptiveLeadershipReview(review) = &context {
+                    // A bounded, otherwise admissible leadership decision must
+                    // remain unadopted because the terminal unknown seal won.
+                    serde_json::json!({"schema_version": 1, "decision": {
+                        "kind": "keep_blocked", "rationale": "Supplied evidence still shows a dependency.",
+                        "evidence_refs": review.source.evidence_refs
+                    }})
+                    .to_string()
+                } else {
+                    "{}".to_owned()
                 };
                 let response: GatewayResponse = serde_json::from_value(serde_json::json!({
                     "content": content, "decision": "forward", "request_id": id,
@@ -3650,6 +3667,15 @@ pub mod bridge {
                     sealed_unknown_model_evidence(&store, &binding, &id, &"b".repeat(64)).is_err()
                 );
                 assert_eq!(store.get_completion(&id).unwrap().unwrap(), original);
+                assert_eq!(
+                    sealed_unknown_model_evidence(&store, &binding, &id, &digest)
+                        .unwrap()
+                        .unwrap(),
+                    evidence
+                );
+                assert!(!store
+                    .reserve_request(&id, &digest, &binding.agent_id().to_string())
+                    .unwrap());
                 assert_eq!(store.get_all_events().unwrap().len(), 1);
                 assert!(store.poll_completions(10).unwrap().is_empty());
                 assert!(resolver.admissions.lock().unwrap().is_empty());
