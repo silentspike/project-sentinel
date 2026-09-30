@@ -30,7 +30,6 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-#[cfg(feature = "llm")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -2811,6 +2810,42 @@ fn validate_provider_usage_event(
     Ok(())
 }
 
+fn reconciliation_warning_due(last: &AtomicU64, now_ms: u64) -> bool {
+    last.fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+        if now_ms > previous && (previous == 0 || now_ms - previous >= 60_000) {
+            Some(now_ms)
+        } else {
+            None
+        }
+    })
+    .is_ok()
+}
+
+// Only compile-time reason strings enter this log; never provider/store payloads.
+fn log_reconciliation_failure(phase: &'static str, reason: &'static str) {
+    static LAST_WARNING_MS: AtomicU64 = AtomicU64::new(0);
+    static CLOCK: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    let elapsed_ms = u64::try_from(CLOCK.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    if reconciliation_warning_due(&LAST_WARNING_MS, elapsed_ms) {
+        warn!(phase, reason, "company reconciliation transition failed");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn reconciliation_warning_is_bounded_and_clock_rollback_safe() {
+    let last = AtomicU64::new(0);
+    assert!(reconciliation_warning_due(&last, 100_000));
+    assert!(!reconciliation_warning_due(&last, 100_000));
+    assert!(!reconciliation_warning_due(&last, 99_999));
+    assert!(!reconciliation_warning_due(&last, 159_999));
+    assert!(reconciliation_warning_due(&last, 160_000));
+    assert_eq!(last.load(Ordering::Acquire), 160_000);
+}
+
 fn workflow_unavailable() -> WorkflowError {
     WorkflowError::new(
         WorkflowErrorCode::PersistenceFailure,
@@ -3761,10 +3796,10 @@ impl WorkflowApi {
             .ok_or_else(|| "collaboration event store is unavailable".to_owned())?;
         let registry = collaboration_event_schema_registry()
             .map_err(|error| format!("collaboration schema registry is invalid: {error}"))?;
-        let publications = self
-            .store
-            .collaboration_publications()
-            .map_err(|error| format!("collaboration publication ledger is unavailable: {error}"))?;
+        let publications = self.store.collaboration_publications().map_err(|error| {
+            log_reconciliation_failure("collaboration_ledger", "publication ledger invalid");
+            format!("collaboration publication ledger is unavailable: {error}")
+        })?;
         publish_collaboration_publications(
             event_store,
             &registry,
@@ -3797,7 +3832,10 @@ fn publish_collaboration_publications(
         let outcome = event_store
             .append_gateway(registry)
             .append(&caller, &publication.proposal)
-            .map_err(|error| format!("collaboration publication failed: {error}"))?;
+            .map_err(|error| {
+                log_reconciliation_failure("collaboration_append", "canonical append rejected");
+                format!("collaboration publication failed: {error}")
+            })?;
         dispositions.push(outcome.disposition);
         pending.store(publications.len() - index - 1, Ordering::Release);
     }
@@ -4798,21 +4836,34 @@ impl WorkflowApi {
     }
 
     fn reconcile_work_batch(&self, should_stop: &impl Fn() -> bool) -> Result<(), WorkflowError> {
-        self.publish_collaboration_backlog()
-            .map_err(|_| workflow_unavailable())?;
+        self.publish_collaboration_backlog().map_err(|_| {
+            log_reconciliation_failure("collaboration_publication", "publication unavailable");
+            workflow_unavailable()
+        })?;
         if should_stop() {
             return Ok(());
         }
         #[cfg(feature = "llm")]
-        self.reconcile_sales_intake()?;
-        for project in self.store.company_projects()? {
+        self.reconcile_sales_intake().inspect_err(|_| {
+            log_reconciliation_failure("sales_intake", "intake reconciliation failed");
+        })?;
+        let projects = self.store.company_projects().inspect_err(|_| {
+            log_reconciliation_failure("project_scan", "project ledger unavailable");
+        })?;
+        for project in projects {
             #[cfg(feature = "llm")]
             self.reconcile_unknown_adaptive_models(&project)
-                .map_err(|_| workflow_unavailable())?;
+                .map_err(|reason| {
+                    log_reconciliation_failure("unknown_model", reason);
+                    workflow_unavailable()
+                })?;
             #[cfg(feature = "llm")]
             if self
                 .reconcile_adaptive_leadership_reviews(&project)
-                .map_err(|_| workflow_unavailable())?
+                .map_err(|reason| {
+                    log_reconciliation_failure("adaptive_leadership", reason);
+                    workflow_unavailable()
+                })?
             {
                 continue;
             }
@@ -6417,6 +6468,51 @@ mod tests {
         assert!(!model_review::rework_limit_reached(&project));
         project.archived_source_reviews.push(archive);
         assert!(model_review::rework_limit_reached(&project));
+    }
+
+    #[test]
+    fn historical_usage_binding_keeps_original_allowance_after_rollover() {
+        let mut historical = project_with_provider_authority();
+        historical.reservations.clear();
+        let work = historical.work_items.values().next().unwrap();
+        let assignment = work.assignments.iter().find(|value| value.active).unwrap();
+        historical.subscription_call = Some(sentinel_workflow::SubscriptionCallAllowanceV1 {
+            allowance_id: "original-allowance".into(),
+            grant: sentinel_workflow::SubscriptionCallGrantV1 {
+                schema_version: 1,
+                work_item_id: work.spec.work_item_id.clone(),
+                assignment_id: assignment.assignment_id.clone(),
+                assignment_version: assignment.assignment_version,
+                agent_id: assignment.agent_id,
+                provider: "codex-cli".into(),
+                model: "test-model".into(),
+                catalog_digest: "a".repeat(64),
+                max_calls: 16,
+                max_concurrent: 1,
+                max_duration_ms: 120_000,
+                token_policy:
+                    sentinel_workflow::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
+                expires_at_unix_ms: 300_003,
+            },
+            created_by: "pm-1".into(),
+            created_at_unix_ms: 3,
+            dispatch: None,
+        });
+        let mut current = historical.clone();
+        let allowance = current.subscription_call.as_mut().unwrap();
+        allowance.allowance_id = "renewed-allowance".into();
+        allowance.created_at_unix_ms = 300_004;
+        allowance.grant.expires_at_unix_ms = 600_004;
+        let current_before = current.clone();
+        assert!(select_provider_usage_binding(
+            std::slice::from_ref(&current), AgentId(6), Some("original-allowance")
+        ).unwrap().is_none());
+        let original = select_provider_usage_binding(
+            std::slice::from_ref(&historical), AgentId(6), Some("original-allowance")
+        ).unwrap().unwrap();
+        assert_eq!(original.reservation_id, "original-allowance");
+        assert_eq!(original.assignment_id, assignment.assignment_id);
+        assert_eq!(current, current_before);
     }
 
     #[test]
