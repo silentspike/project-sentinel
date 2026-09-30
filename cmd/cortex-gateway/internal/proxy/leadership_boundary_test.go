@@ -233,6 +233,8 @@ func TestLeadershipBoundaryOutputSchemaAndLegacy(t *testing.T) {
 		want []byte
 	}{
 		{"leadership", leadershipReviewTestRequest(), codexCLILeadershipSchema},
+		{"unknown_leadership", continuationReviewTestRequest("unknown_model"), codexCLIUnknownLeadershipSchema},
+		{"blocked_continuation", continuationReviewTestRequest("blocked_continuation"), codexCLIContinuationLeadershipSchema},
 		{"legacy1", subscriptionTestRequest(), codexCLIWorkSchema},
 		{"legacy2", salesSubscriptionTestRequest(), nil},
 		{"legacy3", adaptiveSubscriptionTestRequest(), codexCLIAdaptiveSchema},

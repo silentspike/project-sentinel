@@ -30,6 +30,12 @@ func leadershipReviewTestRequest() *LLMRequest {
 	return req
 }
 
+func continuationReviewTestRequest(kind string) *LLMRequest {
+	req := leadershipReviewTestRequest()
+	req.Metadata["leadership_review_kind"] = kind
+	return req
+}
+
 func TestLeadershipReviewClaimsSeparateDurableAuthorityBeforeProvider(t *testing.T) {
 	var callbacks atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -91,6 +97,9 @@ func TestLeadershipReviewRejectsMixedSubjectAndBootstrapGrantBeforeAuthority(t *
 		"foreign_work":            func(m map[string]string) { m["work_item_id"] = "../work" },
 		"noncanonical_assignment": func(m map[string]string) { m["assignment_version"] = "01" },
 		"wrong_output":            func(m map[string]string) { m["company_execution_output_kind"] = "tool_plan" },
+		"empty_review_kind":       func(m map[string]string) { m["leadership_review_kind"] = "" },
+		"foreign_review_kind":     func(m map[string]string) { m["leadership_review_kind"] = "tool_unknown" },
+		"legacy_kind_override":    func(m map[string]string) { m["leadership_review_kind"] = "blocked" },
 	}
 	for name, mutate := range mutations {
 		t.Run(name, func(t *testing.T) {
@@ -104,5 +113,36 @@ func TestLeadershipReviewRejectsMixedSubjectAndBootstrapGrantBeforeAuthority(t *
 				t.Fatal("invalid review reached authority or provider")
 			}
 		})
+	}
+}
+
+func TestLeadershipReviewContinuationKindIsBoundAndLegacyWirePreserved(t *testing.T) {
+	for _, kind := range []string{"", "unknown_model", "blocked_continuation"} {
+		t.Run(kind, func(t *testing.T) {
+			req := leadershipReviewTestRequest()
+			if kind != "" {
+				req.Metadata["leadership_review_kind"] = kind
+			}
+			subject, err := leadershipReviewSubject(req.Metadata)
+			if err != nil || subject.ReviewKind != kind {
+				t.Fatalf("review kind binding: subject=%+v err=%v", subject, err)
+			}
+			encoded, err := json.Marshal(subject)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), `"review_kind"`) != (kind != "") {
+				t.Fatalf("legacy wire changed or continuation kind lost: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestLeadershipReviewKindCannotCrossExecutionSchema(t *testing.T) {
+	for _, req := range []*LLMRequest{subscriptionTestRequest(), adaptiveSubscriptionTestRequest(), projectPlanningSubscriptionTestRequest()} {
+		req.Metadata["leadership_review_kind"] = "unknown_model"
+		if _, err := classifyModelWorkRequest(req, req.Metadata["request_id"]); err == nil {
+			t.Fatal("continuation review marker accepted in another execution schema")
+		}
 	}
 }

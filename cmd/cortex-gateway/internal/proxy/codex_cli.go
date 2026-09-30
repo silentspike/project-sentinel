@@ -72,6 +72,12 @@ var codexCLIAdaptiveSchema []byte
 //go:embed codex_cli_leadership_schema.json
 var codexCLILeadershipSchema []byte
 
+//go:embed codex_cli_unknown_leadership_schema.json
+var codexCLIUnknownLeadershipSchema []byte
+
+//go:embed codex_cli_continuation_leadership_schema.json
+var codexCLIContinuationLeadershipSchema []byte
+
 type codexCLIUsage struct {
 	InputTokens           int64 `json:"input_tokens"`
 	CachedInputTokens     int64 `json:"cached_input_tokens"`
@@ -272,6 +278,12 @@ func (p *CodexCLIProvider) outputSchemaPath(req *LLMRequest) (string, error) {
 			return "", fmt.Errorf("codex-cli leadership request is invalid")
 		}
 		selected = codexCLILeadershipSchema
+		switch req.Metadata["leadership_review_kind"] {
+		case "unknown_model":
+			selected = codexCLIUnknownLeadershipSchema
+		case "blocked_continuation":
+			selected = codexCLIContinuationLeadershipSchema
+		}
 	} else if hasLeadershipReviewMetadata(req.Metadata) {
 		return "", fmt.Errorf("codex-cli mixed leadership output subject")
 	} else if executionSchema == "1" {
