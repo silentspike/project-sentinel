@@ -11,6 +11,8 @@ use crate::{
 };
 use serde::Deserialize;
 
+mod recovery_lineage;
+
 const MAX_JOURNAL_ENTRIES: usize = 512;
 const MAX_SCOPED_ADAPTIVE_HEADS: usize = 64;
 
@@ -285,8 +287,8 @@ impl WorkflowStore {
             ) if effect == sealed => effect.clone(),
             _ => return Ok(None),
         };
-        if root.recovery_feedback.is_some()
-            || root.session.model_calls != 0
+        recovery_lineage::validate_recovery_lineage(&tx, &root)?;
+        if root.session.model_calls != 0
             || root.session.tool_calls != 0
             || root.session.last_observation.is_some()
             || root.session.last_model_result_digest.is_some()
@@ -311,62 +313,16 @@ impl WorkflowStore {
         // Full replay above validates every journal entry. Also bind every command
         // operation to that journal; neither a caller UUID nor an ambiguous alias
         // can be substituted for the original claim/seal operation identity.
-        let mut statement = tx.prepare(
-            "SELECT operation_id,request_digest,response,created_at_ms FROM workflow_operations WHERE operation_namespace=?1 ORDER BY operation_id LIMIT ?2"
-        ).map_err(map_sqlite_error)?;
-        let mut rows = statement
-            .query(params![
-                format!("{ns}:operations"),
-                (MAX_JOURNAL_ENTRIES + 1) as i64
-            ])
-            .map_err(map_sqlite_error)?;
         let mut claim_record = None;
         let mut seal_record = None;
-        let mut versions = std::collections::BTreeSet::new();
-        let mut count = 0;
         let mut adopted = false;
-        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-            count += 1;
-            let operation_key: String = row.get(0).map_err(map_sqlite_error)?;
-            let operation_id = Uuid::parse_str(&operation_key).map_err(|_| corrupt_store())?;
-            let digest: String = row.get(1).map_err(map_sqlite_error)?;
-            let bytes: Vec<u8> = row.get(2).map_err(map_sqlite_error)?;
-            let created: i64 = row.get(3).map_err(map_sqlite_error)?;
-            let response: AdaptiveSessionV1 = decode(&bytes)?;
-            if count > MAX_JOURNAL_ENTRIES
-                || operation_id.is_nil()
-                || operation_key != operation_id.to_string()
-                || response.version <= 1
-                || response.version > head.version
-                || !versions.insert(response.version)
-            {
-                return Err(corrupt_store());
-            }
-            let (entry_digest, entry) = evidence_entry(&tx, &ns, response.version)?;
-            let command = entry.command.as_ref().ok_or_else(corrupt_store)?;
-            let expected_digest = canonical_sha256(
-                "sentinel.workflow.adaptive-command.v1",
-                &(head.grant.session_id, response.version - 1, command),
-            )?;
-            if response != entry.session
-                || !constant_time_eq(&digest, &expected_digest)
-                || stored_u64(created)? != entry.session.updated_at_ms
-            {
-                return Err(corrupt_store());
-            }
-            let record = AdaptiveModelJournalRecordEvidenceV1 {
-                session_version: entry.session.version,
-                entry_digest,
-                operation_id,
-                command_digest: digest,
-                recorded_at_ms: entry.session.updated_at_ms,
-            };
-            if response.version == 2 {
+        for (record, command) in validated_journal_operations(&tx, &head)? {
+            if record.session_version == 2 {
                 claim_record = Some(record);
-            } else if response.version == 3 {
+            } else if record.session_version == 3 {
                 seal_record = Some(record);
             }
-            if matches!(command, AdaptiveTransitionV1::ResolveModel { effect: resolved, .. }
+            if matches!(&command, AdaptiveTransitionV1::ResolveModel { effect: resolved, .. }
                 | AdaptiveTransitionV1::RejectModel { effect: resolved, .. }
                 | AdaptiveTransitionV1::CommitCollaboration { effect: resolved, .. } if resolved.id == effect.id)
             {
@@ -624,6 +580,64 @@ fn command_effect(command: &AdaptiveTransitionV1) -> Option<&AdaptiveEffectV1> {
         AdaptiveTransitionV1::ObserveTool { observation } => Some(&observation.effect),
         _ => None,
     }
+}
+
+fn validated_journal_operations(
+    connection: &Connection,
+    session: &AdaptiveSessionV1,
+) -> Result<Vec<(AdaptiveModelJournalRecordEvidenceV1, AdaptiveTransitionV1)>, WorkflowError> {
+    let ns = namespace(session.grant.session_id);
+    let mut statement = connection.prepare(
+        "SELECT operation_id,request_digest,response,created_at_ms FROM workflow_operations WHERE operation_namespace=?1 ORDER BY operation_id LIMIT ?2",
+    ).map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(params![
+            format!("{ns}:operations"),
+            (MAX_JOURNAL_ENTRIES + 1) as i64
+        ])
+        .map_err(map_sqlite_error)?;
+    let mut records = Vec::new();
+    let mut versions = std::collections::BTreeSet::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let operation_key: String = row.get(0).map_err(map_sqlite_error)?;
+        let operation_id = Uuid::parse_str(&operation_key).map_err(|_| corrupt_store())?;
+        let digest: String = row.get(1).map_err(map_sqlite_error)?;
+        let bytes: Vec<u8> = row.get(2).map_err(map_sqlite_error)?;
+        let created: i64 = row.get(3).map_err(map_sqlite_error)?;
+        let response: AdaptiveSessionV1 = decode(&bytes)?;
+        if records.len() >= MAX_JOURNAL_ENTRIES
+            || operation_id.is_nil()
+            || operation_key != operation_id.to_string()
+            || response.version <= 1
+            || response.version > session.version
+            || !versions.insert(response.version)
+        {
+            return Err(corrupt_store());
+        }
+        let (entry_digest, entry) = evidence_entry(connection, &ns, response.version)?;
+        let command = entry.command.ok_or_else(corrupt_store)?;
+        let expected_digest = canonical_sha256(
+            "sentinel.workflow.adaptive-command.v1",
+            &(session.grant.session_id, response.version - 1, &command),
+        )?;
+        if response != entry.session
+            || !constant_time_eq(&digest, &expected_digest)
+            || stored_u64(created)? != entry.session.updated_at_ms
+        {
+            return Err(corrupt_store());
+        }
+        records.push((
+            AdaptiveModelJournalRecordEvidenceV1 {
+                session_version: entry.session.version,
+                entry_digest,
+                operation_id,
+                command_digest: digest,
+                recorded_at_ms: entry.session.updated_at_ms,
+            },
+            command,
+        ));
+    }
+    Ok(records)
 }
 
 fn evidence_entry(

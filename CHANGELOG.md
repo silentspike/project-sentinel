@@ -1,5 +1,10 @@
 # Changelog
 
+- Verify bounded schema-correction ancestry before attributing an original
+  sealed model request after allowance rollover. Preserve rejected ancestor
+  spending, current session ownership and effect identity; unsupported histories
+  remain non-serving without aborting unrelated project reconciliation (#856).
+
 - Resolve original model-request allowance attribution from bounded, verified
   immutable project history after allowance rollover. Preserve current authority,
   journal ownership and consumed effects; never reset grants or replay unknown
