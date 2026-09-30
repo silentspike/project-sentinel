@@ -271,6 +271,7 @@ fn fixture() -> Fixture {
         token_policy: crate::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
         expires_at_unix_ms: 200_000,
         subject: None,
+        recovery_epoch: None,
     };
     grant.validate(AUTHORIZED_AT).unwrap();
     context.validate(&grant).unwrap();

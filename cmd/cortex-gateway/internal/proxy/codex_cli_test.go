@@ -64,28 +64,32 @@ func TestCodexCLIReasoningAndPrivateErrorClassification(t *testing.T) {
 
 func TestCodexCLIOutputSchemaErrorClassification(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		diagnostic string
-		statusCode int
-		message    string
+		name               string
+		diagnostic         string
+		statusCode         int
+		message            string
+		diagnosticCategory ProviderDiagnosticCategory
 	}{
 		{
-			name:       "invalid schema",
-			diagnostic: "Invalid schema for response_format: private-upstream; token=private-secret",
-			statusCode: http.StatusBadGateway,
-			message:    "codex-cli output schema rejected",
+			name:               "invalid schema",
+			diagnostic:         "Invalid schema for response_format: private-upstream; token=private-secret",
+			statusCode:         http.StatusBadGateway,
+			message:            "codex-cli output schema rejected",
+			diagnosticCategory: ProviderDiagnosticCodexOutputSchemaRejected,
 		},
 		{
-			name:       "invalid_json_schema",
-			diagnostic: "HTTP status 400 bad request: INVALID_JSON_SCHEMA; private-upstream; token=private-secret",
-			statusCode: http.StatusBadGateway,
-			message:    "codex-cli output schema rejected",
+			name:               "invalid_json_schema",
+			diagnostic:         "HTTP status 400 bad request: INVALID_JSON_SCHEMA; private-upstream; token=private-secret",
+			statusCode:         http.StatusBadGateway,
+			message:            "codex-cli output schema rejected",
+			diagnosticCategory: ProviderDiagnosticCodexOutputSchemaRejected,
 		},
 		{
-			name:       "schema keyword not permitted",
-			diagnostic: "Invalid request: output schema keyword uniqueItems is not permitted; private-upstream; token=private-secret",
-			statusCode: http.StatusBadGateway,
-			message:    "codex-cli output schema rejected",
+			name:               "schema keyword not permitted",
+			diagnostic:         "Invalid request: output schema keyword uniqueItems is not permitted; private-upstream; token=private-secret",
+			statusCode:         http.StatusBadGateway,
+			message:            "codex-cli output schema rejected",
+			diagnosticCategory: ProviderDiagnosticCodexOutputSchemaRejected,
 		},
 		{
 			name:       "quota",
@@ -169,6 +173,9 @@ func TestCodexCLIOutputSchemaErrorClassification(t *testing.T) {
 					if err.Error() != expectedError {
 						t.Fatalf("want fixed sanitized error %q, got %q", expectedError, err.Error())
 					}
+					if isProviderError && providerErr.Diagnostic != test.diagnosticCategory {
+						t.Fatalf("diagnostic category=%d want=%d", providerErr.Diagnostic, test.diagnosticCategory)
+					}
 					if test.message == "codex-cli output schema rejected" {
 						var admissionErr *ProviderAdmissionError
 						if errors.As(err, &admissionErr) {
@@ -203,6 +210,9 @@ func TestCodexCLIOutputSchemaStderrFailure(t *testing.T) {
 	}
 	if err.Error() != "provider error: HTTP 502: codex-cli output schema rejected" {
 		t.Fatalf("stderr diagnostic leaked or category changed: %v", err)
+	}
+	if providerErr.Diagnostic != ProviderDiagnosticCodexOutputSchemaRejected {
+		t.Fatalf("stderr diagnostic category=%d", providerErr.Diagnostic)
 	}
 	if got := readTestFile(t, callsPath); got != "called\n" {
 		t.Fatalf("want exactly one fake subprocess call, got %q", got)

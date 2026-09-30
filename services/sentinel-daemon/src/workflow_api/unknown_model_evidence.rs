@@ -9,6 +9,25 @@ impl WorkflowApi {
         session: &AdaptiveSessionV1,
         effect: &AdaptiveEffectV1,
     ) -> Result<Option<String>, &'static str> {
+        self.unknown_model_proof_digest_with_import(project, session, effect, true)
+    }
+
+    pub(super) fn read_only_unknown_model_proof_digest(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        session: &AdaptiveSessionV1,
+        effect: &AdaptiveEffectV1,
+    ) -> Result<Option<String>, &'static str> {
+        self.unknown_model_proof_digest_with_import(project, session, effect, false)
+    }
+
+    fn unknown_model_proof_digest_with_import(
+        &self,
+        project: &sentinel_workflow::ProjectV1,
+        session: &AdaptiveSessionV1,
+        effect: &AdaptiveEffectV1,
+        allow_import: bool,
+    ) -> Result<Option<String>, &'static str> {
         let events = self
             .event_store
             .as_ref()
@@ -200,9 +219,11 @@ impl WorkflowApi {
         {
             return Err("historical source head changed before import");
         }
-        events
-            .import_retrospective_unknown_llm_model_binding(&historical)
-            .map_err(|_| "historical model import rejected")?;
+        if allow_import {
+            events
+                .import_retrospective_unknown_llm_model_binding(&historical)
+                .map_err(|_| "historical model import rejected")?;
+        }
         if self
             .store
             .adaptive_session(session.grant.session_id, &session.grant.authority)
@@ -212,14 +233,20 @@ impl WorkflowApi {
         {
             return Err("historical source head changed during import");
         }
-        let evidence = crate::llm_bridge::bridge::retrospective_unknown_model_evidence(
+        let Some(evidence) = crate::llm_bridge::bridge::retrospective_unknown_model_evidence(
             events,
             &authority,
             &request_id,
             &effect.request_digest,
         )
         .map_err(|_| "historical model evidence invalid")?
-        .ok_or("historical model evidence disappeared")?;
+        else {
+            return if allow_import {
+                Err("historical model evidence disappeared")
+            } else {
+                Ok(None)
+            };
+        };
         let bytes = sentinel_common::canonical_json(&evidence)
             .map_err(|_| "historical evidence encoding failed")?;
         Ok(Some(sentinel_common::sha256_hex(&bytes)))

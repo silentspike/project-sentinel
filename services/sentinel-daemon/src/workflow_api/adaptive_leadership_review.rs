@@ -67,6 +67,14 @@ impl LeadershipContext {
         let source =
             serde_json::to_string(&self.source).map_err(|_| "leadership source invalid")?;
         if let Some(subject) = &self.binding.grant.subject {
+            let (call_ceiling, window_ceiling) = self
+                .binding
+                .grant
+                .recovery_epoch
+                .as_ref()
+                .map_or((64, 300_000), |binding| {
+                    (binding.max_additional_model_calls, binding.max_window_ms)
+                });
             let (description, keep_kind) = match subject {
                 sentinel_workflow::AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. } =>
                     ("a model result whose adoption is permanently abandoned; its accounting remains unresolved", "keep_unknown"),
@@ -78,7 +86,7 @@ impl LeadershipContext {
                 or authority. Decide independently whether the same employee can continue the same \
                 assignment within remaining root limits. Return only strict JSON with schema_version=2 \
                 and a decision object. Either choose kind {keep_kind} with rationale and evidence_refs, \
-                or kind continue with additional_model_calls (1..64), window_ms (1000..300000), \
+                or kind continue with additional_model_calls (1..{call_ceiling}), window_ms (1000..{window_ceiling}), \
                 rationale and evidence_refs. Select only calls/time actually needed; the policy \
                 enforces the remaining root budget. Never retry unknown tool effects or adopt an old \
                 abandoned model result. A continuation requires a fresh private inspection before \
@@ -530,6 +538,7 @@ impl WorkflowApi {
             let now = clock();
             let grant = AdaptiveLeadershipReviewGrantV1 {
                 schema_version: if subject.is_some() { 2 } else { 1 },
+                recovery_epoch: None,
                 subject,
                 review_id: id,
                 project_id: project.project_id.clone(),
@@ -714,6 +723,7 @@ impl WorkflowApi {
         if LeadershipAuthority::from_call(&call) != *binding {
             return Err("leadership binding changed");
         }
+        self.verify_recovery_review_release(&call)?;
         let leader = self
             .principals
             .principal(&binding.grant.leadership_principal.principal_id)
@@ -949,6 +959,7 @@ impl WorkflowApi {
             return Ok(());
         }
         // Fresh credentials must authorize the mutation; never impersonate the sealed principal.
+        self.verify_recovery_review_release(&call)?;
         let leader = self
             .principals
             .principal(&call.grant.leadership_principal.principal_id)
