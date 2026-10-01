@@ -164,7 +164,7 @@ impl LeadershipContext {
     }
 }
 
-fn parse_decision(
+pub(super) fn parse_decision(
     content: &str,
     refs: &[String],
 ) -> Result<AdaptiveLeadershipReviewDecisionV1, &'static str> {
@@ -279,6 +279,11 @@ impl WorkflowApi {
                 .store
                 .adaptive_leadership_review_calls(&project.tenant_id, session.grant.session_id)
                 .map_err(|_| "leadership calls unavailable")?;
+            for call in &calls {
+                if self.reconcile_local_leadership_adoption(call, &clock)? {
+                    return Ok(true);
+                }
+            }
             // An unfinished receipt remains a barrier even after ResolveBlocked committed.
             if let Some(call) = calls
                 .iter()
@@ -828,7 +833,7 @@ impl WorkflowApi {
         self.accept_leadership_review_fenced(completion, context, request_id, request_digest, clock)
     }
 
-    fn accept_leadership_review_fenced(
+    pub(super) fn accept_leadership_review_fenced(
         &self,
         completion: &ModelExecutionCompletion,
         context: &LeadershipContext,
@@ -876,11 +881,42 @@ impl WorkflowApi {
             .get_llm_completion(request_id)
             .map_err(|_| "leadership completion unavailable")?
             .ok_or("leadership completion missing")?;
+        let local_adoption = self
+            .store
+            .adaptive_leadership_local_adoption(
+                &call.grant.leadership_principal.tenant_id,
+                call.grant.review_id,
+            )
+            .map_err(|_| "local adoption authority unavailable")?;
+        let locally_failed = local_adoption.as_ref().is_some_and(|record| {
+            stored.status == "failed"
+                && stored.last_error.as_deref() == Some("continuation audit invalid")
+                && record.request.payload_digest
+                    == sentinel_common::sha256_hex(stored.payload.as_bytes())
+                && record.request.request_digest == request_digest
+                && record.request.request_id == request_id
+        });
+        let locally_disposed = local_adoption.as_ref().is_some_and(|record| {
+            stored.status == "action_claimed"
+                && call.decision.is_some()
+                && call
+                    .continuation
+                    .as_ref()
+                    .and_then(|authorization| authorization.local_adoption.as_deref())
+                    == Some(record)
+                && record.request.payload_digest
+                    == sentinel_common::sha256_hex(stored.payload.as_bytes())
+                && record.request.request_digest == request_digest
+                && record.request.request_id == request_id
+        });
         let retired_replay = call.grant.subject.is_some()
             && call.retired_at_unix_ms.is_some()
             && stored.status == "failed"
             && stored.last_error.as_deref() == Some("leadership_review_stale");
-        if (stored.status != "ready_for_action" && !retired_replay)
+        if (stored.status != "ready_for_action"
+            && !retired_replay
+            && !locally_failed
+            && !locally_disposed)
             || stored.request_digest != request_digest
             || stored.owner_scope
                 != sentinel_common::StateTransferScope::for_agent(
@@ -930,6 +966,24 @@ impl WorkflowApi {
             .validate_subject(&call.grant)
             .map_err(|_| "leadership decision subject mismatch")?;
         let digest = format!("{:x}", Sha256::digest(completion.content.as_bytes()));
+        if let Some(record) = &local_adoption {
+            record
+                .validate_call(&call)
+                .map_err(|_| "local adoption call authority changed")?;
+            if record.request.decision != decision
+                || record.request.model_response_digest != digest
+                || record.request.usage_event_digest
+                    != sentinel_common::sha256_hex(
+                        &sentinel_common::canonical_json(&usage)
+                            .map_err(|_| "local adoption usage encoding invalid")?,
+                    )
+                || record.request.payload_digest
+                    != sentinel_common::sha256_hex(stored.payload.as_bytes())
+                || (call.decision.is_none() && !locally_failed)
+            {
+                return Err("local adoption retained response changed");
+            }
+        }
         if payload
             .get("model_response_digest")
             .and_then(|value| value.as_str())
@@ -984,7 +1038,8 @@ impl WorkflowApi {
             if current_project != call.context.source_project
                 || source != call.context.source_session
             {
-                self.store
+                let retired = self
+                    .store
                     .retire_stale_adaptive_leadership_review_call(
                         &leader.principal,
                         call.grant.review_id,
@@ -992,14 +1047,18 @@ impl WorkflowApi {
                         clock(),
                     )
                     .map_err(|_| "stale leadership retirement rejected")?;
-                events
-                    .record_llm_completion_failure(
-                        request_id,
-                        request_digest,
-                        "leadership_review_stale",
-                        1,
-                    )
-                    .map_err(|_| "stale leadership completion disposition failed")?;
+                if local_adoption.is_some() {
+                    self.reconcile_retired_leadership_adoption(&retired)?;
+                } else {
+                    events
+                        .record_llm_completion_failure(
+                            request_id,
+                            request_digest,
+                            "leadership_review_stale",
+                            1,
+                        )
+                        .map_err(|_| "stale leadership completion disposition failed")?;
+                }
                 return Ok(());
             }
         }
@@ -1026,10 +1085,15 @@ impl WorkflowApi {
             if current_project != call.context.source_project {
                 return Err("continuation project changed");
             }
-            let now = clock();
-            let deadline = now
-                .checked_add(*window_ms)
-                .ok_or("continuation clock overflow")?;
+            let now = local_adoption
+                .as_ref()
+                .map_or_else(&clock, |record| record.issued_at_unix_ms);
+            let deadline = match &local_adoption {
+                Some(record) => record.continuation_deadline_ms,
+                None => now
+                    .checked_add(*window_ms)
+                    .ok_or("continuation clock overflow")?,
+            };
             let allowance = call
                 .continuation_allowance(now, deadline, *additional_model_calls)
                 .map_err(|_| "continuation allowance invalid")?;
@@ -1073,7 +1137,24 @@ impl WorkflowApi {
                 .event_v2_by_id(&event_id.to_string())
                 .map_err(|_| "continuation audit read failed")?;
             if prior_audit.is_none() {
-                if now >= call.grant.expires_at_unix_ms {
+                let expired = match &local_adoption {
+                    Some(record) => clock() >= record.request.expires_at_unix_ms,
+                    None => now >= call.grant.expires_at_unix_ms,
+                };
+                if expired {
+                    if local_adoption.is_some() {
+                        let retired = self
+                            .store
+                            .retire_expired_adaptive_local_adoption(
+                                &leader.principal,
+                                call.grant.review_id,
+                                call.version,
+                                clock(),
+                            )
+                            .map_err(|_| "local adoption expired retirement rejected")?;
+                        self.reconcile_retired_leadership_adoption(&retired)?;
+                        return Ok(());
+                    }
                     self.store
                         .expire_adaptive_leadership_review_call(
                             &leader.principal,
@@ -1120,6 +1201,7 @@ impl WorkflowApi {
                 issued_at_ms: now,
                 deadline_ms: deadline,
                 additional_model_calls: *additional_model_calls,
+                local_adoption: local_adoption.clone().map(Box::new),
             };
             let proposed = CompleteAdaptiveLeadershipReviewCallV1 {
                 review_id: call.grant.review_id,
@@ -1136,24 +1218,44 @@ impl WorkflowApi {
                 .as_ref()
                 .is_some_and(|authorization| clock() >= authorization.deadline_ms)
             {
-                self.store
+                let retired = self
+                    .store
                     .retire_expired_adaptive_continuation_call(&leader.principal, &audited, clock())
                     .map_err(|_| "expired audited continuation retirement rejected")?;
-                events
-                    .record_llm_completion_failure(
-                        request_id,
-                        request_digest,
-                        "leadership_review_stale",
-                        1,
-                    )
-                    .map_err(|_| "expired audited continuation disposition failed")?;
+                if local_adoption.is_some() {
+                    self.reconcile_retired_leadership_adoption(&retired)?;
+                } else {
+                    events
+                        .record_llm_completion_failure(
+                            request_id,
+                            request_digest,
+                            "leadership_review_stale",
+                            1,
+                        )
+                        .map_err(|_| "expired audited continuation disposition failed")?;
+                }
                 return Ok(());
             }
-            if self
-                .store
-                .complete_adaptive_leadership_review_call(&leader.principal, &audited, clock())
-                .is_err()
-            {
+            let committed = if local_adoption.is_some() {
+                let receipt = events
+                    .event_v2_by_id(&event_id.to_string())
+                    .map_err(|_| "local adoption audit receipt unavailable")?
+                    .ok_or("local adoption audit receipt missing")?;
+                self.store
+                    .complete_adaptive_leadership_review_call_with_local_adoption_audit(
+                        &leader.principal,
+                        &audited,
+                        &receipt,
+                        clock(),
+                    )
+            } else {
+                self.store.complete_adaptive_leadership_review_call(
+                    &leader.principal,
+                    &audited,
+                    clock(),
+                )
+            };
+            if committed.is_err() {
                 let now = clock();
                 if !audited
                     .continuation
@@ -1162,17 +1264,22 @@ impl WorkflowApi {
                 {
                     return Err("atomic continuation receipt rejected");
                 }
-                self.store
+                let retired = self
+                    .store
                     .retire_expired_adaptive_continuation_call(&leader.principal, &audited, now)
                     .map_err(|_| "expired continuation commit retirement rejected")?;
-                events
-                    .record_llm_completion_failure(
-                        request_id,
-                        request_digest,
-                        "leadership_review_stale",
-                        1,
-                    )
-                    .map_err(|_| "expired continuation commit disposition failed")?;
+                if local_adoption.is_some() {
+                    self.reconcile_retired_leadership_adoption(&retired)?;
+                } else {
+                    events
+                        .record_llm_completion_failure(
+                            request_id,
+                            request_digest,
+                            "leadership_review_stale",
+                            1,
+                        )
+                        .map_err(|_| "expired continuation commit disposition failed")?;
+                }
             }
             return Ok(());
         }
@@ -1446,6 +1553,7 @@ pub(crate) mod tests {
                 issued_at_ms: issued,
                 deadline_ms: issued + 120_000,
                 additional_model_calls: 1,
+                local_adoption: None,
             }),
         }
     }

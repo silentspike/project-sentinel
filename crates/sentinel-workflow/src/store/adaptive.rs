@@ -773,6 +773,12 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         .iter()
         .find(|assignment| assignment.active && assignment.agent_id == current.agent_id)
         .ok_or_else(authority_conflict)?;
+    let captured_allowance = review
+        .context
+        .source_project
+        .subscription_call
+        .as_ref()
+        .ok_or_else(authority_conflict)?;
     if fresh_allowance.allowance_id != authorization.provider_allowance_id
         || fresh_allowance.allowance_id == review.allowance_id
         || fresh_allowance.created_at_unix_ms != authorization.issued_at_ms
@@ -788,11 +794,13 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         || fresh.catalog_digest != session.grant.catalog_digest
         || fresh.token_policy != review.grant.token_policy
         || fresh.max_calls != authorization.additional_model_calls
+        || fresh.max_calls > captured_allowance.grant.max_calls
         || fresh.max_concurrent != 1
         || fresh.max_duration_ms
             != session
                 .grant
                 .max_call_duration_ms
+                .min(captured_allowance.grant.max_duration_ms)
                 .min(authorization.deadline_ms - authorization.issued_at_ms)
         || fresh.expires_at_unix_ms != authorization.deadline_ms
         || adaptive_continuation_provider_digest(fresh_allowance, current)?
@@ -1892,11 +1900,28 @@ mod continuation_tests {
                 catalog_digest: root.catalog_digest,
                 max_calls: auth.additional_model_calls,
                 max_concurrent: 1,
-                max_duration_ms: 10_000,
+                max_duration_ms: root
+                    .max_call_duration_ms
+                    .min(auth.deadline_ms - auth.issued_at_ms),
                 token_policy: review.grant.token_policy,
                 expires_at_unix_ms: auth.deadline_ms,
             },
         };
+        let mut source_policy = allowance.clone();
+        source_policy.allowance_id = review
+            .context
+            .source_session
+            .grant
+            .provider_allowance_id
+            .clone();
+        source_policy.created_at_unix_ms = review.context.source_session.grant.created_at_ms;
+        source_policy.grant.max_calls = review.context.source_session.grant.max_model_calls;
+        source_policy.grant.max_duration_ms =
+            review.context.source_session.grant.max_call_duration_ms;
+        source_policy.grant.expires_at_unix_ms = review.context.source_session.grant.deadline_ms;
+        review.context.source_project.subscription_call = Some(source_policy);
+        let context_digest = review.context_digest().unwrap();
+        review.dispatch.as_mut().unwrap().context_digest = context_digest;
         auth.provider_authority_digest =
             adaptive_continuation_provider_digest(&allowance, &root.authority).unwrap();
         let mut connection = store.lock().unwrap();
