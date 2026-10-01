@@ -803,6 +803,57 @@ struct Fixture {
     temp: tempfile::TempDir,
 }
 
+pub(crate) fn exhausted_budget_review_fixture(
+) -> (tempfile::TempDir, WorkflowApi, AdaptiveSessionV1) {
+    use super::adaptive_leadership_review::tests::exhaust_review_history;
+
+    let fixture = Fixture::root(true);
+    let before = fixture.read();
+    let project = fixture.project();
+    assert_eq!(before.cursor, AdaptiveCursorV1::ReadyForModel);
+    assert!(before.model_window_exhausted_at(now_unix_ms()));
+    assert!(before.model_calls < before.grant.max_model_calls);
+    assert!(before.continuation.is_none());
+    let initial = fixture.issue_without_observation_at(before.active_deadline_ms(), 3);
+    // Reuse synthetic before-send retirement only; never persist a model decision.
+    let retired = exhaust_review_history(&fixture.api, &initial);
+    let wait_ms = retired.updated_at_unix_ms.saturating_sub(now_unix_ms());
+    assert!(
+        wait_ms <= 2_003,
+        "historical fixture must not wait for a full review window"
+    );
+    // HTTP uses the real clock, which must not precede the two short fixture retirements.
+    if wait_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+    }
+    assert!(reconcile_review_at(&fixture.api, &project, now_unix_ms()));
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 3);
+    assert!(calls.iter().all(|call| {
+        call.grant.schema_version == 3
+            && call.grant.expected_session_version == before.version
+            && call.context.source_project == project
+            && call.context.source_session == before
+            && call.dispatch.is_some()
+            && call.retired_at_unix_ms.is_some()
+            && call.decision.is_none()
+            && call.model_response_digest.is_none()
+            && call.continuation.is_none()
+    }));
+    assert!(fixture
+        .api
+        .store
+        .adaptive_budget_window_limit_recorded(
+            &before.grant.authority.tenant_id,
+            before.grant.session_id,
+            before.version,
+        )
+        .unwrap());
+    assert_eq!(fixture.read(), before);
+    assert_eq!(fixture.project(), project);
+    (fixture.temp, fixture.api, before)
+}
+
 impl Fixture {
     fn productive_root() -> Self {
         let temp = tempfile::tempdir().unwrap();

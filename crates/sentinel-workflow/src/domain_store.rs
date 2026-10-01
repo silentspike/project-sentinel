@@ -12,6 +12,9 @@ use uuid::Uuid;
 
 mod adaptive_leadership_local_adoption;
 mod adaptive_leadership_review;
+pub use adaptive_leadership_review::{
+    AdaptiveBudgetReviewExtensionReceiptV1, AdaptiveBudgetReviewExtensionRequestV1,
+};
 mod historical_allowance;
 mod project_planning;
 mod request_provider;

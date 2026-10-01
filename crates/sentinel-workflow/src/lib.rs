@@ -29,6 +29,9 @@ pub use adaptive_leadership_review::*;
 pub use admission::*;
 pub use collaboration::*;
 pub use domain::*;
+pub use domain_store::{
+    AdaptiveBudgetReviewExtensionReceiptV1, AdaptiveBudgetReviewExtensionRequestV1,
+};
 pub use engine::WorkflowCore;
 pub use error::{WorkflowError, WorkflowErrorCode};
 pub use model::*;

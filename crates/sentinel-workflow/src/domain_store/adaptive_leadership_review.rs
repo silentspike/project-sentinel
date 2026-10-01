@@ -1,4 +1,6 @@
 use super::*;
+#[path = "adaptive_budget_review_extension.rs"]
+pub(crate) mod budget_review_extension;
 #[path = "adaptive_leadership_recovery.rs"]
 mod recovery;
 use crate::{
@@ -8,6 +10,9 @@ use crate::{
     AdaptiveLeadershipReviewGrantV1, AdaptiveLeadershipReviewSubjectV2,
     ClaimAdaptiveLeadershipReviewCallV1, CompleteAdaptiveLeadershipReviewCallV1,
     RequestProviderDispatchV1, ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+};
+pub use budget_review_extension::{
+    AdaptiveBudgetReviewExtensionReceiptV1, AdaptiveBudgetReviewExtensionRequestV1,
 };
 
 const KIND: &str = "adaptive_leadership_review_call";
@@ -1452,6 +1457,16 @@ impl WorkflowStore {
         }
         grant.validate(now_ms)?;
         context.validate(grant)?;
+        let (global_review_limit, head_review_limit, extension_expiry) =
+            if grant.schema_version == 3 {
+                budget_review_extension::limits_for_review(&transaction, grant, context, now_ms)?
+            } else {
+                (
+                    ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                    ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                    None,
+                )
+            };
         if grant.schema_version == 3 {
             require_budget_source(&transaction, grant, context)?;
             if context.source_session.model_calls >= context.source_session.grant.max_model_calls
@@ -1463,13 +1478,15 @@ impl WorkflowStore {
                         state.authorizations.len()
                             >= crate::adaptive::ADAPTIVE_CONTINUATION_MAX_WINDOWS
                     })
-                || get_entity::<AdaptiveBudgetWindowLimitReceiptV1>(
-                    &transaction,
-                    &leader.tenant_id,
-                    BUDGET_LIMIT_KIND,
-                    &budget_limit_id(grant.session_id, grant.expected_session_version)?,
-                )?
-                .is_some()
+                || (extension_expiry.is_none()
+                    && get_entity::<AdaptiveBudgetWindowLimitReceiptV1>(
+                        &transaction,
+                        &leader.tenant_id,
+                        BUDGET_LIMIT_KIND,
+                        &budget_limit_id(grant.session_id, grant.expected_session_version)?,
+                    )?
+                    .is_some())
+                || extension_expiry.is_some_and(|expires| grant.expires_at_unix_ms > expires)
             {
                 return Err(transition());
             }
@@ -1479,7 +1496,7 @@ impl WorkflowStore {
             .iter()
             .filter(|call| call.grant.expected_session_version == grant.expected_session_version)
             .collect();
-        if same_head.len() >= ADAPTIVE_LEADERSHIP_MAX_REVIEWS
+        if same_head.len() >= head_review_limit
             || (grant.schema_version == 2
                 && existing
                     .iter()
@@ -1491,7 +1508,7 @@ impl WorkflowStore {
                     .iter()
                     .filter(|call| call.grant.schema_version == 3)
                     .count()
-                    >= ADAPTIVE_LEADERSHIP_MAX_REVIEWS)
+                    >= global_review_limit)
             || same_head
                 .iter()
                 .any(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none())
@@ -2089,6 +2106,881 @@ mod tests {
     }
 
     const CONTINUATION_AT: u64 = 900_002;
+
+    mod budget_review_extension_tests {
+        use super::*;
+
+        fn operator(f: &Fixture) -> AuthenticatedCompanyPrincipalV1 {
+            let authority =
+                PrincipalAuthorityV1::derive("review-extension-operator", 1, &[9; 32]).unwrap();
+            AuthenticatedCompanyPrincipalV1 {
+                schema_version: 1,
+                tenant_id: f.leader.tenant_id.clone(),
+                principal_id: authority.principal_id,
+                kind: CompanyPrincipalKindV1::Operator,
+                role: CompanyRoleV1::ProjectManager,
+                customer_id: None,
+                agent_id: None,
+                authority_generation: authority.principal_generation,
+                authority_digest: authority.authority_digest,
+            }
+        }
+
+        fn limit_fixture() -> (Fixture, u64) {
+            let mut f = budget_fixture(4);
+            let mut now = CONTINUATION_AT + 7;
+            for index in 0..ADAPTIVE_LEADERSHIP_MAX_REVIEWS {
+                budget_context(&mut f, now, &format!("extension-base-{index}"));
+                let call = authorize_review(&f, now);
+                now = call.grant.expires_at_unix_ms;
+                f.store
+                    .expire_adaptive_leadership_review_call(
+                        &f.leader,
+                        call.grant.review_id,
+                        call.version,
+                        now,
+                    )
+                    .unwrap();
+                now += 1;
+            }
+            budget_context(&mut f, now, "extension-limit");
+            f.store
+                .record_adaptive_budget_window_limit(&f.leader, &f.grant, &f.context, now)
+                .unwrap();
+            (f, now)
+        }
+
+        fn authorize_review(f: &Fixture, now: u64) -> AdaptiveLeadershipReviewCallV1 {
+            f.store
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    &format!("extension-review-{}", f.grant.review_id),
+                    &f.grant,
+                    &f.context,
+                    now,
+                )
+                .unwrap()
+        }
+
+        fn draft(
+            f: &Fixture,
+            now: u64,
+            extra: u16,
+            duration: u64,
+        ) -> AdaptiveBudgetReviewExtensionRequestV1 {
+            f.store
+                .budget_review_extension_draft(
+                    &operator(f),
+                    &f.grant.project_id,
+                    f.grant.session_id,
+                    Uuid::new_v4(),
+                    extra,
+                    "operator-reviewed-evidence",
+                    now + duration,
+                    now,
+                )
+                .unwrap()
+        }
+
+        fn recorded_request(f: &Fixture, now: u64) -> AdaptiveBudgetReviewExtensionRequestV1 {
+            let connection = f.store.connection.lock().unwrap();
+            let limit: AdaptiveBudgetWindowLimitReceiptV1 = get_entity(
+                &connection,
+                &f.leader.tenant_id,
+                BUDGET_LIMIT_KIND,
+                &budget_limit_id(f.grant.session_id, f.grant.expected_session_version).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            let calls =
+                calls_for_session(&connection, &f.leader.tenant_id, f.grant.session_id).unwrap();
+            AdaptiveBudgetReviewExtensionRequestV1 {
+                schema_version: 1,
+                operation_id: Uuid::new_v4(),
+                tenant_id: f.leader.tenant_id.clone(),
+                project_id: f.grant.project_id.clone(),
+                session_id: f.grant.session_id,
+                expected_session_version: f.grant.expected_session_version,
+                budget_limit_receipt_digest: canonical_sha256(
+                    "sentinel.workflow.adaptive-budget-limit.v1",
+                    &limit,
+                )
+                .unwrap(),
+                source_digest: limit.source_digest,
+                base_global_review_count: calls
+                    .iter()
+                    .filter(|call| call.grant.schema_version == 3)
+                    .count(),
+                base_head_review_count: calls
+                    .iter()
+                    .filter(|call| {
+                        call.grant.expected_session_version == f.grant.expected_session_version
+                    })
+                    .count(),
+                additional_reviews: 1,
+                reason_ref: "operator-reviewed-evidence".into(),
+                expires_at_unix_ms: now + 3_600_000,
+            }
+        }
+
+        #[test]
+        fn budget_review_extension_missing_receipt_and_default_denial_are_read_only() {
+            let f = budget_fixture(4);
+            let now = CONTINUATION_AT + 7;
+            let before = rows(&f.store);
+            assert_eq!(
+                f.store
+                    .budget_review_limits(
+                        &f.leader.tenant_id,
+                        f.grant.session_id,
+                        f.grant.expected_session_version,
+                        now,
+                    )
+                    .unwrap(),
+                (3, 3, None)
+            );
+            assert!(f
+                .store
+                .budget_review_extension(
+                    &f.leader.tenant_id,
+                    f.grant.session_id,
+                    f.grant.expected_session_version,
+                )
+                .unwrap()
+                .is_none());
+            assert!(f
+                .store
+                .budget_review_extension_draft(
+                    &operator(&f),
+                    &f.grant.project_id,
+                    f.grant.session_id,
+                    Uuid::new_v4(),
+                    1,
+                    "operator-reviewed-evidence",
+                    now + 3_600_000,
+                    now,
+                )
+                .is_err());
+            assert!(!f
+                .store
+                .adaptive_budget_window_limit_recorded(
+                    &f.leader.tenant_id,
+                    f.grant.session_id,
+                    f.grant.expected_session_version,
+                )
+                .unwrap());
+            assert_eq!(rows(&f.store), before);
+
+            let (f, now) = limit_fixture();
+            let before = rows(&f.store);
+            assert!(f
+                .store
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    "no-implicit-extension",
+                    &f.grant,
+                    &f.context,
+                    now,
+                )
+                .is_err());
+            assert_eq!(rows(&f.store), before);
+        }
+
+        #[test]
+        fn budget_review_extension_exact_extra_reviews_preserve_root_and_old_receipt() {
+            for extra in 1..=3 {
+                let (mut f, mut now) = limit_fixture();
+                let source = session(&f);
+                let project = f.context.source_project.clone();
+                let prior = f
+                    .store
+                    .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+                    .unwrap();
+                let request = draft(&f, now, extra, 3_600_000);
+                assert_eq!(
+                    (
+                        request.base_global_review_count,
+                        request.base_head_review_count
+                    ),
+                    (3, 3)
+                );
+                let (replayed, receipt) = f
+                    .store
+                    .authorize_budget_review_extension(&operator(&f), &request, now)
+                    .unwrap();
+                assert!(!replayed);
+                assert!(receipt.request == request);
+                assert_eq!(session(&f), source);
+                assert_eq!(
+                    f.store
+                        .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+                        .unwrap(),
+                    prior
+                );
+                assert_eq!(
+                    f.store
+                        .company_project(&f.leader.tenant_id, &f.grant.project_id)
+                        .unwrap(),
+                    Some(project.clone())
+                );
+                assert_eq!(
+                    f.store
+                        .budget_review_limits(
+                            &f.leader.tenant_id,
+                            f.grant.session_id,
+                            source.version,
+                            now,
+                        )
+                        .unwrap(),
+                    (
+                        3 + usize::from(extra),
+                        3 + usize::from(extra),
+                        Some(request.expires_at_unix_ms)
+                    )
+                );
+                for index in 0..extra {
+                    now += 1;
+                    budget_context(&mut f, now, &format!("extension-extra-{index}"));
+                    let call = authorize_review(&f, now);
+                    now = call.grant.expires_at_unix_ms;
+                    f.store
+                        .expire_adaptive_leadership_review_call(
+                            &f.leader,
+                            call.grant.review_id,
+                            call.version,
+                            now,
+                        )
+                        .unwrap();
+                }
+                now += 1;
+                budget_context(&mut f, now, "extension-exhausted");
+                let before = rows(&f.store);
+                assert!(f
+                    .store
+                    .authorize_adaptive_leadership_review_call(
+                        &f.leader,
+                        Uuid::new_v4(),
+                        "extension-no-more",
+                        &f.grant,
+                        &f.context,
+                        now,
+                    )
+                    .is_err());
+                assert_eq!(rows(&f.store), before);
+                assert_eq!(session(&f), source);
+                assert_eq!(
+                    f.store
+                        .company_project(&f.leader.tenant_id, &f.grant.project_id)
+                        .unwrap(),
+                    Some(project)
+                );
+                let reopened = WorkflowStore::open(&f.path).unwrap();
+                let calls = reopened
+                    .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+                    .unwrap();
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|call| call.grant.schema_version == 3)
+                        .count(),
+                    3 + usize::from(extra)
+                );
+                for old in &prior {
+                    assert!(calls.iter().any(|call| call == old));
+                }
+                assert!(reopened
+                    .adaptive_budget_window_limit_recorded(
+                        &f.leader.tenant_id,
+                        f.grant.session_id,
+                        source.version,
+                    )
+                    .unwrap());
+                assert!(
+                    reopened
+                        .budget_review_extension(
+                            &f.leader.tenant_id,
+                            f.grant.session_id,
+                            source.version
+                        )
+                        .unwrap()
+                        .unwrap()
+                        == receipt
+                );
+                let before = rows(&reopened);
+                let (replayed, same) = reopened
+                    .authorize_budget_review_extension(
+                        &operator(&f),
+                        &request,
+                        request.expires_at_unix_ms + 1,
+                    )
+                    .unwrap();
+                assert!(replayed && same == receipt);
+                assert_eq!(rows(&reopened), before);
+            }
+        }
+
+        #[test]
+        fn budget_review_extension_replay_precedes_clock_source_and_never_renews() {
+            let (f, now) = limit_fixture();
+            let request = draft(&f, now, 1, 3_600_000);
+            let (_, receipt) = f
+                .store
+                .authorize_budget_review_extension(&operator(&f), &request, now)
+                .unwrap();
+            change_project(&f, now + 1);
+            let reopened = WorkflowStore::open(&f.path).unwrap();
+            let before = rows(&reopened);
+            for replay_at in [
+                0,
+                now - 1,
+                request.expires_at_unix_ms,
+                request.expires_at_unix_ms + 1,
+            ] {
+                let (replayed, same) = reopened
+                    .authorize_budget_review_extension(&operator(&f), &request, replay_at)
+                    .unwrap();
+                assert!(replayed && same == receipt);
+            }
+            assert_eq!(
+                reopened
+                    .budget_review_limits(
+                        &f.leader.tenant_id,
+                        f.grant.session_id,
+                        f.grant.expected_session_version,
+                        now + 1,
+                    )
+                    .unwrap(),
+                (3, 3, None)
+            );
+            assert_eq!(
+                reopened
+                    .budget_review_limits(
+                        &f.leader.tenant_id,
+                        f.grant.session_id,
+                        f.grant.expected_session_version + 1,
+                        now + 1,
+                    )
+                    .unwrap(),
+                (3, 3, None)
+            );
+            for mutation in 0..4 {
+                let mut changed = request.clone();
+                match mutation {
+                    0 => changed.operation_id = Uuid::new_v4(),
+                    1 => changed.reason_ref = "another-reason".into(),
+                    2 => changed.additional_reviews = 2,
+                    _ => changed.expires_at_unix_ms += 1,
+                }
+                let error = reopened
+                    .authorize_budget_review_extension(&operator(&f), &changed, now)
+                    .err()
+                    .unwrap();
+                assert_eq!(error.code, WorkflowErrorCode::IdempotencyConflict);
+            }
+            let mut changed_issuer = operator(&f);
+            changed_issuer.authority_generation += 1;
+            let error = reopened
+                .authorize_budget_review_extension(&changed_issuer, &request, now)
+                .err()
+                .unwrap();
+            assert_eq!(error.code, WorkflowErrorCode::IdempotencyConflict);
+            assert!(reopened
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    "extension-stale-source",
+                    &f.grant,
+                    &f.context,
+                    now + 1,
+                )
+                .is_err());
+            assert_eq!(rows(&reopened), before);
+        }
+
+        #[test]
+        fn budget_review_extension_invalid_authority_body_clock_and_source_do_not_write() {
+            let (f, now) = limit_fixture();
+            let request = draft(&f, now, 1, 3_600_000);
+            let before = rows(&f.store);
+            for mutation in 0..15 {
+                let mut changed = request.clone();
+                match mutation {
+                    0 => changed.schema_version = 2,
+                    1 => changed.operation_id = Uuid::nil(),
+                    2 => changed.session_id = Uuid::nil(),
+                    3 => changed.expected_session_version += 1,
+                    4 => changed.additional_reviews = 0,
+                    5 => changed.additional_reviews = 4,
+                    6 => changed.reason_ref = "../unsafe reason".into(),
+                    7 => changed.expires_at_unix_ms = now + 999,
+                    8 => changed.expires_at_unix_ms = now + 86_400_001,
+                    9 => changed.base_global_review_count += 1,
+                    10 => changed.base_head_review_count += 1,
+                    11 => changed.source_digest = "f".repeat(64),
+                    12 => changed.budget_limit_receipt_digest = "f".repeat(64),
+                    13 => changed.tenant_id = TenantId("foreign-tenant".into()),
+                    _ => changed.project_id = ProjectId("foreign-project".into()),
+                }
+                assert!(
+                    f.store
+                        .authorize_budget_review_extension(&operator(&f), &changed, now)
+                        .is_err(),
+                    "mutation {mutation}"
+                );
+            }
+            for invalid_at in [0, now - 1, request.expires_at_unix_ms] {
+                assert!(f
+                    .store
+                    .authorize_budget_review_extension(&operator(&f), &request, invalid_at)
+                    .is_err());
+            }
+            assert!(f
+                .store
+                .authorize_budget_review_extension(&f.leader, &request, now)
+                .is_err());
+            let mut wrong_role = operator(&f);
+            wrong_role.role = CompanyRoleV1::Developer;
+            assert!(f
+                .store
+                .authorize_budget_review_extension(&wrong_role, &request, now)
+                .is_err());
+            assert!(f
+                .store
+                .budget_review_extension_draft(
+                    &operator(&f),
+                    &ProjectId("foreign-project".into()),
+                    f.grant.session_id,
+                    Uuid::new_v4(),
+                    1,
+                    "reason",
+                    now + 3_600_000,
+                    now,
+                )
+                .is_err());
+            let mut foreign = operator(&f);
+            foreign.tenant_id = TenantId("foreign-tenant".into());
+            assert!(f
+                .store
+                .budget_review_extension_draft(
+                    &foreign,
+                    &f.grant.project_id,
+                    f.grant.session_id,
+                    Uuid::new_v4(),
+                    1,
+                    "reason",
+                    now + 3_600_000,
+                    now,
+                )
+                .is_err());
+            assert_eq!(rows(&f.store), before);
+            change_project(&f, now + 1);
+            let before = rows(&f.store);
+            assert!(f
+                .store
+                .authorize_budget_review_extension(&operator(&f), &request, now + 1)
+                .is_err());
+            assert!(f
+                .store
+                .budget_review_extension_draft(
+                    &operator(&f),
+                    &f.grant.project_id,
+                    f.grant.session_id,
+                    Uuid::new_v4(),
+                    1,
+                    "reason",
+                    now + 3_600_000,
+                    now + 1,
+                )
+                .is_err());
+            assert_eq!(rows(&f.store), before);
+        }
+
+        #[test]
+        fn budget_review_extension_expiry_caps_review_and_is_not_a_new_head_budget() {
+            let (mut f, now) = limit_fixture();
+            let request = draft(&f, now, 1, 1_000);
+            f.store
+                .authorize_budget_review_extension(&operator(&f), &request, now)
+                .unwrap();
+            budget_context(&mut f, now + 1, "extension-expiry-bound");
+            let before = rows(&f.store);
+            assert!(f
+                .store
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    "extension-too-long",
+                    &f.grant,
+                    &f.context,
+                    now + 1,
+                )
+                .is_err());
+            assert_eq!(rows(&f.store), before);
+            f.grant.expires_at_unix_ms = request.expires_at_unix_ms;
+            let old_head = f.grant.expected_session_version;
+            let call = dispatch_budget(&f, now + 1);
+            let result = budget_result(&call, 1, now + 3);
+            f.store
+                .complete_adaptive_leadership_review_call(&f.leader, &result, now + 3)
+                .unwrap();
+            let current = session(&f);
+            assert!(current.version > old_head);
+            for head in [old_head, current.version] {
+                assert_eq!(
+                    f.store
+                        .budget_review_limits(
+                            &f.leader.tenant_id,
+                            f.grant.session_id,
+                            head,
+                            now + 4
+                        )
+                        .unwrap(),
+                    (3, 3, None)
+                );
+            }
+            let before = rows(&f.store);
+            assert!(
+                f.store
+                    .authorize_budget_review_extension(&operator(&f), &request, now + 4)
+                    .unwrap()
+                    .0
+            );
+            assert!(f
+                .store
+                .adaptive_budget_window_limit_recorded(
+                    &f.leader.tenant_id,
+                    f.grant.session_id,
+                    old_head
+                )
+                .unwrap());
+            assert_eq!(rows(&f.store), before);
+
+            let (mut f, now) = limit_fixture();
+            let request = draft(&f, now, 1, 1_000);
+            f.store
+                .authorize_budget_review_extension(&operator(&f), &request, now)
+                .unwrap();
+            assert_eq!(
+                f.store
+                    .budget_review_limits(
+                        &f.leader.tenant_id,
+                        f.grant.session_id,
+                        f.grant.expected_session_version,
+                        now - 1
+                    )
+                    .unwrap(),
+                (3, 3, None)
+            );
+            assert_eq!(
+                f.store
+                    .budget_review_limits(
+                        &f.leader.tenant_id,
+                        f.grant.session_id,
+                        f.grant.expected_session_version,
+                        request.expires_at_unix_ms
+                    )
+                    .unwrap(),
+                (3, 3, None)
+            );
+            budget_context(&mut f, request.expires_at_unix_ms, "extension-expired");
+            let before = rows(&f.store);
+            assert!(f
+                .store
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    "extension-expired",
+                    &f.grant,
+                    &f.context,
+                    request.expires_at_unix_ms,
+                )
+                .is_err());
+            assert_eq!(rows(&f.store), before);
+        }
+
+        #[test]
+        fn budget_review_extension_rejects_active_review_root_and_window_exhaustion() {
+            let mut f = budget_fixture(4);
+            let mut now = CONTINUATION_AT + 7;
+            for index in 0..3 {
+                budget_context(&mut f, now, &format!("extension-active-{index}"));
+                let call = authorize_review(&f, now);
+                if index < 2 {
+                    now = call.grant.expires_at_unix_ms;
+                    f.store
+                        .expire_adaptive_leadership_review_call(
+                            &f.leader,
+                            call.grant.review_id,
+                            call.version,
+                            now,
+                        )
+                        .unwrap();
+                    now += 1;
+                }
+            }
+            f.store
+                .record_adaptive_budget_window_limit(&f.leader, &f.grant, &f.context, now)
+                .unwrap();
+            let before = rows(&f.store);
+            assert!(f
+                .store
+                .budget_review_extension_draft(
+                    &operator(&f),
+                    &f.grant.project_id,
+                    f.grant.session_id,
+                    Uuid::new_v4(),
+                    1,
+                    "reason",
+                    now + 3_600_000,
+                    now
+                )
+                .is_err());
+            assert!(f
+                .store
+                .authorize_budget_review_extension(&operator(&f), &recorded_request(&f, now), now)
+                .is_err());
+            assert_eq!(rows(&f.store), before);
+
+            for exhausted_windows in [false, true] {
+                let mut f = budget_fixture(if exhausted_windows { 8 } else { 2 });
+                let mut now = CONTINUATION_AT + 7;
+                if exhausted_windows {
+                    for index in 0..2 {
+                        let call = dispatch_budget(&f, now);
+                        let result = budget_result(&call, 1, now + 2);
+                        f.store
+                            .complete_adaptive_leadership_review_call(&f.leader, &result, now + 2)
+                            .unwrap();
+                        observe_budget_inspection(&f, session(&f), now + 3);
+                        now += 7;
+                        budget_context(&mut f, now, &format!("extension-window-limit-{index}"));
+                    }
+                }
+                f.store
+                    .record_adaptive_budget_window_limit(&f.leader, &f.grant, &f.context, now)
+                    .unwrap();
+                let before = rows(&f.store);
+                assert!(f
+                    .store
+                    .budget_review_extension_draft(
+                        &operator(&f),
+                        &f.grant.project_id,
+                        f.grant.session_id,
+                        Uuid::new_v4(),
+                        1,
+                        "reason",
+                        now + 3_600_000,
+                        now
+                    )
+                    .is_err());
+                assert!(f
+                    .store
+                    .authorize_budget_review_extension(
+                        &operator(&f),
+                        &recorded_request(&f, now),
+                        now
+                    )
+                    .is_err());
+                assert_eq!(rows(&f.store), before);
+            }
+        }
+
+        #[test]
+        fn budget_review_extension_last_slot_is_atomic_across_store_connections() {
+            let (mut f, now) = limit_fixture();
+            let request = draft(&f, now, 1, 3_600_000);
+            f.store
+                .authorize_budget_review_extension(&operator(&f), &request, now)
+                .unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let mut threads = Vec::new();
+            for index in 0..2 {
+                budget_context(&mut f, now + 1, &format!("extension-racing-{index}"));
+                let grant = f.grant.clone();
+                let context = f.context.clone();
+                let leader = f.leader.clone();
+                let store = WorkflowStore::open(&f.path).unwrap();
+                let barrier = Arc::clone(&barrier);
+                threads.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .authorize_adaptive_leadership_review_call(
+                            &leader,
+                            Uuid::new_v4(),
+                            &format!("extension-racing-{index}"),
+                            &grant,
+                            &context,
+                            now + 1,
+                        )
+                        .is_ok()
+                }));
+            }
+            let admitted = threads
+                .into_iter()
+                .map(|thread| usize::from(thread.join().unwrap()))
+                .sum::<usize>();
+            assert_eq!(admitted, 1);
+            let calls = f
+                .store
+                .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+                .unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call.grant.schema_version == 3)
+                    .count(),
+                4
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none())
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn budget_review_extension_mixed_heads_freeze_counts_and_keep_baseline_receipt_valid() {
+            let mut f = budget_fixture(6);
+            let mut now = CONTINUATION_AT + 7;
+            let continued = dispatch_budget(&f, now);
+            let result = budget_result(&continued, 1, now + 2);
+            f.store
+                .complete_adaptive_leadership_review_call(&f.leader, &result, now + 2)
+                .unwrap();
+            observe_budget_inspection(&f, session(&f), now + 3);
+            now += 7;
+            for index in 0..2 {
+                budget_context(&mut f, now, &format!("extension-mixed-base-{index}"));
+                let call = authorize_review(&f, now);
+                now = call.grant.expires_at_unix_ms;
+                f.store
+                    .expire_adaptive_leadership_review_call(
+                        &f.leader,
+                        call.grant.review_id,
+                        call.version,
+                        now,
+                    )
+                    .unwrap();
+                now += 1;
+            }
+            budget_context(&mut f, now, "extension-mixed-limit");
+            f.store
+                .record_adaptive_budget_window_limit(&f.leader, &f.grant, &f.context, now)
+                .unwrap();
+            let old_limit = {
+                let connection = f.store.connection.lock().unwrap();
+                get_entity::<AdaptiveBudgetWindowLimitReceiptV1>(
+                    &connection,
+                    &f.leader.tenant_id,
+                    BUDGET_LIMIT_KIND,
+                    &budget_limit_id(f.grant.session_id, f.grant.expected_session_version).unwrap(),
+                )
+                .unwrap()
+                .unwrap()
+            };
+            assert_eq!(
+                old_limit.causes,
+                vec![AdaptiveBudgetWindowLimitCauseV1::ReviewLimit]
+            );
+            let request = draft(&f, now, 1, 3_600_000);
+            assert_eq!(
+                (
+                    request.base_global_review_count,
+                    request.base_head_review_count
+                ),
+                (3, 2)
+            );
+            f.store
+                .authorize_budget_review_extension(&operator(&f), &request, now)
+                .unwrap();
+            assert_eq!(
+                f.store
+                    .budget_review_limits(
+                        &f.leader.tenant_id,
+                        f.grant.session_id,
+                        f.grant.expected_session_version,
+                        now
+                    )
+                    .unwrap(),
+                (4, 3, Some(request.expires_at_unix_ms))
+            );
+            now += 1;
+            budget_context(&mut f, now, "extension-mixed-extra");
+            let call = authorize_review(&f, now);
+            now = call.grant.expires_at_unix_ms;
+            f.store
+                .expire_adaptive_leadership_review_call(
+                    &f.leader,
+                    call.grant.review_id,
+                    call.version,
+                    now,
+                )
+                .unwrap();
+            now += 1;
+            budget_context(&mut f, now, "extension-mixed-exhausted");
+            let before = rows(&f.store);
+            assert!(f
+                .store
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    "extension-mixed-no-more",
+                    &f.grant,
+                    &f.context,
+                    now
+                )
+                .is_err());
+            let connection = f.store.connection.lock().unwrap();
+            let current = budget_limit_causes(&connection, &f.grant, &f.context).unwrap();
+            assert!(current.contains(&AdaptiveBudgetWindowLimitCauseV1::HeadReviewLimit));
+            let persisted: AdaptiveBudgetWindowLimitReceiptV1 = get_entity(
+                &connection,
+                &f.leader.tenant_id,
+                BUDGET_LIMIT_KIND,
+                &old_limit.receipt_id,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(persisted == old_limit);
+            drop(connection);
+            assert_eq!(rows(&f.store), before);
+        }
+
+        #[test]
+        fn budget_review_extension_event_failure_rolls_back_issuance() {
+            let (f, now) = limit_fixture();
+            let request = draft(&f, now, 1, 3_600_000);
+            f.store
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER reject_review_extension_event BEFORE INSERT ON company_events
+                 WHEN NEW.event_type='adaptive_budget_review_extension_authorized'
+                 BEGIN SELECT RAISE(ABORT, 'test extension event failure'); END;",
+                )
+                .unwrap();
+            let before = rows(&f.store);
+            assert!(f
+                .store
+                .authorize_budget_review_extension(&operator(&f), &request, now)
+                .is_err());
+            assert_eq!(rows(&f.store), before);
+            assert!(f
+                .store
+                .budget_review_extension(
+                    &f.leader.tenant_id,
+                    f.grant.session_id,
+                    f.grant.expected_session_version
+                )
+                .unwrap()
+                .is_none());
+        }
+    }
 
     fn budget_context(f: &mut Fixture, now: u64, evidence: &str) {
         let source = session(f);
