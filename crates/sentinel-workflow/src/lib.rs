@@ -5,6 +5,7 @@
 
 mod adaptive;
 mod adaptive_core;
+mod adaptive_leadership_local_adoption;
 mod adaptive_leadership_recovery;
 mod adaptive_leadership_review;
 mod admission;
@@ -22,6 +23,7 @@ mod store;
 
 pub use adaptive::*;
 pub use adaptive_core::*;
+pub use adaptive_leadership_local_adoption::*;
 pub use adaptive_leadership_recovery::*;
 pub use adaptive_leadership_review::*;
 pub use admission::*;

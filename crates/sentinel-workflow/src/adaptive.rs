@@ -45,6 +45,8 @@ pub struct AdaptiveContinuationAuthorizationV1 {
     pub issued_at_ms: u64,
     pub deadline_ms: u64,
     pub additional_model_calls: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_adoption: Option<Box<crate::AdaptiveLeadershipLocalAdoptionV1>>,
 }
 
 impl AdaptiveContinuationAuthorizationV1 {
@@ -80,6 +82,26 @@ impl AdaptiveContinuationAuthorizationV1 {
             ) if valid_reason(reason_code) && valid_resolution(resolution_event_id) => {}
             (AdaptiveContinuationSourceV1::ModelUnknown, Some(_)) => {}
             _ => return Err(invalid()),
+        }
+        if let Some(adoption) = &self.local_adoption {
+            adoption.validate()?;
+            let crate::AdaptiveLeadershipReviewDecisionKindV1::Continue {
+                additional_model_calls,
+                window_ms,
+                ..
+            } = &adoption.request.decision.decision
+            else {
+                return Err(invalid());
+            };
+            if adoption.request.session_id != self.session_id
+                || adoption.request.review_id != self.review_id
+                || adoption.issued_at_unix_ms != self.issued_at_ms
+                || adoption.continuation_deadline_ms != self.deadline_ms
+                || *additional_model_calls != self.additional_model_calls
+                || self.deadline_ms - self.issued_at_ms != *window_ms
+            {
+                return Err(invalid());
+            }
         }
         Ok(())
     }
@@ -936,6 +958,7 @@ pub(crate) mod continuation_tests {
             issued_at_ms: NOW + 1_000,
             deadline_ms: NOW + 11_000,
             additional_model_calls: 3,
+            local_adoption: None,
         }
     }
 

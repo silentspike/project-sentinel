@@ -101,12 +101,7 @@ impl WorkflowApi {
                         "model_decision_recorded":false
                     }),
                 ),
-                Err(_) => json_error(
-                    409,
-                    "adaptive_recovery_conflict",
-                    "recovery candidate unavailable",
-                    false,
-                ),
+                Err(reason) => json_error(409, "adaptive_recovery_conflict", reason, false),
             }
         } else {
             let request: AdaptiveLeadershipRecoveryRequestV1 = match decode_body(body) {
@@ -216,12 +211,43 @@ impl WorkflowApi {
             .into_iter()
             .find(|value| value.grant.session_id == session_id)
             .ok_or("recovery session missing")?;
-        let AdaptiveCursorV1::ModelUnknown { effect } = &session.cursor else {
-            return Err("recovery source is not unknown model");
+        let (unknown_effect, proof, blocked_subject, subject) = match &session.cursor {
+            AdaptiveCursorV1::ModelUnknown { effect } => {
+                let proof = self
+                    .read_only_unknown_model_proof_digest(&project, &session, effect)?
+                    .ok_or("recovery unknown proof missing")?;
+                (
+                    Some(effect.clone()),
+                    Some(proof.clone()),
+                    None,
+                    AdaptiveLeadershipReviewSubjectV2::UnknownModel {
+                        effect: effect.clone(),
+                        sealed_unknown_proof_digest: proof,
+                    },
+                )
+            }
+            AdaptiveCursorV1::Blocked { reason_code } => {
+                let model_response_digest = session
+                    .last_model_result_digest
+                    .clone()
+                    .ok_or("recovery blocked model receipt missing")?;
+                (
+                    None,
+                    None,
+                    Some(
+                        sentinel_workflow::AdaptiveLeadershipRecoveryBlockedSubjectV1 {
+                            reason_code: reason_code.clone(),
+                            model_response_digest,
+                        },
+                    ),
+                    AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
+                        reason_code: reason_code.clone(),
+                        resolution_event_id: None,
+                    },
+                )
+            }
+            _ => return Err("recovery source is not eligible model or blocked state"),
         };
-        let proof = self
-            .read_only_unknown_model_proof_digest(&project, &session, effect)?
-            .ok_or("recovery unknown proof missing")?;
         let calls = self
             .store
             .adaptive_leadership_review_calls(&project.tenant_id, session_id)
@@ -235,6 +261,9 @@ impl WorkflowApi {
         if prior.context.source_project != project || prior.context.source_session != session {
             return Err("recovery prior source changed");
         }
+        prior
+            .validate_continuation_source()
+            .map_err(|_| "recovery continuation allowance source invalid")?;
         let leader = self
             .principals
             .principal(&prior.grant.leadership_principal.principal_id)
@@ -302,7 +331,7 @@ impl WorkflowApi {
             .ok_or("recovery head missing")?;
         let (release, repair_digest) = adaptive_recovery_release::verified_current_repair()?;
         let request = AdaptiveLeadershipRecoveryRequestV1 {
-            schema_version: 1,
+            schema_version: if blocked_subject.is_some() { 2 } else { 1 },
             operation_id,
             tenant_id: project.tenant_id.clone(),
             project_id: project_id.clone(),
@@ -315,8 +344,9 @@ impl WorkflowApi {
                 .map_err(|_| "recovery session digest invalid")?,
             project_digest: adaptive_leadership_recovery_project_digest(&project)
                 .map_err(|_| "recovery project digest invalid")?,
-            unknown_effect: effect.clone(),
-            sealed_unknown_proof_digest: proof.clone(),
+            unknown_effect,
+            sealed_unknown_proof_digest: proof,
+            blocked_subject,
             prior_review_history_digest: history,
             repair_digest,
             release,
@@ -344,10 +374,7 @@ impl WorkflowApi {
         grant.review_id = adaptive_leadership_review_id(session_id, session.version, &fingerprint)
             .map_err(|_| "recovery review identity invalid")?;
         grant.evidence_fingerprint = fingerprint;
-        grant.subject = Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel {
-            effect: effect.clone(),
-            sealed_unknown_proof_digest: proof,
-        });
+        grant.subject = Some(subject);
         grant.expires_at_unix_ms = expires_at_unix_ms;
         let proposed = AdaptiveLeadershipRecoveryEpochV1 {
             schema_version: 1,
@@ -403,6 +430,33 @@ impl WorkflowApi {
             || issuer.execution_authority != epoch.issuer_authority
         {
             return Err("recovery issuer authority changed");
+        }
+        if let Some(adoption) = self
+            .store
+            .adaptive_leadership_local_adoption(
+                &call.grant.leadership_principal.tenant_id,
+                call.grant.review_id,
+            )
+            .map_err(|_| "local adoption authority unavailable")?
+        {
+            adoption
+                .validate_against(&epoch, call)
+                .map_err(|_| "local adoption epoch authority invalid")?;
+            let issuer = self
+                .principals
+                .principal(&adoption.issuer_principal.principal_id)
+                .ok_or("local adoption issuer missing")?;
+            if issuer.principal != adoption.issuer_principal
+                || issuer.execution_authority != adoption.issuer_authority
+            {
+                return Err("local adoption issuer authority changed");
+            }
+            if adaptive_recovery_release::verified_current_repair()?
+                != (adoption.request.release, adoption.request.repair_digest)
+            {
+                return Err("local adoption installed repair changed");
+            }
+            return Ok(());
         }
         if adaptive_recovery_release::verified_current_repair()?
             != (epoch.request.release, epoch.request.repair_digest)
