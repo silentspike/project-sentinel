@@ -1,5 +1,11 @@
 # Changelog
 
+- Poll exact executing adaptive Workbench invocations instead of indefinitely
+  replaying Submit. Validate identity and request digest before and after Poll;
+  drain already claimed tool effects after model-allowance expiry without
+  granting a fresh tool start, model call, effect identity or recovery budget
+  (#856).
+
 - Compose leadership continuation against the employee's immutable root and
   the exact current undispatched allowance. Recover blocked work through a
   distinct versioned subject, and authorize bounded local adoption of an
