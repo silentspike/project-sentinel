@@ -2657,6 +2657,8 @@ type PrivateObservationTestStore = (Arc<WorkbenchInvocationStore>, WorkbenchProf
 std::thread_local! {
     static PRIVATE_OBSERVATION_TEST_STORE: std::cell::RefCell<Option<PrivateObservationTestStore>> =
         const { std::cell::RefCell::new(None) };
+    static TERMINAL_WORKBENCH_TEST_SERVICE: std::cell::RefCell<Option<PrivateObservationTestStore>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -2678,6 +2680,42 @@ pub(crate) fn with_private_observation_store_for_test<R>(
         .with(|slot| slot.replace(Some((store, profile, profile_digest))));
     let _restore = Restore(previous);
     run()
+}
+
+/// Thread-scoped productive coordinator replay; never installs a global runtime.
+#[cfg(test)]
+pub(crate) fn with_terminal_workbench_service_for_test<R>(
+    store: Arc<WorkbenchInvocationStore>,
+    profile: WorkbenchProfile,
+    digest: String,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<PrivateObservationTestStore>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TERMINAL_WORKBENCH_TEST_SERVICE.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let previous = TERMINAL_WORKBENCH_TEST_SERVICE
+        .with(|slot| slot.replace(Some((Arc::clone(&store), profile.clone(), digest.clone()))));
+    let _restore = Restore(previous);
+    with_private_observation_store_for_test(store, profile, digest, run)
+}
+
+#[cfg(test)]
+struct TerminalOnlyWorkbenchTestRuntime;
+
+#[cfg(test)]
+impl WorkbenchRuntimeClient for TerminalOnlyWorkbenchTestRuntime {
+    fn exchange(
+        &mut self,
+        _agent_id: AgentId,
+        _request: NanoExecRequest,
+    ) -> anyhow::Result<WorkbenchRuntimeExchange<'_>> {
+        bail!("terminal-only workbench test service forbids runtime exchange");
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2869,6 +2907,17 @@ pub(crate) fn read_workbench_invocation_status(
     profile: &WorkbenchProfile,
     profile_digest: &str,
 ) -> anyhow::Result<Option<WorkbenchInvocationRecord>> {
+    #[cfg(test)]
+    if let Some((store, scoped_profile, digest)) =
+        TERMINAL_WORKBENCH_TEST_SERVICE.with(|slot| slot.borrow().clone())
+    {
+        anyhow::ensure!(
+            profile == &scoped_profile && profile_digest == digest.as_str(),
+            "workbench status profile does not match terminal-only test service"
+        );
+        return WorkbenchCoordinator::new(&store, &scoped_profile, &digest)
+            .invocation_status(invocation_id, authority);
+    }
     let store = WORKBENCH_STATUS_STORE
         .get()
         .ok_or_else(|| anyhow::anyhow!("workbench status store is unavailable"))?;
@@ -2899,6 +2948,64 @@ fn install_workbench_dispatch(
 }
 
 pub fn dispatch_workbench(command: WorkbenchDispatchCommand) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if let Some((store, profile, digest)) =
+        TERMINAL_WORKBENCH_TEST_SERVICE.with(|slot| slot.borrow().clone())
+    {
+        let coordinator = WorkbenchCoordinator::new(&store, &profile, &digest);
+        match &command {
+            WorkbenchDispatchCommand::PrivateObservation {
+                invocation_id,
+                authority,
+                response,
+            } => {
+                let result = coordinator.private_observation(invocation_id, authority.as_ref());
+                response
+                    .send(result)
+                    .map_err(|_| anyhow::anyhow!("private observation test receiver closed"))?;
+            }
+            WorkbenchDispatchCommand::Poll {
+                invocation_id,
+                authority,
+                response,
+            }
+            | WorkbenchDispatchCommand::Recover {
+                invocation_id,
+                authority,
+                response,
+            } => {
+                let result = (|| {
+                    let record = coordinator
+                        .invocation_status(invocation_id, authority.as_ref())?
+                        .ok_or(WorkbenchStoreError::NotReserved)?;
+                    anyhow::ensure!(
+                        record.state.is_terminal(),
+                        "terminal-only workbench test service rejects nonterminal replay"
+                    );
+                    let mut runtime = TerminalOnlyWorkbenchTestRuntime;
+                    // Terminal replay does not use a clock or contact the runtime.
+                    match &command {
+                        WorkbenchDispatchCommand::Poll { .. } => {
+                            coordinator.poll(&mut runtime, invocation_id, authority.as_ref(), 0)
+                        }
+                        _ => coordinator.recover_executing(
+                            &mut runtime,
+                            invocation_id,
+                            authority.as_ref(),
+                            0,
+                        ),
+                    }
+                })();
+                response
+                    .send(result)
+                    .map_err(|_| anyhow::anyhow!("terminal workbench test receiver closed"))?;
+            }
+            WorkbenchDispatchCommand::Submit { .. } | WorkbenchDispatchCommand::Cancel { .. } => {
+                bail!("terminal-only workbench test service rejects submit and cancel");
+            }
+        }
+        return Ok(());
+    }
     #[cfg(test)]
     if let WorkbenchDispatchCommand::PrivateObservation {
         invocation_id,
@@ -3712,6 +3819,337 @@ mod tests {
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("test authority sequence exhausted"))
         }
+    }
+
+    #[test]
+    fn terminal_workbench_test_scope_restores_nested_state_after_panic() {
+        let outer_directory = tempfile::tempdir().unwrap();
+        let inner_directory = tempfile::tempdir().unwrap();
+        let outer_store = Arc::new(store(&outer_directory));
+        let inner_store = Arc::new(store(&inner_directory));
+        let bytes = WorkbenchProfileId::WebAuthoring.immutable_bytes();
+        let profile: WorkbenchProfile =
+            toml::from_str(std::str::from_utf8(bytes).unwrap()).unwrap();
+        let digest = hex_sha256(bytes);
+        let authority = authority(&request("test-scope-status"), &profile);
+        let assert_scopes = |expected: Option<&Arc<WorkbenchInvocationStore>>| {
+            for key in [
+                &TERMINAL_WORKBENCH_TEST_SERVICE,
+                &PRIVATE_OBSERVATION_TEST_STORE,
+            ] {
+                key.with(|slot| match (slot.borrow().as_ref(), expected) {
+                    (Some((actual_store, actual_profile, actual_digest)), Some(expected)) => {
+                        assert!(Arc::ptr_eq(actual_store, expected));
+                        assert_eq!(actual_profile, &profile);
+                        assert_eq!(actual_digest, &digest);
+                    }
+                    (None, None) => {}
+                    _ => panic!("unexpected workbench test scope"),
+                });
+            }
+        };
+
+        assert_scopes(None);
+        with_private_observation_store_for_test(
+            Arc::clone(&outer_store),
+            profile.clone(),
+            digest.clone(),
+            || {
+                let returned = with_terminal_workbench_service_for_test(
+                    Arc::clone(&inner_store),
+                    profile.clone(),
+                    digest.clone(),
+                    || {
+                        assert_scopes(Some(&inner_store));
+                        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            with_terminal_workbench_service_for_test(
+                                Arc::clone(&outer_store),
+                                profile.clone(),
+                                digest.clone(),
+                                || {
+                                    assert_scopes(Some(&outer_store));
+                                    panic!("unwind nested terminal workbench test scope");
+                                },
+                            );
+                        }));
+                        assert!(panic.is_err());
+                        assert_scopes(Some(&inner_store));
+                        std::thread::spawn(|| {
+                            TERMINAL_WORKBENCH_TEST_SERVICE
+                                .with(|slot| assert!(slot.borrow().is_none()));
+                            PRIVATE_OBSERVATION_TEST_STORE
+                                .with(|slot| assert!(slot.borrow().is_none()));
+                        })
+                        .join()
+                        .unwrap();
+
+                        assert!(read_workbench_invocation_status(
+                            "missing", &authority, &profile, &digest,
+                        )
+                        .unwrap()
+                        .is_none());
+                        let mut mismatched_profile = profile.clone();
+                        mismatched_profile.capabilities.clear();
+                        assert!(read_workbench_invocation_status(
+                            "missing",
+                            &authority,
+                            &mismatched_profile,
+                            &digest,
+                        )
+                        .is_err());
+                        assert!(read_workbench_invocation_status(
+                            "missing",
+                            &authority,
+                            &profile,
+                            "mismatched-digest",
+                        )
+                        .is_err());
+                        7
+                    },
+                );
+                assert_eq!(returned, 7);
+                TERMINAL_WORKBENCH_TEST_SERVICE.with(|slot| assert!(slot.borrow().is_none()));
+                PRIVATE_OBSERVATION_TEST_STORE.with(|slot| {
+                    let scoped = slot.borrow();
+                    let (actual_store, actual_profile, actual_digest) = scoped.as_ref().unwrap();
+                    assert!(Arc::ptr_eq(actual_store, &outer_store));
+                    assert_eq!(actual_profile, &profile);
+                    assert_eq!(actual_digest, &digest);
+                });
+            },
+        );
+        assert_scopes(None);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_terminal_workbench_service_for_test(
+                Arc::clone(&outer_store),
+                profile.clone(),
+                digest.clone(),
+                || panic!("unwind outer terminal workbench test scope"),
+            );
+        }));
+        assert!(panic.is_err());
+        assert_scopes(None);
+    }
+
+    #[test]
+    fn terminal_workbench_test_service_rejects_submit_and_cancel_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(store(&directory));
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b28d1");
+        request.tool_profile_digest = digest.clone();
+        request.input_digest = request.canonical_digest().unwrap();
+        profile.authorize_request(&digest, &request).unwrap();
+        let authority: Arc<dyn WorkbenchAuthoritySource> = Arc::new(authority(&request, &profile));
+
+        for state in [
+            None,
+            Some(WorkbenchInvocationState::Reserved),
+            Some(WorkbenchInvocationState::Executing),
+            Some(WorkbenchInvocationState::Cancelled),
+        ] {
+            match state {
+                None => {}
+                Some(WorkbenchInvocationState::Reserved) => {
+                    store.reserve(&request, 1_900_000_000_000).unwrap();
+                }
+                Some(WorkbenchInvocationState::Executing) => {
+                    store
+                        .mark_executing(
+                            &request.invocation_id,
+                            &request.input_digest,
+                            1_900_000_000_001,
+                        )
+                        .unwrap();
+                }
+                Some(WorkbenchInvocationState::Cancelled) => {
+                    store
+                        .mark_cancelled(
+                            &request.invocation_id,
+                            &request.input_digest,
+                            1_900_000_000_002,
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = store.load(&request.invocation_id).unwrap();
+            assert_eq!(before.as_ref().map(|record| record.state), state);
+            with_terminal_workbench_service_for_test(
+                Arc::clone(&store),
+                profile.clone(),
+                digest.clone(),
+                || {
+                    for submit in [true, false] {
+                        let (response, receiver) = mpsc::sync_channel(1);
+                        let command = if submit {
+                            WorkbenchDispatchCommand::Submit {
+                                request: Box::new(request.clone()),
+                                authority: Arc::clone(&authority),
+                                response,
+                            }
+                        } else {
+                            WorkbenchDispatchCommand::Cancel {
+                                invocation_id: request.invocation_id.clone(),
+                                reason: "test_cancel".to_string(),
+                                authority: Arc::clone(&authority),
+                                response,
+                            }
+                        };
+                        assert_eq!(
+                            dispatch_workbench(command).unwrap_err().to_string(),
+                            "terminal-only workbench test service rejects submit and cancel"
+                        );
+                        assert!(matches!(
+                            receiver.try_recv(),
+                            Err(mpsc::TryRecvError::Disconnected)
+                        ));
+                        assert_eq!(store.load(&request.invocation_id).unwrap(), before);
+                    }
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_workbench_test_service_rejects_nonterminal_poll_and_recover_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(store(&directory));
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b28d2");
+        request.tool_profile_digest = digest.clone();
+        request.input_digest = request.canonical_digest().unwrap();
+        profile.authorize_request(&digest, &request).unwrap();
+        let authority: Arc<dyn WorkbenchAuthoritySource> = Arc::new(authority(&request, &profile));
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+
+        for state in [
+            WorkbenchInvocationState::Reserved,
+            WorkbenchInvocationState::Executing,
+        ] {
+            if state == WorkbenchInvocationState::Executing {
+                store
+                    .mark_executing(
+                        &request.invocation_id,
+                        &request.input_digest,
+                        1_900_000_000_001,
+                    )
+                    .unwrap();
+            }
+            let before = store.load(&request.invocation_id).unwrap().unwrap();
+            assert_eq!(before.state, state);
+            with_terminal_workbench_service_for_test(
+                Arc::clone(&store),
+                profile.clone(),
+                digest.clone(),
+                || {
+                    for poll in [true, false] {
+                        let (response, receiver) = mpsc::sync_channel(1);
+                        let command = if poll {
+                            WorkbenchDispatchCommand::Poll {
+                                invocation_id: request.invocation_id.clone(),
+                                authority: Arc::clone(&authority),
+                                response,
+                            }
+                        } else {
+                            WorkbenchDispatchCommand::Recover {
+                                invocation_id: request.invocation_id.clone(),
+                                authority: Arc::clone(&authority),
+                                response,
+                            }
+                        };
+                        dispatch_workbench(command).unwrap();
+                        let error = receiver
+                            .recv()
+                            .unwrap()
+                            .err()
+                            .expect("nonterminal dispatch must be rejected");
+                        // The guard error is distinct from the runtime-exchange error.
+                        assert_eq!(
+                            error.to_string(),
+                            "terminal-only workbench test service rejects nonterminal replay"
+                        );
+                        assert_eq!(store.load(&request.invocation_id).unwrap().unwrap(), before);
+                    }
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_workbench_test_service_replays_terminal_poll_and_recover_without_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(store(&directory));
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b28d3");
+        request.tool_profile_digest = digest.clone();
+        request.input_digest = request.canonical_digest().unwrap();
+        profile.authorize_request(&digest, &request).unwrap();
+        let authority: Arc<dyn WorkbenchAuthoritySource> = Arc::new(authority(&request, &profile));
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+        store
+            .mark_executing(
+                &request.invocation_id,
+                &request.input_digest,
+                1_900_000_000_001,
+            )
+            .unwrap();
+        let completed = store
+            .accept_result(
+                &WorkbenchMessage::Result {
+                    schema_version: WORKBENCH_SCHEMA_VERSION,
+                    invocation_id: request.invocation_id.clone(),
+                    input_digest: request.input_digest.clone(),
+                    outcome: WorkbenchOutcome::Succeeded,
+                    resources: WorkbenchResourceUsage::default(),
+                    artifacts: Vec::new(),
+                    output: BTreeMap::from([("content".to_string(), "PRIVATE-RESULT".to_string())]),
+                    error: None,
+                },
+                1_900_000_000_002,
+            )
+            .unwrap();
+        assert_eq!(completed.state, WorkbenchInvocationState::Succeeded);
+
+        with_terminal_workbench_service_for_test(Arc::clone(&store), profile, digest, || {
+            for poll in [true, false] {
+                let (response, receiver) = mpsc::sync_channel(1);
+                let command = if poll {
+                    WorkbenchDispatchCommand::Poll {
+                        invocation_id: request.invocation_id.clone(),
+                        authority: Arc::clone(&authority),
+                        response,
+                    }
+                } else {
+                    WorkbenchDispatchCommand::Recover {
+                        invocation_id: request.invocation_id.clone(),
+                        authority: Arc::clone(&authority),
+                        response,
+                    }
+                };
+                dispatch_workbench(command).unwrap();
+                // Any runtime exchange would fail through the scoped service's test client.
+                let replay = receiver.recv().unwrap().unwrap();
+                assert!(replay.replayed);
+                assert_eq!(replay.runtime_state, None);
+                assert_eq!(replay.records, vec![completed.clone()]);
+                assert_eq!(
+                    replay.caller_result,
+                    Some(durable_terminal_projection(&completed))
+                );
+                assert!(matches!(
+                    replay.caller_result,
+                    Some(WorkbenchMessage::Result { output, .. }) if output.is_empty()
+                ));
+                assert_eq!(
+                    store.load(&request.invocation_id).unwrap().unwrap(),
+                    completed
+                );
+            }
+        });
     }
 
     #[test]

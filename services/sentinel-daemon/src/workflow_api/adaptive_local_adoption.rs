@@ -334,11 +334,12 @@ impl WorkflowApi {
             .authority
             .as_ref()
             .ok_or("local adoption runtime missing")?
-            .snapshot(
+            .snapshot_for_admission(
                 &project.tenant_id,
                 &project.project_id,
                 &call.grant.work_item_id,
                 call.grant.assignee_authority.agent_id,
+                false,
             )
             .map_err(|_| "local adoption assignee unavailable")?;
         let session = self
@@ -545,12 +546,14 @@ mod tests {
         fixture_schema2_recovery_source, fixture_schema2_recovery_source_with_current_allowance,
         reserve_and_claim_schema2,
     };
+    use super::super::adaptive_leadership_review::tests::{
+        change_review_assignee, discovery_state, exhaust_review_history, stop_review_agent,
+    };
     use sentinel_workflow::{
         AdaptiveContinuationAuthorizationV1, AdaptiveContinuationSourceV1,
         AdaptiveLeadershipLocalAdoptionV1, AdaptiveLeadershipReviewCallV1,
         AdaptiveLeadershipReviewDecisionV1, AdaptiveLeadershipReviewSubjectV2,
-        ClaimAdaptiveLeadershipReviewCallV1, CompleteAdaptiveLeadershipReviewCallV1, WorkflowStore,
-        ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+        CompleteAdaptiveLeadershipReviewCallV1, WorkflowStore, ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
     };
 
     struct LocalFixture {
@@ -571,6 +574,14 @@ mod tests {
         }
 
         fn with_current_allowance(unknown: bool, replace_current_allowance: bool) -> Self {
+            Self::with_assignee_state(unknown, replace_current_allowance, false)
+        }
+
+        fn with_assignee_state(
+            unknown: bool,
+            replace_current_allowance: bool,
+            stopped: bool,
+        ) -> Self {
             // Substitutes installed evidence only. All durable receipts come from real stores.
             let guard = adaptive_recovery_release::TestRepairGuard::fixture().unwrap();
             let temp = tempfile::tempdir().unwrap();
@@ -585,74 +596,9 @@ mod tests {
                 unknown,
             );
             let leader = api.principals.principal("pm").unwrap();
-            let mut call = api
-                .store
-                .adaptive_leadership_review_call(
-                    &leader.principal.tenant_id,
-                    initial.binding.grant.review_id,
-                )
-                .unwrap()
-                .unwrap();
-            for index in 0..ADAPTIVE_LEADERSHIP_MAX_REVIEWS {
-                // Synthetic dispatch admission only; no provider request or response is implied.
-                let claimed = api
-                    .store
-                    .claim_adaptive_leadership_review_call(
-                        &leader.principal,
-                        &ClaimAdaptiveLeadershipReviewCallV1 {
-                            review_id: call.grant.review_id,
-                            allowance_id: call.allowance_id.clone(),
-                            request_id: call.request_id(),
-                            request_digest: "b".repeat(64),
-                            context_digest: call.context_digest().unwrap(),
-                        },
-                        call.grant_issued_at_unix_ms + 1,
-                    )
-                    .unwrap();
-                let retired = api
-                    .store
-                    .expire_adaptive_leadership_review_call(
-                        &leader.principal,
-                        call.grant.review_id,
-                        claimed.version,
-                        call.grant.expires_at_unix_ms,
-                    )
-                    .unwrap();
-                if index + 1 < ADAPTIVE_LEADERSHIP_MAX_REVIEWS {
-                    let issued = retired.updated_at_unix_ms + 1;
-                    let mut context = retired.context.clone();
-                    context.evidence_refs.push(format!(
-                        "leadership-review-retired:{}:{}",
-                        retired.grant.review_id,
-                        retired.retired_at_unix_ms.unwrap()
-                    ));
-                    context.evidence_refs.sort();
-                    let mut grant = retired.grant.clone();
-                    grant.evidence_fingerprint =
-                        sentinel_workflow::adaptive_leadership_evidence_fingerprint(
-                            &context.tool_catalog,
-                            &context.evidence_refs,
-                        )
-                        .unwrap();
-                    grant.review_id = sentinel_workflow::adaptive_leadership_review_id(
-                        grant.session_id,
-                        grant.expected_session_version,
-                        &grant.evidence_fingerprint,
-                    )
-                    .unwrap();
-                    grant.expires_at_unix_ms = issued + 1_000;
-                    call = api
-                        .store
-                        .authorize_adaptive_leadership_review_call(
-                            &leader.principal,
-                            Uuid::new_v4(),
-                            &format!("local-fixture-history-{index}"),
-                            &grant,
-                            &context,
-                            issued,
-                        )
-                        .unwrap();
-                }
+            let call = exhaust_review_history(&api, &initial);
+            if stopped {
+                stop_review_agent(&api, call.grant.assignee_authority.agent_id, false);
             }
             let operator = api.principals.principal("operator").unwrap();
             let epoch_path = format!(
@@ -1140,6 +1086,327 @@ mod tests {
                 ),)
                 .unwrap()
                 .is_none());
+        }
+    }
+
+    #[test]
+    fn stopped_assignee_valid_local_adoption_retains_accounting_and_replays_once() {
+        for unknown in [false, true] {
+            let f = LocalFixture::with_assignee_state(unknown, true, true);
+            let source = f.pending.context.source_session.clone();
+            let authority = &source.grant.authority;
+            assert!(f
+                .api
+                .authority
+                .as_ref()
+                .unwrap()
+                .snapshot(
+                    &authority.tenant_id,
+                    &authority.project_id,
+                    &authority.work_item_id,
+                    authority.agent_id,
+                )
+                .is_err());
+            let now = now_unix_ms().max(f.adoption.issued_at_unix_ms + 1);
+            assert!(now < f.adoption.request.expires_at_unix_ms);
+            {
+                let call = f.call();
+                let _fence = f.api.mutation_fence.write().unwrap();
+                // The audit is appended during reconciliation, before the commit clock is read.
+                assert!(f
+                    .api
+                    .reconcile_local_leadership_adoption(&call, &now_unix_ms)
+                    .unwrap());
+            }
+            let completed = f.call();
+            assert_eq!(completed.decision, Some(f.result.decision.clone()));
+            assert_eq!(completed.continuation, f.result.continuation);
+            let audit = f
+                .api
+                .event_store
+                .as_ref()
+                .unwrap()
+                .event_v2_by_id(&f.result.resolution_event_id.unwrap().to_string())
+                .unwrap()
+                .unwrap();
+            audit.validate_seals().unwrap();
+            let appended_at = u64::try_from(audit.appended_at_ms).unwrap();
+            assert!(appended_at >= f.adoption.issued_at_unix_ms);
+            assert!(appended_at < f.adoption.request.expires_at_unix_ms);
+            assert!(appended_at <= completed.updated_at_unix_ms);
+            f.assert_only_current_allowance_replaced(&completed);
+            f.assert_retained_payload("action_claimed", Some("continuation audit invalid"));
+            let continued = f.session();
+            assert_eq!(continued.grant, source.grant);
+            assert_eq!(continued.model_calls, source.model_calls);
+            assert_eq!(continued.tool_calls, source.tool_calls);
+            let before = discovery_state(
+                &f.temp.path().join("company.sqlite"),
+                &f.temp.path().join("events.sqlite"),
+            );
+            let stale_commit_at = appended_at.checked_sub(1).unwrap();
+            let clock_rejection = f
+                .api
+                .store
+                .complete_adaptive_leadership_review_call_with_local_adoption_audit(
+                    &f.pending.grant.leadership_principal,
+                    &f.result,
+                    &audit,
+                    stale_commit_at,
+                )
+                .expect_err(
+                    "an otherwise exact audit must reject a commit clock before its append",
+                );
+            eprintln!(
+                "local adoption clock-only rejection: {clock_rejection:?}, \
+                 commit_at_ms={stale_commit_at}, audit_appended_at_ms={appended_at}"
+            );
+            assert_eq!(clock_rejection.code, WorkflowErrorCode::InvalidTransition);
+            assert_eq!(
+                f.api
+                    .store
+                    .complete_adaptive_leadership_review_call_with_local_adoption_audit(
+                        &f.pending.grant.leadership_principal,
+                        &f.result,
+                        &audit,
+                        now_unix_ms(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("same audit with current clock rejected: {error:?}")
+                    }),
+                completed
+            );
+            assert!(!f.reconcile(now_unix_ms()));
+            assert_eq!(
+                discovery_state(
+                    &f.temp.path().join("company.sqlite"),
+                    &f.temp.path().join("events.sqlite"),
+                ),
+                before
+            );
+            assert!(f
+                .api
+                .authority
+                .as_ref()
+                .unwrap()
+                .snapshot(
+                    &authority.tenant_id,
+                    &authority.project_id,
+                    &authority.work_item_id,
+                    authority.agent_id,
+                )
+                .is_err());
+        }
+    }
+
+    fn pending_local_adoption_fixture(
+        unknown: bool,
+    ) -> (
+        tempfile::TempDir,
+        adaptive_recovery_release::TestRepairGuard,
+        WorkflowApi,
+        LeadershipContext,
+    ) {
+        let (temp, repair, api, initial) =
+            super::super::adaptive_review_epoch::tests::exhausted_epoch_fixture(unknown);
+        stop_review_agent(
+            &api,
+            initial.binding.grant.assignee_authority.agent_id,
+            false,
+        );
+        let operator = api.principals.principal("operator").unwrap();
+        let path = format!(
+            "{ADAPTIVE_REVIEW_EPOCH_PATH}?project_id={}&session_id={}",
+            initial.binding.grant.project_id, initial.binding.grant.session_id
+        );
+        let draft = api.review_recovery_epoch(&operator, "GET", &path, &[]);
+        assert_eq!(draft.status, 200);
+        let draft: serde_json::Value = serde_json::from_slice(&draft.body).unwrap();
+        let issued = api.review_recovery_epoch(
+            &operator,
+            "POST",
+            ADAPTIVE_REVIEW_EPOCH_PATH,
+            &serde_json::to_vec(&draft["request"]).unwrap(),
+        );
+        assert_eq!(issued.status, 200);
+        let epoch = api
+            .store
+            .adaptive_leadership_recovery_epoch(
+                &operator.principal.tenant_id,
+                initial.binding.grant.session_id,
+            )
+            .unwrap()
+            .unwrap();
+        let call = api
+            .store
+            .adaptive_leadership_review_call(&operator.principal.tenant_id, epoch.review_id)
+            .unwrap()
+            .unwrap();
+        let context = api
+            .prepare_leadership_review(&LeadershipAuthority::from_call(&call))
+            .unwrap();
+        let (id, digest) = reserve_and_claim_schema2(&api, &context);
+        // Synthetic retained response exercises local processing, not live inference.
+        let completion = ModelExecutionCompletion {
+            context: ModelExecutionContext::AdaptiveLeadershipReview(Box::new(context.clone())),
+            content: serde_json::json!({"schema_version":2,"decision":{
+                "kind":"continue","additional_model_calls":1,"window_ms":120_000,
+                "rationale":"Inspect the unchanged assignment before continuing.",
+                "evidence_refs":[context.source.evidence_refs[0]]}})
+            .to_string(),
+            admissible: true,
+        };
+        super::super::adaptive_leadership_review::tests::persist(
+            &api,
+            &completion,
+            &context,
+            &id,
+            &digest,
+            true,
+        );
+        api.event_store
+            .as_ref()
+            .unwrap()
+            .record_llm_completion_failure(&id, &digest, "continuation audit invalid", 1)
+            .unwrap();
+        (temp, repair, api, context)
+    }
+
+    #[test]
+    fn local_adoption_revocation_before_candidate_or_submission_fails_without_writes() {
+        for unknown in [false, true] {
+            for after_candidate in [false, true] {
+                for change in ["assignment", "principal", "leader"] {
+                    let (temp, _repair, mut api, context) = pending_local_adoption_fixture(unknown);
+                    let operator = api.principals.principal("operator").unwrap();
+                    let request = if after_candidate {
+                        Some(
+                            api.local_adoption_candidate(
+                                &operator,
+                                context.binding.grant.review_id,
+                                Uuid::new_v4(),
+                                None,
+                            )
+                            .unwrap(),
+                        )
+                    } else {
+                        None
+                    };
+                    if change == "leader" {
+                        stop_review_agent(
+                            &api,
+                            context.binding.grant.leadership_principal.agent_id.unwrap(),
+                            false,
+                        );
+                    } else {
+                        change_review_assignee(&mut api, &context, change);
+                    }
+                    let before = discovery_state(
+                        &temp.path().join("company.sqlite"),
+                        &temp.path().join("events.sqlite"),
+                    );
+                    assert!(
+                        api.local_adoption_candidate(
+                            &operator,
+                            context.binding.grant.review_id,
+                            Uuid::new_v4(),
+                            None,
+                        )
+                        .is_err(),
+                        "{change}"
+                    );
+                    if let Some(request) = request {
+                        assert_eq!(
+                            api.local_adoption_http(
+                                &operator,
+                                "POST",
+                                ADAPTIVE_LOCAL_ADOPTION_PATH,
+                                &serde_json::to_vec(&request).unwrap(),
+                            )
+                            .status,
+                            409
+                        );
+                    }
+                    assert_eq!(
+                        discovery_state(
+                            &temp.path().join("company.sqlite"),
+                            &temp.path().join("events.sqlite"),
+                        ),
+                        before,
+                        "{change}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_adoption_post_authorization_assignment_revocation_retires_without_continuation() {
+        for unknown in [false, true] {
+            let mut f = LocalFixture::with_assignee_state(unknown, false, true);
+            let context = LeadershipContext {
+                binding: LeadershipAuthority::from_call(&f.pending),
+                source: f.pending.context.clone(),
+                context_digest: f.pending.context_digest().unwrap(),
+                private_observation: None,
+            };
+            change_review_assignee(&mut f.api, &context, "assignment");
+            let changed_project = f.project();
+            let now = now_unix_ms().max(f.adoption.issued_at_unix_ms + 1);
+            assert!(now < f.adoption.request.expires_at_unix_ms);
+            assert!(f.reconcile(now));
+            let retired = f.call();
+            assert!(retired.retired_at_unix_ms.is_some());
+            assert!(retired.decision.is_none());
+            assert!(retired.continuation.is_none());
+            assert_eq!(f.session(), f.pending.context.source_session);
+            assert_eq!(f.project(), changed_project);
+            f.assert_no_adoption_effects();
+            f.assert_retained_payload("failed", Some("leadership_review_stale"));
+            let before = discovery_state(
+                &f.temp.path().join("company.sqlite"),
+                &f.temp.path().join("events.sqlite"),
+            );
+            assert!(!f.reconcile(now + 1));
+            assert_eq!(
+                discovery_state(
+                    &f.temp.path().join("company.sqlite"),
+                    &f.temp.path().join("events.sqlite"),
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn local_adoption_post_authorization_principal_change_cannot_apply_retained_decision() {
+        for unknown in [false, true] {
+            let mut f = LocalFixture::with_assignee_state(unknown, false, true);
+            let context = LeadershipContext {
+                binding: LeadershipAuthority::from_call(&f.pending),
+                source: f.pending.context.clone(),
+                context_digest: f.pending.context_digest().unwrap(),
+                private_observation: None,
+            };
+            change_review_assignee(&mut f.api, &context, "principal");
+            let before = discovery_state(
+                &f.temp.path().join("company.sqlite"),
+                &f.temp.path().join("events.sqlite"),
+            );
+            let _fence = f.api.mutation_fence.write().unwrap();
+            assert!(f
+                .api
+                .reconcile_local_leadership_adoption(&f.call(), &now_unix_ms)
+                .is_err());
+            assert_eq!(
+                discovery_state(
+                    &f.temp.path().join("company.sqlite"),
+                    &f.temp.path().join("events.sqlite"),
+                ),
+                before
+            );
+            f.assert_source_unchanged();
+            f.assert_no_adoption_effects();
         }
     }
 

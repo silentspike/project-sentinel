@@ -9,7 +9,8 @@ use super::adaptive_leadership_review::{LeadershipAuthority, LeadershipContext};
 use super::model_execution::{ModelExecutionCompletion, ModelExecutionContext};
 use super::*;
 use crate::workbench::{
-    with_private_observation_store_for_test, WorkbenchCoordinator, WorkbenchInvocationStore,
+    with_private_observation_store_for_test, with_terminal_workbench_service_for_test,
+    WorkbenchCoordinator, WorkbenchInvocationStore,
 };
 use sentinel_common::{WorkbenchMessage, WorkbenchOutcome, WorkbenchResourceUsage};
 use sentinel_workflow::{
@@ -85,6 +86,378 @@ fn stop_receipt_agent(fixture: &Fixture) {
         .find(|agent| agent.agent_id == fixture.session.grant.authority.agent_id.0)
         .unwrap();
     agent.adapter_health_state = Some(sentinel_common::NanoHealthState::Stopped);
+}
+
+#[test]
+fn stopped_tool_productive_ingress_adopts_original_pending_and_unknown_receipts() {
+    for continued in [false, true] {
+        for unknown in [false, true] {
+            let mut fixture = if continued {
+                Fixture::continued()
+            } else {
+                Fixture::productive_root()
+            };
+            let now = now_unix_ms();
+            let request = fixture.claim_tool(now);
+            let effect = AdaptiveEffectV1 {
+                id: Uuid::parse_str(&request.invocation_id).unwrap(),
+                request_digest: request.input_digest.clone(),
+            };
+            let observation = fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+            let record = fixture.tools.load(&request.invocation_id).unwrap().unwrap();
+            if unknown {
+                fixture.advance(
+                    AdaptiveTransitionV1::MarkUnknown {
+                        effect: effect.clone(),
+                    },
+                    now,
+                );
+            }
+            let before = fixture.read();
+            if continued {
+                assert_eq!(before.version, if unknown { 8 } else { 7 });
+            }
+            let project = fixture.project();
+            let calls = fixture.calls();
+            let binding = fixture
+                .api
+                .provider_usage_binding_for_agent(request.agent_id)
+                .unwrap()
+                .unwrap();
+            stop_receipt_agent(&fixture);
+            fixture.with_terminal_workbench_service(|| {
+                assert_eq!(
+                    fixture.api.adaptive_subscription_queue_priority(&binding),
+                    Ok(Some(0))
+                );
+                let selected = fixture
+                    .api
+                    .provider_usage_binding_for_agent(request.agent_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(selected, binding);
+                assert_eq!(
+                    fixture.api.binding_has_continued_adaptive_session(&binding),
+                    Ok(continued)
+                );
+                assert!(fixture
+                    .api
+                    .adaptive_provider_authority_for_claim(request.agent_id)
+                    .unwrap()
+                    .is_none());
+                let reconstructed = fixture
+                    .api
+                    .workbench
+                    .as_ref()
+                    .unwrap()
+                    .build_adaptive_request(&before, &effect, &request.tool)
+                    .unwrap();
+                assert_eq!(reconstructed, request);
+
+                let discovered = fixture
+                    .api
+                    .adaptive_provider_authority(request.agent_id)
+                    .unwrap()
+                    .unwrap();
+                let adopted = fixture.read();
+                let mut expected = before.clone();
+                expected.cursor = AdaptiveCursorV1::ReadyForModel;
+                expected.version += 1;
+                expected.updated_at_ms = adopted.updated_at_ms;
+                expected.last_observation = Some(AdaptiveObservationRefV1 {
+                    effect: effect.clone(),
+                    observation_digest: observation.digest().to_owned(),
+                });
+                if let Some(continuation) = expected.continuation.as_mut() {
+                    continuation.observation_required = false;
+                }
+                assert!(adopted.updated_at_ms >= before.updated_at_ms);
+                assert_eq!(adopted, expected);
+                assert_eq!(
+                    (adopted.model_calls, adopted.tool_calls),
+                    (if continued { 2 } else { 1 }, 1)
+                );
+                assert_eq!(discovered.grant, adopted.effective_grant());
+                assert_eq!(discovered.session_version, adopted.version);
+                assert_eq!(discovered.previous_observation, adopted.last_observation);
+                assert_eq!(
+                    fixture
+                        .api
+                        .adaptive_provider_authority(request.agent_id)
+                        .unwrap(),
+                    Some(discovered.clone())
+                );
+                assert_eq!(
+                    fixture.api.prepare_adaptive_model(&discovered).unwrap_err(),
+                    "adaptive session unavailable"
+                );
+                assert_eq!(
+                    fixture
+                        .api
+                        .core
+                        .advance_adaptive_session(
+                            adopted.grant.session_id,
+                            adopted.version,
+                            Uuid::new_v4(),
+                            &AdaptiveTransitionV1::ClaimModel {
+                                effect: AdaptiveEffectV1 {
+                                    id: discovered.effect_id,
+                                    request_digest: "a".repeat(64),
+                                },
+                                previous_observation_digest: Some(observation.digest().to_owned()),
+                            },
+                            &adopted.grant.authority,
+                            now_unix_ms(),
+                        )
+                        .unwrap_err()
+                        .code,
+                    WorkflowErrorCode::AuthorityConflict
+                );
+                assert!(fixture
+                    .api
+                    .authority
+                    .as_ref()
+                    .unwrap()
+                    .current_for_request(&request)
+                    .is_err());
+                assert_eq!(fixture.read(), expected);
+                assert_eq!(fixture.project(), project);
+                assert_eq!(fixture.calls(), calls);
+                assert_eq!(
+                    fixture.tools.load(&request.invocation_id).unwrap().unwrap(),
+                    record
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn stopped_tool_productive_ingress_rejects_changed_and_revoked_lineage() {
+    for revoked in [false, true] {
+        let mut fixture = Fixture::continued();
+        let now = now_unix_ms();
+        let request = fixture.claim_tool(now);
+        fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+        let before = fixture.read();
+        let binding = fixture
+            .api
+            .provider_usage_binding_for_agent(request.agent_id)
+            .unwrap()
+            .unwrap();
+        stop_receipt_agent(&fixture);
+        if revoked {
+            let mut authority = fixture.api.authority.as_ref().unwrap().as_ref().clone();
+            assert!(Arc::make_mut(&mut authority.agent_capabilities)
+                .get_mut(&request.agent_id)
+                .unwrap()
+                .remove(sentinel_common::WORKBENCH_RETAIN_OBSERVATION));
+            fixture.api.authority = Some(Arc::new(authority));
+            Fixture::attach_workbench(&mut fixture.api);
+        } else {
+            reassign_receipt_work(&fixture, false);
+        }
+        fixture.with_terminal_workbench_service(|| {
+            assert!(fixture
+                .api
+                .adaptive_subscription_queue_priority(&binding)
+                .is_err());
+            assert!(fixture
+                .api
+                .binding_has_continued_adaptive_session(&binding)
+                .is_err());
+            assert!(fixture
+                .api
+                .adaptive_provider_authority_for_claim(request.agent_id)
+                .is_err());
+            assert!(fixture
+                .api
+                .adaptive_provider_authority(request.agent_id)
+                .is_err());
+            assert_eq!(fixture.read(), before);
+        });
+    }
+}
+
+#[test]
+fn stopped_rejected_campaign_feedback_does_not_poison_other_pending_selection() {
+    let mut fixture = Fixture::root(true);
+    let created = fixture.session.grant.created_at_ms;
+    let effect = fixture.claim_model(created + 1);
+    fixture.advance(
+        AdaptiveTransitionV1::RejectModel {
+            effect,
+            resolution_event_id: Uuid::new_v4().to_string(),
+            reason_code: "adaptive_tool_schema".to_owned(),
+        },
+        created + 2,
+    );
+    let rejected = fixture.read();
+    let project = fixture.project();
+
+    let other = super::model_work::assign_test_work_from(&fixture.api, Some(8), 100);
+    let productive = fixture
+        .api
+        .adaptive_provider_authority(other.agent_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(productive.grant.authority.project_id.0, other.project_id);
+    fixture.session = fixture
+        .api
+        .store
+        .adaptive_session(productive.grant.session_id, &productive.grant.authority)
+        .unwrap()
+        .unwrap();
+    let now = now_unix_ms();
+    let request = fixture.claim_tool(now);
+    let observation = fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+    let before = fixture.read();
+
+    let mut grant = project.subscription_call.as_ref().unwrap().grant.clone();
+    grant.expires_at_unix_ms = now_unix_ms() + 300_000;
+    fixture
+        .api
+        .store
+        .apply_company_command(
+            &fixture.api.principals.principal("pm").unwrap().principal,
+            Uuid::new_v4(),
+            &CompanyWorkflowCommandV1::GrantSubscriptionCall {
+                project_id: project.project_id,
+                expected_version: project.version,
+                grant,
+            },
+            now_unix_ms(),
+        )
+        .unwrap();
+    let rejected_project = fixture
+        .api
+        .store
+        .company_project(
+            &rejected.grant.authority.tenant_id,
+            &rejected.grant.authority.project_id,
+        )
+        .unwrap()
+        .unwrap();
+    let rejected_binding =
+        select_provider_usage_binding(&[rejected_project], rejected.grant.authority.agent_id, None)
+            .unwrap()
+            .unwrap();
+    assert_ne!(
+        rejected_binding.reservation_id,
+        rejected.active_provider_allowance_id()
+    );
+
+    stop_receipt_agent(&fixture);
+    assert!(fixture
+        .api
+        .core
+        .adaptive_recovery_feedback(&rejected.grant.authority)
+        .is_err());
+    let feedback = fixture
+        .api
+        .store
+        .adaptive_recovery_feedback(&rejected.grant.authority)
+        .unwrap()
+        .unwrap();
+    assert_eq!(feedback.count, 0);
+    assert_eq!(feedback.previous_session_id, rejected.grant.session_id);
+    assert_eq!(
+        fixture
+            .api
+            .adaptive_subscription_queue_priority(&rejected_binding),
+        Ok(Some(2))
+    );
+    fixture.with_terminal_workbench_service(|| {
+        let selected = fixture
+            .api
+            .provider_usage_binding_for_agent(other.agent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.reservation_id,
+            before.active_provider_allowance_id()
+        );
+        let discovered = fixture
+            .api
+            .adaptive_provider_authority(other.agent_id)
+            .unwrap()
+            .unwrap();
+        let adopted = fixture.read();
+        let mut expected = before.clone();
+        expected.cursor = AdaptiveCursorV1::ReadyForModel;
+        expected.version += 1;
+        expected.updated_at_ms = adopted.updated_at_ms;
+        expected.last_observation = Some(AdaptiveObservationRefV1 {
+            effect: AdaptiveEffectV1 {
+                id: Uuid::parse_str(&request.invocation_id).unwrap(),
+                request_digest: request.input_digest.clone(),
+            },
+            observation_digest: observation.digest().to_owned(),
+        });
+        assert_eq!(adopted, expected);
+        assert_eq!(discovered.grant, adopted.effective_grant());
+        assert_eq!(discovered.previous_observation, adopted.last_observation);
+    });
+    assert_eq!(
+        fixture
+            .api
+            .store
+            .adaptive_session(rejected.grant.session_id, &rejected.grant.authority)
+            .unwrap()
+            .unwrap(),
+        rejected
+    );
+}
+
+#[test]
+fn stopped_existing_session_discovery_does_not_admit_a_fresh_model_call() {
+    let fixture = Fixture::productive_root();
+    let before = fixture.read();
+    stop_receipt_agent(&fixture);
+    let discovered = fixture
+        .api
+        .adaptive_provider_authority_for_claim(before.grant.authority.agent_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(discovered.grant, before.grant);
+    assert!(fixture.api.prepare_adaptive_model(&discovered).is_err());
+    assert!(fixture
+        .api
+        .core
+        .advance_adaptive_session(
+            before.grant.session_id,
+            before.version,
+            Uuid::new_v4(),
+            &AdaptiveTransitionV1::ClaimModel {
+                effect: AdaptiveEffectV1 {
+                    id: discovered.effect_id,
+                    request_digest: "a".repeat(64),
+                },
+                previous_observation_digest: None,
+            },
+            &before.grant.authority,
+            now_unix_ms(),
+        )
+        .is_err());
+    assert!(fixture
+        .api
+        .core
+        .begin_adaptive_session(&before.grant, now_unix_ms())
+        .is_err());
+    assert_eq!(fixture.read(), before);
+
+    // A nonmatching root grant cannot use discovery to admit its replacement.
+    let fixture = Fixture::root(false);
+    let before = fixture.read();
+    stop_receipt_agent(&fixture);
+    assert_eq!(
+        fixture
+            .api
+            .adaptive_provider_authority_for_claim(before.grant.authority.agent_id)
+            .unwrap_err(),
+        "adaptive session unavailable"
+    );
+    assert_eq!(fixture.read(), before);
 }
 
 #[test]
@@ -431,6 +804,28 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn productive_root() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut api, binding, _) = super::model_work::configured_adaptive_test_api(
+            &temp.path().join("company.sqlite"),
+            &temp.path().join("events.sqlite"),
+        );
+        let session = api
+            .store
+            .adaptive_session(binding.grant.session_id, &binding.grant.authority)
+            .unwrap()
+            .unwrap();
+        Self::attach_workbench(&mut api);
+        let tools =
+            Arc::new(WorkbenchInvocationStore::open(temp.path().join("workbench.redb")).unwrap());
+        Self {
+            api,
+            session,
+            tools,
+            temp,
+        }
+    }
+
     fn continued() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let (mut api, context) = fixture_schema2_blocked(
@@ -552,6 +947,19 @@ impl Fixture {
             .profile_for_binding(&self.session.grant.authority.profile_id)
             .unwrap();
         with_private_observation_store_for_test(
+            Arc::clone(&self.tools),
+            profile.clone(),
+            digest.to_owned(),
+            run,
+        )
+    }
+
+    fn with_terminal_workbench_service<R>(&self, run: impl FnOnce() -> R) -> R {
+        let authority = self.api.authority.as_ref().unwrap();
+        let (profile, digest) = authority
+            .profile_for_binding(&self.session.grant.authority.profile_id)
+            .unwrap();
+        with_terminal_workbench_service_for_test(
             Arc::clone(&self.tools),
             profile.clone(),
             digest.to_owned(),
