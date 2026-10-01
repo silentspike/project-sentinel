@@ -302,6 +302,191 @@ mod continuation_tests {
         }
     }
 
+    struct RetainedToolObservation {
+        original: crate::AdaptiveEffectV1,
+        tool: sentinel_common::WorkbenchTool,
+        digest: String,
+    }
+
+    impl AdaptiveToolPort for RetainedToolObservation {
+        fn reconcile_tool(
+            &self,
+            session: &AdaptiveSessionV1,
+            effect: &crate::AdaptiveEffectV1,
+            tool: &sentinel_common::WorkbenchTool,
+            tool_digest: &str,
+        ) -> Result<AdaptiveToolObservationV1, WorkflowPortError> {
+            assert!(matches!(
+                session.cursor,
+                AdaptiveCursorV1::ToolUnknown { .. }
+            ));
+            assert_eq!(effect, &self.original);
+            assert_eq!(tool, &self.tool);
+            assert_eq!(tool_digest, crate::adaptive_tool_digest(tool).unwrap());
+            Ok(AdaptiveToolObservationV1::Completed {
+                observation_digest: self.digest.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn expired_tool_unknown_adopts_original_observation_and_replays_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(WorkflowStore::open(temp.path().join("workflow.sqlite")).unwrap());
+        let root = grant();
+        let original = effect(103);
+        let tool = sentinel_common::WorkbenchTool::InspectFile {
+            path: "src/main.rs".into(),
+            max_bytes: 1024,
+        };
+        let tool_digest = crate::adaptive_tool_digest(&tool).unwrap();
+        let mut session = store
+            .begin_adaptive_session(&root, &root.authority, NOW)
+            .unwrap()
+            .1;
+        let commands = [
+            AdaptiveTransitionV1::ClaimModel {
+                effect: effect(102),
+                previous_observation_digest: None,
+            },
+            AdaptiveTransitionV1::ResolveModel {
+                effect: effect(102),
+                result_digest: "a".repeat(64),
+                decision: crate::AdaptiveModelDecisionV1::Tool {
+                    tool: tool.clone(),
+                    tool_digest: tool_digest.clone(),
+                },
+            },
+            AdaptiveTransitionV1::ClaimTool {
+                effect: original.clone(),
+                tool_digest,
+            },
+            AdaptiveTransitionV1::MarkUnknown {
+                effect: original.clone(),
+            },
+        ];
+        for (index, command) in commands.iter().enumerate() {
+            session = store
+                .advance_adaptive_session(
+                    root.session_id,
+                    session.version,
+                    Uuid::from_u128(300 + index as u128),
+                    command,
+                    &root.authority,
+                    NOW + 1 + index as u64,
+                )
+                .unwrap()
+                .1;
+        }
+        let unknown = session;
+        let observed_at = root.deadline_ms + 1;
+        let digest = "b".repeat(64);
+        let command = AdaptiveTransitionV1::ObserveTool {
+            observation: AdaptiveObservationRefV1 {
+                effect: original.clone(),
+                observation_digest: digest.clone(),
+            },
+        };
+        let mut changed_request = original.clone();
+        changed_request.request_digest = "c".repeat(64);
+        for wrong_effect in [effect(104), changed_request] {
+            assert_eq!(
+                store
+                    .advance_adaptive_session(
+                        root.session_id,
+                        unknown.version,
+                        Uuid::from_u128(310),
+                        &AdaptiveTransitionV1::ObserveTool {
+                            observation: AdaptiveObservationRefV1 {
+                                effect: wrong_effect,
+                                observation_digest: digest.clone(),
+                            },
+                        },
+                        &root.authority,
+                        observed_at,
+                    )
+                    .unwrap_err()
+                    .code,
+                WorkflowErrorCode::InvalidTransition
+            );
+            assert_eq!(
+                store
+                    .adaptive_session(root.session_id, &root.authority)
+                    .unwrap(),
+                Some(unknown.clone())
+            );
+        }
+        let core = AdaptiveWorkflowCore::new(
+            store.clone(),
+            Organization(root.authority.clone()),
+            NeverPoll,
+            RetainedToolObservation {
+                original: original.clone(),
+                tool,
+                digest,
+            },
+        );
+        let operation_id = Uuid::from_u128(311);
+        let adopted = core
+            .reconcile_tool(root.session_id, &root.authority, operation_id, observed_at)
+            .unwrap();
+        assert_eq!(adopted.cursor, AdaptiveCursorV1::ReadyForModel);
+        assert_eq!(adopted.version, unknown.version + 1);
+        assert_eq!(adopted.updated_at_ms, observed_at);
+        assert_eq!(adopted.grant, unknown.grant);
+        assert_eq!((adopted.model_calls, adopted.tool_calls), (1, 1));
+        assert_eq!(
+            (adopted.model_calls, adopted.tool_calls),
+            (unknown.model_calls, unknown.tool_calls)
+        );
+        assert_eq!(adopted.effect_ids, unknown.effect_ids);
+        assert_eq!(adopted.continuation, unknown.continuation);
+        assert_eq!(
+            adopted.last_model_result_digest,
+            unknown.last_model_result_digest
+        );
+        if let AdaptiveTransitionV1::ObserveTool { observation } = &command {
+            assert_eq!(adopted.last_observation.as_ref(), Some(observation));
+        }
+        assert_eq!(
+            store
+                .advance_adaptive_session(
+                    root.session_id,
+                    unknown.version,
+                    operation_id,
+                    &command,
+                    &root.authority,
+                    observed_at + 1,
+                )
+                .unwrap(),
+            (true, adopted.clone())
+        );
+        let mut changed_command = command;
+        if let AdaptiveTransitionV1::ObserveTool { observation } = &mut changed_command {
+            observation.observation_digest = "d".repeat(64);
+        }
+        assert_eq!(
+            store
+                .advance_adaptive_session(
+                    root.session_id,
+                    unknown.version,
+                    operation_id,
+                    &changed_command,
+                    &root.authority,
+                    observed_at + 2,
+                )
+                .unwrap_err()
+                .code,
+            WorkflowErrorCode::IdempotencyConflict
+        );
+        assert_eq!(
+            store
+                .adaptive_session(root.session_id, &root.authority)
+                .unwrap(),
+            Some(adopted)
+        );
+    }
+
     #[test]
     fn sealed_unknown_read_never_polls_provider_or_tools() {
         let temp = tempfile::tempdir().unwrap();
