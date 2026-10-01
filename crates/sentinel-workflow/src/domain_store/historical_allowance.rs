@@ -40,34 +40,48 @@ impl WorkflowStore {
         if claimed_at_ms < root.created_at_ms || claimed_at_ms >= root.deadline_ms {
             return Err(invalid("historical adaptive claim time is invalid"));
         }
-        let claimed_at = sql_u64(claimed_at_ms)?;
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(WorkflowError::from)?;
-        let sequences = {
-            let mut statement = transaction.prepare(
+        historical_adaptive_provider_project_in_connection(&transaction, root, claimed_at_ms)
+    }
+}
+
+// Reuses the caller's transaction; callers must verify the root against the journal.
+pub(super) fn historical_adaptive_provider_project_in_connection(
+    connection: &Connection,
+    root: &AdaptiveSessionGrantV1,
+    claimed_at_ms: u64,
+) -> Result<Option<ProjectV1>, WorkflowError> {
+    root.validate()?;
+    if claimed_at_ms < root.created_at_ms || claimed_at_ms >= root.deadline_ms {
+        return Err(invalid("historical adaptive claim time is invalid"));
+    }
+    let claimed_at = sql_u64(claimed_at_ms)?;
+    let sequences = {
+        let mut statement = connection.prepare(
                 "SELECT sequence FROM company_events WHERE tenant_id=?1 AND project_id=?2 AND created_at_ms<=?3 AND event_type GLOB 'project_*' AND event_type NOT IN ('project_planning_call_authorized','project_planning_call_renewed','project_planning_call_dispatched','project_planning_call_completed') ORDER BY sequence DESC LIMIT ?4",
             )?;
-            let rows = statement.query_map(
-                params![
-                    root.authority.tenant_id.0,
-                    root.authority.project_id.0,
-                    claimed_at,
-                    (MAX_HISTORICAL_PROJECT_EVENTS + 1) as i64,
-                ],
-                |row| row.get::<_, i64>(0),
-            )?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        if sequences.len() > MAX_HISTORICAL_PROJECT_EVENTS {
-            return Err(invalid("historical adaptive project event limit exceeded"));
-        }
-        let mut selected = None;
-        let mut byte_budget = SnapshotByteBudget::new();
-        for sequence in sequences {
-            let sequence = stored_u64(sequence)?;
-            let payload_bytes = transaction
+        let rows = statement.query_map(
+            params![
+                root.authority.tenant_id.0,
+                root.authority.project_id.0,
+                claimed_at,
+                (MAX_HISTORICAL_PROJECT_EVENTS + 1) as i64,
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if sequences.len() > MAX_HISTORICAL_PROJECT_EVENTS {
+        return Err(invalid("historical adaptive project event limit exceeded"));
+    }
+    let mut selected = None;
+    let mut byte_budget = SnapshotByteBudget::new();
+    for sequence in sequences {
+        let sequence = stored_u64(sequence)?;
+        let payload_bytes = connection
                 .query_row(
                     "SELECT CASE WHEN typeof(payload)='blob' THEN length(payload) ELSE -1 END FROM company_events WHERE sequence=?1",
                     [sql_u64(sequence)?],
@@ -75,26 +89,25 @@ impl WorkflowStore {
                 )
                 .optional()?
                 .ok_or_else(corrupt)?;
-            byte_budget.charge(payload_bytes)?;
-            let row = read_company_event_row(&transaction, sequence)?.ok_or_else(corrupt)?;
-            let (_, project) = validate_project_snapshot_event_with_byte_budget(
-                &transaction,
-                &row,
-                Some(&mut byte_budget),
-            )?;
-            if project.tenant_id != root.authority.tenant_id
-                || project.project_id != root.authority.project_id
-                || project.updated_at_unix_ms > claimed_at_ms
-            {
-                return Err(corrupt());
-            }
-            // Validate the entire bounded selection, even after finding a match.
-            if historical_project_matches(&project, root, claimed_at_ms)? && selected.is_none() {
-                selected = Some(project);
-            }
+        byte_budget.charge(payload_bytes)?;
+        let row = read_company_event_row(connection, sequence)?.ok_or_else(corrupt)?;
+        let (_, project) = validate_project_snapshot_event_with_byte_budget(
+            connection,
+            &row,
+            Some(&mut byte_budget),
+        )?;
+        if project.tenant_id != root.authority.tenant_id
+            || project.project_id != root.authority.project_id
+            || project.updated_at_unix_ms > claimed_at_ms
+        {
+            return Err(corrupt());
         }
-        Ok(selected)
+        // Validate the entire bounded selection, even after finding a match.
+        if historical_project_matches(&project, root, claimed_at_ms)? && selected.is_none() {
+            selected = Some(project);
+        }
     }
+    Ok(selected)
 }
 
 fn historical_project_matches(

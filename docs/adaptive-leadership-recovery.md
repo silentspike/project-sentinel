@@ -2,7 +2,45 @@
 
 An exhausted unknown-model session is not a new task. Its original model
 effects, consumed allowances, reviews and private work remain authoritative.
-Ordinary reconciliation remains bounded to three reviews per session.
+Schema-2 recovery reconciliation remains bounded to three reviews per session.
+Normal budget-window reviews have a separate finite three-review bound; all
+continuations still share the existing three-window bound.
+
+## Normal Leadership Windows
+
+A ReadyForModel employee can exhaust its current call allowance or reach its
+deadline after observing a tool result. This is not an unknown outcome or a
+fabricated Blocked decision. Schema 3 binds that normal review to the exact
+root allowance, active allowance digest, continuation-history digest, project,
+assignment, journal head and observed exhaustion flags. The store authenticates
+the original allowance from durable history inside the same transaction as
+the governing project, continuation and receipt updates. A historical lookup
+alone does not authorize more work.
+
+The assigned Project Manager or Technical Lead makes a real model decision:
+Continue selects bounded additional calls and a window from the remaining
+original policy; DeferBudget records a refusal without renewing the employee.
+Admission itself is not a model decision or permission for a developer call.
+Root counters never reset, no pending effect is replaced, and retired reviews
+still count toward their finite quota. An exhausted root or finite review/window
+limit gets a durable system-policy disposition, not an invented model refusal.
+The normal path does not issue an operator recovery epoch.
+
+The leader can inspect the exact authorized retained tool observation through
+the private Workbench preparation path. Invocation, request, result digest,
+profile and current capabilities must match. Private output stays out of the
+governing journal and public DTOs; the context is bounded and treats prior tool
+output as untrusted evidence, not current filesystem authority. Missing or
+revoked observation authority fails closed.
+
+Normal windows may restore the verified root per-call duration. Recovery
+windows preserve preceding narrowing. Effective provider grants and budget
+validation use the same source-sensitive history calculation, and all governed
+allowances require durable provenance even when their duration equals the
+ordinary duration. Fresh-inspection fences remain intact: a one-call window may
+fund inspection alone, so leadership must explicitly budget useful subsequent
+work. Exact committed replay returns the original receipt after later head
+advancement without granting new authority or rewinding the session.
 
 ## One Explicit Intervention
 

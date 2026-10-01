@@ -1,5 +1,12 @@
 # Changelog
 
+- Add a separate bounded normal budget-window leadership subject, with exact
+  root/current allowance and journal-history bindings, private observation
+  context, native provider schema, real Continue/refusal decisions and cumulative
+  employee spending. Preserve recovery limits and fresh-inspection fences;
+  present actual call ceilings without resetting counters or replaying effects
+  (#856).
+
 - Poll exact executing adaptive Workbench invocations instead of indefinitely
   replaying Submit. Validate identity and request digest before and after Poll;
   drain already claimed tool effects after model-allowance expiry without
