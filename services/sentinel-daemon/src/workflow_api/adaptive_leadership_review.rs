@@ -308,8 +308,8 @@ impl WorkflowApi {
             if assignments.len() != 1 {
                 continue;
             }
-            // Discovery verifies lineage, not serving duty. Exact dispatch and
-            // resolution still require a healthy, on-duty assignee snapshot.
+            // Existing-task review verifies assignee lineage, not serving duty.
+            // Fresh developer model/tool admission still requires serving health.
             let authority = match self
                 .authority
                 .as_ref()
@@ -951,11 +951,12 @@ impl WorkflowApi {
             .authority
             .as_ref()
             .ok_or("leadership runtime missing")?
-            .snapshot(
+            .snapshot_for_admission(
                 &project.tenant_id,
                 &project.project_id,
                 &binding.grant.work_item_id,
                 binding.grant.assignee_authority.agent_id,
+                false,
             )
             .map_err(|_| "leadership assignee unavailable")?;
         let session = self
@@ -1289,11 +1290,12 @@ impl WorkflowApi {
             .authority
             .as_ref()
             .ok_or("leadership runtime missing")?
-            .snapshot(
+            .snapshot_for_admission(
                 &current_project.tenant_id,
                 &current_project.project_id,
                 &call.grant.work_item_id,
                 call.grant.assignee_authority.agent_id,
+                false,
             )
             .map_err(|_| "leadership current assignee unavailable")?;
         if current_authority != call.grant.assignee_authority {
@@ -2461,7 +2463,7 @@ pub(crate) mod tests {
         rows
     }
 
-    fn discovery_state(
+    pub(crate) fn discovery_state(
         path: &Path,
         events: &Path,
     ) -> Vec<Vec<Vec<sentinel_limbo::rusqlite::types::Value>>> {
@@ -3329,8 +3331,337 @@ pub(crate) mod tests {
         assert!(api.adaptive_models_have_unknown_outcome().is_err());
     }
 
+    pub(crate) fn stop_review_agent(api: &WorkflowApi, agent_id: AgentId, off_duty: bool) {
+        let mut health = api
+            .authority
+            .as_ref()
+            .unwrap()
+            .runtime_health
+            .write()
+            .unwrap();
+        let agent = health
+            .agents
+            .iter_mut()
+            .find(|agent| agent.agent_id == agent_id.0)
+            .unwrap();
+        agent.expected_active = !off_duty;
+        agent.runtime_present = false;
+        agent.tracked_pid = None;
+        agent.tracked_pid_alive = false;
+        agent.cgroup_live_pid_count = 0;
+        agent.security_runtime_present = false;
+        agent.adapter_handle_present = false;
+        agent.adapter_instance_matches = false;
+        agent.runtime_resources_healthy = false;
+        agent.adapter_health_state = Some(sentinel_common::NanoHealthState::Stopped);
+        agent.logical_status = Some(sentinel_runtime::AgentStatus::Sleeping);
+    }
+
+    pub(crate) fn change_review_assignee(
+        api: &mut WorkflowApi,
+        context: &LeadershipContext,
+        change: &str,
+    ) {
+        let authority = &context.binding.grant.assignee_authority;
+        if change == "assignment" {
+            let response = api
+                .store
+                .apply_company_command(
+                    &context.binding.grant.leadership_principal,
+                    Uuid::new_v4(),
+                    &CompanyWorkflowCommandV1::ReassignWork {
+                        project_id: authority.project_id.clone(),
+                        expected_version: context.source.source_project.version,
+                        work_item_id: authority.work_item_id.clone(),
+                        expected_assignment_version: authority.assignment_version,
+                        agent_id: authority.agent_id,
+                        organization_generation: authority.organization_generation,
+                        organization_digest: authority.organization_digest.clone(),
+                        reason_ref: "Revoke old assignment and issue a new lineage".into(),
+                    },
+                    now_unix_ms(),
+                )
+                .unwrap();
+            let CompanyWorkflowResponseV1::Project(project) = response.response else {
+                panic!("reassigned project");
+            };
+            let assignments = &project.work_items[&authority.work_item_id].assignments;
+            assert!(!assignments[0].active);
+            assert_eq!(
+                assignments.last().unwrap().assignment_version,
+                authority.assignment_version + 1
+            );
+            return;
+        }
+        if matches!(change, "profile" | "policy") {
+            let current = Arc::make_mut(api.authority.as_mut().unwrap());
+            if change == "profile" {
+                current.workbench_profile_digest = "d".repeat(64);
+            } else {
+                current.project_profiles = ProjectProfileCatalog::test_web_digest("d".repeat(64));
+            }
+            return;
+        }
+        let mut principals = PrincipalAuthenticator {
+            by_credential_digest: api.principals.by_credential_digest.clone(),
+            by_principal_id: api.principals.by_principal_id.clone(),
+        };
+        for bound in principals
+            .by_principal_id
+            .values_mut()
+            .chain(principals.by_credential_digest.values_mut())
+        {
+            if bound.principal.agent_id == Some(authority.agent_id) {
+                match change {
+                    // Same agent and role, but a different current principal binding.
+                    "principal" => {
+                        bound.principal.principal_id = "replacement-developer".into();
+                        bound.execution_authority.principal_id = "replacement-developer".into();
+                    }
+                    "principal_generation" => {
+                        bound.principal.authority_generation += 1;
+                        bound.execution_authority.principal_generation += 1;
+                    }
+                    "principal_digest" => {
+                        bound.execution_authority.authority_digest = "d".repeat(64);
+                    }
+                    _ => panic!("unsupported assignee change"),
+                }
+            }
+        }
+        api.principals = Arc::new(principals);
+        Arc::make_mut(api.authority.as_mut().unwrap()).principals = Arc::clone(&api.principals);
+    }
+
+    pub(crate) fn exhaust_review_history(
+        api: &WorkflowApi,
+        initial: &LeadershipContext,
+    ) -> AdaptiveLeadershipReviewCallV1 {
+        let leader = api.principals.principal("pm").unwrap();
+        let mut call = api
+            .store
+            .adaptive_leadership_review_call(
+                &leader.principal.tenant_id,
+                initial.binding.grant.review_id,
+            )
+            .unwrap()
+            .unwrap();
+        for index in 0..ADAPTIVE_LEADERSHIP_MAX_REVIEWS {
+            // Synthetic admission only; no provider request or model result.
+            let claimed = api
+                .store
+                .claim_adaptive_leadership_review_call(
+                    &leader.principal,
+                    &sentinel_workflow::ClaimAdaptiveLeadershipReviewCallV1 {
+                        review_id: call.grant.review_id,
+                        allowance_id: call.allowance_id.clone(),
+                        request_id: call.request_id(),
+                        request_digest: "b".repeat(64),
+                        context_digest: call.context_digest().unwrap(),
+                    },
+                    call.grant_issued_at_unix_ms + 1,
+                )
+                .unwrap();
+            let retired = api
+                .store
+                .expire_adaptive_leadership_review_call(
+                    &leader.principal,
+                    call.grant.review_id,
+                    claimed.version,
+                    call.grant.expires_at_unix_ms,
+                )
+                .unwrap();
+            call = retired;
+            if index + 1 < ADAPTIVE_LEADERSHIP_MAX_REVIEWS {
+                let issued = call.updated_at_unix_ms + 1;
+                let mut context = call.context.clone();
+                context.evidence_refs.push(format!(
+                    "leadership-review-retired:{}:{}",
+                    call.grant.review_id,
+                    call.retired_at_unix_ms.unwrap()
+                ));
+                context.evidence_refs.sort();
+                let mut grant = call.grant.clone();
+                grant.evidence_fingerprint = adaptive_leadership_evidence_fingerprint(
+                    &context.tool_catalog,
+                    &context.evidence_refs,
+                )
+                .unwrap();
+                grant.review_id = adaptive_leadership_review_id(
+                    grant.session_id,
+                    grant.expected_session_version,
+                    &grant.evidence_fingerprint,
+                )
+                .unwrap();
+                grant.expires_at_unix_ms = issued + 1_000;
+                call = api
+                    .store
+                    .authorize_adaptive_leadership_review_call(
+                        &leader.principal,
+                        Uuid::new_v4(),
+                        &format!("local-fixture-history-{index}"),
+                        &grant,
+                        &context,
+                        issued,
+                    )
+                    .unwrap();
+            }
+        }
+        call
+    }
+
     #[test]
-    fn off_duty_actual_review_target_remains_fail_closed() {
+    fn stopped_assignee_review_prepares_and_accepts_once_without_developer_admission() {
+        for off_duty in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (api, context) = fixture(
+                &temp.path().join("company.sqlite"),
+                &temp.path().join("events.sqlite"),
+            );
+            let authority = &context.binding.grant.assignee_authority;
+            stop_review_agent(&api, authority.agent_id, off_duty);
+            assert!(api
+                .authority
+                .as_ref()
+                .unwrap()
+                .snapshot(
+                    &authority.tenant_id,
+                    &authority.project_id,
+                    &authority.work_item_id,
+                    authority.agent_id,
+                )
+                .is_err());
+            assert_eq!(
+                api.prepare_leadership_review(&context.binding).unwrap(),
+                context
+            );
+            assert_eq!(
+                api.review_sessions(&context.source.source_project).unwrap(),
+                vec![context.source.source_session.clone()]
+            );
+            let (id, digest) = reserve_and_claim(&api, &context);
+            // Synthetic fixture response; no provider call or live model outcome.
+            let completion = make_completion(&context, "keep_blocked");
+            persist(&api, &completion, &context, &id, &digest, false);
+            assert!(api
+                .accept_leadership_review(&completion, &context, &id, &digest)
+                .is_err());
+            let events = api.event_store.as_ref().unwrap();
+            let retained = events.get_llm_completion(&id).unwrap().unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&retained.payload).unwrap();
+            let exact_usage: DomainEvent =
+                serde_json::from_value(payload["usage_event"].clone()).unwrap();
+            events
+                .persist_llm_completion_usage(&id, &digest, &exact_usage)
+                .unwrap();
+            let mut changed = completion.clone();
+            changed.content.push(' ');
+            assert!(api
+                .accept_leadership_review(&changed, &context, &id, &digest)
+                .is_err());
+            api.accept_leadership_review(&completion, &context, &id, &digest)
+                .unwrap();
+            let call = api
+                .store
+                .adaptive_leadership_review_call(
+                    &authority.tenant_id,
+                    context.binding.grant.review_id,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(call.decision.is_some());
+            assert!(call.continuation.is_none());
+            let count = events.get_all_events().unwrap().len();
+            api.accept_leadership_review(&completion, &context, &id, &digest)
+                .unwrap();
+            assert_eq!(events.get_all_events().unwrap().len(), count);
+            assert_eq!(
+                events.get_llm_completion(&id).unwrap().unwrap().payload,
+                retained.payload
+            );
+            assert_eq!(
+                api.store
+                    .adaptive_leadership_review_call(
+                        &authority.tenant_id,
+                        context.binding.grant.review_id,
+                    )
+                    .unwrap(),
+                Some(call)
+            );
+            assert_eq!(
+                api.store.adaptive_session_for_authority(authority).unwrap(),
+                Some(context.source.source_session.clone())
+            );
+            assert_eq!(
+                api.store
+                    .company_project(&authority.tenant_id, &authority.project_id)
+                    .unwrap(),
+                Some(context.source.source_project.clone())
+            );
+            assert!(api
+                .authority
+                .as_ref()
+                .unwrap()
+                .snapshot(
+                    &authority.tenant_id,
+                    &authority.project_id,
+                    &authority.work_item_id,
+                    authority.agent_id,
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn stopped_assignee_lineage_changes_before_prepare_or_accept_cannot_mutate() {
+        for after_prepare in [false, true] {
+            for change in [
+                "assignment",
+                "principal",
+                "principal_generation",
+                "principal_digest",
+                "profile",
+                "policy",
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("company.sqlite");
+                let events_path = temp.path().join("events.sqlite");
+                let (mut api, context) = fixture(&path, &events_path);
+                stop_review_agent(
+                    &api,
+                    context.binding.grant.assignee_authority.agent_id,
+                    false,
+                );
+                let dispatched = if after_prepare {
+                    let prepared = api.prepare_leadership_review(&context.binding).unwrap();
+                    assert_eq!(prepared, context);
+                    let (id, digest) = reserve_and_claim(&api, &context);
+                    let completion = make_completion(&context, "keep_blocked");
+                    persist(&api, &completion, &context, &id, &digest, true);
+                    Some((completion, id, digest))
+                } else {
+                    None
+                };
+                change_review_assignee(&mut api, &context, change);
+                let before = discovery_state(&path, &events_path);
+                assert!(
+                    api.prepare_leadership_review(&context.binding).is_err(),
+                    "{change}"
+                );
+                if let Some((completion, id, digest)) = dispatched {
+                    assert!(
+                        api.accept_leadership_review(&completion, &context, &id, &digest)
+                            .is_err(),
+                        "{change}"
+                    );
+                }
+                assert_eq!(discovery_state(&path, &events_path), before, "{change}");
+            }
+        }
+    }
+
+    #[test]
+    fn stopped_leader_review_remains_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let (api, context) = fixture(
             &temp.path().join("company.sqlite"),
@@ -3339,17 +3670,11 @@ pub(crate) mod tests {
         let (id, digest) = reserve_and_claim(&api, &context);
         let completion = make_completion(&context, "keep_blocked");
         persist(&api, &completion, &context, &id, &digest, true);
-        api.authority
-            .as_ref()
-            .unwrap()
-            .runtime_health
-            .write()
-            .unwrap()
-            .agents
-            .iter_mut()
-            .find(|agent| agent.agent_id == context.binding.grant.assignee_authority.agent_id.0)
-            .unwrap()
-            .expected_active = false;
+        stop_review_agent(
+            &api,
+            context.binding.grant.leadership_principal.agent_id.unwrap(),
+            false,
+        );
         assert_eq!(
             api.review_sessions(&context.source.source_project).unwrap(),
             vec![context.source.source_session.clone()]

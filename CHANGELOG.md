@@ -1,5 +1,10 @@
 # Changelog
 
+- Discover exact durable employee sessions and govern bounded leadership reviews
+  without requiring the assigned developer's live process. Keep current lineage,
+  revocation, observation and journal bindings while fresh employee execution and
+  the reviewing leader remain serving-gated (#856).
+
 - Reconcile already-started employee effects under current durable authority
   without requiring a healthy process. After restart, recover the original
   receipt through an isolated replacement reader with exact instance ownership

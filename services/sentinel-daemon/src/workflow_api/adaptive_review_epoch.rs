@@ -278,11 +278,12 @@ impl WorkflowApi {
             .authority
             .as_ref()
             .ok_or("recovery runtime missing")?
-            .snapshot(
+            .snapshot_for_admission(
                 &project.tenant_id,
                 project_id,
                 &session.grant.authority.work_item_id,
                 session.grant.authority.agent_id,
+                false,
             )
             .map_err(|_| "recovery assignee unavailable")?;
         if current != session.grant.authority {
@@ -468,8 +469,164 @@ impl WorkflowApi {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use super::super::adaptive_leadership_review::tests::{
+        change_review_assignee, discovery_state, exhaust_review_history, stop_review_agent,
+    };
     use super::*;
+
+    pub(crate) fn exhausted_epoch_fixture(
+        unknown: bool,
+    ) -> (
+        tempfile::TempDir,
+        adaptive_recovery_release::TestRepairGuard,
+        WorkflowApi,
+        super::super::adaptive_leadership_review::LeadershipContext,
+    ) {
+        let repair = adaptive_recovery_release::TestRepairGuard::fixture().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (api, context) =
+            super::super::adaptive_continuation_tests::fixture_schema2_recovery_source(
+                &temp.path().join("company.sqlite"),
+                &temp.path().join("events.sqlite"),
+                unknown,
+            );
+        exhaust_review_history(&api, &context);
+        (temp, repair, api, context)
+    }
+
+    #[test]
+    fn stopped_assignee_epoch_draft_and_issue_preserve_root_accounting() {
+        for unknown in [false, true] {
+            let (temp, _repair, api, context) = exhausted_epoch_fixture(unknown);
+            let authority = &context.binding.grant.assignee_authority;
+            stop_review_agent(&api, authority.agent_id, false);
+            let operator = api.principals.principal("operator").unwrap();
+            let path = format!(
+                "{ADAPTIVE_REVIEW_EPOCH_PATH}?project_id={}&session_id={}",
+                authority.project_id, context.binding.grant.session_id
+            );
+            let before = discovery_state(
+                &temp.path().join("company.sqlite"),
+                &temp.path().join("events.sqlite"),
+            );
+            let draft = api.review_recovery_epoch(&operator, "GET", &path, &[]);
+            assert_eq!(
+                draft.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&draft.body)
+            );
+            assert_eq!(
+                discovery_state(
+                    &temp.path().join("company.sqlite"),
+                    &temp.path().join("events.sqlite"),
+                ),
+                before
+            );
+            let draft: serde_json::Value = serde_json::from_slice(&draft.body).unwrap();
+            let issued = api.review_recovery_epoch(
+                &operator,
+                "POST",
+                ADAPTIVE_REVIEW_EPOCH_PATH,
+                &serde_json::to_vec(&draft["request"]).unwrap(),
+            );
+            assert_eq!(
+                issued.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&issued.body)
+            );
+            assert_eq!(
+                api.store.adaptive_session_for_authority(authority).unwrap(),
+                Some(context.source.source_session.clone())
+            );
+            assert_eq!(
+                api.store
+                    .company_project(&authority.tenant_id, &authority.project_id)
+                    .unwrap(),
+                Some(context.source.source_project.clone())
+            );
+            assert!(api
+                .authority
+                .as_ref()
+                .unwrap()
+                .snapshot(
+                    &authority.tenant_id,
+                    &authority.project_id,
+                    &authority.work_item_id,
+                    authority.agent_id,
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn epoch_assignee_revocation_before_draft_or_issue_fails_without_writes() {
+        for unknown in [false, true] {
+            for after_draft in [false, true] {
+                for change in ["assignment", "principal", "leader"] {
+                    let (temp, _repair, mut api, context) = exhausted_epoch_fixture(unknown);
+                    stop_review_agent(
+                        &api,
+                        context.binding.grant.assignee_authority.agent_id,
+                        false,
+                    );
+                    let operator = api.principals.principal("operator").unwrap();
+                    let path = format!(
+                        "{ADAPTIVE_REVIEW_EPOCH_PATH}?project_id={}&session_id={}",
+                        context.binding.grant.project_id, context.binding.grant.session_id
+                    );
+                    let request = if after_draft {
+                        let draft = api.review_recovery_epoch(&operator, "GET", &path, &[]);
+                        assert_eq!(draft.status, 200);
+                        let draft: serde_json::Value = serde_json::from_slice(&draft.body).unwrap();
+                        Some(serde_json::to_vec(&draft["request"]).unwrap())
+                    } else {
+                        None
+                    };
+                    if change == "leader" {
+                        stop_review_agent(
+                            &api,
+                            context.binding.grant.leadership_principal.agent_id.unwrap(),
+                            false,
+                        );
+                    } else {
+                        change_review_assignee(&mut api, &context, change);
+                    }
+                    let before = discovery_state(
+                        &temp.path().join("company.sqlite"),
+                        &temp.path().join("events.sqlite"),
+                    );
+                    assert_eq!(
+                        api.review_recovery_epoch(&operator, "GET", &path, &[])
+                            .status,
+                        409
+                    );
+                    if let Some(request) = request {
+                        assert_eq!(
+                            api.review_recovery_epoch(
+                                &operator,
+                                "POST",
+                                ADAPTIVE_REVIEW_EPOCH_PATH,
+                                &request,
+                            )
+                            .status,
+                            409
+                        );
+                    }
+                    assert_eq!(
+                        discovery_state(
+                            &temp.path().join("company.sqlite"),
+                            &temp.path().join("events.sqlite"),
+                        ),
+                        before,
+                        "{change}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn recovery_epoch_route_rejects_employee_and_customer_authority_without_writes() {
