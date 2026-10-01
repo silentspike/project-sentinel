@@ -14,6 +14,196 @@ const KIND: &str = "adaptive_leadership_review_call";
 const MAX_TENANT_REVIEW_SCAN: usize = 4096;
 const ABANDONED_KIND: &str = "adaptive_leadership_abandoned_allowance";
 const EXPIRED_CONTINUATION_KIND: &str = "adaptive_leadership_expired_continuation";
+const BUDGET_LIMIT_KIND: &str = "adaptive_budget_window_limit";
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AdaptiveBudgetWindowLimitCauseV1 {
+    ReviewLimit,
+    HeadReviewLimit,
+    WindowLimit,
+    RootCallsExhausted,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AdaptiveBudgetWindowDispositionV1 {
+    SystemPolicyLimit,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdaptiveBudgetWindowLimitReceiptV1 {
+    schema_version: u16,
+    disposition: AdaptiveBudgetWindowDispositionV1,
+    receipt_id: String,
+    source_digest: String,
+    grant: AdaptiveLeadershipReviewGrantV1,
+    context: AdaptiveLeadershipReviewContextV1,
+    causes: Vec<AdaptiveBudgetWindowLimitCauseV1>,
+    recorded_at_ms: u64,
+}
+
+fn budget_limit_id(session_id: Uuid, version: u64) -> Result<String, WorkflowError> {
+    Ok(crate::adaptive_leadership_review_id(
+        session_id,
+        version,
+        &canonical_sha256(
+            "sentinel.workflow.adaptive-budget-limit-identity.v1",
+            &(session_id, version),
+        )?,
+    )?
+    .to_string())
+}
+
+fn budget_limit_source_digest(
+    grant: &AdaptiveLeadershipReviewGrantV1,
+    context: &AdaptiveLeadershipReviewContextV1,
+) -> Result<String, WorkflowError> {
+    let Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) = &grant.subject
+    else {
+        return Err(unauthorized());
+    };
+    canonical_sha256(
+        "sentinel.workflow.adaptive-budget-limit-source.v1",
+        &(
+            &context.source_project,
+            &context.source_session,
+            &budget.root_allowance,
+            &budget.active_allowance_digest,
+            &budget.continuation_history_digest,
+            &grant.leadership_principal,
+            &grant.leadership_authority,
+            &grant.assignee_authority,
+            &grant.assignment_id,
+            &grant.provider,
+            &grant.model,
+            &grant.catalog_digest,
+            grant.token_policy,
+        ),
+    )
+}
+
+fn budget_limit_causes(
+    connection: &Connection,
+    grant: &AdaptiveLeadershipReviewGrantV1,
+    context: &AdaptiveLeadershipReviewContextV1,
+) -> Result<Vec<AdaptiveBudgetWindowLimitCauseV1>, WorkflowError> {
+    let calls = calls_for_session(
+        connection,
+        &grant.leadership_principal.tenant_id,
+        grant.session_id,
+    )?;
+    let mut causes = Vec::new();
+    if calls
+        .iter()
+        .filter(|call| call.grant.schema_version == 3)
+        .count()
+        >= ADAPTIVE_LEADERSHIP_MAX_REVIEWS
+    {
+        causes.push(AdaptiveBudgetWindowLimitCauseV1::ReviewLimit);
+    }
+    if calls
+        .iter()
+        .filter(|call| call.grant.expected_session_version == grant.expected_session_version)
+        .count()
+        >= ADAPTIVE_LEADERSHIP_MAX_REVIEWS
+    {
+        causes.push(AdaptiveBudgetWindowLimitCauseV1::HeadReviewLimit);
+    }
+    if context
+        .source_session
+        .continuation
+        .as_ref()
+        .is_some_and(|state| {
+            state.authorizations.len() >= crate::adaptive::ADAPTIVE_CONTINUATION_MAX_WINDOWS
+        })
+    {
+        causes.push(AdaptiveBudgetWindowLimitCauseV1::WindowLimit);
+    }
+    if context.source_session.model_calls >= context.source_session.grant.max_model_calls {
+        causes.push(AdaptiveBudgetWindowLimitCauseV1::RootCallsExhausted);
+    }
+    Ok(causes)
+}
+
+impl CompanyEntity for AdaptiveBudgetWindowLimitReceiptV1 {
+    fn row_binding(&self) -> (&TenantId, &'static str, &str, u64) {
+        (
+            &self.grant.leadership_principal.tenant_id,
+            BUDGET_LIMIT_KIND,
+            &self.receipt_id,
+            1,
+        )
+    }
+
+    fn validate_entity(&self) -> Result<(), WorkflowError> {
+        self.grant.validate(self.recorded_at_ms)?;
+        self.context.validate(&self.grant)?;
+        validate_project(&self.context.source_project)?;
+        if self.schema_version != 1
+            || self.grant.schema_version != 3
+            || self.grant.recovery_epoch.is_some()
+            || self.causes.is_empty()
+            || self.causes.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.receipt_id
+                != budget_limit_id(self.grant.session_id, self.grant.expected_session_version)?
+            || self.source_digest != budget_limit_source_digest(&self.grant, &self.context)?
+        {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
+
+    fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
+        require_budget_source(connection, &self.grant, &self.context)?;
+        let current = budget_limit_causes(connection, &self.grant, &self.context)?;
+        if self.causes.iter().any(|cause| !current.contains(cause)) {
+            return Err(corrupt());
+        }
+        let mut statement = connection.prepare(
+            "SELECT payload,payload_digest,operation_digest,authority_binding_digest,created_at_ms
+             FROM company_events WHERE tenant_id=?1 AND event_type=?2 AND operation_id=?3 LIMIT 2",
+        )?;
+        let records = statement
+            .query_map(
+                params![
+                    self.grant.leadership_principal.tenant_id.0,
+                    "adaptive_budget_window_limit_recorded",
+                    self.grant.review_id.to_string()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if records.len() != 1 {
+            return Err(corrupt());
+        }
+        let (payload, digest, operation, issuer, time) = &records[0];
+        if decode::<AdaptiveBudgetWindowLimitReceiptV1>(payload)? != *self
+            || !constant_time_eq(
+                digest,
+                &bytes_digest("sentinel.workflow.company-event-payload.v1", payload)?,
+            )
+            || !constant_time_eq(
+                operation,
+                &canonical_sha256("sentinel.workflow.adaptive-budget-limit.v1", self)?,
+            )
+            || !constant_time_eq(issuer, &self.grant.leadership_principal.binding_digest()?)
+            || stored_u64(*time)? != self.recorded_at_ms
+        {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -253,7 +443,63 @@ fn require_current_source(
     if project != call.context.source_project || session != call.context.source_session {
         return Err(transition());
     }
-    require_planning_policy(connection, call, &project)
+    require_planning_policy(connection, call, &project)?;
+    require_budget_source(connection, &call.grant, &call.context)
+}
+
+fn require_budget_source(
+    connection: &Connection,
+    grant: &AdaptiveLeadershipReviewGrantV1,
+    context: &AdaptiveLeadershipReviewContextV1,
+) -> Result<(), WorkflowError> {
+    let Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) = &grant.subject
+    else {
+        return Ok(());
+    };
+    let source = &context.source_session;
+    if grant.schema_version != 3
+        || grant.recovery_epoch.is_some()
+        || budget.schema_version != 1
+        || !matches!(source.cursor, AdaptiveCursorV1::ReadyForModel)
+        || budget.observed_at_ms < source.updated_at_ms
+        || budget.model_calls_exhausted != (source.model_calls >= source.active_model_ceiling())
+        || budget.deadline_expired != (budget.observed_at_ms >= source.active_deadline_ms())
+        || !(budget.model_calls_exhausted || budget.deadline_expired)
+    {
+        return Err(unauthorized());
+    }
+    crate::store::adaptive::require_journal_source(connection, source)?;
+    let original = super::historical_allowance::historical_adaptive_provider_project_in_connection(
+        connection,
+        &source.grant,
+        source.grant.created_at_ms,
+    )?
+    .ok_or_else(unauthorized)?;
+    let root = original
+        .subscription_call
+        .as_ref()
+        .ok_or_else(unauthorized)?;
+    let active = context
+        .source_project
+        .subscription_call
+        .as_ref()
+        .ok_or_else(unauthorized)?;
+    if *root != budget.root_allowance
+        || active.allowance_id != source.active_provider_allowance_id()
+        || active.dispatch.is_some()
+        || crate::adaptive_budget_allowance_digest(active)? != budget.active_allowance_digest
+        || crate::adaptive_budget_history_digest(&source.continuation)?
+            != budget.continuation_history_digest
+        || original.governance.project_profile != context.source_project.governance.project_profile
+        || root.grant.provider != active.grant.provider
+        || root.grant.model != active.grant.model
+        || root.grant.catalog_digest != active.grant.catalog_digest
+        || root.grant.token_policy != active.grant.token_policy
+        || root.grant.max_concurrent != active.grant.max_concurrent
+    {
+        return Err(unauthorized());
+    }
+    Ok(())
 }
 
 fn require_planning_policy(
@@ -277,7 +523,7 @@ fn require_planning_policy(
         || planning.grant.catalog_digest != call.grant.catalog_digest
         || planning.grant.token_policy != call.grant.token_policy
         || call.grant.max_duration_ms > planning.grant.max_duration_ms
-        || (call.grant.schema_version == 2
+        || (matches!(call.grant.schema_version, 2 | 3)
             && (call.context.source_session.grant.provider != planning.grant.provider
                 || call.context.source_session.grant.model != planning.grant.model
                 || call.context.source_session.grant.catalog_digest
@@ -312,6 +558,11 @@ fn validate_continuation(
     };
     let authorization = continuation.ok_or_else(unauthorized)?;
     authorization.validate()?;
+    if call.grant.schema_version == 3
+        && (authorization.local_adoption.is_some() || call.grant.recovery_epoch.is_some())
+    {
+        return Err(unauthorized());
+    }
     if let Some(adoption) = &authorization.local_adoption {
         adoption.validate_call(call)?;
         if adoption.request.decision != *decision
@@ -331,6 +582,12 @@ fn validate_continuation(
         .subscription_call
         .as_ref()
         .ok_or_else(unauthorized)?;
+    let policy = match &call.grant.subject {
+        Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) => {
+            &budget.root_allowance
+        }
+        _ => current,
+    };
     let (expected_source, abandoned) = match &call.grant.subject {
         Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { effect, .. }) => (
             crate::adaptive::AdaptiveContinuationSourceV1::ModelUnknown,
@@ -351,6 +608,13 @@ fn validate_continuation(
             };
             (source, None)
         }
+        Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) => (
+            crate::adaptive::AdaptiveContinuationSourceV1::BudgetWindowExhausted {
+                active_allowance_digest: budget.active_allowance_digest.clone(),
+                continuation_history_digest: budget.continuation_history_digest.clone(),
+            },
+            None,
+        ),
         None => return Err(unauthorized()),
     };
     let allowance = call.continuation_allowance(
@@ -365,7 +629,7 @@ fn validate_continuation(
         || authorization.abandoned_model_effect != abandoned
         || authorization.source != expected_source
         || authorization.additional_model_calls != *additional_model_calls
-        || *additional_model_calls > current.grant.max_calls
+        || (call.grant.schema_version != 3 && *additional_model_calls > current.grant.max_calls)
         || *additional_model_calls > source.grant.max_model_calls
         || source
             .model_calls
@@ -380,8 +644,8 @@ fn validate_continuation(
             .deadline_ms
             .checked_sub(source.grant.created_at_ms)
             .is_none_or(|window| *window_ms > window)
-        || allowance.grant.max_duration_ms > current.grant.max_duration_ms
-        || allowance.grant.max_concurrent > current.grant.max_concurrent
+        || allowance.grant.max_duration_ms > policy.grant.max_duration_ms
+        || allowance.grant.max_concurrent > policy.grant.max_concurrent
         || authorization.issued_at_ms
             < call
                 .dispatch
@@ -390,7 +654,13 @@ fn validate_continuation(
                 .dispatched_at_unix_ms
         || (authorization.local_adoption.is_none()
             && authorization.issued_at_ms >= call.grant.expires_at_unix_ms)
-        || authorization.issued_at_ms < source.active_deadline_ms()
+        || (call.grant.schema_version != 3
+            && authorization.issued_at_ms < source.active_deadline_ms())
+        || (call.grant.schema_version == 3
+            && (authorization.issued_at_ms < source.updated_at_ms
+                || !matches!(source.cursor, AdaptiveCursorV1::ReadyForModel)
+                || (source.model_calls < source.active_model_ceiling()
+                    && authorization.issued_at_ms < source.active_deadline_ms())))
         || authorization.provider_allowance_id
             != crate::domain::stable_domain_id(
                 "subscription",
@@ -429,6 +699,19 @@ fn require_subject_time(
     call: &AdaptiveLeadershipReviewCallV1,
     now_ms: u64,
 ) -> Result<(), WorkflowError> {
+    if let Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) =
+        &call.grant.subject
+    {
+        if call.grant.schema_version != 3
+            || now_ms < budget.observed_at_ms
+            || now_ms < call.context.source_session.updated_at_ms
+            || (call.context.source_session.model_calls
+                < call.context.source_session.active_model_ceiling()
+                && now_ms < call.context.source_session.active_deadline_ms())
+        {
+            return Err(transition());
+        }
+    }
     if call.grant.schema_version == 2
         && (now_ms < call.context.source_session.updated_at_ms
             || (matches!(
@@ -454,15 +737,22 @@ fn commit_continuation_allowance(
         .as_ref()
         .ok_or_else(unauthorized)?;
     require_adaptive_allowance_source(call)?;
+    require_budget_source(transaction, &call.grant, &call.context)?;
+    let policy = match &call.grant.subject {
+        Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) => {
+            &budget.root_allowance
+        }
+        _ => prior,
+    };
     let allowance = call.continuation_allowance(
         authorization.issued_at_ms,
         authorization.deadline_ms,
         authorization.additional_model_calls,
     )?;
     if prior.allowance_id == allowance.allowance_id
-        || allowance.grant.max_calls > prior.grant.max_calls
-        || allowance.grant.max_duration_ms > prior.grant.max_duration_ms
-        || allowance.grant.max_concurrent > prior.grant.max_concurrent
+        || (call.grant.schema_version != 3 && allowance.grant.max_calls > prior.grant.max_calls)
+        || allowance.grant.max_duration_ms > policy.grant.max_duration_ms
+        || allowance.grant.max_concurrent > policy.grant.max_concurrent
         || project
             .abandoned_subscription_calls
             .iter()
@@ -504,7 +794,7 @@ fn commit_continuation_allowance(
     // The exact source journal was verified by the continuation transaction helper.
     // Preserve the replaced current allowance separately from the immutable root journal grant.
     project.subscription_call = None;
-    subscription::grant_governed_continuation(&mut project, &completed, &allowance)?;
+    subscription::grant_governed_continuation(transaction, &mut project, &completed, &allowance)?;
     if project.subscription_call.as_ref() != Some(&allowance) {
         return Err(unauthorized());
     }
@@ -559,7 +849,7 @@ fn require_adaptive_allowance_source(
         .subscription_call
         .as_ref()
         .ok_or_else(unauthorized)?;
-    if call.grant.schema_version != 2
+    if !matches!(call.grant.schema_version, 2 | 3)
         || prior.dispatch.is_some()
         || prior.allowance_id == call.allowance_id
         || prior.grant.work_item_id != call.grant.work_item_id
@@ -618,7 +908,7 @@ pub(super) fn validate_governed_allowance_receipt(
     receipt.validate_entity()?;
     let authorization = receipt.continuation.as_ref().ok_or_else(unauthorized)?;
     if receipt.version != 3
-        || receipt.grant.schema_version != 2
+        || !matches!(receipt.grant.schema_version, 2 | 3)
         || receipt.grant.subject.is_none()
         || receipt.retired_at_unix_ms.is_some()
         || *allowance
@@ -653,6 +943,7 @@ pub(super) fn validate_persisted_governed_allowance(
     let receipt: AdaptiveLeadershipReviewCallV1 =
         get_entity(connection, &project.tenant_id, KIND, &ids[0])?.ok_or_else(corrupt)?;
     validate_governed_allowance_receipt(&receipt, allowance).map_err(|_| corrupt())?;
+    require_budget_source(connection, &receipt.grant, &receipt.context).map_err(|_| corrupt())?;
     let authorization = receipt.continuation.as_ref().ok_or_else(corrupt)?;
     let prior = receipt
         .context
@@ -728,7 +1019,7 @@ impl CompanyEntity for ExpiredAdaptiveContinuationRetirementV1 {
         self.review.validate_entity()?;
         let authorization = self.result.continuation.as_ref().ok_or_else(corrupt)?;
         if self.schema_version != 1
-            || self.review.grant.schema_version != 2
+            || !matches!(self.review.grant.schema_version, 2 | 3)
             || self.review.version != 4
             || self.review.retired_at_unix_ms.is_none()
             || self.review.decision.is_some()
@@ -840,7 +1131,7 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
             || self.operation_id.is_nil()
             || self.allowance_id == self.grant.review_id.to_string()
             || self.allowance_id == self.context.source_session.grant.provider_allowance_id
-            || (self.grant.schema_version == 2
+            || (matches!(self.grant.schema_version, 2 | 3)
                 && self.allowance_id == self.context.source_session.active_provider_allowance_id())
             || self.created_at_unix_ms == 0
             || self.grant_issued_at_unix_ms < self.created_at_unix_ms
@@ -913,11 +1204,148 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
     }
 
     fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
-        WorkflowStore::require_recovery_epoch_review(connection, self)
+        WorkflowStore::require_recovery_epoch_review(connection, self)?;
+        require_budget_source(connection, &self.grant, &self.context)
     }
 }
 
 impl WorkflowStore {
+    /// System-policy disposition only: no provider reservation or invented model decision.
+    pub fn record_adaptive_budget_window_limit(
+        &self,
+        leader: &AuthenticatedCompanyPrincipalV1,
+        grant: &AdaptiveLeadershipReviewGrantV1,
+        context: &AdaptiveLeadershipReviewContextV1,
+        now_ms: u64,
+    ) -> Result<(), WorkflowError> {
+        leader.validate()?;
+        let Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) =
+            &grant.subject
+        else {
+            return Err(unauthorized());
+        };
+        grant.validate(budget.observed_at_ms)?;
+        context.validate(grant)?;
+        if grant.schema_version != 3
+            || grant.recovery_epoch.is_some()
+            || *leader != grant.leadership_principal
+        {
+            return Err(unauthorized());
+        }
+        let mut connection = self.connection.lock().map_err(|_| persistence())?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_budget_source(&transaction, grant, context)?;
+        let project: ProjectV1 = get_entity(
+            &transaction,
+            &leader.tenant_id,
+            "project",
+            &grant.project_id.0,
+        )?
+        .ok_or_else(not_found)?;
+        let (session, _) =
+            crate::store::adaptive::load(&transaction, grant.session_id)?.ok_or_else(not_found)?;
+        crate::store::adaptive::require_head(&transaction, &session)?;
+        if project != context.source_project || session != context.source_session {
+            return Err(transition());
+        }
+        // Validate the same accepted policy as review admission, without admitting a call.
+        let provisional = AdaptiveLeadershipReviewCallV1 {
+            schema_version: 3,
+            review_key: grant.review_id.to_string(),
+            allowance_id: "budget-limit-no-provider".into(),
+            operation_id: grant.review_id,
+            grant: grant.clone(),
+            context: context.clone(),
+            version: 1,
+            created_at_unix_ms: now_ms,
+            grant_issued_at_unix_ms: now_ms,
+            updated_at_unix_ms: now_ms,
+            dispatch: None,
+            decision: None,
+            model_response_digest: None,
+            resolution_event_id: None,
+            retired_at_unix_ms: None,
+            continuation: None,
+        };
+        require_planning_policy(&transaction, &provisional, &project)?;
+        require_subject_time(&provisional, now_ms)?;
+        let causes = budget_limit_causes(&transaction, grant, context)?;
+        if causes.is_empty() {
+            return Err(transition());
+        }
+        let receipt_id = budget_limit_id(grant.session_id, grant.expected_session_version)?;
+        let source_digest = budget_limit_source_digest(grant, context)?;
+        if let Some(prior) = get_entity::<AdaptiveBudgetWindowLimitReceiptV1>(
+            &transaction,
+            &leader.tenant_id,
+            BUDGET_LIMIT_KIND,
+            &receipt_id,
+        )? {
+            if prior.source_digest != source_digest
+                || prior.causes != causes
+                || now_ms < prior.recorded_at_ms
+            {
+                return Err(transition());
+            }
+            return Ok(());
+        }
+        let receipt = AdaptiveBudgetWindowLimitReceiptV1 {
+            schema_version: 1,
+            disposition: AdaptiveBudgetWindowDispositionV1::SystemPolicyLimit,
+            receipt_id: receipt_id.clone(),
+            source_digest,
+            grant: grant.clone(),
+            context: context.clone(),
+            causes,
+            recorded_at_ms: now_ms,
+        };
+        receipt.validate_entity()?;
+        put_entity(
+            &transaction,
+            &leader.tenant_id,
+            BUDGET_LIMIT_KIND,
+            &receipt_id,
+            1,
+            &receipt,
+        )?;
+        append_event(
+            &transaction,
+            leader,
+            grant.review_id,
+            &canonical_sha256("sentinel.workflow.adaptive-budget-limit.v1", &receipt)?,
+            Some(&grant.project_id),
+            "adaptive_budget_window_limit_recorded",
+            &receipt,
+            now_ms,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn adaptive_budget_window_limit_recorded(
+        &self,
+        tenant: &TenantId,
+        session_id: Uuid,
+        session_version: u64,
+    ) -> Result<bool, WorkflowError> {
+        tenant.validate()?;
+        let connection = self.connection.lock().map_err(|_| persistence())?;
+        Ok(get_entity::<AdaptiveBudgetWindowLimitReceiptV1>(
+            &connection,
+            tenant,
+            BUDGET_LIMIT_KIND,
+            &budget_limit_id(session_id, session_version)?,
+        )?
+        .is_some())
+    }
+
+    pub(crate) fn require_adaptive_budget_review_source(
+        connection: &Connection,
+        call: &AdaptiveLeadershipReviewCallV1,
+    ) -> Result<(), WorkflowError> {
+        require_budget_source(connection, &call.grant, &call.context)
+    }
+
     /// Build the shared local-adoption audit proposal; this is not proof of a durable append.
     pub fn local_adoption_continuation_audit_proposal(
         call: &AdaptiveLeadershipReviewCallV1,
@@ -1003,7 +1431,7 @@ impl WorkflowStore {
                 return Ok(prior);
             }
             if prior.dispatch.is_some()
-                || prior.grant.schema_version == 2
+                || matches!(prior.grant.schema_version, 2 | 3)
                 || prior.decision.is_some()
                 || prior.retired_at_unix_ms.is_some()
                 || now_ms < prior.grant.expires_at_unix_ms
@@ -1024,6 +1452,28 @@ impl WorkflowStore {
         }
         grant.validate(now_ms)?;
         context.validate(grant)?;
+        if grant.schema_version == 3 {
+            require_budget_source(&transaction, grant, context)?;
+            if context.source_session.model_calls >= context.source_session.grant.max_model_calls
+                || context
+                    .source_session
+                    .continuation
+                    .as_ref()
+                    .is_some_and(|state| {
+                        state.authorizations.len()
+                            >= crate::adaptive::ADAPTIVE_CONTINUATION_MAX_WINDOWS
+                    })
+                || get_entity::<AdaptiveBudgetWindowLimitReceiptV1>(
+                    &transaction,
+                    &leader.tenant_id,
+                    BUDGET_LIMIT_KIND,
+                    &budget_limit_id(grant.session_id, grant.expected_session_version)?,
+                )?
+                .is_some()
+            {
+                return Err(transition());
+            }
+        }
         let existing = calls_for_session(&transaction, &leader.tenant_id, grant.session_id)?;
         let same_head: Vec<_> = existing
             .iter()
@@ -1034,6 +1484,12 @@ impl WorkflowStore {
                 && existing
                     .iter()
                     .filter(|call| call.grant.schema_version == 2)
+                    .count()
+                    >= ADAPTIVE_LEADERSHIP_MAX_REVIEWS)
+            || (grant.schema_version == 3
+                && existing
+                    .iter()
+                    .filter(|call| call.grant.schema_version == 3)
                     .count()
                     >= ADAPTIVE_LEADERSHIP_MAX_REVIEWS)
             || same_head
@@ -1142,7 +1598,8 @@ impl WorkflowStore {
             &result.review_id.to_string(),
         )?
         .ok_or_else(not_found)?;
-        if leader != &call.grant.leadership_principal || call.grant.schema_version != 2 {
+        if leader != &call.grant.leadership_principal || !matches!(call.grant.schema_version, 2 | 3)
+        {
             return Err(unauthorized());
         }
         if call.decision.is_some() || now_ms < call.updated_at_unix_ms {
@@ -1318,7 +1775,7 @@ impl WorkflowStore {
             return Err(unauthorized());
         }
         if explicit_expiry
-            && (call.grant.schema_version != 2
+            && (!matches!(call.grant.schema_version, 2 | 3)
                 || call.grant.subject.is_none()
                 || now_ms < call.grant.expires_at_unix_ms)
         {
@@ -1369,7 +1826,7 @@ impl WorkflowStore {
         {
             return Err(transition());
         }
-        let expired_subject = call.grant.schema_version == 2
+        let expired_subject = matches!(call.grant.schema_version, 2 | 3)
             && call.grant.subject.is_some()
             && (call.dispatch.is_none() || explicit_expiry)
             && now_ms >= call.grant.expires_at_unix_ms;
@@ -1523,7 +1980,7 @@ impl WorkflowStore {
             )?;
         }
         recovery::require_epoch_completion(&transaction, &call, result)?;
-        if call.grant.schema_version == 2
+        if matches!(call.grant.schema_version, 2 | 3)
             && result.continuation.is_none()
             && now_ms >= call.grant.expires_at_unix_ms
         {
@@ -1547,6 +2004,7 @@ impl WorkflowStore {
                 return Err(transition());
             }
             require_planning_policy(&transaction, &call, &project)?;
+            require_budget_source(&transaction, &call.grant, &call.context)?;
             require_subject_time(&call, now_ms)?;
             // All effects share this transaction: no independent receipt or allowance grant.
             let allowance = call.continuation_allowance(
@@ -1631,6 +2089,1192 @@ mod tests {
     }
 
     const CONTINUATION_AT: u64 = 900_002;
+
+    fn budget_context(f: &mut Fixture, now: u64, evidence: &str) {
+        let source = session(f);
+        let project = f
+            .store
+            .company_project(&f.leader.tenant_id, &f.grant.project_id)
+            .unwrap()
+            .unwrap();
+        let original = f
+            .store
+            .historical_adaptive_provider_project(&source.grant, source.grant.created_at_ms)
+            .unwrap()
+            .unwrap();
+        let budget = crate::AdaptiveBudgetWindowAuthorityV1 {
+            schema_version: 1,
+            root_allowance: original.subscription_call.unwrap(),
+            active_allowance_digest: crate::adaptive_budget_allowance_digest(
+                project.subscription_call.as_ref().unwrap(),
+            )
+            .unwrap(),
+            continuation_history_digest: crate::adaptive_budget_history_digest(
+                &source.continuation,
+            )
+            .unwrap(),
+            observed_at_ms: now,
+            model_calls_exhausted: source.model_calls >= source.active_model_ceiling(),
+            deadline_expired: now >= source.active_deadline_ms(),
+        };
+        f.context.source_project = project;
+        f.context.source_session = source.clone();
+        f.context.evidence_refs = vec![
+            format!(
+                "adaptive-budget-root:{}:{}",
+                budget.root_allowance.allowance_id, source.grant.provider_authority_digest
+            ),
+            format!("adaptive-budget-current:{}", budget.active_allowance_digest),
+            format!(
+                "adaptive-budget-history:{}",
+                budget.continuation_history_digest
+            ),
+            evidence.into(),
+        ];
+        if let Some(observation) = &source.last_observation {
+            f.context.evidence_refs.push(format!(
+                "workbench-observation:{}:{}",
+                observation.effect.id, observation.observation_digest
+            ));
+        }
+        f.grant.schema_version = 3;
+        f.grant.expected_session_version = source.version;
+        f.grant.expected_project_version = f.context.source_project.version;
+        f.grant.expected_reason_code.clear();
+        f.grant.subject = Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted {
+            budget: Box::new(budget),
+        });
+        f.grant.recovery_epoch = None;
+        f.grant.expires_at_unix_ms = now + 120_000;
+        rebind_budget_evidence(f);
+    }
+
+    fn rebind_budget_evidence(f: &mut Fixture) {
+        f.grant.evidence_fingerprint = adaptive_leadership_evidence_fingerprint(
+            &f.context.tool_catalog,
+            &f.context.evidence_refs,
+        )
+        .unwrap();
+        f.grant.review_id = adaptive_leadership_review_id(
+            f.grant.session_id,
+            f.grant.expected_session_version,
+            &f.grant.evidence_fingerprint,
+        )
+        .unwrap();
+    }
+
+    fn observe_budget_inspection(
+        f: &Fixture,
+        mut source: crate::AdaptiveSessionV1,
+        now: u64,
+    ) -> crate::AdaptiveSessionV1 {
+        let effect = AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: DIGEST.into(),
+        };
+        let tool = sentinel_common::WorkbenchTool::InspectFile {
+            path: "src/lib.rs".into(),
+            max_bytes: 128,
+        };
+        let tool_digest = crate::adaptive_tool_digest(&tool).unwrap();
+        let commands = [
+            AdaptiveTransitionV1::ClaimModel {
+                effect: effect.clone(),
+                previous_observation_digest: source
+                    .last_observation
+                    .as_ref()
+                    .map(|o| o.observation_digest.clone()),
+            },
+            AdaptiveTransitionV1::ResolveModel {
+                effect,
+                result_digest: DIGEST.into(),
+                decision: AdaptiveModelDecisionV1::Tool {
+                    tool,
+                    tool_digest: tool_digest.clone(),
+                },
+            },
+        ];
+        for (offset, command) in commands.iter().enumerate() {
+            source = f
+                .store
+                .advance_adaptive_session(
+                    source.grant.session_id,
+                    source.version,
+                    Uuid::new_v4(),
+                    command,
+                    &f.grant.assignee_authority,
+                    now + offset as u64,
+                )
+                .unwrap()
+                .1;
+        }
+        let effect = AdaptiveEffectV1 {
+            id: Uuid::new_v4(),
+            request_digest: DIGEST.into(),
+        };
+        source = f
+            .store
+            .advance_adaptive_session(
+                source.grant.session_id,
+                source.version,
+                Uuid::new_v4(),
+                &AdaptiveTransitionV1::ClaimTool {
+                    effect: effect.clone(),
+                    tool_digest,
+                },
+                &f.grant.assignee_authority,
+                now + 2,
+            )
+            .unwrap()
+            .1;
+        f.store
+            .advance_adaptive_session(
+                source.grant.session_id,
+                source.version,
+                Uuid::new_v4(),
+                &AdaptiveTransitionV1::ObserveTool {
+                    observation: crate::AdaptiveObservationRefV1 {
+                        effect,
+                        observation_digest: DIGEST.into(),
+                    },
+                },
+                &f.grant.assignee_authority,
+                now + 3,
+            )
+            .unwrap()
+            .1
+    }
+
+    fn budget_fixture(root_calls: u16) -> Fixture {
+        budget_fixture_with_window(root_calls, 120_000)
+    }
+
+    fn budget_fixture_with_window(root_calls: u16, window: u64) -> Fixture {
+        let mut f = continuation_fixture_with_calls(false, false, root_calls);
+        let call = dispatch_continuation(&f);
+        let result = continue_result_with_window(&call, window);
+        f.store
+            .complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 2)
+            .unwrap();
+        let source = observe_budget_inspection(&f, session(&f), CONTINUATION_AT + 3);
+        assert!(matches!(source.cursor, AdaptiveCursorV1::ReadyForModel));
+        assert_eq!(source.model_calls, 2);
+        budget_context(&mut f, CONTINUATION_AT + 7, "normal-budget-review");
+        f
+    }
+
+    fn dispatch_budget(f: &Fixture, now: u64) -> AdaptiveLeadershipReviewCallV1 {
+        let call = f
+            .store
+            .authorize_adaptive_leadership_review_call(
+                &f.leader,
+                Uuid::new_v4(),
+                &format!("normal-review-{}", f.grant.review_id),
+                &f.grant,
+                &f.context,
+                now,
+            )
+            .unwrap();
+        f.store
+            .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1)
+            .unwrap()
+    }
+
+    fn budget_result(
+        call: &AdaptiveLeadershipReviewCallV1,
+        calls: u16,
+        issued: u64,
+    ) -> CompleteAdaptiveLeadershipReviewCallV1 {
+        let mut result = completion(call, false);
+        result.decision = AdaptiveLeadershipReviewDecisionV1 {
+            schema_version: 3,
+            decision: AdaptiveLeadershipReviewDecisionKindV1::Continue {
+                additional_model_calls: calls,
+                window_ms: 120_000,
+                rationale: "Use the verified unspent original budget".into(),
+                evidence_refs: vec![call.context.evidence_refs[0].clone()],
+            },
+        };
+        let audit = adaptive_leadership_continuation_audit_id(
+            call.grant.review_id,
+            &result.request_digest,
+            &result.model_response_digest,
+            &result.decision,
+        )
+        .unwrap();
+        let allowance = call
+            .continuation_allowance(issued, issued + 120_000, calls)
+            .unwrap();
+        let Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) =
+            &call.grant.subject
+        else {
+            panic!("budget subject")
+        };
+        result.resolution_event_id = Some(audit);
+        result.continuation = Some(crate::AdaptiveContinuationAuthorizationV1 {
+            schema_version: 1,
+            operation_id: call.operation_id,
+            review_id: call.grant.review_id,
+            resolution_event_id: audit,
+            session_id: call.grant.session_id,
+            source_session_version: call.grant.expected_session_version,
+            source: crate::AdaptiveContinuationSourceV1::BudgetWindowExhausted {
+                active_allowance_digest: budget.active_allowance_digest.clone(),
+                continuation_history_digest: budget.continuation_history_digest.clone(),
+            },
+            abandoned_model_effect: None,
+            provider_allowance_id: allowance.allowance_id.clone(),
+            provider_authority_digest: adaptive_leadership_continuation_provider_authority_digest(
+                &allowance,
+                &call.grant.assignee_authority,
+            )
+            .unwrap(),
+            issued_at_ms: issued,
+            deadline_ms: issued + 120_000,
+            additional_model_calls: calls,
+            local_adoption: None,
+        });
+        result
+    }
+
+    #[test]
+    fn schema3_current_single_call_window_can_continue_with_multiple_verified_root_calls() {
+        let f = budget_fixture(4);
+        assert_eq!(
+            f.context
+                .source_project
+                .subscription_call
+                .as_ref()
+                .unwrap()
+                .grant
+                .max_calls,
+            1
+        );
+        assert!(CONTINUATION_AT + 7 < f.context.source_session.active_deadline_ms());
+        let call = dispatch_budget(&f, CONTINUATION_AT + 7);
+        let result = budget_result(&call, 2, CONTINUATION_AT + 9);
+        // An interrupted pre-domain audit retains its fixed proposal across reopen.
+        call.validate_completion_proposal(&result).unwrap();
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        let completed = reopened
+            .complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 10)
+            .unwrap();
+        let continued = reopened
+            .adaptive_session(f.grant.session_id, &f.grant.assignee_authority)
+            .unwrap()
+            .unwrap();
+        assert_eq!(continued.grant, f.context.source_session.grant);
+        assert_eq!(continued.model_calls, 2);
+        assert_eq!(continued.tool_calls, f.context.source_session.tool_calls);
+        assert_eq!(
+            continued.last_observation,
+            f.context.source_session.last_observation
+        );
+        assert_eq!(continued.active_model_ceiling(), 4);
+        assert!(continued.requires_fresh_observation());
+        let project = reopened
+            .company_project(&f.leader.tenant_id, &f.grant.project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            project.subscription_call.as_ref().unwrap().grant.max_calls,
+            2
+        );
+        let before = rows(&reopened);
+        assert_eq!(
+            reopened
+                .complete_adaptive_leadership_review_call(
+                    &f.leader,
+                    &result,
+                    CONTINUATION_AT + 900_000
+                )
+                .unwrap(),
+            completed
+        );
+        assert_eq!(rows(&reopened), before);
+        let advanced = observe_budget_inspection(&f, continued, CONTINUATION_AT + 12);
+        assert!(
+            advanced.version
+                > completed
+                    .continuation
+                    .as_ref()
+                    .unwrap()
+                    .source_session_version
+                    + 1
+        );
+        let before = rows(&reopened);
+        assert_eq!(
+            reopened
+                .complete_adaptive_leadership_review_call(
+                    &f.leader,
+                    &result,
+                    CONTINUATION_AT + 900_000
+                )
+                .unwrap(),
+            completed
+        );
+        assert_eq!(rows(&reopened), before);
+        assert_eq!(
+            reopened
+                .adaptive_session(f.grant.session_id, &f.grant.assignee_authority)
+                .unwrap(),
+            Some(advanced)
+        );
+        {
+            let authorization = completed.continuation.as_ref().unwrap();
+            let allowance = completed
+                .continuation_allowance(
+                    authorization.issued_at_ms,
+                    authorization.deadline_ms,
+                    authorization.additional_model_calls,
+                )
+                .unwrap();
+            let mut connection = reopened.connection.lock().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .unwrap();
+            let (replayed, response) =
+                crate::store::adaptive::continue_adaptive_session_in_transaction(
+                    &transaction,
+                    authorization,
+                    &completed,
+                    &allowance,
+                    &f.grant.assignee_authority,
+                    CONTINUATION_AT + 900_000,
+                )
+                .unwrap();
+            assert!(replayed);
+            assert_eq!(response.version, authorization.source_session_version + 1);
+            assert_eq!(response.model_calls, 2);
+        }
+        assert_eq!(rows(&reopened), before);
+        let old = f
+            .store
+            .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+            .unwrap();
+        assert_eq!(
+            old.iter()
+                .filter(|call| call.grant.schema_version == 2)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn schema3_normal_review_budget_is_separate_from_three_old_schema2_reviews() {
+        let mut f = continuation_fixture(false, false);
+        let mut now = CONTINUATION_AT;
+        for index in 0..2 {
+            f.context
+                .evidence_refs
+                .push(format!("old-review-expiry-{index}"));
+            rebind_budget_evidence(&mut f);
+            f.grant.expires_at_unix_ms = now + 120_000;
+            let call = f
+                .store
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    &format!("old-review-{index}"),
+                    &f.grant,
+                    &f.context,
+                    now,
+                )
+                .unwrap();
+            now = call.grant.expires_at_unix_ms;
+            f.store
+                .expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id, 1, now)
+                .unwrap();
+            now += 1;
+        }
+        f.context
+            .evidence_refs
+            .push("old-review-third-continue".into());
+        rebind_budget_evidence(&mut f);
+        f.grant.expires_at_unix_ms = now + 120_000;
+        let call = f
+            .store
+            .authorize_adaptive_leadership_review_call(
+                &f.leader,
+                Uuid::new_v4(),
+                "old-review-third",
+                &f.grant,
+                &f.context,
+                now,
+            )
+            .unwrap();
+        let call = f
+            .store
+            .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1)
+            .unwrap();
+        let result = continue_result_with_window_at(&call, 120_000, now + 2);
+        f.store
+            .complete_adaptive_leadership_review_call(&f.leader, &result, now + 2)
+            .unwrap();
+        observe_budget_inspection(&f, session(&f), now + 3);
+        now += 7;
+        budget_context(&mut f, now, "normal-after-three-old-reviews");
+        let call = dispatch_budget(&f, now);
+        let result = budget_result(&call, 2, now + 2);
+        f.store
+            .complete_adaptive_leadership_review_call(&f.leader, &result, now + 2)
+            .unwrap();
+        let calls = f
+            .store
+            .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+            .unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.grant.schema_version == 2)
+                .count(),
+            3
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.grant.schema_version == 3)
+                .count(),
+            1
+        );
+        assert_eq!(session(&f).active_model_ceiling(), 4);
+    }
+
+    #[test]
+    fn schema3_forged_root_history_and_observation_sources_fail_before_reservation() {
+        for changed in 0..3 {
+            let mut f = budget_fixture(4);
+            let before = rows(&f.store);
+            match changed {
+                0 => {
+                    let Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) =
+                        &mut f.grant.subject
+                    else {
+                        panic!("budget")
+                    };
+                    budget.root_allowance.created_by = "forged-leader".into();
+                }
+                1 => {
+                    let Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) =
+                        &mut f.grant.subject
+                    else {
+                        panic!("budget")
+                    };
+                    let old = format!(
+                        "adaptive-budget-history:{}",
+                        budget.continuation_history_digest
+                    );
+                    budget.continuation_history_digest = "b".repeat(64);
+                    for reference in &mut f.context.evidence_refs {
+                        if *reference == old {
+                            *reference = format!(
+                                "adaptive-budget-history:{}",
+                                budget.continuation_history_digest
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    let observation = f.context.source_session.last_observation.as_mut().unwrap();
+                    let old = format!(
+                        "workbench-observation:{}:{}",
+                        observation.effect.id, observation.observation_digest
+                    );
+                    observation.observation_digest = "c".repeat(64);
+                    for reference in &mut f.context.evidence_refs {
+                        if *reference == old {
+                            *reference = format!(
+                                "workbench-observation:{}:{}",
+                                observation.effect.id, observation.observation_digest
+                            );
+                        }
+                    }
+                }
+            }
+            rebind_budget_evidence(&mut f);
+            assert!(f
+                .store
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    "forged-budget",
+                    &f.grant,
+                    &f.context,
+                    CONTINUATION_AT + 7
+                )
+                .is_err());
+            assert_eq!(rows(&f.store), before);
+        }
+    }
+
+    #[test]
+    fn schema3_defer_budget_is_an_immutable_model_refusal_without_new_employee_authority() {
+        let f = budget_fixture(4);
+        let call = dispatch_budget(&f, CONTINUATION_AT + 7);
+        let mut result = completion(&call, false);
+        result.decision = AdaptiveLeadershipReviewDecisionV1 {
+            schema_version: 3,
+            decision: AdaptiveLeadershipReviewDecisionKindV1::DeferBudget {
+                rationale: "Do not spend more budget on this head".into(),
+                evidence_refs: vec![call.context.evidence_refs[0].clone()],
+            },
+        };
+        let receipt = f
+            .store
+            .complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 9)
+            .unwrap();
+        assert_eq!(session(&f), f.context.source_session);
+        assert_eq!(
+            f.store
+                .company_project(&f.leader.tenant_id, &f.grant.project_id)
+                .unwrap(),
+            Some(f.context.source_project.clone())
+        );
+        assert!(receipt.continuation.is_none());
+        assert!(receipt.resolution_event_id.is_none());
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        let before = rows(&reopened);
+        assert_eq!(
+            reopened
+                .complete_adaptive_leadership_review_call(
+                    &f.leader,
+                    &result,
+                    CONTINUATION_AT + 900_000
+                )
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(rows(&reopened), before);
+        result.model_response_digest = "d".repeat(64);
+        assert!(reopened
+            .complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 10)
+            .is_err());
+        assert_eq!(rows(&reopened), before);
+    }
+
+    #[test]
+    fn schema3_short_prior_window_does_not_cap_new_normal_duration() {
+        let f = budget_fixture_with_window(4, 1_000);
+        assert_eq!(
+            f.context
+                .source_project
+                .subscription_call
+                .as_ref()
+                .unwrap()
+                .grant
+                .max_duration_ms,
+            1_000
+        );
+        let call = dispatch_budget(&f, CONTINUATION_AT + 7);
+        let result = budget_result(&call, 2, CONTINUATION_AT + 9);
+        let allowance = call
+            .continuation_allowance(CONTINUATION_AT + 9, CONTINUATION_AT + 120_009, 2)
+            .unwrap();
+        assert_eq!(allowance.grant.max_duration_ms, 120_000);
+        f.store
+            .complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 9)
+            .unwrap();
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        let project = reopened
+            .company_project(&f.leader.tenant_id, &f.grant.project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(project.subscription_call, Some(allowance));
+        assert_eq!(
+            reopened
+                .adaptive_session(f.grant.session_id, &f.grant.assignee_authority)
+                .unwrap()
+                .unwrap()
+                .model_calls,
+            2
+        );
+    }
+
+    #[test]
+    fn schema3_deadline_only_exhaustion_can_continue_without_resetting_unused_calls() {
+        let mut f = budget_fixture(4);
+        let call = dispatch_budget(&f, CONTINUATION_AT + 7);
+        let result = budget_result(&call, 2, CONTINUATION_AT + 9);
+        f.store
+            .complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 9)
+            .unwrap();
+        let now = result.continuation.as_ref().unwrap().deadline_ms;
+        budget_context(&mut f, now, "normal-deadline-only");
+        let Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) =
+            &f.grant.subject
+        else {
+            panic!("budget")
+        };
+        assert!(!budget.model_calls_exhausted);
+        assert!(budget.deadline_expired);
+        let source = session(&f);
+        let call = dispatch_budget(&f, now);
+        let result = budget_result(&call, 2, now + 2);
+        f.store
+            .complete_adaptive_leadership_review_call(&f.leader, &result, now + 2)
+            .unwrap();
+        let continued = session(&f);
+        assert_eq!(continued.model_calls, source.model_calls);
+        assert_eq!(continued.tool_calls, source.tool_calls);
+        assert_eq!(continued.grant, source.grant);
+        assert_eq!(continued.active_model_ceiling(), 4);
+        assert_eq!(
+            continued
+                .continuation
+                .as_ref()
+                .unwrap()
+                .authorizations
+                .len(),
+            3
+        );
+        assert!(continued.requires_fresh_observation());
+    }
+
+    #[test]
+    fn schema3_retired_normal_reviews_count_toward_limit_and_system_receipt_replays() {
+        let mut f = budget_fixture(4);
+        let mut now = CONTINUATION_AT + 7;
+        for index in 0..ADAPTIVE_LEADERSHIP_MAX_REVIEWS {
+            budget_context(&mut f, now, &format!("normal-retired-{index}"));
+            let call = f
+                .store
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    &format!("normal-retired-{index}"),
+                    &f.grant,
+                    &f.context,
+                    now,
+                )
+                .unwrap();
+            now = call.grant.expires_at_unix_ms;
+            let retired = f
+                .store
+                .expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id, 1, now)
+                .unwrap();
+            assert_eq!(retired.version, 4);
+            assert!(retired.decision.is_none());
+            now += 1;
+        }
+        budget_context(&mut f, now, "normal-review-limit");
+        let source = session(&f);
+        let project = f.context.source_project.clone();
+        assert!(f
+            .store
+            .authorize_adaptive_leadership_review_call(
+                &f.leader,
+                Uuid::new_v4(),
+                "normal-over-limit",
+                &f.grant,
+                &f.context,
+                now
+            )
+            .is_err());
+        f.store
+            .record_adaptive_budget_window_limit(&f.leader, &f.grant, &f.context, now)
+            .unwrap();
+        assert_eq!(session(&f), source);
+        assert_eq!(
+            f.store
+                .company_project(&f.leader.tenant_id, &f.grant.project_id)
+                .unwrap(),
+            Some(project)
+        );
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert!(reopened
+            .adaptive_budget_window_limit_recorded(
+                &f.leader.tenant_id,
+                f.grant.session_id,
+                source.version
+            )
+            .unwrap());
+        let before = rows(&reopened);
+        reopened
+            .record_adaptive_budget_window_limit(&f.leader, &f.grant, &f.context, now + 1)
+            .unwrap();
+        assert_eq!(rows(&reopened), before);
+        reopened
+            .record_adaptive_budget_window_limit(&f.leader, &f.grant, &f.context, now + 900_000)
+            .unwrap();
+        assert_eq!(rows(&reopened), before);
+        let calls = reopened
+            .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+            .unwrap();
+        assert_eq!(
+            calls.iter().filter(|c| c.grant.schema_version == 3).count(),
+            3
+        );
+        assert_eq!(
+            calls.iter().filter(|c| c.grant.schema_version == 2).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn schema3_zero_root_remaining_records_limit_without_review_or_model_decision() {
+        let f = budget_fixture(2);
+        let source = session(&f);
+        assert_eq!(source.model_calls, source.grant.max_model_calls);
+        let calls = f
+            .store
+            .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+            .unwrap();
+        f.store
+            .record_adaptive_budget_window_limit(
+                &f.leader,
+                &f.grant,
+                &f.context,
+                CONTINUATION_AT + 7,
+            )
+            .unwrap();
+        assert_eq!(session(&f), source);
+        assert_eq!(
+            f.store
+                .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+                .unwrap(),
+            calls
+        );
+        assert!(f
+            .store
+            .authorize_adaptive_leadership_review_call(
+                &f.leader,
+                Uuid::new_v4(),
+                "no-root-budget",
+                &f.grant,
+                &f.context,
+                CONTINUATION_AT + 8
+            )
+            .is_err());
+        let connection = f.store.connection.lock().unwrap();
+        let receipt: AdaptiveBudgetWindowLimitReceiptV1 = get_entity(
+            &connection,
+            &f.leader.tenant_id,
+            BUDGET_LIMIT_KIND,
+            &budget_limit_id(f.grant.session_id, source.version).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            receipt.causes,
+            vec![AdaptiveBudgetWindowLimitCauseV1::RootCallsExhausted]
+        );
+    }
+
+    #[test]
+    fn schema3_three_windows_record_limit_without_resetting_or_adding_a_review() {
+        let mut f = budget_fixture(8);
+        let mut now = CONTINUATION_AT + 7;
+        for index in 0..2 {
+            let call = dispatch_budget(&f, now);
+            let result = budget_result(&call, 1, now + 2);
+            f.store
+                .complete_adaptive_leadership_review_call(&f.leader, &result, now + 2)
+                .unwrap();
+            observe_budget_inspection(&f, session(&f), now + 3);
+            now += 7;
+            budget_context(&mut f, now, &format!("normal-window-{index}"));
+        }
+        let source = session(&f);
+        assert_eq!(
+            source.continuation.as_ref().unwrap().authorizations.len(),
+            3
+        );
+        assert!(source.model_calls < source.grant.max_model_calls);
+        let calls = f
+            .store
+            .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+            .unwrap();
+        f.store
+            .record_adaptive_budget_window_limit(&f.leader, &f.grant, &f.context, now)
+            .unwrap();
+        assert_eq!(session(&f), source);
+        assert_eq!(
+            f.store
+                .adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id)
+                .unwrap(),
+            calls
+        );
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert!(reopened
+            .adaptive_budget_window_limit_recorded(
+                &f.leader.tenant_id,
+                f.grant.session_id,
+                source.version
+            )
+            .unwrap());
+        assert!(f
+            .store
+            .authorize_adaptive_leadership_review_call(
+                &f.leader,
+                Uuid::new_v4(),
+                "fourth-window",
+                &f.grant,
+                &f.context,
+                now + 1
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn schema3_limit_requires_actual_limit_exact_source_and_exact_leader() {
+        let mut f = budget_fixture(4);
+        let before = rows(&f.store);
+        assert!(f
+            .store
+            .record_adaptive_budget_window_limit(
+                &f.leader,
+                &f.grant,
+                &f.context,
+                CONTINUATION_AT + 7
+            )
+            .is_err());
+        let mut foreign = f.leader.clone();
+        foreign.authority_generation += 1;
+        assert!(f
+            .store
+            .record_adaptive_budget_window_limit(
+                &foreign,
+                &f.grant,
+                &f.context,
+                CONTINUATION_AT + 7
+            )
+            .is_err());
+        f.context.source_session.model_calls = f.context.source_session.grant.max_model_calls;
+        assert!(f
+            .store
+            .record_adaptive_budget_window_limit(
+                &f.leader,
+                &f.grant,
+                &f.context,
+                CONTINUATION_AT + 7
+            )
+            .is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+
+    #[test]
+    fn schema3_claim_and_commit_recheck_current_project_before_effects() {
+        for after_dispatch in [false, true] {
+            let f = budget_fixture(4);
+            let call = f
+                .store
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    "normal-stale-project",
+                    &f.grant,
+                    &f.context,
+                    CONTINUATION_AT + 7,
+                )
+                .unwrap();
+            let call = if after_dispatch {
+                f.store
+                    .claim_adaptive_leadership_review_call(
+                        &f.leader,
+                        &claim(&call),
+                        CONTINUATION_AT + 8,
+                    )
+                    .unwrap()
+            } else {
+                call
+            };
+            change_project(&f, CONTINUATION_AT + 9);
+            let before = rows(&f.store);
+            if after_dispatch {
+                let result = budget_result(&call, 2, CONTINUATION_AT + 10);
+                assert!(f
+                    .store
+                    .complete_adaptive_leadership_review_call(
+                        &f.leader,
+                        &result,
+                        CONTINUATION_AT + 10
+                    )
+                    .is_err());
+            } else {
+                assert!(f
+                    .store
+                    .claim_adaptive_leadership_review_call(
+                        &f.leader,
+                        &claim(&call),
+                        CONTINUATION_AT + 10
+                    )
+                    .is_err());
+            }
+            assert_eq!(rows(&f.store), before);
+            assert_eq!(session(&f), f.context.source_session);
+        }
+    }
+
+    #[test]
+    fn schema3_expired_uncommitted_continuation_retires_exact_proposal_across_reopen() {
+        let f = budget_fixture(4);
+        let call = dispatch_budget(&f, CONTINUATION_AT + 7);
+        let result = budget_result(&call, 2, CONTINUATION_AT + 9);
+        let deadline = result.continuation.as_ref().unwrap().deadline_ms;
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert!(reopened
+            .complete_adaptive_leadership_review_call(&f.leader, &result, deadline)
+            .is_err());
+        let retired = reopened
+            .retire_expired_adaptive_continuation_call(&f.leader, &result, deadline)
+            .unwrap();
+        assert_eq!(retired.version, 4);
+        assert!(retired.decision.is_none());
+        assert!(retired.continuation.is_none());
+        assert_eq!(
+            reopened
+                .adaptive_session(f.grant.session_id, &f.grant.assignee_authority)
+                .unwrap(),
+            Some(f.context.source_session.clone())
+        );
+        assert_eq!(
+            reopened
+                .company_project(&f.leader.tenant_id, &f.grant.project_id)
+                .unwrap(),
+            Some(f.context.source_project.clone())
+        );
+        let before = rows(&reopened);
+        assert_eq!(
+            reopened
+                .retire_expired_adaptive_continuation_call(&f.leader, &result, deadline + 1)
+                .unwrap(),
+            retired
+        );
+        assert_eq!(rows(&reopened), before);
+        let mut changed = result.clone();
+        changed.model_response_digest = "e".repeat(64);
+        assert!(reopened
+            .retire_expired_adaptive_continuation_call(&f.leader, &changed, deadline + 2)
+            .is_err());
+        assert_eq!(rows(&reopened), before);
+    }
+
+    #[test]
+    fn schema3_full_duration_allowance_requires_review_and_abandonment_provenance_after_reopen() {
+        for (abandoned, corrupt_record) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let f = budget_fixture(4);
+            let call = dispatch_budget(&f, CONTINUATION_AT + 7);
+            let result = budget_result(&call, 2, CONTINUATION_AT + 9);
+            f.store
+                .complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 9)
+                .unwrap();
+            let project = f
+                .store
+                .company_project(&f.leader.tenant_id, &f.grant.project_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                project
+                    .subscription_call
+                    .as_ref()
+                    .unwrap()
+                    .grant
+                    .max_duration_ms,
+                120_000
+            );
+            let (kind, id) = if abandoned {
+                (
+                    ABANDONED_KIND,
+                    call.context
+                        .source_project
+                        .subscription_call
+                        .as_ref()
+                        .unwrap()
+                        .allowance_id
+                        .clone(),
+                )
+            } else {
+                (KIND, call.grant.review_id.to_string())
+            };
+            {
+                let connection = f.store.connection.lock().unwrap();
+                let sql = if corrupt_record {
+                    "UPDATE company_entities SET payload_digest=?4 WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3"
+                } else {
+                    "DELETE FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3 AND ?4 IS NOT NULL"
+                };
+                assert_eq!(
+                    connection
+                        .execute(sql, params![f.leader.tenant_id.0, kind, id, "f".repeat(64)])
+                        .unwrap(),
+                    1
+                );
+            }
+            let reopened = WorkflowStore::open(&f.path).unwrap();
+            let before = rows(&reopened);
+            assert!(reopened
+                .company_project(&f.leader.tenant_id, &f.grant.project_id)
+                .is_err());
+            assert_eq!(rows(&reopened), before);
+            // Original attribution remains available; corruption cannot mint a new allowance.
+            let original = reopened
+                .historical_adaptive_provider_project(
+                    &f.context.source_session.grant,
+                    f.context.source_session.grant.created_at_ms,
+                )
+                .unwrap()
+                .unwrap();
+            let Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) =
+                &f.grant.subject
+            else {
+                panic!("budget")
+            };
+            assert_eq!(
+                original.subscription_call.as_ref(),
+                Some(&budget.root_allowance)
+            );
+            assert_eq!(rows(&reopened), before);
+        }
+    }
+
+    #[test]
+    fn schema3_full_duration_journal_still_requires_receipt_when_issuance_event_is_missing() {
+        let f = budget_fixture(4);
+        let call = dispatch_budget(&f, CONTINUATION_AT + 7);
+        let result = budget_result(&call, 2, CONTINUATION_AT + 9);
+        f.store
+            .complete_adaptive_leadership_review_call(&f.leader, &result, CONTINUATION_AT + 9)
+            .unwrap();
+        let project = f
+            .store
+            .company_project(&f.leader.tenant_id, &f.grant.project_id)
+            .unwrap()
+            .unwrap();
+        {
+            let connection = f.store.connection.lock().unwrap();
+            assert_eq!(connection.execute(
+                "DELETE FROM company_events WHERE tenant_id=?1 AND event_type='adaptive_leadership_continuation_authorized' AND operation_id=?2",
+                params![f.leader.tenant_id.0, call.operation_id.to_string()],
+            ).unwrap(), 1);
+            assert_eq!(connection.execute("DELETE FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3",
+                params![f.leader.tenant_id.0, KIND, call.grant.review_id.to_string()]).unwrap(), 1);
+        }
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        let before = rows(&reopened);
+        {
+            let connection = reopened.connection.lock().unwrap();
+            assert!(crate::store::adaptive::allowance_is_governed_in_journal(
+                &connection,
+                &project.tenant_id,
+                &project.project_id,
+                project.subscription_call.as_ref().unwrap()
+            )
+            .unwrap());
+            assert!(subscription::validate_persisted(&connection, &project).is_err());
+        }
+        assert!(reopened
+            .company_project(&f.leader.tenant_id, &f.grant.project_id)
+            .is_err());
+        assert_eq!(rows(&reopened), before);
+    }
+
+    #[test]
+    fn ordinary_allowance_reads_and_historical_attribution_survive_65_never_claimed_rollovers() {
+        let f = fixture();
+        resolve(&f, Uuid::new_v4(), 21);
+        let mut project = f.context.source_project.clone();
+        let mut roots = Vec::new();
+        let mut original_project = None;
+        for index in 0..66u64 {
+            let now = 600_001 + index * 300_001;
+            let mut root = f.context.source_session.grant.clone();
+            root.session_id = Uuid::new_v4();
+            root.created_at_ms = now;
+            root.deadline_ms = now + 300_000;
+            let grant = crate::SubscriptionCallGrantV1 {
+                schema_version: 1,
+                work_item_id: f.grant.work_item_id.clone(),
+                assignment_id: f.grant.assignment_id.clone(),
+                assignment_version: f.grant.assignee_authority.assignment_version,
+                agent_id: f.grant.assignee_authority.agent_id,
+                provider: f.grant.provider.clone(),
+                model: f.grant.model.clone(),
+                catalog_digest: f.grant.catalog_digest.clone(),
+                max_calls: root.max_model_calls,
+                max_concurrent: 1,
+                max_duration_ms: 120_000,
+                token_policy: f.grant.token_policy,
+                expires_at_unix_ms: root.deadline_ms,
+            };
+            let response = f
+                .store
+                .apply_company_command(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    &CompanyWorkflowCommandV1::GrantSubscriptionCall {
+                        project_id: project.project_id.clone(),
+                        expected_version: project.version,
+                        grant,
+                    },
+                    now,
+                )
+                .unwrap()
+                .response;
+            let CompanyWorkflowResponseV1::Project(updated) = response else {
+                panic!("project")
+            };
+            project = *updated;
+            let allowance = project.subscription_call.as_ref().unwrap();
+            assert!(allowance.dispatch.is_none());
+            root.provider_allowance_id = allowance.allowance_id.clone();
+            root.provider_authority_digest =
+                adaptive_leadership_continuation_provider_authority_digest(
+                    allowance,
+                    &f.grant.assignee_authority,
+                )
+                .unwrap();
+            let (_, initial) = f
+                .store
+                .begin_adaptive_session(&root, &f.grant.assignee_authority, now)
+                .unwrap();
+            assert_eq!(
+                (initial.version, initial.model_calls, initial.tool_calls),
+                (1, 0, 0)
+            );
+            assert!(initial.continuation.is_none());
+            if index == 0 {
+                original_project = Some(project.clone());
+            }
+            roots.push(root);
+        }
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        let before = rows(&reopened);
+        {
+            let connection = reopened.connection.lock().unwrap();
+            for root in &roots[..65] {
+                let (archived, _) = crate::store::adaptive::load(&connection, root.session_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(archived.grant, *root);
+                assert_eq!((archived.model_calls, archived.tool_calls), (0, 0));
+                assert!(matches!(archived.cursor, AdaptiveCursorV1::Cancelled));
+                assert!(archived.continuation.is_none());
+            }
+            assert!(!crate::store::adaptive::allowance_is_governed_in_journal(
+                &connection,
+                &project.tenant_id,
+                &project.project_id,
+                project.subscription_call.as_ref().unwrap(),
+            )
+            .unwrap());
+            subscription::validate_persisted(&connection, &project).unwrap();
+        }
+        assert_eq!(
+            reopened
+                .company_project(&f.leader.tenant_id, &f.grant.project_id)
+                .unwrap(),
+            Some(project)
+        );
+        assert_eq!(
+            reopened
+                .historical_adaptive_provider_project(&roots[0], roots[0].created_at_ms,)
+                .unwrap(),
+            original_project
+        );
+        assert_eq!(rows(&reopened), before);
+    }
 
     fn continuation_fixture(unknown: bool, resolved: bool) -> Fixture {
         continuation_fixture_with_calls(unknown, resolved, 4)
@@ -2340,6 +3984,13 @@ mod tests {
                 };
                 (source, None)
             }
+            Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) => (
+                crate::adaptive::AdaptiveContinuationSourceV1::BudgetWindowExhausted {
+                    active_allowance_digest: budget.active_allowance_digest.clone(),
+                    continuation_history_digest: budget.continuation_history_digest.clone(),
+                },
+                None,
+            ),
             None => panic!("continuation subject"),
         };
         result.resolution_event_id = Some(audit);
@@ -2633,10 +4284,13 @@ mod tests {
             )
             .is_err());
             assert_eq!(candidate, before);
-            assert!(
-                subscription::grant_governed_continuation(&mut candidate, &call, &allowance)
-                    .is_err()
-            );
+            assert!(subscription::grant_governed_continuation(
+                &f.store.connection.lock().unwrap(),
+                &mut candidate,
+                &call,
+                &allowance
+            )
+            .is_err());
             assert_eq!(candidate, before);
             candidate.subscription_call = Some(allowance.clone());
             let before_claim = candidate.clone();
@@ -4494,7 +6148,11 @@ mod tests {
                 .is_err());
             assert_eq!(rows(&f.store), before);
         }
-        for schema in [0, 1, 3, u16::MAX] {
+        let mut normal_decision = result.decision.clone();
+        normal_decision.schema_version = 3;
+        normal_decision.validate(&f.context.evidence_refs).unwrap();
+        assert!(normal_decision.validate_subject(&f.grant).is_err());
+        for schema in [0, 1, u16::MAX] {
             let mut decision = result.decision.clone();
             decision.schema_version = schema;
             assert!(decision.validate(&f.context.evidence_refs).is_err());

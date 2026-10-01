@@ -120,11 +120,13 @@ pub(super) fn grant(
 }
 
 pub(super) fn grant_governed_continuation(
+    connection: &Connection,
     project: &mut ProjectV1,
     receipt: &crate::AdaptiveLeadershipReviewCallV1,
     allowance: &SubscriptionCallAllowanceV1,
 ) -> Result<(), WorkflowError> {
     adaptive_leadership_review::validate_governed_allowance_receipt(receipt, allowance)?;
+    WorkflowStore::require_adaptive_budget_review_source(connection, receipt)?;
     let mut expected = receipt.context.source_project.clone();
     expected.subscription_call = None;
     if *project != expected || project.subscription_call.is_some() {
@@ -435,6 +437,31 @@ pub(super) fn validate_persisted(
     connection: &Connection,
     project: &ProjectV1,
 ) -> Result<(), WorkflowError> {
+    let mut statement = connection.prepare(
+        "SELECT operation_id FROM company_events WHERE tenant_id=?1 AND project_id=?2
+         AND event_type='adaptive_leadership_continuation_authorized' AND created_at_ms<=?3
+         ORDER BY sequence LIMIT 4097",
+    )?;
+    let operations = statement
+        .query_map(
+            params![
+                project.tenant_id.0,
+                project.project_id.0,
+                sql_u64(project.updated_at_unix_ms)?
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if operations.len() > 4096 {
+        return Err(corrupt());
+    }
+    let issued = operations
+        .iter()
+        .map(|operation| {
+            let operation = Uuid::parse_str(operation).map_err(|_| corrupt())?;
+            stable_domain_id("subscription", &project.tenant_id, operation)
+        })
+        .collect::<Result<BTreeSet<_>, WorkflowError>>()?;
     for allowance in project
         .subscription_call
         .iter()
@@ -452,7 +479,15 @@ pub(super) fn validate_persisted(
                 .filter_map(|record| record.previous_subscription_call.as_ref()),
         )
     {
-        if allowance.grant.max_duration_ms != 120_000 {
+        if issued.contains(&allowance.allowance_id)
+            || crate::store::adaptive::allowance_is_governed_in_journal(
+                connection,
+                &project.tenant_id,
+                &project.project_id,
+                allowance,
+            )?
+            || allowance.grant.max_duration_ms != 120_000
+        {
             adaptive_leadership_review::validate_persisted_governed_allowance(
                 connection, project, allowance,
             )?;

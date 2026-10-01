@@ -2632,6 +2632,37 @@ pub enum WorkbenchDispatchCommand {
 static WORKBENCH_DISPATCH: OnceLock<RwLock<Option<mpsc::SyncSender<WorkbenchDispatchCommand>>>> =
     OnceLock::new();
 static WORKBENCH_SERVICE: OnceLock<Mutex<Option<WorkbenchService>>> = OnceLock::new();
+static WORKBENCH_STATUS_STORE: OnceLock<Arc<WorkbenchInvocationStore>> = OnceLock::new();
+
+#[cfg(test)]
+type PrivateObservationTestStore = (Arc<WorkbenchInvocationStore>, WorkbenchProfile, String);
+
+#[cfg(test)]
+std::thread_local! {
+    static PRIVATE_OBSERVATION_TEST_STORE: std::cell::RefCell<Option<PrivateObservationTestStore>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_private_observation_store_for_test<R>(
+    store: Arc<WorkbenchInvocationStore>,
+    profile: WorkbenchProfile,
+    profile_digest: String,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<PrivateObservationTestStore>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PRIVATE_OBSERVATION_TEST_STORE.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let previous = PRIVATE_OBSERVATION_TEST_STORE
+        .with(|slot| slot.replace(Some((store, profile, profile_digest))));
+    let _restore = Restore(previous);
+    run()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WorkbenchProfileId {
@@ -2747,7 +2778,7 @@ impl WorkbenchProfileRegistry {
 }
 
 pub(crate) struct WorkbenchService {
-    pub(crate) store: WorkbenchInvocationStore,
+    pub(crate) store: Arc<WorkbenchInvocationStore>,
     pub(crate) profile: WorkbenchProfile,
     pub(crate) profile_digest: String,
     pub(crate) qa_profile: WorkbenchProfile,
@@ -2794,12 +2825,15 @@ pub(crate) fn install_workbench_service(
         .profiles
         .get(&WorkbenchProfileId::WebReview)
         .cloned();
-    let store = WorkbenchInvocationStore::open_with_artifact_roots(
+    let store = Arc::new(WorkbenchInvocationStore::open_with_artifact_roots(
         data_dir.join("workbench.redb"),
         artifact_roots,
-    )?;
+    )?);
     let (sender, receiver) = mpsc::sync_channel(128);
     install_workbench_dispatch(sender)?;
+    WORKBENCH_STATUS_STORE
+        .set(Arc::clone(&store))
+        .map_err(|_| anyhow::anyhow!("workbench status store is already installed"))?;
     *service = Some(WorkbenchService {
         store,
         profile,
@@ -2811,6 +2845,19 @@ pub(crate) fn install_workbench_service(
         receiver,
     });
     Ok(())
+}
+
+pub(crate) fn read_workbench_invocation_status(
+    invocation_id: &str,
+    authority: &dyn WorkbenchAuthoritySource,
+    profile: &WorkbenchProfile,
+    profile_digest: &str,
+) -> anyhow::Result<Option<WorkbenchInvocationRecord>> {
+    let store = WORKBENCH_STATUS_STORE
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("workbench status store is unavailable"))?;
+    WorkbenchCoordinator::new(store, profile, profile_digest)
+        .invocation_status(invocation_id, authority)
 }
 
 pub(crate) fn take_workbench_service() -> anyhow::Result<Option<WorkbenchService>> {
@@ -2836,6 +2883,23 @@ fn install_workbench_dispatch(
 }
 
 pub fn dispatch_workbench(command: WorkbenchDispatchCommand) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if let WorkbenchDispatchCommand::PrivateObservation {
+        invocation_id,
+        authority,
+        response,
+    } = &command
+    {
+        let fixture = PRIVATE_OBSERVATION_TEST_STORE.with(|slot| slot.borrow().clone());
+        if let Some((store, profile, digest)) = fixture {
+            let result = WorkbenchCoordinator::new(&store, &profile, &digest)
+                .private_observation(invocation_id, authority.as_ref());
+            response
+                .send(result)
+                .map_err(|_| anyhow::anyhow!("private observation test receiver closed"))?;
+            return Ok(());
+        }
+    }
     let sender = WORKBENCH_DISPATCH
         .get()
         .ok_or_else(|| anyhow::anyhow!("workbench dispatch is not installed"))?
@@ -2869,6 +2933,24 @@ pub struct WorkbenchCoordinator<'a> {
 }
 
 impl<'a> WorkbenchCoordinator<'a> {
+    pub fn invocation_status(
+        &self,
+        invocation_id: &str,
+        authority: &dyn WorkbenchAuthoritySource,
+    ) -> anyhow::Result<Option<WorkbenchInvocationRecord>> {
+        let Some(record) = self.store.load(invocation_id)? else {
+            return Ok(None);
+        };
+        let current = authority.current_for_record(&record)?;
+        authorize_workbench_record(&record, &current)?;
+        if record.tool_profile != self.profile.id
+            || record.tool_profile_digest != self.profile_digest
+        {
+            bail!("workbench status profile binding changed");
+        }
+        Ok(Some(record))
+    }
+
     /// Internal model-context read. Ordinary poll/replay deliberately stay public-safe.
     pub fn private_observation(
         &self,
@@ -2945,6 +3027,9 @@ impl<'a> WorkbenchCoordinator<'a> {
             });
         }
 
+        // A reserved replay has not started its effect yet. Expiry permits
+        // collecting an already executing result, never a late first Start.
+        request.validate_at(now_ms)?;
         let mut records = if replayed { Vec::new() } else { vec![record] };
         let executing =
             self.store
@@ -4081,7 +4166,7 @@ mod tests {
             .cloned();
         let (_sender, receiver) = mpsc::sync_channel(1);
         let service = WorkbenchService {
-            store: store(&config),
+            store: Arc::new(store(&config)),
             profile,
             profile_digest,
             qa_profile,

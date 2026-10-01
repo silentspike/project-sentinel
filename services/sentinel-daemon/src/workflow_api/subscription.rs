@@ -223,6 +223,9 @@ impl WorkflowApi {
             Some(sentinel_workflow::AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
                 ..
             }) => Some("blocked_continuation"),
+            Some(sentinel_workflow::AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted {
+                ..
+            }) => Some("budget_window_exhausted"),
         };
         if grant.review_id != *review_id
             || review_kind.as_deref() != expected_kind

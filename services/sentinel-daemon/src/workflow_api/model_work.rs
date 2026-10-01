@@ -1509,6 +1509,20 @@ mod tests {
                 id: Uuid::new_v4(),
                 request_digest: "f".repeat(64),
             };
+            let projects = api.store.company_projects().unwrap();
+            let expired_at = session.active_deadline_ms() + 1;
+            assert_ne!(
+                select_subscription_queue_allowance_id(
+                    &projects,
+                    AgentId(6),
+                    expired_at,
+                    |_| Ok(false),
+                    |candidate| api.adaptive_subscription_queue_priority(candidate),
+                )
+                .unwrap(),
+                Some(selected.reservation_id.as_str()),
+                "an expired unclaimed tool must not receive admission"
+            );
             session = advance(
                 &session,
                 AdaptiveTransitionV1::ClaimTool {
@@ -1518,7 +1532,19 @@ mod tests {
             );
             assert_eq!(
                 api.adaptive_subscription_queue_priority(&selected).unwrap(),
-                Some(1)
+                Some(0)
+            );
+            assert_eq!(
+                select_subscription_queue_allowance_id(
+                    &projects,
+                    AgentId(6),
+                    expired_at,
+                    |_| Ok(false),
+                    |candidate| api.adaptive_subscription_queue_priority(candidate),
+                )
+                .unwrap(),
+                Some(selected.reservation_id.as_str()),
+                "an exact claimed tool must remain eligible for result collection"
             );
             session = advance(
                 &session,

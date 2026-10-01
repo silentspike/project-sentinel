@@ -335,6 +335,7 @@ func TestNativeGenerationSchemaConformance(t *testing.T) {
 		{"leadership", codexCLILeadershipSchema},
 		{"unknown_leadership", codexCLIUnknownLeadershipSchema},
 		{"continuation_leadership", codexCLIContinuationLeadershipSchema},
+		{"budget_leadership", codexCLIBudgetLeadershipSchema},
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
 			var schema any
@@ -385,9 +386,11 @@ func TestLeadershipBoundaryContinuationSchemaContracts(t *testing.T) {
 	for _, tc := range []struct {
 		name, keep string
 		body       []byte
+		version    int
 	}{
-		{"unknown_leadership", "keep_unknown", codexCLIUnknownLeadershipSchema},
-		{"continuation_leadership", "keep_blocked", codexCLIContinuationLeadershipSchema},
+		{"unknown_leadership", "keep_unknown", codexCLIUnknownLeadershipSchema, 2},
+		{"continuation_leadership", "keep_blocked", codexCLIContinuationLeadershipSchema, 2},
+		{"budget_leadership", "defer_budget", codexCLIBudgetLeadershipSchema, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var schema map[string]any
@@ -402,7 +405,7 @@ func TestLeadershipBoundaryContinuationSchemaContracts(t *testing.T) {
 				}
 			}
 			properties := schema["properties"].(map[string]any)
-			assertJSON(properties["schema_version"], `{"enum":[2],"type":"integer"}`)
+			assertJSON(properties["schema_version"], fmt.Sprintf(`{"enum":[%d],"type":"integer"}`, tc.version))
 			decision := properties["decision"].(map[string]any)
 			alternatives, ok := decision["anyOf"].([]any)
 			if !ok || len(alternatives) != 2 || len(decision) != 1 {
@@ -452,6 +455,7 @@ func TestLeadershipBoundaryOutputSchemaAndLegacy(t *testing.T) {
 		{"leadership", leadershipReviewTestRequest(), codexCLILeadershipSchema},
 		{"unknown_leadership", continuationReviewTestRequest("unknown_model"), codexCLIUnknownLeadershipSchema},
 		{"blocked_continuation", continuationReviewTestRequest("blocked_continuation"), codexCLIContinuationLeadershipSchema},
+		{"budget_window_exhausted", continuationReviewTestRequest("budget_window_exhausted"), codexCLIBudgetLeadershipSchema},
 		{"legacy1", subscriptionTestRequest(), codexCLIWorkSchema},
 		{"legacy2", salesSubscriptionTestRequest(), nil},
 		{"legacy3", adaptiveSubscriptionTestRequest(), codexCLIAdaptiveSchema},
