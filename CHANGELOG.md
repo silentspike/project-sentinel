@@ -1,5 +1,10 @@
 # Changelog
 
+- Reconcile already-started employee effects under current durable authority
+  without requiring a healthy process. After restart, recover the original
+  receipt through an isolated replacement reader with exact instance ownership
+  and confirmed process-tree reap; never send a second tool Execute (#856).
+
 - Recover serial, exactly bound Workbench receipts after process cleanup and
   retrieve committed observations without requiring a new healthy process.
   Preserve serving-state admission for new effects, current assignment and

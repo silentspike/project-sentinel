@@ -1483,7 +1483,7 @@ impl WorkflowApi {
             );
             session = AdaptiveWorkflowCore::new(
                 Arc::clone(&self.store),
-                Arc::clone(authority),
+                WorkbenchRecordRecoveryAuthority(authority.as_ref()),
                 UnavailableAdaptiveModel,
                 workbench.as_ref().clone(),
             )
