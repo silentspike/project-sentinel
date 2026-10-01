@@ -3219,6 +3219,7 @@ pub struct WorkflowApi {
     workbench: Option<Arc<WorkbenchExecutionAdapter>>,
     event_store: Option<sentinel_limbo::EventStore>,
     mutation_fence: RwLock<()>,
+    reconciliation_fence: Mutex<()>,
     enabled: bool,
     model_work_enabled: bool,
     subscription_allowance_id: Option<String>,
@@ -3407,6 +3408,7 @@ impl WorkflowApi {
             workbench: Some(workbench),
             event_store: Some(event_store),
             mutation_fence: RwLock::new(()),
+            reconciliation_fence: Mutex::new(()),
             enabled: true,
             model_work_enabled,
             subscription_allowance_id,
@@ -3443,6 +3445,7 @@ impl WorkflowApi {
             workbench: None,
             event_store: None,
             mutation_fence: RwLock::new(()),
+            reconciliation_fence: Mutex::new(()),
             enabled: false,
             model_work_enabled: false,
             subscription_allowance_id: None,
@@ -5065,7 +5068,11 @@ impl WorkflowApi {
         if !self.enabled {
             return;
         }
-        let Ok(_guard) = self.mutation_fence.try_write() else {
+        let Ok(_batch) = self.reconciliation_fence.try_lock() else {
+            return;
+        };
+        // Normal batches may coexist with durable dispatch claims, but never recovery.
+        let Ok(_guard) = self.mutation_fence.try_read() else {
             return;
         };
         if should_stop() {

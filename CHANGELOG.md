@@ -1,5 +1,11 @@
 # Changelog
 
+- Allow fresh provider claims during ordinary company reconciliation while
+  preserving exclusive recovery, single-batch execution and exactly-once
+  model admission. Durable claim replay never grants a second provider call
+  (#856). Permit one separately audited, finite successor after an exhausted
+  immutable review-capacity issuance, without refilling prior receipts.
+
 - Reauthorize the exact selected leadership review independently of scheduling
   order, preserving validation after its own dispatch. Recheck queued model
   authority before creating a reservation, and reject dispatch callbacks
@@ -7,6 +13,11 @@
   (#856). Permit an explicit, immutable operator extension of normal leadership
   review capacity for the exact exhausted session head, without changing root
   employee budgets, recovery epochs, effects or recorded spending.
+
+- Derive room occupancy and arrivals atomically from current active employee
+  presence, preserving event watermarks and environmental state across startup
+  repair. Show only active, physically present employees in desktop room lists
+  (#856).
 
 - Discover exact durable employee sessions and govern bounded leadership reviews
   without requiring the assigned developer's live process. Keep current lineage,

@@ -41,8 +41,7 @@ impl ProjectionHandler for AgentLiveViewHandler {
                     room = room_id,
                     "Projecting agent_spawned"
                 );
-                txn.upsert_agent(agent_id.0, name, role, *shift_set, "active", row_id)?;
-                txn.update_agent_room(agent_id.0, room_id, row_id)?;
+                txn.upsert_agent_presence(agent_id.0, name, role, *shift_set, room_id, row_id)?;
             }
 
             DomainEventPayload::AgentDespawned { agent_id, .. } => {
