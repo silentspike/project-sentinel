@@ -74,6 +74,9 @@ pub(super) fn reserve_and_claim_schema2(
     let review_kind = match grant.subject.as_ref().unwrap() {
         AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. } => "unknown_model",
         AdaptiveLeadershipReviewSubjectV2::BlockedContinuation { .. } => "blocked_continuation",
+        AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. } => {
+            "budget_window_exhausted"
+        }
     };
     let request = serde_json::json!({
         "schema_version": 5, "allowance_id": context.binding.allowance_id,
@@ -122,7 +125,10 @@ pub(super) fn reserve_and_claim_schema2(
     (id, digest)
 }
 
-fn fixture_schema2_blocked(path: &Path, event_path: &Path) -> (WorkflowApi, LeadershipContext) {
+pub(super) fn fixture_schema2_blocked(
+    path: &Path,
+    event_path: &Path,
+) -> (WorkflowApi, LeadershipContext) {
     fixture_schema2_source(path, event_path, false, false, false)
 }
 
@@ -526,6 +532,7 @@ fn fixture_schema2_source(
             )
             .unwrap();
         let context = LeadershipContext {
+            private_observation: None,
             binding: LeadershipAuthority::from_call(&call),
             context_digest: call.context_digest().unwrap(),
             source: call.context,

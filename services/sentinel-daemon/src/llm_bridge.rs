@@ -2790,6 +2790,15 @@ pub mod bridge {
                 Some("blocked_continuation") => Ok(Some("blocked_continuation")),
                 _ => Err("unsupported leadership review subject"),
             },
+            Some(3)
+                if grant
+                    .get("subject")
+                    .and_then(|subject| subject.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("budget_window_exhausted") =>
+            {
+                Ok(Some("budget_window_exhausted"))
+            }
             _ => Err("unsupported leadership review grant schema"),
         }
     }
@@ -3525,12 +3534,18 @@ pub mod bridge {
                     Ok(Some(kind))
                 );
             }
+            assert_eq!(
+                leadership_review_kind(&serde_json::json!({"schema_version":3,
+                    "subject":{"kind":"budget_window_exhausted"}})),
+                Ok(Some("budget_window_exhausted"))
+            );
             for grant in [
                 serde_json::json!({"schema_version": 2}),
                 serde_json::json!({"schema_version": 2, "subject": null}),
                 serde_json::json!({"schema_version": 2, "subject": {"kind": "tool"}}),
                 serde_json::json!({"schema_version": 1, "subject": {"kind": "unknown_model"}}),
                 serde_json::json!({"schema_version": 3, "subject": {"kind": "unknown_model"}}),
+                serde_json::json!({"schema_version": 2, "subject": {"kind": "budget_window_exhausted"}}),
             ] {
                 assert!(leadership_review_kind(&grant).is_err());
             }

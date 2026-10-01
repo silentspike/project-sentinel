@@ -691,6 +691,10 @@ pub(crate) fn continue_adaptive_session_in_transaction(
     review.grant.validate(review.grant_issued_at_unix_ms)?;
     review.context.validate(&review.grant)?;
     WorkflowStore::require_recovery_epoch_review(tx, review)?;
+    WorkflowStore::require_adaptive_budget_review_source(tx, review)?;
+    if review.grant.schema_version == 3 && authorization.local_adoption.is_some() {
+        return Err(authority_conflict());
+    }
     let stored_review: AdaptiveLeadershipReviewCallV1 = read_company_entity(
         tx,
         &current.tenant_id.0,
@@ -779,6 +783,14 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         .subscription_call
         .as_ref()
         .ok_or_else(authority_conflict)?;
+    let policy_allowance = match &review.grant.subject {
+        Some(crate::AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget })
+            if review.grant.schema_version == 3 =>
+        {
+            &budget.root_allowance
+        }
+        _ => captured_allowance,
+    };
     if fresh_allowance.allowance_id != authorization.provider_allowance_id
         || fresh_allowance.allowance_id == review.allowance_id
         || fresh_allowance.created_at_unix_ms != authorization.issued_at_ms
@@ -794,13 +806,18 @@ pub(crate) fn continue_adaptive_session_in_transaction(
         || fresh.catalog_digest != session.grant.catalog_digest
         || fresh.token_policy != review.grant.token_policy
         || fresh.max_calls != authorization.additional_model_calls
-        || fresh.max_calls > captured_allowance.grant.max_calls
+        || fresh.max_calls > policy_allowance.grant.max_calls
+        || (review.grant.schema_version == 3
+            && session
+                .model_calls
+                .checked_add(fresh.max_calls)
+                .is_none_or(|calls| calls > session.grant.max_model_calls))
         || fresh.max_concurrent != 1
         || fresh.max_duration_ms
             != session
                 .grant
                 .max_call_duration_ms
-                .min(captured_allowance.grant.max_duration_ms)
+                .min(policy_allowance.grant.max_duration_ms)
                 .min(authorization.deadline_ms - authorization.issued_at_ms)
         || fresh.expires_at_unix_ms != authorization.deadline_ms
         || adaptive_continuation_provider_digest(fresh_allowance, current)?
@@ -1038,6 +1055,90 @@ pub(crate) fn load(
     id: Uuid,
 ) -> Result<Option<(AdaptiveSessionV1, String)>, WorkflowError> {
     Ok(load_with_feedback(connection, id)?.map(|(session, digest, _)| (session, digest)))
+}
+
+pub(crate) fn require_journal_source(
+    connection: &Connection,
+    source: &AdaptiveSessionV1,
+) -> Result<(), WorkflowError> {
+    let (head, _) = load(connection, source.grant.session_id)?.ok_or_else(not_found)?;
+    let (_, bytes, _) = read_operation(
+        connection,
+        &namespace(source.grant.session_id),
+        &format!("{:020}", source.version),
+    )?
+    .ok_or_else(not_found)?;
+    let entry: Entry = decode(&bytes)?;
+    if entry.session != *source || head.grant != source.grant {
+        return Err(authority_conflict());
+    }
+    Ok(())
+}
+
+pub(crate) fn allowance_is_governed_in_journal(
+    connection: &Connection,
+    tenant: &crate::TenantId,
+    project: &crate::ProjectId,
+    allowance: &crate::SubscriptionCallAllowanceV1,
+) -> Result<bool, WorkflowError> {
+    // Bound only journals naming this allowance; unrelated expired rollovers are not evidence.
+    let mut statement = connection.prepare(
+        "SELECT root.operation_namespace FROM workflow_operations AS root
+         WHERE root.operation_namespace GLOB 'adaptive-session-v1:*'
+           AND root.operation_id='00000000000000000001'
+           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.tenant_id') END=?1
+           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.project_id') END=?2
+           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.work_item_id') END=?3
+           AND CASE WHEN json_valid(root.response) THEN json_extract(root.response,'$.session.grant.authority.agent_id') END=?4
+           AND EXISTS (
+               SELECT 1 FROM workflow_operations AS journal,
+                    json_each(CASE WHEN json_valid(journal.response) THEN journal.response ELSE '{}' END,
+                              '$.session.continuation.authorizations') AS authorization
+               WHERE journal.operation_namespace=root.operation_namespace
+                 AND json_extract(authorization.value,'$.provider_allowance_id')=?5
+           )
+         ORDER BY root.operation_namespace LIMIT ?6",
+    ).map_err(map_sqlite_error)?;
+    let namespaces = statement
+        .query_map(
+            params![
+                tenant.0,
+                project.0,
+                allowance.grant.work_item_id.0,
+                i64::from(allowance.grant.agent_id.0),
+                allowance.allowance_id,
+                (MAX_SCOPED_ADAPTIVE_HEADS + 1) as i64
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    if namespaces.len() > MAX_SCOPED_ADAPTIVE_HEADS {
+        return Err(corrupt_store());
+    }
+    let mut governed = false;
+    for ns in namespaces {
+        let id = ns
+            .strip_prefix("adaptive-session-v1:")
+            .ok_or_else(corrupt_store)?;
+        let id = Uuid::parse_str(id).map_err(|_| corrupt_store())?;
+        let (session, _) = load(connection, id)?.ok_or_else(corrupt_store)?;
+        if session.grant.authority.tenant_id != *tenant
+            || session.grant.authority.project_id != *project
+            || session.grant.authority.work_item_id != allowance.grant.work_item_id
+            || session.grant.authority.agent_id != allowance.grant.agent_id
+        {
+            return Err(corrupt_store());
+        }
+        governed |= session.continuation.as_ref().is_some_and(|state| {
+            state
+                .authorizations
+                .iter()
+                .any(|authorization| authorization.provider_allowance_id == allowance.allowance_id)
+        });
+    }
+    Ok(governed)
 }
 
 type LoadedSession = (

@@ -26,6 +26,10 @@ pub enum AdaptiveContinuationSourceV1 {
         resolution_event_id: String,
     },
     ModelUnknown,
+    BudgetWindowExhausted {
+        active_allowance_digest: String,
+        continuation_history_digest: String,
+    },
 }
 
 /// A reviewed authorization, never a retry of the original provider request.
@@ -81,6 +85,15 @@ impl AdaptiveContinuationAuthorizationV1 {
                 None,
             ) if valid_reason(reason_code) && valid_resolution(resolution_event_id) => {}
             (AdaptiveContinuationSourceV1::ModelUnknown, Some(_)) => {}
+            (
+                AdaptiveContinuationSourceV1::BudgetWindowExhausted {
+                    active_allowance_digest,
+                    continuation_history_digest,
+                },
+                None,
+            ) if validate_sha256(active_allowance_digest)
+                && validate_sha256(continuation_history_digest)
+                && self.local_adoption.is_none() => {}
             _ => return Err(invalid()),
         }
         if let Some(adoption) = &self.local_adoption {
@@ -441,7 +454,8 @@ impl AdaptiveSessionV1 {
             (
                 Cursor::Blocked { .. }
                 | Cursor::BlockedResolved { .. }
-                | Cursor::ModelUnknown { .. },
+                | Cursor::ModelUnknown { .. }
+                | Cursor::ReadyForModel,
                 Command::ContinueGoverned { authorization },
             ) => {
                 authorization.validate()?;
@@ -454,7 +468,10 @@ impl AdaptiveSessionV1 {
                     || authorization.source_session_version != self.version
                     || now_ms < authorization.issued_at_ms
                     || now_ms >= authorization.deadline_ms
-                    || authorization.issued_at_ms < self.active_deadline_ms()
+                    || (!matches!(
+                        &authorization.source,
+                        AdaptiveContinuationSourceV1::BudgetWindowExhausted { .. }
+                    ) && authorization.issued_at_ms < self.active_deadline_ms())
                     || history.len() >= ADAPTIVE_CONTINUATION_MAX_WINDOWS
                     || authorization.provider_allowance_id == self.grant.provider_allowance_id
                     || history.iter().any(|prior| {
@@ -475,6 +492,21 @@ impl AdaptiveSessionV1 {
                     &authorization.source,
                     &authorization.abandoned_model_effect,
                 ) {
+                    (
+                        Cursor::ReadyForModel,
+                        AdaptiveContinuationSourceV1::BudgetWindowExhausted {
+                            continuation_history_digest,
+                            ..
+                        },
+                        None,
+                    ) if authorization.issued_at_ms >= self.updated_at_ms
+                        && self.model_window_exhausted_at(authorization.issued_at_ms)
+                        && *continuation_history_digest
+                            == crate::adaptive_budget_history_digest(&self.continuation)? =>
+                    {
+                        // The transaction checks the raw active allowance digest;
+                        // the journal only owns the history and exhaustion clock.
+                    }
                     (
                         Cursor::Blocked { reason_code },
                         AdaptiveContinuationSourceV1::Blocked {
@@ -736,11 +768,36 @@ impl AdaptiveSessionV1 {
             grant.created_at_ms = authorization.issued_at_ms;
             grant.deadline_ms = authorization.deadline_ms;
             grant.max_model_calls = self.active_model_ceiling();
-            grant.max_call_duration_ms = grant
-                .max_call_duration_ms
-                .min(authorization.deadline_ms - authorization.issued_at_ms);
+            grant.max_call_duration_ms = self.effective_call_duration_ms();
         }
         grant
+    }
+
+    /// Normal budget windows restore the root duration cap; recovery windows
+    /// retain every preceding restriction until the next normal budget window.
+    pub fn effective_call_duration_ms(&self) -> u64 {
+        let mut duration = self.grant.max_call_duration_ms;
+        if let Some(state) = &self.continuation {
+            for authorization in &state.authorizations {
+                // Invalid clocks fail closed here; receipt validation rejects them.
+                let Some(window) = authorization
+                    .deadline_ms
+                    .checked_sub(authorization.issued_at_ms)
+                    .filter(|window| *window > 0)
+                else {
+                    return 0;
+                };
+                duration = match &authorization.source {
+                    AdaptiveContinuationSourceV1::BudgetWindowExhausted { .. } => {
+                        self.grant.max_call_duration_ms.min(window)
+                    }
+                    AdaptiveContinuationSourceV1::Blocked { .. }
+                    | AdaptiveContinuationSourceV1::BlockedResolved { .. }
+                    | AdaptiveContinuationSourceV1::ModelUnknown => duration.min(window),
+                };
+            }
+        }
+        duration
     }
 
     pub fn active_deadline_ms(&self) -> u64 {
@@ -756,6 +813,15 @@ impl AdaptiveSessionV1 {
         self.continuation
             .as_ref()
             .map_or(self.grant.max_model_calls, |state| state.model_ceiling)
+    }
+
+    /// Reports active model-window exhaustion, including root exhaustion,
+    /// without authorizing continuation or changing session state.
+    pub fn model_window_exhausted_at(&self, now_ms: u64) -> bool {
+        matches!(self.cursor, AdaptiveCursorV1::ReadyForModel)
+            && now_ms >= self.updated_at_ms
+            && (now_ms >= self.active_deadline_ms()
+                || self.model_calls >= self.active_model_ceiling())
     }
 
     pub fn requires_fresh_observation(&self) -> bool {
@@ -973,6 +1039,408 @@ pub(crate) mod continuation_tests {
             },
             now,
         )
+    }
+
+    fn budget_ready() -> AdaptiveSessionV1 {
+        let source = unknown();
+        let mut prior = authorization(&source);
+        prior.additional_model_calls = 1;
+        let mut ready = continue_with(&source, prior).unwrap();
+        ready.model_calls = ready.active_model_ceiling();
+        ready.tool_calls = 4;
+        ready.updated_at_ms = NOW + 1_001;
+        ready
+    }
+
+    fn budget_authorization(
+        source: &AdaptiveSessionV1,
+        id: u128,
+    ) -> AdaptiveContinuationAuthorizationV1 {
+        let mut auth = authorization(source);
+        auth.operation_id = Uuid::from_u128(id);
+        auth.review_id = Uuid::from_u128(id + 1);
+        auth.resolution_event_id = Uuid::from_u128(id + 2);
+        auth.provider_allowance_id = format!("budget-allowance-{id}");
+        auth.source = AdaptiveContinuationSourceV1::BudgetWindowExhausted {
+            active_allowance_digest: "a".repeat(64),
+            continuation_history_digest: crate::adaptive_budget_history_digest(
+                &source.continuation,
+            )
+            .unwrap(),
+        };
+        auth.abandoned_model_effect = None;
+        auth.issued_at_ms = source.updated_at_ms + 1;
+        auth.deadline_ms = auth.issued_at_ms + 120_000;
+        auth.additional_model_calls = 4;
+        auth
+    }
+
+    #[test]
+    fn budget_continuation_before_deadline_preserves_root_counters_and_inspection_fence() {
+        let source = budget_ready();
+        let auth = budget_authorization(&source, 401);
+        assert!(auth.issued_at_ms < source.active_deadline_ms());
+        let ready = continue_with(&source, auth.clone()).unwrap();
+        assert_eq!(ready.grant, source.grant);
+        assert_eq!(
+            (ready.model_calls, ready.tool_calls),
+            (source.model_calls, source.tool_calls)
+        );
+        assert_eq!(ready.effect_ids, source.effect_ids);
+        assert_eq!(ready.last_observation, source.last_observation);
+        assert_eq!(ready.active_model_ceiling(), source.model_calls + 4);
+        assert!(ready.requires_fresh_observation());
+        let history = &ready.continuation.as_ref().unwrap().authorizations;
+        assert_eq!(
+            &history[..history.len() - 1],
+            source
+                .continuation
+                .as_ref()
+                .unwrap()
+                .authorizations
+                .as_slice()
+        );
+        let pending = ready
+            .transition(
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect(410),
+                    previous_observation_digest: None,
+                },
+                auth.issued_at_ms,
+            )
+            .unwrap();
+        let write = WorkbenchTool::WriteFile {
+            path: "src/main.rs".into(),
+            content: "changed".into(),
+            expected_sha256: None,
+        };
+        assert!(pending
+            .transition(
+                &AdaptiveTransitionV1::ResolveModel {
+                    effect: effect(410),
+                    result_digest: "b".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Tool {
+                        tool_digest: adaptive_tool_digest(&write).unwrap(),
+                        tool: write
+                    },
+                },
+                auth.issued_at_ms
+            )
+            .is_err());
+        assert!(continue_with(&ready, auth).is_err());
+    }
+
+    #[test]
+    fn budget_continuation_rejects_stale_history_clock_nonexhaustion_and_wrong_source() {
+        let original = budget_ready();
+        let auth = budget_authorization(&original, 421);
+        for field in 0..8 {
+            let mut source = original.clone();
+            let mut changed = auth.clone();
+            match field {
+                0 => {
+                    if let AdaptiveContinuationSourceV1::BudgetWindowExhausted {
+                        continuation_history_digest,
+                        ..
+                    } = &mut changed.source
+                    {
+                        *continuation_history_digest = "b".repeat(64);
+                    }
+                }
+                1 => {
+                    if let AdaptiveContinuationSourceV1::BudgetWindowExhausted {
+                        active_allowance_digest,
+                        ..
+                    } = &mut changed.source
+                    {
+                        *active_allowance_digest = "invalid".into();
+                    }
+                }
+                2 => changed.issued_at_ms = source.updated_at_ms - 1,
+                3 => source.model_calls -= 1,
+                4 => {
+                    source.cursor = AdaptiveCursorV1::Blocked {
+                        reason_code: "needs_review".into(),
+                    }
+                }
+                5 => changed.abandoned_model_effect = Some(effect(102)),
+                6 => changed.source_session_version += 1,
+                _ => changed.additional_model_calls = 15,
+            }
+            assert!(continue_with(&source, changed).is_err(), "field {field}");
+        }
+        let mut legacy = auth;
+        legacy.source = AdaptiveContinuationSourceV1::Blocked {
+            reason_code: "needs_review".into(),
+        };
+        let mut blocked = original;
+        blocked.cursor = AdaptiveCursorV1::Blocked {
+            reason_code: "needs_review".into(),
+        };
+        assert!(continue_with(&blocked, legacy).is_err());
+    }
+
+    #[test]
+    fn budget_continuation_history_stays_finite_without_resetting_old_windows() {
+        let mut source = budget_ready();
+        for id in [441, 451] {
+            let auth = budget_authorization(&source, id);
+            source = continue_with(&source, auth).unwrap();
+            source.model_calls = source.active_model_ceiling();
+        }
+        assert_eq!(
+            source.continuation.as_ref().unwrap().authorizations.len(),
+            ADAPTIVE_CONTINUATION_MAX_WINDOWS
+        );
+        assert_eq!(source.grant.max_model_calls, 16);
+        assert!(continue_with(&source, budget_authorization(&source, 461)).is_err());
+    }
+
+    #[test]
+    fn budget_continuation_after_first_deadline_does_not_require_a_model_result() {
+        let mut source = AdaptiveSessionV1::initial(grant()).unwrap();
+        source.updated_at_ms = source.grant.deadline_ms;
+        let auth = budget_authorization(&source, 481);
+        let next = continue_with(&source, auth).unwrap();
+        assert_eq!(next.model_calls, 0);
+        assert!(next.last_model_result_digest.is_none());
+        assert!(next.last_observation.is_none());
+        assert!(next.requires_fresh_observation());
+        assert_eq!(next.grant, source.grant);
+    }
+
+    fn append_duration_window(
+        session: &mut AdaptiveSessionV1,
+        source: AdaptiveContinuationSourceV1,
+        window_ms: u64,
+    ) {
+        let mut auth = authorization(session);
+        let index = session
+            .continuation
+            .as_ref()
+            .map_or(0, |state| state.authorizations.len());
+        auth.operation_id = Uuid::from_u128(801 + index as u128 * 3);
+        auth.review_id = Uuid::from_u128(802 + index as u128 * 3);
+        auth.resolution_event_id = Uuid::from_u128(803 + index as u128 * 3);
+        auth.provider_allowance_id = format!("duration-allowance-{index}");
+        auth.issued_at_ms = session.active_deadline_ms();
+        auth.deadline_ms = auth.issued_at_ms + window_ms;
+        auth.abandoned_model_effect =
+            if matches!(&source, AdaptiveContinuationSourceV1::ModelUnknown) {
+                Some(effect(102))
+            } else {
+                None
+            };
+        auth.source = source;
+        auth.validate().unwrap();
+        session
+            .continuation
+            .get_or_insert(AdaptiveContinuationStateV1 {
+                authorizations: Vec::new(),
+                model_ceiling: 3,
+                observation_required: true,
+            })
+            .authorizations
+            .push(auth);
+        session.version += 1;
+    }
+
+    fn duration_recovery_sources() -> [AdaptiveContinuationSourceV1; 3] {
+        [
+            AdaptiveContinuationSourceV1::Blocked {
+                reason_code: "needs_review".into(),
+            },
+            AdaptiveContinuationSourceV1::BlockedResolved {
+                reason_code: "needs_review".into(),
+                resolution_event_id: Uuid::from_u128(900).to_string(),
+            },
+            AdaptiveContinuationSourceV1::ModelUnknown,
+        ]
+    }
+
+    #[test]
+    fn effective_duration_retains_tight_recovery_until_normal_window_resets_it() {
+        for source in duration_recovery_sources() {
+            let mut session = AdaptiveSessionV1::initial(grant()).unwrap();
+            assert_eq!(session.effective_call_duration_ms(), 120_000);
+            assert_eq!(session.effective_grant(), session.grant);
+            append_duration_window(&mut session, source.clone(), 1_000);
+            append_duration_window(&mut session, source, 60_000);
+            assert_eq!(session.effective_call_duration_ms(), 1_000);
+            assert_eq!(session.effective_grant().max_call_duration_ms, 1_000);
+            let normal = budget_authorization(&session, 901).source;
+            append_duration_window(&mut session, normal, 300_000);
+            let effective = session.effective_grant();
+            assert_eq!(session.effective_call_duration_ms(), 120_000);
+            assert_eq!(effective.max_call_duration_ms, 120_000);
+            assert_eq!(
+                effective.provider_allowance_id,
+                session.active_provider_allowance_id()
+            );
+            assert_eq!(effective.deadline_ms, session.active_deadline_ms());
+            assert_eq!(session.grant, grant());
+            assert_eq!((session.model_calls, session.tool_calls), (0, 0));
+            let first = &mut session.continuation.as_mut().unwrap().authorizations[0];
+            first.deadline_ms = first.issued_at_ms;
+            assert_eq!(session.effective_call_duration_ms(), 0);
+            assert_eq!(session.effective_grant().max_call_duration_ms, 0);
+        }
+    }
+
+    #[test]
+    fn effective_duration_normal_reset_is_followed_by_recovery_restrictions() {
+        for source in duration_recovery_sources() {
+            let mut session = AdaptiveSessionV1::initial(grant()).unwrap();
+            append_duration_window(&mut session, source.clone(), 1_000);
+            let normal = budget_authorization(&session, 921).source;
+            append_duration_window(&mut session, normal, 60_000);
+            assert_eq!(session.effective_call_duration_ms(), 60_000);
+            assert_eq!(session.effective_grant().max_call_duration_ms, 60_000);
+            append_duration_window(&mut session, source, 120_000);
+            assert_eq!(session.effective_call_duration_ms(), 60_000);
+            assert_eq!(session.effective_grant().max_call_duration_ms, 60_000);
+        }
+    }
+
+    #[test]
+    fn model_window_exhaustion_initial_boundaries_include_root_limits() {
+        let mut session = AdaptiveSessionV1::initial(grant()).unwrap();
+        let initial = session.clone();
+        assert!(!session.model_window_exhausted_at(NOW));
+        assert!(!session.model_window_exhausted_at(session.grant.deadline_ms - 1));
+        assert!(session.model_window_exhausted_at(session.grant.deadline_ms));
+        assert!(session.model_window_exhausted_at(session.grant.deadline_ms + 1));
+        assert_eq!(session, initial);
+
+        session.model_calls = session.grant.max_model_calls - 1;
+        assert!(!session.model_window_exhausted_at(NOW));
+        session.model_calls += 1;
+        let exhausted = session.clone();
+        assert!(session.model_window_exhausted_at(NOW));
+        assert_eq!(session, exhausted);
+        session.model_calls += 1;
+        assert!(session.model_window_exhausted_at(NOW));
+    }
+
+    #[test]
+    fn model_window_exhaustion_uses_continued_cumulative_limits_not_root_grant() {
+        let source = unknown();
+        let auth = authorization(&source);
+        let mut session = continue_with(&source, auth.clone()).unwrap();
+        let continued = session.clone();
+        assert_eq!(session.model_calls, 1);
+        assert_eq!(session.active_model_ceiling(), 4);
+        assert_eq!(session.grant, source.grant);
+        assert!(!session.model_window_exhausted_at(auth.issued_at_ms));
+        assert!(!session.model_window_exhausted_at(auth.deadline_ms - 1));
+        assert!(session.model_window_exhausted_at(auth.deadline_ms));
+        assert!(session.model_window_exhausted_at(auth.deadline_ms + 1));
+        assert_eq!(session, continued);
+
+        session.model_calls = session.active_model_ceiling() - 1;
+        assert_eq!(session.model_calls, auth.additional_model_calls);
+        assert!(!session.model_window_exhausted_at(auth.issued_at_ms));
+        session.model_calls += 1;
+        assert!(session.model_calls < session.grant.max_model_calls);
+        let exhausted = session.clone();
+        assert!(session.model_window_exhausted_at(auth.issued_at_ms));
+        assert_eq!(session, exhausted);
+        session.model_calls += 1;
+        assert!(session.model_window_exhausted_at(auth.issued_at_ms));
+
+        let mut root_auth = auth;
+        root_auth.additional_model_calls = source.grant.max_model_calls - source.model_calls;
+        let mut root_exhausted = continue_with(&source, root_auth.clone()).unwrap();
+        root_exhausted.model_calls = root_exhausted.grant.max_model_calls;
+        assert_eq!(root_exhausted.grant, source.grant);
+        assert!(root_exhausted.model_window_exhausted_at(root_auth.issued_at_ms));
+    }
+
+    #[test]
+    fn model_window_exhaustion_excludes_every_non_ready_cursor() {
+        let mut session = AdaptiveSessionV1::initial(grant()).unwrap();
+        let tool = WorkbenchTool::InspectFile {
+            path: "src/main.rs".into(),
+            max_bytes: 1024,
+        };
+        let tool_digest = adaptive_tool_digest(&tool).unwrap();
+        for cursor in [
+            AdaptiveCursorV1::ModelPending {
+                effect: effect(102),
+            },
+            AdaptiveCursorV1::ModelUnknown {
+                effect: effect(102),
+            },
+            AdaptiveCursorV1::ReadyForTool {
+                tool: tool.clone(),
+                tool_digest: tool_digest.clone(),
+            },
+            AdaptiveCursorV1::ToolPending {
+                effect: effect(103),
+                tool: tool.clone(),
+                tool_digest: tool_digest.clone(),
+            },
+            AdaptiveCursorV1::ToolUnknown {
+                effect: effect(103),
+                tool,
+                tool_digest,
+            },
+            AdaptiveCursorV1::CollaborationProposed {
+                effect: effect(102),
+                action: AdaptiveCollaborationActionV1::AskQuestion {
+                    question_ref: "question".into(),
+                },
+            },
+            AdaptiveCursorV1::CompletionProposed {
+                artifact_digest: "a".repeat(64),
+            },
+            AdaptiveCursorV1::Blocked {
+                reason_code: "needs_review".into(),
+            },
+            AdaptiveCursorV1::BlockedResolved {
+                reason_code: "needs_review".into(),
+                resolution_event_id: Uuid::from_u128(900).to_string(),
+            },
+            AdaptiveCursorV1::ModelRejected {
+                resolution_event_id: Uuid::from_u128(901).to_string(),
+                reason_code: "rejected".into(),
+            },
+            AdaptiveCursorV1::Cancelled,
+        ] {
+            session.cursor = cursor;
+            session.model_calls = 0;
+            assert!(!session.model_window_exhausted_at(session.grant.deadline_ms));
+            session.model_calls = session.grant.max_model_calls;
+            assert!(!session.model_window_exhausted_at(NOW));
+            let exhausted = session.clone();
+            assert!(!session.model_window_exhausted_at(session.grant.deadline_ms));
+            assert_eq!(session, exhausted);
+        }
+    }
+
+    #[test]
+    fn model_window_exhaustion_rejects_backwards_clock_even_when_exhausted() {
+        let mut session = AdaptiveSessionV1::initial(grant()).unwrap();
+        session.model_calls = session.grant.max_model_calls;
+        assert!(!session.model_window_exhausted_at(NOW - 1));
+        assert!(session.model_window_exhausted_at(NOW));
+
+        let source = unknown();
+        let auth = authorization(&source);
+        session = continue_with(&source, auth.clone()).unwrap();
+        session.model_calls = session.active_model_ceiling();
+        assert!(!session.model_window_exhausted_at(auth.issued_at_ms - 1));
+        assert!(session.model_window_exhausted_at(auth.issued_at_ms));
+
+        session.model_calls = 0;
+        session.updated_at_ms = auth.deadline_ms + 1;
+        assert!(!session.model_window_exhausted_at(auth.deadline_ms));
+        assert!(session.model_window_exhausted_at(session.updated_at_ms));
+        session.model_calls = session.active_model_ceiling();
+        let exhausted = session.clone();
+        assert!(!session.model_window_exhausted_at(auth.deadline_ms));
+        assert!(session.model_window_exhausted_at(session.updated_at_ms));
+        assert_eq!(session, exhausted);
     }
 
     #[test]

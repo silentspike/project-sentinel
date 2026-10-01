@@ -1244,9 +1244,24 @@ impl WorkflowApi {
                     },
                 ))
             }
-            AdaptiveCursorV1::ReadyForTool { .. }
-            | AdaptiveCursorV1::ToolPending { .. }
-            | AdaptiveCursorV1::ToolUnknown { .. } => Ok(Some(1)),
+            // Drain the exact claimed effect even after the model allowance
+            // expires. Submit still rejects a fresh expired reservation; Poll
+            // and Recover cannot issue a new model call or tool identity.
+            AdaptiveCursorV1::ToolPending { effect, .. }
+            | AdaptiveCursorV1::ToolUnknown { effect, .. } => {
+                if now_unix_ms() >= session.active_deadline_ms()
+                    && !self
+                        .workbench
+                        .as_ref()
+                        .ok_or("adaptive Workbench unavailable")?
+                        .adaptive_tool_was_started(&session, effect)
+                        .map_err(|_| "adaptive tool dispatch status unavailable")?
+                {
+                    return Ok(None);
+                }
+                Ok(Some(0))
+            }
+            AdaptiveCursorV1::ReadyForTool { .. } => Ok(Some(1)),
             AdaptiveCursorV1::ReadyForModel => Ok(Some(if session.version > 1 { 1 } else { 2 })),
         }
     }
