@@ -146,6 +146,15 @@ pub mod bridge {
             agent_id: AgentId,
         ) -> Result<Option<ProviderExecutionAuthority>, &'static str>;
 
+        /// Validate a chosen authority; adapters may separate this from scheduling.
+        fn validate_provider_usage_authority(
+            &self,
+            expected: &ProviderExecutionAuthority,
+        ) -> Result<bool, &'static str> {
+            self.resolve_provider_usage_authority(expected.agent_id())
+                .map(|current| current.as_ref() == Some(expected))
+        }
+
         fn model_work_context(
             &self,
             _authority: &ProviderExecutionAuthority,
@@ -1491,10 +1500,21 @@ pub mod bridge {
                 if expected.is_none() && !resolver.allows_unbound_provider_usage() {
                     return Err("provider work requires explicit authority".to_owned());
                 }
-                let current = resolver
-                    .resolve_provider_usage_authority(agent_id)
-                    .map_err(|reason| format!("provider usage reauthorization failed: {reason}"))?;
-                if current.as_ref() != expected {
+                let valid = match expected {
+                    Some(expected) => {
+                        if expected.agent_id() != agent_id {
+                            return Err(
+                                "provider usage authority returned another agent".to_owned()
+                            );
+                        }
+                        resolver.validate_provider_usage_authority(expected)
+                    }
+                    None => resolver
+                        .resolve_provider_usage_authority(agent_id)
+                        .map(|current| current.is_none()),
+                }
+                .map_err(|reason| format!("provider usage reauthorization failed: {reason}"))?;
+                if !valid {
                     return Err("provider usage authority changed during provider I/O".to_string());
                 }
             }
@@ -1520,6 +1540,16 @@ pub mod bridge {
         Ok(())
     }
 
+    fn validate_unreserved_provider_authority(
+        resolver: Option<&dyn ProviderUsageAuthorityResolver>,
+        expected: Option<&ProviderExecutionAuthority>,
+        agent_id: AgentId,
+        model_work: Option<&ModelWorkContext>,
+    ) -> Result<(), String> {
+        validate_current_provider_usage_authority(resolver, expected, agent_id)
+            .and_then(|()| validate_model_work_context(resolver, model_work))
+    }
+
     fn validate_pre_dispatch_provider_authority<S: CompletionStore>(
         store: &S,
         resolver: Option<&dyn ProviderUsageAuthorityResolver>,
@@ -1529,20 +1559,20 @@ pub mod bridge {
         request_digest: &str,
         model_work: Option<&ModelWorkContext>,
     ) -> Result<(), String> {
-        let validation = validate_current_provider_usage_authority(resolver, expected, agent_id)
-            .and_then(|()| validate_model_work_context(resolver, model_work))
-            .and_then(|()| {
-                if let Some(context) = model_work {
-                    if let Some(reservation) =
-                        model_reservation(context, request_id, request_digest)?
-                    {
-                        store
-                            .bind_model_reservation(&reservation)
-                            .map_err(|error| error.to_string())?;
+        let validation =
+            validate_unreserved_provider_authority(resolver, expected, agent_id, model_work)
+                .and_then(|()| {
+                    if let Some(context) = model_work {
+                        if let Some(reservation) =
+                            model_reservation(context, request_id, request_digest)?
+                        {
+                            store
+                                .bind_model_reservation(&reservation)
+                                .map_err(|error| error.to_string())?;
+                        }
                     }
-                }
-                Ok(())
-            });
+                    Ok(())
+                });
         if let Err(reason) = validation {
             return match store.release_undispatched_request(request_id, request_digest) {
                 Ok(true) => Err(reason),
@@ -2292,6 +2322,15 @@ pub mod bridge {
                                 }
                             }
                         };
+                        if let Err(error) = validate_unreserved_provider_authority(
+                            provider_usage_authority_resolver.as_deref(),
+                            provider_usage_authority.as_ref(),
+                            agent_id,
+                            model_work.as_ref(),
+                        ) {
+                            warn!(request_id = %request_id, error, "Provider request reauthorization failed before reservation");
+                            return;
+                        }
                         let call_start = Instant::now();
                         let mut outcome_guard = ProviderOutcomeGuard::new(
                             Arc::clone(&bridge_event_store), task_active, &request_id, &request_digest,
@@ -2439,6 +2478,15 @@ pub mod bridge {
                         }
                     };
                     provider_tasks.spawn(async move {
+                        if let Err(error) = validate_unreserved_provider_authority(
+                            provider_usage_authority_resolver.as_deref(),
+                            provider_usage_authority.as_ref(),
+                            agent_id,
+                            model_work.as_ref(),
+                        ) {
+                            warn!(request_id = %request_id, error, "Provider request reauthorization failed before reservation");
+                            return;
+                        }
                         let call_start = Instant::now();
                         let mut outcome_guard = ProviderOutcomeGuard::new(
                             Arc::clone(&bridge_event_store), task_active, &request_id, &request_digest,
@@ -3416,6 +3464,21 @@ pub mod bridge {
                 store.get_completion("live").unwrap().unwrap().status,
                 "provider_in_flight"
             );
+            let conflicting = ProviderOutcomeGuard::new(
+                Arc::clone(&store),
+                Arc::clone(&active),
+                "live",
+                "different-digest",
+            );
+            assert_eq!(active.lock().unwrap().get("live"), Some(&2));
+            assert!(store
+                .reserve_request("live", "different-digest", &AgentId(6).to_string())
+                .is_err());
+            drop(conflicting);
+            assert_eq!(active.lock().unwrap().get("live"), Some(&1));
+            let pending = store.get_completion("live").unwrap().unwrap();
+            assert_eq!(pending.status, "provider_in_flight");
+            assert_eq!(pending.request_digest, "digest");
             drop(original);
         }
 
@@ -4935,6 +4998,7 @@ pub mod bridge {
 
         struct FailFirstCompletionStore {
             inner: EventStore,
+            reservation_calls: std::sync::atomic::AtomicUsize,
             fail_next_usage: AtomicBool,
             append_calls: Arc<std::sync::atomic::AtomicUsize>,
             failure_observed: Arc<tokio::sync::Notify>,
@@ -4942,6 +5006,281 @@ pub mod bridge {
 
         struct StaticProviderUsageAuthority {
             authority: ProviderUsageAuthority,
+        }
+
+        struct ExactValidationResolver {
+            context: ModelWorkContext,
+            scheduled: Option<ProviderExecutionAuthority>,
+            result: Result<bool, &'static str>,
+            unbound_allowed: bool,
+            selection_calls: std::sync::atomic::AtomicUsize,
+            validation_calls: std::sync::atomic::AtomicUsize,
+            checked: tokio::sync::Notify,
+        }
+
+        impl ExactValidationResolver {
+            fn new(context: ModelWorkContext) -> Self {
+                Self {
+                    scheduled: Some(context.binding()),
+                    context,
+                    result: Ok(true),
+                    unbound_allowed: true,
+                    selection_calls: std::sync::atomic::AtomicUsize::new(0),
+                    validation_calls: std::sync::atomic::AtomicUsize::new(0),
+                    checked: tokio::sync::Notify::new(),
+                }
+            }
+        }
+
+        impl ProviderUsageAuthorityResolver for ExactValidationResolver {
+            fn allows_unbound_provider_usage(&self) -> bool {
+                self.unbound_allowed
+            }
+
+            fn resolve_provider_usage_authority(
+                &self,
+                agent_id: AgentId,
+            ) -> Result<Option<ProviderExecutionAuthority>, &'static str> {
+                self.selection_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(if agent_id == self.context.binding().agent_id() {
+                    self.scheduled.clone()
+                } else {
+                    None
+                })
+            }
+
+            fn validate_provider_usage_authority(
+                &self,
+                expected: &ProviderExecutionAuthority,
+            ) -> Result<bool, &'static str> {
+                self.validation_calls.fetch_add(1, Ordering::SeqCst);
+                self.checked.notify_one();
+                if expected != &self.context.binding() {
+                    return Ok(false);
+                }
+                self.result
+            }
+
+            fn model_work_context(
+                &self,
+                expected: &ProviderExecutionAuthority,
+            ) -> Result<Option<ModelWorkContext>, &'static str> {
+                Ok((expected == &self.context.binding()).then(|| self.context.clone()))
+            }
+        }
+
+        struct SelectionErrorResolver;
+
+        impl ProviderUsageAuthorityResolver for SelectionErrorResolver {
+            fn resolve_provider_usage_authority(
+                &self,
+                _: AgentId,
+            ) -> Result<Option<ProviderExecutionAuthority>, &'static str> {
+                Err("selection unavailable")
+            }
+        }
+
+        #[test]
+        fn exact_validation_does_not_reselect_another_leadership_review() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_, review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
+                &dir.path().join("company.sqlite"),
+                &dir.path().join("events.sqlite"),
+            );
+            let context = ModelWorkContext::AdaptiveLeadershipReview(Box::new(review));
+            let expected = context.binding();
+            let mut resolver = ExactValidationResolver::new(context.clone());
+            let mut another = expected.clone();
+            let ProviderExecutionAuthority::AdaptiveLeadershipReview(binding) = &mut another else {
+                panic!("leadership fixture");
+            };
+            binding.grant.review_id = uuid::Uuid::new_v4();
+            binding.reservation_id = binding.grant.review_id.to_string();
+            binding.grant.project_id =
+                sentinel_workflow::ProjectId::parse("another-project").unwrap();
+            resolver.scheduled = Some(another);
+            assert_ne!(resolver.scheduled.as_ref(), Some(&expected));
+            assert!(validate_unreserved_provider_authority(
+                Some(&resolver),
+                Some(&expected),
+                expected.agent_id(),
+                Some(&context),
+            )
+            .is_ok());
+            let store = EventStore::open(":memory:").unwrap();
+            let id = expected.request_id();
+            let digest = "a".repeat(64);
+            assert!(store
+                .reserve_request(&id, &digest, &expected.agent_id().to_string())
+                .unwrap());
+            assert!(validate_pre_dispatch_provider_authority(
+                &store,
+                Some(&resolver),
+                Some(&expected),
+                expected.agent_id(),
+                &id,
+                &digest,
+                Some(&context),
+            )
+            .is_ok());
+            assert_eq!(
+                store.get_completion(&id).unwrap().unwrap().request_digest,
+                digest
+            );
+            let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+                "content": "review", "actions": [], "tokens_used": 7,
+                "request_id": expected.request_id(), "provider": expected.provider(),
+                "input_tokens": 5, "output_tokens": 2, "cache_read": 0, "cache_creation": 0,
+                "tier": "mid", "hierarchy_tier": 2, "cost_usd": 0.0,
+                "cost_source": "provider_reported", "effective_model": "mock/model"
+            }))
+            .unwrap();
+            assert!(validate_gateway_completion_authority(
+                Some(&resolver),
+                Some(&expected),
+                &response,
+                expected.agent_id(),
+            )
+            .is_ok());
+            assert_eq!(resolver.selection_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 3);
+            for result in [Ok(false), Err("exact authority unavailable")] {
+                resolver.result = result;
+                assert!(validate_gateway_completion_authority(
+                    Some(&resolver),
+                    Some(&expected),
+                    &response,
+                    expected.agent_id(),
+                )
+                .is_err());
+            }
+            assert_eq!(resolver.selection_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 5);
+        }
+
+        #[test]
+        fn unreserved_validation_rejects_false_error_and_wrong_agent_without_row_changes() {
+            let context: ModelWorkContext = crate::workflow_api::model_work::test_context().into();
+            let expected = context.binding();
+            let store = Arc::new(EventStore::open(":memory:").unwrap());
+            let active = Arc::new(Mutex::new(HashMap::new()));
+            let original = reserved_guard(&store, &active, "existing");
+            let pending = store.get_completion("existing").unwrap().unwrap();
+            let foreign_id = expected.request_id();
+            assert!(store
+                .reserve_request(&foreign_id, "foreign-digest", "AGENT-42")
+                .unwrap());
+            let foreign = store.get_completion(&foreign_id).unwrap().unwrap();
+            for result in [Ok(false), Err("exact authority unavailable")] {
+                let mut resolver = ExactValidationResolver::new(context.clone());
+                resolver.result = result;
+                let error = validate_unreserved_provider_authority(
+                    Some(&resolver),
+                    Some(&expected),
+                    expected.agent_id(),
+                    Some(&context),
+                )
+                .unwrap_err();
+                assert!(
+                    error.contains(if result.is_err() {
+                        "provider usage reauthorization failed: exact authority unavailable"
+                    } else {
+                        "provider usage authority changed"
+                    }),
+                    "{error}"
+                );
+                assert_eq!(store.get_completion("existing").unwrap().unwrap(), pending);
+                assert_eq!(store.get_completion(&foreign_id).unwrap().unwrap(), foreign);
+                assert_eq!(active.lock().unwrap().get("existing"), Some(&1));
+            }
+            let resolver = ExactValidationResolver::new(context);
+            assert!(validate_current_provider_usage_authority(
+                Some(&resolver),
+                Some(&expected),
+                AgentId(expected.agent_id().0 + 1),
+            )
+            .unwrap_err()
+            .contains("another agent"));
+            assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(store.get_completion("existing").unwrap().unwrap(), pending);
+            assert_eq!(store.get_completion(&foreign_id).unwrap().unwrap(), foreign);
+            drop(original);
+        }
+
+        #[test]
+        fn authority_validation_default_and_unbound_paths_remain_fail_closed() {
+            let resolver = StaticProviderUsageAuthority {
+                authority: ProviderUsageAuthority {
+                    tenant_id: "tenant-m0".into(),
+                    project_id: "project-m0".into(),
+                    work_item_id: "work-m0".into(),
+                    reservation_id: "reservation-m0".into(),
+                    assignment_id: "assignment-m0".into(),
+                    assignment_version: 1,
+                    agent_id: AgentId(7),
+                    provider: "local-loop".into(),
+                    subscription_grant: None,
+                },
+            };
+            let expected: ProviderExecutionAuthority = resolver.authority.clone().into();
+            assert_eq!(
+                resolver.validate_provider_usage_authority(&expected),
+                Ok(true)
+            );
+            let changed: ProviderExecutionAuthority = ProviderUsageAuthority {
+                assignment_version: 2,
+                ..resolver.authority.clone()
+            }
+            .into();
+            assert_eq!(
+                resolver.validate_provider_usage_authority(&changed),
+                Ok(false)
+            );
+            assert_eq!(
+                SelectionErrorResolver.validate_provider_usage_authority(&expected),
+                Err("selection unavailable")
+            );
+            assert!(validate_unreserved_provider_authority(
+                Some(&resolver),
+                None,
+                AgentId(7),
+                None,
+            )
+            .is_err());
+            assert!(validate_unreserved_provider_authority(
+                Some(&resolver),
+                None,
+                AgentId(8),
+                None,
+            )
+            .is_ok());
+            assert!(validate_unreserved_provider_authority(None, None, AgentId(7), None).is_ok());
+            assert!(validate_unreserved_provider_authority(
+                None,
+                Some(&expected),
+                AgentId(7),
+                None,
+            )
+            .is_err());
+            for authority in [None, Some(&expected)] {
+                assert!(validate_unreserved_provider_authority(
+                    Some(&SelectionErrorResolver),
+                    authority,
+                    AgentId(7),
+                    None,
+                )
+                .unwrap_err()
+                .contains("provider usage reauthorization failed: selection unavailable"));
+            }
+            let mut bound = ExactValidationResolver::new(
+                crate::workflow_api::model_work::test_context().into(),
+            );
+            bound.unbound_allowed = false;
+            assert_eq!(
+                validate_unreserved_provider_authority(Some(&bound), None, AgentId(7), None),
+                Err("provider work requires explicit authority".into())
+            );
+            assert_eq!(bound.selection_calls.load(Ordering::SeqCst), 0);
         }
 
         struct DispatchProofResolver {
@@ -5208,6 +5547,7 @@ pub mod bridge {
                 request_digest: &str,
                 agent_id: &str,
             ) -> anyhow::Result<bool> {
+                self.reservation_calls.fetch_add(1, Ordering::SeqCst);
                 self.inner
                     .reserve_llm_request(request_id, request_digest, agent_id)
             }
@@ -5399,6 +5739,123 @@ pub mod bridge {
         }
 
         #[tokio::test]
+        async fn queued_leadership_expiry_never_reserves_or_sends_http() {
+            let dir = tempfile::tempdir().unwrap();
+            let event_path = dir.path().join("events.sqlite");
+            let (_, mut review) = crate::workflow_api::adaptive_leadership_review::tests::fixture(
+                &dir.path().join("company.sqlite"),
+                &event_path,
+            );
+            review.binding.grant.max_duration_ms = 2_000;
+            review.binding.grant.expires_at_unix_ms = review.binding.issued_at_ms + 2_000;
+            let expires_at = review.binding.grant.expires_at_unix_ms;
+            let context = ModelWorkContext::AdaptiveLeadershipReview(Box::new(review));
+            context.validate_dispatch(unix_now_ms()).unwrap();
+            let expected = context.binding();
+            let resolver = Arc::new(ExactValidationResolver::new(context));
+            let store = Arc::new(FailFirstCompletionStore {
+                inner: EventStore::open(event_path.to_str().unwrap()).unwrap(),
+                reservation_calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_next_usage: AtomicBool::new(false),
+                append_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                failure_observed: Arc::new(tokio::sync::Notify::new()),
+            });
+            let state = Arc::new(
+                StateStore::open(dir.path().join("state.redb").to_str().unwrap()).unwrap(),
+            );
+            let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (gateway_url, provider_task) = start_mock_agent_provider(
+                Arc::clone(&provider_calls),
+                Some(Arc::clone(&observed)),
+                Some(Arc::clone(&release)),
+            )
+            .await;
+            let config = LlmBridgeConfig {
+                gateway_url,
+                credential: "test-credential".into(),
+                max_concurrent: 1,
+                request_timeout: Duration::from_secs(5),
+                shutdown_drain_timeout: Duration::from_secs(2),
+                min_ticks_between_calls: 0,
+                usage_v2_enabled: true,
+                completion_retry_interval: Duration::from_secs(3600),
+                provider_usage_authority: Some(resolver.clone()),
+                ..Default::default()
+            };
+            let (perception_tx, perception_rx) = mpsc::channel();
+            let (action_tx, _action_rx) = mpsc::channel();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let telemetry = Arc::new(BridgeTelemetry::default());
+            let bridge = tokio::spawn(run_llm_bridge_with_store(
+                config,
+                perception_rx,
+                action_tx,
+                Arc::clone(&telemetry),
+                state,
+                Arc::clone(&store),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
+                shutdown_rx,
+                Arc::new(RwLock::new(true)),
+            ));
+            let mut blocker = recovery_test_perception();
+            blocker.agent_id = if expected.agent_id() == AgentId(7) {
+                AgentId(8)
+            } else {
+                AgentId(7)
+            };
+            perception_tx.send(blocker).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), observed.notified())
+                .await
+                .expect("blocking provider request was not observed");
+            let mut queued = recovery_test_perception();
+            queued.agent_id = expected.agent_id();
+            queued.is_directly_addressed = true;
+            perception_tx.send(queued).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while telemetry.calls_total.load(Ordering::SeqCst) != 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("review did not reach semaphore admission");
+            assert!(
+                unix_now_ms() < expires_at,
+                "review expired before it was queued"
+            );
+            assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(store.reservation_calls.load(Ordering::SeqCst), 1);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while unix_now_ms() < expires_at {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("review did not expire within its bound");
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), resolver.checked.notified())
+                .await
+                .expect("queued review was not checked after capacity became available");
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), bridge)
+                .await
+                .expect("bridge did not drain")
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolver.validation_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(store.reservation_calls.load(Ordering::SeqCst), 1);
+            assert!(store
+                .get_completion(&expected.request_id())
+                .unwrap()
+                .is_none());
+            assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+            provider_task.abort();
+            drop(perception_tx);
+        }
+
+        #[tokio::test]
         async fn completed_response_survives_restart_without_provider_or_action_replay() {
             let dir = tempfile::tempdir().unwrap();
             let event_path = dir.path().join("events.db");
@@ -5419,6 +5876,7 @@ pub mod bridge {
             };
             let first_store = Arc::new(FailFirstCompletionStore {
                 inner: EventStore::open(event_path.to_str().unwrap()).unwrap(),
+                reservation_calls: std::sync::atomic::AtomicUsize::new(0),
                 fail_next_usage: AtomicBool::new(true),
                 append_calls: Arc::clone(&append_calls),
                 failure_observed: Arc::clone(&failure_observed),
@@ -5467,6 +5925,7 @@ pub mod bridge {
 
             let second_store = Arc::new(FailFirstCompletionStore {
                 inner: EventStore::open(event_path.to_str().unwrap()).unwrap(),
+                reservation_calls: std::sync::atomic::AtomicUsize::new(0),
                 fail_next_usage: AtomicBool::new(false),
                 append_calls: Arc::clone(&append_calls),
                 failure_observed,

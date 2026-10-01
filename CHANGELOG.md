@@ -1,5 +1,13 @@
 # Changelog
 
+- Reauthorize the exact selected leadership review independently of scheduling
+  order, preserving validation after its own dispatch. Recheck queued model
+  authority before creating a reservation, and reject dispatch callbacks
+  immediately during recovery instead of claiming after the caller times out
+  (#856). Permit an explicit, immutable operator extension of normal leadership
+  review capacity for the exact exhausted session head, without changing root
+  employee budgets, recovery epochs, effects or recorded spending.
+
 - Discover exact durable employee sessions and govern bounded leadership reviews
   without requiring the assigned developer's live process. Keep current lineage,
   revocation, observation and journal bindings while fresh employee execution and
