@@ -79,9 +79,10 @@ impl WorkflowApi {
     }
 
     fn claim_subscription_dispatch(&self, request: &DispatchRequest) -> Result<u64, &'static str> {
+        // A delayed claim could consume authority after the Gateway times out.
         let _fence = self
             .mutation_fence
-            .write()
+            .try_write()
             .map_err(|_| "workflow recovery active")?;
         let now_ms = now_unix_ms();
         if !self.enabled
@@ -211,9 +212,7 @@ impl WorkflowApi {
         else {
             return Err("leadership subject missing");
         };
-        let call = self
-            .leadership_review_for_agent(AgentId(request.agent_id))?
-            .ok_or("leadership grant unavailable")?;
+        let call = self.leadership_review_for_dispatch(AgentId(request.agent_id), *review_id)?;
         let grant = &call.grant;
         let expected_kind = match &grant.subject {
             None => None,
@@ -557,5 +556,165 @@ impl WorkflowApi {
         Ok(grant
             .expires_at_unix_ms
             .min(now_ms.saturating_add(grant.max_duration_ms)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::adaptive_leadership_review::{
+        tests::{discovery_state, fixture},
+        LeadershipContext,
+    };
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn reserved_leadership_request(
+        api: &WorkflowApi,
+        context: &LeadershipContext,
+    ) -> serde_json::Value {
+        let grant = &context.binding.grant;
+        let agent = grant.leadership_principal.agent_id.unwrap();
+        let request_id = format!("company-leadership-{}", grant.review_id);
+        let request_digest = "c".repeat(64);
+        api.event_store
+            .as_ref()
+            .unwrap()
+            .reserve_llm_request(&request_id, &request_digest, &agent.to_string())
+            .unwrap();
+        serde_json::json!({
+            "schema_version": 5,
+            "allowance_id": context.binding.allowance_id,
+            "agent_id": agent.0,
+            "request_id": request_id,
+            "request_digest": request_digest,
+            "context_digest": context.context_digest,
+            "provider": grant.provider,
+            "model": grant.model,
+            "catalog_digest": grant.catalog_digest,
+            "subject": {"kind": "adaptive_leadership_review", "review_id": grant.review_id},
+        })
+    }
+
+    #[test]
+    fn recovery_fence_denies_all_dispatch_schemas_immediately_without_writes_or_late_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, context) = fixture(&path, &events);
+        let request = reserved_leadership_request(&api, &context);
+        let api = Arc::new(api);
+        let before = discovery_state(&path, &events);
+        let recovery_api = Arc::clone(&api);
+        let fence = recovery_api.mutation_fence.write().unwrap();
+        let dispatch_api = Arc::clone(&api);
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut results = Vec::new();
+            for schema in 1..=5 {
+                let mut candidate = request.clone();
+                candidate["schema_version"] = serde_json::json!(schema);
+                candidate["subject"] = match schema {
+                    1 => serde_json::Value::Null,
+                    2 => serde_json::json!({
+                        "kind": "customer_request",
+                        "request_id": "request",
+                        "request_version": 1,
+                    }),
+                    3 => serde_json::json!({
+                        "kind": "adaptive_session",
+                        "session_id": context.binding.grant.session_id,
+                        "effect_id": Uuid::new_v4(),
+                        "session_version": 1,
+                    }),
+                    4 => serde_json::json!({
+                        "kind": "project_planning",
+                        "project_id": context.binding.grant.project_id,
+                        "project_version": 1,
+                    }),
+                    _ => request["subject"].clone(),
+                };
+                let body = serde_json::to_vec(&candidate).unwrap();
+                let decoded: DispatchRequest = serde_json::from_slice(&body).unwrap();
+                results.push((
+                    schema,
+                    dispatch_api.claim_subscription_dispatch(&decoded),
+                    dispatch_api.subscription_dispatch(&body),
+                ));
+            }
+            sender.send(results).unwrap();
+        });
+        let results = receiver.recv_timeout(Duration::from_secs(1));
+        let recovery_still_owns_fence = api.mutation_fence.try_read().is_err();
+        let while_fenced = discovery_state(&path, &events);
+        // Release and join before asserting so a blocking-lock regression cannot hang the suite.
+        drop(fence);
+        worker.join().unwrap();
+        let after_release = discovery_state(&path, &events);
+        let results = results.expect("dispatch must deny while recovery still owns the fence");
+        assert!(recovery_still_owns_fence);
+        for (schema, claim, response) in results {
+            assert_eq!(claim, Err("workflow recovery active"), "schema {schema}");
+            assert_eq!(response.status, 403, "schema {schema}");
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["code"], "subscription_dispatch_denied");
+        }
+        assert_eq!(while_fenced, before);
+        assert_eq!(after_release, before);
+    }
+
+    #[test]
+    fn leadership_callback_rejects_changed_bindings_without_writes_and_claims_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, context) = fixture(&path, &events);
+        let request = reserved_leadership_request(&api, &context);
+        let before = discovery_state(&path, &events);
+        for field in [
+            "allowance_id",
+            "request_id",
+            "request_digest",
+            "context_digest",
+            "provider",
+            "model",
+            "catalog_digest",
+            "/subject/review_id",
+            "/subject/review_kind",
+            "agent_id",
+        ] {
+            let mut changed = request.clone();
+            match field {
+                "/subject/review_id" => {
+                    changed["subject"]["review_id"] = serde_json::json!(Uuid::new_v4())
+                }
+                "/subject/review_kind" => {
+                    changed["subject"]["review_kind"] = serde_json::json!("unknown_model")
+                }
+                "agent_id" => changed["agent_id"] = serde_json::json!(u16::MAX),
+                _ => changed[field] = serde_json::json!("changed"),
+            }
+            assert_eq!(
+                api.subscription_dispatch(&serde_json::to_vec(&changed).unwrap())
+                    .status,
+                403,
+                "{field}"
+            );
+            assert_eq!(discovery_state(&path, &events), before, "{field}");
+        }
+        let body = serde_json::to_vec(&request).unwrap();
+        assert_eq!(api.subscription_dispatch(&body).status, 200);
+        let claimed = api
+            .store
+            .adaptive_leadership_review_call(
+                &context.binding.grant.leadership_principal.tenant_id,
+                context.binding.grant.review_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(claimed.dispatch.is_some());
+        let after_claim = discovery_state(&path, &events);
+        assert_eq!(api.subscription_dispatch(&body).status, 403);
+        assert_eq!(discovery_state(&path, &events), after_claim);
     }
 }

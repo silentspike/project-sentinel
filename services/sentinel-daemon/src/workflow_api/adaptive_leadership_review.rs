@@ -465,7 +465,26 @@ impl WorkflowApi {
                     continue;
                 }
             }
-            if session.model_window_exhausted_at(clock())
+            let now = clock();
+            let normal_budget = matches!(&session.cursor, AdaptiveCursorV1::ReadyForModel)
+                && session.model_window_exhausted_at(now);
+            let (global_review_limit, head_review_limit, extension_expiry) = if normal_budget {
+                self.store
+                    .budget_review_limits(
+                        &project.tenant_id,
+                        session.grant.session_id,
+                        session.version,
+                        now,
+                    )
+                    .map_err(|_| "budget review limits unavailable")?
+            } else {
+                (
+                    ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                    ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                    None,
+                )
+            };
+            if session.model_window_exhausted_at(now)
                 && self
                     .store
                     .adaptive_budget_window_limit_recorded(
@@ -474,11 +493,12 @@ impl WorkflowApi {
                         session.version,
                     )
                     .map_err(|_| "budget limit disposition unavailable")?
+                && extension_expiry.is_none()
             {
                 blocked = true;
                 continue;
             }
-            if session.model_window_exhausted_at(clock()) && calls.iter().any(|call| {
+            if session.model_window_exhausted_at(now) && calls.iter().any(|call| {
                 call.grant.schema_version == 3
                     && call.context.source_project == *project
                     && call.context.source_session == session
@@ -490,7 +510,7 @@ impl WorkflowApi {
             }
             let (reason_code, subject) = match &session.cursor {
                 AdaptiveCursorV1::Blocked { reason_code } => {
-                    let subject = (session.active_deadline_ms() <= clock()).then(|| {
+                    let subject = (session.active_deadline_ms() <= now).then(|| {
                         sentinel_workflow::AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
                             reason_code: reason_code.clone(),
                             resolution_event_id: None,
@@ -501,7 +521,7 @@ impl WorkflowApi {
                 AdaptiveCursorV1::BlockedResolved {
                     reason_code,
                     resolution_event_id,
-                } if session.active_deadline_ms() <= clock() => (
+                } if session.active_deadline_ms() <= now => (
                     reason_code.clone(),
                     Some(
                         sentinel_workflow::AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
@@ -511,7 +531,7 @@ impl WorkflowApi {
                     ),
                 ),
                 AdaptiveCursorV1::ModelUnknown { effect } => {
-                    if session.active_deadline_ms() > clock() {
+                    if session.active_deadline_ms() > now {
                         blocked = true;
                         continue;
                     }
@@ -530,7 +550,7 @@ impl WorkflowApi {
                         ),
                     )
                 }
-                AdaptiveCursorV1::ReadyForModel if session.model_window_exhausted_at(clock()) => {
+                AdaptiveCursorV1::ReadyForModel if normal_budget => {
                     let original = self
                         .store
                         .historical_adaptive_provider_project(
@@ -546,7 +566,7 @@ impl WorkflowApi {
                         .subscription_call
                         .as_ref()
                         .ok_or("budget current allowance missing")?;
-                    let observed_at_ms = clock();
+                    let observed_at_ms = now;
                     let budget = sentinel_workflow::AdaptiveBudgetWindowAuthorityV1 {
                         schema_version: 1,
                         root_allowance,
@@ -666,23 +686,17 @@ impl WorkflowApi {
                 &fingerprint,
             )
             .map_err(|_| "leadership identity invalid")?;
-            let normal_budget = matches!(
-                &subject,
-                Some(
-                    sentinel_workflow::AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. }
-                )
-            );
             let review_limit = (subject.is_some()
                 && calls
                     .iter()
                     .filter(|call| call.grant.schema_version == if normal_budget { 3 } else { 2 })
                     .count()
-                    >= ADAPTIVE_LEADERSHIP_MAX_REVIEWS)
+                    >= global_review_limit)
                 || calls
                     .iter()
                     .filter(|call| call.grant.expected_session_version == session.version)
                     .count()
-                    >= ADAPTIVE_LEADERSHIP_MAX_REVIEWS;
+                    >= head_review_limit;
             let budget_limit = normal_budget
                 && (review_limit
                     || session.model_calls >= session.grant.max_model_calls
@@ -690,7 +704,8 @@ impl WorkflowApi {
                         state.authorizations.len()
                             >= sentinel_workflow::ADAPTIVE_CONTINUATION_MAX_WINDOWS
                     }));
-            if calls.iter().any(|call| call.grant.review_id == id)
+            // Duplicate review identity must not suppress a system-policy receipt.
+            if (!budget_limit && calls.iter().any(|call| call.grant.review_id == id))
                 || (review_limit && !normal_budget)
             {
                 continue;
@@ -730,7 +745,9 @@ impl WorkflowApi {
                         })
                 })
                 .ok_or("accepted planning policy missing")?;
-            let now = clock();
+            let expires_at_unix_ms = now
+                .checked_add(300_000)
+                .ok_or("leadership clock overflow")?;
             let grant = AdaptiveLeadershipReviewGrantV1 {
                 schema_version: match &subject {
                     Some(sentinel_workflow::AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. }) => 3,
@@ -762,9 +779,8 @@ impl WorkflowApi {
                 catalog_digest: planning.grant.catalog_digest,
                 max_duration_ms: planning.grant.max_duration_ms.min(120_000),
                 token_policy: planning.grant.token_policy,
-                expires_at_unix_ms: now
-                    .checked_add(300_000)
-                    .ok_or("leadership clock overflow")?,
+                expires_at_unix_ms: extension_expiry
+                    .map_or(expires_at_unix_ms, |expiry| expires_at_unix_ms.min(expiry)),
             };
             let source = AdaptiveLeadershipReviewContextV1 {
                 source_project: project.clone(),
@@ -776,6 +792,18 @@ impl WorkflowApi {
                 .validate(&grant)
                 .map_err(|_| "leadership source invalid")?;
             if budget_limit {
+                // Extensions never rewrite the immutable baseline disposition.
+                if self
+                    .store
+                    .adaptive_budget_window_limit_recorded(
+                        &project.tenant_id,
+                        session.grant.session_id,
+                        session.version,
+                    )
+                    .map_err(|_| "budget limit disposition unavailable")?
+                {
+                    continue;
+                }
                 self.store
                     .record_adaptive_budget_window_limit(&leader.principal, &grant, &source, now)
                     .map_err(|_| "budget limit disposition rejected")?;
@@ -868,6 +896,7 @@ impl WorkflowApi {
         Ok(())
     }
 
+    // Scheduling only; dispatch admission must look up the exact review ID.
     pub(super) fn leadership_review_for_agent(
         &self,
         agent: AgentId,
@@ -908,6 +937,75 @@ impl WorkflowApi {
             }
         }
         Ok(None)
+    }
+
+    pub(super) fn leadership_review_for_dispatch(
+        &self,
+        agent: AgentId,
+        review_id: Uuid,
+    ) -> Result<AdaptiveLeadershipReviewCallV1, &'static str> {
+        let call = self.leadership_review_for_authority(agent, review_id)?;
+        if call.dispatch.is_some() {
+            return Err("leadership call is already dispatched");
+        }
+        Ok(call)
+    }
+
+    pub(super) fn leadership_review_for_authority(
+        &self,
+        agent: AgentId,
+        review_id: Uuid,
+    ) -> Result<AdaptiveLeadershipReviewCallV1, &'static str> {
+        let mut tenants = BTreeSet::new();
+        let mut selected = None;
+        for bound in self.principals.by_principal_id.values().filter(|bound| {
+            bound.principal.agent_id == Some(agent)
+                && bound.principal.kind == CompanyPrincipalKindV1::Agent
+                && matches!(
+                    bound.principal.role,
+                    CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+                )
+        }) {
+            if !tenants.insert(bound.principal.tenant_id.0.as_str()) {
+                continue;
+            }
+            let Some(call) = self
+                .store
+                .adaptive_leadership_review_call(&bound.principal.tenant_id, review_id)
+                .map_err(|_| "leadership call unavailable")?
+            else {
+                continue;
+            };
+            // Multiple registered identities may share a tenant. Match the call's
+            // exact registered identity, never whichever identity is iterated first.
+            let registered = self
+                .principals
+                .principal(&call.grant.leadership_principal.principal_id)
+                .ok_or("leadership principal missing")?;
+            if call.grant.review_id != review_id
+                || registered.principal.agent_id != Some(agent)
+                || registered.principal.kind != CompanyPrincipalKindV1::Agent
+                || !matches!(
+                    registered.principal.role,
+                    CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
+                )
+                || registered.principal.tenant_id != bound.principal.tenant_id
+                || call.grant.leadership_principal != registered.principal
+                || call.grant.leadership_authority != registered.execution_authority
+            {
+                return Err("leadership principal changed");
+            }
+            if selected.as_ref().is_some_and(|selected| selected != &call) {
+                return Err("leadership review identity is ambiguous");
+            }
+            selected = Some(call);
+        }
+        let call = selected.ok_or("leadership call missing")?;
+        if call.decision.is_some() || call.retired_at_unix_ms.is_some() {
+            return Err("leadership call is not active");
+        }
+        self.prepare_leadership_review(&LeadershipAuthority::from_call(&call))?;
+        Ok(call)
     }
 
     pub(super) fn prepare_leadership_review(
@@ -1609,6 +1707,7 @@ impl WorkflowApi {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::llm_bridge::bridge::ProviderUsageAuthorityResolver;
 
     pub(crate) fn reconcile_review_at(
         api: &WorkflowApi,
@@ -1631,6 +1730,457 @@ pub(crate) mod tests {
             )
             .unwrap()
             .unwrap()
+    }
+
+    fn authorize_review_extension(
+        api: &WorkflowApi,
+        session: &AdaptiveSessionV1,
+        now: u64,
+        expires: u64,
+    ) -> sentinel_workflow::AdaptiveBudgetReviewExtensionReceiptV1 {
+        let operator = &api.principals.principal("operator").unwrap().principal;
+        let request = api
+            .store
+            .budget_review_extension_draft(
+                operator,
+                &session.grant.authority.project_id,
+                session.grant.session_id,
+                Uuid::new_v4(),
+                1,
+                "operator-review-followup",
+                expires,
+                now,
+            )
+            .unwrap();
+        let (replayed, receipt) = api
+            .store
+            .authorize_budget_review_extension(operator, &request, now)
+            .unwrap();
+        assert!(!replayed);
+        assert_eq!(receipt.request, request);
+        receipt
+    }
+
+    fn review_history_time(api: &WorkflowApi, session: &AdaptiveSessionV1) -> u64 {
+        api.store
+            .adaptive_leadership_review_calls(
+                &session.grant.authority.tenant_id,
+                session.grant.session_id,
+            )
+            .unwrap()
+            .iter()
+            .map(|call| call.updated_at_unix_ms)
+            .max()
+            .unwrap()
+            .max(now_unix_ms())
+            + 10
+    }
+
+    #[test]
+    fn normal_budget_review_extension_reconciles_after_limit_with_finite_expiry() {
+        for duration in [1_000, 300_001] {
+            let (temp, api, session) =
+                super::super::budget_window_tests::exhausted_budget_review_fixture();
+            let tenant = &session.grant.authority.tenant_id;
+            let sid = session.grant.session_id;
+            let project = api
+                .store
+                .company_project(tenant, &session.grant.authority.project_id)
+                .unwrap()
+                .unwrap();
+            let limit_payloads = || {
+                let connection =
+                    sentinel_limbo::rusqlite::Connection::open(temp.path().join("company.sqlite"))
+                        .unwrap();
+                let mut query = connection
+                    .prepare(
+                        "SELECT payload FROM company_entities
+                         WHERE entity_kind='adaptive_budget_window_limit' ORDER BY entity_id",
+                    )
+                    .unwrap();
+                let rows = query
+                    .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                rows
+            };
+            let original_limit = limit_payloads();
+            assert_eq!(original_limit.len(), 1);
+            let old_calls = api
+                .store
+                .adaptive_leadership_review_calls(tenant, sid)
+                .unwrap();
+            assert_eq!(old_calls.len(), ADAPTIVE_LEADERSHIP_MAX_REVIEWS);
+            assert!(old_calls.iter().all(|call| call.grant.schema_version == 3
+                && call.retired_at_unix_ms.is_some()
+                && call.decision.is_none()));
+            let now = review_history_time(&api, &session);
+            let expires = now + duration;
+            authorize_review_extension(&api, &session, now, expires);
+            assert_eq!(
+                api.store
+                    .budget_review_limits(tenant, sid, session.version, now)
+                    .unwrap(),
+                (
+                    ADAPTIVE_LEADERSHIP_MAX_REVIEWS + 1,
+                    ADAPTIVE_LEADERSHIP_MAX_REVIEWS + 1,
+                    Some(expires),
+                )
+            );
+            let samples = std::cell::Cell::new(0);
+            {
+                let _fence = api.mutation_fence.write().unwrap();
+                assert!(api
+                    .reconcile_adaptive_leadership_reviews_with_clock(&project, || {
+                        let sample = samples.get();
+                        samples.set(sample + 1);
+                        now + sample
+                    })
+                    .unwrap());
+            }
+            assert_eq!(samples.get(), 1);
+            let calls = api
+                .store
+                .adaptive_leadership_review_calls(tenant, sid)
+                .unwrap();
+            assert_eq!(calls.len(), old_calls.len() + 1);
+            for original in &old_calls {
+                assert!(calls.contains(original));
+            }
+            let issued = calls
+                .iter()
+                .find(|call| call.retired_at_unix_ms.is_none())
+                .unwrap();
+            assert_eq!(issued.grant.schema_version, 3);
+            assert_eq!(issued.grant.expected_session_version, session.version);
+            assert_eq!(issued.grant_issued_at_unix_ms, now);
+            assert_eq!(issued.grant.expires_at_unix_ms, expires.min(now + 300_000));
+            let Some(sentinel_workflow::AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted {
+                budget,
+            }) = &issued.grant.subject
+            else {
+                panic!("expected normal budget review");
+            };
+            assert_eq!(budget.observed_at_ms, now);
+            api.store
+                .expire_adaptive_leadership_review_call(
+                    &issued.grant.leadership_principal,
+                    issued.grant.review_id,
+                    issued.version,
+                    issued.grant.expires_at_unix_ms,
+                )
+                .unwrap();
+            assert!(reconcile_review_at(
+                &api,
+                &project,
+                issued.grant.expires_at_unix_ms,
+            ));
+            assert_eq!(
+                api.store
+                    .adaptive_leadership_review_calls(tenant, sid)
+                    .unwrap()
+                    .len(),
+                calls.len(),
+            );
+            assert_eq!(limit_payloads(), original_limit);
+            assert!(api
+                .store
+                .adaptive_budget_window_limit_recorded(tenant, sid, session.version)
+                .unwrap());
+            assert_eq!(
+                api.store
+                    .adaptive_session(sid, &session.grant.authority)
+                    .unwrap(),
+                Some(session.clone()),
+            );
+            assert_eq!(
+                api.store
+                    .company_project(tenant, &project.project_id)
+                    .unwrap(),
+                Some(project.clone()),
+            );
+        }
+    }
+
+    #[test]
+    fn normal_budget_review_expired_extension_does_not_override_limit() {
+        let (temp, api, session) =
+            super::super::budget_window_tests::exhausted_budget_review_fixture();
+        let tenant = &session.grant.authority.tenant_id;
+        let sid = session.grant.session_id;
+        let project = api
+            .store
+            .company_project(tenant, &session.grant.authority.project_id)
+            .unwrap()
+            .unwrap();
+        let now = review_history_time(&api, &session);
+        let expires = now + 1_000;
+        let receipt = authorize_review_extension(&api, &session, now, expires);
+        assert!(
+            api.store
+                .budget_review_extension(tenant, sid, session.version)
+                .unwrap()
+                == Some(receipt.clone())
+        );
+        assert_eq!(
+            api.store
+                .budget_review_limits(tenant, sid, session.version, expires)
+                .unwrap(),
+            (
+                ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                None
+            ),
+        );
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let before = discovery_state(&path, &events);
+        assert!(reconcile_review_at(&api, &project, expires));
+        assert_eq!(discovery_state(&path, &events), before);
+        assert!(
+            api.store
+                .budget_review_extension(tenant, sid, session.version)
+                .unwrap()
+                == Some(receipt)
+        );
+        assert_eq!(
+            api.store
+                .adaptive_session(sid, &session.grant.authority)
+                .unwrap(),
+            Some(session.clone()),
+        );
+    }
+
+    #[test]
+    fn normal_budget_review_mixed_head_extension_preserves_original_limit_causes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events_path = temp.path().join("events.sqlite");
+        let (api, binding, _) =
+            super::super::model_work::configured_adaptive_test_api(&path, &events_path);
+        let tenant = &binding.grant.authority.tenant_id;
+        let sid = binding.grant.session_id;
+        let read_session = || {
+            api.store
+                .adaptive_session(sid, &binding.grant.authority)
+                .unwrap()
+                .unwrap()
+        };
+        let read_project = || {
+            api.store
+                .company_project(tenant, &binding.grant.authority.project_id)
+                .unwrap()
+                .unwrap()
+        };
+        let first_head = read_session();
+        let project = read_project();
+        seed_planning_receipt_with_catalog(&api, &path, &project, &first_head.grant.catalog_digest);
+        let issued_at = first_head.active_deadline_ms();
+        assert!(reconcile_review_at(&api, &project, issued_at));
+        let first = api
+            .store
+            .adaptive_leadership_review_calls(tenant, sid)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let context = LeadershipContext {
+            binding: LeadershipAuthority::from_call(&first),
+            context_digest: first.context_digest().unwrap(),
+            source: first.context.clone(),
+            private_observation: None,
+        };
+        // Synthetic, durably accounted Continue only; no provider or developer call.
+        let id = first.request_id();
+        let digest = "c".repeat(64);
+        api.event_store
+            .as_ref()
+            .unwrap()
+            .reserve_llm_request(
+                &id,
+                &digest,
+                &first
+                    .grant
+                    .leadership_principal
+                    .agent_id
+                    .unwrap()
+                    .to_string(),
+            )
+            .unwrap();
+        api.store
+            .claim_adaptive_leadership_review_call(
+                &first.grant.leadership_principal,
+                &sentinel_workflow::ClaimAdaptiveLeadershipReviewCallV1 {
+                    review_id: first.grant.review_id,
+                    allowance_id: first.allowance_id.clone(),
+                    request_id: id.clone(),
+                    request_digest: digest.clone(),
+                    context_digest: context.context_digest.clone(),
+                },
+                issued_at,
+            )
+            .unwrap();
+        let completion = ModelExecutionCompletion {
+            context: ModelExecutionContext::AdaptiveLeadershipReview(Box::new(context.clone())),
+            content: serde_json::json!({
+                "schema_version": 3,
+                "decision": {
+                    "kind": "continue",
+                    "rationale": "Bounded synthetic mixed-head fixture.",
+                    "evidence_refs": context.source.evidence_refs,
+                    "additional_model_calls": 1,
+                    "window_ms": 1_000,
+                },
+            })
+            .to_string(),
+            admissible: true,
+        };
+        persist(&api, &completion, &context, &id, &digest, true);
+        api.accept_leadership_review_at(&completion, &context, &id, &digest, issued_at)
+            .unwrap();
+        let session = read_session();
+        let project = read_project();
+        assert_ne!(session.version, first_head.version);
+        assert_eq!(session.grant, first_head.grant);
+        assert_eq!(session.model_calls, first_head.model_calls);
+        assert_eq!(
+            session.continuation.as_ref().unwrap().authorizations.len(),
+            1,
+        );
+        let mut now = session.active_deadline_ms();
+        for _ in 0..2 {
+            assert!(reconcile_review_at(&api, &project, now));
+            let call = api
+                .store
+                .adaptive_leadership_review_calls(tenant, sid)
+                .unwrap()
+                .into_iter()
+                .find(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none())
+                .unwrap();
+            api.store
+                .expire_adaptive_leadership_review_call(
+                    &call.grant.leadership_principal,
+                    call.grant.review_id,
+                    call.version,
+                    call.grant.expires_at_unix_ms,
+                )
+                .unwrap();
+            now = call.grant.expires_at_unix_ms + 1;
+        }
+        assert!(reconcile_review_at(&api, &project, now));
+        let limit_payload = || {
+            sentinel_limbo::rusqlite::Connection::open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM company_entities
+                     WHERE entity_kind='adaptive_budget_window_limit' AND tenant_id=?1",
+                    [&tenant.0],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .unwrap()
+        };
+        let original_limit = limit_payload();
+        let original: serde_json::Value = serde_json::from_slice(&original_limit).unwrap();
+        assert_eq!(original["causes"], serde_json::json!(["review_limit"]));
+        let expires = now + 300_001;
+        authorize_review_extension(&api, &session, now, expires);
+        assert_eq!(
+            api.store
+                .budget_review_limits(tenant, sid, session.version, now)
+                .unwrap(),
+            (4, 3, Some(expires)),
+        );
+        assert!(reconcile_review_at(&api, &project, now));
+        let call = api
+            .store
+            .adaptive_leadership_review_calls(tenant, sid)
+            .unwrap()
+            .into_iter()
+            .find(|call| call.decision.is_none() && call.retired_at_unix_ms.is_none())
+            .unwrap();
+        now = call.grant.expires_at_unix_ms;
+        assert!(now < expires);
+        api.store
+            .expire_adaptive_leadership_review_call(
+                &call.grant.leadership_principal,
+                call.grant.review_id,
+                call.version,
+                now,
+            )
+            .unwrap();
+        let calls = api
+            .store
+            .adaptive_leadership_review_calls(tenant, sid)
+            .unwrap();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.grant.expected_session_version == session.version)
+                .count(),
+            3,
+        );
+        let before = discovery_state(&path, &events_path);
+        // The baseline now has both causes; the original receipt must not be rewritten.
+        assert!(reconcile_review_at(&api, &project, now));
+        assert_eq!(discovery_state(&path, &events_path), before);
+        assert_eq!(limit_payload(), original_limit);
+        assert_eq!(read_session(), session);
+        assert_eq!(read_project(), project);
+    }
+
+    #[test]
+    fn normal_budget_review_stale_extension_does_not_override_limit() {
+        let (temp, api, session) =
+            super::super::budget_window_tests::exhausted_budget_review_fixture();
+        let tenant = &session.grant.authority.tenant_id;
+        let sid = session.grant.session_id;
+        let project = api
+            .store
+            .company_project(tenant, &session.grant.authority.project_id)
+            .unwrap()
+            .unwrap();
+        let now = review_history_time(&api, &session);
+        let receipt = authorize_review_extension(&api, &session, now, now + 300_000);
+        assert_eq!(
+            api.store
+                .budget_review_limits(tenant, sid, session.version + 1, now)
+                .unwrap(),
+            (
+                ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                None
+            ),
+        );
+        let changed = record_independent_decision(&api, &project);
+        assert_ne!(changed, project);
+        assert_eq!(
+            api.store
+                .budget_review_limits(tenant, sid, session.version, now)
+                .unwrap(),
+            (
+                ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                None
+            ),
+        );
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let before = discovery_state(&path, &events);
+        assert!(reconcile_review_at(&api, &changed, now));
+        assert_eq!(discovery_state(&path, &events), before);
+        assert!(
+            api.store
+                .budget_review_extension(tenant, sid, session.version)
+                .unwrap()
+                == Some(receipt)
+        );
+        assert_eq!(
+            api.store
+                .adaptive_session(sid, &session.grant.authority)
+                .unwrap(),
+            Some(session.clone()),
+        );
     }
 
     #[test]
@@ -2910,6 +3460,374 @@ pub(crate) mod tests {
         (api, context)
     }
 
+    #[test]
+    fn leadership_dispatch_exact_review_survives_scheduling_queue_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, _) = super::super::adaptive_recovery::tests::fixture(&path, &events, true);
+        let other = super::super::model_work::assign_test_work_from(&api, Some(8), 100);
+        let binding = api
+            .adaptive_provider_authority(other.agent_id)
+            .unwrap()
+            .unwrap();
+        let session = api
+            .store
+            .adaptive_session(binding.grant.session_id, &binding.grant.authority)
+            .unwrap()
+            .unwrap();
+        let effect = sentinel_workflow::AdaptiveEffectV1 {
+            id: binding.effect_id,
+            request_digest: "d".repeat(64),
+        };
+        let now = now_unix_ms();
+        let pending = api
+            .store
+            .advance_adaptive_session(
+                session.grant.session_id,
+                session.version,
+                Uuid::new_v4(),
+                &AdaptiveTransitionV1::ClaimModel {
+                    effect: effect.clone(),
+                    previous_observation_digest: None,
+                },
+                &session.grant.authority,
+                now,
+            )
+            .unwrap()
+            .1;
+        api.store
+            .advance_adaptive_session(
+                session.grant.session_id,
+                pending.version,
+                Uuid::new_v4(),
+                &AdaptiveTransitionV1::ResolveModel {
+                    effect,
+                    result_digest: "e".repeat(64),
+                    decision: sentinel_workflow::AdaptiveModelDecisionV1::Blocked {
+                        reason_code: "dependency_unavailable".into(),
+                    },
+                },
+                &session.grant.authority,
+                now,
+            )
+            .unwrap();
+        let projects = api.store.company_projects().unwrap();
+        assert_eq!(projects.len(), 2);
+        for project in &projects {
+            seed_planning_receipt(&api, &path, project);
+        }
+        let agent = api
+            .principals
+            .principal("pm")
+            .unwrap()
+            .principal
+            .agent_id
+            .unwrap();
+        assert!(reconcile_review_at(&api, &projects[1], now_unix_ms()));
+        let original = api.leadership_review_for_agent(agent).unwrap().unwrap();
+        assert_eq!(original.grant.project_id, projects[1].project_id);
+        assert_eq!(
+            api.leadership_review_for_dispatch(agent, original.grant.review_id),
+            Ok(original.clone())
+        );
+
+        // A newly eligible earlier project changes scheduling, not exact admission.
+        assert!(reconcile_review_at(&api, &projects[0], now_unix_ms()));
+        let scheduled = api.leadership_review_for_agent(agent).unwrap().unwrap();
+        assert_eq!(scheduled.grant.project_id, projects[0].project_id);
+        assert_ne!(scheduled.grant.review_id, original.grant.review_id);
+        let before = discovery_state(&path, &events);
+        for call in [&original, &scheduled] {
+            let expected = ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(
+                LeadershipAuthority::from_call(call),
+            ));
+            assert_eq!(
+                api.leadership_review_for_dispatch(agent, call.grant.review_id),
+                Ok(call.clone())
+            );
+            assert_eq!(api.validate_provider_usage_authority(&expected), Ok(true));
+        }
+        assert_eq!(discovery_state(&path, &events), before);
+
+        api.store
+            .claim_adaptive_leadership_review_call(
+                &original.grant.leadership_principal,
+                &sentinel_workflow::ClaimAdaptiveLeadershipReviewCallV1 {
+                    review_id: original.grant.review_id,
+                    allowance_id: original.allowance_id.clone(),
+                    request_id: original.request_id(),
+                    request_digest: "c".repeat(64),
+                    context_digest: original.context_digest().unwrap(),
+                },
+                now_unix_ms(),
+            )
+            .unwrap();
+        let dispatched = api
+            .store
+            .adaptive_leadership_review_call(
+                &original.grant.leadership_principal.tenant_id,
+                original.grant.review_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(dispatched.dispatch.is_some());
+        let expected = ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(
+            LeadershipAuthority::from_call(&original),
+        ));
+        let before = discovery_state(&path, &events);
+        assert_eq!(api.leadership_review_for_agent(agent), Ok(Some(scheduled)));
+        assert_eq!(
+            api.leadership_review_for_authority(agent, original.grant.review_id),
+            Ok(dispatched)
+        );
+        assert_eq!(api.validate_provider_usage_authority(&expected), Ok(true));
+        assert_eq!(
+            api.leadership_review_for_dispatch(agent, original.grant.review_id),
+            Err("leadership call is already dispatched")
+        );
+        assert_eq!(discovery_state(&path, &events), before);
+    }
+
+    #[test]
+    fn leadership_dispatch_rejects_missing_wrong_leader_and_changed_identity() {
+        for change in [
+            "missing_review",
+            "wrong_agent",
+            "missing_principal",
+            "principal_id",
+            "generation",
+            "execution_digest",
+            "execution_principal",
+            "role",
+            "kind",
+            "tenant",
+            "agent",
+            "stopped_leader",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("company.sqlite");
+            let events = temp.path().join("events.sqlite");
+            let (mut api, context) = fixture(&path, &events);
+            let leader = &context.binding.grant.leadership_principal;
+            let mut agent = leader.agent_id.unwrap();
+            let mut review_id = context.binding.grant.review_id;
+            if change == "missing_review" {
+                review_id = Uuid::new_v4();
+            } else if change == "wrong_agent" {
+                agent = context.binding.grant.assignee_authority.agent_id;
+            } else if change == "stopped_leader" {
+                stop_review_agent(&api, agent, false);
+            } else {
+                let mut principals = PrincipalAuthenticator {
+                    by_credential_digest: api.principals.by_credential_digest.clone(),
+                    by_principal_id: api.principals.by_principal_id.clone(),
+                };
+                if change == "missing_principal" {
+                    principals.by_principal_id.remove(&leader.principal_id);
+                } else {
+                    let bound = principals
+                        .by_principal_id
+                        .get_mut(&leader.principal_id)
+                        .unwrap();
+                    match change {
+                        "principal_id" => bound.principal.principal_id = "replacement-pm".into(),
+                        "generation" => bound.principal.authority_generation += 1,
+                        "execution_digest" => {
+                            bound.execution_authority.authority_digest = "d".repeat(64);
+                        }
+                        "execution_principal" => {
+                            bound.execution_authority.principal_id = "replacement-pm".into();
+                        }
+                        "role" => bound.principal.role = CompanyRoleV1::Developer,
+                        "kind" => bound.principal.kind = CompanyPrincipalKindV1::Customer,
+                        "tenant" => {
+                            bound.principal.tenant_id = TenantId::parse("other-tenant").unwrap();
+                        }
+                        "agent" => bound.principal.agent_id = Some(AgentId(99)),
+                        _ => panic!("unsupported leader change"),
+                    }
+                }
+                api.principals = Arc::new(principals);
+            }
+            let before = discovery_state(&path, &events);
+            assert!(
+                api.leadership_review_for_dispatch(agent, review_id)
+                    .is_err(),
+                "{change}"
+            );
+            let mut binding = context.binding.clone();
+            binding.grant.review_id = review_id;
+            binding.grant.leadership_principal.agent_id = Some(agent);
+            let expected = ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(binding));
+            assert!(
+                api.validate_provider_usage_authority(&expected).is_err(),
+                "{change}"
+            );
+            assert_eq!(discovery_state(&path, &events), before, "{change}");
+        }
+    }
+
+    #[test]
+    fn leadership_dispatch_rejects_nonfresh_expired_and_changed_context() {
+        for state in [
+            "dispatched",
+            "decided",
+            "retired",
+            "expired",
+            "project_changed",
+            "head_changed",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("company.sqlite");
+            let events = temp.path().join("events.sqlite");
+            let (api, context) = fixture(&path, &events);
+            let mut call = expiry_review(&api, &context);
+            let leader = &call.grant.leadership_principal;
+            let agent = leader.agent_id.unwrap();
+            let review_id = call.grant.review_id;
+            let now = now_unix_ms();
+            if matches!(state, "dispatched" | "decided") {
+                api.store
+                    .claim_adaptive_leadership_review_call(
+                        leader,
+                        &sentinel_workflow::ClaimAdaptiveLeadershipReviewCallV1 {
+                            review_id,
+                            allowance_id: call.allowance_id.clone(),
+                            request_id: call.request_id(),
+                            request_digest: "c".repeat(64),
+                            context_digest: call.context_digest().unwrap(),
+                        },
+                        now,
+                    )
+                    .unwrap();
+                if state == "decided" {
+                    api.store
+                        .complete_adaptive_leadership_review_call(
+                            leader,
+                            &CompleteAdaptiveLeadershipReviewCallV1 {
+                                review_id,
+                                allowance_id: call.allowance_id.clone(),
+                                request_digest: "c".repeat(64),
+                                model_response_digest: "d".repeat(64),
+                                decision: serde_json::from_str(
+                                    &make_completion(&context, "keep_blocked").content,
+                                )
+                                .unwrap(),
+                                resolution_event_id: None,
+                                continuation: None,
+                            },
+                            now,
+                        )
+                        .unwrap();
+                }
+            } else if matches!(state, "retired" | "project_changed") {
+                record_independent_decision(&api, &context.source.source_project);
+                if state == "retired" {
+                    api.store
+                        .retire_stale_adaptive_leadership_review_call(
+                            leader,
+                            review_id,
+                            call.version,
+                            now_unix_ms(),
+                        )
+                        .unwrap();
+                }
+            } else if state == "head_changed" {
+                let source = &call.context.source_session;
+                api.store
+                    .advance_adaptive_session(
+                        source.grant.session_id,
+                        source.version,
+                        Uuid::new_v4(),
+                        &AdaptiveTransitionV1::ResolveBlocked {
+                            expected_reason_code: "dependency_unavailable".into(),
+                            resolution_event_id: Uuid::new_v4().to_string(),
+                        },
+                        &source.grant.authority,
+                        now,
+                    )
+                    .unwrap();
+            } else {
+                // Fixture-only historical admission clock; retain the exact source.
+                call.created_at_unix_ms = now - 600_000;
+                call.grant_issued_at_unix_ms = call.created_at_unix_ms;
+                call.updated_at_unix_ms = call.created_at_unix_ms;
+                call.grant.expires_at_unix_ms = now - 300_000;
+                let payload = serde_json::to_vec(&call).unwrap();
+                let mut hash = Sha256::new();
+                hash.update(b"sentinel.workflow.company-entity-row.v1\0");
+                hash.update(serde_json::to_vec(&payload).unwrap());
+                let changed = sentinel_limbo::rusqlite::Connection::open(&path).unwrap().execute(
+                    "UPDATE company_entities SET payload=?3,payload_digest=?4 WHERE tenant_id=?1 AND entity_kind='adaptive_leadership_review_call' AND entity_id=?2",
+                    sentinel_limbo::rusqlite::params![call.grant.leadership_principal.tenant_id.0,
+                        call.review_key, payload, format!("{:x}", hash.finalize())],
+                ).unwrap();
+                assert_eq!(changed, 1);
+                assert_eq!(expiry_review(&api, &context), call);
+            }
+            let before = discovery_state(&path, &events);
+            assert!(
+                api.leadership_review_for_dispatch(agent, review_id)
+                    .is_err(),
+                "{state}"
+            );
+            let expected = ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(
+                if state == "expired" {
+                    LeadershipAuthority::from_call(&call)
+                } else {
+                    context.binding.clone()
+                },
+            ));
+            if state == "dispatched" {
+                assert_eq!(api.validate_provider_usage_authority(&expected), Ok(true));
+            } else {
+                assert!(
+                    api.validate_provider_usage_authority(&expected).is_err(),
+                    "{state}"
+                );
+            }
+            assert_eq!(discovery_state(&path, &events), before, "{state}");
+        }
+    }
+
+    #[test]
+    fn leadership_authority_validation_rejects_changed_expected_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (api, context) = fixture(&path, &events);
+        let before = discovery_state(&path, &events);
+        for change in [
+            "schema",
+            "reservation",
+            "allowance",
+            "issued",
+            "model",
+            "principal",
+        ] {
+            let mut binding = context.binding.clone();
+            match change {
+                "schema" => binding.schema_version += 1,
+                "reservation" => binding.reservation_id = Uuid::new_v4().to_string(),
+                "allowance" => binding.allowance_id = "wrong-allowance".into(),
+                "issued" => binding.issued_at_ms += 1,
+                "model" => binding.grant.model = "different-model".into(),
+                "principal" => {
+                    binding.grant.leadership_principal.principal_id = "wrong-pm".into();
+                }
+                _ => panic!("unsupported binding change"),
+            }
+            let expected = ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(binding));
+            assert_eq!(
+                api.validate_provider_usage_authority(&expected),
+                Ok(false),
+                "{change}"
+            );
+        }
+        assert_eq!(discovery_state(&path, &events), before);
+    }
+
     pub(crate) fn usage(context: &LeadershipContext) -> DomainEvent {
         let grant = &context.binding.grant;
         let agent = grant.leadership_principal.agent_id.unwrap();
@@ -3539,7 +4457,24 @@ pub(crate) mod tests {
                 api.review_sessions(&context.source.source_project).unwrap(),
                 vec![context.source.source_session.clone()]
             );
+            let leader = context.binding.grant.leadership_principal.agent_id.unwrap();
+            let review_id = context.binding.grant.review_id;
+            let expected = ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(
+                context.binding.clone(),
+            ));
+            assert_eq!(
+                LeadershipAuthority::from_call(
+                    &api.leadership_review_for_dispatch(leader, review_id)
+                        .unwrap(),
+                ),
+                context.binding
+            );
+            assert_eq!(api.validate_provider_usage_authority(&expected), Ok(true));
             let (id, digest) = reserve_and_claim(&api, &context);
+            assert_eq!(api.validate_provider_usage_authority(&expected), Ok(true));
+            assert!(api
+                .leadership_review_for_dispatch(leader, review_id)
+                .is_err());
             // Synthetic fixture response; no provider call or live model outcome.
             let completion = make_completion(&context, "keep_blocked");
             persist(&api, &completion, &context, &id, &digest, false);
@@ -3646,6 +4581,13 @@ pub(crate) mod tests {
                 let before = discovery_state(&path, &events_path);
                 assert!(
                     api.prepare_leadership_review(&context.binding).is_err(),
+                    "{change}"
+                );
+                let expected = ProviderExecutionAuthority::AdaptiveLeadershipReview(Box::new(
+                    context.binding.clone(),
+                ));
+                assert!(
+                    api.validate_provider_usage_authority(&expected).is_err(),
                     "{change}"
                 );
                 if let Some((completion, id, digest)) = dispatched {

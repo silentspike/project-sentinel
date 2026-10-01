@@ -1,6 +1,8 @@
 //! Authenticated M0 company workflow and productive Workbench integration.
 
 #[cfg(feature = "llm")]
+mod adaptive_budget_review_extension;
+#[cfg(feature = "llm")]
 mod adaptive_continuation;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/adaptive_continuation.rs"]
@@ -8,6 +10,9 @@ mod adaptive_continuation_tests;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/adaptive_tool_poll.rs"]
 mod adaptive_tool_poll_tests;
+#[cfg(all(test, feature = "llm"))]
+#[path = "workflow_api/tests/budget_review_extension.rs"]
+mod budget_review_extension_tests;
 
 #[cfg(feature = "llm")]
 pub(crate) mod adaptive_leadership_review;
@@ -111,6 +116,8 @@ pub const AGENT_COMMAND_PATH: &str = "/agent/workflow/commands";
 pub const WORK_CORRECTION_PATH: &str = "/agent/workflow/corrections";
 pub const ADAPTIVE_RECOVERY_PATH: &str = "/agent/workflow/adaptive-recovery";
 pub const ADAPTIVE_REVIEW_EPOCH_PATH: &str = "/operator/workflow/adaptive-review-epochs";
+pub const ADAPTIVE_BUDGET_REVIEW_EXTENSION_PATH: &str =
+    "/operator/workflow/adaptive-budget-review-extensions";
 pub const ADAPTIVE_LOCAL_ADOPTION_PATH: &str = "/operator/workflow/adaptive-local-adoptions";
 pub const SOURCE_REVIEW_PATH: &str = "/agent/workflow/source-reviews";
 pub const OPERATOR_PROJECT_PATH: &str = "/operator/workflow/projects";
@@ -3502,6 +3509,10 @@ impl WorkflowApi {
                 self.review_recovery_epoch(&principal, method, path, body)
             }
             #[cfg(feature = "llm")]
+            ("GET" | "POST", ADAPTIVE_BUDGET_REVIEW_EXTENSION_PATH) => {
+                self.budget_review_extension_http(&principal, method, path, body)
+            }
+            #[cfg(feature = "llm")]
             ("GET" | "POST", ADAPTIVE_LOCAL_ADOPTION_PATH) => {
                 self.local_adoption_http(&principal, method, path, body)
             }
@@ -5538,6 +5549,25 @@ impl crate::llm_bridge::bridge::ProviderUsageAuthorityResolver for WorkflowApi {
         self.subscription_allowance_id.is_none() && self.request_sales_tenant.is_none()
     }
 
+    fn validate_provider_usage_authority(
+        &self,
+        expected: &model_execution::ProviderExecutionAuthority,
+    ) -> Result<bool, &'static str> {
+        if let model_execution::ProviderExecutionAuthority::AdaptiveLeadershipReview(binding) =
+            expected
+        {
+            // Scheduling chooses work once; reauthorization follows its exact
+            // durable identity, including after the chosen dispatch commits.
+            let call =
+                self.leadership_review_for_authority(expected.agent_id(), binding.grant.review_id)?;
+            return Ok(
+                adaptive_leadership_review::LeadershipAuthority::from_call(&call) == **binding,
+            );
+        }
+        self.resolve_provider_usage_authority(expected.agent_id())
+            .map(|current| current.as_ref() == Some(expected))
+    }
+
     fn is_provider_usage_candidate(&self, agent_id: AgentId) -> Result<bool, &'static str> {
         if self.leadership_review_for_agent(agent_id)?.is_some() {
             return Ok(true);
@@ -5989,6 +6019,7 @@ fn is_workflow_path(path: &str) -> bool {
             | WORK_CORRECTION_PATH
             | ADAPTIVE_RECOVERY_PATH
             | ADAPTIVE_REVIEW_EPOCH_PATH
+            | ADAPTIVE_BUDGET_REVIEW_EXTENSION_PATH
             | ADAPTIVE_LOCAL_ADOPTION_PATH
             | SOURCE_REVIEW_PATH
             | REQUEST_PROVIDER_ABANDON_PATH
