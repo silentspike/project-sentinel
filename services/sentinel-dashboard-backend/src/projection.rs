@@ -144,7 +144,7 @@ fn room_occupants(db_path: &str, room_id: &str) -> Result<Vec<Value>, rusqlite::
     let conn = open_ro(db_path)?;
     let mut stmt = conn.prepare(
         "SELECT agent_id,name,status FROM agent_live_view \
-         WHERE current_room = ?1 AND status != 'despawned' ORDER BY agent_id",
+         WHERE current_room = ?1 AND status = 'active' AND in_transit = 0 ORDER BY agent_id",
     )?;
     let rows = stmt.query_map([room_id], |r| {
         Ok(json!({
@@ -430,6 +430,55 @@ mod tests {
         assert_eq!(rows[0]["active_chaos"][0], "coffee_spill");
         assert_eq!(rows[0]["active_smells"][0], "espresso");
         assert_eq!(rows[0]["last_event_id"], 99);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn room_occupants_query_only_returns_active_stationary_exact_room() {
+        let dir = std::env::temp_dir().join(format!("pdb-occupants-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("projection.db");
+        {
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE agent_live_view (agent_id INTEGER PRIMARY KEY,name TEXT NOT NULL,\
+                 status TEXT NOT NULL,current_room TEXT,in_transit INTEGER NOT NULL,transit_target TEXT);\
+                 INSERT INTO agent_live_view VALUES\
+                 (20,'Same name','active','kueche',0,NULL),\
+                 (10,'Same name','active','kueche',0,NULL),\
+                 (30,'Suspended','suspended','kueche',0,NULL),\
+                 (31,'Despawned','despawned','kueche',0,NULL),\
+                 (32,'Sleeping','sleeping','kueche',0,NULL),\
+                 (33,'Errored','errored','kueche',0,NULL),\
+                 (34,'Recovery','recovery_required','kueche',0,NULL),\
+                 (35,'Wrong case','Active','kueche',0,NULL),\
+                 (36,'No status','','kueche',0,NULL),\
+                 (40,'Departing','active','kueche',1,'lounge'),\
+                 (41,'Arriving','active','lounge',1,'kueche'),\
+                 (42,'Same-room transit','active','kueche',1,'kueche'),\
+                 (43,'Unlocated transit','active',NULL,1,'kueche'),\
+                 (50,'Other room','active','lounge',0,NULL),\
+                 (51,'Room prefix','active','kueche-extra',0,NULL),\
+                 (52,'Room case','active','Kueche',0,NULL),\
+                 (53,'Room whitespace','active','kueche ',0,NULL),\
+                 (54,'Unlocated','active',NULL,0,NULL);",
+            )
+            .unwrap();
+        }
+
+        let db_path = db.to_str().unwrap();
+        assert_eq!(
+            room_occupants(db_path, "kueche").unwrap(),
+            vec![
+                json!({"agent_id": 10, "name": "Same name", "status": "active"}),
+                json!({"agent_id": 20, "name": "Same name", "status": "active"}),
+            ]
+        );
+        assert_eq!(
+            room_occupants(db_path, "lounge").unwrap(),
+            vec![json!({"agent_id": 50, "name": "Other room", "status": "active"})]
+        );
+        assert!(room_occupants(db_path, "missing").unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
