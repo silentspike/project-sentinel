@@ -8,23 +8,24 @@ fn issuance_receipt(
     receipt: &AdaptiveBudgetReviewExtensionReceiptV1,
     replayed: bool,
 ) -> WorkflowHttpResponse {
-    json(
-        200,
-        &serde_json::json!({
-            "schema_version": 1,
-            "operation_id": receipt.request.operation_id,
-            "project_id": receipt.request.project_id,
-            "session_id": receipt.request.session_id,
-            "expected_session_version": receipt.request.expected_session_version,
-            "additional_reviews": receipt.request.additional_reviews,
-            "expires_at_unix_ms": receipt.request.expires_at_unix_ms,
-            "replayed": replayed,
-            "receipt_kind": "immutable_issuance",
-            "authority": "bounded_normal_leadership_reviews",
-            "model_decision_recorded": false,
-            "decision_state": "not_asserted_by_issuance_receipt"
-        }),
-    )
+    let mut value = serde_json::json!({
+        "schema_version": receipt.request.schema_version,
+        "operation_id": receipt.request.operation_id,
+        "project_id": receipt.request.project_id,
+        "session_id": receipt.request.session_id,
+        "expected_session_version": receipt.request.expected_session_version,
+        "additional_reviews": receipt.request.additional_reviews,
+        "expires_at_unix_ms": receipt.request.expires_at_unix_ms,
+        "replayed": replayed,
+        "receipt_kind": "immutable_issuance",
+        "authority": "bounded_normal_leadership_reviews",
+        "model_decision_recorded": false,
+        "decision_state": "not_asserted_by_issuance_receipt"
+    });
+    if let Some(prior) = receipt.request.prior_operation_id {
+        value["prior_operation_id"] = serde_json::json!(prior);
+    }
+    json(200, &value)
 }
 
 impl WorkflowApi {
@@ -73,6 +74,11 @@ impl WorkflowApi {
                 Err(error) => workflow_error(error),
             };
         }
+        let successor = match query_parameter(path, "successor") {
+            None | Some("false") => false,
+            Some("true") => true,
+            _ => return json_error(400, "invalid_input", "invalid successor selection", false),
+        };
         let project_id =
             match query_parameter(path, "project_id").and_then(|id| ProjectId::parse(id).ok()) {
                 Some(id) => id,
@@ -111,7 +117,9 @@ impl WorkflowApi {
             requested_version,
         ) {
             Ok(Some(receipt)) if receipt.request.project_id == project_id => {
-                return issuance_receipt(&receipt, true);
+                if !successor || receipt.request.schema_version == 2 {
+                    return issuance_receipt(&receipt, true);
+                }
             }
             Ok(Some(_)) => {
                 return json_error(403, "authority_conflict", "budget project mismatch", false)
@@ -130,20 +138,34 @@ impl WorkflowApi {
         let Some(expires) = now.checked_add(3_600_000) else {
             return workflow_error(workflow_unavailable());
         };
-        match self.store.budget_review_extension_draft(
-            &principal.principal,
-            &project_id,
-            session_id,
-            Uuid::new_v4(),
-            3,
-            "maintainer-model-budget-extension",
-            expires,
-            now,
-        ) {
+        let draft = if successor {
+            self.store.budget_review_extension_successor_draft(
+                &principal.principal,
+                &project_id,
+                session_id,
+                Uuid::new_v4(),
+                3,
+                "maintainer-model-budget-extension-successor",
+                expires,
+                now,
+            )
+        } else {
+            self.store.budget_review_extension_draft(
+                &principal.principal,
+                &project_id,
+                session_id,
+                Uuid::new_v4(),
+                3,
+                "maintainer-model-budget-extension",
+                expires,
+                now,
+            )
+        };
+        match draft {
             Ok(request) => json(
                 200,
                 &serde_json::json!({
-                    "schema_version": 1,
+                    "schema_version": request.schema_version,
                     "requires_explicit_submission": true,
                     "request": request,
                     "model_decision_recorded": false

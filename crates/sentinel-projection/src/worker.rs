@@ -119,7 +119,8 @@ impl ProjectionWorker {
             },
             || {
                 if *last_row_id > offset {
-                    self.event_store.update_offset(PROJECTION_NAME, *last_row_id)?;
+                    self.event_store
+                        .update_offset(PROJECTION_NAME, *last_row_id)?;
                 }
                 Ok(())
             },
@@ -1151,32 +1152,62 @@ mod tests {
     #[test]
     fn pending_batch_failure_rolls_back_presence_before_offset_mirroring() {
         let dir = tempdir().unwrap();
-        let event_store = Arc::new(EventStore::open(
-            dir.path().join("events.db").to_str().unwrap(),
-        ).unwrap());
-        append_event(&event_store, 1, &DomainEventPayload::AgentSpawned {
-            agent_id: AgentId(1),
-            name: "Test Agent".into(),
-            role: "QA".into(),
-            shift_set: 1,
-            room_id: "empfang".into(),
-        });
-        let mut worker = ProjectionWorker::new(Arc::clone(&event_store), ProjectionConfig {
-            db_path: dir.path().join("projection.db").to_string_lossy().into_owned(),
-            ..ProjectionConfig::default()
-        }).unwrap();
+        let event_store =
+            Arc::new(EventStore::open(dir.path().join("events.db").to_str().unwrap()).unwrap());
+        append_event(
+            &event_store,
+            1,
+            &DomainEventPayload::AgentSpawned {
+                agent_id: AgentId(1),
+                name: "Test Agent".into(),
+                role: "QA".into(),
+                shift_set: 1,
+                room_id: "empfang".into(),
+            },
+        );
+        let mut worker = ProjectionWorker::new(
+            Arc::clone(&event_store),
+            ProjectionConfig {
+                db_path: dir
+                    .path()
+                    .join("projection.db")
+                    .to_string_lossy()
+                    .into_owned(),
+                ..ProjectionConfig::default()
+            },
+        )
+        .unwrap();
         worker.handlers.push(Box::new(FailingHandler));
         assert!(worker.process_pending_batch().is_err());
         assert!(worker.read_store().get_agent(1).unwrap().is_none());
-        assert_eq!(worker.read_store().get_room("empfang").unwrap().unwrap().occupant_count, 0);
+        assert_eq!(
+            worker
+                .read_store()
+                .get_room("empfang")
+                .unwrap()
+                .unwrap()
+                .occupant_count,
+            0
+        );
         assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), None);
 
         worker.handlers.pop();
         assert_eq!(worker.process_pending_batch().unwrap(), 1);
         let projected = worker.read_store().get_agent(1).unwrap().unwrap();
         assert_eq!(projected.current_room.as_deref(), Some("empfang"));
-        assert_eq!(worker.read_store().get_room("empfang").unwrap().unwrap().occupant_count, 1);
-        assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), Some(projected.last_event_id));
+        assert_eq!(
+            worker
+                .read_store()
+                .get_room("empfang")
+                .unwrap()
+                .unwrap()
+                .occupant_count,
+            1
+        );
+        assert_eq!(
+            event_store.get_offset(PROJECTION_NAME).unwrap(),
+            Some(projected.last_event_id)
+        );
         assert_eq!(worker.process_pending_batch().unwrap(), 0);
     }
 
