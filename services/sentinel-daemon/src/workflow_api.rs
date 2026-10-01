@@ -5,6 +5,9 @@ mod adaptive_continuation;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/adaptive_continuation.rs"]
 mod adaptive_continuation_tests;
+#[cfg(all(test, feature = "llm"))]
+#[path = "workflow_api/tests/adaptive_tool_poll.rs"]
+mod adaptive_tool_poll_tests;
 #[cfg(feature = "llm")]
 pub(crate) mod adaptive_leadership_review;
 #[cfg(feature = "llm")]
@@ -1852,6 +1855,30 @@ impl AdaptiveModelPort for UnavailableAdaptiveModel {
 }
 
 impl WorkbenchExecutionAdapter {
+    fn adaptive_tool_was_started(
+        &self,
+        session: &AdaptiveSessionV1,
+        effect: &AdaptiveEffectV1,
+    ) -> Result<bool, WorkflowPortError> {
+        let (profile, digest) = self.authority.profile_for_binding(&session.grant.authority.profile_id)?;
+        let record = crate::workbench::read_workbench_invocation_status(
+            &effect.id.to_string(),
+            self.authority.as_ref(),
+            profile,
+            digest,
+        )
+        .map_err(|_| WorkflowPortError::Unavailable)?;
+        let Some(record) = record else {
+            return Ok(false);
+        };
+        if record.invocation_id != effect.id.to_string()
+            || record.request_digest != effect.request_digest
+        {
+            return Err(WorkflowPortError::AuthorityConflict);
+        }
+        Ok(record.state != WorkbenchInvocationState::Reserved)
+    }
+
     fn build_request(
         &self,
         pending: &PendingExecutionV1,
@@ -2144,10 +2171,17 @@ impl AdaptiveToolPort for WorkbenchExecutionAdapter {
         let authority: Arc<dyn WorkbenchAuthoritySource> = self.authority.clone();
         let update = match session.cursor {
             sentinel_workflow::AdaptiveCursorV1::ToolPending { .. } => {
-                self.exchange(|response| WorkbenchDispatchCommand::Submit {
+                let update = self.exchange(|response| WorkbenchDispatchCommand::Submit {
                     request: Box::new(request),
-                    authority,
+                    authority: Arc::clone(&authority),
                     response,
+                })?;
+                poll_executing_adaptive_tool(update, effect, || {
+                    self.exchange(|response| WorkbenchDispatchCommand::Poll {
+                        invocation_id: effect.id.to_string(),
+                        authority,
+                        response,
+                    })
                 })?
             }
             sentinel_workflow::AdaptiveCursorV1::ToolUnknown { .. } => {
@@ -2182,6 +2216,30 @@ impl AdaptiveToolPort for WorkbenchExecutionAdapter {
             observation_digest: observation.digest().to_owned(),
         })
     }
+}
+
+fn poll_executing_adaptive_tool(
+    update: crate::workbench::WorkbenchCoordinatorUpdate,
+    effect: &AdaptiveEffectV1,
+    poll: impl FnOnce() -> Result<crate::workbench::WorkbenchCoordinatorUpdate, WorkflowPortError>,
+) -> Result<crate::workbench::WorkbenchCoordinatorUpdate, WorkflowPortError> {
+    let validate = |update: &crate::workbench::WorkbenchCoordinatorUpdate| {
+        let record = update.records.last().ok_or(WorkflowPortError::UnknownOutcome)?;
+        if record.invocation_id != effect.id.to_string()
+            || record.request_digest != effect.request_digest
+        {
+            return Err(WorkflowPortError::AuthorityConflict);
+        }
+        Ok(record.state)
+    };
+    if validate(&update)? != WorkbenchInvocationState::Executing {
+        return Ok(update);
+    }
+    // Submit reserves or replays the exact effect; only Poll collects its
+    // running result. Repeating Submit alone can never leave Executing.
+    let polled = poll()?;
+    validate(&polled)?;
+    Ok(polled)
 }
 
 fn map_workbench_dispatch_error(error: anyhow::Error) -> WorkflowPortError {
