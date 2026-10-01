@@ -266,6 +266,7 @@ impl WorkflowApi {
         )
         .map_err(|_| "local adoption model response invalid")?;
         let expected = LeadershipContext {
+            private_observation: None,
             binding: LeadershipAuthority::from_call(&call),
             source: call.context.clone(),
             context_digest: call
@@ -692,6 +693,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let context = LeadershipContext {
+                private_observation: None,
                 binding: LeadershipAuthority::from_call(&epoch_call),
                 context_digest: epoch_call.context_digest().unwrap(),
                 source: epoch_call.context.clone(),

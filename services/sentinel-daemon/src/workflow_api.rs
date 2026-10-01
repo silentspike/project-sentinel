@@ -8,6 +8,7 @@ mod adaptive_continuation_tests;
 #[cfg(all(test, feature = "llm"))]
 #[path = "workflow_api/tests/adaptive_tool_poll.rs"]
 mod adaptive_tool_poll_tests;
+
 #[cfg(feature = "llm")]
 pub(crate) mod adaptive_leadership_review;
 #[cfg(feature = "llm")]
@@ -17,6 +18,9 @@ mod adaptive_recovery;
 mod adaptive_recovery_release;
 #[cfg(feature = "llm")]
 mod adaptive_review_epoch;
+#[cfg(all(test, feature = "llm"))]
+#[path = "workflow_api/tests/budget_window.rs"]
+mod budget_window_tests;
 mod delivery_intent;
 mod delivery_runtime;
 #[cfg(feature = "llm")]
@@ -1860,7 +1864,9 @@ impl WorkbenchExecutionAdapter {
         session: &AdaptiveSessionV1,
         effect: &AdaptiveEffectV1,
     ) -> Result<bool, WorkflowPortError> {
-        let (profile, digest) = self.authority.profile_for_binding(&session.grant.authority.profile_id)?;
+        let (profile, digest) = self
+            .authority
+            .profile_for_binding(&session.grant.authority.profile_id)?;
         let record = crate::workbench::read_workbench_invocation_status(
             &effect.id.to_string(),
             self.authority.as_ref(),
@@ -2224,7 +2230,10 @@ fn poll_executing_adaptive_tool(
     poll: impl FnOnce() -> Result<crate::workbench::WorkbenchCoordinatorUpdate, WorkflowPortError>,
 ) -> Result<crate::workbench::WorkbenchCoordinatorUpdate, WorkflowPortError> {
     let validate = |update: &crate::workbench::WorkbenchCoordinatorUpdate| {
-        let record = update.records.last().ok_or(WorkflowPortError::UnknownOutcome)?;
+        let record = update
+            .records
+            .last()
+            .ok_or(WorkflowPortError::UnknownOutcome)?;
         if record.invocation_id != effect.id.to_string()
             || record.request_digest != effect.request_digest
         {
