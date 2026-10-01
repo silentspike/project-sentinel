@@ -22,6 +22,79 @@ use std::collections::BTreeMap;
 
 const PRIVATE_CONTENT: &str = "PRIVATE-BUDGET-WINDOW-OBSERVATION";
 
+#[test]
+fn exact_pending_tool_authority_survives_process_exit_but_new_admission_does_not() {
+    let mut fixture = Fixture::root(false);
+    let now = now_unix_ms();
+    let request = fixture.claim_tool(now);
+    fixture.tools.reserve(&request, now).unwrap();
+    fixture
+        .tools
+        .mark_executing(&request.invocation_id, &request.input_digest, now)
+        .unwrap();
+    let record = fixture.tools.load(&request.invocation_id).unwrap().unwrap();
+    let authority = fixture.api.authority.as_ref().unwrap();
+    authority.runtime_health.write().unwrap().agents.clear();
+    assert!(authority.current_for_request(&request).is_err());
+    assert!(authority.current_for_record(&record).is_ok());
+    let adapter = fixture.api.workbench.as_ref().unwrap();
+    let effect = AdaptiveEffectV1 {
+        id: Uuid::parse_str(&request.invocation_id).unwrap(),
+        request_digest: request.input_digest.clone(),
+    };
+    let rebuilt = adapter
+        .build_adaptive_request(&fixture.session, &effect, &request.tool)
+        .unwrap();
+    assert_eq!(rebuilt.input_digest, request.input_digest);
+    let mut fresh = fixture.session.clone();
+    fresh.cursor = AdaptiveCursorV1::ReadyForTool {
+        tool: request.tool.clone(),
+        tool_digest: adaptive_tool_digest(&request.tool).unwrap(),
+    };
+    assert!(adapter
+        .build_adaptive_request(&fresh, &effect, &request.tool)
+        .is_err());
+    let mut foreign = record.clone();
+    foreign.project_id = "project-foreign".to_owned();
+    assert!(authority.current_for_record(&foreign).is_err());
+    let mut revoked = record;
+    revoked.caller_id = "revoked-principal".to_owned();
+    assert!(authority.current_for_record(&revoked).is_err());
+}
+
+#[test]
+fn committed_private_tool_observation_is_readable_without_a_live_process() {
+    let mut fixture = Fixture::root(false);
+    let now = now_unix_ms();
+    let request = fixture.claim_tool(now);
+    fixture.observe_tool(&request, now, now);
+    fixture
+        .api
+        .authority
+        .as_ref()
+        .unwrap()
+        .runtime_health
+        .write()
+        .unwrap()
+        .agents
+        .clear();
+    let observation = fixture.private_observation(&request.invocation_id);
+    observation
+        .validate(&request.invocation_id, &request.input_digest)
+        .unwrap();
+    assert_eq!(
+        fixture.read().last_observation.unwrap().observation_digest,
+        observation.digest()
+    );
+    assert!(fixture
+        .api
+        .authority
+        .as_ref()
+        .unwrap()
+        .current_for_request(&request)
+        .is_err());
+}
+
 struct Fixture {
     api: WorkflowApi,
     session: AdaptiveSessionV1,

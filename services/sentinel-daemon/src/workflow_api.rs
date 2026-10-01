@@ -858,9 +858,16 @@ impl CompanyAuthority {
         project_id: &ProjectId,
         work_item_id: &WorkItemId,
         agent_id: AgentId,
+        require_serving_state: bool,
     ) -> anyhow::Result<WorkbenchAuthoritySnapshot> {
         let runtime = self
-            .snapshot(tenant_id, project_id, work_item_id, agent_id)
+            .snapshot_for_admission(
+                tenant_id,
+                project_id,
+                work_item_id,
+                agent_id,
+                require_serving_state,
+            )
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let principal = self
             .principals
@@ -1158,6 +1165,7 @@ impl WorkbenchAuthoritySource for CompanyAuthority {
             &ProjectId::parse(&request.project_id)?,
             &WorkItemId::parse(&request.work_item_id)?,
             request.agent_id,
+            true,
         )
     }
 
@@ -1174,6 +1182,7 @@ impl WorkbenchAuthoritySource for CompanyAuthority {
             &ProjectId::parse(&record.project_id)?,
             &WorkItemId::parse(&record.work_item_id)?,
             record.agent_id,
+            false,
         )
     }
 }
@@ -2066,11 +2075,17 @@ impl WorkbenchExecutionAdapter {
         effect: &AdaptiveEffectV1,
         tool: &WorkbenchTool,
     ) -> Result<WorkbenchRequest, WorkflowPortError> {
-        let authority = self.authority.snapshot(
+        let require_serving_state = !matches!(
+            session.cursor,
+            sentinel_workflow::AdaptiveCursorV1::ToolPending { .. }
+                | sentinel_workflow::AdaptiveCursorV1::ToolUnknown { .. }
+        );
+        let authority = self.authority.snapshot_for_admission(
             &session.grant.authority.tenant_id,
             &session.grant.authority.project_id,
             &session.grant.authority.work_item_id,
             session.grant.authority.agent_id,
+            require_serving_state,
         )?;
         if authority != session.grant.authority {
             return Err(WorkflowPortError::AuthorityConflict);
@@ -2177,11 +2192,21 @@ impl AdaptiveToolPort for WorkbenchExecutionAdapter {
         let authority: Arc<dyn WorkbenchAuthoritySource> = self.authority.clone();
         let update = match session.cursor {
             sentinel_workflow::AdaptiveCursorV1::ToolPending { .. } => {
-                let update = self.exchange(|response| WorkbenchDispatchCommand::Submit {
-                    request: Box::new(request),
-                    authority: Arc::clone(&authority),
-                    response,
-                })?;
+                // An existing effect is polled without admitting a new process.
+                // Reserved/missing effects still use Submit's serving-state gate.
+                let update = if self.adaptive_tool_was_started(session, effect)? {
+                    self.exchange(|response| WorkbenchDispatchCommand::Poll {
+                        invocation_id: effect.id.to_string(),
+                        authority: Arc::clone(&authority),
+                        response,
+                    })?
+                } else {
+                    self.exchange(|response| WorkbenchDispatchCommand::Submit {
+                        request: Box::new(request),
+                        authority: Arc::clone(&authority),
+                        response,
+                    })?
+                };
                 poll_executing_adaptive_tool(update, effect, || {
                     self.exchange(|response| WorkbenchDispatchCommand::Poll {
                         invocation_id: effect.id.to_string(),

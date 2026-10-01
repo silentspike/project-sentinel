@@ -1052,6 +1052,73 @@ pub(crate) mod continuation_tests {
         ready
     }
 
+    #[test]
+    fn expired_tool_unknown_observation_preserves_nonempty_continuation_history() {
+        let source = unknown();
+        let ready = continue_with(&source, authorization(&source)).unwrap();
+        let tool = WorkbenchTool::InspectFile {
+            path: "src/main.rs".into(),
+            max_bytes: 1024,
+        };
+        let tool_digest = adaptive_tool_digest(&tool).unwrap();
+        let commands = [
+            AdaptiveTransitionV1::ClaimModel {
+                effect: effect(103),
+                previous_observation_digest: None,
+            },
+            AdaptiveTransitionV1::ResolveModel {
+                effect: effect(103),
+                result_digest: "a".repeat(64),
+                decision: AdaptiveModelDecisionV1::Tool {
+                    tool,
+                    tool_digest: tool_digest.clone(),
+                },
+            },
+            AdaptiveTransitionV1::ClaimTool {
+                effect: effect(104),
+                tool_digest,
+            },
+            AdaptiveTransitionV1::MarkUnknown {
+                effect: effect(104),
+            },
+        ];
+        let mut unknown = ready;
+        for (index, command) in commands.iter().enumerate() {
+            unknown = unknown
+                .transition(command, NOW + 1_001 + index as u64)
+                .unwrap();
+        }
+        assert!(unknown.requires_fresh_observation());
+        assert_eq!(
+            unknown.continuation.as_ref().unwrap().authorizations.len(),
+            1
+        );
+        let observation = AdaptiveObservationRefV1 {
+            effect: effect(104),
+            observation_digest: "b".repeat(64),
+        };
+        let observed_at = unknown.active_deadline_ms() + 1;
+        let adopted = unknown
+            .transition(
+                &AdaptiveTransitionV1::ObserveTool {
+                    observation: observation.clone(),
+                },
+                observed_at,
+            )
+            .unwrap();
+        let mut expected = unknown.clone();
+        expected.cursor = AdaptiveCursorV1::ReadyForModel;
+        expected.version += 1;
+        expected.updated_at_ms = observed_at;
+        expected.last_observation = Some(observation);
+        expected.continuation.as_mut().unwrap().observation_required = false;
+        assert_eq!(adopted, expected);
+        assert_eq!(
+            adopted.continuation.as_ref().unwrap().authorizations,
+            unknown.continuation.as_ref().unwrap().authorizations
+        );
+    }
+
     fn budget_authorization(
         source: &AdaptiveSessionV1,
         id: u128,
