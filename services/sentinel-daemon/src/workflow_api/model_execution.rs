@@ -936,7 +936,7 @@ impl WorkflowApi {
         ) else {
             return Ok(false);
         };
-        let session = match self.core.adaptive_session_for_authority(&current) {
+        let session = match self.store.adaptive_session_for_authority(&current) {
             Ok(Some(session)) => session,
             Ok(None) => return Ok(false),
             Err(error) if error.code == WorkflowErrorCode::AuthorityConflict => return Ok(false),
@@ -1123,7 +1123,7 @@ impl WorkflowApi {
             )
             .map_err(|_| "adaptive runtime authority unavailable")?;
         let session = self
-            .core
+            .store
             .adaptive_session_for_authority(&current)
             .map_err(|_| "adaptive continuation head unavailable")?;
         if session.as_ref().is_some_and(|session| {
@@ -1154,7 +1154,7 @@ impl WorkflowApi {
             )
             .map_err(|_| "adaptive runtime authority unavailable")?;
         let Some(session) = self
-            .core
+            .store
             .adaptive_session_for_authority(&current)
             .map_err(|_| "adaptive queue session unavailable")?
         else {
@@ -1178,7 +1178,7 @@ impl WorkflowApi {
             let rejected = matches!(session.version, 3 | 4)
                 && matches!(session.cursor, AdaptiveCursorV1::ModelRejected { .. });
             let corrections_available = if rejected {
-                self.core
+                self.store
                     .adaptive_recovery_feedback(&current)
                     .map_err(|_| "adaptive recovery lineage unavailable")?
                     .is_some_and(|feedback| {
@@ -1321,7 +1321,7 @@ impl WorkflowApi {
             .snapshot_for_admission(&tenant, &project_id, &work_item_id, agent_id, false)
             .map_err(|_| "adaptive runtime authority unavailable")?;
         let existing = self
-            .core
+            .store
             .adaptive_session_for_authority(&current)
             .map_err(|_| "adaptive continuation head unavailable")?;
         if existing.as_ref().is_some_and(|session| {
@@ -1367,11 +1367,8 @@ impl WorkflowApi {
             created_at_ms: allowance.created_at_unix_ms,
             deadline_ms: subscription.expires_at_unix_ms,
         };
-        let mut session = match existing.filter(|session| {
-            session.continuation.is_some()
-                && session.active_provider_allowance_id() == allowance.allowance_id
-        }) {
-            Some(session) => {
+        let mut session = match existing {
+            Some(session) if session.continuation.is_some() => {
                 let effective = session.effective_grant();
                 if effective.authority != current
                     || effective.provider_authority_digest != grant.provider_authority_digest
@@ -1386,7 +1383,10 @@ impl WorkflowApi {
                 }
                 session
             }
-            None => {
+            // Exact existing effects are discovered under independently current
+            // lineage authority. New/replacement grants still require serving duty.
+            Some(session) if session.grant == grant => session,
+            _ => {
                 self.core
                     .begin_adaptive_session(&grant, allowance.created_at_unix_ms)
                     .map_err(|_| "adaptive session unavailable")?
@@ -4052,7 +4052,7 @@ impl WorkflowApi {
                 )
                 .map_err(|_| "adaptive renewal authority unavailable")?;
             if self
-                .core
+                .store
                 .adaptive_session_for_authority(&authority)
                 .map_err(|_| "adaptive renewal head unavailable")?
                 .is_some_and(|session| session.continuation.is_some())
