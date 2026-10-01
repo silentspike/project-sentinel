@@ -72,6 +72,8 @@ const NON_AGENT_EVENT_TYPES: &[&str] = &[
 
 const ROOM_EVENT_TYPES: &[&str] = &[
     "agent_spawned",
+    "agent_status_changed",
+    "bio_state_updated",
     "transit_started",
     "transit_completed",
     "chaos_triggered",
@@ -544,6 +546,41 @@ mod tests {
         assert!(should_skip_read(0));
         assert!(!should_skip_read(1));
         assert!(!should_skip_read(43));
+    }
+
+    #[test]
+    fn status_and_bio_events_refresh_agents_and_rooms_without_kpi() {
+        for event_type in ["agent_status_changed", "bio_state_updated"] {
+            assert_eq!(
+                classify(event_type),
+                DirtyModels {
+                    agents: true,
+                    rooms: true,
+                    kpi: false,
+                },
+                "{event_type} must refresh on-site room presence"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_status_and_bio_events_coalesce_into_one_dirty_set() {
+        let mut dirty = DirtyModels::default();
+        assert!(dirty.is_clean());
+        for _ in 0..1_000 {
+            dirty.merge(classify("bio_state_updated"));
+            dirty.merge(classify("agent_status_changed"));
+        }
+        assert_eq!(
+            dirty,
+            DirtyModels {
+                agents: true,
+                rooms: true,
+                kpi: false,
+            }
+        );
+        dirty = DirtyModels::default();
+        assert!(dirty.is_clean());
     }
 
     #[test]

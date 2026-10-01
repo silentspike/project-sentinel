@@ -263,31 +263,15 @@ impl ReadModelStore {
             }
         }
 
-        // Startup-Cleanup: Stale Transits zuruecksetzen.
-        // Nach Daemon-Crash/-Restart kann die Projection in_transit=1 Zeilen enthalten,
-        // fuer die kein TransitCompleted Event geschrieben wurde. Der ECS-State (SSOT)
-        // hat nach Restore keine stale Transits — die Projection muss nachziehen.
-        let stale_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM agent_live_view WHERE in_transit = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        if stale_count > 0 {
-            conn.execute(
-                "UPDATE agent_live_view SET in_transit = 0, transit_target = NULL WHERE in_transit = 1",
-                [],
-            )?;
-            info!(stale_count, "Stale Transits in Projection zurueckgesetzt");
-        }
-
         bootstrap_projection_watermark(&conn)?;
 
-        info!(path, "ReadModelStore opened");
-        Ok(Self {
+        let store = Self {
             conn: Arc::new(Mutex::new(conn)),
-        })
+        };
+        // Repair derived aggregates, not the event-projected agent presence.
+        store.reconcile_room_presence()?;
+        info!(path, "ReadModelStore opened");
+        Ok(store)
     }
 
     /// Oeffnet eine existierende Read-Model-Datenbank schreibgeschuetzt.
@@ -308,17 +292,16 @@ impl ReadModelStore {
     /// Initialisiert Room-Rows fuer alle bekannten Raeume.
     /// INSERT OR IGNORE — existierende Rows werden nicht ueberschrieben.
     pub fn initialize_rooms(&self, room_ids: &[&str]) -> anyhow::Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        let now_ms = now_ms();
-        for room_id in room_ids {
-            conn.execute(
-                "INSERT OR IGNORE INTO room_live_view (room_id, occupant_count, transit_count, updated_at) VALUES (?1, 0, 0, ?2)",
-                params![room_id, now_ms],
-            )?;
-        }
+        self.transaction(|txn| {
+            let now_ms = now_ms();
+            for room_id in room_ids {
+                txn.guard.execute(
+                    "INSERT OR IGNORE INTO room_live_view (room_id, occupant_count, transit_count, updated_at) VALUES (?1, 0, 0, ?2)",
+                    params![room_id, now_ms],
+                )?;
+            }
+            txn.reconcile_room_presence()
+        })?;
         info!(rooms = room_ids.len(), "Rooms initialized");
         Ok(())
     }
@@ -395,25 +378,14 @@ impl ReadModelStore {
         Ok(())
     }
 
-    /// Recomputes occupant_count from agent_live_view (post-rebuild consistency).
-    ///
-    /// Delta-based counting drifts when the event stream has gaps (daemon restarts
-    /// without despawn events). This sets occupant_count = COUNT of active agents
-    /// currently assigned to each room — the ground truth.
+    /// Reconciles both room counters from active projected presence in one transaction.
+    pub fn reconcile_room_presence(&self) -> anyhow::Result<()> {
+        self.transaction(|txn| txn.reconcile_room_presence())
+    }
+
+    /// Compatibility entry point for post-rebuild presence reconciliation.
     pub fn recompute_occupant_counts(&self) -> anyhow::Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        conn.execute_batch(
-            "UPDATE room_live_view SET occupant_count = (
-                SELECT COUNT(*) FROM agent_live_view
-                WHERE agent_live_view.current_room = room_live_view.room_id
-                  AND agent_live_view.status = 'active'
-            )",
-        )?;
-        info!("Occupant counts recomputed from agent_live_view");
-        Ok(())
+        self.reconcile_room_presence()
     }
 
     /// Startet eine Transaktion fuer Batch-Verarbeitung.
@@ -1012,6 +984,32 @@ impl<'a> ReadModelTransaction<'a> {
 
     // ── agent_live_view ──
 
+    /// Projects the complete spawn presence with one agent-row watermark check.
+    pub fn upsert_agent_presence(
+        &self,
+        agent_id: u16,
+        name: &str,
+        role: &str,
+        shift_set: u8,
+        room_id: &str,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "INSERT INTO agent_live_view
+               (agent_id, name, role, shift_set, status, current_room, in_transit,
+                transit_target, last_event_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, 0, NULL, ?6, ?7)
+             ON CONFLICT(agent_id) DO UPDATE SET
+               name = excluded.name, role = excluded.role, shift_set = excluded.shift_set,
+               status = excluded.status, current_room = excluded.current_room,
+               in_transit = excluded.in_transit, transit_target = excluded.transit_target,
+               last_event_id = excluded.last_event_id, updated_at = excluded.updated_at
+             WHERE excluded.last_event_id > agent_live_view.last_event_id",
+            params![agent_id, name, role, shift_set, room_id, row_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// UPSERT: Agent spawned oder aktualisiert.
     /// Idempotent: nur wenn row_id > last_event_id.
     pub fn upsert_agent(
@@ -1189,6 +1187,25 @@ impl<'a> ReadModelTransaction<'a> {
     }
 
     // ── room_live_view ──
+
+    /// Presence is derived after the agent handler, independently of room metadata watermarks.
+    pub fn reconcile_room_presence(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.active.get(), "room presence reconciliation requires a transaction");
+        self.guard.execute_batch(
+            "UPDATE room_live_view SET
+               occupant_count = (
+                 SELECT COUNT(*) FROM agent_live_view
+                 WHERE status = 'active' AND in_transit = 0
+                   AND current_room = room_live_view.room_id
+               ),
+               transit_count = (
+                 SELECT COUNT(*) FROM agent_live_view
+                 WHERE status = 'active' AND in_transit = 1
+                   AND transit_target = room_live_view.room_id
+               )",
+        )?;
+        Ok(())
+    }
 
     /// Raum-Belegung aendern (delta: +1 oder -1).
     pub fn update_room_occupancy(
@@ -1655,6 +1672,237 @@ mod tests {
 
         // Idempotent: nochmal initialisieren aendert nichts
         store.initialize_rooms(&["empfang", "kueche"]).unwrap();
+    }
+
+    #[test]
+    fn atomic_spawn_presence_replays_and_respawns_without_counter_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReadModelStore::open(dir.path().join("presence.db").to_str().unwrap()).unwrap();
+        store.initialize_rooms(&["empfang", "kueche"]).unwrap();
+        store.transaction(|txn| {
+            txn.upsert_agent_presence(1, "Agent", "QA", 1, "empfang", 10)?;
+            txn.upsert_agent_presence(1, "Duplicate", "Developer", 2, "kueche", 10)?;
+            txn.reconcile_room_presence()
+        }).unwrap();
+        let agent = store.get_agent(1).unwrap().unwrap();
+        assert_eq!(agent.name, "Agent");
+        assert_eq!(agent.current_room.as_deref(), Some("empfang"));
+        assert_eq!(agent.last_event_id, 10);
+        assert_eq!(store.get_room("empfang").unwrap().unwrap().occupant_count, 1);
+        assert_eq!(store.get_room("kueche").unwrap().unwrap().occupant_count, 0);
+
+        store.transaction(|txn| {
+            txn.update_agent_status(1, "despawned", 11)?;
+            txn.upsert_agent_presence(1, "Respawned", "QA", 1, "kueche", 12)?;
+            txn.update_agent_transit_start(1, "kueche", "empfang", 13)?;
+            txn.upsert_agent_presence(1, "Stale", "QA", 1, "kueche", 12)?;
+            txn.reconcile_room_presence()
+        }).unwrap();
+        let agent = store.get_agent(1).unwrap().unwrap();
+        assert_eq!(agent.name, "Respawned");
+        assert!(agent.in_transit);
+        assert_eq!(agent.transit_target.as_deref(), Some("empfang"));
+        assert_eq!(store.get_room("kueche").unwrap().unwrap().occupant_count, 0);
+        assert_eq!(store.get_room("empfang").unwrap().unwrap().transit_count, 1);
+
+        store.transaction(|txn| {
+            txn.upsert_agent_presence(1, "Relocated", "QA", 1, "empfang", 14)?;
+            txn.reconcile_room_presence()
+        }).unwrap();
+        let agent = store.get_agent(1).unwrap().unwrap();
+        assert_eq!(agent.status, "active");
+        assert!(!agent.in_transit);
+        assert!(agent.transit_target.is_none());
+        let room = store.get_room("empfang").unwrap().unwrap();
+        assert_eq!((room.occupant_count, room.transit_count), (1, 0));
+    }
+
+    #[test]
+    fn derived_room_presence_ignores_history_and_metadata_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReadModelStore::open(dir.path().join("derived.db").to_str().unwrap()).unwrap();
+        store.initialize_rooms(&["empfang", "kueche"]).unwrap();
+        store.transaction(|txn| {
+            txn.update_room_physics("empfang", 21.0, 450.0, 35.0, false, 100, 100)?;
+            txn.upsert_agent_presence(1, "Active", "QA", 1, "empfang", 10)?;
+            txn.upsert_agent_presence(2, "Historical", "QA", 1, "empfang", 10)?;
+            txn.update_agent_status(2, "despawned", 11)?;
+            txn.update_agent_transit_start(2, "empfang", "kueche", 12)?;
+            txn.upsert_agent_presence(3, "Paused", "QA", 1, "empfang", 10)?;
+            txn.update_agent_status(3, "paused", 11)?;
+            txn.update_agent_transit_start(1, "empfang", "empfang", 11)?;
+            txn.reconcile_room_presence()
+        }).unwrap();
+        let room = store.get_room("empfang").unwrap().unwrap();
+        assert_eq!((room.occupant_count, room.transit_count), (0, 1));
+        assert_eq!(store.get_room("kueche").unwrap().unwrap().transit_count, 0);
+        store.transaction(|txn| {
+            txn.update_agent_transit_complete(1, "empfang", 12)?;
+            txn.update_agent_transit_start(1, "empfang", "kueche", 11)?;
+            txn.update_agent_transit_complete(1, "kueche", 12)?;
+            txn.reconcile_room_presence()
+        }).unwrap();
+        let completed = store.get_room("empfang").unwrap().unwrap();
+        assert_eq!((completed.occupant_count, completed.transit_count), (1, 0));
+        assert_eq!(completed.last_event_id, room.last_event_id);
+        assert_eq!(completed.last_event_tick, room.last_event_tick);
+        assert_eq!(completed.updated_at, room.updated_at);
+        assert_eq!((completed.temperature, completed.co2_ppm, completed.noise_db),
+            (room.temperature, room.co2_ppm, room.noise_db));
+        assert_eq!(store.get_agent(1).unwrap().unwrap().current_room.as_deref(), Some("empfang"));
+    }
+
+    #[test]
+    fn startup_repairs_only_derived_presence_and_keeps_transit_and_watermarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repair.db");
+        let store = ReadModelStore::open(path.to_str().unwrap()).unwrap();
+        store.initialize_rooms(&["empfang", "kueche"]).unwrap();
+        store.transaction(|txn| {
+            txn.upsert_agent_presence(1, "Staying", "QA", 1, "empfang", 10)?;
+            txn.upsert_agent_presence(2, "Arriving", "QA", 1, "empfang", 11)?;
+            txn.update_agent_transit_start(2, "empfang", "kueche", 12)?;
+            txn.upsert_agent_presence(3, "Historical", "QA", 1, "kueche", 13)?;
+            txn.update_agent_status(3, "despawned", 14)?;
+            txn.update_room_chaos("empfang", "{\"created_tick\":20}", 20, 20)?;
+            txn.update_room_smells("empfang", "{\"tick\":21}", 21, 21)?;
+            txn.update_room_physics("empfang", 22.0, 500.0, 40.0, false, 22, 22)?;
+            txn.update_projection_watermark(PROJECTION_NAME, 30)?;
+            txn.guard.execute("UPDATE room_live_view SET occupant_count=99, transit_count=4959", [])?;
+            Ok(())
+        }).unwrap();
+        let room_before = store.get_room("empfang").unwrap().unwrap();
+        let presence_rows = |store: &ReadModelStore| {
+            let conn = store.conn.lock().unwrap();
+            let mut statement = conn.prepare("SELECT * FROM agent_live_view ORDER BY agent_id").unwrap();
+            let columns = statement.column_count();
+            let mapped = statement.query_map([], |row| {
+                (0..columns).map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<Result<Vec<_>, _>>()
+            }).unwrap();
+            mapped.collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        let agents_before = presence_rows(&store);
+        drop(store);
+        let readonly = ReadModelStore::open_readonly(path.to_str().unwrap()).unwrap();
+        assert_eq!(readonly.get_room("empfang").unwrap().unwrap().transit_count, 4959);
+        drop(readonly);
+        let store = ReadModelStore::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(presence_rows(&store), agents_before);
+        let repaired = store.get_room("empfang").unwrap().unwrap();
+        assert_eq!((repaired.occupant_count, repaired.transit_count), (1, 0));
+        let target = store.get_room("kueche").unwrap().unwrap();
+        assert_eq!((target.occupant_count, target.transit_count), (0, 1));
+        assert_eq!((repaired.active_chaos, repaired.active_smells, repaired.temperature,
+            repaired.co2_ppm, repaired.noise_db, repaired.last_event_tick, repaired.last_event_id, repaired.updated_at),
+            (room_before.active_chaos, room_before.active_smells, room_before.temperature,
+            room_before.co2_ppm, room_before.noise_db, room_before.last_event_tick, room_before.last_event_id, room_before.updated_at));
+        store.transaction(|txn| {
+            assert_eq!(txn.projection_watermark(PROJECTION_NAME)?, 30);
+            Ok(())
+        }).unwrap();
+        store.reconcile_room_presence().unwrap();
+        assert_eq!(presence_rows(&store), agents_before);
+    }
+
+    #[test]
+    fn historical_active_null_room_is_preserved_without_inventing_occupancy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown-room.db");
+        let store = ReadModelStore::open(path.to_str().unwrap()).unwrap();
+        store.initialize_rooms(&["empfang", "kueche"]).unwrap();
+        store.conn.lock().unwrap().execute_batch(
+            "INSERT INTO agent_live_view
+               (agent_id,name,role,shift_set,status,current_room,last_event_id,updated_at)
+             VALUES (1,'Unknown room','QA',1,'active',NULL,50,123),
+                    (2,'Known room','QA',1,'active','empfang',51,124);
+             UPDATE room_live_view SET occupant_count=99,transit_count=99,
+               last_event_id=80,last_event_tick=8,updated_at=456;
+             UPDATE projection_watermarks SET last_event_id=100;",
+        ).unwrap();
+        drop(store);
+        let store = ReadModelStore::open(path.to_str().unwrap()).unwrap();
+        for _ in 0..2 {
+            let unknown = store.get_agent(1).unwrap().unwrap();
+            assert_eq!(unknown.status, "active");
+            assert!(unknown.current_room.is_none());
+            assert!(!unknown.in_transit);
+            assert!(unknown.transit_target.is_none());
+            assert_eq!((unknown.last_event_id, unknown.updated_at), (50, 123));
+            for (room_id, occupants) in [("empfang", 1), ("kueche", 0)] {
+                let room = store.get_room(room_id).unwrap().unwrap();
+                assert_eq!((room.occupant_count, room.transit_count), (occupants, 0));
+                assert_eq!((room.last_event_id, room.last_event_tick, room.updated_at), (80, Some(8), 456));
+            }
+            store.transaction(|txn| {
+                assert_eq!(txn.projection_watermark(PROJECTION_NAME)?, 100);
+                assert_eq!(txn.guard.query_row("SELECT COUNT(*) FROM room_live_view", [],
+                    |row| row.get::<_, i64>(0))?, 2);
+                Ok(())
+            }).unwrap();
+            store.recompute_occupant_counts().unwrap();
+        }
+    }
+
+    #[test]
+    fn historical_transit_null_target_is_preserved_without_inventing_arrivals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown-target.db");
+        let store = ReadModelStore::open(path.to_str().unwrap()).unwrap();
+        store.initialize_rooms(&["empfang", "kueche"]).unwrap();
+        store.conn.lock().unwrap().execute_batch(
+            "INSERT INTO agent_live_view
+               (agent_id,name,role,shift_set,status,current_room,in_transit,
+                transit_target,last_event_id,updated_at)
+             VALUES (1,'Unknown target','QA',1,'active','empfang',1,NULL,50,123),
+                    (2,'Known target','QA',1,'active','empfang',1,'kueche',51,124);
+             UPDATE room_live_view SET occupant_count=99,transit_count=99,
+               last_event_id=80,last_event_tick=8,updated_at=456;
+             UPDATE projection_watermarks SET last_event_id=100;",
+        ).unwrap();
+        drop(store);
+        let store = ReadModelStore::open(path.to_str().unwrap()).unwrap();
+        for _ in 0..2 {
+            let unknown = store.get_agent(1).unwrap().unwrap();
+            assert_eq!(unknown.status, "active");
+            assert_eq!(unknown.current_room.as_deref(), Some("empfang"));
+            assert!(unknown.in_transit);
+            assert!(unknown.transit_target.is_none());
+            assert_eq!((unknown.last_event_id, unknown.updated_at), (50, 123));
+            for (room_id, arrivals) in [("empfang", 0), ("kueche", 1)] {
+                let room = store.get_room(room_id).unwrap().unwrap();
+                assert_eq!((room.occupant_count, room.transit_count), (0, arrivals));
+                assert_eq!((room.last_event_id, room.last_event_tick, room.updated_at), (80, Some(8), 456));
+            }
+            store.transaction(|txn| {
+                assert_eq!(txn.projection_watermark(PROJECTION_NAME)?, 100);
+                assert_eq!(txn.guard.query_row("SELECT COUNT(*) FROM room_live_view", [],
+                    |row| row.get::<_, i64>(0))?, 2);
+                Ok(())
+            }).unwrap();
+            store.recompute_occupant_counts().unwrap();
+        }
+    }
+
+    #[test]
+    fn presence_and_derived_counts_roll_back_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReadModelStore::open(dir.path().join("rollback-presence.db").to_str().unwrap()).unwrap();
+        store.initialize_rooms(&["empfang"]).unwrap();
+        let result: anyhow::Result<()> = store.transaction(|txn| {
+            txn.upsert_agent_presence(1, "Uncommitted", "QA", 1, "empfang", 10)?;
+            txn.reconcile_room_presence()?;
+            txn.update_projection_watermark(PROJECTION_NAME, 10)?;
+            anyhow::bail!("presence fixture abort")
+        });
+        assert!(result.is_err());
+        assert!(store.get_agent(1).unwrap().is_none());
+        let room = store.get_room("empfang").unwrap().unwrap();
+        assert_eq!((room.occupant_count, room.transit_count), (0, 0));
+        store.transaction(|txn| {
+            assert_eq!(txn.projection_watermark(PROJECTION_NAME)?, 0);
+            Ok(())
+        }).unwrap();
     }
 
     #[test]

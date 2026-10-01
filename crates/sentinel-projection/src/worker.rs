@@ -74,6 +74,7 @@ impl ProjectionWorker {
     pub fn new(event_store: Arc<EventStore>, config: ProjectionConfig) -> anyhow::Result<Self> {
         let read_store = ReadModelStore::open(&config.db_path)
             .with_context(|| format!("Failed to open read model store: {}", config.db_path))?;
+        read_store.initialize_rooms(ROOM_IDS)?;
 
         let handlers: Vec<Box<dyn ProjectionHandler>> = vec![
             Box::new(AgentLiveViewHandler),
@@ -97,12 +98,40 @@ impl ProjectionWorker {
         &self.read_store
     }
 
+    /// Projects one ordinary live batch, committing views before mirroring the offset.
+    pub fn process_pending_batch(&self) -> anyhow::Result<usize> {
+        let offset = self.event_store.get_offset(PROJECTION_NAME)?.unwrap_or(0);
+        let batch = self
+            .event_store
+            .get_events_since_with_id(offset, self.config.batch_size)?;
+        let Some((last_row_id, _)) = batch.last() else {
+            return Ok(0);
+        };
+        let count = commit_then_mirror(
+            || {
+                let count = self.process_batch(&batch)?;
+                if let Some(max_tick) = batch.iter().map(|(_, event)| event.tick).max() {
+                    sqlite_busy("expired smell cleanup", || {
+                        self.read_store.cleanup_expired_smells(max_tick)
+                    })?;
+                }
+                Ok(count)
+            },
+            || {
+                if *last_row_id > offset {
+                    self.event_store.update_offset(PROJECTION_NAME, *last_row_id)?;
+                }
+                Ok(())
+            },
+        )?;
+        debug!(events = count, offset = last_row_id, "Batch processed");
+        Ok(count)
+    }
+
     /// Live-Modus: Endlos-Poll-Loop.
     ///
     /// Blockiert den aktuellen Thread. Bricht ab bei Fehler.
     pub fn run(&self) -> anyhow::Result<()> {
-        // Rooms initialisieren (idempotent)
-        self.read_store.initialize_rooms(ROOM_IDS)?;
         let mut next_rebuild_poll = Instant::now();
 
         info!(
@@ -119,40 +148,10 @@ impl ProjectionWorker {
             }
 
             let hierarchy_processed = self.process_hierarchy_pending_batch()?;
-            let offset = self.event_store.get_offset(PROJECTION_NAME)?.unwrap_or(0);
-
-            let batch = self
-                .event_store
-                .get_events_since_with_id(offset, self.config.batch_size)?;
-
-            if batch.is_empty() {
-                if hierarchy_processed == 0 {
-                    thread::sleep(self.config.poll_interval);
-                }
-                continue;
+            let processed = self.process_pending_batch()?;
+            if processed == 0 && hierarchy_processed == 0 {
+                thread::sleep(self.config.poll_interval);
             }
-
-            let last_row_id = batch.last().unwrap().0;
-            let count = commit_then_mirror(
-                || {
-                    let count = self.process_batch(&batch)?;
-                    if let Some(max_tick) = batch.iter().map(|(_, e)| e.tick).max() {
-                        sqlite_busy("expired smell cleanup", || {
-                            self.read_store.cleanup_expired_smells(max_tick)
-                        })?;
-                    }
-                    Ok(count)
-                },
-                || {
-                    if last_row_id > offset {
-                        self.event_store
-                            .update_offset(PROJECTION_NAME, last_row_id)?;
-                    }
-                    Ok(())
-                },
-            )?;
-
-            debug!(events = count, offset = last_row_id, "Batch processed");
         }
     }
 
@@ -205,10 +204,7 @@ impl ProjectionWorker {
             })?;
         }
 
-        // Post-rebuild consistency: recompute occupant_count from agent_live_view.
-        // Delta-based counting drifts when the event stream has gaps (e.g. daemon
-        // restarts without despawn events in historical data).
-        self.read_store.recompute_occupant_counts()?;
+        self.read_store.reconcile_room_presence()?;
         self.rebuild_hierarchy_projection()?;
 
         info!(total = total_processed, "Full rebuild complete");
@@ -1150,6 +1146,38 @@ mod tests {
             event_store.get_offset(PROJECTION_NAME).unwrap(),
             Some(mixed.last().unwrap().0)
         );
+    }
+
+    #[test]
+    fn pending_batch_failure_rolls_back_presence_before_offset_mirroring() {
+        let dir = tempdir().unwrap();
+        let event_store = Arc::new(EventStore::open(
+            dir.path().join("events.db").to_str().unwrap(),
+        ).unwrap());
+        append_event(&event_store, 1, &DomainEventPayload::AgentSpawned {
+            agent_id: AgentId(1),
+            name: "Test Agent".into(),
+            role: "QA".into(),
+            shift_set: 1,
+            room_id: "empfang".into(),
+        });
+        let mut worker = ProjectionWorker::new(Arc::clone(&event_store), ProjectionConfig {
+            db_path: dir.path().join("projection.db").to_string_lossy().into_owned(),
+            ..ProjectionConfig::default()
+        }).unwrap();
+        worker.handlers.push(Box::new(FailingHandler));
+        assert!(worker.process_pending_batch().is_err());
+        assert!(worker.read_store().get_agent(1).unwrap().is_none());
+        assert_eq!(worker.read_store().get_room("empfang").unwrap().unwrap().occupant_count, 0);
+        assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), None);
+
+        worker.handlers.pop();
+        assert_eq!(worker.process_pending_batch().unwrap(), 1);
+        let projected = worker.read_store().get_agent(1).unwrap().unwrap();
+        assert_eq!(projected.current_room.as_deref(), Some("empfang"));
+        assert_eq!(worker.read_store().get_room("empfang").unwrap().unwrap().occupant_count, 1);
+        assert_eq!(event_store.get_offset(PROJECTION_NAME).unwrap(), Some(projected.last_event_id));
+        assert_eq!(worker.process_pending_batch().unwrap(), 0);
     }
 
     #[test]

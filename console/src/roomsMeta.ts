@@ -56,10 +56,18 @@ export function mergeRoomMeta(room: RoomRow, agents: AgentRow[]): RoomViewModel 
     capacity: 0,
     room_type: "unknown",
   };
+  const occupants: string[] = [];
+  const presentAgents = new Set<number>();
+  for (const agent of agents) {
+    if (agent.status !== "active" || agent.in_transit || agent.current_room !== room.room_id
+      || presentAgents.has(agent.agent_id)) continue;
+    presentAgents.add(agent.agent_id);
+    occupants.push(agent.name);
+  }
   return {
     ...room,
     ...meta,
     id: room.room_id,
-    occupants: agents.filter((agent) => agent.current_room === room.room_id).map((agent) => agent.name),
+    occupants,
   };
 }
