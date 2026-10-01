@@ -3,12 +3,12 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use crate::workbench::{
-    ReservationOutcome, WorkbenchCoordinator, WorkbenchCoordinatorUpdate,
-    WorkbenchInvocationStore, WorkbenchRuntimeClient, WorkbenchRuntimeExchange,
+    ReservationOutcome, WorkbenchCoordinator, WorkbenchCoordinatorUpdate, WorkbenchInvocationStore,
+    WorkbenchRuntimeClient, WorkbenchRuntimeExchange,
 };
 use sentinel_common::{
-    NanoExecRequest, NanoExecResult, WorkbenchErrorClass, WorkbenchErrorInfo,
-    WorkbenchMessage, WorkbenchOutcome, WorkbenchResourceUsage, WORKBENCH_RETAIN_OBSERVATION,
+    NanoExecRequest, NanoExecResult, WorkbenchErrorClass, WorkbenchErrorInfo, WorkbenchMessage,
+    WorkbenchOutcome, WorkbenchResourceUsage, WORKBENCH_RETAIN_OBSERVATION,
 };
 
 const RESERVED_AT: u64 = 1_900_000_000_000;
@@ -26,8 +26,8 @@ struct ToolFixture {
 impl ToolFixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let store = WorkbenchInvocationStore::open(directory.path().join("workbench.redb"))
-            .unwrap();
+        let store =
+            WorkbenchInvocationStore::open(directory.path().join("workbench.redb")).unwrap();
         let request = WorkbenchRequest {
             schema_version: WORKBENCH_SCHEMA_VERSION,
             invocation_id: Uuid::new_v4().to_string(),
@@ -122,7 +122,11 @@ impl ToolFixture {
     }
 
     fn coordinator(&self) -> WorkbenchCoordinator<'_> {
-        WorkbenchCoordinator::new(&self.store, &self.profile, &self.request.tool_profile_digest)
+        WorkbenchCoordinator::new(
+            &self.store,
+            &self.profile,
+            &self.request.tool_profile_digest,
+        )
     }
 
     fn executing(&self) -> WorkbenchInvocationRecord {
@@ -154,7 +158,10 @@ impl ToolFixture {
     }
 
     fn load(&self) -> WorkbenchInvocationRecord {
-        self.store.load(&self.request.invocation_id).unwrap().unwrap()
+        self.store
+            .load(&self.request.invocation_id)
+            .unwrap()
+            .unwrap()
     }
 }
 
@@ -172,17 +179,21 @@ fn executing_polls_once_and_returns_succeeded_with_retained_observation() {
     let fixture = ToolFixture::new();
     let executing = fixture.executing();
     let polls = Cell::new(0);
-    let completed = poll_executing_adaptive_tool(update(executing.clone()), &fixture.effect, || {
-        polls.set(polls.get() + 1);
-        let result = fixture.result(WorkbenchOutcome::Succeeded);
-        let succeeded = fixture.store.accept_result(&result, RESERVED_AT + 2).unwrap();
-        let mut polled = update(succeeded);
-        polled.records.insert(0, executing.clone());
-        polled.runtime_state = Some("completed".into());
-        polled.caller_result = Some(result);
-        Ok(polled)
-    })
-    .unwrap();
+    let completed =
+        poll_executing_adaptive_tool(update(executing.clone()), &fixture.effect, || {
+            polls.set(polls.get() + 1);
+            let result = fixture.result(WorkbenchOutcome::Succeeded);
+            let succeeded = fixture
+                .store
+                .accept_result(&result, RESERVED_AT + 2)
+                .unwrap();
+            let mut polled = update(succeeded);
+            polled.records.insert(0, executing.clone());
+            polled.runtime_state = Some("completed".into());
+            polled.caller_result = Some(result);
+            Ok(polled)
+        })
+        .unwrap();
     assert_eq!(polls.get(), 1);
     let record = completed.records.last().unwrap();
     assert_eq!(record.state, WorkbenchInvocationState::Succeeded);
@@ -198,8 +209,14 @@ fn executing_polls_once_and_returns_succeeded_with_retained_observation() {
     observation
         .validate(&record.invocation_id, &record.request_digest)
         .unwrap();
-    assert_eq!(record.observation_digest.as_deref(), Some(observation.digest()));
-    assert_eq!(observation.output().get("content").unwrap(), "retained tool observation");
+    assert_eq!(
+        record.observation_digest.as_deref(),
+        Some(observation.digest())
+    );
+    assert_eq!(
+        observation.output().get("content").unwrap(),
+        "retained tool observation"
+    );
 }
 
 #[test]
@@ -211,11 +228,12 @@ fn pending_poll_preserves_exact_record_counters_identity_and_update() {
     polled.replayed = false;
     let polls = Cell::new(0);
     for _ in 0..2 {
-        let result = poll_executing_adaptive_tool(update(executing.clone()), &fixture.effect, || {
-            polls.set(polls.get() + 1);
-            Ok(polled.clone())
-        })
-        .unwrap();
+        let result =
+            poll_executing_adaptive_tool(update(executing.clone()), &fixture.effect, || {
+                polls.set(polls.get() + 1);
+                Ok(polled.clone())
+            })
+            .unwrap();
         assert!(result == polled);
         assert_eq!(fixture.load(), executing);
         assert_eq!(fixture.effect.id.to_string(), executing.invocation_id);
@@ -281,7 +299,10 @@ fn mismatched_initial_identity_rejects_before_poll_including_terminal_replay() {
         let original = if terminal {
             fixture
                 .store
-                .accept_result(&fixture.result(WorkbenchOutcome::Succeeded), RESERVED_AT + 2)
+                .accept_result(
+                    &fixture.result(WorkbenchOutcome::Succeeded),
+                    RESERVED_AT + 2,
+                )
                 .unwrap()
         } else {
             executing
@@ -313,7 +334,10 @@ fn mismatched_final_identity_is_not_adopted_after_exactly_one_poll() {
         foreign.executing();
         let mut wrong = foreign
             .store
-            .accept_result(&foreign.result(WorkbenchOutcome::Succeeded), RESERVED_AT + 2)
+            .accept_result(
+                &foreign.result(WorkbenchOutcome::Succeeded),
+                RESERVED_AT + 2,
+            )
             .unwrap();
         if wrong_id {
             wrong.request_digest = fixture.effect.request_digest.clone();
@@ -321,12 +345,13 @@ fn mismatched_final_identity_is_not_adopted_after_exactly_one_poll() {
             wrong.invocation_id = fixture.effect.id.to_string();
         }
         let polls = Cell::new(0);
-        let result = poll_executing_adaptive_tool(update(executing.clone()), &fixture.effect, || {
-            polls.set(polls.get() + 1);
-            let mut polled = update(executing.clone());
-            polled.records.push(wrong);
-            Ok(polled)
-        });
+        let result =
+            poll_executing_adaptive_tool(update(executing.clone()), &fixture.effect, || {
+                polls.set(polls.get() + 1);
+                let mut polled = update(executing.clone());
+                polled.records.push(wrong);
+                Ok(polled)
+            });
         assert_eq!(polls.get(), 1);
         assert!(matches!(result, Err(WorkflowPortError::AuthorityConflict)));
         assert_eq!(fixture.load(), executing);
@@ -366,10 +391,11 @@ fn poll_errors_are_propagated_without_changing_the_existing_effect() {
         WorkflowPortError::UnknownOutcome,
     ] {
         let polls = Cell::new(0);
-        let result = poll_executing_adaptive_tool(update(executing.clone()), &fixture.effect, || {
-            polls.set(polls.get() + 1);
-            Err(error.clone())
-        });
+        let result =
+            poll_executing_adaptive_tool(update(executing.clone()), &fixture.effect, || {
+                polls.set(polls.get() + 1);
+                Err(error.clone())
+            });
         assert_eq!(polls.get(), 1);
         assert!(matches!(result, Err(actual) if actual == error));
         assert_eq!(fixture.load(), executing);
@@ -401,11 +427,16 @@ fn coordinator_rejects_expired_fresh_and_reserved_submit_without_start() {
         calls: Vec::new(),
         response: None,
     };
-    for now in [fixture.request.deadline_unix_ms, fixture.request.deadline_unix_ms + 1] {
+    for now in [
+        fixture.request.deadline_unix_ms,
+        fixture.request.deadline_unix_ms + 1,
+    ] {
         let mut fresh = fixture.request.clone();
         fresh.invocation_id = Uuid::new_v4().to_string();
         fresh = fresh.bind_digest().unwrap();
-        assert!(coordinator.submit(&mut runtime, &fresh, &fixture.authority, now).is_err());
+        assert!(coordinator
+            .submit(&mut runtime, &fresh, &fixture.authority, now)
+            .is_err());
         assert!(fixture.store.load(&fresh.invocation_id).unwrap().is_none());
         assert!(coordinator
             .submit(&mut runtime, &fixture.request, &fixture.authority, now)
@@ -438,12 +469,21 @@ fn coordinator_replays_expired_executing_then_helper_polls_only_same_effect() {
     let submitted = coordinator
         .submit(&mut runtime, &fixture.request, &fixture.authority, now)
         .unwrap();
-    assert!(runtime.calls.is_empty(), "Executing replay must not Start again");
+    assert!(
+        runtime.calls.is_empty(),
+        "Executing replay must not Start again"
+    );
     assert!(submitted.replayed);
     assert_eq!(submitted.records, vec![executing.clone()]);
     assert_eq!(fixture.load(), executing);
     let polled = poll_executing_adaptive_tool(submitted, &fixture.effect, || {
-        coordinator.poll(&mut runtime, &fixture.effect.id.to_string(), &fixture.authority, now)
+        coordinator
+            .poll(
+                &mut runtime,
+                &fixture.effect.id.to_string(),
+                &fixture.authority,
+                now,
+            )
             .map_err(|_| WorkflowPortError::UnknownOutcome)
     })
     .unwrap();
@@ -452,10 +492,13 @@ fn coordinator_replays_expired_executing_then_helper_polls_only_same_effect() {
     assert_eq!(*agent, fixture.request.agent_id);
     assert_eq!(request.operation, "workbench_poll");
     let frame: serde_json::Value = serde_json::from_str(&request.input).unwrap();
-    assert_eq!(frame, serde_json::json!({
-        "kind": "poll", "schema_version": WORKBENCH_SCHEMA_VERSION,
-        "invocation_id": fixture.effect.id.to_string()
-    }));
+    assert_eq!(
+        frame,
+        serde_json::json!({
+            "kind": "poll", "schema_version": WORKBENCH_SCHEMA_VERSION,
+            "invocation_id": fixture.effect.id.to_string()
+        })
+    );
     assert_eq!(polled.records.last().unwrap(), &executing);
     assert_eq!(polled.runtime_state.as_deref(), Some("pending"));
     assert_eq!(fixture.load(), executing);
@@ -529,7 +572,10 @@ fn invocation_status_preserves_reserved_executing_and_terminal_records() {
             WorkbenchInvocationState::Executing => fixture.executing(),
             WorkbenchInvocationState::Succeeded => fixture
                 .store
-                .accept_result(&fixture.result(WorkbenchOutcome::Succeeded), RESERVED_AT + 2)
+                .accept_result(
+                    &fixture.result(WorkbenchOutcome::Succeeded),
+                    RESERVED_AT + 2,
+                )
                 .unwrap(),
             _ => unreachable!(),
         };
