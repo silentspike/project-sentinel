@@ -860,6 +860,7 @@ pub struct BwrapNanoRuntime {
     pending_spawns: HashMap<String, BwrapSpawnTransaction>,
     cas_manifest_enabled: bool,
     exchanges: HashMap<String, WorkbenchExchange>,
+    replacement_pending: std::collections::HashSet<String>,
 }
 
 impl BwrapNanoRuntime {
@@ -882,6 +883,7 @@ impl BwrapNanoRuntime {
             pending_spawns: HashMap::new(),
             cas_manifest_enabled: false,
             exchanges: HashMap::new(),
+            replacement_pending: std::collections::HashSet::new(),
         }
     }
 
@@ -1017,7 +1019,7 @@ impl BwrapNanoRuntime {
             let handle = teardown_handle_after_owned_process_reap(
                 handle,
                 owned_process_reaped,
-                cgroup_quiesced,
+                cgroup_quiesced && !self.replacement_pending.contains(workload_id),
             );
             self.enforcer.teardown_agent(&handle)?;
         }
@@ -1039,6 +1041,7 @@ impl BwrapNanoRuntime {
         self.processes.remove(workload_id);
         self.handles.remove(workload_id);
         self.workloads.remove(workload_id);
+        self.replacement_pending.remove(workload_id);
         Ok(stopped)
     }
 
@@ -1532,36 +1535,25 @@ impl BwrapNanoRuntime {
     }
 
     fn recycle_workbench_runtime(&mut self, workload_id: &str) -> Result<()> {
-        self.recycle_workbench_runtime_with(
-            workload_id,
-            |enforcer, previous, agent_name, workload_id, command| {
-                enforcer.teardown_agent(&previous)?;
-                let mut handle = enforcer
-                    .setup_agent(agent_name, &CgroupLimits::default())
-                    .with_context(|| format!("recreate workbench cgroup for {agent_name}"))?;
-                let process = enforcer
-                    .start_workbench_process(agent_name, Some(workload_id), command)
-                    .with_context(|| format!("restart agent-runtime for {agent_name}"))?;
-                handle.bwrap_pid = Some(process.pid);
-                let attestation = process
-                    .workbench_isolation_attestation()
-                    .context("restarted workbench process lacks isolation attestation")?;
-                anyhow::ensure!(
-                    handle.cgroup_created
-                        && process.child_pid == Some(attestation.sandbox_init_pid)
-                        && attestation.runtime_pid > 0
-                        && attestation.runtime_namespace_pid > 1
-                        && attestation.landlock_abi > 0,
-                    "restarted workbench process isolation evidence is incomplete"
-                );
-                handle.landlock_applied = true;
-                handle.network_isolated = true;
-                handle.cgroup_id = cgroups::runtime_cgroup_id(agent_name).or(handle.cgroup_id);
-                Ok((handle, process))
-            },
-        )
+        if self.replacement_pending.contains(workload_id) {
+            self.processes
+                .get_mut(workload_id)
+                .ok_or_else(|| anyhow!("pending replacement lost process ownership"))?
+                .terminate_checked()?;
+            return self.replace_reaped_workbench_runtime(workload_id);
+        }
+        let process = self.processes.get(workload_id).ok_or_else(|| {
+            anyhow!("workbench runtime process is unavailable during terminal recycle")
+        })?;
+        anyhow::ensure!(
+            process.protocol_supervision_snapshot().terminal_finalized
+                && process.owned_process_reaped(),
+            "workbench runtime is not quiescent enough to recycle"
+        );
+        self.replace_reaped_workbench_runtime(workload_id)
     }
 
+    #[cfg(test)]
     fn recycle_workbench_runtime_with<Replace>(
         &mut self,
         workload_id: &str,
@@ -1584,6 +1576,32 @@ impl BwrapNanoRuntime {
             supervision.terminal_finalized && process.owned_process_reaped(),
             "workbench runtime is not quiescent enough to recycle"
         );
+        self.replace_reaped_workbench_runtime_with(workload_id, replace)
+    }
+
+    #[cfg(test)]
+    fn replace_reaped_workbench_runtime_with<Replace>(
+        &mut self,
+        workload_id: &str,
+        replace: Replace,
+    ) -> Result<()>
+    where
+        Replace: FnOnce(
+            &SandboxEnforcer,
+            SandboxHandle,
+            &str,
+            &str,
+            &[String],
+        ) -> Result<(SandboxHandle, AgentProcess)>,
+    {
+        let process = self.processes.get(workload_id).ok_or_else(|| {
+            anyhow!("workbench runtime process is unavailable during replacement")
+        })?;
+        anyhow::ensure!(
+            process.owned_process_reaped(),
+            "workbench replacement requires confirmed owned-process reap"
+        );
+        let supervision = process.protocol_supervision_snapshot();
         let (agent_name, command) = self
             .workloads
             .get(workload_id)
@@ -1594,9 +1612,6 @@ impl BwrapNanoRuntime {
             "terminal protocol recycle is limited to agent-runtime workloads"
         );
 
-        if let Some(process) = self.processes.get_mut(workload_id) {
-            process.join_protocol_reader();
-        }
         let previous = self
             .handles
             .get(workload_id)
@@ -1611,8 +1626,153 @@ impl BwrapNanoRuntime {
             .ok_or_else(|| anyhow!("workbench sandbox handle is unavailable during recycle"))?;
         let (handle, process) =
             replace(&self.enforcer, previous, &agent_name, workload_id, &command)?;
+        if let Some(previous) = self.processes.get_mut(workload_id) {
+            previous.join_protocol_reader();
+        }
         self.handles.insert(workload_id.to_string(), handle);
         self.processes.insert(workload_id.to_string(), process);
+        self.replacement_pending.remove(workload_id);
+        Ok(())
+    }
+
+    fn reap_receipt_recovery_reader(&mut self, handle: &NanoHandle) -> Result<bool> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        let state = self
+            .workloads
+            .get(&handle.workload_id)
+            .ok_or_else(|| anyhow!("receipt recovery workload is unavailable"))?;
+        ensure_handle_instance(handle, state.instance_id)?;
+        anyhow::ensure!(
+            !self.exchanges.contains_key(&handle.workload_id),
+            "receipt reader replacement requires an exchange-free workload"
+        );
+        let productive_workbench = is_workbench_agent_runtime(&state.command);
+        if self.health(handle)?.state == NanoHealthState::Healthy {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            productive_workbench,
+            "receipt reader replacement is limited to agent-runtime workloads"
+        );
+        // Recovery only reads the original sealed receipt. Reap the exact owned
+        // process tree before replacing its reader; never restart the tool.
+        self.processes
+            .get_mut(&handle.workload_id)
+            .ok_or_else(|| anyhow!("receipt recovery process ownership is unavailable"))?
+            .terminate_checked()?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn prepare_receipt_recovery_runtime_with<Replace>(
+        &mut self,
+        handle: &NanoHandle,
+        replace: Replace,
+    ) -> Result<()>
+    where
+        Replace: FnOnce(
+            &SandboxEnforcer,
+            SandboxHandle,
+            &str,
+            &str,
+            &[String],
+        ) -> Result<(SandboxHandle, AgentProcess)>,
+    {
+        if self.reap_receipt_recovery_reader(handle)? {
+            self.replace_reaped_workbench_runtime_with(&handle.workload_id, replace)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_receipt_recovery_runtime(&mut self, handle: &NanoHandle) -> Result<()> {
+        if self.reap_receipt_recovery_reader(handle)? {
+            self.replace_reaped_workbench_runtime(&handle.workload_id)?;
+        }
+        Ok(())
+    }
+
+    fn replace_reaped_workbench_runtime(&mut self, workload_id: &str) -> Result<()> {
+        let process = self
+            .processes
+            .get(workload_id)
+            .ok_or_else(|| anyhow!("workbench replacement process ownership is unavailable"))?;
+        anyhow::ensure!(
+            process.owned_process_reaped(),
+            "replacement requires owned-process reap"
+        );
+        let supervision = process.protocol_supervision_snapshot();
+        let state = self
+            .workloads
+            .get(workload_id)
+            .ok_or_else(|| anyhow!("workbench replacement workload is unavailable"))?;
+        anyhow::ensure!(
+            is_workbench_agent_runtime(&state.command),
+            "replacement requires agent-runtime"
+        );
+        let agent_name = state.workload.agent_name.clone();
+        let command = state.command.clone();
+        let previous = self
+            .handles
+            .get(workload_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("workbench replacement sandbox is unavailable"))?;
+        let previous = teardown_handle_after_owned_process_reap(
+            previous,
+            true,
+            supervision.cgroup_quiesced && !self.replacement_pending.contains(workload_id),
+        );
+        self.replacement_pending.insert(workload_id.to_string());
+        self.enforcer.teardown_agent(&previous)?;
+        // An escaped descendant can retain stdout until cgroup cleanup. Never
+        // join the reader before that cleanup has succeeded.
+        self.processes
+            .get_mut(workload_id)
+            .expect("owned process retained")
+            .join_protocol_reader();
+        let pending = self
+            .handles
+            .get_mut(workload_id)
+            .expect("sandbox ownership retained");
+        pending.bwrap_pid = None;
+        pending.cgroup_created = true;
+        pending.landlock_applied = false;
+        pending.network_isolated = false;
+        let mut sandbox = self
+            .enforcer
+            .setup_agent(&agent_name, &CgroupLimits::default())?;
+        sandbox.landlock_applied = false;
+        sandbox.network_isolated = false;
+        self.handles.insert(workload_id.to_string(), sandbox);
+        let process =
+            self.enforcer
+                .start_workbench_process(&agent_name, Some(workload_id), &command)?;
+        self.handles
+            .get_mut(workload_id)
+            .expect("new sandbox retained")
+            .bwrap_pid = Some(process.pid);
+        // Retain the exact new child before any fallible attestation check so
+        // checked cleanup can be retried rather than relying on Drop.
+        self.processes.insert(workload_id.to_string(), process);
+        let process = &self.processes[workload_id];
+        let sandbox = self
+            .handles
+            .get_mut(workload_id)
+            .expect("new sandbox retained");
+        let attestation = process
+            .workbench_isolation_attestation()
+            .context("replacement workbench reader lacks isolation attestation")?;
+        anyhow::ensure!(
+            sandbox.cgroup_created
+                && process.child_pid == Some(attestation.sandbox_init_pid)
+                && attestation.runtime_pid > 0
+                && attestation.runtime_namespace_pid > 1
+                && attestation.landlock_abi > 0,
+            "replacement isolation evidence is incomplete"
+        );
+        sandbox.landlock_applied = true;
+        sandbox.network_isolated = true;
+        sandbox.cgroup_id = cgroups::runtime_cgroup_id(&agent_name).or(sandbox.cgroup_id);
+        self.replacement_pending.remove(workload_id);
         Ok(())
     }
 
@@ -1908,6 +2068,7 @@ impl BwrapNanoRuntime {
             }
         }
 
+        self.prepare_receipt_recovery_runtime(handle)?;
         let channel_available = self
             .processes
             .get(&handle.workload_id)
@@ -2691,18 +2852,7 @@ impl NanoRuntime for BwrapNanoRuntime {
             }
             "workbench_poll" => self.poll_workbench_exchange(handle, &request.input),
             "workbench_cancel" => self.cancel_workbench_exchange(handle, &request.input),
-            "workbench_recover" => {
-                if !self.exchanges.contains_key(&handle.workload_id)
-                    && self.health(handle)?.state != NanoHealthState::Healthy
-                {
-                    return Err(exec_error(
-                        NanoExecErrorCode::WorkloadUnavailable,
-                        false,
-                        "workbench workload is not healthy",
-                    ));
-                }
-                self.recover_workbench_exchange(handle, &request.input)
-            }
+            "workbench_recover" => self.recover_workbench_exchange(handle, &request.input),
             _ => Err(exec_error(
                 NanoExecErrorCode::UnsupportedOperation,
                 false,
@@ -2869,6 +3019,7 @@ impl NanoRuntime for BwrapNanoRuntime {
             .workloads
             .get(&handle.workload_id)
             .is_some_and(|state| state.suspended)
+            || self.replacement_pending.contains(&handle.workload_id)
         {
             NanoHealthState::Degraded
         } else if let Some(process) = self.processes.get_mut(&handle.workload_id) {
@@ -3757,6 +3908,148 @@ mod tests {
     #[test]
     fn terminal_recovery_recycles_agent_runtime_for_a_second_serial_receipt() {
         assert_terminal_invocation_recycles_for_serial_exchange(true);
+    }
+
+    #[test]
+    fn receipt_recovery_replaces_a_reaped_reader_without_reexecuting_the_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        let record = temp.path().join("recovery-input.jsonl");
+        let descendant = temp.path().join("recovery-descendant.pid");
+        let process = AgentProcess::launch_fixture().unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "restart-recovery", process);
+        runtime
+            .workloads
+            .get_mut(&handle.workload_id)
+            .unwrap()
+            .command = vec!["/usr/bin/agent-runtime".to_string()];
+        runtime
+            .processes
+            .get_mut(&handle.workload_id)
+            .unwrap()
+            .terminate_checked()
+            .unwrap();
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Stopped
+        );
+        assert!(!runtime.exchanges.contains_key(&handle.workload_id));
+        runtime
+            .prepare_receipt_recovery_runtime_with(&handle, |_, mut previous, _, _, command| {
+                assert_eq!(
+                    previous.bwrap_pid, None,
+                    "reaped numeric PID must not be signaled"
+                );
+                assert!(is_workbench_agent_runtime(command));
+                let process =
+                    AgentProcess::launch_recording_protocol_fixture(&[], &record, &descendant)?;
+                previous.bwrap_pid = Some(process.pid);
+                Ok((previous, process))
+            })
+            .unwrap();
+        assert_eq!(
+            runtime.workloads[&handle.workload_id].instance_id,
+            handle.instance_id
+        );
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Healthy
+        );
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2983";
+        let input = recover_frame(invocation_id, &"a".repeat(64));
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_recover".to_string(),
+                    input: input.clone(),
+                },
+            )
+            .unwrap();
+        let frames = wait_for_recorded_lines(&record, 1);
+        assert_eq!(frames.lines().count(), 1);
+        assert_eq!(frames.trim(), input);
+        assert!(!frames.contains("\"execute\""));
+        runtime.stop(&handle).unwrap();
+    }
+
+    #[test]
+    fn receipt_reader_replacement_rejects_stale_ownership_and_non_workbench_runtime() {
+        let process = AgentProcess::launch_fixture().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "recovery-ownership", process);
+        runtime
+            .processes
+            .get_mut(&handle.workload_id)
+            .unwrap()
+            .terminate_checked()
+            .unwrap();
+        let mut stale = handle.clone();
+        stale.instance_id = uuid::Uuid::new_v4();
+        assert!(runtime
+            .prepare_receipt_recovery_runtime_with(&stale, |_, _, _, _, _| {
+                panic!("stale instance must not replace a process")
+            })
+            .is_err());
+        assert!(runtime
+            .prepare_receipt_recovery_runtime_with(&handle, |_, _, _, _, _| {
+                panic!("non-agent-runtime must not replace a process")
+            })
+            .is_err());
+        assert_eq!(
+            runtime.workloads[&handle.workload_id].instance_id,
+            handle.instance_id
+        );
+        runtime.stop(&handle).unwrap();
+    }
+
+    #[test]
+    fn incomplete_receipt_reader_replacement_is_not_serving_and_retains_cleanup_ownership() {
+        let process = AgentProcess::launch_fixture().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "incomplete-reader", process);
+        runtime
+            .workloads
+            .get_mut(&handle.workload_id)
+            .unwrap()
+            .command = vec!["/usr/bin/agent-runtime".to_string()];
+        runtime
+            .replacement_pending
+            .insert(handle.workload_id.clone());
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Degraded
+        );
+        let error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(
+                        "018f3f32-4f01-7f2c-a6c1-f6f4a81b2984",
+                        unix_time_ms() + 10_000,
+                    ),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::WorkloadUnavailable);
+        assert!(!runtime.exchanges.contains_key(&handle.workload_id));
+        assert!(runtime
+            .prepare_receipt_recovery_runtime_with(&handle, |_, _, _, _, _| {
+                anyhow::bail!("injected replacement setup failure")
+            })
+            .is_err());
+        assert!(runtime.processes[&handle.workload_id].owned_process_reaped());
+        assert!(runtime.handles.contains_key(&handle.workload_id));
+        assert!(runtime.replacement_pending.contains(&handle.workload_id));
+        assert_eq!(
+            runtime.workloads[&handle.workload_id].instance_id,
+            handle.instance_id
+        );
+        runtime.stop(&handle).unwrap();
+        assert!(!runtime.replacement_pending.contains(&handle.workload_id));
     }
 
     fn assert_terminal_invocation_recycles_for_serial_exchange(recovery: bool) {

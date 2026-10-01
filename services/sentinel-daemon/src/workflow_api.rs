@@ -1151,6 +1151,26 @@ impl sentinel_workflow::OrganizationRuntimePort for CompanyAuthority {
     }
 }
 
+// Only existing tool effects may recover records without serving process health.
+struct WorkbenchRecordRecoveryAuthority<'a>(&'a CompanyAuthority);
+
+impl sentinel_workflow::OrganizationRuntimePort for WorkbenchRecordRecoveryAuthority<'_> {
+    fn readiness(&self) -> DependencyReadiness {
+        DependencyReadiness::Ready
+    }
+
+    fn authority_snapshot(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+        work_item_id: &WorkItemId,
+        agent_id: AgentId,
+    ) -> Result<RuntimeAuthoritySnapshotV1, WorkflowPortError> {
+        self.0
+            .snapshot_for_admission(tenant_id, project_id, work_item_id, agent_id, false)
+    }
+}
+
 impl WorkbenchAuthoritySource for CompanyAuthority {
     fn current_for_request(
         &self,
@@ -2192,21 +2212,17 @@ impl AdaptiveToolPort for WorkbenchExecutionAdapter {
         let authority: Arc<dyn WorkbenchAuthoritySource> = self.authority.clone();
         let update = match session.cursor {
             sentinel_workflow::AdaptiveCursorV1::ToolPending { .. } => {
-                // An existing effect is polled without admitting a new process.
+                // Recover also reads the original receipt after runtime startup.
                 // Reserved/missing effects still use Submit's serving-state gate.
-                let update = if self.adaptive_tool_was_started(session, effect)? {
-                    self.exchange(|response| WorkbenchDispatchCommand::Poll {
-                        invocation_id: effect.id.to_string(),
-                        authority: Arc::clone(&authority),
+                let started = self.adaptive_tool_was_started(session, effect)?;
+                let update = self.exchange(|response| {
+                    pending_adaptive_tool_dispatch(
+                        request,
+                        Arc::clone(&authority),
                         response,
-                    })?
-                } else {
-                    self.exchange(|response| WorkbenchDispatchCommand::Submit {
-                        request: Box::new(request),
-                        authority: Arc::clone(&authority),
-                        response,
-                    })?
-                };
+                        started,
+                    )
+                })?;
                 poll_executing_adaptive_tool(update, effect, || {
                     self.exchange(|response| WorkbenchDispatchCommand::Poll {
                         invocation_id: effect.id.to_string(),
@@ -2249,6 +2265,27 @@ impl AdaptiveToolPort for WorkbenchExecutionAdapter {
     }
 }
 
+fn pending_adaptive_tool_dispatch(
+    request: WorkbenchRequest,
+    authority: Arc<dyn WorkbenchAuthoritySource>,
+    response: mpsc::SyncSender<anyhow::Result<crate::workbench::WorkbenchCoordinatorUpdate>>,
+    started: bool,
+) -> WorkbenchDispatchCommand {
+    if started {
+        WorkbenchDispatchCommand::Recover {
+            invocation_id: request.invocation_id,
+            authority,
+            response,
+        }
+    } else {
+        WorkbenchDispatchCommand::Submit {
+            request: Box::new(request),
+            authority,
+            response,
+        }
+    }
+}
+
 fn poll_executing_adaptive_tool(
     update: crate::workbench::WorkbenchCoordinatorUpdate,
     effect: &AdaptiveEffectV1,
@@ -2269,8 +2306,8 @@ fn poll_executing_adaptive_tool(
     if validate(&update)? != WorkbenchInvocationState::Executing {
         return Ok(update);
     }
-    // Submit reserves or replays the exact effect; only Poll collects its
-    // running result. Repeating Submit alone can never leave Executing.
+    // Submit or Recover can return acceptance before terminal output is ready.
+    // One bounded Poll collects that output without repeating admission.
     let polled = poll()?;
     validate(&polled)?;
     Ok(polled)
