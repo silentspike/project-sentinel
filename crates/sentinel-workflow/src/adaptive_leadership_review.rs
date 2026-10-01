@@ -128,9 +128,23 @@ impl AdaptiveLeadershipReviewCallV1 {
         additional_model_calls: u16,
     ) -> Result<crate::SubscriptionCallAllowanceV1, WorkflowError> {
         let window_ms = deadline_ms.checked_sub(issued_at_ms).ok_or_else(invalid)?;
+        let source = &self.context.source_session;
+        let current = self
+            .context
+            .source_project
+            .subscription_call
+            .as_ref()
+            .ok_or_else(invalid)?;
+        let remaining = source
+            .grant
+            .max_model_calls
+            .checked_sub(source.model_calls)
+            .ok_or_else(invalid)?;
         if issued_at_ms == 0
             || !(1_000..=ADAPTIVE_LEADERSHIP_MAX_GRANT_MS).contains(&window_ms)
             || !(1..=crate::ADAPTIVE_SESSION_MAX_CALLS).contains(&additional_model_calls)
+            || additional_model_calls > remaining.min(current.grant.max_calls)
+            || current.grant.max_concurrent != 1
             || self.grant.recovery_epoch.as_ref().is_some_and(|binding| {
                 additional_model_calls > binding.max_additional_model_calls
                     || window_ms > binding.max_window_ms
@@ -160,6 +174,7 @@ impl AdaptiveLeadershipReviewCallV1 {
                     .source_session
                     .grant
                     .max_call_duration_ms
+                    .min(current.grant.max_duration_ms)
                     .min(window_ms),
                 token_policy: self.grant.token_policy,
                 expires_at_unix_ms: deadline_ms,
@@ -312,6 +327,10 @@ impl AdaptiveLeadershipReviewDecisionV1 {
                 || !matches!(
                     &grant.subject,
                     Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. })
+                        | Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
+                            resolution_event_id: None,
+                            ..
+                        })
                 )
                 || matches!(
                     &self.decision,
@@ -435,6 +454,10 @@ impl AdaptiveLeadershipReviewGrantV1 {
                 || !matches!(
                     &self.subject,
                     Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. })
+                        | Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
+                            resolution_event_id: None,
+                            ..
+                        })
                 )
             {
                 return Err(invalid());

@@ -3338,6 +3338,201 @@ impl EventStore {
         Ok(true)
     }
 
+    /// Finish exact local adoption after the caller verified the durable domain receipt.
+    /// Retain payload, failure and attempts; this does not requeue or grant provider I/O.
+    pub fn finish_known_leadership_local_adoption(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        payload_digest: &str,
+        adoption_key: &str,
+        domain_receipt_digest: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            request_id.starts_with("company-leadership-")
+                && is_canonical_sha256(request_digest)
+                && is_canonical_sha256(payload_digest)
+                && is_canonical_sha256(domain_receipt_digest)
+                && adoption_key.starts_with("local-adoption-")
+                && adoption_key.len() <= 96,
+            "invalid local adoption cleanup identity"
+        );
+        let owner = self.llm_completion_scope(request_id)?;
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
+        let state: (String, String, String, String, Option<String>) = conn.query_row(
+            "SELECT request_digest,owner_scope,payload,status,last_error FROM llm_completion_outbox WHERE request_id=?1",
+            [request_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        )?;
+        anyhow::ensure!(
+            state.0 == request_digest
+                && state.1 == owner.to_wire()
+                && !state.2.is_empty()
+                && state.2.len() <= 2 * 1024 * 1024
+                && sentinel_common::sha256_hex(state.2.as_bytes()) == payload_digest,
+            "local adoption cleanup response changed"
+        );
+        let value: serde_json::Value = serde_json::from_str(&state.2)?;
+        anyhow::ensure!(
+            value.get("version").and_then(|v| v.as_u64()) == Some(2)
+                && value
+                    .get("actions")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|v| v.is_empty())
+                && value
+                    .get("model_work")
+                    .and_then(|v| v.get("admissible"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true),
+            "local adoption cleanup is not a known action-free response"
+        );
+        let operation = format!("llm_local_adoption_{request_id}");
+        let receipt = serde_json::json!({"request_id":request_id,"request_digest":request_digest,
+            "payload_digest":payload_digest,"adoption_key":adoption_key,
+            "domain_receipt_digest":domain_receipt_digest})
+        .to_string();
+        if state.3 == "action_claimed" {
+            let prior: Option<String> = conn
+                .query_row(
+                    "SELECT payload FROM events WHERE operation_id=?1",
+                    [&operation],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            anyhow::ensure!(
+                prior.as_deref() == Some(receipt.as_str()),
+                "local adoption cleanup receipt changed"
+            );
+            conn.commit()?;
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            state.3 == "failed" && state.4.as_deref() == Some("continuation audit invalid"),
+            "local adoption cleanup failure state changed"
+        );
+        let aggregate = match owner {
+            StateTransferScope::NanoContainer(agent) => agent,
+            StateTransferScope::World => anyhow::bail!("local adoption requires agent scope"),
+        };
+        let event = DomainEvent::new(
+            "llm_completion_locally_adopted",
+            &aggregate,
+            &receipt,
+            request_id,
+            0,
+        )
+        .with_operation_id(&operation);
+        conn.execute("INSERT INTO events (event_id,event_type,aggregate_id,payload,correlation_id,causation_id,operation_id,tick,timestamp_ms,schema_version,compensation_type)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![event.event_id,event.event_type,event.aggregate_id,event.payload,
+            event.correlation_id,event.causation_id,event.operation_id,event.tick as i64,event.timestamp_ms as i64,event.schema_version,event.compensation_type])?;
+        let changed = conn.execute("UPDATE llm_completion_outbox SET status='action_claimed'
+            WHERE request_id=?1 AND request_digest=?2 AND owner_scope=?3 AND status='failed' AND last_error='continuation audit invalid'",
+            params![request_id,request_digest,state.1])?;
+        anyhow::ensure!(changed == 1, "local adoption cleanup state changed");
+        conn.commit()?;
+        Ok(true)
+    }
+
+    /// Disposition a retained known response only after its domain adoption has
+    /// retired. This keeps it terminal and preserves payload and attempt history.
+    pub fn retire_known_leadership_local_adoption(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        payload_digest: &str,
+        adoption_key: &str,
+        domain_receipt_digest: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            request_id.starts_with("company-leadership-")
+                && is_canonical_sha256(request_digest)
+                && is_canonical_sha256(payload_digest)
+                && is_canonical_sha256(domain_receipt_digest)
+                && adoption_key.starts_with("local-adoption-")
+                && adoption_key.len() <= 96,
+            "invalid local adoption retirement identity"
+        );
+        let owner = self.llm_completion_scope(request_id)?;
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
+        let state: (String, String, String, String, Option<String>) = conn.query_row(
+            "SELECT request_digest,owner_scope,payload,status,last_error FROM llm_completion_outbox WHERE request_id=?1",
+            [request_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        )?;
+        anyhow::ensure!(
+            state.0 == request_digest
+                && state.1 == owner.to_wire()
+                && !state.2.is_empty()
+                && state.2.len() <= 2 * 1024 * 1024
+                && sentinel_common::sha256_hex(state.2.as_bytes()) == payload_digest
+                && state.3 == "failed"
+                && matches!(
+                    state.4.as_deref(),
+                    Some("continuation audit invalid" | "leadership_review_stale")
+                ),
+            "local adoption retirement response changed"
+        );
+        let value: serde_json::Value = serde_json::from_str(&state.2)?;
+        anyhow::ensure!(
+            value.get("version").and_then(|v| v.as_u64()) == Some(2)
+                && value
+                    .get("actions")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|v| v.is_empty())
+                && value
+                    .get("model_work")
+                    .and_then(|v| v.get("admissible"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true),
+            "local adoption retirement is not a known action-free response"
+        );
+        let aggregate = match owner {
+            StateTransferScope::NanoContainer(agent) => agent,
+            StateTransferScope::World => anyhow::bail!("local adoption requires agent scope"),
+        };
+        let operation = format!("llm_local_adoption_retired_{request_id}");
+        let receipt = serde_json::json!({"request_id":request_id,"request_digest":request_digest,
+            "payload_digest":payload_digest,"adoption_key":adoption_key,
+            "domain_receipt_digest":domain_receipt_digest,
+            "original_completion_error":"continuation audit invalid"})
+        .to_string();
+        if state.4.as_deref() == Some("leadership_review_stale") {
+            let prior: Option<(String, String, String)> = conn
+                .query_row(
+                    "SELECT event_type,aggregate_id,payload FROM events WHERE operation_id=?1",
+                    [&operation],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            anyhow::ensure!(
+                prior
+                    == Some((
+                        "llm_completion_local_adoption_retired".into(),
+                        aggregate,
+                        receipt
+                    )),
+                "local adoption retirement receipt changed"
+            );
+            conn.commit()?;
+            return Ok(false);
+        }
+        let event = DomainEvent::new(
+            "llm_completion_local_adoption_retired",
+            &aggregate,
+            &receipt,
+            request_id,
+            0,
+        )
+        .with_operation_id(&operation);
+        conn.execute("INSERT INTO events (event_id,event_type,aggregate_id,payload,correlation_id,causation_id,operation_id,tick,timestamp_ms,schema_version,compensation_type)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![event.event_id,event.event_type,event.aggregate_id,event.payload,
+            event.correlation_id,event.causation_id,event.operation_id,event.tick as i64,event.timestamp_ms as i64,event.schema_version,event.compensation_type])?;
+        let changed = conn.execute("UPDATE llm_completion_outbox SET last_error='leadership_review_stale'
+            WHERE request_id=?1 AND request_digest=?2 AND owner_scope=?3 AND status='failed' AND last_error='continuation audit invalid'",
+            params![request_id, request_digest, state.1])?;
+        anyhow::ensure!(changed == 1, "local adoption retirement state changed");
+        conn.commit()?;
+        Ok(true)
+    }
+
     /// Claim actions before sending them. A crash after this transition is
     /// intentionally at-most-once/fail-closed: claimed actions are never replayed.
     pub fn claim_llm_completion_actions(
@@ -5020,6 +5215,9 @@ pub trait OutboxTransport: Send + Sync + 'static {
 // ──────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod local_adoption_tests;
 
 #[cfg(test)]
 mod tests {

@@ -275,6 +275,7 @@ fn validate_evidence(
     Ok((proof.release, format!("{:x}", Sha256::digest(repair))))
 }
 
+#[cfg(not(test))]
 pub(super) fn verified_current_repair() -> Result<(AdaptiveRecoveryReleaseV1, String), &'static str>
 {
     let repair = evidence_bytes(Path::new(REPAIR_FILE))?;
@@ -291,10 +292,107 @@ pub(super) fn verified_current_repair() -> Result<(AdaptiveRecoveryReleaseV1, St
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+struct TestRepairEvidence {
+    repair: Vec<u8>,
+    manifest: Vec<u8>,
+    gateway_digest: String,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_REPAIRS: std::cell::RefCell<Vec<(u64, TestRepairEvidence)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static TEST_REPAIR_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test evidence substitution only, not evidence of an installed or serving gateway.
+#[cfg(test)]
+pub(super) struct TestRepairGuard {
+    id: u64,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+impl TestRepairGuard {
+    pub(super) fn fixture() -> Result<Self, &'static str> {
+        let (repair, manifest, gateway) = tests::fixture();
+        Self::install(
+            serde_json::to_vec(&repair).map_err(|_| "test repair encoding failed")?,
+            manifest,
+            gateway,
+        )
+    }
+
+    pub(super) fn install(
+        repair: Vec<u8>,
+        manifest: Vec<u8>,
+        gateway_digest: String,
+    ) -> Result<Self, &'static str> {
+        validate_evidence(&repair, &manifest, &gateway_digest)?;
+        let id = TEST_REPAIR_ID.with(|next| {
+            let id = next
+                .get()
+                .checked_add(1)
+                .expect("test repair token exhausted");
+            next.set(id);
+            id
+        });
+        TEST_REPAIRS.with(|stack| {
+            stack.borrow_mut().push((
+                id,
+                TestRepairEvidence {
+                    repair,
+                    manifest,
+                    gateway_digest,
+                },
+            ));
+        });
+        Ok(Self {
+            id,
+            _thread_bound: std::marker::PhantomData,
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestRepairGuard {
+    fn drop(&mut self) {
+        // Remove this token rather than restoring a snapshot: out-of-order drops are safe.
+        TEST_REPAIRS.with(|stack| stack.borrow_mut().retain(|(id, _)| *id != self.id));
+    }
+}
+
+#[cfg(test)]
+pub(super) fn verified_current_repair() -> Result<(AdaptiveRecoveryReleaseV1, String), &'static str>
+{
+    if let Some(evidence) =
+        TEST_REPAIRS.with(|stack| stack.borrow().last().map(|(_, value)| value.clone()))
+    {
+        return validate_evidence(
+            &evidence.repair,
+            &evidence.manifest,
+            &evidence.gateway_digest,
+        );
+    }
+    // Without a guard, tests retain the same protected-file and serving-process checks.
+    let repair = evidence_bytes(Path::new(REPAIR_FILE))?;
+    let manifest = evidence_bytes(Path::new(MANIFEST_FILE))?;
+    let actual_gateway = gateway_digest()?;
+    let result = validate_evidence(&repair, &manifest, &actual_gateway)?;
+    if evidence_bytes(Path::new(REPAIR_FILE))? != repair
+        || evidence_bytes(Path::new(MANIFEST_FILE))? != manifest
+    {
+        return Err("recovery installed evidence changed");
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fixture() -> (serde_json::Value, Vec<u8>, String) {
+    pub(super) fn fixture() -> (serde_json::Value, Vec<u8>, String) {
         let gateway = "c".repeat(64);
         let manifest = serde_json::to_vec(&serde_json::json!({
             "version":"1.0", "created_at":"2026-09-30", "git_sha":"a".repeat(40),
@@ -323,6 +421,45 @@ mod tests {
         changed_manifest.push(b' ');
         assert!(validate_evidence(&bytes, &changed_manifest, &gateway).is_err());
         assert!(validate_evidence(&bytes, &manifest, &"f".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn repair_guard_validates_restores_and_is_thread_local() {
+        let (repair, manifest, gateway) = fixture();
+        let bytes = serde_json::to_vec(&repair).unwrap();
+        let expected = validate_evidence(&bytes, &manifest, &gateway).unwrap();
+        assert!(TestRepairGuard::install(bytes.clone(), manifest.clone(), "f".repeat(64)).is_err());
+        assert!(TEST_REPAIRS.with(|stack| stack.borrow().is_empty()));
+        let outer =
+            TestRepairGuard::install(bytes.clone(), manifest.clone(), gateway.clone()).unwrap();
+        let mut nested_repair = repair.clone();
+        nested_repair["gate_evidence_digest"] = serde_json::json!("e".repeat(64));
+        let nested_bytes = serde_json::to_vec(&nested_repair).unwrap();
+        let nested_expected = validate_evidence(&nested_bytes, &manifest, &gateway).unwrap();
+        {
+            let _inner =
+                TestRepairGuard::install(nested_bytes.clone(), manifest.clone(), gateway.clone())
+                    .unwrap();
+            assert_eq!(verified_current_repair().unwrap(), nested_expected);
+        }
+        assert_eq!(verified_current_repair().unwrap(), expected);
+        std::thread::spawn(|| {
+            assert!(TEST_REPAIRS.with(|stack| stack.borrow().is_empty()));
+        })
+        .join()
+        .unwrap();
+        let inner =
+            TestRepairGuard::install(nested_bytes, manifest.clone(), gateway.clone()).unwrap();
+        drop(outer);
+        assert_eq!(verified_current_repair().unwrap(), nested_expected);
+        drop(inner);
+        assert!(TEST_REPAIRS.with(|stack| stack.borrow().is_empty()));
+        let panic = std::panic::catch_unwind(|| {
+            let _guard = TestRepairGuard::install(bytes, manifest, gateway).unwrap();
+            panic!("fixture unwind");
+        });
+        assert!(panic.is_err());
+        assert!(TEST_REPAIRS.with(|stack| stack.borrow().is_empty()));
     }
 
     #[test]

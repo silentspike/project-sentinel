@@ -172,6 +172,8 @@ impl WorkflowStore {
         get_entity(&connection, tenant, EPOCH_KIND, &key)
     }
 
+    /// Both disjoint request subjects consume the same permanent original-session slot.
+    /// Epoch validation binds Blocked to its retained result, never an invented unknown proof.
     pub fn authorize_adaptive_leadership_recovery_epoch(
         &self,
         operator: &AuthenticatedCompanyPrincipalV1,
