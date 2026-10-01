@@ -1754,12 +1754,36 @@ impl EventStore {
 
     /// Append-only: Fuegt ein Event ein. Gibt die interne Row-ID zurueck.
     pub(crate) fn append_event(&self, event: &DomainEvent) -> anyhow::Result<i64> {
+        self.append_event_with_additional_guard(event, None)
+    }
+
+    pub(crate) fn append_event_with_world_guard(
+        &self,
+        event: &DomainEvent,
+        guard: &OwnerWriteGuard,
+    ) -> anyhow::Result<i64> {
+        anyhow::ensure!(
+            guard.scope() == &StateTransferScope::World,
+            "expected World guard"
+        );
+        self.append_event_with_additional_guard(event, Some(guard))
+    }
+
+    fn append_event_with_additional_guard(
+        &self,
+        event: &DomainEvent,
+        additional_guard: Option<&OwnerWriteGuard>,
+    ) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
-        let conn = self.begin_fenced_write(
+        let mut conn = self.begin_fenced_write(
             &self
                 .owner_registry
                 .issue(StateTransferScope::for_aggregate(&event.aggregate_id))?,
         )?;
+        if let Some(guard) = additional_guard {
+            self.owner_registry.validate(guard)?;
+            conn.additional_guards.push(guard.clone());
+        }
         conn.execute(
             "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
@@ -5143,6 +5167,7 @@ pub struct FencedSqliteWrite<'a> {
     guard: OwnerWriteGuard,
     owner_registry: &'static OwnerRegistry,
     committed: bool,
+    additional_guards: Vec<OwnerWriteGuard>,
 }
 
 impl std::ops::Deref for FencedSqliteWrite<'_> {
@@ -5162,6 +5187,9 @@ impl std::ops::DerefMut for FencedSqliteWrite<'_> {
 impl FencedSqliteWrite<'_> {
     pub fn commit(mut self) -> anyhow::Result<()> {
         self.owner_registry.validate(&self.guard)?;
+        for guard in &self.additional_guards {
+            self.owner_registry.validate(guard)?;
+        }
         self.conn.execute_batch("COMMIT")?;
         self.committed = true;
         Ok(())
@@ -5191,6 +5219,7 @@ impl FencedStore for EventStore {
             guard: guard.clone(),
             owner_registry: self.owner_registry,
             committed: false,
+            additional_guards: Vec::new(),
         })
     }
 }
@@ -7690,6 +7719,7 @@ mod tests {
             ),
             owner_registry: store.owner_registry,
             committed: false,
+            additional_guards: Vec::new(),
         };
         stale
             .execute(
@@ -7701,6 +7731,32 @@ mod tests {
         assert!(stale.commit().is_err());
 
         assert_eq!(store.get_offset("stale").unwrap(), None);
+    }
+
+    #[test]
+    fn workbench_append_requires_world_and_agent_authority_at_commit() {
+        let registry = Box::leak(Box::new(OwnerRegistry::new_for_test(
+            sentinel_common::NodeId::new(),
+        )));
+        let store = EventStore::open_with_owner_registry(":memory:", registry).unwrap();
+        let world = registry.issue(StateTransferScope::World).unwrap();
+        let event = test_event("workbench_invocation_succeeded", "AGENT-07");
+        store.append_event_with_world_guard(&event, &world).unwrap();
+        assert_eq!(store.event_count().unwrap(), 1);
+        let agent = registry
+            .issue(StateTransferScope::for_agent("AGENT-07"))
+            .unwrap();
+        let mut write = store.begin_fenced_write(&agent).unwrap();
+        write.execute("INSERT INTO projection_offsets (projection_name, last_event_id, updated_at) VALUES ('world-stale', 1, 1)", []).unwrap();
+        write.additional_guards.push(OwnerWriteGuard::for_test(
+            StateTransferScope::World,
+            registry.this_node(),
+            0,
+        ));
+        assert!(registry.validate(&agent).is_ok());
+        assert!(write.commit().is_err());
+        assert_eq!(store.get_offset("world-stale").unwrap(), None);
+        assert_eq!(store.event_count().unwrap(), 1);
     }
 
     /// AC1: Event+Outbox atomar in einer Transaktion

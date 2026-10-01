@@ -1,5 +1,11 @@
 # Changelog
 
+- Recover serial, exactly bound Workbench receipts after process cleanup and
+  retrieve committed observations without requiring a new healthy process.
+  Preserve serving-state admission for new effects, current assignment and
+  principal authorization, and terminal replay without duplicate execution.
+  Keep terminal replay independent of transient PID metadata (#856).
+
 - Add a separate bounded normal budget-window leadership subject, with exact
   root/current allowance and journal-history bindings, private observation
   context, native provider schema, real Continue/refusal decisions and cumulative

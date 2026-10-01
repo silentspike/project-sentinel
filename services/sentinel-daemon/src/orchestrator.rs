@@ -787,6 +787,34 @@ fn process_workbench_dispatch(
             runtimes,
             owner_registry,
         };
+        let publication_guard = runtime.issue_world_authority();
+        if !matches!(
+            &command,
+            crate::workbench::WorkbenchDispatchCommand::PrivateObservation { .. }
+        ) {
+            if let Err(error) = &publication_guard {
+                let response = match &command {
+                    crate::workbench::WorkbenchDispatchCommand::Submit { response, .. }
+                    | crate::workbench::WorkbenchDispatchCommand::Poll { response, .. }
+                    | crate::workbench::WorkbenchDispatchCommand::Recover { response, .. }
+                    | crate::workbench::WorkbenchDispatchCommand::Cancel { response, .. } => {
+                        response
+                    }
+                    crate::workbench::WorkbenchDispatchCommand::PrivateObservation { .. } => {
+                        unreachable!()
+                    }
+                };
+                if response
+                    .send(Err(anyhow::anyhow!(
+                        "workbench World authority is unavailable: {error}"
+                    )))
+                    .is_err()
+                {
+                    warn!("workbench requester disconnected before World-authority rejection");
+                }
+                continue;
+            }
+        }
         let (result, response) = match command {
             crate::workbench::WorkbenchDispatchCommand::PrivateObservation {
                 invocation_id,
@@ -918,24 +946,58 @@ fn process_workbench_dispatch(
             }
         };
         let result = result.and_then(|update| {
-            let agent_id = affected_agent_id
-                .ok_or_else(|| anyhow::anyhow!("workbench runtime owner is unavailable"))?;
-            let (handle, resources) = runtimes.observe(agent_id)?;
-            let (cgroup_id, pid) = synchronize_workbench_runtime_observation(
-                agent_id,
-                &handle,
-                &resources,
-                sandbox_handles,
-                security_runtime_state,
+            let publication_guard = publication_guard?;
+            owner_registry
+                .validate(&publication_guard)
+                .context("workbench publication World authority became stale")?;
+            // Durable terminal replay has no runtime transition to synchronize.
+            // Its coordinator has already revalidated current record authority.
+            if !update.replayed
+                || update.records.is_empty()
+                || !update
+                    .records
+                    .iter()
+                    .all(|record| record.state.is_terminal())
+            {
+                let agent_id = affected_agent_id
+                    .ok_or_else(|| anyhow::anyhow!("workbench runtime owner is unavailable"))?;
+                let (handle, resources) = runtimes.observe(agent_id)?;
+                let (cgroup_id, pid) = synchronize_workbench_runtime_observation(
+                    agent_id,
+                    &handle,
+                    &resources,
+                    sandbox_handles,
+                    security_runtime_state,
+                )?;
+                ebpf_collector.update_agent_pid(cgroup_id, pid);
+            }
+            publish_workbench_records_with_world_authority(
+                owner_registry,
+                &publication_guard,
+                event_store,
+                &update.records,
+                tick,
             )?;
-            ebpf_collector.update_agent_pid(cgroup_id, pid);
-            crate::workbench::publish_workbench_records(event_store, &update.records, tick)?;
             Ok(update)
         });
         if response.send(result).is_err() {
             warn!("workbench requester disconnected before receiving its durable outcome");
         }
     }
+}
+
+fn publish_workbench_records_with_world_authority(
+    owner_registry: &sentinel_common::OwnerRegistry,
+    guard: &sentinel_common::OwnerWriteGuard,
+    event_store: &EventStore,
+    records: &[crate::workbench::WorkbenchInvocationRecord],
+    tick: u64,
+) -> Result<()> {
+    owner_registry
+        .validate(guard)
+        .context("workbench publication World authority became stale")?;
+    crate::workbench::publish_workbench_records_with_world_guard(event_store, guard, records, tick)
+        .map(|_| ())
 }
 
 fn synchronize_workbench_runtime_observation(
@@ -12582,6 +12644,28 @@ mod tests {
         let security = security_runtime_state.read().unwrap();
         assert_eq!(security[&agent_id.0].runtime_pid, Some(20_055));
         assert_eq!(security[&agent_id.0].bwrap_pid, Some(20_055));
+    }
+
+    #[test]
+    fn workbench_replay_publication_requires_the_original_world_guard() {
+        let directory = tempfile::tempdir().unwrap();
+        let event_store =
+            EventStore::open(directory.path().join("events.db").to_str().unwrap()).unwrap();
+        let owner = sentinel_common::OwnerRegistry::new_for_test(sentinel_common::NodeId::new());
+        let guard = owner
+            .issue(sentinel_common::StateTransferScope::World)
+            .unwrap();
+        publish_workbench_records_with_world_authority(&owner, &guard, &event_store, &[], 1)
+            .unwrap();
+        owner.close_owner_readiness();
+        assert!(publish_workbench_records_with_world_authority(
+            &owner,
+            &guard,
+            &event_store,
+            &[],
+            2
+        )
+        .is_err());
     }
 
     #[test]

@@ -45,6 +45,18 @@ impl LegacyEventAppendGateway<'_> {
         self.store.append_event(event)
     }
 
+    pub fn append_event_with_world_guard(
+        &self,
+        event: &DomainEvent,
+        guard: &sentinel_common::OwnerWriteGuard,
+    ) -> anyhow::Result<i64> {
+        anyhow::ensure!(
+            self.producer == LegacyEventProducer::DaemonWorkbench,
+            "World-bound compatibility append is owned by Workbench"
+        );
+        self.store.append_event_with_world_guard(event, guard)
+    }
+
     pub fn append_with_outbox(&self, event: &DomainEvent, topic: &str) -> anyhow::Result<i64> {
         self.store.append_with_outbox(event, topic)
     }
