@@ -1,16 +1,12 @@
 //! Handler fuer die `room_live_view` Projektion.
 //!
-//! Verarbeitet 7 Event-Varianten:
-//! - AgentSpawned -> room_id occupancy++
-//! - TransitStarted -> from_room occupancy--, transit_count++
-//! - TransitCompleted -> to_room occupancy++, transit_count--
+//! Presence counters are derived from active agent rows after the agent handler.
+//! Other room fields retain their event-watermark guards:
 //! - ChaosTriggered -> active_chaos auf target_room
 //! - RoomPhysicsUpdated -> temperature, co2_ppm, noise_db
-//! - AgentDespawned -> current_room occupancy--
-//! - ShiftTransitionCompleted -> pro removed_agent: current_room occupancy--
 
 use sentinel_common::{DomainEvent, DomainEventPayload};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::store::ReadModelTransaction;
 
@@ -42,51 +38,14 @@ impl ProjectionHandler for RoomLiveViewHandler {
         txn: &ReadModelTransaction<'_>,
     ) -> anyhow::Result<()> {
         match payload {
-            DomainEventPayload::AgentSpawned {
-                agent_id, room_id, ..
-            } => {
-                // Only increment occupancy if agent was not already active.
-                // Without this guard, daemon restarts (re-spawn without prior despawn)
-                // cause occupant_count to drift upward monotonically.
-                let was_active = txn
-                    .get_agent_status(agent_id.0)?
-                    .map(|s| s != "despawned")
-                    .unwrap_or(false);
-                if was_active {
-                    // Agent already counted — update room but don't increment
-                    if let Some(old_room) = txn.get_agent_room(agent_id.0)? {
-                        if old_room != *room_id {
-                            txn.update_room_occupancy(&old_room, -1, event.tick, row_id)?;
-                            txn.update_room_occupancy(room_id, 1, event.tick, row_id)?;
-                        }
-                    }
-                    debug!(
-                        agent_id = agent_id.0,
-                        room = room_id,
-                        "Re-spawn: agent already active, no occupancy increment"
-                    );
-                } else {
-                    debug!(room = room_id, "Projecting agent_spawned (room occupancy)");
-                    txn.update_room_occupancy(room_id, 1, event.tick, row_id)?;
-                }
-            }
-
-            DomainEventPayload::TransitStarted {
-                from_room, to_room, ..
-            } => {
-                debug!(
-                    from = from_room,
-                    to = to_room,
-                    "Projecting transit_started (room)"
-                );
-                txn.update_room_occupancy(from_room, -1, event.tick, row_id)?;
-                txn.update_room_transit(to_room, 1, row_id)?;
-            }
-
-            DomainEventPayload::TransitCompleted { room_id, .. } => {
-                debug!(room = room_id, "Projecting transit_completed (room)");
-                txn.update_room_occupancy(room_id, 1, event.tick, row_id)?;
-                txn.update_room_transit(room_id, -1, row_id)?;
+            DomainEventPayload::AgentSpawned { .. }
+            | DomainEventPayload::AgentDespawned { .. }
+            | DomainEventPayload::AgentStatusChanged { .. }
+            | DomainEventPayload::TransitStarted { .. }
+            | DomainEventPayload::TransitCompleted { .. }
+            | DomainEventPayload::ShiftTransitionCompleted { .. }
+            | DomainEventPayload::BioStateUpdated { .. } => {
+                txn.reconcile_room_presence()?;
             }
 
             DomainEventPayload::ChaosTriggered {
@@ -129,44 +88,6 @@ impl ProjectionHandler for RoomLiveViewHandler {
                     event.tick,
                     row_id,
                 )?;
-            }
-
-            DomainEventPayload::AgentDespawned { agent_id, .. } => {
-                // Agent despawned: Raum-Belegung anpassen
-                if let Some(room) = txn.get_agent_room(agent_id.0)? {
-                    debug!(
-                        agent_id = agent_id.0,
-                        room, "Projecting agent_despawned (room occupancy)"
-                    );
-                    txn.update_room_occupancy(&room, -1, event.tick, row_id)?;
-                }
-            }
-
-            DomainEventPayload::ShiftTransitionCompleted { removed_agents, .. } => {
-                // Gruppiere Decrements pro Raum um den Idempotenz-Guard
-                // nicht auszuhebeln (gleiche row_id, gleicher Raum).
-                debug!(
-                    count = removed_agents.len(),
-                    "Projecting shift_transition (room occupancy)"
-                );
-                let mut room_decrements: std::collections::HashMap<String, i64> =
-                    std::collections::HashMap::new();
-                for agent_id in removed_agents {
-                    match txn.get_agent_room(agent_id.0)? {
-                        Some(room) => {
-                            *room_decrements.entry(room).or_insert(0) -= 1;
-                        }
-                        None => {
-                            warn!(
-                                agent_id = agent_id.0,
-                                "Agent has no current_room during shift transition"
-                            );
-                        }
-                    }
-                }
-                for (room, delta) in &room_decrements {
-                    txn.update_room_occupancy(room, *delta, event.tick, row_id)?;
-                }
             }
 
             DomainEventPayload::SmellEventTriggered {

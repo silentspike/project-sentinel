@@ -8,6 +8,11 @@
   review capacity for the exact exhausted session head, without changing root
   employee budgets, recovery epochs, effects or recorded spending.
 
+- Derive room occupancy and arrivals atomically from current active employee
+  presence, preserving event watermarks and environmental state across startup
+  repair. Show only active, physically present employees in desktop room lists
+  (#856).
+
 - Discover exact durable employee sessions and govern bounded leadership reviews
   without requiring the assigned developer's live process. Keep current lineage,
   revocation, observation and journal bindings while fresh employee execution and
