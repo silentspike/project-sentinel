@@ -55,7 +55,10 @@ use sentinel_workflow::{
 };
 use sha2::{Digest, Sha256};
 
-fn reserve_and_claim_schema2(api: &WorkflowApi, context: &LeadershipContext) -> (String, String) {
+pub(super) fn reserve_and_claim_schema2(
+    api: &WorkflowApi,
+    context: &LeadershipContext,
+) -> (String, String) {
     let grant = &context.binding.grant;
     assert_eq!(grant.schema_version, 2);
     let id = format!("company-leadership-{}", grant.review_id);
@@ -68,13 +71,17 @@ fn reserve_and_claim_schema2(api: &WorkflowApi, context: &LeadershipContext) -> 
             &grant.leadership_principal.agent_id.unwrap().to_string(),
         )
         .unwrap();
+    let review_kind = match grant.subject.as_ref().unwrap() {
+        AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. } => "unknown_model",
+        AdaptiveLeadershipReviewSubjectV2::BlockedContinuation { .. } => "blocked_continuation",
+    };
     let request = serde_json::json!({
         "schema_version": 5, "allowance_id": context.binding.allowance_id,
         "agent_id": grant.leadership_principal.agent_id.unwrap().0,
         "request_id": id, "request_digest": digest, "context_digest": context.context_digest,
         "provider": grant.provider, "model": grant.model, "catalog_digest": grant.catalog_digest,
         "subject": {"kind": "adaptive_leadership_review", "review_id": grant.review_id,
-            "review_kind": "blocked_continuation"},
+            "review_kind": review_kind},
     });
     let before = api
         .store
@@ -116,20 +123,53 @@ fn reserve_and_claim_schema2(api: &WorkflowApi, context: &LeadershipContext) -> 
 }
 
 fn fixture_schema2_blocked(path: &Path, event_path: &Path) -> (WorkflowApi, LeadershipContext) {
+    fixture_schema2_source(path, event_path, false, false, false)
+}
+
+pub(super) fn fixture_schema2_recovery_source(
+    path: &Path,
+    event_path: &Path,
+    unknown: bool,
+) -> (WorkflowApi, LeadershipContext) {
+    fixture_schema2_source(path, event_path, true, unknown, false)
+}
+
+pub(super) fn fixture_schema2_recovery_source_with_current_allowance(
+    path: &Path,
+    event_path: &Path,
+    unknown: bool,
+) -> (WorkflowApi, LeadershipContext) {
+    fixture_schema2_source(path, event_path, true, unknown, true)
+}
+
+fn fixture_schema2_source(
+    path: &Path,
+    event_path: &Path,
+    historical_review: bool,
+    unknown: bool,
+    replace_current_allowance: bool,
+) -> (WorkflowApi, LeadershipContext) {
     let mut api = super::model_work::configured_test_api(path);
-    let historical = now_unix_ms().checked_sub(600_000).unwrap();
+    let historical = now_unix_ms()
+        .checked_sub(if historical_review {
+            1_200_000
+        } else {
+            600_000
+        })
+        .unwrap();
     let binding = super::model_work::assign_test_work_from_at(&api, Some(8), 0, historical);
     api.subscription_allowance_id = Some(binding.reservation_id.clone());
     api.event_store = Some(sentinel_limbo::EventStore::open(event_path.to_str().unwrap()).unwrap());
     let tenant = TenantId::parse(&binding.tenant_id).unwrap();
     let project_id = ProjectId::parse(&binding.project_id).unwrap();
     let work_item_id = WorkItemId::parse(&binding.work_item_id).unwrap();
-    let project = api
+    let root_project = api
         .store
         .company_project(&tenant, &project_id)
         .unwrap()
         .unwrap();
-    let allowance = project.subscription_call.as_ref().unwrap();
+    let allowance = root_project.subscription_call.as_ref().unwrap();
+    let mut project = root_project.clone();
     let current = api
         .authority
         .as_ref()
@@ -177,22 +217,140 @@ fn fixture_schema2_blocked(path: &Path, event_path: &Path) -> (WorkflowApi, Lead
             historical + 1,
         )
         .unwrap();
-    api.store
-        .advance_adaptive_session(
-            grant.session_id,
-            pending.version,
-            Uuid::new_v4(),
-            &AdaptiveTransitionV1::ResolveModel {
-                effect,
-                result_digest: "b".repeat(64),
-                decision: AdaptiveModelDecisionV1::Blocked {
-                    reason_code: "dependency_unavailable".into(),
+    if unknown {
+        use super::model_execution::{AdaptiveProviderAuthority, ProviderExecutionAuthority};
+        let assignment = project.work_items[&work_item_id]
+            .assignments
+            .iter()
+            .find(|entry| entry.active)
+            .unwrap();
+        let authority = ProviderExecutionAuthority::Adaptive(Box::new(AdaptiveProviderAuthority {
+            schema_version: 3,
+            grant: grant.clone(),
+            session_version: initial.version,
+            effect_id: effect.id,
+            assignment_id: assignment.assignment_id.clone(),
+            previous_observation: None,
+        }));
+        let request_id = authority.request_id();
+        let events = api.event_store.as_ref().unwrap();
+        events
+            .reserve_llm_request(
+                &request_id,
+                &effect.request_digest,
+                &current.agent_id.to_string(),
+            )
+            .unwrap();
+        // Synthetic before-send registration; the unknown receipt is sealed by the real store.
+        events
+            .bind_llm_model_reservation(&sentinel_limbo::LlmModelReservationV1 {
+                schema_version: 1,
+                request_id: request_id.clone(),
+                request_digest: effect.request_digest.clone(),
+                owner_scope: sentinel_common::StateTransferScope::for_agent(
+                    current.agent_id.to_string(),
+                ),
+                subject: sentinel_limbo::LlmModelSubjectV1::Adaptive {
+                    session_id: grant.session_id,
+                    effect_id: effect.id,
+                    session_version: initial.version,
                 },
-            },
-            &current,
-            historical + 2,
-        )
-        .unwrap();
+                allowance_id: grant.provider_allowance_id.clone(),
+                context_digest: "d".repeat(64),
+                authority_digest: sentinel_common::sha256_hex(
+                    &serde_json::to_vec(&authority).unwrap(),
+                ),
+                usage_binding: sentinel_limbo::LlmModelUsageBindingV1 {
+                    agent_id: current.agent_id,
+                    tenant_id: current.tenant_id.0.clone(),
+                    project_id: current.project_id.0.clone(),
+                    work_item_id: current.work_item_id.0.clone(),
+                    reservation_id: grant.provider_allowance_id.clone(),
+                    assignment_id: assignment.assignment_id.clone(),
+                    assignment_version: current.assignment_version,
+                    provider: grant.provider.clone(),
+                    model: grant.model.clone(),
+                },
+            })
+            .unwrap();
+        assert!(events
+            .mark_llm_provider_outcome_unknown(
+                &request_id,
+                &effect.request_digest,
+                "UnknownOutcome: provider_transport_deadline_elapsed",
+            )
+            .unwrap());
+        api.store
+            .advance_adaptive_session(
+                grant.session_id,
+                pending.version,
+                Uuid::new_v4(),
+                &AdaptiveTransitionV1::MarkUnknown {
+                    effect: effect.clone(),
+                },
+                &current,
+                historical + 2,
+            )
+            .unwrap();
+    } else {
+        api.store
+            .advance_adaptive_session(
+                grant.session_id,
+                pending.version,
+                Uuid::new_v4(),
+                &AdaptiveTransitionV1::ResolveModel {
+                    effect,
+                    result_digest: "b".repeat(64),
+                    decision: AdaptiveModelDecisionV1::Blocked {
+                        reason_code: "dependency_unavailable".into(),
+                    },
+                },
+                &current,
+                historical + 2,
+            )
+            .unwrap();
+    }
+
+    let leader = api.principals.principal("pm").unwrap();
+    if replace_current_allowance {
+        assert!(historical_review);
+        let before = api
+            .store
+            .adaptive_session(grant.session_id, &current)
+            .unwrap()
+            .unwrap();
+        let mut replacement = allowance.grant.clone();
+        replacement.expires_at_unix_ms = grant.deadline_ms + 300_000;
+        let response = api
+            .store
+            .apply_company_command(
+                &leader.principal,
+                Uuid::new_v4(),
+                &CompanyWorkflowCommandV1::GrantSubscriptionCall {
+                    project_id: project_id.clone(),
+                    expected_version: project.version,
+                    grant: replacement,
+                },
+                grant.deadline_ms,
+            )
+            .unwrap()
+            .response;
+        let CompanyWorkflowResponseV1::Project(replaced) = response else {
+            panic!("replacement allowance project");
+        };
+        project = *replaced;
+        let replacement = project.subscription_call.as_ref().unwrap();
+        assert_ne!(replacement.allowance_id, grant.provider_allowance_id);
+        assert!(replacement.dispatch.is_none());
+        assert_eq!(
+            api.store
+                .adaptive_session(grant.session_id, &current)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        api.subscription_allowance_id = Some(replacement.allowance_id.clone());
+    }
 
     // Synthetic planning receipt only, as in the shared fixture. Keep its policy
     // identical to the root allowance; no provider request or decision is implied.
@@ -204,8 +362,17 @@ fn fixture_schema2_blocked(path: &Path, event_path: &Path) -> (WorkflowApi, Lead
         .find(|event| event.project_id == project_id && event.event_type == "project_created")
         .unwrap()
         .project;
-    let leader = api.principals.principal("pm").unwrap();
-    let now = now_unix_ms();
+    let now = if historical_review {
+        grant.deadline_ms
+    } else {
+        now_unix_ms()
+    };
+    if historical_review {
+        assert!(
+            now + 300_000 + 10_000 < now_unix_ms(),
+            "historical review needs room before epoch issuance"
+        );
+    }
     let mut planning = sentinel_workflow::ProjectPlanningCallV1 {
         schema_version: 1,
         allowance_id: "continuation-fixture-planning".into(),
@@ -253,6 +420,118 @@ fn fixture_schema2_blocked(path: &Path, event_path: &Path) -> (WorkflowApi, Lead
             .unwrap(),
         Some(planning)
     );
+    if historical_review {
+        // Seed historical review admission through the store, without changing daemon clock APIs.
+        let session = api
+            .store
+            .adaptive_session(grant.session_id, &current)
+            .unwrap()
+            .unwrap();
+        let work = &project.work_items[&work_item_id];
+        let (profile, _) = api
+            .authority
+            .as_ref()
+            .unwrap()
+            .profile_for_binding(&current.profile_id)
+            .unwrap();
+        let catalog = super::model_execution::tool_catalog::adaptive_tool_catalog(
+            profile, &current, &work.spec,
+        )
+        .unwrap();
+        let (reason, subject, refs) = match &session.cursor {
+            AdaptiveCursorV1::ModelUnknown { effect } => {
+                let proof = api
+                    .read_only_unknown_model_proof_digest(&project, &session, effect)
+                    .unwrap()
+                    .unwrap();
+                (
+                    String::new(),
+                    AdaptiveLeadershipReviewSubjectV2::UnknownModel {
+                        effect: effect.clone(),
+                        sealed_unknown_proof_digest: proof.clone(),
+                    },
+                    vec![
+                        format!(
+                            "adaptive-model-unknown:{}:{}",
+                            effect.id, effect.request_digest
+                        ),
+                        format!("sealed-provider-unknown:{proof}"),
+                    ],
+                )
+            }
+            AdaptiveCursorV1::Blocked { reason_code } => (
+                reason_code.clone(),
+                AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
+                    reason_code: reason_code.clone(),
+                    resolution_event_id: None,
+                },
+                vec![format!(
+                    "adaptive-model-result:{}",
+                    session.last_model_result_digest.as_ref().unwrap()
+                )],
+            ),
+            _ => panic!("unexpected historical fixture cursor"),
+        };
+        let fingerprint =
+            sentinel_workflow::adaptive_leadership_evidence_fingerprint(&catalog, &refs).unwrap();
+        let review_grant = sentinel_workflow::AdaptiveLeadershipReviewGrantV1 {
+            schema_version: 2,
+            recovery_epoch: None,
+            subject: Some(subject),
+            review_id: sentinel_workflow::adaptive_leadership_review_id(
+                grant.session_id,
+                session.version,
+                &fingerprint,
+            )
+            .unwrap(),
+            project_id: project_id.clone(),
+            expected_project_version: project.version,
+            work_item_id: work_item_id.clone(),
+            session_id: grant.session_id,
+            expected_session_version: session.version,
+            expected_reason_code: reason,
+            evidence_fingerprint: fingerprint,
+            leadership_principal: leader.principal.clone(),
+            leadership_authority: leader.execution_authority.clone(),
+            assignment_id: work
+                .assignments
+                .iter()
+                .find(|entry| entry.active)
+                .unwrap()
+                .assignment_id
+                .clone(),
+            assignee_authority: current.clone(),
+            provider: allowance.grant.provider.clone(),
+            model: allowance.grant.model.clone(),
+            catalog_digest: allowance.grant.catalog_digest.clone(),
+            max_duration_ms: allowance.grant.max_duration_ms,
+            token_policy: allowance.grant.token_policy,
+            expires_at_unix_ms: now + 1_000,
+        };
+        let source = sentinel_workflow::AdaptiveLeadershipReviewContextV1 {
+            source_project: project.clone(),
+            source_session: session,
+            tool_catalog: catalog,
+            evidence_refs: refs,
+        };
+        let call = api
+            .store
+            .authorize_adaptive_leadership_review_call(
+                &leader.principal,
+                Uuid::new_v4(),
+                "local-fixture-history-initial",
+                &review_grant,
+                &source,
+                now,
+            )
+            .unwrap();
+        let context = LeadershipContext {
+            binding: LeadershipAuthority::from_call(&call),
+            context_digest: call.context_digest().unwrap(),
+            source: call.context,
+        };
+        return (api, context);
+    }
     {
         let _fence = api.mutation_fence.write().unwrap();
         assert!(api.reconcile_adaptive_leadership_reviews(&project).unwrap());
@@ -470,6 +749,7 @@ impl Fixture {
             issued_at_ms,
             deadline_ms,
             additional_model_calls: 1,
+            local_adoption: None,
         };
         let proposed = CompleteAdaptiveLeadershipReviewCallV1 {
             review_id: call.grant.review_id,

@@ -26,7 +26,12 @@ fn validate_audit(payload: &[u8]) -> Result<(), EventContractError> {
     let audit: ContinuationAudit = serde_json::from_slice(payload).map_err(|_| invalid())?;
     let continuation = audit.result.continuation.as_ref().ok_or_else(invalid)?;
     let call = &audit.call;
-    if audit.schema_version != 1
+    if audit.schema_version
+        != (if continuation.local_adoption.is_some() {
+            2
+        } else {
+            1
+        })
         || call.decision.is_some()
         || call.retired_at_unix_ms.is_some()
         || audit.result.review_id != call.grant.review_id
@@ -80,9 +85,19 @@ fn continuation_proposal(
         .continuation
         .as_ref()
         .ok_or("continuation missing")?;
+    if authorization.local_adoption.is_some() {
+        return sentinel_workflow::WorkflowStore::local_adoption_continuation_audit_proposal(
+            call, proposed,
+        )
+        .map_err(|_| "continuation audit invalid");
+    }
     let id = authorization.resolution_event_id.to_string();
     let payload = sentinel_common::canonical_json(&ContinuationAudit {
-        schema_version: 1,
+        schema_version: if authorization.local_adoption.is_some() {
+            2
+        } else {
+            1
+        },
         call: call.clone(),
         result: proposed.clone(),
     })

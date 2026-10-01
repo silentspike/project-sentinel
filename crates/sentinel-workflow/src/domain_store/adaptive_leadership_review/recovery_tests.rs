@@ -2,12 +2,18 @@ use super::*;
 use crate::{
     adaptive_leadership_recovery_history_digest, adaptive_leadership_recovery_project_digest,
     adaptive_leadership_recovery_session_digest,
-    AdaptiveLeadershipRecoveryEpochV1, AdaptiveLeadershipRecoveryRequestV1,
+    AdaptiveLeadershipRecoveryBlockedSubjectV1, AdaptiveLeadershipRecoveryEpochV1,
+    AdaptiveLeadershipRecoveryRequestV1,
+    AdaptiveLeadershipLocalAdoptionRequestV1, AdaptiveLeadershipLocalAdoptionV1,
     AdaptiveRecoveryReleaseV1,
 };
 
 fn recovery_source() -> (Fixture, Vec<AdaptiveLeadershipReviewCallV1>, u64) {
-    let mut f = continuation_fixture(true, false);
+    recovery_source_with_subject(true)
+}
+
+fn recovery_source_with_subject(unknown: bool) -> (Fixture, Vec<AdaptiveLeadershipReviewCallV1>, u64) {
+    let mut f = continuation_fixture(unknown, false);
     let source = f.context.source_session.clone();
     let project = f.context.source_project.clone();
     let mut retired = Vec::new();
@@ -73,16 +79,24 @@ fn recovery_request(
     retired: &[AdaptiveLeadershipReviewCallV1],
 ) -> AdaptiveLeadershipRecoveryRequestV1 {
     let source = &f.context.source_session;
-    let AdaptiveLeadershipReviewSubjectV2::UnknownModel {
-        effect, sealed_unknown_proof_digest,
-    } = f.grant.subject.as_ref().unwrap() else {
-        panic!("unknown model fixture");
+    let (schema_version, unknown_effect, sealed_unknown_proof_digest, blocked_subject) =
+        match f.grant.subject.as_ref().unwrap() {
+            AdaptiveLeadershipReviewSubjectV2::UnknownModel { effect, sealed_unknown_proof_digest } => {
+                (1, Some(effect.clone()), Some(sealed_unknown_proof_digest.clone()), None)
+            }
+            AdaptiveLeadershipReviewSubjectV2::BlockedContinuation { reason_code, resolution_event_id: None } => {
+                (2, None, None, Some(AdaptiveLeadershipRecoveryBlockedSubjectV1 {
+                    reason_code: reason_code.clone(),
+                    model_response_digest: source.last_model_result_digest.clone().unwrap(),
+                }))
+            }
+            _ => panic!("unsupported recovery fixture"),
     };
     let (_, head_digest) = crate::store::adaptive::load(
         &f.store.connection.lock().unwrap(), source.grant.session_id,
     ).unwrap().unwrap();
     let request = AdaptiveLeadershipRecoveryRequestV1 {
-        schema_version: 1,
+        schema_version,
         operation_id: Uuid::new_v4(),
         tenant_id: f.leader.tenant_id.clone(),
         project_id: f.grant.project_id.clone(),
@@ -93,8 +107,9 @@ fn recovery_request(
         session_head_digest: head_digest,
         session_digest: adaptive_leadership_recovery_session_digest(source).unwrap(),
         project_digest: adaptive_leadership_recovery_project_digest(&f.context.source_project).unwrap(),
-        unknown_effect: effect.clone(),
-        sealed_unknown_proof_digest: sealed_unknown_proof_digest.clone(),
+        unknown_effect,
+        sealed_unknown_proof_digest,
+        blocked_subject,
         prior_review_history_digest: adaptive_leadership_recovery_history_digest(retired).unwrap(),
         repair_digest: "b".repeat(64),
         release: AdaptiveRecoveryReleaseV1 {
@@ -129,6 +144,131 @@ fn authorize_recovery(
     ).unwrap();
     assert!(!replayed);
     epoch
+}
+
+#[test]
+fn blocked_recovery_preserves_original_session_history_and_permanent_slot() {
+    let (mut f, retired, now) = recovery_source_with_subject(false);
+    let source = session(&f);
+    let mut request = recovery_request(&mut f, &retired);
+    request.max_additional_model_calls = source.grant.max_model_calls - source.model_calls;
+    f.context.evidence_refs.retain(|reference| !reference.starts_with("recovery-request:"));
+    f.context.evidence_refs.push(format!("recovery-request:{}", request.canonical_digest().unwrap()));
+    f.context.evidence_refs.sort();
+    refresh_recovery_review(&mut f);
+    assert_eq!(request.schema_version, 2);
+    assert!(request.unknown_effect.is_none());
+    assert!(request.sealed_unknown_proof_digest.is_none());
+    assert_eq!(request.blocked_subject.as_ref().unwrap().model_response_digest,
+        source.last_model_result_digest.clone().unwrap());
+    let epoch = authorize_recovery(&f, &request, now);
+    epoch.validate_history(&retired).unwrap();
+    let call = recovery_call(&f, &epoch);
+    let dispatched = f.store.claim_adaptive_leadership_review_call(
+        &f.leader, &claim(&call), now + 1,
+    ).unwrap();
+    let result = recovery_continue_result_with_calls(&dispatched, now + 2, 2);
+    let completed = f.store.complete_adaptive_leadership_review_call(
+        &f.leader, &result, now + 2,
+    ).unwrap();
+    let continued = session(&f);
+    assert_eq!(continued.grant, source.grant);
+    assert_eq!((continued.model_calls, continued.tool_calls), (source.model_calls, source.tool_calls));
+    assert_eq!(continued.last_model_result_digest, source.last_model_result_digest);
+    assert_eq!(continued.effect_ids, source.effect_ids);
+    assert!(continued.requires_fresh_observation());
+    assert_eq!(continued.active_model_ceiling(), source.model_calls + 2);
+    assert!(completed.continuation.as_ref().unwrap().abandoned_model_effect.is_none());
+    let calls = f.store.adaptive_leadership_review_calls(&request.tenant_id, request.session_id).unwrap();
+    assert_eq!(calls.len(), 4);
+    for prior in retired {
+        assert!(calls.contains(&prior));
+    }
+    let before = rows(&f.store);
+    let operator = recovery_operator(&request.tenant_id);
+    assert_eq!(f.store.authorize_adaptive_leadership_recovery_epoch(
+        &operator, &request, &f.grant, &f.context, request.expires_at_unix_ms + 1,
+    ).unwrap(), (true, epoch));
+    let mut other_subject = request.clone();
+    other_subject.schema_version = 1;
+    other_subject.unknown_effect = Some(AdaptiveEffectV1 { id: Uuid::new_v4(), request_digest: DIGEST.into() });
+    other_subject.sealed_unknown_proof_digest = Some(DIGEST.into());
+    other_subject.blocked_subject = None;
+    assert_eq!(f.store.authorize_adaptive_leadership_recovery_epoch(
+        &operator, &other_subject, &f.grant, &f.context, request.expires_at_unix_ms + 1,
+    ).unwrap_err().code, WorkflowErrorCode::IdempotencyConflict);
+    assert_eq!(rows(&f.store), before);
+}
+
+#[test]
+fn blocked_recovery_subject_and_original_root_caps_cannot_be_rebound() {
+    for field in ["reason", "result", "calls", "window", "subject", "resolved", "clock"] {
+        let (mut f, retired, now) = recovery_source_with_subject(false);
+        let source = session(&f);
+        let mut request = recovery_request(&mut f, &retired);
+        let issued = match field {
+            "reason" => { request.blocked_subject.as_mut().unwrap().reason_code = "other_blocked".into(); now },
+            "result" => { request.blocked_subject.as_mut().unwrap().model_response_digest = "f".repeat(64); now },
+            "calls" => { request.max_additional_model_calls = source.grant.max_model_calls - source.model_calls + 1; now },
+            "window" => { request.max_window_ms = source.grant.deadline_ms - source.grant.created_at_ms + 1; now },
+            "subject" => {
+                request.schema_version = 1;
+                request.unknown_effect = Some(AdaptiveEffectV1 { id: Uuid::new_v4(), request_digest: DIGEST.into() });
+                request.sealed_unknown_proof_digest = Some(DIGEST.into());
+                request.blocked_subject = None;
+                now
+            }
+            "resolved" => {
+                f.grant.subject = Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
+                    reason_code: REASON.into(), resolution_event_id: Some(Uuid::new_v4().to_string()),
+                });
+                now
+            }
+            "clock" => source.active_deadline_ms() - 1,
+            _ => unreachable!(),
+        };
+        f.context.evidence_refs.retain(|reference| !reference.starts_with("recovery-request:"));
+        f.context.evidence_refs.push(format!("recovery-request:{}", request.canonical_digest().unwrap()));
+        f.context.evidence_refs.sort();
+        refresh_recovery_review(&mut f);
+        let before = rows(&f.store);
+        assert!(f.store.authorize_adaptive_leadership_recovery_epoch(
+            &recovery_operator(&request.tenant_id), &request, &f.grant, &f.context, issued,
+        ).is_err(), "accepted invalid blocked {field}");
+        assert_eq!(rows(&f.store), before);
+        assert_eq!(session(&f), source);
+    }
+}
+
+#[test]
+fn unknown_recovery_cannot_use_a_blocked_request_or_mixed_retired_history() {
+    let (mut f, retired, now) = recovery_source();
+    let mut request = recovery_request(&mut f, &retired);
+    request.schema_version = 2;
+    request.unknown_effect = None;
+    request.sealed_unknown_proof_digest = None;
+    request.blocked_subject = Some(AdaptiveLeadershipRecoveryBlockedSubjectV1 {
+        reason_code: REASON.into(), model_response_digest: DIGEST.into(),
+    });
+    f.context.evidence_refs.retain(|reference| !reference.starts_with("recovery-request:"));
+    f.context.evidence_refs.push(format!("recovery-request:{}", request.canonical_digest().unwrap()));
+    f.context.evidence_refs.sort();
+    refresh_recovery_review(&mut f);
+    let before = rows(&f.store);
+    assert!(f.store.authorize_adaptive_leadership_recovery_epoch(
+        &recovery_operator(&request.tenant_id), &request, &f.grant, &f.context, now,
+    ).is_err());
+    assert_eq!(rows(&f.store), before);
+
+    let (mut blocked, blocked_history, blocked_now) = recovery_source_with_subject(false);
+    let mut mixed = blocked_history.clone();
+    mixed[0] = retired[0].clone();
+    let request = recovery_request(&mut blocked, &mixed);
+    let before = rows(&blocked.store);
+    assert!(blocked.store.authorize_adaptive_leadership_recovery_epoch(
+        &recovery_operator(&request.tenant_id), &request, &blocked.grant, &blocked.context, blocked_now,
+    ).is_err());
+    assert_eq!(rows(&blocked.store), before);
 }
 
 #[test]
@@ -269,7 +409,7 @@ fn recovery_epoch_invalid_head_history_and_time_do_not_consume_authority() {
         let issued_at = match changed_field {
             "head" => { request.session_head_digest = "f".repeat(64); now },
             "history" => { request.prior_review_history_digest = "f".repeat(64); now },
-            "effect" => { request.unknown_effect.id = Uuid::new_v4(); now },
+            "effect" => { request.unknown_effect.as_mut().unwrap().id = Uuid::new_v4(); now },
             "time" => request.expires_at_unix_ms,
             "project" => { change_project(&f, now + 1); now + 2 },
             _ => unreachable!(),
@@ -362,6 +502,441 @@ fn recovery_continue_result_with_calls(
     result
 }
 
+fn local_adoption_source(unknown: bool) -> (
+    Fixture,
+    AdaptiveLeadershipRecoveryEpochV1,
+    AdaptiveLeadershipReviewCallV1,
+    CompleteAdaptiveLeadershipReviewCallV1,
+    AdaptiveLeadershipLocalAdoptionRequestV1,
+    u64,
+) {
+    let (mut f, retired, now) = recovery_source_with_subject(unknown);
+    let recovery = recovery_request(&mut f, &retired);
+    let epoch = authorize_recovery(&f, &recovery, now);
+    let call = recovery_call(&f, &epoch);
+    let dispatched = f.store.claim_adaptive_leadership_review_call(
+        &f.leader, &claim(&call), now + 1,
+    ).unwrap();
+    // Retain the known response before expiry; only local authority gets a new clock.
+    let known = recovery_continue_result(&dispatched, now + 2);
+    let issued = dispatched.grant.expires_at_unix_ms + 1;
+    let request = AdaptiveLeadershipLocalAdoptionRequestV1 {
+        schema_version: 1,
+        operation_id: Uuid::new_v4(),
+        tenant_id: recovery.tenant_id.clone(),
+        project_id: recovery.project_id.clone(),
+        work_item_id: recovery.work_item_id.clone(),
+        session_id: recovery.session_id,
+        review_id: epoch.review_id,
+        epoch_digest: epoch.canonical_digest().unwrap(),
+        original_call_digest: crate::adaptive_leadership_local_adoption_source_call_digest(&dispatched).unwrap(),
+        project_digest: recovery.project_digest.clone(),
+        session_digest: recovery.session_digest.clone(),
+        session_head_digest: recovery.session_head_digest.clone(),
+        request_id: dispatched.request_id(),
+        request_digest: known.request_digest.clone(),
+        context_digest: dispatched.context_digest().unwrap(),
+        payload_digest: "1".repeat(64),
+        model_response_digest: known.model_response_digest.clone(),
+        usage_event_digest: "2".repeat(64),
+        original_completion_error: "continuation audit invalid".into(),
+        completion_attempts: 5,
+        release: AdaptiveRecoveryReleaseV1 {
+            schema_version: 1,
+            source_git_sha: "3".repeat(40),
+            release_manifest_digest: "4".repeat(64),
+            gateway_binary_digest: "5".repeat(64),
+        },
+        repair_digest: "6".repeat(64),
+        decision: known.decision.clone(),
+        expires_at_unix_ms: issued + 60_000,
+    };
+    (f, epoch, dispatched, known, request, issued)
+}
+
+fn local_adoption_result(
+    call: &AdaptiveLeadershipReviewCallV1,
+    known: &CompleteAdaptiveLeadershipReviewCallV1,
+    adoption: &AdaptiveLeadershipLocalAdoptionV1,
+) -> CompleteAdaptiveLeadershipReviewCallV1 {
+    let mut result = known.clone();
+    let authorization = result.continuation.as_mut().unwrap();
+    let allowance = call.continuation_allowance(
+        adoption.issued_at_unix_ms, adoption.continuation_deadline_ms,
+        authorization.additional_model_calls,
+    ).unwrap();
+    authorization.issued_at_ms = adoption.issued_at_unix_ms;
+    authorization.deadline_ms = adoption.continuation_deadline_ms;
+    authorization.provider_authority_digest = adaptive_leadership_continuation_provider_authority_digest(
+        &allowance, &call.grant.assignee_authority,
+    ).unwrap();
+    authorization.local_adoption = Some(Box::new(adoption.clone()));
+    result
+}
+
+#[test]
+fn local_adoption_persisted_continue_completes_both_subjects_and_replays_after_reopen() {
+    for unknown in [true, false] {
+        let (f, epoch, call, known, request, issued) = local_adoption_source(unknown);
+        let source = session(&f);
+        let operator = recovery_operator(&request.tenant_id);
+        assert!(issued > call.grant.expires_at_unix_ms);
+        assert_ne!(request.release, epoch.request.release);
+        let (replayed, adoption) = f.store.authorize_adaptive_leadership_local_adoption(
+            &operator, &request, issued,
+        ).unwrap();
+        assert!(!replayed);
+        assert_eq!(adoption.issued_at_unix_ms, issued);
+        assert_eq!(adoption.continuation_deadline_ms, issued + 120_000);
+        assert_eq!(session(&f), source);
+        assert_eq!(recovery_call(&f, &epoch), call);
+        let before = rows(&f.store);
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert_eq!(reopened.adaptive_leadership_local_adoption(
+            &request.tenant_id, request.review_id,
+        ).unwrap(), Some(adoption.clone()));
+        assert_eq!(reopened.authorize_adaptive_leadership_local_adoption(
+            &operator, &request, issued + 10,
+        ).unwrap(), (true, adoption.clone()));
+        assert_eq!(rows(&reopened), before);
+        let result = local_adoption_result(&call, &known, &adoption);
+        assert_eq!(result.decision, known.decision);
+        assert_eq!(result.model_response_digest, known.model_response_digest);
+        assert_eq!(result.resolution_event_id, known.resolution_event_id);
+        let completed = reopened.complete_adaptive_leadership_review_call(
+            &f.leader, &result, issued + 11,
+        ).unwrap();
+        assert_eq!(completed.version, 3);
+        assert_eq!(completed.decision, Some(request.decision.clone()));
+        assert_eq!(completed.model_response_digest, Some(request.model_response_digest.clone()));
+        let continued = session(&f);
+        assert_eq!(continued.version, source.version + 1);
+        assert_eq!(continued.grant, source.grant);
+        assert_eq!(continued.model_calls, source.model_calls);
+        assert_eq!(continued.tool_calls, source.tool_calls);
+        let authorization = continued.continuation.as_ref().unwrap().authorizations.last().unwrap();
+        assert_eq!(authorization, result.continuation.as_ref().unwrap());
+        if let Some(effect) = &epoch.request.unknown_effect {
+            assert!(continued.is_abandoned_model_effect(effect));
+        } else {
+            assert!(authorization.abandoned_model_effect.is_none());
+        }
+        assert_eq!(reopened.adaptive_leadership_review_calls(
+            &request.tenant_id, request.session_id,
+        ).unwrap().len(), ADAPTIVE_LEADERSHIP_MAX_REVIEWS + 1);
+        change_project(&f, request.expires_at_unix_ms + 1);
+        let before = rows(&f.store);
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert_eq!(reopened.authorize_adaptive_leadership_local_adoption(
+            &operator, &request, adoption.continuation_deadline_ms + 1,
+        ).unwrap(), (true, adoption));
+        assert_eq!(reopened.complete_adaptive_leadership_review_call(
+            &f.leader, &result, issued + 120_001,
+        ).unwrap(), completed);
+        assert_eq!(reopened.adaptive_leadership_review_call(
+            &request.tenant_id, request.review_id,
+        ).unwrap(), Some(completed));
+        assert_eq!(rows(&reopened), before);
+        assert_eq!(session(&f), continued);
+        let audits: i64 = reopened.connection.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM company_events
+             WHERE event_type='adaptive_leadership_local_adoption_authorized' AND operation_id=?1",
+            [request.operation_id.to_string()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(audits, 1);
+    }
+}
+
+#[test]
+fn local_adoption_expiry_rejects_fresh_issuance_and_completion_without_writes() {
+    for unknown in [true, false] {
+        let (f, epoch, call, known, request, issued) = local_adoption_source(unknown);
+        let operator = recovery_operator(&request.tenant_id);
+        let source = session(&f);
+        let before = rows(&f.store);
+        assert!(f.store.authorize_adaptive_leadership_local_adoption(
+            &operator, &request, request.expires_at_unix_ms,
+        ).is_err());
+        assert_eq!(rows(&f.store), before);
+        assert!(f.store.adaptive_leadership_local_adoption(
+            &request.tenant_id, request.review_id,
+        ).unwrap().is_none());
+        let (_, adoption) = f.store.authorize_adaptive_leadership_local_adoption(
+            &operator, &request, issued,
+        ).unwrap();
+        let result = local_adoption_result(&call, &known, &adoption);
+        let before = rows(&f.store);
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        for now in [issued - 1, request.expires_at_unix_ms, adoption.continuation_deadline_ms] {
+            assert!(reopened.complete_adaptive_leadership_review_call(&f.leader, &result, now).is_err());
+            assert_eq!(rows(&reopened), before);
+        }
+        assert_eq!(reopened.authorize_adaptive_leadership_local_adoption(
+            &operator, &request, request.expires_at_unix_ms + 1,
+        ).unwrap(), (true, adoption));
+        assert_eq!(rows(&reopened), before);
+        assert_eq!(session(&f), source);
+        assert_eq!(recovery_call(&f, &epoch), call);
+    }
+}
+
+fn sealed_local_adoption_audit(
+    call: &AdaptiveLeadershipReviewCallV1,
+    result: &CompleteAdaptiveLeadershipReviewCallV1,
+    appended_at: u64,
+) -> sentinel_common::EventEnvelopeV2 {
+    let proposal = local_adoption_audit_proposal(call, result).unwrap();
+    // Synthetic store-owned fields are test fixtures, never runtime durability evidence.
+    let mut event = sentinel_common::EventEnvelopeV2 {
+        event_id: proposal.requested_event_id.clone().unwrap(),
+        event_truth_generation: 1,
+        stream_namespace: proposal.causal_context.authority_scope_digest().unwrap(),
+        stream_revision: 1,
+        global_position: 1,
+        event_type: proposal.event_type.clone(),
+        schema_version: proposal.schema_version,
+        payload_codec: proposal.payload_codec,
+        payload_digest: proposal.payload_digest.clone(),
+        payload: proposal.payload.clone(),
+        causal_context: proposal.causal_context.clone(),
+        producer: proposal.producer.clone(),
+        owner_term: proposal.owner_term.clone(),
+        tick: proposal.tick,
+        appended_at_ms: i64::try_from(appended_at).unwrap(),
+        durability: proposal.requested_durability,
+        canonical_request_digest: proposal.canonical_request_digest().unwrap(),
+        append_receipt_digest: String::new(),
+        sealed_envelope_digest: String::new(),
+    };
+    reseal_local_adoption_audit(&mut event);
+    event
+}
+
+fn reseal_local_adoption_audit(event: &mut sentinel_common::EventEnvelopeV2) {
+    event.payload_digest = sentinel_common::sha256_hex(&event.payload);
+    event.stream_namespace = event.causal_context.authority_scope_digest().unwrap();
+    event.append_receipt_digest = event.expected_append_receipt_digest().unwrap();
+    event.sealed_envelope_digest = event.expected_sealed_envelope_digest().unwrap();
+    event.validate_seals().unwrap();
+}
+
+#[test]
+fn local_adoption_sealed_audit_replays_after_admission_before_fixed_deadline() {
+    for unknown in [true, false] {
+        let (f, epoch, call, known, request, issued) = local_adoption_source(unknown);
+        let (_, adoption) = f.store.authorize_adaptive_leadership_local_adoption(
+            &recovery_operator(&request.tenant_id), &request, issued,
+        ).unwrap();
+        let result = local_adoption_result(&call, &known, &adoption);
+        let event = sealed_local_adoption_audit(&call, &result, request.expires_at_unix_ms - 1);
+        let proposal = WorkflowStore::local_adoption_continuation_audit_proposal(&call, &result).unwrap();
+        assert_eq!(proposal.payload, event.payload);
+        assert_eq!(proposal.causal_context, event.causal_context);
+        assert_eq!(proposal.canonical_request_digest().unwrap(), event.canonical_request_digest);
+        let mut invalid = result.clone();
+        invalid.allowance_id.push_str("-other");
+        assert!(WorkflowStore::local_adoption_continuation_audit_proposal(&call, &invalid).is_err());
+        let now = request.expires_at_unix_ms + 1;
+        assert!(now < adoption.continuation_deadline_ms);
+        let before = rows(&f.store);
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        assert!(reopened.complete_adaptive_leadership_review_call(&f.leader, &result, now).is_err());
+        assert_eq!(rows(&reopened), before);
+        let completed = reopened.complete_adaptive_leadership_review_call_with_local_adoption_audit(
+            &f.leader, &result, &event, now,
+        ).unwrap();
+        assert_eq!(completed.version, 3);
+        assert_eq!(completed.continuation, result.continuation);
+        assert_eq!(recovery_call(&f, &epoch), completed);
+        assert_eq!(session(&f).continuation.unwrap().authorizations.last(), result.continuation.as_ref());
+        let before = rows(&reopened);
+        assert!(reopened.retire_expired_adaptive_local_adoption(
+            &f.leader, request.review_id, completed.version, now,
+        ).is_err());
+        assert_eq!(reopened.complete_adaptive_leadership_review_call_with_local_adoption_audit(
+            &f.leader, &result, &event, now + 1,
+        ).unwrap(), completed);
+        assert_eq!(rows(&reopened), before);
+    }
+}
+
+#[test]
+fn local_adoption_audit_rejects_invalid_seals_payload_bindings_and_clocks_without_writes() {
+    for unknown in [true, false] {
+        let (f, epoch, call, known, request, issued) = local_adoption_source(unknown);
+        let (_, adoption) = f.store.authorize_adaptive_leadership_local_adoption(
+            &recovery_operator(&request.tenant_id), &request, issued,
+        ).unwrap();
+        let result = local_adoption_result(&call, &known, &adoption);
+        let event = sealed_local_adoption_audit(&call, &result, issued + 1);
+        let now = request.expires_at_unix_ms + 1;
+        let before = rows(&f.store);
+        for field in 0..18 {
+            let mut changed = event.clone();
+            match field {
+                0 => changed.sealed_envelope_digest = "f".repeat(64),
+                1 => changed.append_receipt_digest = "f".repeat(64),
+                2 => changed.payload.push(b' '),
+                3 => changed.event_type.push_str("_other"),
+                4 => changed.producer.push_str("_other"),
+                5 => changed.schema_version = 2,
+                6 => changed.payload_codec = sentinel_common::EventPayloadCodec::DeterministicCbor,
+                7 => changed.event_id = Uuid::now_v7().to_string(),
+                8 => changed.causal_context.request_id.push_str("-other"),
+                9 => changed.causal_context.operation_id = Uuid::now_v7().to_string(),
+                10 => changed.causal_context.correlation_id = Uuid::new_v4().to_string(),
+                11 => changed.durability = sentinel_common::EventDurability::DurableOperational,
+                12 => changed.appended_at_ms = i64::try_from(issued - 1).unwrap(),
+                13 => changed.appended_at_ms = i64::try_from(request.expires_at_unix_ms).unwrap(),
+                14 => changed.appended_at_ms = i64::try_from(now + 1).unwrap(),
+                15 => {
+                    let mut payload: serde_json::Value = serde_json::from_slice(&changed.payload).unwrap();
+                    payload["call"]["updated_at_unix_ms"] = serde_json::json!(call.updated_at_unix_ms + 1);
+                    changed.payload = sentinel_common::canonical_json(&payload).unwrap();
+                }
+                16 => {
+                    let mut payload: serde_json::Value = serde_json::from_slice(&changed.payload).unwrap();
+                    payload["result"]["continuation"]["additional_model_calls"] = serde_json::json!(2);
+                    changed.payload = sentinel_common::canonical_json(&payload).unwrap();
+                }
+                _ => changed.canonical_request_digest = "f".repeat(64),
+            }
+            if field >= 3 {
+                reseal_local_adoption_audit(&mut changed);
+            }
+            assert!(f.store.complete_adaptive_leadership_review_call_with_local_adoption_audit(
+                &f.leader, &result, &changed, now,
+            ).is_err(), "accepted changed audit field {field}");
+            assert_eq!(rows(&f.store), before);
+        }
+        assert!(f.store.complete_adaptive_leadership_review_call_with_local_adoption_audit(
+            &f.leader, &result, &event, issued,
+        ).is_err());
+        let mut noncanonical = event.clone();
+        noncanonical.payload.push(b' ');
+        reseal_local_adoption_audit(&mut noncanonical);
+        assert!(f.store.complete_adaptive_leadership_review_call_with_local_adoption_audit(
+            &f.leader, &result, &noncanonical, now,
+        ).is_err());
+        assert!(f.store.complete_adaptive_leadership_review_call_with_local_adoption_audit(
+            &f.leader, &result, &event, adoption.continuation_deadline_ms,
+        ).is_err());
+        assert_eq!(rows(&f.store), before);
+        assert_eq!(session(&f), call.context.source_session);
+        assert_eq!(recovery_call(&f, &epoch), call);
+    }
+}
+
+#[test]
+fn local_adoption_retirement_requires_expired_admission_and_replays_terminal_unchanged() {
+    for unknown in [true, false] {
+        let (f, epoch, call, _, request, issued) = local_adoption_source(unknown);
+        let before = rows(&f.store);
+        assert!(f.store.retire_expired_adaptive_local_adoption(
+            &f.leader, request.review_id, call.version, request.expires_at_unix_ms,
+        ).is_err());
+        assert_eq!(rows(&f.store), before);
+        let (_, adoption) = f.store.authorize_adaptive_leadership_local_adoption(
+            &recovery_operator(&request.tenant_id), &request, issued,
+        ).unwrap();
+        let before = rows(&f.store);
+        for (version, now) in [(call.version, request.expires_at_unix_ms - 1),
+            (call.version + 1, request.expires_at_unix_ms)] {
+            assert!(f.store.retire_expired_adaptive_local_adoption(
+                &f.leader, request.review_id, version, now,
+            ).is_err());
+            assert_eq!(rows(&f.store), before);
+        }
+        f.store.connection.lock().unwrap().execute_batch(
+            "CREATE TRIGGER reject_local_adoption_retirement BEFORE INSERT ON company_events
+             WHEN NEW.event_type='adaptive_leadership_review_retired'
+             BEGIN SELECT RAISE(ABORT, 'test retirement audit failure'); END;",
+        ).unwrap();
+        assert!(f.store.retire_expired_adaptive_local_adoption(
+            &f.leader, request.review_id, call.version, request.expires_at_unix_ms,
+        ).is_err());
+        assert_eq!(rows(&f.store), before);
+        assert_eq!(recovery_call(&f, &epoch), call);
+        f.store.connection.lock().unwrap().execute_batch(
+            "DROP TRIGGER reject_local_adoption_retirement;",
+        ).unwrap();
+        let retired = f.store.retire_expired_adaptive_local_adoption(
+            &f.leader, request.review_id, call.version, request.expires_at_unix_ms,
+        ).unwrap();
+        assert_eq!(retired.version, 4);
+        assert_eq!(retired.retired_at_unix_ms, Some(request.expires_at_unix_ms));
+        assert!(retired.decision.is_none());
+        assert!(retired.continuation.is_none());
+        assert_eq!(session(&f), call.context.source_session);
+        assert_eq!(recovery_call(&f, &epoch), retired);
+        let before = rows(&f.store);
+        let reopened = WorkflowStore::open(&f.path).unwrap();
+        for version in [call.version, 4, call.version] {
+            assert_eq!(reopened.retire_expired_adaptive_local_adoption(
+                &f.leader, request.review_id, version, adoption.continuation_deadline_ms + 1,
+            ).unwrap(), retired);
+            assert_eq!(rows(&reopened), before);
+        }
+        assert_eq!(reopened.adaptive_leadership_local_adoption(
+            &request.tenant_id, request.review_id,
+        ).unwrap(), Some(adoption));
+    }
+}
+
+#[test]
+fn local_adoption_conflicting_request_issuer_and_attached_authority_never_write() {
+    for unknown in [true, false] {
+        let (f, epoch, call, known, request, issued) = local_adoption_source(unknown);
+        let operator = recovery_operator(&request.tenant_id);
+        let (_, adoption) = f.store.authorize_adaptive_leadership_local_adoption(
+            &operator, &request, issued,
+        ).unwrap();
+        let result = local_adoption_result(&call, &known, &adoption);
+        let before = rows(&f.store);
+        for field in ["operation", "response", "decision", "expiry", "repair"] {
+            let mut changed = request.clone();
+            match field {
+                "operation" => changed.operation_id = Uuid::new_v4(),
+                "response" => changed.model_response_digest = "f".repeat(64),
+                "decision" => {
+                    if let AdaptiveLeadershipReviewDecisionKindV1::Continue { rationale, .. } = &mut changed.decision.decision {
+                        *rationale = "A different response cannot replace the retained decision".into();
+                    }
+                }
+                "expiry" => changed.expires_at_unix_ms += 1,
+                _ => changed.repair_digest = "f".repeat(64),
+            }
+            assert_eq!(f.store.authorize_adaptive_leadership_local_adoption(
+                &operator, &changed, issued + 1,
+            ).unwrap_err().code, WorkflowErrorCode::IdempotencyConflict);
+            assert_eq!(rows(&f.store), before);
+        }
+        let mut other_issuer = operator.clone();
+        other_issuer.authority_generation += 1;
+        assert_eq!(f.store.authorize_adaptive_leadership_local_adoption(
+            &other_issuer, &request, issued + 1,
+        ).unwrap_err().code, WorkflowErrorCode::IdempotencyConflict);
+        let mut forged = adoption.clone();
+        forged.request.repair_digest = "f".repeat(64);
+        let forged_result = local_adoption_result(&call, &known, &forged);
+        call.validate_completion_proposal(&forged_result).unwrap();
+        assert!(f.store.complete_adaptive_leadership_review_call(
+            &f.leader, &forged_result, issued + 1,
+        ).is_err());
+        let mut changed_response = result.clone();
+        changed_response.model_response_digest = "f".repeat(64);
+        assert!(f.store.complete_adaptive_leadership_review_call(
+            &f.leader, &changed_response, issued + 1,
+        ).is_err());
+        assert_eq!(rows(&f.store), before);
+        assert_eq!(session(&f), call.context.source_session);
+        assert_eq!(recovery_call(&f, &epoch), call);
+        assert_eq!(f.store.adaptive_leadership_local_adoption(
+            &request.tenant_id, request.review_id,
+        ).unwrap(), Some(adoption));
+    }
+}
+
 #[test]
 fn recovery_epoch_multiple_employee_calls_use_only_unspent_root_budget() {
     let (mut f, retired, now) = recovery_source();
@@ -423,7 +998,7 @@ fn recovery_epoch_continuation_keeps_identity_and_historical_replay_after_head_c
     assert_eq!(continued.model_calls, source.model_calls);
     assert_eq!(continued.tool_calls, source.tool_calls);
     assert_eq!(continued.version, source.version + 1);
-    assert!(continued.is_abandoned_model_effect(&request.unknown_effect));
+    assert!(continued.is_abandoned_model_effect(request.unknown_effect.as_ref().unwrap()));
     let before = rows(&f.store);
     let reopened = WorkflowStore::open(&f.path).unwrap();
     let operator = recovery_operator(&request.tenant_id);
@@ -526,7 +1101,7 @@ fn recovery_epoch_rejects_non_leadership_operator_and_unknown_tool_source() {
         "tool": "list_directory", "path": ".", "after": null, "max_entries": 16,
     })).unwrap();
     f.context.source_session.cursor = AdaptiveCursorV1::ToolUnknown {
-        effect: request.unknown_effect.clone(),
+        effect: request.unknown_effect.clone().unwrap(),
         tool_digest: crate::adaptive_tool_digest(&tool).unwrap(),
         tool,
     };

@@ -1,5 +1,14 @@
 # Changelog
 
+- Compose leadership continuation against the employee's immutable root and
+  the exact current undispatched allowance. Recover blocked work through a
+  distinct versioned subject, and authorize bounded local adoption of an
+  already accounted model decision without another provider call. Preserve
+  original review history, model-selected limits and fixed recovery clocks;
+  reconcile domain and completion receipts across restart. Persist exact
+  retirement receipts for already failed completions without retrying work
+  or resetting payload, attempt and original failure history (#856).
+
 - Authorize one immutable, operator-governed leadership recovery review after
   an exhausted unknown-model session, bound to the original history and a
   protected installed repair release. Preserve model-selected decisions,

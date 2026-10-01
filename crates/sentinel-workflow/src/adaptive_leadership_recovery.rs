@@ -24,6 +24,13 @@ pub struct AdaptiveRecoveryReleaseV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AdaptiveLeadershipRecoveryBlockedSubjectV1 {
+    pub reason_code: String,
+    pub model_response_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdaptiveLeadershipRecoveryRequestV1 {
     pub schema_version: u16,
     pub operation_id: Uuid,
@@ -36,8 +43,12 @@ pub struct AdaptiveLeadershipRecoveryRequestV1 {
     pub session_head_digest: String,
     pub session_digest: String,
     pub project_digest: String,
-    pub unknown_effect: AdaptiveEffectV1,
-    pub sealed_unknown_proof_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_effect: Option<AdaptiveEffectV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_unknown_proof_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_subject: Option<AdaptiveLeadershipRecoveryBlockedSubjectV1>,
     pub prior_review_history_digest: String,
     /// Digest of a server-loaded root-attested release/deployment repair receipt.
     /// A caller-provided digest alone is not evidence that the repair is installed.
@@ -166,15 +177,38 @@ impl AdaptiveLeadershipRecoveryRequestV1 {
             &self.session_head_digest,
             &self.session_digest,
             &self.project_digest,
-            &self.unknown_effect.request_digest,
-            &self.sealed_unknown_proof_digest,
             &self.prior_review_history_digest,
             &self.repair_digest,
         ] {
             validate_digest(digest)?;
         }
-        if self.schema_version != 1
-            || operator.kind != CompanyPrincipalKindV1::Operator
+        match (
+            self.schema_version,
+            &self.unknown_effect,
+            &self.sealed_unknown_proof_digest,
+            &self.blocked_subject,
+        ) {
+            (1, Some(effect), Some(proof), None) => {
+                if effect.id.is_nil() {
+                    return Err(invalid());
+                }
+                validate_digest(&effect.request_digest)?;
+                validate_digest(proof)?;
+            }
+            (2, None, None, Some(blocked)) => {
+                if blocked.reason_code.is_empty()
+                    || blocked.reason_code.len() > 64
+                    || !blocked.reason_code.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+                {
+                    return Err(invalid());
+                }
+                validate_digest(&blocked.model_response_digest)?;
+            }
+            _ => return Err(invalid()),
+        }
+        if operator.kind != CompanyPrincipalKindV1::Operator
             || !matches!(
                 operator.role,
                 CompanyRoleV1::ProjectManager | CompanyRoleV1::TechnicalLead
@@ -182,7 +216,6 @@ impl AdaptiveLeadershipRecoveryRequestV1 {
             || operator.tenant_id != self.tenant_id
             || self.operation_id.is_nil()
             || self.session_id.is_nil()
-            || self.unknown_effect.id.is_nil()
             || self.expected_project_version == 0
             || self.expected_project_version.checked_add(1).is_none()
             || self.expected_session_version == 0
@@ -198,6 +231,48 @@ impl AdaptiveLeadershipRecoveryRequestV1 {
             return Err(invalid());
         }
         Ok(())
+    }
+
+    fn matches_source(&self, session: &crate::AdaptiveSessionV1) -> bool {
+        match (&session.cursor, &self.unknown_effect, &self.blocked_subject) {
+            (AdaptiveCursorV1::ModelUnknown { effect }, Some(expected), None) => {
+                self.schema_version == 1 && effect == expected
+            }
+            (AdaptiveCursorV1::Blocked { reason_code }, None, Some(blocked)) => {
+                self.schema_version == 2
+                    && reason_code == &blocked.reason_code
+                    && session.last_model_result_digest.as_ref()
+                        == Some(&blocked.model_response_digest)
+            }
+            _ => false,
+        }
+    }
+
+    fn matches_review_subject(&self, grant: &AdaptiveLeadershipReviewGrantV1) -> bool {
+        match (&grant.subject, &self.unknown_effect, &self.blocked_subject) {
+            (
+                Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel {
+                    effect,
+                    sealed_unknown_proof_digest,
+                }),
+                Some(expected),
+                None,
+            ) => {
+                self.schema_version == 1
+                    && effect == expected
+                    && self.sealed_unknown_proof_digest.as_ref()
+                        == Some(sealed_unknown_proof_digest)
+            }
+            (
+                Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
+                    reason_code,
+                    resolution_event_id: None,
+                }),
+                None,
+                Some(blocked),
+            ) => self.schema_version == 2 && reason_code == &blocked.reason_code,
+            _ => false,
+        }
     }
 
     pub fn canonical_digest(&self) -> Result<String, WorkflowError> {
@@ -275,12 +350,8 @@ impl AdaptiveLeadershipRecoveryEpochV1 {
             || request.session_digest != adaptive_leadership_recovery_session_digest(session)?
             || request.project_digest
                 != adaptive_leadership_recovery_project_digest(&context.source_project)?
-            || !matches!(&session.cursor, AdaptiveCursorV1::ModelUnknown { effect }
-                if effect == &request.unknown_effect)
-            || !matches!(&grant.subject, Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel {
-                effect, sealed_unknown_proof_digest,
-            }) if effect == &request.unknown_effect
-                && sealed_unknown_proof_digest == &request.sealed_unknown_proof_digest)
+            || !request.matches_source(session)
+            || !request.matches_review_subject(grant)
             || !context
                 .evidence_refs
                 .contains(&format!("recovery-request:{}", request.canonical_digest()?,))
@@ -368,10 +439,10 @@ impl AdaptiveLeadershipRecoveryEpochV1 {
                 || call.continuation.is_some()
                 || call.model_response_digest.is_some()
                 || call.resolution_event_id.is_some()
-                || !matches!(&call.grant.subject, Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel {
-                    effect, sealed_unknown_proof_digest,
-                }) if effect == &self.request.unknown_effect
-                    && sealed_unknown_proof_digest == &self.request.sealed_unknown_proof_digest)
+                || !self.request.matches_review_subject(&call.grant)
+                || (self.request.schema_version == 2
+                    && (!self.request.matches_source(&call.context.source_session)
+                        || call.context.source_session != self.source_context.source_session))
             {
                 return Err(invalid());
             }
@@ -402,12 +473,13 @@ impl AdaptiveLeadershipRecoveryEpochV1 {
     }
 
     /// Inputs must come from trusted live evidence, never the request body alone.
+    /// Subject proof is the sealed unknown proof or the retained blocked model digest.
     pub fn validate_live_evidence(
         &self,
         installed_release: &AdaptiveRecoveryReleaseV1,
         repair_digest: &str,
         session_head_digest: &str,
-        sealed_unknown_proof_digest: &str,
+        subject_proof_digest: &str,
         now_ms: u64,
     ) -> Result<(), WorkflowError> {
         self.validate()?;
@@ -415,7 +487,17 @@ impl AdaptiveLeadershipRecoveryEpochV1 {
         if installed_release != &self.request.release
             || repair_digest != self.request.repair_digest
             || session_head_digest != self.request.session_head_digest
-            || sealed_unknown_proof_digest != self.request.sealed_unknown_proof_digest
+            || Some(subject_proof_digest)
+                != self
+                    .request
+                    .sealed_unknown_proof_digest
+                    .as_deref()
+                    .or_else(|| {
+                        self.request
+                            .blocked_subject
+                            .as_ref()
+                            .map(|blocked| blocked.model_response_digest.as_str())
+                    })
             || now_ms < self.issued_at_unix_ms
             || now_ms >= self.expires_at_unix_ms
         {
@@ -464,11 +546,12 @@ mod tests {
             session_head_digest: "b".repeat(64),
             session_digest: "c".repeat(64),
             project_digest: "d".repeat(64),
-            unknown_effect: AdaptiveEffectV1 {
+            unknown_effect: Some(AdaptiveEffectV1 {
                 id: Uuid::from_u128(3),
                 request_digest: "e".repeat(64),
-            },
-            sealed_unknown_proof_digest: "f".repeat(64),
+            }),
+            sealed_unknown_proof_digest: Some("f".repeat(64)),
+            blocked_subject: None,
             prior_review_history_digest: "1".repeat(64),
             repair_digest: "2".repeat(64),
             release: AdaptiveRecoveryReleaseV1 {
@@ -542,11 +625,131 @@ mod tests {
             token_policy: crate::SubscriptionTokenPolicyV1::MeasuredWithoutGenerationCap,
             expires_at_unix_ms: request.expires_at_unix_ms,
             subject: Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel {
-                effect: request.unknown_effect,
-                sealed_unknown_proof_digest: request.sealed_unknown_proof_digest,
+                effect: request.unknown_effect.unwrap(),
+                sealed_unknown_proof_digest: request.sealed_unknown_proof_digest.unwrap(),
             }),
             recovery_epoch: None,
         }
+    }
+
+    #[test]
+    fn unknown_request_preserves_legacy_wire_bytes_and_digest() {
+        #[derive(Serialize)]
+        struct LegacyUnknownRequest<'a> {
+            schema_version: u16,
+            operation_id: Uuid,
+            tenant_id: &'a TenantId,
+            project_id: &'a ProjectId,
+            work_item_id: &'a WorkItemId,
+            session_id: Uuid,
+            expected_project_version: u64,
+            expected_session_version: u64,
+            session_head_digest: &'a str,
+            session_digest: &'a str,
+            project_digest: &'a str,
+            unknown_effect: &'a AdaptiveEffectV1,
+            sealed_unknown_proof_digest: &'a str,
+            prior_review_history_digest: &'a str,
+            repair_digest: &'a str,
+            release: &'a AdaptiveRecoveryReleaseV1,
+            reason_ref: &'a str,
+            expires_at_unix_ms: u64,
+            max_additional_model_calls: u16,
+            max_window_ms: u64,
+        }
+        let request = request();
+        let legacy = LegacyUnknownRequest {
+            schema_version: request.schema_version,
+            operation_id: request.operation_id,
+            tenant_id: &request.tenant_id,
+            project_id: &request.project_id,
+            work_item_id: &request.work_item_id,
+            session_id: request.session_id,
+            expected_project_version: request.expected_project_version,
+            expected_session_version: request.expected_session_version,
+            session_head_digest: &request.session_head_digest,
+            session_digest: &request.session_digest,
+            project_digest: &request.project_digest,
+            unknown_effect: request.unknown_effect.as_ref().unwrap(),
+            sealed_unknown_proof_digest: request.sealed_unknown_proof_digest.as_deref().unwrap(),
+            prior_review_history_digest: &request.prior_review_history_digest,
+            repair_digest: &request.repair_digest,
+            release: &request.release,
+            reason_ref: &request.reason_ref,
+            expires_at_unix_ms: request.expires_at_unix_ms,
+            max_additional_model_calls: request.max_additional_model_calls,
+            max_window_ms: request.max_window_ms,
+        };
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        assert_eq!(bytes, serde_json::to_vec(&request).unwrap());
+        assert_eq!(
+            request.canonical_digest().unwrap(),
+            canonical_sha256(
+                "sentinel.workflow.adaptive-leadership-recovery-request.v1",
+                &legacy,
+            )
+            .unwrap()
+        );
+        let decoded: AdaptiveLeadershipRecoveryRequestV1 = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, request);
+        decoded.validate(&operator(), 1_000).unwrap();
+    }
+
+    #[test]
+    fn requests_require_disjoint_versioned_subjects_and_retained_blocked_digest() {
+        let unknown = request();
+        let mut blocked = unknown.clone();
+        blocked.schema_version = 2;
+        blocked.unknown_effect = None;
+        blocked.sealed_unknown_proof_digest = None;
+        blocked.blocked_subject = Some(AdaptiveLeadershipRecoveryBlockedSubjectV1 {
+            reason_code: "model_blocked".into(),
+            model_response_digest: "a".repeat(64),
+        });
+        blocked.validate(&operator(), 1_000).unwrap();
+        let value = serde_json::to_value(&blocked).unwrap();
+        assert!(value.get("unknown_effect").is_none());
+        assert!(value.get("sealed_unknown_proof_digest").is_none());
+        assert_eq!(
+            serde_json::from_value::<AdaptiveLeadershipRecoveryRequestV1>(value.clone()).unwrap(),
+            blocked
+        );
+        let mut missing_digest = value;
+        missing_digest["blocked_subject"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model_response_digest");
+        assert!(
+            serde_json::from_value::<AdaptiveLeadershipRecoveryRequestV1>(missing_digest).is_err()
+        );
+        for mask in 0..8 {
+            for version in [1, 2, 3] {
+                let mut mixed = unknown.clone();
+                mixed.schema_version = version;
+                mixed.unknown_effect =
+                    (mask & 1 != 0).then(|| unknown.unknown_effect.clone().unwrap());
+                mixed.sealed_unknown_proof_digest =
+                    (mask & 2 != 0).then(|| unknown.sealed_unknown_proof_digest.clone().unwrap());
+                mixed.blocked_subject =
+                    (mask & 4 != 0).then(|| blocked.blocked_subject.clone().unwrap());
+                assert_eq!(
+                    mixed.validate(&operator(), 1_000).is_ok(),
+                    (version == 1 && mask == 3) || (version == 2 && mask == 4)
+                );
+            }
+        }
+        for reason in ["", "Blocked", "blocked-reason", "blocked reason"] {
+            let mut invalid = blocked.clone();
+            invalid.blocked_subject.as_mut().unwrap().reason_code = reason.into();
+            assert!(invalid.validate(&operator(), 1_000).is_err());
+        }
+        blocked
+            .blocked_subject
+            .as_mut()
+            .unwrap()
+            .model_response_digest
+            .clear();
+        assert!(blocked.validate(&operator(), 1_000).is_err());
     }
 
     #[test]
@@ -690,7 +893,7 @@ mod tests {
         changed.release.gateway_binary_digest = "9".repeat(64);
         assert_ne!(digest, changed.canonical_digest().unwrap());
         changed = original;
-        changed.unknown_effect.id = Uuid::from_u128(10);
+        changed.unknown_effect.as_mut().unwrap().id = Uuid::from_u128(10);
         assert_ne!(digest, changed.canonical_digest().unwrap());
     }
 
@@ -723,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn binding_requires_unknown_model_and_one_call_decision() {
+    fn binding_requires_exact_recovery_subject_and_bounded_decision() {
         let mut grant = grant();
         grant.recovery_epoch = Some(AdaptiveLeadershipRecoveryBindingV1 {
             schema_version: 1,
@@ -755,6 +958,11 @@ mod tests {
             resolution_event_id: None,
         });
         grant.expected_reason_code = "blocked".into();
+        grant.validate(1_000).unwrap();
+        grant.subject = Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
+            reason_code: "blocked".into(),
+            resolution_event_id: Some(Uuid::from_u128(11).to_string()),
+        });
         assert!(grant.validate(1_000).is_err());
         grant.schema_version = 1;
         grant.subject = None;
