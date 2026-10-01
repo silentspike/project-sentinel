@@ -761,6 +761,22 @@ pub fn publish_workbench_records(
         .collect()
 }
 
+pub(crate) fn publish_workbench_records_with_world_guard(
+    event_store: &sentinel_limbo::EventStore,
+    guard: &sentinel_common::OwnerWriteGuard,
+    records: &[WorkbenchInvocationRecord],
+    tick: u64,
+) -> anyhow::Result<Vec<i64>> {
+    records
+        .iter()
+        .map(|record| {
+            event_store
+                .legacy_append_gateway(sentinel_limbo::LegacyEventProducer::DaemonWorkbench)
+                .append_event_with_world_guard(&record.safe_event(tick)?, guard)
+        })
+        .collect()
+}
+
 fn invocation_state_name(state: WorkbenchInvocationState) -> &'static str {
     match state {
         WorkbenchInvocationState::Reserved => "reserved",
@@ -6364,6 +6380,120 @@ mod tests {
         assert_eq!(
             cancelled.records.last().unwrap().state,
             WorkbenchInvocationState::Cancelled
+        );
+    }
+
+    #[test]
+    fn terminal_recovery_replay_survives_post_adoption_response_loss_without_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let profile_authority = secure_test_workbench_profile_authority();
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_authority.path()).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2819");
+        request.tool_profile_digest = profile_digest.clone();
+        request.input_digest = request.canonical_digest().unwrap();
+        let mut authority = authority(&request, &profile);
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+        store
+            .mark_executing(
+                &request.invocation_id,
+                &request.input_digest,
+                1_900_000_000_001,
+            )
+            .unwrap();
+        let result = WorkbenchMessage::Result {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            outcome: WorkbenchOutcome::Succeeded,
+            resources: WorkbenchResourceUsage::default(),
+            artifacts: Vec::new(),
+            output: BTreeMap::from([("content".to_string(), "PRIVATE-RESULT".to_string())]),
+            error: None,
+        };
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = GuardedRuntime {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            validations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            operations: Arc::clone(&operations),
+            fail_validation: usize::MAX,
+            response: NanoExecResult {
+                runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
+                workload_id: "AGENT-07".to_string(),
+                success: true,
+                output: serde_json::to_string(&serde_json::json!({
+                    "schema_version": WORKBENCH_SCHEMA_VERSION,
+                    "invocation_id": request.invocation_id,
+                    "state": "completed",
+                    "messages": [result.clone()],
+                }))
+                .unwrap(),
+            },
+        };
+        let adopted = WorkbenchCoordinator::new(&store, &profile, &profile_digest)
+            .recover_executing(
+                &mut runtime,
+                &request.invocation_id,
+                &authority,
+                1_900_000_000_002,
+            )
+            .unwrap();
+        assert_eq!(operations.lock().unwrap().as_slice(), ["workbench_recover"]);
+        assert!(adopted.caller_result.as_ref() == Some(&result));
+        let committed = store.load(&request.invocation_id).unwrap().unwrap();
+        assert_eq!(adopted.records.last(), Some(&committed));
+        assert_eq!(committed.state, WorkbenchInvocationState::Succeeded);
+        assert!(committed.result_digest.is_some());
+
+        // The caller disconnects after adoption, not during the runtime exchange.
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        assert!(sender.send(adopted).is_err());
+        drop(store);
+
+        let reopened =
+            WorkbenchInvocationStore::open(directory.path().join("workbench.redb")).unwrap();
+        let coordinator = WorkbenchCoordinator::new(&reopened, &profile, &profile_digest);
+        let mut unavailable_runtime = FakeRuntime {
+            calls: 0,
+            responses: VecDeque::new(),
+        };
+        for replay in [
+            coordinator.poll(
+                &mut unavailable_runtime,
+                &request.invocation_id,
+                &authority,
+                request.deadline_unix_ms + 1,
+            ),
+            coordinator.recover_executing(
+                &mut unavailable_runtime,
+                &request.invocation_id,
+                &authority,
+                request.deadline_unix_ms + 2,
+            ),
+        ] {
+            let replay = replay.unwrap();
+            assert!(replay.replayed);
+            assert_eq!(replay.runtime_state, None);
+            assert_eq!(replay.records, vec![committed.clone()]);
+            assert!(replay.caller_result == Some(durable_terminal_projection(&committed)));
+            assert!(!serde_json::to_string(&replay.records)
+                .unwrap()
+                .contains("PRIVATE-RESULT"));
+        }
+        authority.assignment_active = false;
+        assert!(coordinator
+            .recover_executing(
+                &mut unavailable_runtime,
+                &request.invocation_id,
+                &authority,
+                request.deadline_unix_ms + 3,
+            )
+            .is_err());
+        assert_eq!(unavailable_runtime.calls, 0);
+        assert_eq!(
+            reopened.load(&request.invocation_id).unwrap(),
+            Some(committed)
         );
     }
 

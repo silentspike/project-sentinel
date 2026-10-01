@@ -1866,31 +1866,46 @@ impl BwrapNanoRuntime {
                 .get(&handle.workload_id)
                 .expect("exchange retained after recovery cleanup retry");
             if exchange.invocation_id != invocation_id {
-                return Err(exec_error(
-                    NanoExecErrorCode::InvocationConflict,
-                    false,
-                    "workbench recovery invocation conflicts with retained state",
-                ));
+                let ready_for_serial_recovery = exchange.finalized
+                    && !exchange.cleanup_pending
+                    && self
+                        .workloads
+                        .get(&handle.workload_id)
+                        .is_some_and(|state| is_workbench_agent_runtime(&state.command))
+                    && self
+                        .processes
+                        .get(&handle.workload_id)
+                        .is_some_and(AgentProcess::protocol_channel_available);
+                if !ready_for_serial_recovery
+                    || self.health(handle)?.state != NanoHealthState::Healthy
+                {
+                    return Err(exec_error(
+                        NanoExecErrorCode::InvocationConflict,
+                        false,
+                        "workbench recovery invocation conflicts with retained state",
+                    ));
+                }
+                // Like serial start, serial recovery uses only the replacement
+                // runtime after validated terminal cleanup, never the old child.
+                self.exchanges.remove(&handle.workload_id);
+            } else {
+                if exchange.input_digest != input_digest {
+                    return Err(exec_error(
+                        NanoExecErrorCode::DigestConflict,
+                        false,
+                        "workbench recovery digest conflicts with retained state",
+                    ));
+                }
+                let poll = serde_json::json!({
+                    "kind": "poll",
+                    "schema_version": WORKBENCH_SCHEMA_VERSION,
+                    "invocation_id": invocation_id,
+                })
+                .to_string();
+                // Import queued child frames through bounded polling even if
+                // autonomous terminal cleanup has already stopped the process.
+                return self.poll_workbench_exchange(handle, &poll);
             }
-            if exchange.input_digest != input_digest {
-                return Err(exec_error(
-                    NanoExecErrorCode::DigestConflict,
-                    false,
-                    "workbench recovery digest conflicts with retained state",
-                ));
-            }
-            let poll = serde_json::json!({
-                "kind": "poll",
-                "schema_version": WORKBENCH_SCHEMA_VERSION,
-                "invocation_id": invocation_id,
-            })
-            .to_string();
-            // A retained exchange may have completed after the original
-            // requester timed out. Recovery must import those child frames
-            // through the same bounded protocol and cleanup path as polling;
-            // returning only the supervision snapshot would strand the
-            // durable invocation in Executing despite an existing receipt.
-            return self.poll_workbench_exchange(handle, &poll);
         }
 
         let channel_available = self
@@ -3736,6 +3751,15 @@ mod tests {
 
     #[test]
     fn terminal_invocation_recycles_agent_runtime_for_a_second_serial_invocation() {
+        assert_terminal_invocation_recycles_for_serial_exchange(false);
+    }
+
+    #[test]
+    fn terminal_recovery_recycles_agent_runtime_for_a_second_serial_receipt() {
+        assert_terminal_invocation_recycles_for_serial_exchange(true);
+    }
+
+    fn assert_terminal_invocation_recycles_for_serial_exchange(recovery: bool) {
         let first_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2981";
         let second_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2982";
         let temp = tempfile::tempdir().unwrap();
@@ -3761,12 +3785,21 @@ mod tests {
             .get_mut(&handle.workload_id)
             .unwrap()
             .command = vec!["/usr/bin/agent-runtime".to_string()];
-        let first_start = start_frame(first_id, unix_time_ms() + 10_000);
+        let operation = if recovery {
+            "workbench_recover"
+        } else {
+            "workbench_start"
+        };
+        let first_start = if recovery {
+            recover_frame(first_id, &"a".repeat(64))
+        } else {
+            start_frame(first_id, unix_time_ms() + 10_000)
+        };
         runtime
             .exec(
                 &handle,
                 NanoExecRequest {
-                    operation: "workbench_start".to_string(),
+                    operation: operation.to_string(),
                     input: first_start.clone(),
                 },
             )
@@ -3785,6 +3818,22 @@ mod tests {
                 .protocol_supervision_snapshot()
                 .terminal_finalized
         );
+        if recovery {
+            let conflict = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: operation.to_string(),
+                        input: recover_frame(second_id, &"b".repeat(64)),
+                    },
+                )
+                .unwrap_err();
+            assert_exec_error(&conflict, NanoExecErrorCode::InvocationConflict);
+            assert_eq!(
+                runtime.exchanges[&handle.workload_id].invocation_id,
+                first_id
+            );
+        }
         {
             let exchange = runtime.exchanges.get_mut(&handle.workload_id).unwrap();
             exchange.messages = vec![
@@ -3827,7 +3876,7 @@ mod tests {
             .exec(
                 &handle,
                 NanoExecRequest {
-                    operation: "workbench_start".to_string(),
+                    operation: operation.to_string(),
                     input: first_start,
                 },
             )
@@ -3838,12 +3887,61 @@ mod tests {
             "terminal replay reached the replacement runtime"
         );
 
-        let second_start = start_frame(second_id, unix_time_ms() + 10_000);
+        let second_start = if recovery {
+            recover_frame(second_id, &"b".repeat(64))
+        } else {
+            start_frame(second_id, unix_time_ms() + 10_000)
+        };
+        if recovery {
+            runtime
+                .workloads
+                .get_mut(&handle.workload_id)
+                .unwrap()
+                .suspended = true;
+            let error = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: operation.to_string(),
+                        input: second_start.clone(),
+                    },
+                )
+                .unwrap_err();
+            assert_exec_error(&error, NanoExecErrorCode::InvocationConflict);
+            assert!(!second_record.exists());
+            assert_eq!(
+                runtime.exchanges[&handle.workload_id].invocation_id,
+                first_id
+            );
+            runtime
+                .workloads
+                .get_mut(&handle.workload_id)
+                .unwrap()
+                .suspended = false;
+
+            let mut stale = handle.clone();
+            stale.instance_id = uuid::Uuid::new_v4();
+            let error = runtime
+                .exec(
+                    &stale,
+                    NanoExecRequest {
+                        operation: operation.to_string(),
+                        input: second_start.clone(),
+                    },
+                )
+                .unwrap_err();
+            assert_exec_error(&error, NanoExecErrorCode::WorkloadUnavailable);
+            assert!(!second_record.exists());
+            assert_eq!(
+                runtime.exchanges[&handle.workload_id].invocation_id,
+                first_id
+            );
+        }
         let accepted = runtime
             .exec(
                 &handle,
                 NanoExecRequest {
-                    operation: "workbench_start".to_string(),
+                    operation: operation.to_string(),
                     input: second_start.clone(),
                 },
             )
@@ -3854,11 +3952,19 @@ mod tests {
             second_start,
             "second invocation did not use the same exact NanoHandle once"
         );
+        // The replacement is a shell fixture, so terminal polling must use
+        // fixture teardown rather than launching a real isolated agent-runtime.
+        runtime
+            .workloads
+            .get_mut(&handle.workload_id)
+            .unwrap()
+            .command
+            .clear();
         let duplicate = runtime
             .exec(
                 &handle,
                 NanoExecRequest {
-                    operation: "workbench_start".to_string(),
+                    operation: operation.to_string(),
                     input: second_start,
                 },
             )
@@ -3868,12 +3974,6 @@ mod tests {
             wait_for_recorded_lines(&second_record, 1).lines().count(),
             1
         );
-        runtime
-            .workloads
-            .get_mut(&handle.workload_id)
-            .unwrap()
-            .command
-            .clear();
         let terminal = (0..100).find_map(|_| {
             let result = runtime
                 .exec(
@@ -3893,6 +3993,15 @@ mod tests {
             })
         });
         assert!(terminal.is_some());
+        if recovery {
+            for record in [&first_record, &second_record] {
+                let recorded = std::fs::read_to_string(record).unwrap();
+                assert_eq!(recorded.lines().count(), 1);
+                let frame: serde_json::Value =
+                    serde_json::from_str(recorded.lines().next().unwrap()).unwrap();
+                assert_eq!(frame["kind"], "recover");
+            }
+        }
     }
 
     #[test]
@@ -3928,6 +4037,12 @@ mod tests {
             )
             .unwrap();
         assert!(accepted.output.contains("accepted"));
+        let quiesced = wait_for_autonomous_quiescence(&runtime, &handle.workload_id);
+        assert!(quiesced.terminal_finalized);
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Stopped
+        );
         let terminal = (0..100)
             .find_map(|_| {
                 let result = runtime
@@ -3959,6 +4074,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(terminal_replay.output, terminal.output);
+
+        let serial_error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_recover".to_string(),
+                    input: recover_frame("018f3f32-4f01-7f2c-a6c1-f6f4a81b2903", &"b".repeat(64)),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&serial_error, NanoExecErrorCode::InvocationConflict);
+        assert_eq!(
+            runtime.exchanges[&handle.workload_id].invocation_id,
+            invocation_id
+        );
 
         let digest_error = runtime
             .exec(
