@@ -22,6 +22,334 @@ use std::collections::BTreeMap;
 
 const PRIVATE_CONTENT: &str = "PRIVATE-BUDGET-WINDOW-OBSERVATION";
 
+struct RetainedReceiptTool<'a> {
+    fixture: &'a Fixture,
+    reassign_after_read: bool,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AdaptiveToolPort for RetainedReceiptTool<'_> {
+    fn reconcile_tool(
+        &self,
+        session: &AdaptiveSessionV1,
+        effect: &AdaptiveEffectV1,
+        tool: &WorkbenchTool,
+        tool_digest: &str,
+    ) -> Result<AdaptiveToolObservationV1, WorkflowPortError> {
+        assert_eq!(session, &self.fixture.session);
+        assert_eq!(adaptive_tool_digest(tool).as_deref(), Ok(tool_digest));
+        let observation = self.fixture.private_observation(&effect.id.to_string());
+        observation
+            .validate(&effect.id.to_string(), &effect.request_digest)
+            .unwrap();
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        if self.reassign_after_read {
+            reassign_receipt_work(self.fixture, false);
+        }
+        Ok(AdaptiveToolObservationV1::Completed {
+            observation_digest: observation.digest().to_owned(),
+        })
+    }
+}
+
+fn reassign_receipt_work(fixture: &Fixture, different_agent: bool) {
+    let mut project = fixture.project();
+    let work = project
+        .work_items
+        .get_mut(&fixture.session.grant.authority.work_item_id)
+        .unwrap();
+    let assignment = work.assignments.iter_mut().find(|a| a.active).unwrap();
+    if different_agent {
+        assignment.agent_id = AgentId(7);
+    } else {
+        assignment.organization_generation += 1;
+    }
+    persist_discovery_project(&fixture.temp.path().join("company.sqlite"), &project);
+    if !different_agent {
+        assert_eq!(fixture.project(), project);
+    }
+}
+
+fn stop_receipt_agent(fixture: &Fixture) {
+    let mut health = fixture
+        .api
+        .authority
+        .as_ref()
+        .unwrap()
+        .runtime_health
+        .write()
+        .unwrap();
+    let agent = health
+        .agents
+        .iter_mut()
+        .find(|agent| agent.agent_id == fixture.session.grant.authority.agent_id.0)
+        .unwrap();
+    agent.adapter_health_state = Some(sentinel_common::NanoHealthState::Stopped);
+}
+
+#[test]
+fn stopped_record_recovery_adopts_original_pending_and_unknown_receipts_without_reset() {
+    for unknown in [false, true] {
+        let mut fixture = Fixture::continued();
+        let now = now_unix_ms();
+        let request = fixture.claim_tool(now);
+        let observation = fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+        let effect = AdaptiveEffectV1 {
+            id: Uuid::parse_str(&request.invocation_id).unwrap(),
+            request_digest: request.input_digest.clone(),
+        };
+        if unknown {
+            fixture.advance(
+                AdaptiveTransitionV1::MarkUnknown {
+                    effect: effect.clone(),
+                },
+                now,
+            );
+        }
+        let before = fixture.read();
+        assert_eq!((before.model_calls, before.tool_calls), (2, 1));
+        stop_receipt_agent(&fixture);
+        let authority = fixture.api.authority.as_ref().unwrap();
+        assert!(authority.current_for_request(&request).is_err());
+        assert!(
+            sentinel_workflow::OrganizationRuntimePort::authority_snapshot(
+                authority.as_ref(),
+                &before.grant.authority.tenant_id,
+                &before.grant.authority.project_id,
+                &before.grant.authority.work_item_id,
+                before.grant.authority.agent_id,
+            )
+            .is_err()
+        );
+        let mut fresh = before.clone();
+        fresh.cursor = AdaptiveCursorV1::ReadyForTool {
+            tool: request.tool.clone(),
+            tool_digest: adaptive_tool_digest(&request.tool).unwrap(),
+        };
+        assert!(fixture
+            .api
+            .workbench
+            .as_ref()
+            .unwrap()
+            .build_adaptive_request(&fresh, &effect, &request.tool)
+            .is_err());
+        let recovered_at = now_unix_ms();
+        let core = AdaptiveWorkflowCore::new(
+            Arc::clone(&fixture.api.store),
+            WorkbenchRecordRecoveryAuthority(authority.as_ref()),
+            UnavailableAdaptiveModel,
+            RetainedReceiptTool {
+                fixture: &fixture,
+                reassign_after_read: false,
+                reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+        );
+        let adopted = core
+            .reconcile_tool(
+                before.grant.session_id,
+                &before.grant.authority,
+                Uuid::new_v4(),
+                recovered_at,
+            )
+            .unwrap();
+        let mut expected = before;
+        expected.cursor = AdaptiveCursorV1::ReadyForModel;
+        expected.version += 1;
+        expected.updated_at_ms = recovered_at;
+        expected.last_observation = Some(AdaptiveObservationRefV1 {
+            effect,
+            observation_digest: observation.digest().to_owned(),
+        });
+        expected.continuation.as_mut().unwrap().observation_required = false;
+        assert_eq!(adopted, expected);
+        assert_eq!(fixture.read(), expected);
+        assert!(authority.current_for_request(&request).is_err());
+    }
+}
+
+#[test]
+fn stopped_record_recovery_rejects_assignment_changes_before_and_after_receipt_read() {
+    for (after_read, different_agent) in [(false, false), (false, true), (true, false)] {
+        let mut fixture = Fixture::continued();
+        let now = now_unix_ms();
+        let request = fixture.claim_tool(now);
+        fixture.retain_tool_result(&request, now, now, PRIVATE_CONTENT);
+        let before = fixture.read();
+        stop_receipt_agent(&fixture);
+        let authority = fixture.api.authority.as_ref().unwrap();
+        if !after_read {
+            reassign_receipt_work(&fixture, different_agent);
+        }
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = RetainedReceiptTool {
+            fixture: &fixture,
+            reassign_after_read: after_read,
+            reads: Arc::clone(&reads),
+        };
+        let core = AdaptiveWorkflowCore::new(
+            Arc::clone(&fixture.api.store),
+            WorkbenchRecordRecoveryAuthority(authority.as_ref()),
+            UnavailableAdaptiveModel,
+            tool,
+        );
+        let error = core
+            .reconcile_tool(
+                before.grant.session_id,
+                &before.grant.authority,
+                Uuid::new_v4(),
+                now_unix_ms(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            if different_agent {
+                WorkflowErrorCode::OrganizationUnavailable
+            } else {
+                WorkflowErrorCode::AuthorityConflict
+            }
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), usize::from(after_read));
+        assert_eq!(fixture.read(), before);
+    }
+}
+
+struct ReceiptReaderRuntime {
+    invocation_id: String,
+    input_digest: String,
+    result: WorkbenchMessage,
+    calls: Vec<String>,
+}
+
+impl crate::workbench::WorkbenchRuntimeClient for ReceiptReaderRuntime {
+    fn exchange(
+        &mut self,
+        agent_id: AgentId,
+        request: sentinel_common::NanoExecRequest,
+    ) -> anyhow::Result<crate::workbench::WorkbenchRuntimeExchange<'_>> {
+        let frame: serde_json::Value = serde_json::from_str(&request.input).unwrap();
+        assert_eq!(frame["invocation_id"], self.invocation_id);
+        let (state, messages) = match request.operation.as_str() {
+            "workbench_recover" => {
+                assert!(self.calls.is_empty());
+                assert_eq!(frame["input_digest"], self.input_digest);
+                ("accepted", Vec::new())
+            }
+            "workbench_poll" => {
+                assert_eq!(self.calls, ["workbench_recover"]);
+                (
+                    "completed",
+                    vec![
+                        self.result.clone(),
+                        WorkbenchMessage::Progress {
+                            schema_version: WORKBENCH_SCHEMA_VERSION,
+                            invocation_id: self.invocation_id.clone(),
+                            stage: sentinel_common::WorkbenchProgressStage::Completed,
+                            elapsed_ms: 0,
+                        },
+                    ],
+                )
+            }
+            operation => panic!("receipt recovery dispatched unexpected effect: {operation}"),
+        };
+        self.calls.push(request.operation);
+        Ok(crate::workbench::WorkbenchRuntimeExchange::new(
+            sentinel_common::NanoExecResult {
+                runtime_key: WORKBENCH_RUNTIME_BWRAP.to_owned(),
+                workload_id: format!("AGENT-{:02}", agent_id.0),
+                success: true,
+                output: serde_json::to_string(&serde_json::json!({
+                    "schema_version": WORKBENCH_SCHEMA_VERSION,
+                    "invocation_id": self.invocation_id,
+                    "state": state,
+                    "messages": messages,
+                }))?,
+            },
+            || Ok(()),
+        ))
+    }
+}
+
+#[test]
+fn started_pending_tool_recovers_exact_digest_then_polls_without_second_start() {
+    let mut fixture = Fixture::continued();
+    let now = now_unix_ms();
+    let request = fixture.claim_tool(now);
+    fixture.tools.reserve(&request, now).unwrap();
+    fixture
+        .tools
+        .mark_executing(&request.invocation_id, &request.input_digest, now)
+        .unwrap();
+    stop_receipt_agent(&fixture);
+    let authority = fixture.api.authority.as_ref().unwrap();
+    let source: Arc<dyn WorkbenchAuthoritySource> = authority.clone();
+    let (response, _receiver) = mpsc::sync_channel(1);
+    let command = pending_adaptive_tool_dispatch(request.clone(), source, response, true);
+    let WorkbenchDispatchCommand::Recover {
+        invocation_id,
+        authority: source,
+        ..
+    } = command
+    else {
+        panic!("started pending tool must recover, never submit or poll first");
+    };
+    assert_eq!(invocation_id, request.invocation_id);
+    let (profile, digest) = authority
+        .profile_for_binding(&request.tool_profile)
+        .unwrap();
+    let coordinator = WorkbenchCoordinator::new(&fixture.tools, profile, digest);
+    let result = WorkbenchMessage::Result {
+        schema_version: WORKBENCH_SCHEMA_VERSION,
+        invocation_id: request.invocation_id.clone(),
+        input_digest: request.input_digest.clone(),
+        outcome: WorkbenchOutcome::Succeeded,
+        resources: WorkbenchResourceUsage::default(),
+        artifacts: Vec::new(),
+        output: BTreeMap::from([("content".into(), PRIVATE_CONTENT.into())]),
+        error: None,
+    };
+    let mut runtime = ReceiptReaderRuntime {
+        invocation_id: request.invocation_id.clone(),
+        input_digest: request.input_digest.clone(),
+        result,
+        calls: Vec::new(),
+    };
+    let accepted = coordinator
+        .recover_executing(&mut runtime, &invocation_id, source.as_ref(), now)
+        .unwrap();
+    let effect = AdaptiveEffectV1 {
+        id: Uuid::parse_str(&invocation_id).unwrap(),
+        request_digest: request.input_digest.clone(),
+    };
+    let terminal = poll_executing_adaptive_tool(accepted, &effect, || {
+        coordinator
+            .poll(&mut runtime, &invocation_id, source.as_ref(), now)
+            .map_err(map_workbench_dispatch_error)
+    })
+    .unwrap();
+    assert!(terminal.records.last().unwrap().state.is_terminal());
+    assert_eq!(runtime.calls, ["workbench_recover", "workbench_poll"]);
+    fixture
+        .private_observation(&invocation_id)
+        .validate(&invocation_id, &request.input_digest)
+        .unwrap();
+    assert_eq!(fixture.read(), fixture.session);
+    assert_eq!(
+        (fixture.session.model_calls, fixture.session.tool_calls),
+        (2, 1)
+    );
+    let (response, _receiver) = mpsc::sync_channel(1);
+    assert!(matches!(
+        pending_adaptive_tool_dispatch(request.clone(), authority.clone(), response, false),
+        WorkbenchDispatchCommand::Submit { request: submitted, .. }
+            if *submitted == request
+    ));
+    assert!(authority.current_for_request(&request).is_err());
+    assert!(coordinator
+        .submit(&mut runtime, &request, source.as_ref(), now)
+        .is_err());
+    assert_eq!(runtime.calls, ["workbench_recover", "workbench_poll"]);
+}
+
 #[test]
 fn exact_pending_tool_authority_survives_process_exit_but_new_admission_does_not() {
     let mut fixture = Fixture::root(false);
@@ -340,6 +668,29 @@ impl Fixture {
         observed_at: u64,
         content: &str,
     ) {
+        let observation = self.retain_tool_result(request, claimed_at, observed_at, content);
+        self.advance(
+            AdaptiveTransitionV1::ObserveTool {
+                observation: AdaptiveObservationRefV1 {
+                    effect: AdaptiveEffectV1 {
+                        id: Uuid::parse_str(&request.invocation_id).unwrap(),
+                        request_digest: request.input_digest.clone(),
+                    },
+                    observation_digest: observation.digest().to_owned(),
+                },
+            },
+            observed_at,
+        );
+        assert_eq!(self.session.cursor, AdaptiveCursorV1::ReadyForModel);
+    }
+
+    fn retain_tool_result(
+        &self,
+        request: &WorkbenchRequest,
+        claimed_at: u64,
+        observed_at: u64,
+        content: &str,
+    ) -> sentinel_common::WorkbenchPrivateObservation {
         self.tools.reserve(request, claimed_at).unwrap();
         self.tools
             .mark_executing(&request.invocation_id, &request.input_digest, claimed_at)
@@ -362,19 +713,7 @@ impl Fixture {
         observation
             .validate(&request.invocation_id, &request.input_digest)
             .unwrap();
-        self.advance(
-            AdaptiveTransitionV1::ObserveTool {
-                observation: AdaptiveObservationRefV1 {
-                    effect: AdaptiveEffectV1 {
-                        id: Uuid::parse_str(&request.invocation_id).unwrap(),
-                        request_digest: request.input_digest.clone(),
-                    },
-                    observation_digest: observation.digest().to_owned(),
-                },
-            },
-            observed_at,
-        );
-        assert_eq!(self.session.cursor, AdaptiveCursorV1::ReadyForModel);
+        observation
     }
 
     fn private_observation(
