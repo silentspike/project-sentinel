@@ -9,6 +9,8 @@ const MAX_EXTENSION_MS: u64 = 24 * 60 * 60 * 1_000;
 pub struct AdaptiveBudgetReviewExtensionRequestV1 {
     pub schema_version: u16,
     pub operation_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_operation_id: Option<Uuid>,
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub session_id: Uuid,
@@ -29,7 +31,12 @@ impl AdaptiveBudgetReviewExtensionRequestV1 {
         validate_digest(&self.budget_limit_receipt_digest)?;
         validate_digest(&self.source_digest)?;
         validate_identifier(&self.reason_ref)?;
-        if self.schema_version != 1
+        if !matches!(
+            (self.schema_version, self.prior_operation_id),
+            (1, None) | (2, Some(_))
+        ) || self
+            .prior_operation_id
+            .is_some_and(|prior| prior.is_nil() || prior == self.operation_id)
             || self.operation_id.is_nil()
             || self.session_id.is_nil()
             || self.expected_session_version == 0
@@ -66,6 +73,8 @@ pub struct AdaptiveBudgetReviewExtensionReceiptV1 {
     extension_key: String,
     budget_limit_receipt: AdaptiveBudgetWindowLimitReceiptV1,
     prior_reviews: Vec<AdaptiveLeadershipReviewCallV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prior_receipt_digest: Option<String>,
 }
 
 fn conflict() -> WorkflowError {
@@ -88,6 +97,93 @@ fn extension_key(tenant: &TenantId, session: Uuid, head: u64) -> Result<String, 
             &(tenant, session, head),
         )?
     ))
+}
+
+fn successor_key(tenant: &TenantId, session: Uuid, head: u64) -> Result<String, WorkflowError> {
+    let original = extension_key(tenant, session, head)?;
+    Ok(format!("{original}-successor"))
+}
+
+fn request_key(request: &AdaptiveBudgetReviewExtensionRequestV1) -> Result<String, WorkflowError> {
+    match request.schema_version {
+        1 => extension_key(
+            &request.tenant_id,
+            request.session_id,
+            request.expected_session_version,
+        ),
+        2 => successor_key(
+            &request.tenant_id,
+            request.session_id,
+            request.expected_session_version,
+        ),
+        _ => Err(invalid("invalid budget review extension schema")),
+    }
+}
+
+fn original_in_connection(
+    connection: &Connection,
+    tenant: &TenantId,
+    session: Uuid,
+    head: u64,
+) -> Result<Option<AdaptiveBudgetReviewExtensionReceiptV1>, WorkflowError> {
+    // Row/key validation rejects schema 2 in this slot before persisted validation.
+    // The original therefore never reads its successor while validating its proof.
+    get_entity(
+        connection,
+        tenant,
+        EXTENSION_KIND,
+        &extension_key(tenant, session, head)?,
+    )
+}
+
+fn latest_in_connection(
+    connection: &Connection,
+    tenant: &TenantId,
+    session: Uuid,
+    head: u64,
+) -> Result<Option<AdaptiveBudgetReviewExtensionReceiptV1>, WorkflowError> {
+    if let Some(successor) = get_entity(
+        connection,
+        tenant,
+        EXTENSION_KIND,
+        &successor_key(tenant, session, head)?,
+    )? {
+        return Ok(Some(successor));
+    }
+    original_in_connection(connection, tenant, session, head)
+}
+
+fn require_parent(
+    connection: &Connection,
+    request: &AdaptiveBudgetReviewExtensionRequestV1,
+    calls: &[AdaptiveLeadershipReviewCallV1],
+    now: u64,
+) -> Result<AdaptiveBudgetReviewExtensionReceiptV1, WorkflowError> {
+    let parent = original_in_connection(
+        connection,
+        &request.tenant_id,
+        request.session_id,
+        request.expected_session_version,
+    )?
+    .ok_or_else(not_found)?;
+    let extra = usize::from(parent.request.additional_reviews);
+    let (global, head) = review_counts(calls, request.expected_session_version);
+    if parent.request.schema_version != 1
+        || request.prior_operation_id != Some(parent.request.operation_id)
+        || request.project_id != parent.request.project_id
+        || request.source_digest != parent.request.source_digest
+        || request.budget_limit_receipt_digest != parent.request.budget_limit_receipt_digest
+        || now < parent.issued_at_unix_ms
+        || global < parent.request.base_global_review_count + extra
+        || head < parent.request.base_head_review_count + extra
+        || parent
+            .prior_reviews
+            .iter()
+            .any(|prior| !calls.contains(prior))
+    {
+        return Err(transition());
+    }
+    Ok(parent)
 }
 
 fn require_operator(
@@ -209,13 +305,13 @@ impl CompanyEntity for AdaptiveBudgetReviewExtensionReceiptV1 {
         let limit = &self.budget_limit_receipt;
         limit.validate_entity()?;
         require_review_only_limit(limit)?;
-        if self.schema_version != 1
-            || self.extension_key
-                != extension_key(
-                    &self.request.tenant_id,
-                    self.request.session_id,
-                    self.request.expected_session_version,
-                )?
+        match (self.request.schema_version, &self.prior_receipt_digest) {
+            (1, None) => {}
+            (2, Some(digest)) => validate_digest(digest)?,
+            _ => return Err(corrupt()),
+        }
+        if self.schema_version != self.request.schema_version
+            || self.extension_key != request_key(&self.request)?
             || self.request.tenant_id != limit.grant.leadership_principal.tenant_id
             || self.request.project_id != limit.grant.project_id
             || self.request.session_id != limit.grant.session_id
@@ -283,6 +379,23 @@ impl CompanyEntity for AdaptiveBudgetReviewExtensionReceiptV1 {
                 return Err(corrupt());
             }
         }
+        if self.request.schema_version == 2 {
+            let parent = require_parent(
+                connection,
+                &self.request,
+                &self.prior_reviews,
+                self.issued_at_unix_ms,
+            )
+            .map_err(|_| corrupt())?;
+            if self.prior_receipt_digest.as_ref()
+                != Some(&canonical_sha256(
+                    "sentinel.workflow.adaptive-budget-review-extension-receipt.v1",
+                    &parent,
+                )?)
+            {
+                return Err(corrupt());
+            }
+        }
         let mut statement = connection.prepare(
             "SELECT payload,payload_digest,operation_digest,authority_binding_digest,created_at_ms
              FROM company_events WHERE tenant_id=?1 AND event_type=?2 AND operation_id=?3 LIMIT 2",
@@ -336,14 +449,7 @@ pub(super) fn limits_in_connection(
         ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
         None,
     );
-    let key = extension_key(tenant, session_id, head)?;
-    let Some(receipt) = get_entity::<AdaptiveBudgetReviewExtensionReceiptV1>(
-        connection,
-        tenant,
-        EXTENSION_KIND,
-        &key,
-    )?
-    else {
+    let Some(receipt) = latest_in_connection(connection, tenant, session_id, head)? else {
         return Ok(baseline);
     };
     if now < receipt.issued_at_unix_ms || now >= receipt.request.expires_at_unix_ms {
@@ -383,15 +489,11 @@ pub(super) fn limits_for_review(
         now,
     )?;
     if limits.2.is_some() {
-        let receipt: AdaptiveBudgetReviewExtensionReceiptV1 = get_entity(
+        let receipt = latest_in_connection(
             connection,
             &grant.leadership_principal.tenant_id,
-            EXTENSION_KIND,
-            &extension_key(
-                &grant.leadership_principal.tenant_id,
-                grant.session_id,
-                grant.expected_session_version,
-            )?,
+            grant.session_id,
+            grant.expected_session_version,
         )?
         .ok_or_else(corrupt)?;
         if budget_limit_source_digest(grant, context)? != receipt.request.source_digest {
@@ -412,6 +514,55 @@ impl WorkflowStore {
         reason_ref: &str,
         expires_at: u64,
         now: u64,
+    ) -> Result<AdaptiveBudgetReviewExtensionRequestV1, WorkflowError> {
+        self.budget_review_extension_draft_for_schema(
+            operator,
+            project_id,
+            session_id,
+            operation_id,
+            additional_reviews,
+            reason_ref,
+            expires_at,
+            now,
+            false,
+        )
+    }
+
+    pub fn budget_review_extension_successor_draft(
+        &self,
+        operator: &AuthenticatedCompanyPrincipalV1,
+        project_id: &ProjectId,
+        session_id: Uuid,
+        operation_id: Uuid,
+        additional_reviews: u16,
+        reason_ref: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> Result<AdaptiveBudgetReviewExtensionRequestV1, WorkflowError> {
+        self.budget_review_extension_draft_for_schema(
+            operator,
+            project_id,
+            session_id,
+            operation_id,
+            additional_reviews,
+            reason_ref,
+            expires_at,
+            now,
+            true,
+        )
+    }
+
+    fn budget_review_extension_draft_for_schema(
+        &self,
+        operator: &AuthenticatedCompanyPrincipalV1,
+        project_id: &ProjectId,
+        session_id: Uuid,
+        operation_id: Uuid,
+        additional_reviews: u16,
+        reason_ref: &str,
+        expires_at: u64,
+        now: u64,
+        successor: bool,
     ) -> Result<AdaptiveBudgetReviewExtensionRequestV1, WorkflowError> {
         require_operator(operator, &operator.tenant_id)?;
         project_id.validate()?;
@@ -435,9 +586,35 @@ impl WorkflowStore {
         .ok_or_else(not_found)?;
         let calls = require_issuance_source(&connection, &limit, now)?;
         let (global, head) = review_counts(&calls, source.version);
+        let prior_operation_id = if successor {
+            if get_entity::<AdaptiveBudgetReviewExtensionReceiptV1>(
+                &connection,
+                &operator.tenant_id,
+                EXTENSION_KIND,
+                &successor_key(&operator.tenant_id, session_id, source.version)?,
+            )?
+            .is_some()
+            {
+                return Err(conflict());
+            }
+            Some(
+                original_in_connection(
+                    &connection,
+                    &operator.tenant_id,
+                    session_id,
+                    source.version,
+                )?
+                .ok_or_else(not_found)?
+                .request
+                .operation_id,
+            )
+        } else {
+            None
+        };
         let request = AdaptiveBudgetReviewExtensionRequestV1 {
-            schema_version: 1,
+            schema_version: if successor { 2 } else { 1 },
             operation_id,
+            prior_operation_id,
             tenant_id: operator.tenant_id.clone(),
             project_id: project_id.clone(),
             session_id,
@@ -454,6 +631,9 @@ impl WorkflowStore {
             expires_at_unix_ms: expires_at,
         };
         request.validate(now)?;
+        if successor {
+            require_parent(&connection, &request, &calls, now)?;
+        }
         Ok(request)
     }
 
@@ -463,9 +643,8 @@ impl WorkflowStore {
         session_id: Uuid,
         head_version: u64,
     ) -> Result<Option<AdaptiveBudgetReviewExtensionReceiptV1>, WorkflowError> {
-        let key = extension_key(tenant, session_id, head_version)?;
         let connection = self.connection.lock().map_err(|_| persistence())?;
-        get_entity(&connection, tenant, EXTENSION_KIND, &key)
+        latest_in_connection(&connection, tenant, session_id, head_version)
     }
 
     pub fn authorize_budget_review_extension(
@@ -475,11 +654,7 @@ impl WorkflowStore {
         now: u64,
     ) -> Result<(bool, AdaptiveBudgetReviewExtensionReceiptV1), WorkflowError> {
         require_operator(operator, &request.tenant_id)?;
-        let key = extension_key(
-            &request.tenant_id,
-            request.session_id,
-            request.expected_session_version,
-        )?;
+        let key = request_key(request)?;
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(prior) = get_entity::<AdaptiveBudgetReviewExtensionReceiptV1>(
@@ -509,14 +684,24 @@ impl WorkflowStore {
         )?
         .ok_or_else(not_found)?;
         let prior_reviews = require_issuance_source(&transaction, &limit, now)?;
+        let prior_receipt_digest = if request.schema_version == 2 {
+            let parent = require_parent(&transaction, request, &prior_reviews, now)?;
+            Some(canonical_sha256(
+                "sentinel.workflow.adaptive-budget-review-extension-receipt.v1",
+                &parent,
+            )?)
+        } else {
+            None
+        };
         let receipt = AdaptiveBudgetReviewExtensionReceiptV1 {
-            schema_version: 1,
+            schema_version: request.schema_version,
             request: request.clone(),
             issuer_principal: operator.clone(),
             issued_at_unix_ms: now,
             extension_key: key,
             budget_limit_receipt: limit,
             prior_reviews,
+            prior_receipt_digest,
         };
         receipt.validate_entity()?;
         put_entity(
@@ -550,5 +735,34 @@ impl WorkflowStore {
     ) -> Result<(usize, usize, Option<u64>), WorkflowError> {
         let connection = self.connection.lock().map_err(|_| persistence())?;
         limits_in_connection(&connection, tenant, session_id, head_version, now)
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn absent_parent_preserves_legacy_v1_request_bytes_and_digest() {
+        let legacy = br#"{"schema_version":1,"operation_id":"00000000-0000-0000-0000-000000000001","tenant_id":"tenant-a","project_id":"project-a","session_id":"00000000-0000-0000-0000-000000000002","expected_session_version":8,"budget_limit_receipt_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","base_global_review_count":3,"base_head_review_count":3,"additional_reviews":3,"reason_ref":"operator-reviewed-evidence","expires_at_unix_ms":3600001}"#;
+        let request: AdaptiveBudgetReviewExtensionRequestV1 =
+            serde_json::from_slice(legacy).unwrap();
+        assert_eq!(request.prior_operation_id, None);
+        assert_eq!(serde_json::to_vec(&request).unwrap(), legacy.to_vec());
+        let mut hash = Sha256::new();
+        hash.update(b"sentinel.workflow.adaptive-budget-review-extension.v1\0");
+        hash.update(legacy);
+        assert_eq!(
+            request.canonical_digest().unwrap(),
+            format!("{:x}", hash.finalize())
+        );
+        let mut invalid = request.clone();
+        invalid.prior_operation_id = Some(Uuid::new_v4());
+        assert!(invalid.validate(1).is_err());
+        invalid.schema_version = 2;
+        assert!(invalid.validate(1).is_ok());
+        invalid.prior_operation_id = None;
+        assert!(invalid.validate(1).is_err());
     }
 }

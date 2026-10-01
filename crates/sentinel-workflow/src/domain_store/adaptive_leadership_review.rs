@@ -2198,6 +2198,7 @@ mod tests {
             AdaptiveBudgetReviewExtensionRequestV1 {
                 schema_version: 1,
                 operation_id: Uuid::new_v4(),
+                prior_operation_id: None,
                 tenant_id: f.leader.tenant_id.clone(),
                 project_id: f.grant.project_id.clone(),
                 session_id: f.grant.session_id,

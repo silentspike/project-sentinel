@@ -1,5 +1,11 @@
 # Changelog
 
+- Allow fresh provider claims during ordinary company reconciliation while
+  preserving exclusive recovery, single-batch execution and exactly-once
+  model admission. Durable claim replay never grants a second provider call
+  (#856). Permit one separately audited, finite successor after an exhausted
+  immutable review-capacity issuance, without refilling prior receipts.
+
 - Reauthorize the exact selected leadership review independently of scheduling
   order, preserving validation after its own dispatch. Recheck queued model
   authority before creating a reservation, and reject dispatch callbacks

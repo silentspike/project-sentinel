@@ -31,7 +31,9 @@ fn rows(path: &Path, sql: &str) -> Vec<Vec<Value>> {
     let mut statement = connection.prepare(sql).unwrap();
     let columns = statement.column_count();
     let result = statement
-        .query_map([], |row| (0..columns).map(|column| row.get(column)).collect())
+        .query_map([], |row| {
+            (0..columns).map(|column| row.get(column)).collect()
+        })
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -304,7 +306,10 @@ fn duplicate_event_and_unmirrored_arrival_replay_preserve_views_and_history() {
     assert_eq!(fixture.events.get_offset(PROJECTION).unwrap(), offset);
     assert_eq!(watermark(&fixture.projection_path), arrival_row);
     assert_eq!(fixture.worker.process_pending_batch().unwrap(), 0);
-    assert_eq!(fixture.events.get_offset(PROJECTION).unwrap(), Some(arrival_row));
+    assert_eq!(
+        fixture.events.get_offset(PROJECTION).unwrap(),
+        Some(arrival_row)
+    );
     assert_eq!(stable_views(&fixture.projection_path), views);
     assert_eq!(fixture.history(), history);
 
@@ -431,7 +436,10 @@ fn reopen_repairs_only_derived_room_counters_without_resetting_presence_or_progr
         "SELECT projection_name,last_event_id FROM projection_watermarks ORDER BY projection_name";
     let agents = rows(&fixture.projection_path, agents_sql);
     let progress = rows(&fixture.projection_path, progress_sql);
-    let kpis = rows(&fixture.projection_path, "SELECT * FROM kpi_1m ORDER BY bucket_start");
+    let kpis = rows(
+        &fixture.projection_path,
+        "SELECT * FROM kpi_1m ORDER BY bucket_start",
+    );
     let metadata_sql = "SELECT room_id,active_chaos,active_smells,temperature,co2_ppm,noise_db,
                                last_event_tick,last_event_id,updated_at
                         FROM room_live_view ORDER BY room_id";
@@ -462,13 +470,19 @@ fn reopen_repairs_only_derived_room_counters_without_resetting_presence_or_progr
     fixture.counts("kueche", 1, 0);
     fixture.counts("buero-dev-1", 0, 1);
     assert!(fixture.agent(36).in_transit);
-    assert_eq!(fixture.agent(36).transit_target.as_deref(), Some("buero-dev-1"));
+    assert_eq!(
+        fixture.agent(36).transit_target.as_deref(),
+        Some("buero-dev-1")
+    );
     assert!(fixture.agent(40).in_transit);
     assert_eq!(fixture.agent(40).status, "paused");
     assert_eq!(rows(&fixture.projection_path, agents_sql), agents);
     assert_eq!(rows(&fixture.projection_path, progress_sql), progress);
     assert_eq!(
-        rows(&fixture.projection_path, "SELECT * FROM kpi_1m ORDER BY bucket_start"),
+        rows(
+            &fixture.projection_path,
+            "SELECT * FROM kpi_1m ORDER BY bucket_start"
+        ),
         kpis,
     );
     assert_eq!(rows(&fixture.projection_path, metadata_sql), metadata);

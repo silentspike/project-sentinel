@@ -69,16 +69,39 @@ Its bindings are:
   `expected_session_version`;
 - `budget_limit_receipt_digest`, `source_digest`, `base_global_review_count`
   and `base_head_review_count`;
-- `additional_reviews`, `reason_ref` and `expires_at_unix_ms`.
+- `additional_reviews`, `reason_ref` and `expires_at_unix_ms`;
+- schema 2 additionally requires `prior_operation_id`, referencing the original
+  schema-1 issuance operation. Schema 1 omits this field, preserving its original
+  serialized bytes and canonical digest.
 
 The server validates these bindings against durable current state. A caller
 cannot substitute another tenant, source head, receipt or review count.
 `additional_reviews` is finite, from one through three, and fresh issuance may
 expire no more than 24 hours after its issuance clock. There is one immutable
-extension per tenant, session and exact head. Exact replay returns the original
+schema-1 extension per tenant, session and exact head. Exact replay returns the original
 receipt without refilling slots or renewing expiry, including after the
-extension expires. A different operation ID cannot create a second extension
-for the same head.
+extension expires. A different operation ID cannot replace that original
+issuance or refill its slots.
+
+After the original capacity is fully consumed and every prior review is
+terminal, an operator may explicitly request **one** immutable schema-2
+successor for the same exact current head. GET with `successor=true` proposes a
+server-bound draft only when eligible; POST remains a separate explicit
+authorization. The successor binds the original operation, the same historical
+limit receipt/source, and fresh exact global/head review counts. It adds only
+one through three slots, with a finite new expiry, in a distinct append-only
+storage slot. It does not mutate the original receipt or erase consumed calls.
+Its sealed historical proof binds the exact original receipt digest as well as
+the original operation; latest reads validate both without a cyclic dependency.
+An expired but fully consumed original can be referenced; expiry never returns
+unused slots. Active or nonterminal prior reviews prevent issuance.
+
+Only one successor exists per tenant/session/head. No successor may reference
+another successor, and competing requests for that slot conflict. Public reads
+and effective limits select the successor when present, without falling back
+to an original grant when it expires or becomes stale. Exact POST replay still
+selects its own immutable receipt, including the original schema-1 receipt
+after a successor exists. Neither GET nor replay authorizes a further refill.
 
 The extension raises only the normal review quota. It neither creates a
 leadership decision nor grants employee model/tool work. A subsequently
