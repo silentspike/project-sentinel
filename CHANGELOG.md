@@ -1,5 +1,10 @@
 # Changelog
 
+- Preserve terminal QA timeout classification when a strict broker timeout frame
+  arrives before the client deadline. Reject unready, malformed, unknown or
+  contradictory error frames without adopting partial output or weakening the
+  existing deadline (#856).
+
 - Keep operator socket parsing and responses bounded, move synchronous company
   handlers off async executor threads, and retain admission until an in-flight
   handler actually finishes. Reuse only completed persisted validation proofs
