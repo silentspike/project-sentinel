@@ -794,48 +794,54 @@ impl WorkflowStore {
     /// binding. The M0 provider bridge uses this bounded read to resolve one
     /// exact active assignment and cost reservation before external I/O.
     pub fn company_projects(&self) -> Result<Vec<ProjectV1>, WorkflowError> {
-        let connection = self.connection.lock().map_err(|_| persistence())?;
-        let mut statement = connection
+        let mut connection = self.connection.lock().map_err(|_| persistence())?;
+        // Pin discovery without aggregating unrelated projects' proof-arena limits.
+        let snapshot = connection.savepoint()?;
+        let projects = (|| {
+            let mut statement = snapshot
             .prepare(
                 "SELECT tenant_id,entity_kind,entity_id,version,payload,payload_digest FROM company_entities WHERE entity_kind='project' ORDER BY tenant_id,entity_id",
             )
             .map_err(WorkflowError::from)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })
+                .map_err(WorkflowError::from)?;
+            rows.map(|row| {
+                let (tenant, kind, id, version, payload, payload_digest) =
+                    row.map_err(WorkflowError::from)?;
+                if kind != "project"
+                    || version <= 0
+                    || !constant_time_eq(
+                        &bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?,
+                        &payload_digest,
+                    )
+                {
+                    return Err(corrupt());
+                }
+                let project: ProjectV1 = decode(&payload)?;
+                if project.tenant_id.0 != tenant
+                    || project.project_id.0 != id
+                    || project.version != stored_u64(version)?
+                {
+                    return Err(corrupt());
+                }
+                validate_project(&project).map_err(|_| corrupt())?;
+                subscription::validate_persisted(&snapshot, &project).map_err(|_| corrupt())?;
+                Ok(project)
             })
-            .map_err(WorkflowError::from)?;
-        rows.map(|row| {
-            let (tenant, kind, id, version, payload, payload_digest) =
-                row.map_err(WorkflowError::from)?;
-            if kind != "project"
-                || version <= 0
-                || !constant_time_eq(
-                    &bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?,
-                    &payload_digest,
-                )
-            {
-                return Err(corrupt());
-            }
-            let project: ProjectV1 = decode(&payload)?;
-            if project.tenant_id.0 != tenant
-                || project.project_id.0 != id
-                || project.version != stored_u64(version)?
-            {
-                return Err(corrupt());
-            }
-            validate_project(&project).map_err(|_| corrupt())?;
-            subscription::validate_persisted(&connection, &project).map_err(|_| corrupt())?;
-            Ok(project)
-        })
-        .collect()
+            .collect::<Result<Vec<_>, WorkflowError>>()
+        })()?;
+        snapshot.commit()?;
+        Ok(projects)
     }
 
     pub fn company_customer_projects(
@@ -8031,6 +8037,53 @@ mod tests {
         assert!(!store
             .has_company_operation(&principal, Uuid::from_u128(11))
             .unwrap());
+    }
+
+    #[test]
+    fn company_projects_snapshot_does_not_reuse_rows_after_corruption_or_error() {
+        let (_temp, _path, store, _principal, project) = accepted_project_fixture();
+        assert_eq!(store.company_projects().unwrap(), vec![project.clone()]);
+        let original_digest: String = {
+            let connection = store.connection.lock().unwrap();
+            assert!(connection.is_autocommit());
+            let digest = connection.query_row(
+                "SELECT payload_digest FROM company_entities WHERE entity_kind='project' AND entity_id=?1",
+                params![project.project_id.0], |row| row.get(0),
+            ).unwrap();
+            connection.execute(
+                "UPDATE company_entities SET payload_digest=?1 WHERE entity_kind='project' AND entity_id=?2",
+                params!["0".repeat(64), project.project_id.0],
+            ).unwrap();
+            digest
+        };
+        assert!(store.company_projects().is_err());
+        {
+            let connection = store.connection.lock().unwrap();
+            assert!(connection.is_autocommit());
+            connection.execute(
+                "UPDATE company_entities SET payload_digest=?1 WHERE entity_kind='project' AND entity_id=?2",
+                params![original_digest, project.project_id.0],
+            ).unwrap();
+        }
+        assert_eq!(store.company_projects().unwrap(), vec![project]);
+        assert!(store.connection.lock().unwrap().is_autocommit());
+    }
+
+    #[test]
+    fn company_projects_snapshot_preserves_the_callers_outer_transaction() {
+        let (_temp, _path, store, _principal, project) = accepted_project_fixture();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("BEGIN")
+            .unwrap();
+        assert_eq!(store.company_projects().unwrap(), vec![project]);
+        let connection = store.connection.lock().unwrap();
+        assert!(!connection.is_autocommit());
+        assert_eq!(validation_scope::validations("entity"), 0);
+        connection.execute_batch("ROLLBACK").unwrap();
+        assert!(connection.is_autocommit());
     }
 
     #[test]
