@@ -673,7 +673,7 @@ class BrokerProtocolTests(unittest.TestCase):
                 self.reject(frame(wire) if index < 6 else wire)
 
     def test_invalid_versions_are_rejected_for_every_event_kind(self):
-        for kind in ("ready", "stdout", "stderr", "exit"):
+        for kind in ("ready", "stdout", "stderr", "exit", "error"):
             for version in (0, 2, True, "1", None):
                 with self.subTest(kind=kind, version=version):
                     value = event(kind)
@@ -682,7 +682,42 @@ class BrokerProtocolTests(unittest.TestCase):
                         value["dataHex"] = ""
                     if kind == "exit":
                         value.update(code=0, signal=None)
+                    if kind == "error":
+                        value["code"] = "tool_timeout"
                     self.reject((b"" if kind == "ready" else frame(event("ready"))) + frame(value))
+
+    def test_broker_timeout_before_client_deadline_remains_terminal_error(self):
+        ready = frame(event("ready"))
+        timeout_event = frame(event("error", code="tool_timeout"))
+        for prefix in (ready, ready + frame(event("stdout", dataHex="00ff"))):
+            with self.subTest(partial_output=prefix != ready):
+                self.reject(prefix + timeout_event, "tool_timeout", deadline=5)
+
+    def test_timeout_event_requires_ready_exact_fields_code_and_terminal_eof(self):
+        ready = frame(event("ready"))
+        timeout_event = frame(event("error", code="tool_timeout"))
+        fixtures = [
+            timeout_event,
+            ready + frame(event("error")),
+            ready + frame(event("error", code="tool_timeout", extra=True)),
+            ready + timeout_event + b"x",
+            ready + timeout_event + timeout_event,
+            ready + timeout_event + frame(event("exit", code=0, signal=None)),
+            ready + frame(b'{"kind":"error","version":1,"code":"tool_timeout","code":"tool_timeout"}'),
+        ]
+        for code in ("broker_denied", "pass", "tests_failed", "tool_output_limit",
+                     "", True, 1, None, [], {}):
+            fixtures.append(ready + frame(event("error", code=code)))
+        for index, wire in enumerate(fixtures):
+            with self.subTest(index=index):
+                self.reject(wire)
+
+    def test_timeout_event_waits_for_terminal_eof_only_until_client_deadline(self):
+        started = time.monotonic()
+        self.reject(frame(event("ready")) + frame(event("error", code="tool_timeout")),
+                    "tool_timeout", pause=True, deadline=0.05)
+        self.assertGreaterEqual(time.monotonic() - started, 0.05)
+        self.assertLess(time.monotonic() - started, 1)
 
     def test_ready_order_and_post_exit_bytes_are_rejected(self):
         ready, exit_event = frame(event("ready")), frame(event("exit", code=0, signal=None))

@@ -359,7 +359,7 @@ fn require_local_adoption_audit(
     Ok(())
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExpiredAdaptiveContinuationRetirementV1 {
     schema_version: u16,
@@ -395,6 +395,16 @@ fn store_call(
 }
 
 fn calls_for_session(
+    connection: &Connection,
+    tenant: &TenantId,
+    session_id: Uuid,
+) -> Result<Vec<AdaptiveLeadershipReviewCallV1>, WorkflowError> {
+    validation_scope::memoize(connection, "review-calls", &(tenant, session_id), || {
+        calls_for_session_uncached(connection, tenant, session_id)
+    })
+}
+
+fn calls_for_session_uncached(
     connection: &Connection,
     tenant: &TenantId,
     session_id: Uuid,
@@ -435,6 +445,15 @@ fn require_current_source(
     connection: &Connection,
     call: &AdaptiveLeadershipReviewCallV1,
 ) -> Result<(), WorkflowError> {
+    validation_scope::with_scope(connection, || {
+        require_current_source_uncached(connection, call)
+    })
+}
+
+fn require_current_source_uncached(
+    connection: &Connection,
+    call: &AdaptiveLeadershipReviewCallV1,
+) -> Result<(), WorkflowError> {
     let project: ProjectV1 = get_entity(
         connection,
         &call.grant.leadership_principal.tenant_id,
@@ -453,6 +472,16 @@ fn require_current_source(
 }
 
 fn require_budget_source(
+    connection: &Connection,
+    grant: &AdaptiveLeadershipReviewGrantV1,
+    context: &AdaptiveLeadershipReviewContextV1,
+) -> Result<(), WorkflowError> {
+    validation_scope::memoize(connection, "budget-source", &(grant, context), || {
+        require_budget_source_uncached(connection, grant, context)
+    })
+}
+
+fn require_budget_source_uncached(
     connection: &Connection,
     grant: &AdaptiveLeadershipReviewGrantV1,
     context: &AdaptiveLeadershipReviewContextV1,
@@ -929,6 +958,19 @@ pub(super) fn validate_governed_allowance_receipt(
 }
 
 pub(super) fn validate_persisted_governed_allowance(
+    connection: &Connection,
+    project: &ProjectV1,
+    allowance: &SubscriptionCallAllowanceV1,
+) -> Result<(), WorkflowError> {
+    validation_scope::memoize(
+        connection,
+        "governed-allowance",
+        &(project, allowance),
+        || validate_persisted_governed_allowance_uncached(connection, project, allowance),
+    )
+}
+
+fn validate_persisted_governed_allowance_uncached(
     connection: &Connection,
     project: &ProjectV1,
     allowance: &SubscriptionCallAllowanceV1,
@@ -2980,6 +3022,86 @@ mod tests {
                 )
                 .unwrap()
                 .is_none());
+        }
+
+        #[test]
+        fn budget_review_validation_scope_reuses_the_exact_journal_proof() {
+            let (f, now) = limit_fixture();
+            let request = draft(&f, now, 1, 3_600_000);
+            f.store
+                .authorize_budget_review_extension(&operator(&f), &request, now)
+                .unwrap();
+            let connection = f.store.connection.lock().unwrap();
+            validation_scope::with_scope(&connection, || {
+                let receipt = f.grant.expected_session_version;
+                let first = budget_review_extension::limits_in_connection(
+                    &connection,
+                    &f.leader.tenant_id,
+                    f.grant.session_id,
+                    receipt,
+                    now,
+                )?;
+                let journals = validation_scope::validations("adaptive-journal");
+                assert!(journals > 0);
+                let second = budget_review_extension::limits_in_connection(
+                    &connection,
+                    &f.leader.tenant_id,
+                    f.grant.session_id,
+                    receipt,
+                    now,
+                )?;
+                assert_eq!(first, second);
+                assert_eq!(validation_scope::validations("adaptive-journal"), journals);
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        #[test]
+        fn budget_review_validation_scope_rejects_corrupt_old_proof_in_a_new_operation() {
+            for target in ["review", "event", "journal"] {
+                let (f, now) = limit_fixture();
+                let request = draft(&f, now, 1, 3_600_000);
+                f.store
+                    .authorize_budget_review_extension(&operator(&f), &request, now)
+                    .unwrap();
+                assert!(f
+                    .store
+                    .budget_review_limits(
+                        &f.leader.tenant_id,
+                        f.grant.session_id,
+                        f.grant.expected_session_version,
+                        now,
+                    )
+                    .is_ok());
+                let connection = f.store.connection.lock().unwrap();
+                let changed = match target {
+                    "review" => connection.execute(
+                        "UPDATE company_entities SET payload=X'00' WHERE rowid=(SELECT rowid FROM company_entities WHERE entity_kind='adaptive_leadership_review_call' LIMIT 1)", [],
+                    ).unwrap(),
+                    "event" => connection.execute(
+                        "UPDATE company_events SET payload=X'00' WHERE sequence=(SELECT MIN(sequence) FROM company_events WHERE event_type='adaptive_budget_review_extension_authorized')", [],
+                    ).unwrap(),
+                    "journal" => connection.execute(
+                        "UPDATE workflow_operations SET response=X'00' WHERE operation_namespace=?1",
+                        [format!("adaptive-session-v1:{}", f.grant.session_id)],
+                    ).unwrap(),
+                    _ => unreachable!(),
+                };
+                assert!(changed > 0);
+                drop(connection);
+                assert!(
+                    f.store
+                        .budget_review_limits(
+                            &f.leader.tenant_id,
+                            f.grant.session_id,
+                            f.grant.expected_session_version,
+                            now,
+                        )
+                        .is_err(),
+                    "tampered {target} was accepted"
+                );
+            }
         }
     }
 

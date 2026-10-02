@@ -1,5 +1,18 @@
 # Changelog
 
+- Preserve terminal QA timeout classification when a strict broker timeout frame
+  arrives before the client deadline. Reject unready, malformed, unknown or
+  contradictory error frames without adopting partial output or weakening the
+  existing deadline (#856).
+
+- Keep operator socket parsing and responses bounded, move synchronous company
+  handlers off async executor threads, and retain admission until an in-flight
+  handler actually finishes. Reuse only completed persisted validation proofs
+  inside one bounded SQLite snapshot and invalidate them before writes. Fence
+  delayed Console authentication responses against newer login/logout outcomes
+  without changing employee history, model authority or provider accounting
+  (#856).
+
 - Allow fresh provider claims during ordinary company reconciliation while
   preserving exclusive recovery, single-batch execution and exactly-once
   model admission. Durable claim replay never grants a second provider call
@@ -577,6 +590,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+- Keep room-detail dialogs visible in a viewport portal when their Floorplan
+  panel is scrolled; preserve explicit room identity and modal cleanup.
 
 - Keep every desktop workspace navigation control visible without horizontal
   page overflow, including narrow desktop viewports (#856).

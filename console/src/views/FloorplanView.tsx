@@ -1,4 +1,5 @@
 import { createMemo, createSignal, For, Show, type JSX } from "solid-js";
+import { Portal } from "solid-js/web";
 import { apiJson, postJson } from "../api";
 import { consoleStore } from "../stores/console";
 import { mergeRoomMeta, roomDisplayName, type RoomViewModel } from "../roomsMeta";
@@ -285,8 +286,9 @@ export function FloorplanView(): JSX.Element {
         </Show>
 
         <Show when={activeRoomId()}>
+          <Portal>
           <button type="button" class="drawer-backdrop" aria-label="Raumdetail schliessen" onClick={closeDetail} />
-          <aside class="room-detail-drawer" role="dialog" aria-modal="true" data-testid="room-detail">
+          <aside class="room-detail-drawer" role="dialog" aria-modal="true" aria-label={activeRoom()?.name ?? roomDisplayName(activeRoomId())} data-room-id={activeRoomId()} data-testid="room-detail">
             <div class="room-detail-header">
               <div>
                 <h2>{activeRoom()?.name ?? roomDisplayName(activeRoomId())}</h2>
@@ -413,6 +415,7 @@ export function FloorplanView(): JSX.Element {
               </Show>
             </Show>
           </aside>
+          </Portal>
         </Show>
       </div>
     </section>
