@@ -1151,6 +1151,15 @@ fn load_with_feedback(
     connection: &Connection,
     id: Uuid,
 ) -> Result<Option<LoadedSession>, WorkflowError> {
+    crate::domain_store::validation_scope::memoize(connection, "adaptive-journal", &id, || {
+        load_with_feedback_uncached(connection, id)
+    })
+}
+
+fn load_with_feedback_uncached(
+    connection: &Connection,
+    id: Uuid,
+) -> Result<Option<LoadedSession>, WorkflowError> {
     let mut statement = connection.prepare(
         "SELECT operation_id, request_digest, response, created_at_ms FROM workflow_operations WHERE operation_namespace=?1 ORDER BY operation_id LIMIT ?2"
     ).map_err(map_sqlite_error)?;
@@ -1165,6 +1174,7 @@ fn load_with_feedback(
         let key: String = row.get(0).map_err(map_sqlite_error)?;
         let digest: String = row.get(1).map_err(map_sqlite_error)?;
         let bytes: Vec<u8> = row.get(2).map_err(map_sqlite_error)?;
+        crate::domain_store::validation_scope::charge_bytes(connection, bytes.len())?;
         let created: i64 = row.get(3).map_err(map_sqlite_error)?;
         let entry: Entry = decode(&bytes)?;
         let recomputed = canonical_sha256("sentinel.workflow.adaptive-entry.v1", &entry)?;
