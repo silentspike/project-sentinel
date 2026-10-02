@@ -217,6 +217,14 @@ def run_tool(args: list[str], root: Path, deadline: float,
                     if channel.recv(1):
                         raise QaError("io_or_tool_error", "error")
                     return event["code"], bytes(streams["stdout"]), bytes(streams["stderr"])
+                elif (kind == "error" and set(event) == {"kind", "version", "code"}
+                      and ready and event["code"] == "tool_timeout"):
+                    # Either side can observe the deadline first. A broker
+                    # timeout is still a terminal error, never an assertion exit.
+                    timeout()
+                    if channel.recv(1):
+                        raise QaError("io_or_tool_error", "error")
+                    raise QaError("tool_timeout", "error")
                 else:
                     raise QaError("io_or_tool_error", "error")
     except (TimeoutError, socket.timeout):
