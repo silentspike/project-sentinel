@@ -117,7 +117,7 @@ func TestLeadershipReviewRejectsMixedSubjectAndBootstrapGrantBeforeAuthority(t *
 }
 
 func TestLeadershipReviewContinuationKindIsBoundAndLegacyWirePreserved(t *testing.T) {
-	for _, kind := range []string{"", "unknown_model", "blocked_continuation", "budget_window_exhausted"} {
+	for _, kind := range []string{"", "unknown_model", "blocked_continuation", "budget_window_exhausted", "admission_repair"} {
 		t.Run(kind, func(t *testing.T) {
 			req := leadershipReviewTestRequest()
 			if kind != "" {

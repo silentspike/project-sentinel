@@ -49,6 +49,8 @@ pub struct AdaptiveLeadershipRecoveryRequestV1 {
     pub sealed_unknown_proof_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_subject: Option<AdaptiveLeadershipRecoveryBlockedSubjectV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_repair: Option<AdaptiveLeadershipAdmissionRepairV1>,
     pub prior_review_history_digest: String,
     /// Digest of a server-loaded root-attested release/deployment repair receipt.
     /// A caller-provided digest alone is not evidence that the repair is installed.
@@ -87,6 +89,149 @@ pub struct AdaptiveLeadershipRecoveryEpochV1 {
     pub review_id: Uuid,
     pub issued_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
+}
+
+/// An extraordinary review-cap exception, never a refunded ordinary review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveLeadershipAdmissionRepairV1 {
+    pub schema_version: u16,
+    pub source_digest: String,
+    pub disposition_digest: String,
+    pub failed_release: AdaptiveRecoveryReleaseV1,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveLeadershipAdmissionRepairSourceV1 {
+    pub schema_version: u16,
+    pub session: crate::AdaptiveSessionV1,
+    pub session_head_digest: String,
+    pub project: crate::ProjectV1,
+    pub calls: Vec<AdaptiveLeadershipReviewCallV1>,
+    pub original_extension: Box<crate::AdaptiveBudgetReviewExtensionReceiptV1>,
+    pub successor_extension: Box<crate::AdaptiveBudgetReviewExtensionReceiptV1>,
+    pub legacy_epoch: Box<AdaptiveLeadershipRecoveryEpochV1>,
+    /// All current-head retired undispatched candidates, not a single-release attestation.
+    pub qualifying_review_ids: Vec<Uuid>,
+    /// Exact completed receipts verified against retained journal and allowance history.
+    pub continuation_reviews: Vec<AdaptiveLeadershipReviewCallV1>,
+}
+
+/// Produced by a trusted server callback from retained evidence, not HTTP assertions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveLeadershipAdmissionRepairEvidenceV1 {
+    pub source_digest: String,
+    pub disposition_digest: String,
+    pub repair_digest: String,
+    pub release: AdaptiveRecoveryReleaseV1,
+    pub failed_release: AdaptiveRecoveryReleaseV1,
+    /// Nonempty exact subset covered by the failed-release admission evidence.
+    pub attested_review_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveLeadershipAdmissionRepairEpochV1 {
+    // Heap-backed snapshots keep receipt validation within normal thread stacks.
+    pub epoch: Box<AdaptiveLeadershipRecoveryEpochV1>,
+    pub source: Box<AdaptiveLeadershipAdmissionRepairSourceV1>,
+    pub evidence: AdaptiveLeadershipAdmissionRepairEvidenceV1,
+}
+
+impl std::fmt::Debug for AdaptiveLeadershipAdmissionRepairSourceV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdaptiveLeadershipAdmissionRepairSourceV1")
+            .field("session_id", &self.session.grant.session_id)
+            .field("session_version", &self.session.version)
+            .field("review_count", &self.calls.len())
+            .finish_non_exhaustive()
+    }
+}
+
+pub fn adaptive_leadership_admission_repair_key(
+    tenant: &TenantId,
+    session_id: Uuid,
+) -> Result<String, WorkflowError> {
+    tenant.validate()?;
+    if session_id.is_nil() {
+        return Err(invalid());
+    }
+    Ok(format!(
+        "admission-repair-{}",
+        canonical_sha256(
+            "sentinel.workflow.adaptive-leadership-admission-repair-key.v1",
+            &(tenant, session_id),
+        )?
+    ))
+}
+
+pub fn adaptive_leadership_admission_repair_history_digest(
+    calls: &[AdaptiveLeadershipReviewCallV1],
+) -> Result<String, WorkflowError> {
+    if calls.is_empty() || calls.len() > 4096 {
+        return Err(invalid());
+    }
+    let mut ordered: Vec<_> = calls.iter().collect();
+    ordered.sort_by_key(|call| call.grant.review_id);
+    if ordered
+        .windows(2)
+        .any(|pair| pair[0].grant.review_id == pair[1].grant.review_id)
+    {
+        return Err(invalid());
+    }
+    canonical_sha256(
+        "sentinel.workflow.adaptive-leadership-admission-repair-history.v1",
+        &ordered,
+    )
+}
+
+impl AdaptiveLeadershipAdmissionRepairSourceV1 {
+    pub fn canonical_digest(&self) -> Result<String, WorkflowError> {
+        canonical_sha256(
+            "sentinel.workflow.adaptive-leadership-admission-repair-source.v1",
+            self,
+        )
+    }
+}
+
+impl AdaptiveLeadershipAdmissionRepairEpochV1 {
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        self.epoch.validate()?;
+        let request = &self.epoch.request;
+        let repair = request.admission_repair.as_ref().ok_or_else(invalid)?;
+        let source = &self.source;
+        if self.epoch.schema_version != 2
+            || source.schema_version != 1
+            || source.session != self.epoch.source_context.source_session
+            || source.project != self.epoch.source_context.source_project
+            || source.session_head_digest != request.session_head_digest
+            || source.canonical_digest()? != repair.source_digest
+            || adaptive_leadership_admission_repair_history_digest(&source.calls)?
+                != request.prior_review_history_digest
+            || self.evidence.source_digest != repair.source_digest
+            || self.evidence.disposition_digest != repair.disposition_digest
+            || self.evidence.repair_digest != request.repair_digest
+            || self.evidence.release != request.release
+            || self.evidence.failed_release != repair.failed_release
+            || self.evidence.attested_review_ids.is_empty()
+            || self
+                .evidence
+                .attested_review_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
+                .evidence
+                .attested_review_ids
+                .iter()
+                .any(|id| !source.qualifying_review_ids.contains(id))
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
 }
 
 impl AdaptiveRecoveryReleaseV1 {
@@ -187,15 +332,16 @@ impl AdaptiveLeadershipRecoveryRequestV1 {
             &self.unknown_effect,
             &self.sealed_unknown_proof_digest,
             &self.blocked_subject,
+            &self.admission_repair,
         ) {
-            (1, Some(effect), Some(proof), None) => {
+            (1, Some(effect), Some(proof), None, None) => {
                 if effect.id.is_nil() {
                     return Err(invalid());
                 }
                 validate_digest(&effect.request_digest)?;
                 validate_digest(proof)?;
             }
-            (2, None, None, Some(blocked)) => {
+            (2, None, None, Some(blocked), None) => {
                 if blocked.reason_code.is_empty()
                     || blocked.reason_code.len() > 64
                     || !blocked.reason_code.bytes().all(|byte| {
@@ -205,6 +351,14 @@ impl AdaptiveLeadershipRecoveryRequestV1 {
                     return Err(invalid());
                 }
                 validate_digest(&blocked.model_response_digest)?;
+            }
+            (3, None, None, None, Some(repair)) => {
+                validate_digest(&repair.source_digest)?;
+                validate_digest(&repair.disposition_digest)?;
+                repair.failed_release.validate()?;
+                if repair.schema_version != 1 || repair.failed_release == self.release {
+                    return Err(invalid());
+                }
             }
             _ => return Err(invalid()),
         }
@@ -234,6 +388,9 @@ impl AdaptiveLeadershipRecoveryRequestV1 {
     }
 
     fn matches_source(&self, session: &crate::AdaptiveSessionV1) -> bool {
+        if self.schema_version == 3 && self.admission_repair.is_some() {
+            return matches!(session.cursor, AdaptiveCursorV1::ReadyForModel);
+        }
         match (&session.cursor, &self.unknown_effect, &self.blocked_subject) {
             (AdaptiveCursorV1::ModelUnknown { effect }, Some(expected), None) => {
                 self.schema_version == 1 && effect == expected
@@ -249,6 +406,13 @@ impl AdaptiveLeadershipRecoveryRequestV1 {
     }
 
     fn matches_review_subject(&self, grant: &AdaptiveLeadershipReviewGrantV1) -> bool {
+        if self.schema_version == 3 && self.admission_repair.is_some() {
+            return grant.schema_version == 4
+                && matches!(
+                    grant.subject,
+                    Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. })
+                );
+        }
         match (&grant.subject, &self.unknown_effect, &self.blocked_subject) {
             (
                 Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel {
@@ -287,12 +451,15 @@ impl AdaptiveLeadershipRecoveryBindingV1 {
     pub fn validate(&self) -> Result<(), WorkflowError> {
         let key_digest = self
             .epoch_key
-            .strip_prefix("recovery-")
+            .strip_prefix(match self.schema_version {
+                1 => "recovery-",
+                2 => "admission-repair-",
+                _ => return Err(invalid()),
+            })
             .ok_or_else(invalid)?;
         validate_digest(key_digest)?;
         validate_digest(&self.epoch_digest)?;
-        if self.schema_version != 1
-            || self.review_id.is_nil()
+        if self.review_id.is_nil()
             || !(1_000..=ADAPTIVE_LEADERSHIP_MAX_GRANT_MS).contains(&self.max_window_ms)
             || !(1..=crate::ADAPTIVE_SESSION_MAX_CALLS).contains(&self.max_additional_model_calls)
         {
@@ -308,9 +475,12 @@ impl AdaptiveLeadershipRecoveryBindingV1 {
         review_id: Uuid,
     ) -> Result<(), WorkflowError> {
         self.validate()?;
-        if self.epoch_key != adaptive_leadership_recovery_epoch_key(tenant, session_id)?
-            || self.review_id != review_id
-        {
+        let expected = match self.schema_version {
+            1 => adaptive_leadership_recovery_epoch_key(tenant, session_id)?,
+            2 => adaptive_leadership_admission_repair_key(tenant, session_id)?,
+            _ => return Err(invalid()),
+        };
+        if self.epoch_key != expected || self.review_id != review_id {
             return Err(invalid());
         }
         Ok(())
@@ -327,15 +497,20 @@ impl AdaptiveLeadershipRecoveryEpochV1 {
         let grant = &self.review_grant;
         let context = &self.source_context;
         let session = &context.source_session;
-        if self.schema_version != 1
-            || self.epoch_key
-                != adaptive_leadership_recovery_epoch_key(&request.tenant_id, request.session_id)?
+        let repair = request.admission_repair.is_some();
+        let key = if repair {
+            adaptive_leadership_admission_repair_key(&request.tenant_id, request.session_id)?
+        } else {
+            adaptive_leadership_recovery_epoch_key(&request.tenant_id, request.session_id)?
+        };
+        if self.schema_version != (if repair { 2 } else { 1 })
+            || self.epoch_key != key
             || self.issuer_authority.principal_id != self.issuer_principal.principal_id
             || self.issuer_authority.principal_generation
                 != self.issuer_principal.authority_generation
             || self.issuer_authority.authority_digest != self.issuer_principal.authority_digest
             || grant.recovery_epoch.is_some()
-            || grant.schema_version != 2
+            || grant.schema_version != (if repair { 4 } else { 2 })
             || grant.leadership_principal.tenant_id != request.tenant_id
             || grant.project_id != request.project_id
             || grant.work_item_id != request.work_item_id
@@ -346,7 +521,10 @@ impl AdaptiveLeadershipRecoveryEpochV1 {
             || self.expires_at_unix_ms != request.expires_at_unix_ms
             || grant.expires_at_unix_ms != self.expires_at_unix_ms
             || self.issued_at_unix_ms < session.updated_at_ms
-            || self.issued_at_unix_ms < session.active_deadline_ms()
+            || (!repair && self.issued_at_unix_ms < session.active_deadline_ms())
+            || (repair
+                && session.model_calls < session.active_model_ceiling()
+                && self.issued_at_unix_ms < session.active_deadline_ms())
             || request.session_digest != adaptive_leadership_recovery_session_digest(session)?
             || request.project_digest
                 != adaptive_leadership_recovery_project_digest(&context.source_project)?
@@ -366,8 +544,20 @@ impl AdaptiveLeadershipRecoveryEpochV1 {
         {
             return Err(invalid());
         }
-        grant.validate(self.issued_at_unix_ms)?;
-        context.validate(grant)
+        let mut bound = grant.clone();
+        if repair {
+            // Shape-only binding avoids a recursive epoch digest while requiring schema 4 authority.
+            bound.recovery_epoch = Some(AdaptiveLeadershipRecoveryBindingV1 {
+                schema_version: 2,
+                epoch_key: self.epoch_key.clone(),
+                epoch_digest: "0".repeat(64),
+                review_id: self.review_id,
+                max_window_ms: request.max_window_ms,
+                max_additional_model_calls: request.max_additional_model_calls,
+            });
+        }
+        bound.validate(self.issued_at_unix_ms)?;
+        context.validate(&bound)
     }
 
     pub fn canonical_digest(&self) -> Result<String, WorkflowError> {
@@ -380,7 +570,7 @@ impl AdaptiveLeadershipRecoveryEpochV1 {
 
     pub fn binding(&self) -> Result<AdaptiveLeadershipRecoveryBindingV1, WorkflowError> {
         Ok(AdaptiveLeadershipRecoveryBindingV1 {
-            schema_version: 1,
+            schema_version: if self.schema_version == 2 { 2 } else { 1 },
             epoch_key: self.epoch_key.clone(),
             epoch_digest: self.canonical_digest()?,
             review_id: self.review_id,
@@ -416,6 +606,9 @@ impl AdaptiveLeadershipRecoveryEpochV1 {
         calls: &[AdaptiveLeadershipReviewCallV1],
     ) -> Result<(), WorkflowError> {
         self.validate()?;
+        if self.request.admission_repair.is_some() {
+            return Err(invalid());
+        }
         if adaptive_leadership_recovery_history_digest(calls)?
             != self.request.prior_review_history_digest
         {
@@ -456,7 +649,11 @@ impl AdaptiveLeadershipRecoveryEpochV1 {
     ) -> Result<(), WorkflowError> {
         self.validate()?;
         decision.validate(&self.source_context.evidence_refs)?;
-        decision.validate_subject(&self.review_grant)?;
+        let mut grant = self.review_grant.clone();
+        if self.schema_version == 2 {
+            grant.recovery_epoch = Some(self.binding()?);
+        }
+        decision.validate_subject(&grant)?;
         if let crate::AdaptiveLeadershipReviewDecisionKindV1::Continue {
             additional_model_calls,
             window_ms,
@@ -497,6 +694,12 @@ impl AdaptiveLeadershipRecoveryEpochV1 {
                             .blocked_subject
                             .as_ref()
                             .map(|blocked| blocked.model_response_digest.as_str())
+                    })
+                    .or_else(|| {
+                        self.request
+                            .admission_repair
+                            .as_ref()
+                            .map(|repair| repair.source_digest.as_str())
                     })
             || now_ms < self.issued_at_unix_ms
             || now_ms >= self.expires_at_unix_ms
@@ -552,6 +755,7 @@ mod tests {
             }),
             sealed_unknown_proof_digest: Some("f".repeat(64)),
             blocked_subject: None,
+            admission_repair: None,
             prior_review_history_digest: "1".repeat(64),
             repair_digest: "2".repeat(64),
             release: AdaptiveRecoveryReleaseV1 {
@@ -836,6 +1040,72 @@ mod tests {
         let mut changed = original;
         changed.gateway_binary_digest = "not-attested".into();
         assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn admission_repair_request_is_disjoint_and_preserves_absent_legacy_wire_field() {
+        let legacy = request();
+        let value = serde_json::to_value(&legacy).unwrap();
+        assert!(value.get("admission_repair").is_none());
+        assert_eq!(
+            serde_json::from_value::<AdaptiveLeadershipRecoveryRequestV1>(value).unwrap(),
+            legacy
+        );
+        let mut repair = legacy.clone();
+        repair.schema_version = 3;
+        repair.unknown_effect = None;
+        repair.sealed_unknown_proof_digest = None;
+        repair.admission_repair = Some(AdaptiveLeadershipAdmissionRepairV1 {
+            schema_version: 1,
+            source_digest: "a".repeat(64),
+            disposition_digest: "b".repeat(64),
+            failed_release: legacy.release.clone(),
+        });
+        repair.release.source_git_sha = "c".repeat(40);
+        repair.validate(&operator(), 1_000).unwrap();
+        for schema in [1, 2] {
+            let mut invalid = repair.clone();
+            invalid.schema_version = schema;
+            assert!(invalid.validate(&operator(), 1_000).is_err());
+        }
+        let mut invalid = repair.clone();
+        invalid.admission_repair = None;
+        assert!(invalid.validate(&operator(), 1_000).is_err());
+        invalid = repair.clone();
+        invalid.unknown_effect = legacy.unknown_effect;
+        assert!(invalid.validate(&operator(), 1_000).is_err());
+        invalid = repair.clone();
+        invalid.release = repair.admission_repair.unwrap().failed_release;
+        assert!(invalid.validate(&operator(), 1_000).is_err());
+    }
+
+    #[test]
+    fn admission_repair_key_and_binding_cannot_reuse_legacy_or_foreign_session_slot() {
+        let request = request();
+        let key = adaptive_leadership_admission_repair_key(&request.tenant_id, request.session_id)
+            .unwrap();
+        assert_ne!(
+            key,
+            adaptive_leadership_recovery_epoch_key(&request.tenant_id, request.session_id).unwrap()
+        );
+        let binding = AdaptiveLeadershipRecoveryBindingV1 {
+            schema_version: 2,
+            epoch_key: key,
+            epoch_digest: "a".repeat(64),
+            review_id: Uuid::from_u128(7),
+            max_window_ms: 1_000,
+            max_additional_model_calls: 1,
+        };
+        binding
+            .validate_for(&request.tenant_id, request.session_id, binding.review_id)
+            .unwrap();
+        assert!(binding
+            .validate_for(&request.tenant_id, Uuid::from_u128(8), binding.review_id)
+            .is_err());
+        let mut wrong = binding;
+        wrong.epoch_key =
+            adaptive_leadership_recovery_epoch_key(&request.tenant_id, request.session_id).unwrap();
+        assert!(wrong.validate().is_err());
     }
 
     #[test]

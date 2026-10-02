@@ -83,6 +83,9 @@ var codexCLIContinuationLeadershipSchema []byte
 //go:embed codex_cli_budget_leadership_schema.json
 var codexCLIBudgetLeadershipSchema []byte
 
+//go:embed codex_cli_admission_repair_schema.json
+var codexCLIAdmissionRepairSchema []byte
+
 type codexCLIUsage struct {
 	InputTokens           int64 `json:"input_tokens"`
 	CachedInputTokens     int64 `json:"cached_input_tokens"`
@@ -343,6 +346,8 @@ func (p *CodexCLIProvider) outputSchemaPath(req *LLMRequest) (string, error) {
 			selected = codexCLIContinuationLeadershipSchema
 		case "budget_window_exhausted":
 			selected = codexCLIBudgetLeadershipSchema
+		case "admission_repair":
+			selected = codexCLIAdmissionRepairSchema
 		}
 	} else if hasLeadershipReviewMetadata(req.Metadata) {
 		return "", fmt.Errorf("codex-cli mixed leadership output subject")

@@ -1,5 +1,13 @@
 # Changelog
 
+- Add an explicit, permanently consumed admission-repair review entitlement for
+  an original employee session after both normal review issuances are exhausted.
+  Require the complete retained mixed-effect history, exact failed-admission
+  disposition and a protected purpose-specific proof of the serving repair.
+  Keep legacy recovery keys, ordinary review spending, root call ceilings and
+  recorded effects unchanged; only a genuine model decision may authorize a
+  subsequent bounded continuation (#856).
+
 - Bound the Gateway's local workflow admission wait independently of provider
   execution, retain caller cancellation and fail-closed no-retry behavior, and
   report dispatch validation latency. Skip only impossible registered-role
