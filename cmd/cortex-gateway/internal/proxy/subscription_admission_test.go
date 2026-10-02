@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/forwardqueue"
@@ -37,6 +38,230 @@ func subscriptionTestRequest() *LLMRequest {
 			"reservation_id": "subscription-test", "subscription_allowance_id": "subscription-test",
 			"reserved_provider": CodexCLIProviderName, "company_execution_schema": "1",
 			"subscription_catalog_digest": strings.Repeat("c", 64), "company_execution_context_digest": strings.Repeat("b", 64)},
+	}
+}
+
+type subscriptionTestRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f subscriptionTestRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+type subscriptionAdmissionRecordingProvider struct {
+	subscriptionTestProvider
+	deadline time.Time
+	timeout  time.Duration
+}
+
+func (p *subscriptionAdmissionRecordingProvider) Send(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+	// Count entry even with a cancelled context, so fail-closed tests detect any provider call.
+	p.calls.Add(1)
+	p.deadline, _ = ctx.Deadline()
+	p.timeout = req.ProviderTimeout
+	return &LLMResponse{Content: "result", Model: req.Model}, ctx.Err()
+}
+
+func subscriptionDelayedTestBody(ctx context.Context, delay time.Duration, body []byte) io.ReadCloser {
+	reader, writer := io.Pipe()
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			_ = writer.CloseWithError(ctx.Err())
+		case <-timer.C:
+			_, _ = writer.Write(body)
+			_ = writer.Close()
+		}
+	}()
+	return reader
+}
+
+func TestSubscriptionAdmissionTimeoutPolicy(t *testing.T) {
+	if subscriptionAdmissionTimeout != 30*time.Second {
+		t.Fatalf("admission timeout=%v, want 30s", subscriptionAdmissionTimeout)
+	}
+	for _, salesAutonomy := range []bool{false, true} {
+		admission, err := NewSubscriptionAdmissionWithSalesAutonomy("subscription-test", strings.Repeat("c", 64), "http://127.0.0.1:1", "credential", salesAutonomy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if admission.client.Timeout != subscriptionAdmissionTimeout {
+			t.Fatalf("client timeout=%v, want %v", admission.client.Timeout, subscriptionAdmissionTimeout)
+		}
+	}
+}
+
+func TestSubscriptionAdmissionTimeoutAndCallerCancellationNeverCallProvider(t *testing.T) {
+	for _, stage := range []string{"headers", "receipt-body"} {
+		for _, mode := range []string{"admission-timeout", "shorter-caller-deadline", "caller-cancelled"} {
+			t.Run(stage+"/"+mode, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					admission, err := NewSubscriptionAdmission("subscription-test", strings.Repeat("c", 64), "http://127.0.0.1:1", "credential")
+					if err != nil {
+						t.Fatal(err)
+					}
+					provider := &subscriptionAdmissionRecordingProvider{}
+					queue := forwardqueue.NewManager(1)
+					var callbacks atomic.Int32
+					admission.client.Transport = subscriptionTestRoundTripper(func(r *http.Request) (*http.Response, error) {
+						callbacks.Add(1)
+						if queue.Stats().Active != 1 || provider.calls.Load() != 0 {
+							t.Fatal("claim must follow queue lease and precede provider I/O")
+						}
+						if stage == "headers" {
+							<-r.Context().Done()
+							return nil, r.Context().Err()
+						}
+						if mode == "admission-timeout" {
+							// Reading the body must not restart the admission budget.
+							time.Sleep(6 * time.Second)
+						}
+						return &http.Response{StatusCode: http.StatusOK, Body: subscriptionDelayedTestBody(r.Context(), time.Hour, nil)}, nil
+					})
+					ctx := context.Background()
+					wantElapsed := 30 * time.Second
+					var wantCallerErr error
+					switch mode {
+					case "shorter-caller-deadline":
+						var cancel context.CancelFunc
+						wantElapsed = 7 * time.Second
+						ctx, cancel = context.WithTimeout(ctx, wantElapsed)
+						defer cancel()
+						wantCallerErr = context.DeadlineExceeded
+					case "caller-cancelled":
+						var cancel context.CancelFunc
+						ctx, cancel = context.WithCancel(ctx)
+						defer cancel()
+						wantElapsed = 3 * time.Second
+						stop := time.AfterFunc(wantElapsed, cancel)
+						defer stop.Stop()
+						wantCallerErr = context.Canceled
+					}
+					started := time.Now()
+					_, err = NewSubscriptionQueuedProvider(provider, queue, admission).Send(ctx, leadershipReviewTestRequest())
+					var admissionErr *ProviderAdmissionError
+					if !errors.As(err, &admissionErr) || time.Since(started) != wantElapsed || ctx.Err() != wantCallerErr {
+						t.Fatalf("error=%v elapsed=%v caller=%v, want admission failure after %v with caller=%v", err, time.Since(started), ctx.Err(), wantElapsed, wantCallerErr)
+					}
+					if callbacks.Load() != 1 || provider.calls.Load() != 0 || queue.Stats().Active != 0 {
+						t.Fatalf("authority calls=%d provider calls=%d queue=%+v", callbacks.Load(), provider.calls.Load(), queue.Stats())
+					}
+				})
+			})
+		}
+	}
+}
+
+func TestSubscriptionAdmissionDelayedValidClaimPreservesDispatchBudgets(t *testing.T) {
+	for _, mode := range []string{"overall-cap", "authority-deadline", "caller-deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				admission, err := NewSubscriptionAdmission("subscription-test", strings.Repeat("c", 64), "http://127.0.0.1:1", "credential")
+				if err != nil {
+					t.Fatal(err)
+				}
+				started := time.Now()
+				deadline := started.Add(time.Hour)
+				wantDeadline := started.Add(maxModelWorkDuration)
+				ctx := context.Background()
+				req := leadershipReviewTestRequest()
+				req.ProviderTimeout = time.Hour
+				wantTimeout := maxModelWorkDuration
+				switch mode {
+				case "authority-deadline":
+					deadline = started.Add(45 * time.Second)
+					wantDeadline = deadline
+					req.ProviderTimeout = 9 * time.Second
+					wantTimeout = req.ProviderTimeout
+				case "caller-deadline":
+					var cancel context.CancelFunc
+					wantDeadline = started.Add(20 * time.Second)
+					ctx, cancel = context.WithDeadline(ctx, wantDeadline)
+					defer cancel()
+				}
+				provider := &subscriptionAdmissionRecordingProvider{}
+				queue := forwardqueue.NewManager(1)
+				var callbacks atomic.Int32
+				admission.client.Transport = subscriptionTestRoundTripper(func(r *http.Request) (*http.Response, error) {
+					callbacks.Add(1)
+					checkLeadershipAuthorityTransport(t, r)
+					if queue.Stats().Active != 1 || provider.calls.Load() != 0 {
+						t.Fatal("claim must follow queue lease and precede provider I/O")
+					}
+					var claim subscriptionDispatch
+					if err := json.NewDecoder(r.Body).Decode(&claim); err != nil {
+						t.Fatal(err)
+					}
+					// Both phases exceed the old five-second limit, without wall-clock waits.
+					time.Sleep(6 * time.Second)
+					body, err := json.Marshal(subscriptionDispatchReceipt{SchemaVersion: claim.SchemaVersion,
+						AllowanceID: claim.AllowanceID, RequestID: claim.RequestID, RequestDigest: claim.RequestDigest, DeadlineUnixMS: deadline.UnixMilli()})
+					if err != nil {
+						t.Fatal(err)
+					}
+					return &http.Response{StatusCode: http.StatusOK, Body: subscriptionDelayedTestBody(r.Context(), 6*time.Second, body)}, nil
+				})
+				_, err = NewSubscriptionQueuedProvider(provider, queue, admission).Send(ctx, req)
+				if err != nil || time.Since(started) != 12*time.Second {
+					t.Fatalf("delayed claim error=%v elapsed=%v", err, time.Since(started))
+				}
+				if !provider.deadline.Equal(wantDeadline) || provider.timeout != wantTimeout {
+					t.Fatalf("dispatch deadline=%v timeout=%v, want deadline=%v timeout=%v", provider.deadline, provider.timeout, wantDeadline, wantTimeout)
+				}
+				if callbacks.Load() != 1 || provider.calls.Load() != 1 || queue.Stats().Active != 0 {
+					t.Fatalf("authority calls=%d provider calls=%d queue=%+v", callbacks.Load(), provider.calls.Load(), queue.Stats())
+				}
+			})
+		})
+	}
+}
+
+func TestSubscriptionAdmissionInvalidLateReceiptNeverCallsProvider(t *testing.T) {
+	for _, mode := range []string{"expired", "schema", "allowance", "request", "digest", "duplicate", "case", "unknown", "suffix", "rejected"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				admission, err := NewSubscriptionAdmission("subscription-test", strings.Repeat("c", 64), "http://127.0.0.1:1", "credential")
+				if err != nil {
+					t.Fatal(err)
+				}
+				provider := &subscriptionAdmissionRecordingProvider{}
+				queue := forwardqueue.NewManager(1)
+				var callbacks atomic.Int32
+				admission.client.Transport = subscriptionTestRoundTripper(func(r *http.Request) (*http.Response, error) {
+					callbacks.Add(1)
+					var claim subscriptionDispatch
+					if err := json.NewDecoder(r.Body).Decode(&claim); err != nil {
+						t.Fatal(err)
+					}
+					receipt := subscriptionDispatchReceipt{SchemaVersion: claim.SchemaVersion, AllowanceID: claim.AllowanceID,
+						RequestID: claim.RequestID, RequestDigest: claim.RequestDigest, DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli()}
+					body := leadershipReceiptFixture(mode, receipt)
+					if mode == "expired" {
+						// Valid when issued, expired by the time the delayed body arrives.
+						receipt.DeadlineUnixMS = time.Now().Add(5 * time.Second).UnixMilli()
+						body = leadershipReceiptFixture("approved", receipt)
+					}
+					if mode == "rejected" {
+						time.Sleep(6 * time.Second)
+						return &http.Response{StatusCode: http.StatusForbidden, Body: io.NopCloser(strings.NewReader(""))}, nil
+					}
+					return &http.Response{StatusCode: http.StatusOK, Body: subscriptionDelayedTestBody(r.Context(), 6*time.Second, body)}, nil
+				})
+				started := time.Now()
+				_, err = NewSubscriptionQueuedProvider(provider, queue, admission).Send(context.Background(), leadershipReviewTestRequest())
+				var admissionErr *ProviderAdmissionError
+				if !errors.As(err, &admissionErr) || time.Since(started) != 6*time.Second {
+					t.Fatalf("late receipt error=%v elapsed=%v", err, time.Since(started))
+				}
+				if mode == "expired" && !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("receipt expiring in transit: %v, want dispatch deadline exceeded", err)
+				}
+				if callbacks.Load() != 1 || provider.calls.Load() != 0 || queue.Stats().Active != 0 {
+					t.Fatalf("authority calls=%d provider calls=%d queue=%+v", callbacks.Load(), provider.calls.Load(), queue.Stats())
+				}
+			})
+		})
 	}
 }
 

@@ -1,5 +1,6 @@
 //! Final dispatch consumes workflow authority, never an in-memory call counter.
 use super::*;
+use tracing::info;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,23 +49,34 @@ impl WorkflowApi {
             Ok(request) => request,
             Err(response) => return response,
         };
+        let started = std::time::Instant::now();
         match self.claim_subscription_dispatch(&request) {
-            Ok(deadline) => json(
-                200,
-                &serde_json::json!({
-                    "schema_version": request.schema_version,
-                    "allowance_id": request.allowance_id,
-                    "request_id": request.request_id,
-                    "request_digest": request.request_digest,
-                    "deadline_unix_ms": deadline,
-                }),
-            ),
+            Ok(deadline) => {
+                info!(
+                    request_id = %request.request_id,
+                    agent_id = %request.agent_id,
+                    schema_version = request.schema_version,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "Subscription dispatch accepted before provider I/O"
+                );
+                json(
+                    200,
+                    &serde_json::json!({
+                        "schema_version": request.schema_version,
+                        "allowance_id": request.allowance_id,
+                        "request_id": request.request_id,
+                        "request_digest": request.request_digest,
+                        "deadline_unix_ms": deadline,
+                    }),
+                )
+            }
             Err(reason) => {
                 warn!(
                     allowance_id = %request.allowance_id,
                     request_id = %request.request_id,
                     agent_id = %request.agent_id,
                     schema_version = request.schema_version,
+                    elapsed_ms = started.elapsed().as_millis(),
                     reason,
                     "Subscription dispatch denied before provider I/O"
                 );
@@ -212,7 +224,8 @@ impl WorkflowApi {
         else {
             return Err("leadership subject missing");
         };
-        let call = self.leadership_review_for_dispatch(AgentId(request.agent_id), *review_id)?;
+        let (call, prepared) = self
+            .leadership_review_for_dispatch_with_context(AgentId(request.agent_id), *review_id)?;
         let grant = &call.grant;
         let expected_kind = match &grant.subject {
             None => None,
@@ -236,9 +249,8 @@ impl WorkflowApi {
         {
             return Err("leadership dispatch binding mismatch");
         }
-        let binding = super::adaptive_leadership_review::LeadershipAuthority::from_call(&call);
         let context = super::model_execution::ModelExecutionContext::AdaptiveLeadershipReview(
-            Box::new(self.prepare_leadership_review(&binding)?),
+            Box::new(prepared),
         );
         context.validate_dispatch(now)?;
         if call

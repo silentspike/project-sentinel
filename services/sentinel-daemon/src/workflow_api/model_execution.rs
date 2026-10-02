@@ -2838,6 +2838,22 @@ impl WorkflowApi {
         Ok(())
     }
 
+    // Negative selection hint only. Do not validate authority or health here:
+    // an eligible identity must still reach the durable reads and fresh proof.
+    pub(super) fn has_registered_model_role(
+        &self,
+        agent_id: AgentId,
+        tenant: Option<&TenantId>,
+        roles: &[CompanyRoleV1],
+    ) -> bool {
+        self.principals.by_principal_id.values().any(|bound| {
+            bound.principal.agent_id == Some(agent_id)
+                && bound.principal.kind == CompanyPrincipalKindV1::Agent
+                && tenant.is_none_or(|tenant| bound.principal.tenant_id == *tenant)
+                && roles.contains(&bound.principal.role)
+        })
+    }
+
     pub(crate) fn fresh_request_sales_call(
         &self,
         agent_id: AgentId,
@@ -2848,6 +2864,9 @@ impl WorkflowApi {
         };
         if !self.enabled || !self.model_work_enabled {
             return Err("Sales model execution is disabled");
+        }
+        if !self.has_registered_model_role(agent_id, Some(tenant), &[CompanyRoleV1::Sales]) {
+            return Ok(None);
         }
         for call in self
             .store
@@ -3218,6 +3237,10 @@ impl WorkflowApi {
         let Some(tenant) = self.request_sales_tenant.as_ref() else {
             return Ok(None);
         };
+        if !self.has_registered_model_role(agent_id, Some(tenant), &[CompanyRoleV1::ProjectManager])
+        {
+            return Ok(None);
+        }
         let mut projects = self
             .store
             .company_projects()
@@ -4309,6 +4332,229 @@ impl WorkflowApi {
 #[cfg(test)]
 mod family_selection_tests {
     use super::*;
+
+    #[test]
+    fn model_role_prefilters_skip_impossible_and_foreign_identities_before_store_reads() {
+        for planning in [false, true] {
+            for change in ["missing", "role", "kind", "tenant", "agent"] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("company.sqlite");
+                let (mut api, sales) = super::tests::fixture(&path);
+                if planning {
+                    accepted_context(&api, &sales, "web-project-v1");
+                }
+                let principal_id = if planning { "pm" } else { "sales" };
+                let agent = api
+                    .principals
+                    .principal(principal_id)
+                    .unwrap()
+                    .principal
+                    .agent_id
+                    .unwrap();
+                let mut principals = PrincipalAuthenticator {
+                    by_credential_digest: api.principals.by_credential_digest.clone(),
+                    by_principal_id: api.principals.by_principal_id.clone(),
+                };
+                if change == "missing" {
+                    principals.by_principal_id.remove(principal_id);
+                } else {
+                    let principal = &mut principals
+                        .by_principal_id
+                        .get_mut(principal_id)
+                        .unwrap()
+                        .principal;
+                    match change {
+                        "role" => principal.role = CompanyRoleV1::TechnicalLead,
+                        "kind" => principal.kind = CompanyPrincipalKindV1::Operator,
+                        "tenant" => {
+                            principal.tenant_id = TenantId::parse("tenant-foreign").unwrap();
+                        }
+                        "agent" => principal.agent_id = Some(AgentId(99)),
+                        _ => unreachable!(),
+                    }
+                }
+                api.principals = Arc::new(principals);
+                let kind = if planning {
+                    "project"
+                } else {
+                    "request_provider_call"
+                };
+                assert!(sentinel_limbo::rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "UPDATE company_entities SET payload_digest='invalid' WHERE entity_kind=?1",
+                        [kind],
+                    )
+                    .unwrap() > 0);
+                if planning {
+                    assert!(api.store.company_projects().is_err());
+                    assert_eq!(
+                        api.project_planning_call(agent, now_unix_ms()),
+                        Ok(None),
+                        "{change}"
+                    );
+                } else {
+                    assert!(api
+                        .store
+                        .request_provider_calls(api.request_sales_tenant.as_ref().unwrap())
+                        .is_err());
+                    assert_eq!(
+                        api.fresh_request_sales_call(agent, now_unix_ms()),
+                        Ok(None),
+                        "{change}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn model_role_prefilters_keep_multiple_identity_positives_and_eligible_store_errors() {
+        for planning in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("company.sqlite");
+            let (mut api, sales) = super::tests::fixture(&path);
+            let plan = planning.then(|| accepted_context(&api, &sales, "web-project-v1"));
+            let principal_id = if planning { "pm" } else { "sales" };
+            let original = api.principals.principal(principal_id).unwrap().principal;
+            let agent = original.agent_id.unwrap();
+            let aliases = PrincipalAuthenticator::new(
+                [
+                    (
+                        "other-role",
+                        original.tenant_id.clone(),
+                        CompanyRoleV1::Developer,
+                    ),
+                    ("same-role", original.tenant_id.clone(), original.role),
+                    (
+                        "foreign-role",
+                        TenantId::parse("tenant-foreign").unwrap(),
+                        original.role,
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, tenant_id, role)| {
+                    (
+                        format!("selection-credential-{id}-{}", "x".repeat(32)),
+                        PrincipalBinding {
+                            credential_name: id.into(),
+                            tenant_id,
+                            principal_id: id.into(),
+                            kind: CompanyPrincipalKindV1::Agent,
+                            role,
+                            customer_id: None,
+                            agent_id: Some(agent),
+                            authority_generation: 1,
+                        },
+                    )
+                })
+                .collect(),
+            )
+            .unwrap();
+            let mut principals = PrincipalAuthenticator {
+                by_credential_digest: api.principals.by_credential_digest.clone(),
+                by_principal_id: api.principals.by_principal_id.clone(),
+            };
+            principals
+                .by_credential_digest
+                .extend(aliases.by_credential_digest);
+            principals.by_principal_id.extend(aliases.by_principal_id);
+            api.principals = Arc::new(principals);
+            Arc::make_mut(api.authority.as_mut().unwrap()).principals = Arc::clone(&api.principals);
+            if let Some(plan) = plan {
+                let expected = api
+                    .store
+                    .project_planning_call(&original.tenant_id, &plan.binding.grant.project_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    api.project_planning_call(agent, now_unix_ms()),
+                    Ok(Some(expected.clone()))
+                );
+                assert_eq!(api.prepare_project_planning(&plan.binding), Ok(plan));
+                // Planning selection has no mode guard; preserve that behavior.
+                api.enabled = false;
+                api.model_work_enabled = false;
+                assert_eq!(
+                    api.project_planning_call(agent, now_unix_ms()),
+                    Ok(Some(expected))
+                );
+            } else {
+                let expected = api.request_sales_call().unwrap().unwrap();
+                assert_eq!(
+                    api.fresh_request_sales_call(agent, now_unix_ms()),
+                    Ok(Some(expected.clone()))
+                );
+                assert_eq!(api.prepare_request_sales(&sales.binding), Ok(sales.clone()));
+                api.subscription_allowance_id = None;
+                assert_eq!(api.fresh_request_sales_call(agent, now_unix_ms()), Ok(None));
+                api.request_sales_autonomous_enabled = true;
+                assert_eq!(
+                    api.fresh_request_sales_call(agent, now_unix_ms()),
+                    Ok(Some(expected))
+                );
+            }
+            // An eligible but malformed identity must not become a negative hint.
+            let mut principals = PrincipalAuthenticator {
+                by_credential_digest: api.principals.by_credential_digest.clone(),
+                by_principal_id: api.principals.by_principal_id.clone(),
+            };
+            principals
+                .by_principal_id
+                .retain(|id, _| id == principal_id);
+            principals
+                .by_principal_id
+                .get_mut(principal_id)
+                .unwrap()
+                .principal
+                .authority_generation = 0;
+            api.principals = Arc::new(principals);
+            let kind = if planning {
+                "project"
+            } else {
+                "request_provider_call"
+            };
+            assert!(
+                sentinel_limbo::rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "UPDATE company_entities SET payload_digest='invalid' WHERE entity_kind=?1",
+                        [kind],
+                    )
+                    .unwrap()
+                    > 0
+            );
+            if planning {
+                assert_eq!(
+                    api.project_planning_call(agent, now_unix_ms()),
+                    Err("project planning store unavailable")
+                );
+            } else {
+                assert_eq!(
+                    api.fresh_request_sales_call(agent, now_unix_ms()),
+                    Err("Sales allowance store unavailable")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sales_role_prefilter_preserves_disabled_and_missing_tenant_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut api, _) = super::tests::fixture(&temp.path().join("company.sqlite"));
+        let agent = AgentId(99);
+        for (enabled, model_work_enabled) in [(false, true), (true, false)] {
+            api.enabled = enabled;
+            api.model_work_enabled = model_work_enabled;
+            assert_eq!(
+                api.fresh_request_sales_call(agent, now_unix_ms()),
+                Err("Sales model execution is disabled")
+            );
+        }
+        api.request_sales_tenant = None;
+        assert_eq!(api.fresh_request_sales_call(agent, now_unix_ms()), Ok(None));
+        assert_eq!(api.project_planning_call(agent, now_unix_ms()), Ok(None));
+    }
 
     fn offer(family: Option<&str>) -> SalesAction {
         let mut json = serde_json::json!({

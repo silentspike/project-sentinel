@@ -901,6 +901,13 @@ impl WorkflowApi {
         &self,
         agent: AgentId,
     ) -> Result<Option<AdaptiveLeadershipReviewCallV1>, &'static str> {
+        if !self.has_registered_model_role(
+            agent,
+            None,
+            &[CompanyRoleV1::ProjectManager, CompanyRoleV1::TechnicalLead],
+        ) {
+            return Ok(None);
+        }
         let now = now_unix_ms();
         for project in self
             .store
@@ -939,19 +946,40 @@ impl WorkflowApi {
         Ok(None)
     }
 
+    #[cfg(test)]
     pub(super) fn leadership_review_for_dispatch(
         &self,
         agent: AgentId,
         review_id: Uuid,
     ) -> Result<AdaptiveLeadershipReviewCallV1, &'static str> {
-        let call = self.leadership_review_for_authority(agent, review_id)?;
+        self.leadership_review_for_dispatch_with_context(agent, review_id)
+            .map(|(call, _)| call)
+    }
+
+    pub(super) fn leadership_review_for_dispatch_with_context(
+        &self,
+        agent: AgentId,
+        review_id: Uuid,
+    ) -> Result<(AdaptiveLeadershipReviewCallV1, LeadershipContext), &'static str> {
+        let call = self.exact_registered_leadership_review(agent, review_id)?;
+        let context = self.prepare_leadership_review(&LeadershipAuthority::from_call(&call))?;
         if call.dispatch.is_some() {
             return Err("leadership call is already dispatched");
         }
-        Ok(call)
+        Ok((call, context))
     }
 
     pub(super) fn leadership_review_for_authority(
+        &self,
+        agent: AgentId,
+        review_id: Uuid,
+    ) -> Result<AdaptiveLeadershipReviewCallV1, &'static str> {
+        let call = self.exact_registered_leadership_review(agent, review_id)?;
+        self.prepare_leadership_review(&LeadershipAuthority::from_call(&call))?;
+        Ok(call)
+    }
+
+    fn exact_registered_leadership_review(
         &self,
         agent: AgentId,
         review_id: Uuid,
@@ -1004,7 +1032,6 @@ impl WorkflowApi {
         if call.decision.is_some() || call.retired_at_unix_ms.is_some() {
             return Err("leadership call is not active");
         }
-        self.prepare_leadership_review(&LeadershipAuthority::from_call(&call))?;
         Ok(call)
     }
 
@@ -3461,6 +3488,194 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn leadership_role_prefilter_skips_impossible_agents_but_keeps_eligible_store_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("company.sqlite");
+        let events = temp.path().join("events.sqlite");
+        let (mut api, context) = fixture(&path, &events);
+        assert!(sentinel_limbo::rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE company_entities SET payload_digest='invalid' WHERE entity_kind='project'",
+                [],
+            )
+            .unwrap() > 0);
+        assert!(api.store.company_projects().is_err());
+        let before = discovery_state(&path, &events);
+        for agent in [
+            AgentId(99),
+            AgentId(3),
+            context.binding.grant.assignee_authority.agent_id,
+        ] {
+            assert_eq!(api.leadership_review_for_agent(agent), Ok(None));
+        }
+        for id in ["pm", "technical-lead"] {
+            let agent = api
+                .principals
+                .principal(id)
+                .unwrap()
+                .principal
+                .agent_id
+                .unwrap();
+            assert_eq!(
+                api.leadership_review_for_agent(agent),
+                Err("leadership projects unavailable")
+            );
+        }
+        let agent = context.binding.grant.leadership_principal.agent_id.unwrap();
+        let registered = Arc::clone(&api.principals);
+        for change in ["missing", "role", "kind", "agent", "generation"] {
+            let mut principals = PrincipalAuthenticator {
+                by_credential_digest: registered.by_credential_digest.clone(),
+                by_principal_id: registered.by_principal_id.clone(),
+            };
+            if change == "missing" {
+                principals.by_principal_id.remove("pm");
+            } else {
+                let principal = &mut principals.by_principal_id.get_mut("pm").unwrap().principal;
+                match change {
+                    "role" => principal.role = CompanyRoleV1::Developer,
+                    "kind" => principal.kind = CompanyPrincipalKindV1::Operator,
+                    "agent" => principal.agent_id = None,
+                    "generation" => principal.authority_generation = 0,
+                    _ => unreachable!(),
+                }
+            }
+            api.principals = Arc::new(principals);
+            let expected = if change == "generation" {
+                Err("leadership projects unavailable")
+            } else {
+                Ok(None)
+            };
+            assert_eq!(api.leadership_review_for_agent(agent), expected, "{change}");
+        }
+        assert_eq!(discovery_state(&path, &events), before);
+    }
+
+    #[test]
+    fn leadership_dispatch_context_keeps_exact_identity_across_roles_and_tenants() {
+        for technical_lead in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("company.sqlite");
+            let events = temp.path().join("events.sqlite");
+            let (mut api, session) =
+                super::super::adaptive_recovery::tests::fixture(&path, &events, true);
+            let mut project = api
+                .store
+                .company_project(
+                    &session.grant.authority.tenant_id,
+                    &session.grant.authority.project_id,
+                )
+                .unwrap()
+                .unwrap();
+            if technical_lead {
+                let mut participant = project
+                    .governance
+                    .participants
+                    .iter()
+                    .find(|participant| participant.role == CompanyRoleV1::ProjectManager)
+                    .unwrap()
+                    .clone();
+                participant.agent_id = AgentId(7);
+                participant.principal_id = "technical-lead".into();
+                participant.role = CompanyRoleV1::TechnicalLead;
+                project.governance.participants.push(participant);
+                persist_discovery_project(&path, &project);
+                stop_review_agent(&api, AgentId(5), true);
+            }
+            seed_planning_receipt(&api, &path, &project);
+            assert!(reconcile_review_at(&api, &project, now_unix_ms()));
+            let id = if technical_lead {
+                "technical-lead"
+            } else {
+                "pm"
+            };
+            let leader = api.principals.principal(id).unwrap().principal;
+            let agent = leader.agent_id.unwrap();
+            let call = api.leadership_review_for_agent(agent).unwrap().unwrap();
+            assert_eq!(call.grant.leadership_principal, leader);
+            let expected_context = api
+                .prepare_leadership_review(&LeadershipAuthority::from_call(&call))
+                .unwrap();
+            let aliases = PrincipalAuthenticator::new(
+                [
+                    (
+                        "other-role",
+                        leader.tenant_id.clone(),
+                        CompanyRoleV1::Developer,
+                    ),
+                    ("same-role", leader.tenant_id.clone(), leader.role),
+                    (
+                        "foreign-role",
+                        TenantId::parse("tenant-foreign").unwrap(),
+                        leader.role,
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, tenant_id, role)| {
+                    (
+                        format!("leadership-credential-{id}-{}", "x".repeat(32)),
+                        PrincipalBinding {
+                            credential_name: id.into(),
+                            tenant_id,
+                            principal_id: id.into(),
+                            kind: CompanyPrincipalKindV1::Agent,
+                            role,
+                            customer_id: None,
+                            agent_id: Some(agent),
+                            authority_generation: 1,
+                        },
+                    )
+                })
+                .collect(),
+            )
+            .unwrap();
+            let mut principals = PrincipalAuthenticator {
+                by_credential_digest: api.principals.by_credential_digest.clone(),
+                by_principal_id: api.principals.by_principal_id.clone(),
+            };
+            principals
+                .by_credential_digest
+                .extend(aliases.by_credential_digest);
+            principals.by_principal_id.extend(aliases.by_principal_id);
+            api.principals = Arc::new(principals);
+            Arc::make_mut(api.authority.as_mut().unwrap()).principals = Arc::clone(&api.principals);
+            // Leadership tenants are not restricted by the configured Sales tenant.
+            api.request_sales_tenant = Some(TenantId::parse("tenant-foreign").unwrap());
+            let before = discovery_state(&path, &events);
+            assert_eq!(
+                api.leadership_review_for_agent(agent),
+                Ok(Some(call.clone()))
+            );
+            assert_eq!(
+                api.leadership_review_for_dispatch_with_context(agent, call.grant.review_id),
+                Ok((call.clone(), expected_context)),
+            );
+            assert_eq!(
+                api.leadership_review_for_authority(agent, call.grant.review_id),
+                Ok(call.clone()),
+            );
+            // Another eligible identity cannot replace the exact registered leader.
+            let mut principals = PrincipalAuthenticator {
+                by_credential_digest: api.principals.by_credential_digest.clone(),
+                by_principal_id: api.principals.by_principal_id.clone(),
+            };
+            principals
+                .by_principal_id
+                .get_mut(id)
+                .unwrap()
+                .principal
+                .authority_generation += 1;
+            api.principals = Arc::new(principals);
+            assert_eq!(
+                api.leadership_review_for_dispatch_with_context(agent, call.grant.review_id),
+                Err("leadership principal changed"),
+            );
+            assert_eq!(discovery_state(&path, &events), before);
+        }
+    }
+
+    #[test]
     fn leadership_dispatch_exact_review_survives_scheduling_queue_change() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("company.sqlite");
@@ -3546,6 +3761,13 @@ pub(crate) mod tests {
                 api.leadership_review_for_dispatch(agent, call.grant.review_id),
                 Ok(call.clone())
             );
+            let (selected, context) = api
+                .leadership_review_for_dispatch_with_context(agent, call.grant.review_id)
+                .unwrap();
+            assert_eq!(selected, *call);
+            assert_eq!(context.binding, LeadershipAuthority::from_call(call));
+            assert_eq!(context.source, call.context);
+            assert_eq!(context.context_digest, call.context_digest().unwrap());
             assert_eq!(api.validate_provider_usage_authority(&expected), Ok(true));
         }
         assert_eq!(discovery_state(&path, &events), before);
@@ -3653,6 +3875,11 @@ pub(crate) mod tests {
             let before = discovery_state(&path, &events);
             assert!(
                 api.leadership_review_for_dispatch(agent, review_id)
+                    .is_err(),
+                "{change}"
+            );
+            assert!(
+                api.leadership_review_for_dispatch_with_context(agent, review_id)
                     .is_err(),
                 "{change}"
             );
@@ -3769,6 +3996,11 @@ pub(crate) mod tests {
             let before = discovery_state(&path, &events);
             assert!(
                 api.leadership_review_for_dispatch(agent, review_id)
+                    .is_err(),
+                "{state}"
+            );
+            assert!(
+                api.leadership_review_for_dispatch_with_context(agent, review_id)
                     .is_err(),
                 "{state}"
             );
