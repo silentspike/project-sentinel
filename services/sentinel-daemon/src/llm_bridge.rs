@@ -2847,6 +2847,20 @@ pub mod bridge {
             {
                 Ok(Some("budget_window_exhausted"))
             }
+            Some(4)
+                if grant
+                    .get("subject")
+                    .and_then(|subject| subject.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("budget_window_exhausted")
+                    && grant
+                        .get("recovery_epoch")
+                        .and_then(|binding| binding.get("schema_version"))
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(2) =>
+            {
+                Ok(Some("admission_repair"))
+            }
             _ => Err("unsupported leadership review grant schema"),
         }
     }
@@ -3602,6 +3616,12 @@ pub mod bridge {
                     "subject":{"kind":"budget_window_exhausted"}})),
                 Ok(Some("budget_window_exhausted"))
             );
+            assert_eq!(
+                leadership_review_kind(&serde_json::json!({"schema_version":4,
+                    "subject":{"kind":"budget_window_exhausted"},
+                    "recovery_epoch":{"schema_version":2}})),
+                Ok(Some("admission_repair"))
+            );
             for grant in [
                 serde_json::json!({"schema_version": 2}),
                 serde_json::json!({"schema_version": 2, "subject": null}),
@@ -3609,6 +3629,9 @@ pub mod bridge {
                 serde_json::json!({"schema_version": 1, "subject": {"kind": "unknown_model"}}),
                 serde_json::json!({"schema_version": 3, "subject": {"kind": "unknown_model"}}),
                 serde_json::json!({"schema_version": 2, "subject": {"kind": "budget_window_exhausted"}}),
+                serde_json::json!({"schema_version": 4, "subject": {"kind": "budget_window_exhausted"}}),
+                serde_json::json!({"schema_version": 4, "subject": {"kind": "budget_window_exhausted"}, "recovery_epoch": {"schema_version": 1}}),
+                serde_json::json!({"schema_version": 4, "subject": {"kind": "unknown_model"}, "recovery_epoch": {"schema_version": 2}}),
             ] {
                 assert!(leadership_review_kind(&grant).is_err());
             }

@@ -415,7 +415,7 @@ impl WorkflowApi {
                 } else {
                     blocked = true;
                     if !committed_head
-                        && matches!(call.grant.schema_version, 2 | 3)
+                        && matches!(call.grant.schema_version, 2 | 3 | 4)
                         && call.dispatch.is_some()
                         && clock() >= call.grant.expires_at_unix_ms
                     {
@@ -832,7 +832,7 @@ impl WorkflowApi {
         call: &AdaptiveLeadershipReviewCallV1,
         clock: &impl Fn() -> u64,
     ) -> Result<(), &'static str> {
-        if !matches!(call.grant.schema_version, 2 | 3)
+        if !matches!(call.grant.schema_version, 2 | 3 | 4)
             || call.grant.subject.is_none()
             || call.decision.is_some()
             || call.retired_at_unix_ms.is_some()
