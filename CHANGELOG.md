@@ -586,6 +586,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Keep room-detail dialogs visible in a viewport portal when their Floorplan
+  panel is scrolled; preserve explicit room identity and modal cleanup.
+
 - Keep every desktop workspace navigation control visible without horizontal
   page overflow, including narrow desktop viewports (#856).
 - Preserve minimum working area dimensions in nested desktop splits and keep
