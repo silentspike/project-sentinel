@@ -142,6 +142,17 @@ fn latest_in_connection(
     session: Uuid,
     head: u64,
 ) -> Result<Option<AdaptiveBudgetReviewExtensionReceiptV1>, WorkflowError> {
+    validation_scope::with_scope(connection, || {
+        latest_in_connection_uncached(connection, tenant, session, head)
+    })
+}
+
+fn latest_in_connection_uncached(
+    connection: &Connection,
+    tenant: &TenantId,
+    session: Uuid,
+    head: u64,
+) -> Result<Option<AdaptiveBudgetReviewExtensionReceiptV1>, WorkflowError> {
     if let Some(successor) = get_entity(
         connection,
         tenant,
@@ -265,6 +276,16 @@ fn limit_call(limit: &AdaptiveBudgetWindowLimitReceiptV1) -> AdaptiveLeadershipR
 }
 
 fn require_issuance_source(
+    connection: &Connection,
+    limit: &AdaptiveBudgetWindowLimitReceiptV1,
+    now: u64,
+) -> Result<Vec<AdaptiveLeadershipReviewCallV1>, WorkflowError> {
+    validation_scope::with_scope(connection, || {
+        require_issuance_source_uncached(connection, limit, now)
+    })
+}
+
+fn require_issuance_source_uncached(
     connection: &Connection,
     limit: &AdaptiveBudgetWindowLimitReceiptV1,
     now: u64,
@@ -444,6 +465,18 @@ pub(super) fn limits_in_connection(
     head: u64,
     now: u64,
 ) -> Result<(usize, usize, Option<u64>), WorkflowError> {
+    validation_scope::with_scope(connection, || {
+        limits_in_connection_uncached(connection, tenant, session_id, head, now)
+    })
+}
+
+fn limits_in_connection_uncached(
+    connection: &Connection,
+    tenant: &TenantId,
+    session_id: Uuid,
+    head: u64,
+    now: u64,
+) -> Result<(usize, usize, Option<u64>), WorkflowError> {
     let baseline = (
         ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
         ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
@@ -476,6 +509,17 @@ pub(super) fn limits_in_connection(
 }
 
 pub(super) fn limits_for_review(
+    connection: &Connection,
+    grant: &AdaptiveLeadershipReviewGrantV1,
+    context: &AdaptiveLeadershipReviewContextV1,
+    now: u64,
+) -> Result<(usize, usize, Option<u64>), WorkflowError> {
+    validation_scope::with_scope(connection, || {
+        limits_for_review_uncached(connection, grant, context, now)
+    })
+}
+
+fn limits_for_review_uncached(
     connection: &Connection,
     grant: &AdaptiveLeadershipReviewGrantV1,
     context: &AdaptiveLeadershipReviewContextV1,
@@ -570,6 +614,7 @@ impl WorkflowStore {
             return Err(invalid("invalid extension session"));
         }
         let connection = self.connection.lock().map_err(|_| persistence())?;
+        let scope = validation_scope::enter(&connection)?;
         let (source, _) =
             crate::store::adaptive::load(&connection, session_id)?.ok_or_else(not_found)?;
         if source.grant.authority.tenant_id != operator.tenant_id
@@ -634,6 +679,7 @@ impl WorkflowStore {
         if successor {
             require_parent(&connection, &request, &calls, now)?;
         }
+        scope.finish()?;
         Ok(request)
     }
 
@@ -657,6 +703,7 @@ impl WorkflowStore {
         let key = request_key(request)?;
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let scope = validation_scope::enter(&transaction)?;
         if let Some(prior) = get_entity::<AdaptiveBudgetReviewExtensionReceiptV1>(
             &transaction,
             &request.tenant_id,
@@ -666,6 +713,7 @@ impl WorkflowStore {
             if prior.request != *request || prior.issuer_principal != *operator {
                 return Err(conflict());
             }
+            scope.finish()?;
             return Ok((true, prior));
         }
         request.validate(now)?;
@@ -722,6 +770,7 @@ impl WorkflowStore {
             &receipt,
             now,
         )?;
+        scope.finish()?;
         transaction.commit()?;
         Ok((false, receipt))
     }

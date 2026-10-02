@@ -1,7 +1,7 @@
-import { createSignal, createEffect, onMount, For, Show, type JSX } from "solid-js";
+import { createSignal, createEffect, onMount, onCleanup, For, Show, type JSX } from "solid-js";
 import "./styles/tokens.css";
 import { connectTransport } from "./stores/console";
-import { authStatus, login as doLogin } from "./auth";
+import { authStatus, login as doLogin, type AuthOutcomeBinding, type LoginResult } from "./auth";
 import {
   ToastContainer,
 } from "./components/controls";
@@ -57,14 +57,13 @@ const PANEL_LABEL: Record<PanelKind, string> = {
   "agent-deep": "Agent Deep View",
 };
 
-function Login(props: { onOk: () => void }): JSX.Element {
+function Login(props: { authenticate: (key: string) => Promise<LoginResult | null> }): JSX.Element {
   const [key, setKey] = createSignal("");
   // #474: distinguish wrong key ("invalid") from rate-limit ("rate-limited") for the operator.
   const [err, setErr] = createSignal<"" | "invalid" | "rate-limited">("");
   const submit = async () => {
-    const res = await doLogin(key());
-    if (res === "ok") props.onOk();
-    else setErr(res);
+    const res = await props.authenticate(key());
+    if (res !== null && res !== "ok") setErr(res);
   };
   return (
     <div data-testid="login" style={{ display: "grid", "place-items": "center", height: "100%" }}>
@@ -128,13 +127,27 @@ function renderPanel(panel: PanelKind, leafId: string): JSX.Element {
 
 export default function App(): JSX.Element {
   const [authed, setAuthed] = createSignal(false);
+  const auth: AuthOutcomeBinding = { generation: 0, authenticated: false };
   const isMobile = useIsMobile();
   const [tab, setTab] = createSignal<PanelKind>("agents");
   const [deliveryOpen, setDeliveryOpen] = createSignal(false);
 
   onMount(async () => {
-    setAuthed(await authStatus());
+    const generation = auth.generation;
+    const authenticated = await authStatus(auth);
+    if (auth.generation === generation) setAuthed(authenticated);
   });
+  onCleanup(() => {
+    ++auth.generation;
+    auth.authenticated = false;
+  });
+  const authenticate = async (key: string): Promise<LoginResult | null> => {
+    const generation = auth.generation + 1;
+    const outcome = await doLogin(key, auth);
+    if (auth.generation !== generation) return null;
+    if (outcome === "ok" && auth.authenticated) setAuthed(true);
+    return outcome;
+  };
   // WT erst nach Auth verbinden — der Connect holt ein Ticket von /api/wt-ticket (require_auth);
   // URL = same-origin (window.location.origin). Browser senden bei WT keine Cookies -> Ticket-Auth.
   createEffect(() => {
@@ -142,7 +155,7 @@ export default function App(): JSX.Element {
   });
 
   return (
-    <Show when={authed()} fallback={<Login onOk={() => setAuthed(true)} />}>
+    <Show when={authed()} fallback={<Login authenticate={authenticate} />}>
       <div data-testid="shell" style={{ height: "100%", display: "flex", "flex-direction": "column" }}>
         <nav data-testid="product-navigation" style={{ display: "flex", padding: "6px var(--gap)", "border-bottom": "1px solid var(--border)", background: "var(--surface-0)" }}>
           <button data-testid="open-delivery" onClick={() => setDeliveryOpen((open) => !open)}>

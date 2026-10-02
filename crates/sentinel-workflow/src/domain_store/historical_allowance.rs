@@ -54,6 +54,19 @@ pub(super) fn historical_adaptive_provider_project_in_connection(
     root: &AdaptiveSessionGrantV1,
     claimed_at_ms: u64,
 ) -> Result<Option<ProjectV1>, WorkflowError> {
+    validation_scope::memoize(
+        connection,
+        "historical-project",
+        &(root, claimed_at_ms),
+        || historical_adaptive_provider_project_uncached(connection, root, claimed_at_ms),
+    )
+}
+
+fn historical_adaptive_provider_project_uncached(
+    connection: &Connection,
+    root: &AdaptiveSessionGrantV1,
+    claimed_at_ms: u64,
+) -> Result<Option<ProjectV1>, WorkflowError> {
     root.validate()?;
     if claimed_at_ms < root.created_at_ms || claimed_at_ms >= root.deadline_ms {
         return Err(invalid("historical adaptive claim time is invalid"));

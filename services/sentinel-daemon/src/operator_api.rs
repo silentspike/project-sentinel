@@ -21,7 +21,8 @@ use sentinel_redb::{ApiCpSnapshot, StateStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 use sentinel_common::{
@@ -100,6 +101,10 @@ const OPERATOR_SECURITY_AGENT_FS_READ_PATH: &str = "/operator/security/agent-fs-
 /// #428 FS-Read Size-Cap: groessere Dateien werden abgeschnitten (truncated=true).
 const MAX_AGENT_FS_READ_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
+const MAX_IN_FLIGHT_REQUESTS: usize = 16;
+const MAX_IN_FLIGHT_BUSY_RESPONSES: usize = 4;
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const MAX_APICP_SNAPSHOT_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Config-Apply (#425) traegt eine ganze Firma inline (agents[] + building) — eine 60er-Firma
@@ -482,6 +487,8 @@ struct AppState {
     owner_registry: &'static sentinel_common::OwnerRegistry,
     #[cfg(test)]
     before_direct_world_effect: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    before_workflow_health: Option<Arc<dyn Fn() + Send + Sync>>,
     allowed_rooms: Arc<HashSet<String>>,
     shared_secret: Option<String>,
     data_dir: PathBuf,
@@ -662,6 +669,7 @@ enum ApiError {
     UnprocessableEntity(&'static str),
     MethodNotAllowed,
     PayloadTooLarge,
+    RequestTimeout,
     ServiceUnavailable(&'static str),
 }
 
@@ -700,6 +708,12 @@ impl ApiError {
                 413,
                 ErrorResponse {
                     error: "Request zu gross",
+                },
+            ),
+            Self::RequestTimeout => json_response(
+                408,
+                ErrorResponse {
+                    error: "Request read timed out; handler not started",
                 },
             ),
             Self::ServiceUnavailable(msg) => json_response(503, ErrorResponse { error: msg }),
@@ -748,6 +762,8 @@ pub async fn start_server(
         owner_registry: sentinel_common::OwnerRegistry::global(),
         #[cfg(test)]
         before_direct_world_effect: None,
+        #[cfg(test)]
+        before_workflow_health: None,
         allowed_rooms: Arc::new(allowed_rooms.into_iter().collect()),
         shared_secret: config.shared_secret,
         data_dir,
@@ -788,30 +804,101 @@ pub async fn start_server(
     );
 
     Ok(tokio::spawn(async move {
-        if let Err(err) = server_loop(listener, state).await {
+        let admission = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
+        if let Err(err) = server_loop(
+            listener,
+            state,
+            admission,
+            REQUEST_READ_TIMEOUT,
+            RESPONSE_WRITE_TIMEOUT,
+        )
+        .await
+        {
             warn!(error = %err, "Operator-API beendet");
         }
     }))
 }
 
-async fn server_loop(listener: TcpListener, state: AppState) -> AnyResult<()> {
+async fn server_loop(
+    listener: TcpListener,
+    state: AppState,
+    admission: Arc<Semaphore>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> AnyResult<()> {
+    let busy_admission = Arc::new(Semaphore::new(MAX_IN_FLIGHT_BUSY_RESPONSES));
     loop {
         let (stream, addr) = listener.accept().await.context("Operator-API accept")?;
+        let permit = match Arc::clone(&admission).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let _ =
+                    spawn_busy_response(stream, addr, Arc::clone(&busy_admission), write_timeout);
+                continue;
+            }
+        };
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, state).await {
-                debug!(error = %err, remote = %addr, "Operator-API Request fehlgeschlagen");
+            if let Err(err) =
+                handle_connection(stream, state, permit, read_timeout, write_timeout).await
+            {
+                debug!(error = %err, remote = %addr, "Operator-API connection ended");
             }
         });
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, state: AppState) -> AnyResult<()> {
-    let response = match read_http_request(&mut stream).await {
-        Ok(request) => handle_http_request(request, &state),
-        Err(err) => err.to_response(),
+fn spawn_busy_response(
+    mut stream: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+    remote: std::net::SocketAddr,
+    admission: Arc<Semaphore>,
+    write_timeout: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let permit = admission.try_acquire_owned().ok()?;
+    Some(tokio::spawn(async move {
+        let _permit = permit;
+        let response =
+            ApiError::ServiceUnavailable("Operator API busy; request not admitted").to_response();
+        if let Err(err) = write_http_response(&mut stream, response, write_timeout).await {
+            debug!(error = %err, remote = %remote, "Operator-API busy response unavailable");
+        }
+    }))
+}
+
+async fn run_blocking_handler(
+    permit: Arc<OwnedSemaphorePermit>,
+    handler: impl FnOnce() -> HttpResponse + Send + 'static,
+) -> AnyResult<HttpResponse> {
+    tokio::task::spawn_blocking(move || {
+        // A dropped response waiter must not free capacity for a still-running mutation.
+        let _permit = permit;
+        handler()
+    })
+    .await
+    .context("Operator-API handler response unavailable; mutation outcome not asserted")
+}
+
+async fn handle_connection(
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    state: AppState,
+    permit: OwnedSemaphorePermit,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> AnyResult<()> {
+    let permit = Arc::new(permit);
+    let response = match tokio::time::timeout(read_timeout, read_http_request(&mut stream)).await {
+        Ok(Ok(request)) => {
+            run_blocking_handler(Arc::clone(&permit), move || {
+                handle_http_request(request, &state)
+            })
+            .await?
+        }
+        Ok(Err(err)) => err.to_response(),
+        Err(_) => ApiError::RequestTimeout.to_response(),
     };
-    write_http_response(&mut stream, response).await
+    let result = write_http_response(&mut stream, response, write_timeout).await;
+    drop(permit);
+    result
 }
 
 fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
@@ -870,10 +957,23 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                     ApiError::ServiceUnavailable("Platform-State nicht verfuegbar").to_response()
                 }
             },
-            OPERATOR_RUNTIME_HEALTH_PATH => match state.runtime_health.read() {
-                Ok(snapshot) => match serde_json::to_value(snapshot.clone()) {
+            OPERATOR_RUNTIME_HEALTH_PATH => {
+                let snapshot = {
+                    match state.runtime_health.read() {
+                        Ok(snapshot) => snapshot.clone(),
+                        Err(_) => {
+                            return ApiError::ServiceUnavailable("Runtime-Health nicht verfuegbar")
+                                .to_response();
+                        }
+                    }
+                };
+                match serde_json::to_value(snapshot) {
                     Ok(mut payload) => {
                         if let Some(object) = payload.as_object_mut() {
+                            #[cfg(test)]
+                            if let Some(hook) = state.before_workflow_health.as_ref() {
+                                hook();
+                            }
                             object.insert(
                                 "company_workflow".to_owned(),
                                 serde_json::to_value(state.workflow_api.health())
@@ -884,11 +984,8 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                     }
                     Err(_) => ApiError::ServiceUnavailable("Runtime-Health nicht serialisierbar")
                         .to_response(),
-                },
-                Err(_) => {
-                    ApiError::ServiceUnavailable("Runtime-Health nicht verfuegbar").to_response()
                 }
-            },
+            }
             OPERATOR_EPISODE_PROJECTION_PATH => match state.episode_projection_admission.read() {
                 Ok(snapshot) => json_response(200, snapshot.clone()),
                 Err(_) => {
@@ -3702,7 +3799,9 @@ fn is_authorized(headers: &HashMap<String, String>, shared_secret: Option<&str>)
             .is_some_and(|value| value == shared_secret)
 }
 
-async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRequest, ApiError> {
+async fn read_http_request(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> std::result::Result<HttpRequest, ApiError> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 2048];
     let header_end = loop {
@@ -3802,7 +3901,11 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-async fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> AnyResult<()> {
+async fn write_http_response(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    response: HttpResponse,
+    timeout: Duration,
+) -> AnyResult<()> {
     let status_text = match response.status {
         202 => "Accepted",
         400 => "Bad Request",
@@ -3810,6 +3913,7 @@ async fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> 
         404 => "Not Found",
         409 => "Conflict",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         503 => "Service Unavailable",
         _ => "OK",
@@ -3820,15 +3924,19 @@ async fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> 
         status_text,
         response.body.len()
     );
-    stream
-        .write_all(header.as_bytes())
-        .await
-        .context("Operator-API Header schreiben")?;
-    stream
-        .write_all(&response.body)
-        .await
-        .context("Operator-API Body schreiben")?;
-    Ok(())
+    tokio::time::timeout(timeout, async {
+        stream
+            .write_all(header.as_bytes())
+            .await
+            .context("Operator-API Header schreiben")?;
+        stream
+            .write_all(&response.body)
+            .await
+            .context("Operator-API Body schreiben")?;
+        Ok(())
+    })
+    .await
+    .context("Operator-API response write timed out; mutation outcome not asserted")?
 }
 
 fn json_response<T: Serialize>(status: u16, payload: T) -> HttpResponse {
@@ -3881,6 +3989,7 @@ mod tests {
         let state = AppState {
             owner_registry,
             before_direct_world_effect: None,
+            before_workflow_health: None,
             allowed_rooms: Arc::new(
                 ["empfang".to_string(), "flur_eg".to_string()]
                     .into_iter()
@@ -4021,6 +4130,540 @@ mod tests {
             headers: HashMap::new(),
             body: Vec::new(),
         }
+    }
+
+    struct BlockingHandlerRelease(Option<mpsc::Sender<()>>);
+
+    impl BlockingHandlerRelease {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for BlockingHandlerRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn paused_response(
+        response: HttpResponse,
+    ) -> (
+        BlockingHandlerRelease,
+        oneshot::Receiver<()>,
+        impl FnOnce() -> HttpResponse + Send + 'static,
+    ) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handler = move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            response
+        };
+        (
+            BlockingHandlerRelease(Some(release_tx)),
+            entered_rx,
+            handler,
+        )
+    }
+
+    async fn exchange_operator_request(
+        address: std::net::SocketAddr,
+        request: HttpRequest,
+    ) -> HttpResponse {
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let mut header = format!(
+                "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n",
+                request.method,
+                request.path,
+                request.body.len(),
+            );
+            for (name, value) in request.headers {
+                header.push_str(&format!("{name}: {value}\r\n"));
+            }
+            header.push_str("\r\n");
+            let mut wire = header.into_bytes();
+            wire.extend_from_slice(&request.body);
+            stream.write_all(&wire).await.unwrap();
+            read_operator_response(&mut stream).await
+        })
+        .await
+        .expect("operator response must not wait for the paused handler")
+    }
+
+    async fn read_operator_response(
+        stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) -> HttpResponse {
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).await.unwrap();
+            header.push(byte[0]);
+            assert!(header.len() <= MAX_REQUEST_BYTES);
+        }
+        let header = String::from_utf8(header).unwrap();
+        let status = header.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let length = header
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).await.unwrap();
+        HttpResponse { status, body }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_handler_keeps_async_accept_and_timer_responsive() {
+        let (mut state, _commands, _platform, _runtime) = test_state(None);
+        attach_test_fs_layer(&mut state);
+        let (entered_tx, entered) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut release = BlockingHandlerRelease(Some(release_tx));
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let release_rx = std::sync::Mutex::new(release_rx);
+        state.before_direct_world_effect = Some(Arc::new(move || {
+            let entered = entered_tx.lock().unwrap().take();
+            if let Some(entered) = entered {
+                entered.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let admission = Arc::new(Semaphore::new(1));
+        let server = tokio::spawn(server_loop(
+            listener,
+            state,
+            Arc::clone(&admission),
+            REQUEST_READ_TIMEOUT,
+            RESPONSE_WRITE_TIMEOUT,
+        ));
+        let blocked = tokio::spawn(exchange_operator_request(
+            address,
+            test_request(
+                OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,
+                serde_json::json!({
+                    "agent_name": "Test Agent",
+                    "relative_path": "paused-handler.txt",
+                    "content": "bounded handler fixture"
+                }),
+            ),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let timer = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::time::sleep(Duration::from_millis(1)),
+        )
+        .await;
+        let busy =
+            exchange_operator_request(address, test_get_request(OPERATOR_PLATFORM_STATE_PATH))
+                .await;
+        let held_while_paused = admission.available_permits();
+        release.release();
+        let terminal = blocked.await.unwrap();
+        let admitted =
+            exchange_operator_request(address, test_get_request(OPERATOR_PLATFORM_STATE_PATH))
+                .await;
+        server.abort();
+        let _ = server.await;
+
+        assert!(timer.is_ok());
+        assert_eq!(busy.status, 503);
+        assert_eq!(held_while_paused, 0);
+        assert_eq!(terminal.status, 202);
+        assert_eq!(admitted.status, 200);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_operator_admission_rejects_without_effects() {
+        let (state, commands, platform, runtime) = test_state(None);
+        let events = Arc::clone(&state.event_store);
+        let before = events.get_latest_event_id().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let admission = Arc::new(Semaphore::new(2));
+        let server = tokio::spawn(server_loop(
+            listener,
+            state,
+            Arc::clone(&admission),
+            REQUEST_READ_TIMEOUT,
+            RESPONSE_WRITE_TIMEOUT,
+        ));
+        let mut releases = Vec::new();
+        let mut blocked = Vec::new();
+        for _ in 0..2 {
+            let permit = Arc::new(Arc::clone(&admission).try_acquire_owned().unwrap());
+            let (release, entered, handler) = paused_response(json_response(200, true));
+            releases.push(release);
+            blocked.push(tokio::spawn(run_blocking_handler(permit, handler)));
+            tokio::time::timeout(Duration::from_secs(5), entered)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let busy = exchange_operator_request(
+            address,
+            test_request(
+                OPERATOR_CHAOS_PATH,
+                serde_json::json!({
+                    "room_id": "empfang",
+                    "chaos_type": "AirConBroken",
+                    "duration_ticks": 45
+                }),
+            ),
+        )
+        .await;
+        let held_while_paused = admission.available_permits();
+        let commands_empty = matches!(commands.try_recv(), Err(mpsc::TryRecvError::Empty));
+        let platform_empty = matches!(platform.try_recv(), Err(mpsc::TryRecvError::Empty));
+        let runtime_empty = matches!(runtime.try_recv(), Err(mpsc::TryRecvError::Empty));
+        let after = events.get_latest_event_id().unwrap();
+        for release in &mut releases {
+            release.release();
+        }
+        for handler in blocked {
+            assert_eq!(handler.await.unwrap().unwrap().status, 200);
+        }
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(busy.status, 503);
+        let payload: serde_json::Value = serde_json::from_slice(&busy.body).unwrap();
+        assert_eq!(payload["error"], "Operator API busy; request not admitted");
+        assert_eq!(held_while_paused, 0);
+        assert_eq!(admission.available_permits(), 2);
+        assert!(commands_empty && platform_empty && runtime_empty);
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_response_retains_permit_until_handler_terminal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let admission = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(Arc::clone(&admission).try_acquire_owned().unwrap());
+        let effects = Arc::new(AtomicUsize::new(0));
+        let handler_effects = Arc::clone(&effects);
+        let (mut release, entered, handler) = paused_response(json_response(200, true));
+        let waiter = tokio::spawn(run_blocking_handler(permit, move || {
+            let response = handler();
+            handler_effects.fetch_add(1, Ordering::SeqCst);
+            response
+        }));
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        waiter.abort();
+        let cancelled = waiter.await.unwrap_err();
+        let held_after_abandonment = admission.available_permits();
+        let replacement_denied = Arc::clone(&admission).try_acquire_owned().is_err();
+        let effects_before_release = effects.load(Ordering::SeqCst);
+        release.release();
+        let terminal_permit = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&admission).acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(cancelled.is_cancelled());
+        assert_eq!(held_after_abandonment, 0);
+        assert!(replacement_denied);
+        assert_eq!(effects_before_release, 0);
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        drop(terminal_permit);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_handler_error_and_panic_release_permits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn assert_send_static<T: Send + 'static>() {}
+        assert_send_static::<HttpRequest>();
+        assert_send_static::<AppState>();
+        assert_send_static::<HttpResponse>();
+
+        let admission = Arc::new(Semaphore::new(1));
+        let (state, _commands, _platform, _runtime) = test_state(Some("secret"));
+        let request = test_get_request(OPERATOR_RUNTIME_HEALTH_PATH);
+        let permit = Arc::new(Arc::clone(&admission).try_acquire_owned().unwrap());
+        let denied = run_blocking_handler(permit, move || handle_http_request(request, &state))
+            .await
+            .unwrap();
+        assert_eq!(denied.status, 401);
+        assert_eq!(admission.available_permits(), 1);
+
+        let effects = Arc::new(AtomicUsize::new(0));
+        let handler_effects = Arc::clone(&effects);
+        let permit = Arc::new(Arc::clone(&admission).try_acquire_owned().unwrap());
+        let error = run_blocking_handler(permit, move || {
+            handler_effects.fetch_add(1, Ordering::SeqCst);
+            panic!("injected handler panic after an effect");
+        })
+        .await
+        .unwrap_err();
+        assert!(error
+            .downcast_ref::<tokio::task::JoinError>()
+            .unwrap()
+            .is_panic());
+        assert!(error.to_string().contains("mutation outcome not asserted"));
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_admission_preserves_parsing_auth_and_command_identity() {
+        let (state, commands, _platform, _runtime) = test_state(Some("secret"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let admission = Arc::new(Semaphore::new(1));
+        let server = tokio::spawn(server_loop(
+            listener,
+            state,
+            Arc::clone(&admission),
+            REQUEST_READ_TIMEOUT,
+            RESPONSE_WRITE_TIMEOUT,
+        ));
+        let unparsed = TcpStream::connect(address).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while admission.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let busy =
+            exchange_operator_request(address, test_get_request(OPERATOR_PLATFORM_STATE_PATH))
+                .await;
+        drop(unparsed);
+        // EOF/error cleanup must release connection admission before another request.
+        let reclaimed = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&admission).acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(reclaimed);
+
+        let unauthorized =
+            exchange_operator_request(address, test_get_request(OPERATOR_RUNTIME_HEALTH_PATH))
+                .await;
+        let oversized = exchange_operator_request(
+            address,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: OPERATOR_CHAT_PATH.to_string(),
+                headers: HashMap::from([(OPERATOR_KEY_HEADER.to_string(), "secret".to_string())]),
+                body: vec![b'a'; MAX_BODY_BYTES + 1],
+            },
+        )
+        .await;
+        let mut request = test_request(
+            OPERATOR_CHAOS_PATH,
+            serde_json::json!({
+                "room_id": "empfang",
+                "chaos_type": "AirConBroken",
+                "duration_ticks": 45
+            }),
+        );
+        request
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "secret".to_string());
+        let accepted = exchange_operator_request(address, request).await;
+        let command = commands.try_recv().unwrap();
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(busy.status, 503);
+        assert_eq!(unauthorized.status, 401);
+        assert_eq!(oversized.status, 413);
+        assert_eq!(accepted.status, 202);
+        let receipt: TriggerChaosResponse = serde_json::from_slice(&accepted.body).unwrap();
+        match command {
+            OperatorCommand::Chaos(command) => {
+                assert_eq!(command.event_id, receipt.event_id);
+                assert_eq!(command.room_id, receipt.room_id);
+                assert_eq!(command.chaos_type, receipt.chaos_type);
+                assert_eq!(command.duration_ticks, Some(45));
+            }
+            other => panic!("unexpected operator command: {other:?}"),
+        }
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_and_incomplete_requests_time_out_without_effects() {
+        let incomplete = [
+            Vec::new(),
+            b"POST /operator/chaos HTTP/1.1\r\n".to_vec(),
+            b"POST /operator/chaos HTTP/1.1\r\nContent-Length: 64\r\n\r\n{".to_vec(),
+        ];
+        for wire in incomplete {
+            let (state, commands, _platform, _runtime) = test_state(None);
+            let events = Arc::clone(&state.event_store);
+            let before = events.get_latest_event_id().unwrap();
+            let admission = Arc::new(Semaphore::new(1));
+            let permit = Arc::clone(&admission).try_acquire_owned().unwrap();
+            let (mut peer, stream) = tokio::io::duplex(1024);
+            peer.write_all(&wire).await.unwrap();
+            let connection = tokio::spawn(handle_connection(
+                stream,
+                state,
+                permit,
+                Duration::from_millis(20),
+                Duration::from_secs(1),
+            ));
+            let response =
+                tokio::time::timeout(Duration::from_secs(1), read_operator_response(&mut peer))
+                    .await
+                    .unwrap();
+            connection.await.unwrap().unwrap();
+
+            assert_eq!(response.status, 408);
+            assert_eq!(admission.available_permits(), 1);
+            assert!(matches!(
+                commands.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+            assert_eq!(events.get_latest_event_id().unwrap(), before);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn socket_write_deadline_bounds_overload_and_terminal_responses() {
+        let busy_admission = Arc::new(Semaphore::new(1));
+        let (_unread_peer, stream) = tokio::io::duplex(32);
+        let remote = "127.0.0.1:1".parse().unwrap();
+        let busy = spawn_busy_response(
+            stream,
+            remote,
+            Arc::clone(&busy_admission),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let (_second_peer, second_stream) = tokio::io::duplex(32);
+        let excess = spawn_busy_response(
+            second_stream,
+            remote,
+            Arc::clone(&busy_admission),
+            Duration::from_millis(20),
+        );
+        assert!(excess.is_none());
+        tokio::time::timeout(Duration::from_secs(1), busy)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(busy_admission.available_permits(), 1);
+
+        let (state, commands, _platform, _runtime) = test_state(None);
+        let admission = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&admission).try_acquire_owned().unwrap();
+        let (mut unread_peer, stream) = tokio::io::duplex(32);
+        let connection = tokio::spawn(handle_connection(
+            stream,
+            state,
+            permit,
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+        ));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "room_id": "empfang",
+            "chaos_type": "AirConBroken",
+            "duration_ticks": 45
+        }))
+        .unwrap();
+        let mut wire = format!(
+            "POST {OPERATOR_CHAOS_PATH} HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len(),
+        )
+        .into_bytes();
+        wire.extend_from_slice(&body);
+        tokio::time::timeout(Duration::from_secs(1), unread_peer.write_all(&wire))
+            .await
+            .unwrap()
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("mutation outcome not asserted"));
+        assert_eq!(admission.available_permits(), 1);
+        assert!(matches!(commands.try_recv(), Ok(OperatorCommand::Chaos(_))));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_health_snapshot_writer_is_not_held_by_workflow_health() {
+        let (mut state, _commands, _platform, _runtime) = test_state(None);
+        let health = Arc::clone(&state.runtime_health);
+        let (mut release, entered, pause) = paused_response(json_response(200, true));
+        let pause = std::sync::Mutex::new(Some(pause));
+        state.before_workflow_health = Some(Arc::new(move || {
+            if let Some(pause) = pause.lock().unwrap().take() {
+                let _ = pause();
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let admission = Arc::new(Semaphore::new(1));
+        let server = tokio::spawn(server_loop(
+            listener,
+            state,
+            admission,
+            REQUEST_READ_TIMEOUT,
+            RESPONSE_WRITE_TIMEOUT,
+        ));
+        let response = tokio::spawn(exchange_operator_request(
+            address,
+            test_get_request(OPERATOR_RUNTIME_HEALTH_PATH),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let writer_ran = match health.try_write() {
+            Ok(mut snapshot) => {
+                snapshot.current_shift = 3;
+                true
+            }
+            Err(_) => false,
+        };
+        release.release();
+        let response = response.await.unwrap();
+        server.abort();
+        let _ = server.await;
+
+        assert!(writer_ran);
+        assert_eq!(response.status, 200);
+        let payload: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(payload["current_shift"], 1);
+        assert_eq!(health.read().unwrap().current_shift, 3);
+        assert!(payload.get("company_workflow").is_some());
     }
 
     fn attach_test_fs_layer(state: &mut AppState) -> Arc<LayerManager> {
