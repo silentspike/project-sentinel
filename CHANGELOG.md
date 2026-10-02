@@ -1,5 +1,13 @@
 # Changelog
 
+- Keep operator socket parsing and responses bounded, move synchronous company
+  handlers off async executor threads, and retain admission until an in-flight
+  handler actually finishes. Reuse only completed persisted validation proofs
+  inside one bounded SQLite snapshot and invalidate them before writes. Fence
+  delayed Console authentication responses against newer login/logout outcomes
+  without changing employee history, model authority or provider accounting
+  (#856).
+
 - Allow fresh provider claims during ordinary company reconciliation while
   preserving exclusive recovery, single-batch execution and exactly-once
   model admission. Durable claim replay never grants a second provider call

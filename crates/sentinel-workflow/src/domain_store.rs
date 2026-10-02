@@ -20,6 +20,7 @@ mod project_planning;
 mod request_provider;
 mod source_review_rework;
 mod subscription;
+pub(crate) mod validation_scope;
 mod work_corrections;
 
 use crate::admission::*;
@@ -306,7 +307,7 @@ fn table_columns(
         .map_err(WorkflowError::from)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct CompanyEventRow {
     sequence: i64,
     event_id: String,
@@ -340,12 +341,27 @@ fn validate_project_snapshot_event_with_byte_budget(
     row: &CompanyEventRow,
     byte_budget: Option<&mut historical_allowance::SnapshotByteBudget>,
 ) -> Result<(u64, ProjectV1), WorkflowError> {
-    let sequence = stored_u64(row.sequence)?;
-    let created_at_ms = stored_u64(row.created_at_ms)?;
-    let operation_id = Uuid::parse_str(&row.operation_id).map_err(|_| corrupt())?;
+    validation_scope::with_scope(connection, || {
+        if let Some(budget) = byte_budget {
+            let principal = company_event_principal(row)?;
+            let response_bytes = connection.query_row(
+                "SELECT CASE WHEN typeof(response)='blob' THEN length(response) ELSE -1 END FROM company_operations WHERE authority_namespace=?1 AND operation_id=?2",
+                params![principal.namespace(), row.operation_id],
+                |operation| operation.get::<_, i64>(0),
+            ).optional()?.ok_or_else(corrupt)?;
+            // A cached event still consumes this historical selection's exact byte budget.
+            budget.charge(response_bytes)?;
+        }
+        validation_scope::memoize(connection, "project-snapshot", row, || {
+            validate_project_snapshot_event_uncached(connection, row)
+        })
+    })
+}
+
+fn company_event_principal(
+    row: &CompanyEventRow,
+) -> Result<AuthenticatedCompanyPrincipalV1, WorkflowError> {
     let tenant_id = TenantId::parse(&row.tenant_id).map_err(|_| corrupt())?;
-    let project_id =
-        ProjectId::parse(row.project_id.as_deref().ok_or_else(corrupt)?).map_err(|_| corrupt())?;
     let agent_id = row
         .agent_id
         .map(stored_u64)
@@ -368,6 +384,21 @@ fn validate_project_snapshot_event_with_byte_budget(
         authority_digest: row.authority_digest.clone(),
     };
     principal.validate().map_err(|_| corrupt())?;
+    Ok(principal)
+}
+
+fn validate_project_snapshot_event_uncached(
+    connection: &Connection,
+    row: &CompanyEventRow,
+) -> Result<(u64, ProjectV1), WorkflowError> {
+    validation_scope::charge_bytes(connection, row.payload.len())?;
+    let sequence = stored_u64(row.sequence)?;
+    let created_at_ms = stored_u64(row.created_at_ms)?;
+    let operation_id = Uuid::parse_str(&row.operation_id).map_err(|_| corrupt())?;
+    let tenant_id = TenantId::parse(&row.tenant_id).map_err(|_| corrupt())?;
+    let project_id =
+        ProjectId::parse(row.project_id.as_deref().ok_or_else(corrupt)?).map_err(|_| corrupt())?;
+    let principal = company_event_principal(row)?;
     validate_digest(&row.operation_digest).map_err(|_| corrupt())?;
     validate_digest(&row.authority_digest).map_err(|_| corrupt())?;
     let payload_digest = bytes_digest("sentinel.workflow.company-event-payload.v1", &row.payload)?;
@@ -400,18 +431,6 @@ fn validate_project_snapshot_event_with_byte_budget(
     }
     validate_project(&project)?;
     subscription::validate_persisted(connection, &project)?;
-    if let Some(budget) = byte_budget {
-        let response_bytes = connection
-            .query_row(
-                "SELECT CASE WHEN typeof(response)='blob' THEN length(response) ELSE -1 END FROM company_operations WHERE authority_namespace=?1 AND operation_id=?2",
-                params![principal.namespace(), row.operation_id],
-                |operation| operation.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(WorkflowError::from)?
-            .ok_or_else(corrupt)?;
-        budget.charge(response_bytes)?;
-    }
     let operation = connection
         .query_row(
             "SELECT request_digest,authority_binding_digest,target_predecessor_digest,response,response_digest,created_at_ms FROM company_operations WHERE authority_namespace=?1 AND operation_id=?2",
@@ -421,6 +440,7 @@ fn validate_project_snapshot_event_with_byte_budget(
         .optional()
         .map_err(WorkflowError::from)?
         .ok_or_else(corrupt)?;
+    validation_scope::charge_bytes(connection, operation.3.len())?;
     validate_digest(&operation.2).map_err(|_| corrupt())?;
     if !constant_time_eq(&operation.0, &row.operation_digest)
         || !constant_time_eq(&operation.1, &row.authority_binding_digest)
@@ -5726,6 +5746,7 @@ fn append_event<T: Serialize>(
     payload: &T,
     now_ms: u64,
 ) -> Result<u64, WorkflowError> {
+    validation_scope::before_write(transaction)?;
     let payload = encode(payload)?;
     let payload_digest = bytes_digest("sentinel.workflow.company-event-payload.v1", &payload)?;
     let authority_binding_digest = principal.binding_digest()?;
@@ -7501,6 +7522,7 @@ fn put_entity<T: Serialize>(
     version: u64,
     value: &T,
 ) -> Result<(), WorkflowError> {
+    validation_scope::before_write(transaction)?;
     let payload = encode(value)?;
     let payload_digest = bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?;
     transaction.execute(
@@ -7567,13 +7589,25 @@ impl CompanyEntity for ProjectV1 {
     }
 }
 
-fn get_entity<T: DeserializeOwned + CompanyEntity>(
+fn get_entity<T: DeserializeOwned + Serialize + Clone + CompanyEntity + 'static>(
+    connection: &Connection,
+    tenant_id: &TenantId,
+    kind: &str,
+    id: &str,
+) -> Result<Option<T>, WorkflowError> {
+    validation_scope::memoize(connection, "entity", &(tenant_id, kind, id), || {
+        get_entity_uncached(connection, tenant_id, kind, id)
+    })
+}
+
+fn get_entity_uncached<T: DeserializeOwned + CompanyEntity>(
     connection: &Connection,
     tenant_id: &TenantId,
     kind: &str,
     id: &str,
 ) -> Result<Option<T>, WorkflowError> {
     connection.query_row("SELECT tenant_id,entity_kind,entity_id,version,payload,payload_digest FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3", params![tenant_id.0, kind, id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, Vec<u8>>(4)?, row.get::<_, String>(5)?))).optional().map_err(WorkflowError::from)?.map(|(row_tenant,row_kind,row_id,row_version,payload,payload_digest)| {
+        validation_scope::charge_bytes(connection, payload.len())?;
         if row_tenant != tenant_id.0 || row_kind != kind || row_id != id || row_version <= 0 || !constant_time_eq(&bytes_digest("sentinel.workflow.company-entity-row.v1", &payload)?, &payload_digest) {
             return Err(corrupt());
         }
