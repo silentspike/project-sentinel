@@ -565,7 +565,7 @@ fn require_planning_policy(
         || planning.grant.catalog_digest != call.grant.catalog_digest
         || planning.grant.token_policy != call.grant.token_policy
         || call.grant.max_duration_ms > planning.grant.max_duration_ms
-        || (matches!(call.grant.schema_version, 2 | 3 | 4)
+        || (matches!(call.grant.schema_version, 2..=4)
             && (call.context.source_session.grant.provider != planning.grant.provider
                 || call.context.source_session.grant.model != planning.grant.model
                 || call.context.source_session.grant.catalog_digest
@@ -896,7 +896,7 @@ fn require_adaptive_allowance_source(
         .subscription_call
         .as_ref()
         .ok_or_else(unauthorized)?;
-    if !matches!(call.grant.schema_version, 2 | 3 | 4)
+    if !matches!(call.grant.schema_version, 2..=4)
         || prior.dispatch.is_some()
         || prior.allowance_id == call.allowance_id
         || prior.grant.work_item_id != call.grant.work_item_id
@@ -955,7 +955,7 @@ pub(super) fn validate_governed_allowance_receipt(
     receipt.validate_entity()?;
     let authorization = receipt.continuation.as_ref().ok_or_else(unauthorized)?;
     if receipt.version != 3
-        || !matches!(receipt.grant.schema_version, 2 | 3 | 4)
+        || !matches!(receipt.grant.schema_version, 2..=4)
         || receipt.grant.subject.is_none()
         || receipt.retired_at_unix_ms.is_some()
         || *allowance
@@ -1079,7 +1079,7 @@ impl CompanyEntity for ExpiredAdaptiveContinuationRetirementV1 {
         self.review.validate_entity()?;
         let authorization = self.result.continuation.as_ref().ok_or_else(corrupt)?;
         if self.schema_version != 1
-            || !matches!(self.review.grant.schema_version, 2 | 3 | 4)
+            || !matches!(self.review.grant.schema_version, 2..=4)
             || self.review.version != 4
             || self.review.retired_at_unix_ms.is_none()
             || self.review.decision.is_some()
@@ -1191,7 +1191,7 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
             || self.operation_id.is_nil()
             || self.allowance_id == self.grant.review_id.to_string()
             || self.allowance_id == self.context.source_session.grant.provider_allowance_id
-            || (matches!(self.grant.schema_version, 2 | 3 | 4)
+            || (matches!(self.grant.schema_version, 2..=4)
                 && self.allowance_id == self.context.source_session.active_provider_allowance_id())
             || self.created_at_unix_ms == 0
             || self.grant_issued_at_unix_ms < self.created_at_unix_ms
@@ -1494,7 +1494,7 @@ impl WorkflowStore {
                 return Ok(prior);
             }
             if prior.dispatch.is_some()
-                || matches!(prior.grant.schema_version, 2 | 3 | 4)
+                || matches!(prior.grant.schema_version, 2..=4)
                 || prior.decision.is_some()
                 || prior.retired_at_unix_ms.is_some()
                 || now_ms < prior.grant.expires_at_unix_ms
@@ -1678,7 +1678,7 @@ impl WorkflowStore {
         )?
         .ok_or_else(not_found)?;
         if leader != &call.grant.leadership_principal
-            || !matches!(call.grant.schema_version, 2 | 3 | 4)
+            || !matches!(call.grant.schema_version, 2..=4)
         {
             return Err(unauthorized());
         }
@@ -1855,7 +1855,7 @@ impl WorkflowStore {
             return Err(unauthorized());
         }
         if explicit_expiry
-            && (!matches!(call.grant.schema_version, 2 | 3 | 4)
+            && (!matches!(call.grant.schema_version, 2..=4)
                 || call.grant.subject.is_none()
                 || now_ms < call.grant.expires_at_unix_ms)
         {
@@ -1906,7 +1906,7 @@ impl WorkflowStore {
         {
             return Err(transition());
         }
-        let expired_subject = matches!(call.grant.schema_version, 2 | 3 | 4)
+        let expired_subject = matches!(call.grant.schema_version, 2..=4)
             && call.grant.subject.is_some()
             && (call.dispatch.is_none() || explicit_expiry)
             && now_ms >= call.grant.expires_at_unix_ms;
@@ -2063,7 +2063,7 @@ impl WorkflowStore {
             )?;
         }
         recovery::require_epoch_completion(&transaction, &call, result)?;
-        if matches!(call.grant.schema_version, 2 | 3 | 4)
+        if matches!(call.grant.schema_version, 2..=4)
             && result.continuation.is_none()
             && now_ms >= call.grant.expires_at_unix_ms
         {

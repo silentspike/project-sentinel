@@ -327,7 +327,9 @@ func (p *CodexCLIProvider) cleanupOutputSchema(path string) {
 
 func (p *CodexCLIProvider) outputSchemaPath(req *LLMRequest) (string, error) {
 	executionSchema := req.Metadata["company_execution_schema"]
-	if executionSchema != "1" && executionSchema != "3" && executionSchema != "5" {
+	switch executionSchema {
+	case "1", "3", "5":
+	default:
 		if hasLeadershipReviewMetadata(req.Metadata) {
 			return "", fmt.Errorf("codex-cli mixed leadership output subject")
 		}

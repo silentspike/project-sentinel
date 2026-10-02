@@ -243,7 +243,7 @@ fn validate_repair_source(
         let stored: AdaptiveLeadershipReviewCallV1 =
             get_entity(connection, tenant, KIND, &call.review_key)?.ok_or_else(corrupt)?;
         if stored != *call
-            || !matches!(call.grant.schema_version, 1 | 2 | 3)
+            || !matches!(call.grant.schema_version, 1..=3)
             || call.grant.session_id != session.grant.session_id
             || call.grant.project_id != source.project.project_id
             || call.grant.work_item_id != session.grant.authority.work_item_id
