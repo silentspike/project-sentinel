@@ -362,10 +362,16 @@ impl AdaptiveLeadershipReviewCallV1 {
             .checked_sub(source.model_calls)
             .ok_or_else(invalid)?;
         let (call_limit, duration_limit) = match (&self.grant.subject, self.grant.schema_version) {
-            (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }), 3) => {
+            (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }), 3 | 4) => {
                 self.context.validate(&self.grant)?;
-                if self.schema_version != 3
-                    || self.grant.recovery_epoch.is_some()
+                if self.schema_version != self.grant.schema_version
+                    || (self.grant.schema_version == 3 && self.grant.recovery_epoch.is_some())
+                    || (self.grant.schema_version == 4
+                        && self
+                            .grant
+                            .recovery_epoch
+                            .as_ref()
+                            .is_none_or(|binding| binding.schema_version != 2))
                     || issued_at_ms < budget.observed_at_ms
                     || source.continuation.as_ref().is_some_and(|state| {
                         state.authorizations.len() >= crate::ADAPTIVE_CONTINUATION_MAX_WINDOWS
@@ -537,7 +543,9 @@ impl AdaptiveLeadershipReviewDecisionV1 {
             } => (rationale, evidence_refs),
         };
         let version_matches = match self.decision {
-            AdaptiveLeadershipReviewDecisionKindV1::DeferBudget { .. } => self.schema_version == 3,
+            AdaptiveLeadershipReviewDecisionKindV1::DeferBudget { .. } => {
+                matches!(self.schema_version, 3 | 4)
+            }
             AdaptiveLeadershipReviewDecisionKindV1::ResolveBlocked { .. } => {
                 self.schema_version == 1
             }
@@ -550,14 +558,14 @@ impl AdaptiveLeadershipReviewDecisionV1 {
                 window_ms,
                 ..
             } => {
-                matches!(self.schema_version, 2 | 3)
+                matches!(self.schema_version, 2..=4)
                     && (1..=crate::ADAPTIVE_SESSION_MAX_CALLS).contains(&additional_model_calls)
                     && (1_000..=ADAPTIVE_LEADERSHIP_MAX_GRANT_MS).contains(&window_ms)
             }
         };
         if !version_matches
             || !valid_text(rationale, ADAPTIVE_LEADERSHIP_MAX_RATIONALE_BYTES)
-            || (matches!(self.schema_version, 2 | 3) && refs.is_empty())
+            || (matches!(self.schema_version, 2..=4) && refs.is_empty())
         {
             return Err(invalid());
         }
@@ -578,7 +586,7 @@ impl AdaptiveLeadershipReviewDecisionV1 {
         if self.schema_version != grant.schema_version {
             return Err(invalid());
         }
-        if (grant.schema_version == 3)
+        if matches!(grant.schema_version, 3 | 4)
             != matches!(
                 &grant.subject,
                 Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. })
@@ -593,15 +601,18 @@ impl AdaptiveLeadershipReviewDecisionV1 {
                 grant.session_id,
                 grant.review_id,
             )?;
-            if grant.schema_version != 2
-                || !matches!(
+            if !matches!(
+                (grant.schema_version, binding.schema_version),
+                (2, 1) | (4, 2)
+            ) || (binding.schema_version == 1
+                && !matches!(
                     &grant.subject,
                     Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. })
                         | Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
                             resolution_event_id: None,
                             ..
                         })
-                )
+                ))
                 || matches!(
                     &self.decision,
                     AdaptiveLeadershipReviewDecisionKindV1::Continue {
@@ -612,6 +623,9 @@ impl AdaptiveLeadershipReviewDecisionV1 {
             {
                 return Err(invalid());
             }
+        }
+        if grant.schema_version == 4 && grant.recovery_epoch.is_none() {
+            return Err(invalid());
         }
         let valid = matches!(
             (&grant.subject, &self.decision),
@@ -724,25 +738,33 @@ impl AdaptiveLeadershipReviewGrantV1 {
         let leader = &self.leadership_principal;
         if let Some(binding) = &self.recovery_epoch {
             binding.validate_for(&leader.tenant_id, self.session_id, self.review_id)?;
-            if self.schema_version != 2
-                || !matches!(
+            if !matches!(
+                (self.schema_version, binding.schema_version),
+                (2, 1) | (4, 2)
+            ) || (binding.schema_version == 1
+                && !matches!(
                     &self.subject,
                     Some(AdaptiveLeadershipReviewSubjectV2::UnknownModel { .. })
                         | Some(AdaptiveLeadershipReviewSubjectV2::BlockedContinuation {
                             resolution_event_id: None,
                             ..
                         })
-                )
+                ))
             {
                 return Err(invalid());
             }
         }
         let valid_subject = match (&self.subject, self.schema_version) {
-            (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }), 3) => {
+            (Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }), 3 | 4) => {
                 budget.validate_shape()?;
                 self.expected_reason_code.is_empty()
                     && budget.observed_at_ms <= issued_at_ms
-                    && self.recovery_epoch.is_none()
+                    && ((self.schema_version == 3 && self.recovery_epoch.is_none())
+                        || (self.schema_version == 4
+                            && self
+                                .recovery_epoch
+                                .as_ref()
+                                .is_some_and(|binding| binding.schema_version == 2)))
             }
             (None, 1) => valid_reason(&self.expected_reason_code),
             (
@@ -816,9 +838,14 @@ impl AdaptiveLeadershipReviewContextV1 {
                 )
                 | (
                     Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { .. }),
-                    3
+                    3 | 4
                 )
         ) || (grant.schema_version == 3 && grant.recovery_epoch.is_some())
+            || (grant.schema_version == 4
+                && grant
+                    .recovery_epoch
+                    .as_ref()
+                    .is_none_or(|binding| binding.schema_version != 2))
         {
             return Err(invalid());
         }
@@ -841,8 +868,13 @@ impl AdaptiveLeadershipReviewContextV1 {
         let valid_subject = match &grant.subject {
             Some(AdaptiveLeadershipReviewSubjectV2::BudgetWindowExhausted { budget }) => {
                 budget.validate(self)?;
-                grant.schema_version == 3
-                    && grant.recovery_epoch.is_none()
+                matches!(grant.schema_version, 3 | 4)
+                    && ((grant.schema_version == 3 && grant.recovery_epoch.is_none())
+                        || (grant.schema_version == 4
+                            && grant
+                                .recovery_epoch
+                                .as_ref()
+                                .is_some_and(|binding| binding.schema_version == 2)))
                     && grant.expected_reason_code.is_empty()
                     && grant.assignment_id == budget.root_allowance.grant.assignment_id
                     && grant.provider == session.grant.provider

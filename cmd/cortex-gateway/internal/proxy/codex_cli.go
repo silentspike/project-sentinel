@@ -83,6 +83,9 @@ var codexCLIContinuationLeadershipSchema []byte
 //go:embed codex_cli_budget_leadership_schema.json
 var codexCLIBudgetLeadershipSchema []byte
 
+//go:embed codex_cli_admission_repair_schema.json
+var codexCLIAdmissionRepairSchema []byte
+
 type codexCLIUsage struct {
 	InputTokens           int64 `json:"input_tokens"`
 	CachedInputTokens     int64 `json:"cached_input_tokens"`
@@ -324,7 +327,9 @@ func (p *CodexCLIProvider) cleanupOutputSchema(path string) {
 
 func (p *CodexCLIProvider) outputSchemaPath(req *LLMRequest) (string, error) {
 	executionSchema := req.Metadata["company_execution_schema"]
-	if executionSchema != "1" && executionSchema != "3" && executionSchema != "5" {
+	switch executionSchema {
+	case "1", "3", "5":
+	default:
 		if hasLeadershipReviewMetadata(req.Metadata) {
 			return "", fmt.Errorf("codex-cli mixed leadership output subject")
 		}
@@ -343,6 +348,8 @@ func (p *CodexCLIProvider) outputSchemaPath(req *LLMRequest) (string, error) {
 			selected = codexCLIContinuationLeadershipSchema
 		case "budget_window_exhausted":
 			selected = codexCLIBudgetLeadershipSchema
+		case "admission_repair":
+			selected = codexCLIAdmissionRepairSchema
 		}
 	} else if hasLeadershipReviewMetadata(req.Metadata) {
 		return "", fmt.Errorf("codex-cli mixed leadership output subject")

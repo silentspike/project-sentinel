@@ -139,6 +139,51 @@ session head fail closed, including on retries. An authenticated credential
 rotation of the same leader can finish a prior decision across the crash gap
 without a new model call or alteration of the historical event.
 
+## One-Time Admission Repair Review
+
+The operator admission-repair path addresses a different failure: a bounded
+leadership review was retired before provider dispatch while an admission defect
+was present. It authorizes one exceptional additional leadership review for the
+original tenant and session. It is not a refunded ordinary review, an automatic
+retry, or a model decision. The separate permanent slot remains consumed after
+expiry, release changes, restarts and exact request replay. Existing recovery
+epochs and ordinary review receipts remain unchanged.
+
+The authenticated operator route is
+`/operator/workflow/adaptive-review-epochs`. Preparation uses
+`GET ?mode=admission_repair_source&project_id=<id>&session_id=<uuid>` to read the
+server-validated mixed review history and candidate fingerprints. This read
+requires no repair attestation and issues no authority. It does not assert that
+an absent completion row, zero attempt count or missing dispatch proves that a
+provider was never contacted.
+
+A protected server-side attestation must bind the complete source and inventory,
+the exact subset of eligible retired reviews, their historical failed release,
+and the currently installed repaired daemon and Gateway. Historical deployment
+and admission-ordering evidence is a trusted producer assertion backed by
+protected, digest-bound records; it is not a fabricated provider receipt.
+Unknown or dispatched effects retain their existing disposition requirements.
+Evidence for one failed release cannot be applied to reviews from another.
+
+With valid evidence, `GET ?mode=admission_repair` returns a draft. An explicit
+authenticated POST of that exact schema-3 request issues a schema-4 review with
+a version-2 recovery binding. The store revalidates current source and proof
+before its first write. Exact historical replay returns the immutable issuance
+receipt without creating another slot or extending its lifetime.
+
+Issuance preserves the original session, tools and model counters, root limits,
+active ceilings, continuation windows, assignment and customer task. Only a real
+subsequent leadership model decision can authorize a continuation inside the
+remaining root allowance. Defer, expiry, denial and unknown outcomes do not
+silently refill any budget. Gateway schema selection follows the authoritative
+review grant; caller metadata cannot upgrade an ordinary review to this mode.
+
+For example, when ordinary reviews are exhausted after an admission defect,
+the operator may establish the exact failed-release evidence and issue the one
+exceptional review. Leadership can then decide to continue the same work within
+its remaining allowance or to defer it. Neither preparation nor issuance
+implements the task or claims customer acceptance.
+
 ## ORC Integration Contract
 
 `workflow_api.rs` declares `mod adaptive_recovery;`, an `ADAPTIVE_RECOVERY_PATH`

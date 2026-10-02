@@ -239,6 +239,11 @@ impl WorkflowApi {
                 ..
             }) => Some("budget_window_exhausted"),
         };
+        let expected_kind = if grant.schema_version == 4 {
+            Some("admission_repair")
+        } else {
+            expected_kind
+        };
         if grant.review_id != *review_id
             || review_kind.as_deref() != expected_kind
             || request.allowance_id != call.allowance_id
