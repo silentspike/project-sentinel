@@ -1,5 +1,12 @@
 # Changelog
 
+- Bound the Gateway's local workflow admission wait independently of provider
+  execution, retain caller cancellation and fail-closed no-retry behavior, and
+  report dispatch validation latency. Skip only impossible registered-role
+  candidates before durable scans, prepare an exact leadership context once,
+  and share completed validation proofs only inside each read snapshot or
+  read-only claim phase. Preserve all current authority and spending (#856).
+
 - Preserve terminal QA timeout classification when a strict broker timeout frame
   arrives before the client deadline. Reject unready, malformed, unknown or
   contradictory error frames without adopting partial output or weakening the

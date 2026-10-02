@@ -1914,6 +1914,8 @@ impl WorkflowStore {
         validate_digest(&claim.context_digest)?;
         let mut connection = self.connection.lock().map_err(|_| persistence())?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Share proofs only within this read-only claim preflight, never with dispatch writes.
+        let scope = validation_scope::enter(&transaction)?;
         let mut call: AdaptiveLeadershipReviewCallV1 = get_entity(
             &transaction,
             &leader.tenant_id,
@@ -1935,6 +1937,7 @@ impl WorkflowStore {
         require_current_source(&transaction, &call)?;
         require_subject_time(&call, now_ms)?;
         recovery::require_epoch_time(&transaction, &call, now_ms)?;
+        scope.finish()?;
         call.dispatch = Some(RequestProviderDispatchV1 {
             request_id: claim.request_id.clone(),
             request_digest: claim.request_digest.clone(),
@@ -2145,6 +2148,82 @@ mod tests {
     include!("adaptive_leadership_review/tests.rs");
     mod recovery_tests {
         include!("adaptive_leadership_review/recovery_tests.rs");
+
+        #[test]
+        fn recovery_claim_validation_scope_reuses_epoch_and_rejects_changed_proofs() {
+            for target in ["epoch-authority", "epoch-event", "missing-epoch"] {
+                let (mut f, retired, now) = recovery_source();
+                let request = recovery_request(&mut f, &retired);
+                let mut epoch = authorize_recovery(&f, &request, now);
+                let call = recovery_call(&f, &epoch);
+                {
+                    let mut connection = f.store.connection.lock().unwrap();
+                    let transaction = connection
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .unwrap();
+                    let scope = validation_scope::enter(&transaction).unwrap();
+                    let loaded: AdaptiveLeadershipReviewCallV1 =
+                        get_entity(&transaction, &f.leader.tenant_id, KIND, &call.review_key)
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(loaded, call);
+                    require_current_source(&transaction, &loaded).unwrap();
+                    require_subject_time(&loaded, now + 1).unwrap();
+                    let entities = validation_scope::validations("entity");
+                    // The review, its epoch, current project and canonical planning call.
+                    assert_eq!(entities, 4);
+                    assert_eq!(validation_scope::validations("adaptive-journal"), 1);
+                    for _ in 0..3 {
+                        recovery::require_epoch_time(&transaction, &loaded, now + 1).unwrap();
+                        assert_eq!(validation_scope::validations("entity"), entities);
+                    }
+                    scope.finish().unwrap();
+                    assert_eq!(validation_scope::validations("entity"), 0);
+                    transaction.commit().unwrap();
+                }
+                match target {
+                    "epoch-authority" => {
+                        epoch.issuer_principal.authority_generation += 1;
+                        epoch.issuer_authority.principal_generation += 1;
+                        persist_entity(&f.store, &epoch);
+                    }
+                    "epoch-event" => {
+                        let changed = f.store.connection.lock().unwrap().execute(
+                            "UPDATE company_events SET payload=X'00'
+                             WHERE tenant_id=?1 AND event_type='adaptive_leadership_recovery_epoch_authorized'
+                             AND operation_id=?2",
+                            params![f.leader.tenant_id.0, request.operation_id.to_string()],
+                        ).unwrap();
+                        assert_eq!(changed, 1);
+                    }
+                    "missing-epoch" => {
+                        let changed = f
+                            .store
+                            .connection
+                            .lock()
+                            .unwrap()
+                            .execute(
+                                "DELETE FROM company_entities WHERE tenant_id=?1
+                             AND entity_kind='adaptive_leadership_recovery_epoch' AND entity_id=?2",
+                                params![f.leader.tenant_id.0, epoch.epoch_key],
+                            )
+                            .unwrap();
+                        assert_eq!(changed, 1);
+                    }
+                    _ => unreachable!(),
+                }
+                let before = rows(&f.store);
+                assert!(
+                    f.store
+                        .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1)
+                        .is_err(),
+                    "accepted changed {target}"
+                );
+                assert_eq!(validation_scope::validations("entity"), 0);
+                assert_eq!(rows(&f.store), before);
+                assert_eq!(session(&f), f.context.source_session);
+            }
+        }
     }
 
     const CONTINUATION_AT: u64 = 900_002;
@@ -3293,6 +3372,206 @@ mod tests {
         f.store
             .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1)
             .unwrap()
+    }
+
+    #[test]
+    fn leadership_claim_validation_scope_bounds_repeated_compound_proofs() {
+        let f = budget_fixture(4);
+        let now = CONTINUATION_AT + 7;
+        let call = f
+            .store
+            .authorize_adaptive_leadership_review_call(
+                &f.leader,
+                Uuid::new_v4(),
+                "claim-proof-count",
+                &f.grant,
+                &f.context,
+                now,
+            )
+            .unwrap();
+        {
+            let mut connection = f.store.connection.lock().unwrap();
+            // A new transaction must build its own proofs, even on the same connection.
+            for _ in 0..2 {
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                let scope = validation_scope::enter(&transaction).unwrap();
+                assert_eq!(validation_scope::validations("adaptive-journal"), 0);
+                let loaded: AdaptiveLeadershipReviewCallV1 =
+                    get_entity(&transaction, &f.leader.tenant_id, KIND, &call.review_key)
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(loaded, call);
+                assert_eq!(validation_scope::validations("adaptive-journal"), 1);
+                require_current_source(&transaction, &loaded).unwrap();
+                require_subject_time(&loaded, now + 1).unwrap();
+                recovery::require_epoch_time(&transaction, &loaded, now + 1).unwrap();
+                assert_eq!(validation_scope::validations("adaptive-journal"), 1);
+                let entities = validation_scope::validations("entity");
+                let budgets = validation_scope::validations("budget-source");
+                // Current/prior reviews, absent epoch, project, abandonment and planning.
+                assert_eq!(entities, 6);
+                assert_eq!(budgets, 2);
+                assert_eq!(validation_scope::validations("historical-project"), 1);
+                assert_eq!(validation_scope::validations("governed-allowance"), 1);
+                for _ in 0..3 {
+                    let repeated: AdaptiveLeadershipReviewCallV1 =
+                        get_entity(&transaction, &f.leader.tenant_id, KIND, &call.review_key)
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(repeated, loaded);
+                    require_current_source(&transaction, &repeated).unwrap();
+                    require_subject_time(&repeated, now + 1).unwrap();
+                    recovery::require_epoch_time(&transaction, &repeated, now + 1).unwrap();
+                    assert_eq!(validation_scope::validations("adaptive-journal"), 1);
+                    assert_eq!(validation_scope::validations("entity"), entities);
+                    assert_eq!(validation_scope::validations("budget-source"), budgets);
+                    assert_eq!(validation_scope::validations("historical-project"), 1);
+                    assert_eq!(validation_scope::validations("governed-allowance"), 1);
+                }
+                scope.finish().unwrap();
+                assert_eq!(validation_scope::validations("adaptive-journal"), 0);
+                transaction.commit().unwrap();
+            }
+        }
+        let dispatched = f
+            .store
+            .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1)
+            .unwrap();
+        assert_eq!(dispatched.version, 2);
+        assert_eq!(dispatched.grant, call.grant);
+        assert_eq!(dispatched.context, call.context);
+        assert_eq!(session(&f), f.context.source_session);
+        assert_eq!(
+            f.store
+                .company_project(&f.leader.tenant_id, &f.grant.project_id)
+                .unwrap(),
+            Some(f.context.source_project.clone())
+        );
+        assert_eq!(
+            f.store
+                .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                .unwrap(),
+            Some(dispatched)
+        );
+        let before = rows(&f.store);
+        assert!(f
+            .store
+            .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 2)
+            .is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+
+    #[test]
+    fn leadership_claim_validation_scope_rejects_corruption_after_failed_preflight() {
+        for target in ["review", "project", "planning", "journal"] {
+            let f = budget_fixture(4);
+            let now = CONTINUATION_AT + 7;
+            let call = f
+                .store
+                .authorize_adaptive_leadership_review_call(
+                    &f.leader,
+                    Uuid::new_v4(),
+                    "claim-corrupt-proof",
+                    &f.grant,
+                    &f.context,
+                    now,
+                )
+                .unwrap();
+            let mut changed_leader = f.leader.clone();
+            changed_leader.authority_generation += 1;
+            let before = rows(&f.store);
+            assert!(f
+                .store
+                .claim_adaptive_leadership_review_call(&changed_leader, &claim(&call), now + 1)
+                .is_err());
+            assert_eq!(rows(&f.store), before);
+            assert_eq!(validation_scope::validations("entity"), 0);
+            {
+                let connection = f.store.connection.lock().unwrap();
+                let changed = match target {
+                    "review" | "project" | "planning" => {
+                        let (kind, id) = match target {
+                            "review" => (KIND, call.review_key.as_str()),
+                            "project" => ("project", f.grant.project_id.0.as_str()),
+                            "planning" => ("project_planning_call", f.grant.project_id.0.as_str()),
+                            _ => unreachable!(),
+                        };
+                        connection
+                            .execute(
+                                "UPDATE company_entities SET payload=X'00'
+                             WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3",
+                                params![f.leader.tenant_id.0, kind, id],
+                            )
+                            .unwrap()
+                    }
+                    "journal" => connection
+                        .execute(
+                            "UPDATE workflow_operations SET response=X'00' WHERE rowid=(
+                         SELECT rowid FROM workflow_operations WHERE operation_namespace=?1
+                         ORDER BY operation_id LIMIT 1)",
+                            [format!("adaptive-session-v1:{}", f.grant.session_id)],
+                        )
+                        .unwrap(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(changed, 1);
+            }
+            let before = rows(&f.store);
+            assert!(
+                f.store
+                    .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1)
+                    .is_err(),
+                "accepted corrupt {target}"
+            );
+            assert_eq!(validation_scope::validations("entity"), 0);
+            assert_eq!(rows(&f.store), before);
+        }
+    }
+
+    #[test]
+    fn leadership_claim_validation_scope_write_failure_rolls_back_and_allows_retry() {
+        let f = fixture();
+        let call = authorize(&f);
+        f.store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_claim_event BEFORE INSERT ON company_events
+             WHEN NEW.event_type='adaptive_leadership_review_dispatched'
+             BEGIN SELECT RAISE(ABORT, 'test claim event failure'); END;",
+            )
+            .unwrap();
+        let before = rows(&f.store);
+        assert!(f
+            .store
+            .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), AUTHORIZED_AT + 1)
+            .is_err());
+        assert_eq!(validation_scope::validations("entity"), 0);
+        assert_eq!(rows(&f.store), before);
+        assert_eq!(
+            f.store
+                .adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id)
+                .unwrap(),
+            Some(call.clone())
+        );
+        f.store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_claim_event")
+            .unwrap();
+        let dispatched = f
+            .store
+            .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), AUTHORIZED_AT + 1)
+            .unwrap();
+        assert_eq!(dispatched.version, 2);
+        assert_eq!(dispatched.grant, call.grant);
+        assert_eq!(dispatched.context, call.context);
+        assert_eq!(validation_scope::validations("entity"), 0);
+        assert_eq!(session(&f), f.context.source_session);
     }
 
     fn budget_result(

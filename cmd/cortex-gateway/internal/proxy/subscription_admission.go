@@ -19,6 +19,9 @@ import (
 var subscriptionIdentifier = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$`)
 var subscriptionDigest = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// Authority latency has its own finite bound; provider and caller budgets stay unchanged.
+const subscriptionAdmissionTimeout = 30 * time.Second
+
 // SubscriptionAdmission is a client of workflow authority, not another store.
 // All registry providers, including internal/background callers, pass this gate.
 type SubscriptionAdmission struct {
@@ -91,7 +94,7 @@ func NewSubscriptionAdmissionWithSalesAutonomy(allowanceID, catalogDigest, opera
 	return &SubscriptionAdmission{
 		allowanceID: allowanceID, catalogDigest: catalogDigest, endpoint: endpoint.String(), credential: credential,
 		salesAutonomousEnabled: enabled,
-		client:                 &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
+		client:                 &http.Client{Timeout: subscriptionAdmissionTimeout, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
 	}, nil
 }
 
