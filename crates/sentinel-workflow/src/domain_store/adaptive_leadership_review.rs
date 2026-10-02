@@ -1677,8 +1677,7 @@ impl WorkflowStore {
             &result.review_id.to_string(),
         )?
         .ok_or_else(not_found)?;
-        if leader != &call.grant.leadership_principal
-            || !matches!(call.grant.schema_version, 2..=4)
+        if leader != &call.grant.leadership_principal || !matches!(call.grant.schema_version, 2..=4)
         {
             return Err(unauthorized());
         }
