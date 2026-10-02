@@ -77,6 +77,54 @@ pub struct AdaptiveBudgetReviewExtensionReceiptV1 {
     prior_receipt_digest: Option<String>,
 }
 
+impl AdaptiveBudgetReviewExtensionReceiptV1 {
+    pub fn canonical_digest(&self) -> Result<String, WorkflowError> {
+        self.validate_entity()?;
+        canonical_sha256(
+            "sentinel.workflow.adaptive-budget-review-extension-receipt.v1",
+            self,
+        )
+    }
+}
+
+pub(super) fn admission_repair_extensions(
+    connection: &Connection,
+    tenant: &TenantId,
+    session_id: Uuid,
+    head: u64,
+    calls: &[AdaptiveLeadershipReviewCallV1],
+) -> Result<
+    (
+        AdaptiveBudgetReviewExtensionReceiptV1,
+        AdaptiveBudgetReviewExtensionReceiptV1,
+    ),
+    WorkflowError,
+> {
+    let original =
+        original_in_connection(connection, tenant, session_id, head)?.ok_or_else(not_found)?;
+    let successor: AdaptiveBudgetReviewExtensionReceiptV1 = get_entity(
+        connection,
+        tenant,
+        EXTENSION_KIND,
+        &successor_key(tenant, session_id, head)?,
+    )?
+    .ok_or_else(not_found)?;
+    let (global, same_head) = review_counts(calls, head);
+    if successor.request.schema_version != 2
+        || successor.request.prior_operation_id != Some(original.request.operation_id)
+        || successor.prior_receipt_digest.as_ref() != Some(&original.canonical_digest()?)
+        || global
+            < successor.request.base_global_review_count
+                + usize::from(successor.request.additional_reviews)
+        || same_head
+            < successor.request.base_head_review_count
+                + usize::from(successor.request.additional_reviews)
+    {
+        return Err(transition());
+    }
+    Ok((original, successor))
+}
+
 fn conflict() -> WorkflowError {
     WorkflowError::new(
         WorkflowErrorCode::IdempotencyConflict,
@@ -214,7 +262,7 @@ fn require_operator(
     Ok(())
 }
 
-fn review_counts(calls: &[AdaptiveLeadershipReviewCallV1], head: u64) -> (usize, usize) {
+pub(super) fn review_counts(calls: &[AdaptiveLeadershipReviewCallV1], head: u64) -> (usize, usize) {
     (
         calls
             .iter()
@@ -222,7 +270,9 @@ fn review_counts(calls: &[AdaptiveLeadershipReviewCallV1], head: u64) -> (usize,
             .count(),
         calls
             .iter()
-            .filter(|call| call.grant.expected_session_version == head)
+            .filter(|call| {
+                call.grant.expected_session_version == head && call.grant.schema_version != 4
+            })
             .count(),
     )
 }

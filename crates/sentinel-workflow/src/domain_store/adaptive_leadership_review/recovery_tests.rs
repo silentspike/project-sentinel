@@ -13,7 +13,10 @@ fn recovery_source() -> (Fixture, Vec<AdaptiveLeadershipReviewCallV1>, u64) {
 }
 
 fn recovery_source_with_subject(unknown: bool) -> (Fixture, Vec<AdaptiveLeadershipReviewCallV1>, u64) {
-    let mut f = continuation_fixture(unknown, false);
+    recovery_source_from_fixture(continuation_fixture(unknown, false))
+}
+
+fn recovery_source_from_fixture(mut f: Fixture) -> (Fixture, Vec<AdaptiveLeadershipReviewCallV1>, u64) {
     let source = f.context.source_session.clone();
     let project = f.context.source_project.clone();
     let mut retired = Vec::new();
@@ -110,6 +113,7 @@ fn recovery_request(
         unknown_effect,
         sealed_unknown_proof_digest,
         blocked_subject,
+        admission_repair: None,
         prior_review_history_digest: adaptive_leadership_recovery_history_digest(retired).unwrap(),
         repair_digest: "b".repeat(64),
         release: AdaptiveRecoveryReleaseV1 {
@@ -1170,4 +1174,485 @@ fn recovery_epoch_decision_preflight_is_read_only_and_historical() {
     assert!(f.store.validate_adaptive_leadership_recovery_decision(&call, &expanded_calls).is_err());
     assert!(f.store.validate_adaptive_leadership_recovery_decision(&call, &expanded_window).is_err());
     assert_eq!(rows(&f.store), before);
+}
+
+fn admission_repair_fixture(mixed_head: bool) -> (Fixture, u64) {
+    let (mut f, retired, mut now) = recovery_source_from_fixture(
+        continuation_fixture_with_calls(false, false, 16),
+    );
+    let request = recovery_request(&mut f, &retired);
+    let epoch = authorize_recovery(&f, &request, now);
+    let call = recovery_call(&f, &epoch);
+    let dispatched = f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1).unwrap();
+    let result = continue_result_with_window_at(&dispatched, 120_000, now + 2);
+    f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).unwrap();
+    observe_budget_inspection(&f, session(&f), now + 3);
+    now += 7;
+    if mixed_head {
+        budget_context(&mut f, now, "repair-prior-head-completed");
+        let call = dispatch_budget(&f, now);
+        let result = budget_result(&call, 2, now + 2);
+        f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).unwrap();
+        now = result.continuation.as_ref().unwrap().deadline_ms;
+    }
+    let operator = recovery_operator(&f.leader.tenant_id);
+    for round in 0..3 {
+        let count = if round == 0 && mixed_head { 2 } else { 3 };
+        for index in 0..count {
+            budget_context(&mut f, now, &format!("repair-retired-{round}-{index}"));
+            let call = f.store.authorize_adaptive_leadership_review_call(
+                &f.leader, Uuid::new_v4(), &format!("repair-review-{round}-{index}"),
+                &f.grant, &f.context, now,
+            ).unwrap();
+            now = call.grant.expires_at_unix_ms;
+            f.store.expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id, 1, now).unwrap();
+            now += 1;
+        }
+        if round < 2 {
+            budget_context(&mut f, now, "repair-exhausted-extension");
+            if round == 0 {
+                f.store.record_adaptive_budget_window_limit(&f.leader, &f.grant, &f.context, now).unwrap();
+            }
+            let request = if round == 0 {
+                f.store.budget_review_extension_draft(&operator, &f.grant.project_id,
+                    f.grant.session_id, Uuid::new_v4(), 3, "repair-original-extension", now + 3_600_000, now)
+            } else {
+                f.store.budget_review_extension_successor_draft(&operator, &f.grant.project_id,
+                    f.grant.session_id, Uuid::new_v4(), 3, "repair-successor-extension", now + 3_600_000, now)
+            }.unwrap();
+            f.store.authorize_budget_review_extension(&operator, &request, now).unwrap();
+            now += 1;
+        }
+    }
+    (f, now)
+}
+
+fn admission_repair_request(f: &mut Fixture, now: u64) -> AdaptiveLeadershipRecoveryRequestV1 {
+    let source = f.store.adaptive_leadership_admission_repair_source(
+        &f.leader.tenant_id, f.grant.session_id,
+    ).unwrap();
+    budget_context(f, now, "explicit-admission-repair");
+    let request = AdaptiveLeadershipRecoveryRequestV1 {
+        schema_version: 3, operation_id: Uuid::new_v4(), tenant_id: f.leader.tenant_id.clone(),
+        project_id: f.grant.project_id.clone(), work_item_id: f.grant.work_item_id.clone(),
+        session_id: f.grant.session_id, expected_project_version: source.project.version,
+        expected_session_version: source.session.version, session_head_digest: source.session_head_digest.clone(),
+        session_digest: adaptive_leadership_recovery_session_digest(&source.session).unwrap(),
+        project_digest: adaptive_leadership_recovery_project_digest(&source.project).unwrap(),
+        unknown_effect: None, sealed_unknown_proof_digest: None, blocked_subject: None,
+        admission_repair: Some(crate::AdaptiveLeadershipAdmissionRepairV1 {
+            schema_version: 1, source_digest: source.canonical_digest().unwrap(),
+            // A test callback attestation, not a claim that mixed history had zero provider I/O.
+            disposition_digest: "a".repeat(64),
+            failed_release: source.legacy_epoch.request.release.clone(),
+        }),
+        prior_review_history_digest: crate::adaptive_leadership_admission_repair_history_digest(&source.calls).unwrap(),
+        repair_digest: "b".repeat(64),
+        release: AdaptiveRecoveryReleaseV1 { schema_version: 1, source_git_sha: "f".repeat(40),
+            release_manifest_digest: "1".repeat(64), gateway_binary_digest: "2".repeat(64) },
+        reason_ref: "explicit-once-admission-repair".into(), expires_at_unix_ms: now + 120_000,
+        max_additional_model_calls: 2, max_window_ms: 120_000,
+    };
+    f.grant.schema_version = 4;
+    f.context.evidence_refs.push(format!("recovery-request:{}", request.canonical_digest().unwrap()));
+    f.context.evidence_refs.sort();
+    rebind_budget_evidence(f);
+    request
+}
+
+fn admission_repair_evidence(
+    source: &crate::AdaptiveLeadershipAdmissionRepairSourceV1,
+    request: &AdaptiveLeadershipRecoveryRequestV1,
+) -> Result<crate::AdaptiveLeadershipAdmissionRepairEvidenceV1, WorkflowError> {
+    let repair = request.admission_repair.as_ref().unwrap();
+    assert_eq!(source.calls.len(), 13);
+    assert_eq!(source.calls.iter().filter(|call| call.grant.schema_version == 3).count(), 9);
+    assert_eq!(source.calls.iter().filter(|call| call.grant.schema_version == 2).count(), 4);
+    assert!(source.calls.iter().any(|call| call.dispatch.is_some() && call.continuation.is_some()));
+    Ok(crate::AdaptiveLeadershipAdmissionRepairEvidenceV1 {
+        source_digest: source.canonical_digest()?, disposition_digest: repair.disposition_digest.clone(),
+        repair_digest: request.repair_digest.clone(), release: request.release.clone(),
+        failed_release: repair.failed_release.clone(),
+        attested_review_ids: vec![source.qualifying_review_ids[0]],
+    })
+}
+
+fn authorize_admission_repair(
+    f: &Fixture, request: &AdaptiveLeadershipRecoveryRequestV1, now: u64,
+) -> crate::AdaptiveLeadershipAdmissionRepairEpochV1 {
+    let (replayed, receipt) = f.store.authorize_adaptive_leadership_admission_repair(
+        &recovery_operator(&f.leader.tenant_id), request, &f.grant, &f.context, now, admission_repair_evidence,
+    ).unwrap();
+    assert!(!replayed);
+    receipt
+}
+
+fn assert_admission_repair_heap_layout_preserves_wire(
+    receipt: &crate::AdaptiveLeadershipAdmissionRepairEpochV1,
+) {
+    #[derive(serde::Serialize)]
+    struct InlineSource<'a> {
+        schema_version: u16,
+        session: &'a crate::AdaptiveSessionV1,
+        session_head_digest: &'a str,
+        project: &'a ProjectV1,
+        calls: &'a [AdaptiveLeadershipReviewCallV1],
+        original_extension: &'a crate::AdaptiveBudgetReviewExtensionReceiptV1,
+        successor_extension: &'a crate::AdaptiveBudgetReviewExtensionReceiptV1,
+        legacy_epoch: &'a AdaptiveLeadershipRecoveryEpochV1,
+        qualifying_review_ids: &'a [Uuid],
+        continuation_reviews: &'a [AdaptiveLeadershipReviewCallV1],
+    }
+    #[derive(serde::Serialize)]
+    struct InlineReceipt<'a> {
+        epoch: &'a AdaptiveLeadershipRecoveryEpochV1,
+        source: InlineSource<'a>,
+        evidence: &'a crate::AdaptiveLeadershipAdmissionRepairEvidenceV1,
+    }
+    let source = &receipt.source;
+    let inline = InlineReceipt {
+        epoch: &receipt.epoch,
+        source: InlineSource {
+            schema_version: source.schema_version,
+            session: &source.session,
+            session_head_digest: &source.session_head_digest,
+            project: &source.project,
+            calls: &source.calls,
+            original_extension: &source.original_extension,
+            successor_extension: &source.successor_extension,
+            legacy_epoch: &source.legacy_epoch,
+            qualifying_review_ids: &source.qualifying_review_ids,
+            continuation_reviews: &source.continuation_reviews,
+        },
+        evidence: &receipt.evidence,
+    };
+    assert!(std::mem::size_of::<crate::AdaptiveLeadershipAdmissionRepairEpochV1>() < 1024);
+    assert_eq!(serde_json::to_vec(receipt).unwrap(), serde_json::to_vec(&inline).unwrap());
+    assert_eq!(source.canonical_digest().unwrap(), canonical_sha256(
+        "sentinel.workflow.adaptive-leadership-admission-repair-source.v1", &inline.source,
+    ).unwrap());
+    assert_eq!(serde_json::from_slice::<crate::AdaptiveLeadershipAdmissionRepairEpochV1>(
+        &serde_json::to_vec(&inline).unwrap(),
+    ).unwrap(), *receipt);
+}
+
+#[test]
+fn admission_repair_preserves_mixed_inventory_occupied_epoch_and_root_without_refund() {
+    for mixed_head in [false, true] {
+        let (mut f, now) = admission_repair_fixture(mixed_head);
+        let request = admission_repair_request(&mut f, now);
+        let before_session = session(&f);
+        let before_project = f.context.source_project.clone();
+        let legacy = f.store.adaptive_leadership_recovery_epoch(&f.leader.tenant_id, f.grant.session_id).unwrap().unwrap();
+        let receipt = authorize_admission_repair(&f, &request, now);
+        assert_admission_repair_heap_layout_preserves_wire(&receipt);
+        assert_eq!(receipt.source.qualifying_review_ids.len(), if mixed_head { 8 } else { 9 });
+        assert_eq!(receipt.source.continuation_reviews.len(), if mixed_head { 2 } else { 1 });
+        assert_eq!(session(&f), before_session);
+        assert_eq!(session(&f).grant.max_model_calls, 16);
+        assert_eq!(session(&f).model_calls, 2);
+        assert!(f.store.company_project(&f.leader.tenant_id, &f.grant.project_id).unwrap() == Some(before_project));
+        assert_eq!(f.store.adaptive_leadership_recovery_epoch(&f.leader.tenant_id, f.grant.session_id).unwrap(), Some(legacy));
+        assert_ne!(receipt.epoch.epoch_key, receipt.source.legacy_epoch.epoch_key);
+        let calls = f.store.adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id).unwrap();
+        assert_eq!(calls.len(), 14);
+        assert_eq!(calls.iter().filter(|call| call.grant.schema_version == 3).count(), 9);
+        assert_eq!(calls.iter().filter(|call| call.grant.schema_version == 4).count(), 1);
+        assert_eq!(budget_review_extension::review_counts(&calls, session(&f).version),
+            (9, if mixed_head { 8 } else { 9 }));
+        assert!(receipt.source.calls.iter().all(|prior| calls.contains(prior)));
+        assert!(f.store.authorize_adaptive_leadership_recovery_epoch(
+            &recovery_operator(&f.leader.tenant_id), &request, &f.grant, &f.context, now,
+        ).is_err());
+        assert!(f.store.authorize_adaptive_leadership_review_call(
+            &f.leader, request.operation_id, "ordinary-cannot-issue-repair", &f.grant, &f.context, now,
+        ).is_err());
+    }
+}
+
+#[test]
+fn admission_repair_exact_replay_after_expiry_reopen_and_release_change_never_renews() {
+    let (mut f, now) = admission_repair_fixture(false);
+    let request = admission_repair_request(&mut f, now);
+    let receipt = authorize_admission_repair(&f, &request, now);
+    let call = f.store.adaptive_leadership_review_call(&f.leader.tenant_id, receipt.epoch.review_id).unwrap().unwrap();
+    f.store.expire_adaptive_leadership_review_call(&f.leader, call.grant.review_id, 1, request.expires_at_unix_ms).unwrap();
+    change_project(&f, request.expires_at_unix_ms + 1);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    let before = rows(&reopened);
+    let (replayed, prior) = reopened.authorize_adaptive_leadership_admission_repair(
+        &recovery_operator(&f.leader.tenant_id), &request, &f.grant, &f.context,
+        request.expires_at_unix_ms + 2, |_, _| panic!("historical replay must not verify or grant again"),
+    ).unwrap();
+    assert!(replayed && prior == receipt);
+    assert_eq!(rows(&reopened), before);
+    let mut changed = request.clone();
+    changed.release.source_git_sha = "9".repeat(40);
+    assert!(reopened.authorize_adaptive_leadership_admission_repair(
+        &recovery_operator(&f.leader.tenant_id), &changed, &f.grant, &f.context,
+        request.expires_at_unix_ms + 2, |_, _| panic!("occupied slot must conflict before callback"),
+    ).is_err());
+    let mut denied = recovery_operator(&f.leader.tenant_id);
+    denied.role = CompanyRoleV1::Sales;
+    assert!(reopened.authorize_adaptive_leadership_admission_repair(
+        &denied, &request, &f.grant, &f.context, now,
+        |_, _| panic!("invalid operator must not reach callback"),
+    ).is_err());
+    assert_eq!(rows(&reopened), before);
+}
+
+#[test]
+fn admission_repair_failed_or_mismatched_trusted_verification_writes_nothing() {
+    let (mut f, now) = admission_repair_fixture(true);
+    let request = admission_repair_request(&mut f, now);
+    let before = rows(&f.store);
+    for mismatch in 0..9 {
+        let result = f.store.authorize_adaptive_leadership_admission_repair(
+            &recovery_operator(&f.leader.tenant_id), &request, &f.grant, &f.context, now,
+            |source, request| {
+                if mismatch == 0 { return Err(transition()); }
+                let mut evidence = admission_repair_evidence(source, request)?;
+                match mismatch {
+                    1 => evidence.source_digest = "8".repeat(64),
+                    2 => evidence.disposition_digest = "8".repeat(64),
+                    3 => evidence.repair_digest = "8".repeat(64),
+                    4 => evidence.release.gateway_binary_digest = "8".repeat(64),
+                    5 => evidence.failed_release.source_git_sha = "8".repeat(40),
+                    6 => evidence.attested_review_ids.clear(),
+                    7 => evidence.attested_review_ids = vec![source.legacy_epoch.review_id],
+                    _ => evidence.attested_review_ids.push(evidence.attested_review_ids[0]),
+                }
+                Ok(evidence)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(rows(&f.store), before);
+    }
+    authorize_admission_repair(&f, &request, now);
+}
+
+#[test]
+fn admission_repair_dispatch_defer_and_expired_continuation_retirement_preserve_slot() {
+    for retire_proposal in [false, true] {
+        let (mut f, now) = admission_repair_fixture(false);
+        let request = admission_repair_request(&mut f, now);
+        let receipt = authorize_admission_repair(&f, &request, now);
+        let call = f.store.adaptive_leadership_review_call(&f.leader.tenant_id, receipt.epoch.review_id).unwrap().unwrap();
+        let dispatched = f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1).unwrap();
+        let source = session(&f);
+        if retire_proposal {
+            let mut result = budget_result(&dispatched, 2, now + 2);
+            result.decision.schema_version = 4;
+            let audit = adaptive_leadership_continuation_audit_id(dispatched.grant.review_id,
+                &result.request_digest, &result.model_response_digest, &result.decision).unwrap();
+            result.resolution_event_id = Some(audit);
+            result.continuation.as_mut().unwrap().resolution_event_id = audit;
+            let retired = f.store.retire_expired_adaptive_continuation_call(
+                &f.leader, &result, now + 120_002,
+            ).unwrap();
+            assert_eq!(retired.version, 4);
+            assert!(retired.decision.is_none() && retired.continuation.is_none());
+        } else {
+            let mut result = completion(&dispatched, false);
+            result.decision = AdaptiveLeadershipReviewDecisionV1 {
+                schema_version: 4,
+                decision: AdaptiveLeadershipReviewDecisionKindV1::DeferBudget {
+                    rationale: "Explicit repair review declined further spending".into(),
+                    evidence_refs: vec![dispatched.context.evidence_refs[0].clone()],
+                },
+            };
+            let completed = f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).unwrap();
+            assert_eq!(completed.version, 3);
+            assert!(completed.continuation.is_none());
+        }
+        assert_eq!(session(&f), source);
+        assert!(f.store.adaptive_leadership_admission_repair_epoch(&f.leader.tenant_id, f.grant.session_id).unwrap() == Some(receipt));
+    }
+}
+
+#[test]
+fn admission_repair_only_real_model_continuation_changes_window_and_reopens() {
+    let (mut f, now) = admission_repair_fixture(false);
+    let request = admission_repair_request(&mut f, now);
+    let receipt = authorize_admission_repair(&f, &request, now);
+    let call = f.store.adaptive_leadership_review_call(&f.leader.tenant_id, receipt.epoch.review_id).unwrap().unwrap();
+    let dispatched = f.store.claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1).unwrap();
+    let source = session(&f);
+    let mut result = budget_result(&dispatched, 2, now + 2);
+    result.decision.schema_version = 4;
+    let audit = adaptive_leadership_continuation_audit_id(dispatched.grant.review_id,
+        &result.request_digest, &result.model_response_digest, &result.decision).unwrap();
+    result.resolution_event_id = Some(audit);
+    result.continuation.as_mut().unwrap().resolution_event_id = audit;
+    let completed = f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).unwrap();
+    let continued = session(&f);
+    assert_eq!(continued.grant, source.grant);
+    assert_eq!(continued.model_calls, source.model_calls);
+    assert_eq!(continued.tool_calls, source.tool_calls);
+    assert_eq!(continued.active_model_ceiling(), source.model_calls + 2);
+    assert_eq!(continued.continuation.as_ref().unwrap().authorizations.len(), 2);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    assert_eq!(reopened.adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id).unwrap(), Some(completed));
+    assert!(reopened.company_project(&f.leader.tenant_id, &f.grant.project_id).is_ok());
+    assert!(reopened.adaptive_leadership_admission_repair_epoch(&f.leader.tenant_id, f.grant.session_id).unwrap() == Some(receipt));
+}
+
+#[test]
+fn admission_repair_concurrent_same_request_consumes_one_permanent_slot_and_verifies_once() {
+    let (mut f, now) = admission_repair_fixture(true);
+    let request = admission_repair_request(&mut f, now);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let verified = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let workers: Vec<_> = (0..2).map(|_| {
+        let store = WorkflowStore::open(&f.path).unwrap();
+        let operator = recovery_operator(&f.leader.tenant_id);
+        let request = request.clone();
+        let grant = f.grant.clone();
+        let context = f.context.clone();
+        let barrier = barrier.clone();
+        let verified = verified.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            store.authorize_adaptive_leadership_admission_repair(
+                &operator, &request, &grant, &context, now, |source, request| {
+                    verified.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    admission_repair_evidence(source, request)
+                },
+            ).unwrap()
+        })
+    }).collect();
+    let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|(replayed, _)| !replayed).count(), 1);
+    assert_eq!(verified.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(results[0].1 == results[1].1);
+    let calls = f.store.adaptive_leadership_review_calls(&f.leader.tenant_id, f.grant.session_id).unwrap();
+    assert_eq!(calls.len(), 14);
+    assert_eq!(calls.iter().filter(|call| call.grant.schema_version == 4).count(), 1);
+}
+
+#[test]
+fn admission_repair_event_failure_rolls_back_and_fresh_retry_verifies_again() {
+    let (mut f, now) = admission_repair_fixture(false);
+    let request = admission_repair_request(&mut f, now);
+    let before = rows(&f.store);
+    f.store.connection.lock().unwrap().execute_batch(
+        "CREATE TRIGGER reject_admission_repair BEFORE INSERT ON company_events
+         WHEN NEW.event_type='adaptive_leadership_admission_repair_authorized'
+         BEGIN SELECT RAISE(ABORT,'repair event rejected'); END;",
+    ).unwrap();
+    assert!(f.store.authorize_adaptive_leadership_admission_repair(
+        &recovery_operator(&f.leader.tenant_id), &request, &f.grant, &f.context, now, admission_repair_evidence,
+    ).is_err());
+    assert_eq!(rows(&f.store), before);
+    assert!(f.store.adaptive_leadership_admission_repair_epoch(&f.leader.tenant_id, f.grant.session_id).unwrap().is_none());
+    f.store.connection.lock().unwrap().execute_batch("DROP TRIGGER reject_admission_repair").unwrap();
+    authorize_admission_repair(&f, &request, now);
+}
+
+#[test]
+fn admission_repair_disposition_gate_permits_nonretired_decision_absent_continuation() {
+    let (f, _) = admission_repair_fixture(true);
+    let source = f.store.adaptive_leadership_admission_repair_source(
+        &f.leader.tenant_id, f.grant.session_id,
+    ).unwrap();
+    let mut call = source.continuation_reviews.iter()
+        .find(|call| call.grant.schema_version == 3).unwrap().clone();
+    assert!(call.retired_at_unix_ms.is_none());
+    call.decision = None;
+    assert!(super::super::recovery::has_repair_disposition(&call));
+    // This gate cannot substitute for the typed receipt's independent model proof.
+    assert!(call.validate_entity().is_err());
+    call.continuation = None;
+    assert!(!super::super::recovery::has_repair_disposition(&call));
+}
+
+#[test]
+fn admission_repair_corrupted_continuation_denied_before_trusted_verifier() {
+    let (mut f, now) = admission_repair_fixture(true);
+    let request = admission_repair_request(&mut f, now);
+    let source = f.store.adaptive_leadership_admission_repair_source(
+        &f.leader.tenant_id, f.grant.session_id,
+    ).unwrap();
+    let original = source.continuation_reviews.iter()
+        .find(|call| call.grant.schema_version == 3).unwrap();
+    let mut changed = original.clone();
+    changed.continuation.as_mut().unwrap().provider_authority_digest = "0".repeat(64);
+    {
+        let mut connection = f.store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        put_entity(&transaction, &f.leader.tenant_id, KIND, &original.review_key,
+            original.version, &changed).unwrap();
+        transaction.commit().unwrap();
+    }
+    let before = rows(&f.store);
+    assert!(f.store.adaptive_leadership_admission_repair_source(
+        &f.leader.tenant_id, f.grant.session_id,
+    ).is_err());
+    assert!(f.store.authorize_adaptive_leadership_admission_repair(
+        &recovery_operator(&f.leader.tenant_id), &request, &f.grant, &f.context, now,
+        |_, _| panic!("corrupt continuation must fail before verifier"),
+    ).is_err());
+    assert_eq!(rows(&f.store), before);
+    {
+        let mut connection = f.store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        put_entity(&transaction, &f.leader.tenant_id, KIND, &original.review_key,
+            original.version, original).unwrap();
+        transaction.commit().unwrap();
+    }
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    assert!(reopened.adaptive_leadership_admission_repair_source(
+        &f.leader.tenant_id, f.grant.session_id,
+    ).unwrap() == source);
+}
+
+#[test]
+fn admission_repair_retained_continuation_corruption_fails_closed_without_cached_proof() {
+    let (mut f, now) = admission_repair_fixture(true);
+    let request = admission_repair_request(&mut f, now);
+    let receipt = authorize_admission_repair(&f, &request, now);
+    let completed = receipt.source.continuation_reviews.iter().find(|call| call.grant.schema_version == 3).unwrap();
+    let digest: String = f.store.connection.lock().unwrap().query_row(
+        "SELECT payload_digest FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3",
+        params![f.leader.tenant_id.0, KIND, completed.review_key], |row| row.get(0),
+    ).unwrap();
+    f.store.connection.lock().unwrap().execute(
+        "UPDATE company_entities SET payload_digest='tampered' WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3",
+        params![f.leader.tenant_id.0, KIND, completed.review_key],
+    ).unwrap();
+    let before = rows(&f.store);
+    assert!(f.store.adaptive_leadership_admission_repair_epoch(&f.leader.tenant_id, f.grant.session_id).is_err());
+    assert!(f.store.authorize_adaptive_leadership_admission_repair(
+        &recovery_operator(&f.leader.tenant_id), &request, &f.grant, &f.context, now,
+        |_, _| panic!("corrupt historical proof must fail before verifier"),
+    ).is_err());
+    assert_eq!(rows(&f.store), before);
+    f.store.connection.lock().unwrap().execute(
+        "UPDATE company_entities SET payload_digest=?4 WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3",
+        params![f.leader.tenant_id.0, KIND, completed.review_key, digest],
+    ).unwrap();
+    let original = f.store.adaptive_leadership_review_call(&f.leader.tenant_id, receipt.epoch.review_id).unwrap().unwrap();
+    for downgrade in [false, true] {
+        let mut unbound = original.clone();
+        unbound.grant.recovery_epoch = None;
+        if downgrade {
+            unbound.schema_version = 3;
+            unbound.grant.schema_version = 3;
+        }
+        {
+            let mut connection = f.store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            put_entity(&transaction, &f.leader.tenant_id, KIND, &original.review_key, original.version, &unbound).unwrap();
+            transaction.commit().unwrap();
+        }
+        assert!(f.store.adaptive_leadership_review_call(&f.leader.tenant_id, original.grant.review_id).is_err());
+    }
+    {
+        let mut connection = f.store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        put_entity(&transaction, &f.leader.tenant_id, KIND, &original.review_key, original.version, &original).unwrap();
+        transaction.commit().unwrap();
+    }
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    assert!(reopened.adaptive_leadership_admission_repair_epoch(&f.leader.tenant_id, f.grant.session_id).unwrap() == Some(receipt));
 }
