@@ -558,14 +558,14 @@ impl AdaptiveLeadershipReviewDecisionV1 {
                 window_ms,
                 ..
             } => {
-                matches!(self.schema_version, 2 | 3 | 4)
+                matches!(self.schema_version, 2..=4)
                     && (1..=crate::ADAPTIVE_SESSION_MAX_CALLS).contains(&additional_model_calls)
                     && (1_000..=ADAPTIVE_LEADERSHIP_MAX_GRANT_MS).contains(&window_ms)
             }
         };
         if !version_matches
             || !valid_text(rationale, ADAPTIVE_LEADERSHIP_MAX_RATIONALE_BYTES)
-            || (matches!(self.schema_version, 2 | 3 | 4) && refs.is_empty())
+            || (matches!(self.schema_version, 2..=4) && refs.is_empty())
         {
             return Err(invalid());
         }
