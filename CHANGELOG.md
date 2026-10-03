@@ -1,5 +1,11 @@
 # Changelog
 
+- Revalidate accounting-reconsideration proofs in a fresh bounded post-write
+  snapshot without committing the outer transaction early. Avoid repeated
+  historical scans after cache invalidation; preserve all review limits and
+  receipt/event/membership/call rollback, and distinguish invalid designated
+  grant and context errors without exposing private evidence (#856).
+
 - Give adaptive employees bounded, private journal working memory with observed
   tool outcomes and explicit root/window spending. Preserve sealed historical
   model contexts, fresh inspection and failed-test truth. Permit one explicit
