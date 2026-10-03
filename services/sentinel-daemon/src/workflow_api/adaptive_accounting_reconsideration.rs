@@ -670,8 +670,20 @@ fn designated_review(
     } else {
         return Err(source_conflict());
     }
-    grant.validate(now)?;
-    context.validate(&grant)?;
+    grant.validate(now).map_err(|error| {
+        WorkflowError::new(
+            error.code,
+            error.retryable,
+            "accounting designated review grant invalid",
+        )
+    })?;
+    context.validate(&grant).map_err(|error| {
+        WorkflowError::new(
+            error.code,
+            error.retryable,
+            "accounting designated review context invalid",
+        )
+    })?;
     let operation = stable_operation_id(
         "sentinel.workflow.accounting-reconsideration-review.v1",
         &request.operation_id.to_string(),
@@ -909,6 +921,36 @@ mod tests {
             "credential",
         ] {
             assert!(!text.contains(forbidden), "HTTP exposed {forbidden}");
+        }
+    }
+
+    #[test]
+    fn accounting_issuance_later_than_draft_keeps_refusal_and_original_deadlines() {
+        let f = RefusalFixture::new("pruned");
+        let before = f.state();
+        let (request, _) = f.draft();
+        let issued_at = request.expires_at_unix_ms - 150_000;
+        let response = f.http_at("POST", &serde_json::to_vec(&request).unwrap(), issued_at);
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let receipt = f
+            .api
+            .store
+            .adaptive_accounting_reconsideration(
+                &f.session.grant.authority.tenant_id,
+                f.session.grant.session_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.issued_at_unix_ms, issued_at);
+        assert_eq!(receipt.source.refused_review, f.refusal);
+        assert_eq!(receipt.source.source_session, f.session);
+        for (old_rows, current_rows) in before.into_iter().zip(f.state()) {
+            assert!(old_rows.iter().all(|row| current_rows.contains(row)));
         }
     }
 
