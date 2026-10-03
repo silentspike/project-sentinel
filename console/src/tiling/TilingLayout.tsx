@@ -1,13 +1,11 @@
-import { createMemo, onMount, onCleanup, Show, type JSX } from "solid-js";
+import { createMemo, createSignal, For, onMount, onCleanup, type JSX } from "solid-js";
 import { type TileNode, type SplitNode, resizeSplit, focusLeaf, minimumTileSize, TILE_GUTTER, type PanelKind } from "./engine";
+import { layoutTiles, type TileRect } from "./geometry";
 
-// Render der Tiling-Engine (#444): rekursiv auf CSS Grid. Split = `grid-template-{columns|rows}`
-// aus `fraction` + Gutter dazwischen. Gutter-Pointer-Drag aktualisiert die Fraktion (60fps).
-// Smooth Re-Tiling via CSS-Transition + WAAPI-Fade-in neuer Panels.
-// Das aktuelle Container-Rect bleibt auch nach Workspace-Scroll korrekt.
+// Keyed leaves own views independently of the split tree, preserving edits during re-tiling.
 
 const GUTTER = TILE_GUTTER;
-const TRANSITION = "grid-template-columns 180ms ease, grid-template-rows 180ms ease";
+const TRANSITION = "left 180ms ease, top 180ms ease, width 180ms ease, height 180ms ease";
 
 function Gutter(props: { split: SplitNode; rect: () => DOMRect | null }) {
   let dragging = false;
@@ -64,59 +62,64 @@ function Gutter(props: { split: SplitNode; rect: () => DOMRect | null }) {
   );
 }
 
-export function Tiling(props: { node: TileNode; renderPanel: (p: PanelKind, leafId: string) => JSX.Element }): JSX.Element {
-  return (
-    <Show
-      when={props.node.kind === "split" ? (props.node as SplitNode) : null}
-      fallback={<LeafTile node={props.node as Extract<TileNode, { kind: "leaf" }>} renderPanel={props.renderPanel} />}
-    >
-      {(split) => <SplitTile split={split()} renderPanel={props.renderPanel} />}
-    </Show>
-  );
-}
-
-function SplitTile(props: { split: SplitNode; renderPanel: (p: PanelKind, leafId: string) => JSX.Element }): JSX.Element {
+export function Tiling(props: { node: TileNode; renderPanel: (p: PanelKind, leafId: string, initialAgentId?: number) => JSX.Element }): JSX.Element {
   let el: HTMLDivElement | undefined;
-  const getRect = () => el?.getBoundingClientRect() ?? null;
-  const minimumA = createMemo(() => minimumTileSize(props.split.a));
-  const minimumB = createMemo(() => minimumTileSize(props.split.b));
-  const template = () => {
-    const axis = props.split.dir === "row" ? "width" : "height";
-    const a = `minmax(${minimumA()[axis]}px, ${props.split.fraction}fr)`;
-    const b = `minmax(${minimumB()[axis]}px, ${1 - props.split.fraction}fr)`;
-    return `${a} ${GUTTER}px ${b}`;
+  const [size, setSize] = createSignal({ width: 0, height: 0 });
+  const minimum = createMemo(() => minimumTileSize(props.node));
+  const layout = createMemo(() => layoutTiles(props.node, size().width, size().height));
+  const position = (rect: TileRect): JSX.CSSProperties => ({
+    position: "absolute", left: `${rect.x}px`, top: `${rect.y}px`,
+    width: `${rect.width}px`, height: `${rect.height}px`,
+    "min-width": 0, "min-height": 0, overflow: "hidden", transition: TRANSITION,
+  });
+  const getRect = (rect: TileRect) => {
+    const surface = el?.getBoundingClientRect();
+    return surface ? new DOMRect(surface.left + rect.x, surface.top + rect.y,
+      rect.width, rect.height) : null;
   };
+  onMount(() => {
+    const measure = () => {
+      if (el) setSize({ width: el.clientWidth, height: el.clientHeight });
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el!);
+    onCleanup(() => observer.disconnect());
+  });
   return (
     <div
       ref={el}
-      data-testid={`split-${props.split.id}`}
+      data-testid="tiling-surface"
       style={{
-        display: "grid",
-        [props.split.dir === "row" ? "grid-template-columns" : "grid-template-rows"]: template(),
-        gap: 0,
-        height: "100%",
-        width: "100%",
-        "min-height": `${props.split.dir === "col" ? minimumA().height + GUTTER + minimumB().height : Math.max(minimumA().height, minimumB().height)}px`,
-        "min-width": `${props.split.dir === "row" ? minimumA().width + GUTTER + minimumB().width : Math.max(minimumA().width, minimumB().width)}px`,
-        transition: TRANSITION,
+        position: "relative", height: "100%", width: "100%",
+        "min-width": `${minimum().width}px`, "min-height": `${minimum().height}px`,
       }}
     >
-      <div style={{ "min-width": 0, "min-height": 0, overflow: "hidden" }}>
-        <Tiling node={props.split.a} renderPanel={props.renderPanel} />
-      </div>
-      <Gutter split={props.split} rect={getRect} />
-      <div style={{ "min-width": 0, "min-height": 0, overflow: "hidden" }}>
-        <Tiling node={props.split.b} renderPanel={props.renderPanel} />
-      </div>
+      <For each={[...layout().leaves.keys()]}>{(id) => {
+        const initial = layout().leaves.get(id)!;
+        const slot = () => layout().leaves.get(id) ?? initial;
+        return <div style={position(slot())}>
+          <LeafTile node={slot().node} renderPanel={props.renderPanel} />
+        </div>;
+      }}</For>
+      <For each={[...layout().gutters.keys()]}>{(id) => {
+        const initial = layout().gutters.get(id)!;
+        const slot = () => layout().gutters.get(id) ?? initial;
+        return <div style={position(slot())} data-testid={`split-${id}`}>
+          <Gutter split={slot().node} rect={() => getRect(slot().parent)} />
+        </div>;
+      }}</For>
     </div>
   );
 }
 
-function LeafTile(props: { node: Extract<TileNode, { kind: "leaf" }>; renderPanel: (p: PanelKind, leafId: string) => JSX.Element }): JSX.Element {
+function LeafTile(props: { node: Extract<TileNode, { kind: "leaf" }>; renderPanel: (p: PanelKind, leafId: string, initialAgentId?: number) => JSX.Element }): JSX.Element {
+  const { id, panel, initialAgentId } = props.node;
+  const content = props.renderPanel(panel, id, initialAgentId);
   let el: HTMLDivElement | undefined;
   onMount(() => {
     // WAAPI-Fade-in beim Erscheinen eines neuen Panels (GPU: opacity/transform), kein Jank.
-    el?.animate(
+    el?.animate?.(
       [{ opacity: 0, transform: "scale(0.98)" }, { opacity: 1, transform: "scale(1)" }],
       { duration: 160, easing: "ease-out" },
     );
@@ -124,11 +127,11 @@ function LeafTile(props: { node: Extract<TileNode, { kind: "leaf" }>; renderPane
   return (
     <div
       ref={el}
-      data-testid={`tile-${props.node.panel}`}
-      onPointerDown={() => focusLeaf(props.node.id)}
+      data-testid={`tile-${panel}`}
+      onPointerDown={() => focusLeaf(id)}
       style={{ height: "100%", width: "100%", "min-height": 0, "min-width": 0 }}
     >
-      {props.renderPanel(props.node.panel, props.node.id)}
+      {content}
     </div>
   );
 }

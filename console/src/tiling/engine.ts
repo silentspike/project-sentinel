@@ -12,6 +12,7 @@ export interface LeafNode {
   kind: "leaf";
   id: string;
   panel: PanelKind;
+  initialAgentId?: number;
 }
 export interface SplitNode {
   kind: "split";
@@ -42,8 +43,8 @@ function nextId(prefix: string): string {
   return `${prefix}-${counter++}`;
 }
 
-export function leaf(panel: PanelKind): LeafNode {
-  return { kind: "leaf", id: nextId("leaf"), panel };
+export function leaf(panel: PanelKind, initialAgentId?: number): LeafNode {
+  return { kind: "leaf", id: nextId("leaf"), panel, ...(initialAgentId == null ? {} : { initialAgentId }) };
 }
 
 /** Default-Workspace: drei Saeulen fuer die ersten migrierten Push-Views. */
@@ -89,11 +90,11 @@ function mapNode(node: TileNode, id: string, fn: (n: TileNode) => TileNode | nul
 }
 
 /** Splittet ein Leaf: das bestehende Panel bleibt, ein neues Panel kommt daneben/darunter. */
-export function splitLeaf(leafId: string, dir: SplitDir, panel: PanelKind) {
+export function splitLeaf(leafId: string, dir: SplitDir, panel: PanelKind, initialAgentId?: number) {
   setTree(
     produce((s) => {
       const root = mapNode(s.root, leafId, (n) =>
-        n.kind === "leaf" ? { kind: "split", id: nextId("split"), dir, fraction: 0.5, a: n, b: leaf(panel) } : n,
+        n.kind === "leaf" ? { kind: "split", id: nextId("split"), dir, fraction: 0.5, a: n, b: leaf(panel, initialAgentId) } : n,
       );
       if (root) s.root = root;
     }),
@@ -124,9 +125,9 @@ export function resizeSplit(splitId: string, fraction: number) {
 }
 
 /** Gaia-Command: oeffnet kontextuell ein Panel (z.B. "zeig Floorplan") — splittet das fokussierte/erste Leaf. */
-export function openPanel(panel: PanelKind, dir: SplitDir = "row") {
+export function openPanel(panel: PanelKind, dir: SplitDir = "row", initialAgentId?: number) {
   const target = (tree.focused && findLeaf(tree.root, tree.focused)) || firstLeaf(tree.root);
-  splitLeaf(target.id, dir, panel);
+  splitLeaf(target.id, dir, panel, initialAgentId);
 }
 
 export function focusLeaf(leafId: string) {

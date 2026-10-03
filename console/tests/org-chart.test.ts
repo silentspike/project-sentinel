@@ -86,14 +86,14 @@ describe("OrgChartView (#424)", () => {
     expect(tiers.some((t) => t.includes("—"))).toBe(true); // Max's null tier
   });
 
-  it("click on an agent sets selectedAgentId + opens the agent-editor (AC-3)", async () => {
+  it("click on an agent opens a tile-scoped editor without changing existing selections (AC-3)", async () => {
     stubFetch();
     const { getAllByTestId } = render(OrgChartView);
     await waitFor(() => expect(getAllByTestId("org-agent-node").length).toBe(4));
     // DOM order (dept Design->Dev->Leitung, agents by name): Lisa(2), Max(3), Anna(4), Thomas(1).
     fireEvent.click(getAllByTestId("org-agent-node")[0]); // Lisa, id 2
-    expect(selectedAgentId()).toBe(2);
-    expect(openPanel).toHaveBeenCalledWith("agent-editor");
+    expect(selectedAgentId()).toBe(null);
+    expect(openPanel).toHaveBeenCalledWith("agent-editor", "row", 2);
   });
 
   it("exposes agent nodes as keyboard-focusable buttons", async () => {
@@ -127,6 +127,15 @@ describe("OrgChartView (#424)", () => {
 });
 
 describe("AgentEditorView consume-and-clear (#424 AC-3)", () => {
+  it("binds an explicit tile selection without consuming another view's legacy selection", async () => {
+    stubFetch();
+    setSelectedAgentId(2);
+    const { getByTestId } = render(() => AgentEditorView({ initialAgentId: 4 }));
+    await waitFor(() => expect((getByTestId("ae-name") as HTMLInputElement).value).toBe("Anna"));
+    expect((getByTestId("ae-select") as HTMLSelectElement).value).toBe("4");
+    expect(selectedAgentId()).toBe(2);
+  });
+
   it("pre-selects the org-chart-requested agent then clears the shared signal", async () => {
     stubFetch();
     setSelectedAgentId(4); // org-chart requested agent 4 (Anna)
