@@ -1109,6 +1109,7 @@ pub(crate) mod tests {
                         continuation_history_digest: history_digest.clone(),
                         observed_at_ms: now,
                         deadline_expired: true,
+                        dispatch_slack_insufficient: false,
                         model_calls_exhausted: session.model_calls
                             >= session.active_model_ceiling(),
                     }),

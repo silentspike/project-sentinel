@@ -1,5 +1,18 @@
 # Changelog
 
+- Add one immutable, finite resume policy per original employee session, with
+  operator-bound issuance, sealed review membership, preserved root spending
+  and genuine leadership decisions before new work windows. Recheck execution
+  time after store validation and the provider queue, without deadline renewal,
+  refunded claims or unknown-effect replay (#856).
+
+- Share historical subscription proofs across all allowances of one project
+  read, without sharing validation budgets or cached authority across projects
+  or later reads. Fuse initial provider candidate and authority selection and
+  reuse already prepared leadership, Sales and planning context only for that
+  selection; retain durable recovery before deferred work preparation and fresh
+  authorization before reservation and dispatch (#856).
+
 - Add an explicit, permanently consumed admission-repair review entitlement for
   an original employee session after both normal review issuances are exhausted.
   Require the complete retained mixed-effect history, exact failed-admission

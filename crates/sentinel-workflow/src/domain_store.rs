@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 mod adaptive_leadership_local_adoption;
 mod adaptive_leadership_review;
+pub(crate) mod adaptive_resume_policy;
 pub use adaptive_leadership_review::{
     AdaptiveBudgetReviewExtensionReceiptV1, AdaptiveBudgetReviewExtensionRequestV1,
 };

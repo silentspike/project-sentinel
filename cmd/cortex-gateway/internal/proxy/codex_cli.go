@@ -217,6 +217,9 @@ func (p *CodexCLIProvider) reserveInferenceSlot(ctx context.Context) error {
 	select {
 	case p.sem <- struct{}{}:
 	case <-ctx.Done():
+		if bounded, _ := ctx.Value(subscriptionDispatchContextKey{}).(bool); bounded {
+			return providerAdmissionError(fmt.Errorf("subscription semaphore wait expired: %w", ctx.Err()))
+		}
 		return fmt.Errorf("codex-cli semaphore wait: %w", ctx.Err())
 	}
 	// A preceding in-flight attempt may have established quota while we waited.
@@ -265,6 +268,9 @@ func (p *CodexCLIProvider) Send(ctx context.Context, req *LLMRequest) (response 
 	cmd.Dir = p.workdir
 	cmd.Env = p.commandEnv()
 	cmd.Stdin = strings.NewReader(prompt)
+	if err := validateSubscriptionDispatchSlack(ctx, p.now()); err != nil {
+		return nil, err
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("codex-cli stdout pipe: %w", err)

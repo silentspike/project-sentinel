@@ -139,6 +139,62 @@ session head fail closed, including on retries. An authenticated credential
 rotation of the same leader can finish a prior decision across the crash gap
 without a new model call or alteration of the historical event.
 
+## Finite Session Resume Policy
+
+An expired work window is not the same as an exhausted task budget. A retained
+unknown model effect is not evidence that the provider did no work. When the
+original task still has model and tool capacity, an authenticated same-tenant
+Operator Project Manager or Technical Lead can declare one finite resume policy
+through `/operator/workflow/adaptive-resume-policy`. Read-only preparation
+captures the exact current project, assignment, session head, original grant,
+spent calls, review history, continuation history and, for an unknown result,
+independently verified model-only evidence. Submission revalidates that source
+and seals the immutable policy and audit event atomically.
+
+`GET` prepares the request without issuing authority; `POST` submits that exact
+request. The default policy expiry is 24 hours, each work window is at most
+300 seconds, and every admitted model call retains the original per-call limit
+plus at least one second of dispatch margin. The policy has at most 128 total
+review tickets, including earlier reviews. Smaller productive limits are
+allowed; issuance cannot create capacity beyond the original unspent budget.
+
+This policy changes the cumulative review and work-window ceilings, not the
+original model/tool ceilings or their consumed calls. Its additional capacity
+cannot exceed the remaining original model calls, remaining original tool calls
+or the bounded review inventory. The policy is permanent for that session:
+another operation cannot replace it, and an exact retry returns the same receipt
+without renewing its expiry or capacity. It never resets an earlier review,
+window, failed request, unknown effect or task identity.
+
+The employee's real Project Manager or Technical Lead still decides whether to
+continue. A policy only permits bounded model-driven reviews; it is not a
+developer allowance, a completion claim or customer acceptance. Each review
+permanently consumes an ordinal, even when it expires before dispatch. A real
+`Continue` atomically appends one policy-bound authorization and allowance. A
+`KeepUnknown` or `DeferBudget` remains a decision, not an automatic retry loop.
+That refusal remains effective for the exact session head under its policy even
+when unrelated project metadata changes. Policy-bound leadership calls also
+retain the original task's per-call ceiling. Expired review history is bound by
+one deterministic count/digest reference instead of an unbounded evidence list;
+the spent policy ordinal still distinguishes every new review.
+An unknown model effect stays abandoned, and fresh private observation is still
+required before any subsequent work.
+
+Historical policy and review membership use immutable sealed leaf proofs. They
+do not recursively reload completed reviews or current project snapshots.
+Fresh issuance and consumption independently verify current assignment,
+unchanged root authority and exact journal descent from the policy anchor.
+Missing, altered or mismatched membership fails closed rather than falling
+back to the earlier review or window limits.
+
+The store samples the final claim clock after authority validation. A governed
+window must have enough remaining time for its declared call duration and
+dispatch margin; insufficient time creates no effect or counter increment.
+The Gateway checks remaining slack after the workflow claim, and Codex checks
+again after its own queue and preparation before subprocess start. Both retain
+the absolute deadline. A late rejection after a committed claim neither
+refunds that claim nor grants replay permission.
+
 ## One-Time Admission Repair Review
 
 The operator admission-repair path addresses a different failure: a bounded
@@ -183,6 +239,28 @@ the operator may establish the exact failed-release evidence and issue the one
 exceptional review. Leadership can then decide to continue the same work within
 its remaining allowance or to defer it. Neither preparation nor issuance
 implements the task or claims customer acceptance.
+
+## Validation And Dispatch Preparation
+
+Project discovery validates all current and historical subscription allowances
+inside one bounded SQLite read scope per project. Completed journal and receipt
+proofs may be reused only inside that unchanged snapshot. Independent projects
+receive independent validation budgets. A later read or a reopened store must
+validate again; writes invalidate reuse, and corrupt, cyclic or over-budget
+proofs remain errors. This avoids replaying the same historical journal once
+for every allowance without trusting cached authority across requests.
+
+The bridge combines initial candidate and authority selection. Leadership,
+Sales and planning contexts already prepared by that selection can be used for
+the same request; adaptive and ordinary work context preparation remains after
+durable reservation recovery. Queue admission, reservation and provider dispatch
+still revalidate current authority. Selection and preparation latency is
+reported as metadata, not as private model text.
+
+This optimization does not renew a work deadline, restore consumed calls,
+reopen an exhausted review entitlement or classify a provider timeout as no I/O.
+For example, a slow initial read must not cause the bridge to replay an unknown
+provider effect or send work using an expired grant.
 
 ## ORC Integration Contract
 

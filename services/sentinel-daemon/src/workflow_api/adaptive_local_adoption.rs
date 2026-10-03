@@ -740,6 +740,7 @@ mod tests {
                     ).unwrap(),
                     issued_at_ms: adoption.issued_at_unix_ms, deadline_ms: adoption.continuation_deadline_ms,
                     additional_model_calls: 1, local_adoption: Some(Box::new(adoption.clone())),
+                    resume_policy: None,
                 }),
             };
             pending.validate_completion_proposal(&result).unwrap();

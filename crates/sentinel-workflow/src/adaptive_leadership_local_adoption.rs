@@ -641,6 +641,7 @@ mod tests {
             deadline_ms: original.continuation_deadline_ms,
             additional_model_calls: 1,
             local_adoption: Some(Box::new(original.clone())),
+            resume_policy: None,
         };
         continuation.validate().unwrap();
         let replay: crate::AdaptiveContinuationAuthorizationV1 =
