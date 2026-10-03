@@ -21,12 +21,12 @@ pub use event_gateway::{
 pub use event_store::{
     runtime_config_apply_digest, EventStore, LlmCompletionEntry, LlmHistoricalInferenceBoundaryV1,
     LlmHistoricalModelJournalReceiptV1, LlmModelReservationV1, LlmModelSubjectV1,
-    LlmModelUsageBindingV1, LlmRetrospectiveModelBindingV1, LlmRetrospectiveModelProvenanceV1,
-    LlmRetrospectiveUnknownModelEvidenceV1, LlmSealedUnknownModelEvidenceV1, MonotonicityError,
-    OutboxEntry, OutboxTransport, RuntimeConfigApplyDecision, RuntimeConfigApplyPhase,
-    RuntimeConfigApplyRecoveryMarker, RuntimeConfigApplyRecoveryStart, RuntimeConfigRecoveryMarker,
-    RuntimeConfigRecoveryPhase, SnapshotRow, IMMUTABLE_SNAPSHOT_MS,
-    RUNTIME_CONFIG_APPLY_SCHEMA_VERSION,
+    LlmModelUsageBindingV1, LlmRetainedModelRejectionEvidenceV1, LlmRetrospectiveModelBindingV1,
+    LlmRetrospectiveModelProvenanceV1, LlmRetrospectiveUnknownModelEvidenceV1,
+    LlmSealedUnknownModelEvidenceV1, MonotonicityError, OutboxEntry, OutboxTransport,
+    RuntimeConfigApplyDecision, RuntimeConfigApplyPhase, RuntimeConfigApplyRecoveryMarker,
+    RuntimeConfigApplyRecoveryStart, RuntimeConfigRecoveryMarker, RuntimeConfigRecoveryPhase,
+    SnapshotRow, IMMUTABLE_SNAPSHOT_MS, RUNTIME_CONFIG_APPLY_SCHEMA_VERSION,
 };
 pub use outbox_publisher::{OutboxPublisher, OutboxPublisherConfig, PublishCycleStats};
 

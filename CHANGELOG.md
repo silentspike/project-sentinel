@@ -1,5 +1,16 @@
 # Changelog
 
+- Bind leadership decision generation to the exact validated evidence-reference
+  set. Native structured output cannot shorten or invent those references;
+  carry the journal's fresh-inspection requirement into employee prompts and
+  generation schemas despite retained historical observations. Verify and
+  retire expired invalid leadership responses without adopting a decision,
+  changing retained completions, refunding consumed reviews, replaying unknown
+  effects or increasing original root budgets (#856).
+  Retain known pre-inspection write rejections and their usage, publish an exact
+  receipt, and atomically reject/resume the same journal under unchanged grants
+  and fresh-inspection requirements; never execute the rejected proposal.
+
 - Add one immutable, finite resume policy per original employee session, with
   operator-bound issuance, sealed review membership, preserved root spending
   and genuine leadership decisions before new work windows. Recheck execution

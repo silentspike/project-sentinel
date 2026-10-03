@@ -5136,6 +5136,18 @@ impl WorkflowApi {
         })?;
         for project in projects {
             #[cfg(feature = "llm")]
+            if self
+                .recover_known_rejected_adaptive_model(&project)
+                .map_err(|reason| {
+                    log_reconciliation_failure("known_model_rejection", reason);
+                    workflow_unavailable()
+                })?
+            {
+                // A receipt-only disposition grants no provider window. Read
+                // the committed head on the next turn before normal discovery.
+                continue;
+            }
+            #[cfg(feature = "llm")]
             self.reconcile_unknown_adaptive_models(&project)
                 .map_err(|reason| {
                     log_reconciliation_failure("unknown_model", reason);

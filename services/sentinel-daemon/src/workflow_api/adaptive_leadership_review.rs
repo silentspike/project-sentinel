@@ -6,8 +6,9 @@ use super::*;
 use sentinel_workflow::{
     adaptive_leadership_evidence_fingerprint, adaptive_leadership_review_id,
     AdaptiveLeadershipReviewCallV1, AdaptiveLeadershipReviewContextV1,
-    AdaptiveLeadershipReviewDecisionV1, AdaptiveLeadershipReviewGrantV1,
-    CompleteAdaptiveLeadershipReviewCallV1, ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+    AdaptiveLeadershipReviewDecisionKindV1, AdaptiveLeadershipReviewDecisionV1,
+    AdaptiveLeadershipReviewGrantV1, CompleteAdaptiveLeadershipReviewCallV1,
+    ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,7 +450,9 @@ impl WorkflowApi {
                         && call.dispatch.is_some()
                         && clock() >= call.grant.expires_at_unix_ms
                     {
-                        self.expire_sealed_unknown_leadership_review(call, &clock)?;
+                        if !self.expire_invalid_leadership_review(call, &clock)? {
+                            self.expire_sealed_unknown_leadership_review(call, &clock)?;
+                        }
                         // Retirement is durable before a later reconciliation can
                         // derive a distinct, independently bounded review identity.
                         continue;
@@ -950,6 +953,201 @@ impl WorkflowApi {
         Ok(blocked)
     }
 
+    // Caller holds the mutation fence; verification is historical, not fresh admission.
+    fn expire_invalid_leadership_review(
+        &self,
+        call: &AdaptiveLeadershipReviewCallV1,
+        clock: &impl Fn() -> u64,
+    ) -> Result<bool, &'static str> {
+        if !matches!(call.grant.schema_version, 2..=4)
+            || call.grant.subject.is_none()
+            || call.version != 2
+            || call.decision.is_some()
+            || call.continuation.is_some()
+            || call.retired_at_unix_ms.is_some()
+        {
+            return Ok(false);
+        }
+        let dispatch = call
+            .dispatch
+            .as_ref()
+            .ok_or("leadership dispatch missing")?;
+        let events = self
+            .event_store
+            .as_ref()
+            .ok_or("leadership EventStore missing")?;
+        let Some(stored) = events
+            .get_llm_completion(&dispatch.request_id)
+            .map_err(|_| "leadership completion unavailable")?
+        else {
+            return Ok(false);
+        };
+        if stored.status != "failed"
+            || stored.last_error.as_deref() != Some("leadership decision evidence invalid")
+            || clock() < call.grant.expires_at_unix_ms
+        {
+            return Ok(false);
+        }
+        if self
+            .store
+            .adaptive_leadership_local_adoption(
+                &call.grant.leadership_principal.tenant_id,
+                call.grant.review_id,
+            )
+            .map_err(|_| "local adoption authority unavailable")?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let (completion, _) = self.verified_retained_leadership_completion(call, &stored)?;
+        let Ok(decision) =
+            serde_json::from_str::<AdaptiveLeadershipReviewDecisionV1>(&completion.content)
+        else {
+            return Ok(false);
+        };
+        let returned_refs = match &decision.decision {
+            AdaptiveLeadershipReviewDecisionKindV1::DeferBudget { evidence_refs, .. }
+            | AdaptiveLeadershipReviewDecisionKindV1::ResolveBlocked { evidence_refs, .. }
+            | AdaptiveLeadershipReviewDecisionKindV1::KeepBlocked { evidence_refs, .. }
+            | AdaptiveLeadershipReviewDecisionKindV1::KeepUnknown { evidence_refs, .. }
+            | AdaptiveLeadershipReviewDecisionKindV1::Continue { evidence_refs, .. } => {
+                evidence_refs
+            }
+        };
+        // Self-reference validation isolates membership from shape and subject failures.
+        // The raw decision and the sealed supplied evidence remain unchanged.
+        if decision.validate(returned_refs).is_err()
+            || decision.validate_subject(&call.grant).is_err()
+            || decision.validate(&call.context.evidence_refs).is_ok()
+        {
+            return Ok(false);
+        }
+        let leader = self
+            .principals
+            .principal(&call.grant.leadership_principal.principal_id)
+            .ok_or("leader principal missing")?;
+        if leader.principal != call.grant.leadership_principal
+            || leader.execution_authority != call.grant.leadership_authority
+        {
+            return Err("leader authority changed");
+        }
+        self.validate_company_employee(&leader.principal)?;
+        let now = clock();
+        if now < call.grant.expires_at_unix_ms {
+            return Ok(false);
+        }
+        self.store
+            .expire_adaptive_leadership_review_call(
+                &leader.principal,
+                call.grant.review_id,
+                call.version,
+                now,
+            )
+            .map_err(|_| "expired leadership retirement rejected")?;
+        Ok(true)
+    }
+
+    fn verified_retained_leadership_completion(
+        &self,
+        call: &AdaptiveLeadershipReviewCallV1,
+        stored: &sentinel_limbo::LlmCompletionEntry,
+    ) -> Result<(ModelExecutionCompletion, DomainEvent), &'static str> {
+        if stored.payload.len() > 2 * 1024 * 1024 {
+            return Err("leadership payload exceeds bound");
+        }
+        let dispatch = call
+            .dispatch
+            .as_ref()
+            .ok_or("leadership dispatch missing")?;
+        let payload: serde_json::Value =
+            serde_json::from_str(&stored.payload).map_err(|_| "leadership payload invalid")?;
+        let completion: ModelExecutionCompletion = serde_json::from_value(
+            payload
+                .get("model_work")
+                .cloned()
+                .ok_or("leadership completion missing")?,
+        )
+        .map_err(|_| "leadership completion invalid")?;
+        if completion.content.len() > 16 * 1024 {
+            return Err("leadership decision exceeds bound");
+        }
+        let ModelExecutionContext::AdaptiveLeadershipReview(context) = &completion.context else {
+            return Err("leadership completion inadmissible");
+        };
+        let context_digest = call
+            .context_digest()
+            .map_err(|_| "leadership context digest invalid")?;
+        if !completion.admissible
+            || context.binding != LeadershipAuthority::from_call(call)
+            || context.source != call.context
+            || context.context_digest != context_digest
+            || dispatch.context_digest != context_digest
+            || dispatch.request_id != call.request_id()
+            || stored.request_id != dispatch.request_id
+            || stored.request_digest != dispatch.request_digest
+            || stored.owner_scope
+                != sentinel_common::StateTransferScope::for_agent(
+                    call.grant
+                        .leadership_principal
+                        .agent_id
+                        .ok_or("leader agent missing")?
+                        .to_string(),
+                )
+            || dispatch.dispatched_at_unix_ms < call.grant_issued_at_unix_ms
+            || dispatch.dispatched_at_unix_ms >= call.grant.expires_at_unix_ms
+        {
+            return Err("leadership dispatch mismatch");
+        }
+        // Validate the original context at issuance, never against today's expiry.
+        context.validate_dispatch(call.grant_issued_at_unix_ms)?;
+        if payload.get("model_work")
+            != Some(
+                &serde_json::to_value(&completion).map_err(|_| "leadership completion invalid")?,
+            )
+            || payload.get("version").and_then(|value| value.as_u64()) != Some(2)
+            || !payload
+                .get("actions")
+                .and_then(|value| value.as_array())
+                .is_some_and(|actions| actions.is_empty())
+            || payload.get("request_id").and_then(|v| v.as_str())
+                != Some(dispatch.request_id.as_str())
+            || payload.get("request_digest").and_then(|v| v.as_str())
+                != Some(dispatch.request_digest.as_str())
+        {
+            return Err("leadership payload mismatch");
+        }
+        let digest = format!("{:x}", Sha256::digest(completion.content.as_bytes()));
+        if payload
+            .get("model_response_digest")
+            .and_then(|value| value.as_str())
+            != Some(digest.as_str())
+        {
+            return Err("leadership raw response digest mismatch");
+        }
+        let usage: DomainEvent = serde_json::from_value(
+            payload
+                .get("usage_event")
+                .cloned()
+                .ok_or("leadership usage missing")?,
+        )
+        .map_err(|_| "leadership usage invalid")?;
+        completion.validate_usage(&usage)?;
+        let persisted_usage = self
+            .event_store
+            .as_ref()
+            .ok_or("leadership EventStore missing")?
+            .event_by_operation_id(&format!("llm_usage_{}", dispatch.request_id))
+            .map_err(|_| "leadership persisted usage unavailable")?
+            .ok_or("leadership persisted usage missing")?;
+        if serde_json::to_value(&persisted_usage)
+            .map_err(|_| "leadership persisted usage invalid")?
+            != serde_json::to_value(&usage).map_err(|_| "leadership usage invalid")?
+        {
+            return Err("leadership persisted usage mismatch");
+        }
+        Ok((completion, usage))
+    }
+
     fn expire_sealed_unknown_leadership_review(
         &self,
         call: &AdaptiveLeadershipReviewCallV1,
@@ -1410,37 +1608,12 @@ impl WorkflowApi {
         {
             return Err("leadership completion not durably accounted");
         }
-        let payload: serde_json::Value =
-            serde_json::from_str(&stored.payload).map_err(|_| "leadership payload invalid")?;
-        if payload.get("model_work")
-            != Some(&serde_json::to_value(completion).map_err(|_| "leadership completion invalid")?)
-            || payload.get("version").and_then(|value| value.as_u64()) != Some(2)
-            || !payload
-                .get("actions")
-                .and_then(|value| value.as_array())
-                .is_some_and(|actions| actions.is_empty())
-            || payload.get("request_id").and_then(|v| v.as_str()) != Some(request_id)
-            || payload.get("request_digest").and_then(|v| v.as_str()) != Some(request_digest)
+        let (retained, usage) = self.verified_retained_leadership_completion(&call, &stored)?;
+        if retained.context != completion.context
+            || retained.content != completion.content
+            || retained.admissible != completion.admissible
         {
             return Err("leadership payload mismatch");
-        }
-        let usage: DomainEvent = serde_json::from_value(
-            payload
-                .get("usage_event")
-                .cloned()
-                .ok_or("leadership usage missing")?,
-        )
-        .map_err(|_| "leadership usage invalid")?;
-        completion.validate_usage(&usage)?;
-        let persisted_usage = events
-            .event_by_operation_id(&format!("llm_usage_{request_id}"))
-            .map_err(|_| "leadership persisted usage unavailable")?
-            .ok_or("leadership persisted usage missing")?;
-        if serde_json::to_value(&persisted_usage)
-            .map_err(|_| "leadership persisted usage invalid")?
-            != serde_json::to_value(&usage).map_err(|_| "leadership usage invalid")?
-        {
-            return Err("leadership persisted usage mismatch");
         }
         let decision = parse_decision(&completion.content, &context.source.evidence_refs)?;
         decision
@@ -1464,13 +1637,6 @@ impl WorkflowApi {
             {
                 return Err("local adoption retained response changed");
             }
-        }
-        if payload
-            .get("model_response_digest")
-            .and_then(|value| value.as_str())
-            != Some(digest.as_str())
-        {
-            return Err("leadership raw response digest mismatch");
         }
         if call.decision.is_some() {
             if call.decision.as_ref() == Some(&decision)
@@ -2386,6 +2552,559 @@ pub(crate) mod tests {
 
         context.source.source_session.model_calls += 1;
         assert!(context.prompt().is_err());
+    }
+
+    mod expired_invalid_completion_tests {
+        use super::*;
+
+        struct Fixture {
+            temp: tempfile::TempDir,
+            api: WorkflowApi,
+            context: LeadershipContext,
+            completion: ModelExecutionCompletion,
+            id: String,
+            digest: String,
+        }
+
+        impl Fixture {
+            // Synthetic retained provider output and committed usage, not live inference.
+            fn new() -> Self {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("company.sqlite");
+                let mut api = super::super::super::model_work::configured_test_api(&path);
+                let created = now_unix_ms() - 600_000;
+                let binding = super::super::super::model_work::assign_test_work_from_at(
+                    &api,
+                    Some(64),
+                    0,
+                    created,
+                );
+                api.subscription_allowance_id = Some(binding.reservation_id);
+                api.event_store = Some(
+                    sentinel_limbo::EventStore::open(
+                        temp.path().join("events.sqlite").to_str().unwrap(),
+                    )
+                    .unwrap(),
+                );
+                let tenant = TenantId::parse(&binding.tenant_id).unwrap();
+                let project_id = ProjectId::parse(&binding.project_id).unwrap();
+                let work_item = WorkItemId::parse(&binding.work_item_id).unwrap();
+                let project = api
+                    .store
+                    .company_project(&tenant, &project_id)
+                    .unwrap()
+                    .unwrap();
+                let allowance = project.subscription_call.as_ref().unwrap();
+                let authority = api
+                    .authority
+                    .as_ref()
+                    .unwrap()
+                    .snapshot_for_admission(
+                        &tenant,
+                        &project_id,
+                        &work_item,
+                        binding.agent_id,
+                        false,
+                    )
+                    .unwrap();
+                let grant = sentinel_workflow::AdaptiveSessionGrantV1 {
+                    schema_version: 1,
+                    session_id: Uuid::new_v4(),
+                    provider_allowance_id: allowance.allowance_id.clone(),
+                    provider_authority_digest:
+                        sentinel_workflow::adaptive_leadership_continuation_provider_authority_digest(
+                            allowance, &authority,
+                        ).unwrap(),
+                    authority: authority.clone(),
+                    provider: allowance.grant.provider.clone(),
+                    model: allowance.grant.model.clone(),
+                    catalog_digest: allowance.grant.catalog_digest.clone(),
+                    max_output_tokens: 4_096,
+                    max_call_duration_ms: allowance.grant.max_duration_ms,
+                    max_model_calls: 64,
+                    max_tool_calls: 64,
+                    created_at_ms: created,
+                    deadline_ms: allowance.grant.expires_at_unix_ms,
+                };
+                let source = api
+                    .store
+                    .begin_adaptive_session(&grant, &authority, created)
+                    .unwrap()
+                    .1;
+                seed_planning_receipt_with_catalog(&api, &path, &project, &grant.catalog_digest);
+                let now = now_unix_ms();
+                let operator = api.principals.principal("operator").unwrap();
+                let request = api
+                    .store
+                    .adaptive_resume_policy_draft(
+                        &operator.principal,
+                        &project_id,
+                        grant.session_id,
+                        Uuid::new_v4(),
+                        "fixture-invalid-leadership-expiry",
+                        now + 3_600_000,
+                        now,
+                    )
+                    .unwrap();
+                api.store
+                    .authorize_adaptive_resume_policy(&operator.principal, &request, now)
+                    .unwrap();
+                assert!(reconcile_review_at(&api, &project, now));
+                let call = api
+                    .store
+                    .adaptive_leadership_review_calls(&tenant, grant.session_id)
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+                assert_eq!(call.grant.schema_version, 3);
+                assert_eq!(call.context.source_session, source);
+                assert_eq!(call.grant.resume_policy.as_ref().unwrap().ordinal, 1);
+                let context = LeadershipContext {
+                    binding: LeadershipAuthority::from_call(&call),
+                    context_digest: call.context_digest().unwrap(),
+                    source: call.context,
+                    private_observation: None,
+                };
+                let root = context
+                    .source
+                    .evidence_refs
+                    .iter()
+                    .find(|reference| reference.starts_with("adaptive-budget-root:"))
+                    .unwrap();
+                let shortened = root.rsplit_once(':').unwrap().0;
+                assert!(!context
+                    .source
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference == shortened));
+                let completion = ModelExecutionCompletion {
+                    context: ModelExecutionContext::AdaptiveLeadershipReview(Box::new(
+                        context.clone(),
+                    )),
+                    content: serde_json::json!({"schema_version":3,"decision":{
+                        "kind":"continue","additional_model_calls":2,"window_ms":300_000,
+                        "rationale":"Synthetic decision with a shortened evidence reference.",
+                        "evidence_refs":[shortened],
+                    }})
+                    .to_string(),
+                    admissible: true,
+                };
+                assert_eq!(
+                    parse_decision(&completion.content, &context.source.evidence_refs),
+                    Err("leadership decision evidence invalid")
+                );
+                let (id, digest) = register_expiry_dispatch(&api, &context, true);
+                persist(&api, &completion, &context, &id, &digest, true);
+                for attempt in 1..=5 {
+                    assert_eq!(
+                        api.event_store
+                            .as_ref()
+                            .unwrap()
+                            .record_llm_completion_failure(
+                                &id,
+                                &digest,
+                                "leadership decision evidence invalid",
+                                5,
+                            )
+                            .unwrap(),
+                        (attempt, attempt == 5)
+                    );
+                }
+                Self {
+                    temp,
+                    api,
+                    context,
+                    completion,
+                    id,
+                    digest,
+                }
+            }
+
+            fn snapshot(&self) -> Vec<Vec<Vec<sentinel_limbo::rusqlite::types::Value>>> {
+                discovery_state(
+                    &self.temp.path().join("company.sqlite"),
+                    &self.temp.path().join("events.sqlite"),
+                )
+            }
+
+            fn reconcile(&self, now: u64) -> Result<bool, &'static str> {
+                let _fence = self.api.mutation_fence.write().unwrap();
+                self.api.reconcile_adaptive_leadership_reviews_with_clock(
+                    &self.context.source.source_project,
+                    || now,
+                )
+            }
+
+            fn reopen(&mut self) {
+                self.api = super::super::super::model_work::configured_test_api(
+                    &self.temp.path().join("company.sqlite"),
+                );
+                self.api.event_store = Some(
+                    sentinel_limbo::EventStore::open(
+                        self.temp.path().join("events.sqlite").to_str().unwrap(),
+                    )
+                    .unwrap(),
+                );
+            }
+
+            fn change_payload(&self, change: impl FnOnce(&mut serde_json::Value)) {
+                let events = self.api.event_store.as_ref().unwrap();
+                let row = events.get_llm_completion(&self.id).unwrap().unwrap();
+                let mut payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+                change(&mut payload);
+                sentinel_limbo::rusqlite::Connection::open(self.temp.path().join("events.sqlite"))
+                    .unwrap()
+                    .execute(
+                        "UPDATE llm_completion_outbox SET payload=?2 WHERE request_id=?1",
+                        sentinel_limbo::rusqlite::params![self.id, payload.to_string()],
+                    )
+                    .unwrap();
+            }
+        }
+
+        #[test]
+        fn schema3_invalid_evidence_expiry_preserves_usage_policy_and_reopens_once() {
+            let mut fixture = Fixture::new();
+            let expires = fixture.context.binding.grant.expires_at_unix_ms;
+            let before = fixture.snapshot();
+            let call = expiry_review(&fixture.api, &fixture.context);
+            let tenant = &call.grant.leadership_principal.tenant_id;
+            let policy = fixture
+                .api
+                .store
+                .adaptive_resume_policy(tenant, call.grant.session_id)
+                .unwrap();
+            assert_eq!(fixture.reconcile(expires - 1), Ok(true));
+            assert_eq!(fixture.snapshot(), before);
+            assert_eq!(fixture.reconcile(expires), Ok(true));
+            let retired = expiry_review(&fixture.api, &fixture.context);
+            assert_eq!(retired.version, 4);
+            assert_eq!(retired.retired_at_unix_ms, Some(expires));
+            assert_eq!(retired.dispatch, call.dispatch);
+            assert_eq!(retired.allowance_id, call.allowance_id);
+            assert!(retired.decision.is_none());
+            assert!(retired.continuation.is_none());
+            assert!(retired.model_response_digest.is_none());
+            assert_eq!(&fixture.snapshot()[3..], &before[3..]);
+            fixture.reopen();
+            assert_eq!(expiry_review(&fixture.api, &fixture.context), retired);
+            assert_eq!(fixture.reconcile(expires + 1), Ok(true));
+            let calls = fixture
+                .api
+                .store
+                .adaptive_leadership_review_calls(tenant, call.grant.session_id)
+                .unwrap();
+            assert_eq!(calls.len(), 2);
+            let next = calls
+                .iter()
+                .find(|next| next.grant.review_id != call.grant.review_id)
+                .unwrap();
+            let original_policy = call.grant.resume_policy.as_ref().unwrap();
+            let next_policy = next.grant.resume_policy.as_ref().unwrap();
+            assert_eq!(next_policy.ordinal, original_policy.ordinal + 1);
+            assert_eq!(next_policy.policy_id, original_policy.policy_id);
+            assert_eq!(next_policy.receipt_digest, original_policy.receipt_digest);
+            assert_eq!(next_policy.limits, original_policy.limits);
+            assert_ne!(next.allowance_id, call.allowance_id);
+            assert_ne!(next.request_id(), fixture.id);
+            assert_eq!(
+                next.context.source_session,
+                fixture.context.source.source_session
+            );
+            assert!(next.dispatch.is_none());
+            assert!(next.decision.is_none());
+            assert!(next.continuation.is_none());
+            let after = fixture.snapshot();
+            assert_eq!(&after[3..], &before[3..]);
+            assert_eq!(
+                fixture
+                    .api
+                    .store
+                    .adaptive_resume_policy(tenant, call.grant.session_id)
+                    .unwrap(),
+                policy
+            );
+            assert_eq!(
+                fixture
+                    .api
+                    .store
+                    .adaptive_session_for_authority(&call.grant.assignee_authority)
+                    .unwrap(),
+                Some(fixture.context.source.source_session.clone())
+            );
+            assert_eq!(
+                fixture
+                    .api
+                    .store
+                    .company_project(tenant, &call.grant.project_id)
+                    .unwrap(),
+                Some(fixture.context.source.source_project.clone())
+            );
+            fixture.reopen();
+            assert_eq!(fixture.reconcile(expires + 2), Ok(true));
+            assert!(fixture
+                .api
+                .accept_leadership_review_at(
+                    &fixture.completion,
+                    &fixture.context,
+                    &fixture.id,
+                    &fixture.digest,
+                    expires + 2,
+                )
+                .is_err());
+            assert_eq!(fixture.snapshot(), after);
+        }
+
+        #[test]
+        fn schema3_invalid_evidence_expiry_rejects_other_failures_and_changed_evidence() {
+            for change in [
+                "context",
+                "binding",
+                "refs",
+                "owner",
+                "digest",
+                "usage",
+                "usage_authority",
+                "missing_usage",
+                "other_error",
+                "ready",
+                "valid_decision",
+                "malformed_decision",
+                "response_digest",
+                "request_digest",
+                "inadmissible",
+                "actions",
+                "envelope",
+                "raw_bound",
+                "payload_bound",
+            ] {
+                let fixture = Fixture::new();
+                let connection = sentinel_limbo::rusqlite::Connection::open(
+                    fixture.temp.path().join("events.sqlite"),
+                )
+                .unwrap();
+                match change {
+                    "owner" | "digest" | "other_error" | "ready" | "payload_bound" => {
+                        let (column, value) = match change {
+                            "owner" => ("owner_scope", sentinel_common::StateTransferScope::for_agent("999").to_wire()),
+                            "digest" => ("request_digest", "d".repeat(64)),
+                            "other_error" => ("last_error", "continuation audit invalid".into()),
+                            "ready" => ("status", "ready_for_action".into()),
+                            "payload_bound" => ("payload", "x".repeat(2 * 1024 * 1024 + 1)),
+                            _ => unreachable!(),
+                        };
+                        connection.execute(&format!(
+                            "UPDATE llm_completion_outbox SET {column}=?2 WHERE request_id=?1",
+                        ), sentinel_limbo::rusqlite::params![fixture.id, value]).unwrap();
+                    }
+                    "missing_usage" => {
+                        connection.execute("DELETE FROM events WHERE operation_id=?1",
+                            [format!("llm_usage_{}", fixture.id)]).unwrap();
+                    }
+                    _ => fixture.change_payload(|payload| {
+                        match change {
+                            "context" | "binding" | "refs" => {
+                                let mut completion: ModelExecutionCompletion = serde_json::from_value(payload["model_work"].clone()).unwrap();
+                                let ModelExecutionContext::AdaptiveLeadershipReview(context) = &mut completion.context else { unreachable!() };
+                                if change == "context" {
+                                    context.context_digest = "d".repeat(64);
+                                } else if change == "binding" {
+                                    context.binding.allowance_id.push_str(":changed");
+                                } else {
+                                    context.source.evidence_refs[0].push_str(":changed");
+                                }
+                                payload["model_work"] = serde_json::to_value(completion).unwrap();
+                            }
+                            "usage" => payload["usage_event"]["timestamp_ms"] = serde_json::json!(0),
+                            "usage_authority" => {
+                                let mut usage: serde_json::Value = serde_json::from_str(payload["usage_event"]["payload"].as_str().unwrap()).unwrap();
+                                usage["project_id"] = serde_json::json!("foreign");
+                                payload["usage_event"]["payload"] = serde_json::json!(usage.to_string());
+                            }
+                            "valid_decision" => payload["model_work"]["content"] = serde_json::json!(serde_json::json!({
+                                "schema_version":3,"decision":{"kind":"defer_budget","rationale":"Synthetic refusal.",
+                                    "evidence_refs":[fixture.context.source.evidence_refs[0]]},
+                            }).to_string()),
+                            "malformed_decision" => payload["model_work"]["content"] = serde_json::json!("{"),
+                            "response_digest" => payload["model_response_digest"] = serde_json::json!("d".repeat(64)),
+                            "request_digest" => payload["request_digest"] = serde_json::json!("d".repeat(64)),
+                            "inadmissible" => payload["model_work"]["admissible"] = serde_json::json!(false),
+                            "actions" => payload["actions"] = serde_json::json!([{}]),
+                            "envelope" => payload["version"] = serde_json::json!(1),
+                            "raw_bound" => payload["model_work"]["content"] = serde_json::json!("x".repeat(16 * 1024 + 1)),
+                            _ => unreachable!(),
+                        }
+                        if matches!(change, "valid_decision" | "malformed_decision" | "raw_bound") {
+                            payload["model_response_digest"] = serde_json::json!(format!("{:x}",
+                                Sha256::digest(payload["model_work"]["content"].as_str().unwrap().as_bytes())));
+                        }
+                    }),
+                }
+                let before = fixture.snapshot();
+                let _ = fixture.reconcile(fixture.context.binding.grant.expires_at_unix_ms);
+                assert_eq!(fixture.snapshot(), before, "{change}");
+                assert!(
+                    expiry_review(&fixture.api, &fixture.context)
+                        .retired_at_unix_ms
+                        .is_none(),
+                    "{change}"
+                );
+            }
+        }
+
+        #[test]
+        fn schema3_invalid_evidence_expiry_rejects_semantic_and_subject_failures() {
+            for change in [
+                "blank_rationale",
+                "oversized_rationale",
+                "zero_calls",
+                "excess_calls",
+                "short_window",
+                "excess_window",
+                "invalid_schema",
+                "wrong_schema_bad_refs",
+                "wrong_subject_bad_refs",
+                "empty_refs",
+                "duplicate_refs",
+                "blank_ref",
+            ] {
+                let fixture = Fixture::new();
+                fixture.change_payload(|payload| {
+                    let mut decision: serde_json::Value =
+                        serde_json::from_str(payload["model_work"]["content"].as_str().unwrap())
+                            .unwrap();
+                    match change {
+                        "blank_rationale" => {
+                            decision["decision"]["rationale"] = serde_json::json!(" ");
+                        }
+                        "oversized_rationale" => {
+                            decision["decision"]["rationale"] = serde_json::json!("x".repeat(
+                                sentinel_workflow::ADAPTIVE_LEADERSHIP_MAX_RATIONALE_BYTES + 1,
+                            ));
+                        }
+                        "zero_calls" => {
+                            decision["decision"]["additional_model_calls"] = serde_json::json!(0);
+                        }
+                        "excess_calls" => {
+                            decision["decision"]["additional_model_calls"] = serde_json::json!(
+                                sentinel_workflow::ADAPTIVE_SESSION_MAX_CALLS + 1
+                            );
+                        }
+                        "short_window" => {
+                            decision["decision"]["window_ms"] = serde_json::json!(999);
+                        }
+                        "excess_window" => {
+                            decision["decision"]["window_ms"] = serde_json::json!(
+                                sentinel_workflow::ADAPTIVE_LEADERSHIP_MAX_GRANT_MS + 1
+                            );
+                        }
+                        "invalid_schema" => decision["schema_version"] = serde_json::json!(0),
+                        "wrong_schema_bad_refs" => {
+                            decision["schema_version"] = serde_json::json!(2);
+                        }
+                        "wrong_subject_bad_refs" => {
+                            decision["schema_version"] = serde_json::json!(2);
+                            decision["decision"]["kind"] = serde_json::json!("keep_unknown");
+                            decision["decision"]
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("additional_model_calls");
+                            decision["decision"]
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("window_ms");
+                        }
+                        "empty_refs" => {
+                            decision["decision"]["evidence_refs"] = serde_json::json!([]);
+                        }
+                        "duplicate_refs" => {
+                            let reference = decision["decision"]["evidence_refs"][0].clone();
+                            decision["decision"]["evidence_refs"] =
+                                serde_json::json!([reference, reference]);
+                        }
+                        "blank_ref" => {
+                            decision["decision"]["evidence_refs"] = serde_json::json!([" "]);
+                        }
+                        _ => unreachable!(),
+                    }
+                    let content = decision.to_string();
+                    if matches!(change, "wrong_schema_bad_refs" | "wrong_subject_bad_refs") {
+                        let parsed: AdaptiveLeadershipReviewDecisionV1 =
+                            serde_json::from_str(&content).unwrap();
+                        let references: Vec<String> =
+                            serde_json::from_value(decision["decision"]["evidence_refs"].clone())
+                                .unwrap();
+                        assert!(parsed.validate(&references).is_ok(), "{change}");
+                        assert!(parsed
+                            .validate_subject(&fixture.context.binding.grant)
+                            .is_err());
+                    }
+                    assert_eq!(
+                        parse_decision(&content, &fixture.context.source.evidence_refs),
+                        Err("leadership decision evidence invalid"),
+                        "{change}"
+                    );
+                    payload["model_response_digest"] =
+                        serde_json::json!(format!("{:x}", Sha256::digest(content.as_bytes())));
+                    payload["model_work"]["content"] = serde_json::json!(content);
+                });
+                let call = expiry_review(&fixture.api, &fixture.context);
+                let stored = fixture
+                    .api
+                    .event_store
+                    .as_ref()
+                    .unwrap()
+                    .get_llm_completion(&fixture.id)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    fixture
+                        .api
+                        .verified_retained_leadership_completion(&call, &stored)
+                        .is_ok(),
+                    "{change}"
+                );
+                let before = fixture.snapshot();
+                assert_eq!(
+                    fixture.reconcile(call.grant.expires_at_unix_ms),
+                    Ok(true),
+                    "{change}"
+                );
+                assert_eq!(fixture.snapshot(), before, "{change}");
+                assert!(
+                    expiry_review(&fixture.api, &fixture.context)
+                        .retired_at_unix_ms
+                        .is_none(),
+                    "{change}"
+                );
+            }
+        }
+
+        #[test]
+        fn schema3_invalid_evidence_expiry_resamples_clock_without_mutation() {
+            let fixture = Fixture::new();
+            let expires = fixture.context.binding.grant.expires_at_unix_ms;
+            let samples = std::cell::Cell::new(0);
+            let before = fixture.snapshot();
+            let _fence = fixture.api.mutation_fence.write().unwrap();
+            assert_eq!(
+                fixture.api.expire_invalid_leadership_review(
+                    &expiry_review(&fixture.api, &fixture.context),
+                    &|| {
+                        let index = samples.get();
+                        samples.set(index + 1);
+                        if index == 0 {
+                            expires
+                        } else {
+                            expires - 1
+                        }
+                    },
+                ),
+                Ok(false)
+            );
+            assert_eq!(samples.get(), 2);
+            assert_eq!(fixture.snapshot(), before);
+        }
     }
 
     fn schema2_expiry_fixture(path: &Path, events: &Path) -> (WorkflowApi, LeadershipContext) {

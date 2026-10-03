@@ -948,6 +948,264 @@ impl LlmModelRetryEvidence {
     }
 }
 
+/// Caller-validated rejection of a retained adaptive result, not retry authority.
+/// The current journal version is verified by the caller, not by Limbo.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmRetainedModelRejectionEvidenceV1 {
+    pub schema_version: u16,
+    pub request_id: String,
+    pub request_digest: String,
+    pub owner_scope: StateTransferScope,
+    pub session_id: uuid::Uuid,
+    pub effect_id: uuid::Uuid,
+    pub provider_session_version: u64,
+    pub expected_session_version: u64,
+    pub reservation: LlmModelReservationV1,
+    pub authority_binding: serde_json::Value,
+    pub authority_binding_digest: String,
+    pub completion_payload_digest: String,
+    pub model_response_digest: String,
+    pub model_context_digest: String,
+    pub usage_event: DomainEvent,
+    pub usage_event_digest: String,
+    pub expected_error: String,
+    pub expected_attempt_count: u32,
+    pub expected_created_at_ms: u64,
+    pub expected_updated_at_ms: u64,
+    pub reason_code: String,
+}
+
+const RETAINED_MODEL_REJECTION_ERROR: &str = "adaptive model result admission failed";
+const RETAINED_MODEL_REJECTION_REASON: &str = "fresh_observation_required";
+const RETAINED_MODEL_REJECTION_MAX_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+const RETAINED_MODEL_REJECTION_MAX_CONTEXT_BYTES: usize = 128 * 1024;
+
+fn retained_rejection_json_digest(value: &serde_json::Value) -> anyhow::Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(sentinel_common::canonical_json(value)?)
+    ))
+}
+
+impl LlmRetainedModelRejectionEvidenceV1 {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.schema_version == 1
+                && self.expected_error == RETAINED_MODEL_REJECTION_ERROR
+                && self.reason_code == RETAINED_MODEL_REJECTION_REASON
+                && self.expected_attempt_count > 0
+                && self.expected_updated_at_ms >= self.expected_created_at_ms
+                && self.provider_session_version.checked_add(1)
+                    == Some(self.expected_session_version),
+            "invalid retained model rejection"
+        );
+        i64::try_from(self.expected_created_at_ms)?;
+        i64::try_from(self.expected_updated_at_ms)?;
+        for digest in [
+            &self.authority_binding_digest,
+            &self.completion_payload_digest,
+            &self.model_response_digest,
+            &self.model_context_digest,
+            &self.usage_event_digest,
+        ] {
+            anyhow::ensure!(is_canonical_sha256(digest), "invalid rejection digest");
+        }
+        let binding = &self.authority_binding;
+        anyhow::ensure!(
+            sentinel_common::canonical_json(binding)?.len() <= 32 * 1024
+                && retained_rejection_json_digest(binding)? == self.authority_binding_digest
+                && binding
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(3)
+                && binding
+                    .get("session_version")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(self.provider_session_version)
+                && binding.get("effect_id").and_then(serde_json::Value::as_str)
+                    == Some(self.effect_id.to_string().as_str())
+                && binding
+                    .pointer("/grant/schema_version")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(1)
+                && binding
+                    .pointer("/grant/session_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(self.session_id.to_string().as_str()),
+            "retained adaptive authority changed"
+        );
+        let grant = &binding["grant"];
+        let authority = &grant["authority"];
+        let usage_binding: LlmModelUsageBindingV1 = serde_json::from_value(serde_json::json!({
+            "agent_id": authority["agent_id"],
+            "tenant_id": authority["tenant_id"],
+            "project_id": authority["project_id"],
+            "work_item_id": authority["work_item_id"],
+            "reservation_id": grant["provider_allowance_id"],
+            "assignment_id": binding["assignment_id"],
+            "assignment_version": authority["assignment_version"],
+            "provider": grant["provider"],
+            "model": grant["model"],
+        }))?;
+        let subject = LlmModelSubjectV1::Adaptive {
+            session_id: self.session_id,
+            effect_id: self.effect_id,
+            session_version: self.provider_session_version,
+        };
+        self.reservation.validate()?;
+        anyhow::ensure!(
+            sentinel_common::canonical_json(&serde_json::to_value(&self.reservation)?)?.len()
+                <= 32 * 1024
+                && self.reservation.request_id == self.request_id
+                && self.reservation.request_digest == self.request_digest
+                && self.reservation.owner_scope == self.owner_scope
+                && self.reservation.subject == subject
+                && self.reservation.allowance_id == usage_binding.reservation_id
+                && self.reservation.usage_binding == usage_binding,
+            "retained model reservation changed"
+        );
+        validate_model_binding(
+            1,
+            &self.request_id,
+            &self.request_digest,
+            &self.owner_scope,
+            &subject,
+            &usage_binding.reservation_id,
+            &self.authority_binding_digest,
+            &usage_binding,
+        )?;
+        validate_model_usage(
+            &subject,
+            &self.request_id,
+            &usage_binding,
+            &self.usage_event,
+        )?;
+        let usage_value = serde_json::to_value(&self.usage_event)?;
+        anyhow::ensure!(
+            sentinel_common::canonical_json(&usage_value)?.len() <= 64 * 1024
+                && retained_rejection_json_digest(&usage_value)? == self.usage_event_digest,
+            "retained model usage digest changed"
+        );
+        let usage: DomainEventPayload = serde_json::from_str(&self.usage_event.payload)?;
+        anyhow::ensure!(
+            matches!(usage, DomainEventPayload::AgentLlmUsage { output_tokens, .. } if output_tokens > 0),
+            "retained model output usage missing"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedAdaptiveCompletion {
+    context: serde_json::Value,
+    content: String,
+    admissible: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedAdaptiveWriteDecision {
+    schema_version: u16,
+    decision: RetainedAdaptiveToolDecision,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RetainedAdaptiveToolDecision {
+    Tool {
+        tool: sentinel_common::WorkbenchTool,
+    },
+}
+
+fn validate_retained_rejection_payload(
+    entry: &LlmCompletionEntry,
+    evidence: &LlmRetainedModelRejectionEvidenceV1,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        entry.request_id == evidence.request_id
+            && entry.request_digest == evidence.request_digest
+            && entry.owner_scope == evidence.owner_scope
+            && entry.status == "failed"
+            && entry.last_error.as_deref() == Some(evidence.expected_error.as_str())
+            && entry.attempt_count == evidence.expected_attempt_count
+            && entry.created_at == evidence.expected_created_at_ms
+            && entry.updated_at == evidence.expected_updated_at_ms
+            && !entry.payload.is_empty()
+            && entry.payload.len() <= RETAINED_MODEL_REJECTION_MAX_PAYLOAD_BYTES
+            && format!("{:x}", Sha256::digest(entry.payload.as_bytes()))
+                == evidence.completion_payload_digest,
+        "retained model completion changed"
+    );
+    let payload: serde_json::Value = serde_json::from_str(&entry.payload)?;
+    anyhow::ensure!(
+        payload.get("version").and_then(serde_json::Value::as_u64) == Some(2)
+            && payload
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(evidence.request_id.as_str())
+            && payload
+                .get("request_digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(evidence.request_digest.as_str())
+            && payload
+                .get("actions")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+            && payload.get("usage_event") == Some(&serde_json::to_value(&evidence.usage_event)?),
+        "retained model envelope changed"
+    );
+    let completion: RetainedAdaptiveCompletion = serde_json::from_value(
+        payload
+            .get("model_work")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing retained model work"))?,
+    )?;
+    anyhow::ensure!(
+        completion.admissible
+            && completion.content.len() <= RETAINED_MODEL_REJECTION_MAX_CONTEXT_BYTES
+            && completion.context.get("binding") == Some(&evidence.authority_binding)
+            && sentinel_common::canonical_json(&completion.context)?.len()
+                <= RETAINED_MODEL_REJECTION_MAX_CONTEXT_BYTES
+            && retained_rejection_json_digest(&completion.context)?
+                == evidence.model_context_digest
+            && format!("{:x}", Sha256::digest(completion.content.as_bytes()))
+                == evidence.model_response_digest
+            && payload
+                .get("model_response_digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(evidence.model_response_digest.as_str()),
+        "retained model context or response changed"
+    );
+    let decision: RetainedAdaptiveWriteDecision = serde_json::from_str(&completion.content)?;
+    let RetainedAdaptiveToolDecision::Tool { tool } = decision.decision;
+    anyhow::ensure!(
+        decision.schema_version == 1
+            && matches!(&tool, sentinel_common::WorkbenchTool::WriteFile { .. }),
+        "retained rejection requires an adaptive write_file decision"
+    );
+    tool.validate_shape()?;
+    Ok(())
+}
+
+fn retained_rejection_event(
+    conn: &Connection,
+    operation_id: &str,
+) -> anyhow::Result<Option<DomainEvent>> {
+    conn.query_row(
+        "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE operation_id=?1",
+        params![operation_id],
+        |row| Ok(DomainEvent {
+            event_id: row.get(0)?, event_type: row.get(1)?, aggregate_id: row.get(2)?,
+            payload: row.get(3)?, correlation_id: row.get(4)?, causation_id: row.get(5)?,
+            operation_id: row.get(6)?, tick: row.get::<_, i64>(7)? as u64,
+            timestamp_ms: row.get::<_, i64>(8)? as u64, schema_version: row.get(9)?,
+            compensation_type: row.get(10)?,
+        }),
+    ).optional().map_err(Into::into)
+}
+
 fn llm_completion_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmCompletionEntry> {
     let owner_scope_wire: String = row.get(2)?;
     let owner_scope = StateTransferScope::from_wire(&owner_scope_wire).ok_or_else(|| {
@@ -3726,6 +3984,86 @@ impl EventStore {
             reason,
             Some(evidence),
         )
+    }
+
+    /// Append rejection evidence without changing or deleting the retained result.
+    /// Even receipt replay rechecks the exact row and durable usage under the fence.
+    pub fn record_retained_model_decision_rejection(
+        &self,
+        evidence: &LlmRetainedModelRejectionEvidenceV1,
+    ) -> anyhow::Result<DomainEvent> {
+        evidence.validate()?;
+        let guard = self.owner_registry.issue(evidence.owner_scope.clone())?;
+        let conn = self.begin_fenced_write(&guard)?;
+        let (entry, model_binding, retrospective_binding): (LlmCompletionEntry, String, String) = conn.query_row(
+            "SELECT request_id, request_digest, owner_scope, payload, status, attempt_count, last_error, created_at, updated_at, model_binding, retrospective_model_binding FROM llm_completion_outbox WHERE request_id=?1 AND attempt_count=?2 AND created_at=?3 AND updated_at=?4",
+            params![evidence.request_id, i64::from(evidence.expected_attempt_count), evidence.expected_created_at_ms as i64, evidence.expected_updated_at_ms as i64],
+            |row| Ok((llm_completion_from_row(row)?, row.get(9)?, row.get(10)?)),
+        )?;
+        anyhow::ensure!(
+            !model_binding.is_empty()
+                && retrospective_binding.is_empty()
+                && model_binding.len() <= 32 * 1024
+                && serde_json::from_str::<LlmModelReservationV1>(&model_binding)?
+                    == evidence.reservation,
+            "retained rejection requires its exact before-send reservation"
+        );
+        validate_retained_rejection_payload(&entry, evidence)?;
+        let usage = retained_rejection_event(&conn, &format!("llm_usage_{}", evidence.request_id))?
+            .ok_or_else(|| anyhow::anyhow!("retained rejection requires durable usage"))?;
+        anyhow::ensure!(
+            serde_json::to_value(&usage)? == serde_json::to_value(&evidence.usage_event)?,
+            "retained rejection usage changed"
+        );
+        let aggregate_id = evidence.usage_event.aggregate_id.as_str();
+        let operation_id = format!("llm_resolution_{}", evidence.request_id);
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "request_id": evidence.request_id,
+            "request_digest": evidence.request_digest,
+            "terminal_status": "failed",
+            "resolution": "model_decision_rejected",
+            "prior_error": evidence.expected_error,
+            "reason_code": evidence.reason_code,
+            "reservation_digest": retained_rejection_json_digest(&serde_json::to_value(&evidence.reservation)?)?,
+            "validated_evidence": evidence,
+        });
+        let encoded_payload = sentinel_common::canonical_json(&payload)?;
+        anyhow::ensure!(
+            encoded_payload.len() <= RETAINED_MODEL_REJECTION_MAX_CONTEXT_BYTES,
+            "retained rejection receipt exceeds its bound"
+        );
+        if let Some(event) = retained_rejection_event(&conn, &operation_id)? {
+            anyhow::ensure!(
+                event.event_type == "llm_completion_resolved"
+                    && event.aggregate_id == aggregate_id
+                    && event.correlation_id == evidence.request_id
+                    && event.schema_version == 1
+                    && event.tick == 0
+                    && event.causation_id.is_none()
+                    && event.compensation_type == "none"
+                    && serde_json::from_str::<serde_json::Value>(&event.payload)? == payload,
+                "retained model rejection receipt conflict"
+            );
+            conn.commit()?;
+            return Ok(event);
+        }
+        let event = DomainEvent::new(
+            "llm_completion_resolved",
+            aggregate_id,
+            &String::from_utf8(encoded_payload)?,
+            &evidence.request_id,
+            0,
+        )
+        .with_operation_id(&operation_id);
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![event.event_id, event.event_type, event.aggregate_id, event.payload,
+                event.correlation_id, event.causation_id, event.operation_id, event.tick as i64,
+                event.timestamp_ms as i64, event.schema_version, event.compensation_type],
+        )?;
+        conn.commit()?;
+        Ok(event)
     }
 
     fn resolve_failed_model_retry(
@@ -7402,6 +7740,695 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    mod retained_model_rejection_tests {
+        use super::*;
+
+        // Synthetic typed before-send inputs; no provider or journal execution.
+        #[derive(Serialize)]
+        struct FixtureAuthority {
+            schema_version: u16,
+            grant: serde_json::Value,
+            session_version: u64,
+            effect_id: uuid::Uuid,
+            assignment_id: String,
+        }
+
+        #[derive(Serialize)]
+        struct FixtureContext {
+            binding: FixtureAuthority,
+            task: serde_json::Value,
+            accepted_customer_contract: serde_json::Value,
+            agent_context: serde_json::Value,
+        }
+
+        fn fixture(store: &EventStore, agent: AgentId) -> LlmRetainedModelRejectionEvidenceV1 {
+            fixture_with_padding(store, agent, 0)
+        }
+
+        fn fixture_with_padding(
+            store: &EventStore,
+            agent: AgentId,
+            padding: usize,
+        ) -> LlmRetainedModelRejectionEvidenceV1 {
+            let mut reservation = model_reservation_fixture();
+            reservation.usage_binding.agent_id = agent;
+            reservation.owner_scope = StateTransferScope::for_agent(agent.to_string());
+            let LlmModelSubjectV1::Adaptive {
+                session_id,
+                effect_id,
+                session_version,
+            } = reservation.subject.clone()
+            else {
+                unreachable!()
+            };
+            let usage_binding = &reservation.usage_binding;
+            let context = FixtureContext {
+                binding: FixtureAuthority {
+                    schema_version: 3,
+                    grant: serde_json::json!({
+                        "schema_version": 1, "session_id": session_id,
+                        "provider_allowance_id": reservation.allowance_id,
+                        "authority": {
+                            "agent_id": agent, "tenant_id": usage_binding.tenant_id,
+                            "project_id": usage_binding.project_id,
+                            "work_item_id": usage_binding.work_item_id,
+                            "assignment_version": usage_binding.assignment_version,
+                        },
+                        "provider": usage_binding.provider, "model": usage_binding.model,
+                    }),
+                    session_version,
+                    effect_id,
+                    assignment_id: usage_binding.assignment_id.clone(),
+                },
+                task: serde_json::json!({"owner": agent, "padding": "x".repeat(padding)}),
+                accepted_customer_contract: serde_json::json!({"fixture": true}),
+                agent_context: serde_json::json!({"agent_id": agent}),
+            };
+            reservation.context_digest = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&context).unwrap())
+            );
+            reservation.authority_digest = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&context.binding).unwrap())
+            );
+            let context = serde_json::to_value(context).unwrap();
+            let authority_binding = context["binding"].clone();
+            let usage_event = late_model_usage_fixture(&reservation);
+            let content = serde_json::json!({
+                "schema_version": 1, "decision": {"kind": "tool", "tool": {
+                    "tool": "write_file", "path": "src/main.py", "content": "print('fixture')\n",
+                }},
+            })
+            .to_string();
+            let model_response_digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+            let payload = serde_json::json!({
+                "version": 2, "request_id": reservation.request_id,
+                "request_digest": reservation.request_digest,
+                "actions": [], "usage_event": usage_event,
+                "model_work": {"context": context, "content": content, "admissible": true},
+                "model_response_digest": model_response_digest,
+            })
+            .to_string();
+            store
+                .reserve_llm_request(
+                    &reservation.request_id,
+                    &reservation.request_digest,
+                    &agent.to_string(),
+                )
+                .unwrap();
+            store.bind_llm_model_reservation(&reservation).unwrap();
+            store
+                .enqueue_llm_completion(
+                    &reservation.request_id,
+                    &reservation.request_digest,
+                    &payload,
+                )
+                .unwrap();
+            store
+                .persist_llm_completion_usage(
+                    &reservation.request_id,
+                    &reservation.request_digest,
+                    &usage_event,
+                )
+                .unwrap();
+            store
+                .record_llm_completion_failure(
+                    &reservation.request_id,
+                    &reservation.request_digest,
+                    RETAINED_MODEL_REJECTION_ERROR,
+                    1,
+                )
+                .unwrap();
+            let entry = store
+                .get_llm_completion(&reservation.request_id)
+                .unwrap()
+                .unwrap();
+            LlmRetainedModelRejectionEvidenceV1 {
+                schema_version: 1,
+                request_id: reservation.request_id.clone(),
+                request_digest: reservation.request_digest.clone(),
+                owner_scope: reservation.owner_scope.clone(),
+                session_id,
+                effect_id,
+                provider_session_version: session_version,
+                expected_session_version: session_version + 1,
+                reservation,
+                authority_binding_digest: retained_rejection_json_digest(&authority_binding)
+                    .unwrap(),
+                authority_binding,
+                completion_payload_digest: format!("{:x}", Sha256::digest(payload.as_bytes())),
+                model_response_digest,
+                model_context_digest: retained_rejection_json_digest(&context).unwrap(),
+                usage_event_digest: retained_rejection_json_digest(
+                    &serde_json::to_value(&usage_event).unwrap(),
+                )
+                .unwrap(),
+                usage_event,
+                expected_error: RETAINED_MODEL_REJECTION_ERROR.into(),
+                expected_attempt_count: entry.attempt_count,
+                expected_created_at_ms: entry.created_at,
+                expected_updated_at_ms: entry.updated_at,
+                reason_code: RETAINED_MODEL_REJECTION_REASON.into(),
+            }
+        }
+
+        fn snapshot(store: &EventStore) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+            let conn = store.conn();
+            [
+                "SELECT * FROM llm_completion_outbox ORDER BY request_id",
+                "SELECT * FROM events ORDER BY id",
+                "SELECT * FROM outbox ORDER BY id",
+            ]
+            .into_iter()
+            .map(|sql| {
+                let mut statement = conn.prepare(sql).unwrap();
+                let columns = statement.column_count();
+                let rows = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|index| row.get(index))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                rows
+            })
+            .collect()
+        }
+
+        #[test]
+        fn retained_rejection_appends_once_preserves_every_row_and_reopens() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("retained-rejection.sqlite");
+            let store = EventStore::open(path.to_str().unwrap()).unwrap();
+            let evidence = fixture(&store, AgentId(7));
+            assert_ne!(
+                evidence.reservation.context_digest,
+                evidence.model_context_digest
+            );
+            assert_ne!(
+                evidence.reservation.authority_digest,
+                evidence.authority_binding_digest
+            );
+            let before = snapshot(&store);
+            let event = store
+                .record_retained_model_decision_rejection(&evidence)
+                .unwrap();
+            let after = snapshot(&store);
+            assert_eq!(after[0], before[0]);
+            assert_eq!(after[2], before[2]);
+            assert_eq!(&after[1][..before[1].len()], before[1].as_slice());
+            assert_eq!(after[1].len(), before[1].len() + 1);
+            assert_eq!(event.event_type, "llm_completion_resolved");
+            let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+            assert_eq!(payload["resolution"], "model_decision_rejected");
+            assert_eq!(
+                payload["validated_evidence"],
+                serde_json::to_value(&evidence).unwrap()
+            );
+            assert_eq!(
+                payload["reservation_digest"],
+                retained_rejection_json_digest(
+                    &serde_json::to_value(&evidence.reservation).unwrap()
+                )
+                .unwrap()
+            );
+            assert!(!event.payload.contains("print('fixture')"));
+            drop(store);
+            let store = EventStore::open(path.to_str().unwrap()).unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    store
+                        .record_retained_model_decision_rejection(&evidence)
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(event).unwrap()
+            );
+            assert_eq!(snapshot(&store), after);
+            assert!(!store
+                .reserve_llm_request(&evidence.request_id, &evidence.request_digest, "AGENT-07")
+                .unwrap());
+        }
+
+        #[test]
+        fn retained_rejection_context_bound_is_independent_of_small_receipt() {
+            let store = EventStore::open(":memory:").unwrap();
+            let evidence = fixture(&store, AgentId(7));
+            let entry = store
+                .get_llm_completion(&evidence.request_id)
+                .unwrap()
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&entry.payload).unwrap();
+            let base_size = sentinel_common::canonical_json(&payload["model_work"]["context"])
+                .unwrap()
+                .len();
+            for extra in [0, 1] {
+                let store = EventStore::open(":memory:").unwrap();
+                let evidence = fixture_with_padding(
+                    &store,
+                    AgentId(7),
+                    RETAINED_MODEL_REJECTION_MAX_CONTEXT_BYTES - base_size + extra,
+                );
+                let before = snapshot(&store);
+                let result = store.record_retained_model_decision_rejection(&evidence);
+                if extra == 0 {
+                    let receipt = result.unwrap();
+                    assert!(receipt.payload.len() < 16 * 1024);
+                    assert_eq!(snapshot(&store)[0], before[0]);
+                } else {
+                    assert!(result.is_err());
+                    assert_eq!(snapshot(&store), before);
+                }
+            }
+        }
+
+        #[test]
+        fn retained_rejection_conflicting_evidence_fails_before_and_after_receipt() {
+            for replay in [false, true] {
+                let store = EventStore::open(":memory:").unwrap();
+                let evidence = fixture(&store, AgentId(7));
+                if replay {
+                    store
+                        .record_retained_model_decision_rejection(&evidence)
+                        .unwrap();
+                }
+                for field in [
+                    "schema",
+                    "request",
+                    "request_digest",
+                    "owner",
+                    "session",
+                    "effect",
+                    "provider_version",
+                    "head_version",
+                    "binding",
+                    "binding_digest",
+                    "payload_digest",
+                    "raw_digest",
+                    "context_digest",
+                    "usage_digest",
+                    "usage",
+                    "error",
+                    "reason",
+                    "attempts",
+                    "created",
+                    "updated",
+                    "reservation_context",
+                    "reservation_authority",
+                    "reservation_subject",
+                    "reservation_usage",
+                ] {
+                    let mut changed = evidence.clone();
+                    match field {
+                        "schema" => changed.schema_version = 2,
+                        "request" => changed.request_id.push_str("-changed"),
+                        "request_digest" => changed.request_digest = "d".repeat(64),
+                        "owner" => changed.owner_scope = StateTransferScope::World,
+                        "session" => changed.session_id = uuid::Uuid::new_v4(),
+                        "effect" => changed.effect_id = uuid::Uuid::new_v4(),
+                        "provider_version" => changed.provider_session_version += 1,
+                        "head_version" => changed.expected_session_version += 1,
+                        "binding" => {
+                            changed.authority_binding["assignment_id"] =
+                                serde_json::json!("foreign");
+                            changed.authority_binding_digest =
+                                retained_rejection_json_digest(&changed.authority_binding).unwrap();
+                        }
+                        "binding_digest" => changed.authority_binding_digest = "d".repeat(64),
+                        "payload_digest" => changed.completion_payload_digest = "d".repeat(64),
+                        "raw_digest" => changed.model_response_digest = "d".repeat(64),
+                        "context_digest" => changed.model_context_digest = "d".repeat(64),
+                        "usage_digest" => changed.usage_event_digest = "d".repeat(64),
+                        "usage" => {
+                            changed.usage_event.tick += 1;
+                            changed.usage_event_digest = retained_rejection_json_digest(
+                                &serde_json::to_value(&changed.usage_event).unwrap(),
+                            )
+                            .unwrap();
+                        }
+                        "error" => changed.expected_error.push_str(" "),
+                        "reason" => changed.reason_code = "schema_correction".into(),
+                        "attempts" => changed.expected_attempt_count += 1,
+                        "created" => changed.expected_created_at_ms += 1,
+                        "updated" => changed.expected_updated_at_ms += 1,
+                        "reservation_context" => {
+                            changed.reservation.context_digest = "d".repeat(64)
+                        }
+                        "reservation_authority" => {
+                            changed.reservation.authority_digest = "d".repeat(64)
+                        }
+                        "reservation_subject" => {
+                            changed.reservation.subject =
+                                LlmModelSubjectV1::AdaptiveLeadershipReview {
+                                    review_id: uuid::Uuid::new_v4(),
+                                }
+                        }
+                        "reservation_usage" => changed
+                            .reservation
+                            .usage_binding
+                            .assignment_id
+                            .push_str("-foreign"),
+                        _ => unreachable!(),
+                    }
+                    let before = snapshot(&store);
+                    assert!(
+                        store
+                            .record_retained_model_decision_rejection(&changed)
+                            .is_err(),
+                        "{field}, replay={replay}"
+                    );
+                    assert_eq!(snapshot(&store), before, "{field}, replay={replay}");
+                }
+            }
+        }
+
+        #[test]
+        fn retained_rejection_requires_exact_row_reservation_and_existing_usage() {
+            for replay in [false, true] {
+                for change in [
+                    "missing",
+                    "empty_binding",
+                    "changed_binding",
+                    "retrospective",
+                    "status",
+                    "error",
+                    "attempts",
+                    "created",
+                    "updated",
+                    "owner",
+                    "digest",
+                    "empty_payload",
+                    "payload",
+                    "missing_usage",
+                    "changed_usage",
+                ] {
+                    let store = EventStore::open(":memory:").unwrap();
+                    let evidence = fixture(&store, AgentId(7));
+                    if replay {
+                        store
+                            .record_retained_model_decision_rejection(&evidence)
+                            .unwrap();
+                    }
+                    {
+                        let conn = store.conn();
+                        match change {
+                            "missing" => {
+                                conn.execute(
+                                    "DELETE FROM llm_completion_outbox WHERE request_id=?1",
+                                    params![evidence.request_id],
+                                )
+                                .unwrap();
+                            }
+                            "missing_usage" => {
+                                conn.execute(
+                                    "DELETE FROM events WHERE operation_id=?1",
+                                    params![evidence.usage_event.operation_id],
+                                )
+                                .unwrap();
+                            }
+                            "changed_usage" => {
+                                conn.execute(
+                                    "UPDATE events SET tick=tick+1 WHERE operation_id=?1",
+                                    params![evidence.usage_event.operation_id],
+                                )
+                                .unwrap();
+                            }
+                            _ => {
+                                let (column, value) = match change {
+                                    "empty_binding" => ("model_binding", String::new()),
+                                    "changed_binding" => {
+                                        let mut reservation = evidence.reservation.clone();
+                                        reservation.context_digest = "d".repeat(64);
+                                        (
+                                            "model_binding",
+                                            serde_json::to_string(&reservation).unwrap(),
+                                        )
+                                    }
+                                    "retrospective" => ("retrospective_model_binding", "{}".into()),
+                                    "status" => ("status", "ready_for_action".into()),
+                                    "error" => ("last_error", "adaptive tool is invalid".into()),
+                                    "attempts" => (
+                                        "attempt_count",
+                                        (evidence.expected_attempt_count + 1).to_string(),
+                                    ),
+                                    "created" => (
+                                        "created_at",
+                                        (evidence.expected_created_at_ms + 1).to_string(),
+                                    ),
+                                    "updated" => (
+                                        "updated_at",
+                                        (evidence.expected_updated_at_ms + 1).to_string(),
+                                    ),
+                                    "owner" => (
+                                        "owner_scope",
+                                        StateTransferScope::for_agent("AGENT-08").to_wire(),
+                                    ),
+                                    "digest" => ("request_digest", "d".repeat(64)),
+                                    "empty_payload" => ("payload", String::new()),
+                                    "payload" => ("payload", "{}".into()),
+                                    _ => unreachable!(),
+                                };
+                                conn.execute(&format!("UPDATE llm_completion_outbox SET {column}=?2 WHERE request_id=?1"),
+                                    params![evidence.request_id, value]).unwrap();
+                            }
+                        }
+                    }
+                    let before = snapshot(&store);
+                    assert!(
+                        store
+                            .record_retained_model_decision_rejection(&evidence)
+                            .is_err(),
+                        "{change}, replay={replay}"
+                    );
+                    assert_eq!(snapshot(&store), before, "{change}, replay={replay}");
+                }
+            }
+        }
+
+        #[test]
+        fn retained_rejection_only_accepts_strict_parse_valid_write_file() {
+            for change in [
+                "malformed",
+                "schema",
+                "foreign_kind",
+                "extra_field",
+                "wrong_tool",
+                "invalid_path",
+                "wrong_envelope",
+                "actions",
+                "inadmissible",
+                "context",
+                "binding",
+                "usage",
+                "raw_digest",
+                "completion_field",
+                "null_actions",
+                "missing_usage",
+                "missing_raw_digest",
+                "request",
+                "request_digest",
+                "raw_bound",
+                "context_bound",
+                "payload_bound",
+            ] {
+                let store = EventStore::open(":memory:").unwrap();
+                let mut evidence = fixture(&store, AgentId(7));
+                let row = store
+                    .get_llm_completion(&evidence.request_id)
+                    .unwrap()
+                    .unwrap();
+                let mut payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+                let mut decision: serde_json::Value =
+                    serde_json::from_str(payload["model_work"]["content"].as_str().unwrap())
+                        .unwrap();
+                match change {
+                    "schema" => decision["schema_version"] = serde_json::json!(2),
+                    "foreign_kind" => {
+                        decision["decision"] =
+                            serde_json::json!({"kind":"blocked", "reason_code":"fixture"})
+                    }
+                    "extra_field" => {
+                        decision["decision"]["tool"]["extra"] = serde_json::json!(true)
+                    }
+                    "wrong_tool" => {
+                        decision["decision"]["tool"] = serde_json::json!({"tool":"inspect_file", "path":"src/main.py", "max_bytes":100})
+                    }
+                    "invalid_path" => {
+                        decision["decision"]["tool"]["path"] = serde_json::json!("../outside.py")
+                    }
+                    "wrong_envelope" => payload["version"] = serde_json::json!(1),
+                    "actions" => payload["actions"] = serde_json::json!([{}]),
+                    "null_actions" => payload["actions"] = serde_json::Value::Null,
+                    "missing_usage" => {
+                        payload.as_object_mut().unwrap().remove("usage_event");
+                    }
+                    "missing_raw_digest" => {
+                        payload
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("model_response_digest");
+                    }
+                    "completion_field" => {
+                        payload["model_work"]["unknown"] = serde_json::json!(true)
+                    }
+                    "inadmissible" => {
+                        payload["model_work"]["admissible"] = serde_json::json!(false)
+                    }
+                    "context" => {
+                        payload["model_work"]["context"]["task"] = serde_json::json!({"owner":8})
+                    }
+                    "binding" => {
+                        payload["model_work"]["context"]["binding"]["session_version"] =
+                            serde_json::json!(9)
+                    }
+                    "usage" => payload["usage_event"]["tick"] = serde_json::json!(9),
+                    "request" => payload["request_id"] = serde_json::json!("foreign"),
+                    "request_digest" => {
+                        payload["request_digest"] = serde_json::json!("d".repeat(64))
+                    }
+                    "context_bound" => {
+                        payload["model_work"]["context"]["task"] = serde_json::json!(
+                            "x".repeat(RETAINED_MODEL_REJECTION_MAX_CONTEXT_BYTES)
+                        )
+                    }
+                    "payload_bound" => {
+                        payload["padding"] = serde_json::json!(
+                            "x".repeat(RETAINED_MODEL_REJECTION_MAX_PAYLOAD_BYTES)
+                        )
+                    }
+                    "malformed" | "raw_digest" | "raw_bound" => {}
+                    _ => unreachable!(),
+                }
+                let content = match change {
+                    "malformed" => "{".into(),
+                    "raw_bound" => "x".repeat(RETAINED_MODEL_REJECTION_MAX_CONTEXT_BYTES + 1),
+                    _ => decision.to_string(),
+                };
+                payload["model_work"]["content"] = serde_json::json!(content);
+                evidence.model_response_digest =
+                    format!("{:x}", Sha256::digest(content.as_bytes()));
+                if change != "missing_raw_digest" {
+                    payload["model_response_digest"] =
+                        serde_json::json!(if change == "raw_digest" {
+                            "d".repeat(64)
+                        } else {
+                            evidence.model_response_digest.clone()
+                        });
+                }
+                let payload = payload.to_string();
+                evidence.completion_payload_digest =
+                    format!("{:x}", Sha256::digest(payload.as_bytes()));
+                store
+                    .conn()
+                    .execute(
+                        "UPDATE llm_completion_outbox SET payload=?2 WHERE request_id=?1",
+                        params![evidence.request_id, payload],
+                    )
+                    .unwrap();
+                let before = snapshot(&store);
+                assert!(
+                    store
+                        .record_retained_model_decision_rejection(&evidence)
+                        .is_err(),
+                    "{change}"
+                );
+                assert_eq!(snapshot(&store), before, "{change}");
+            }
+        }
+
+        #[test]
+        fn retained_rejection_append_failure_rolls_back_without_touching_evidence() {
+            let store = EventStore::open(":memory:").unwrap();
+            let evidence = fixture(&store, AgentId(7));
+            store
+                .conn()
+                .execute_batch(
+                    "CREATE TRIGGER reject_retained_receipt AFTER INSERT ON events
+                WHEN NEW.event_type='llm_completion_resolved'
+                BEGIN SELECT RAISE(ABORT, 'injected retained receipt failure'); END;",
+                )
+                .unwrap();
+            let before = snapshot(&store);
+            assert!(store
+                .record_retained_model_decision_rejection(&evidence)
+                .is_err());
+            assert_eq!(snapshot(&store), before);
+            assert!(store.conn().is_autocommit());
+            store
+                .conn()
+                .execute_batch("DROP TRIGGER reject_retained_receipt;")
+                .unwrap();
+            store
+                .record_retained_model_decision_rejection(&evidence)
+                .unwrap();
+            assert_eq!(snapshot(&store)[0], before[0]);
+        }
+
+        #[test]
+        fn retained_rejection_conflicts_with_other_resolution_and_wrong_owner_fence() {
+            let store = EventStore::open(":memory:").unwrap();
+            let evidence = fixture(&store, AgentId(7));
+            let event = DomainEvent::new(
+                "llm_completion_resolved",
+                "AGENT-07",
+                "{\"resolution\":\"model_schema_correction\"}",
+                &evidence.request_id,
+                0,
+            )
+            .with_operation_id(&format!("llm_resolution_{}", evidence.request_id));
+            store.append_event(&event).unwrap();
+            let before = snapshot(&store);
+            assert!(store
+                .record_retained_model_decision_rejection(&evidence)
+                .is_err());
+            assert_eq!(snapshot(&store), before);
+
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("retained-fence.sqlite");
+            let store = EventStore::open(path.to_str().unwrap()).unwrap();
+            let evidence = fixture(&store, AgentId(8));
+            drop(store);
+            let store = EventStore::open_with_owner_registry(
+                path.to_str().unwrap(),
+                cluster_owner_registry(),
+            )
+            .unwrap();
+            let before = snapshot(&store);
+            assert!(store
+                .record_retained_model_decision_rejection(&evidence)
+                .unwrap_err()
+                .downcast_ref::<sentinel_common::OwnerIssueError>()
+                .is_some());
+            assert_eq!(snapshot(&store), before);
+        }
+
+        #[test]
+        fn retained_rejection_concurrent_replay_returns_the_same_event() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("retained-race.sqlite");
+            let store = EventStore::open(path.to_str().unwrap()).unwrap();
+            let evidence = fixture(&store, AgentId(7));
+            let other = EventStore::open(path.to_str().unwrap()).unwrap();
+            let copy = evidence.clone();
+            let thread = std::thread::spawn(move || {
+                other
+                    .record_retained_model_decision_rejection(&copy)
+                    .unwrap()
+            });
+            let event = store
+                .record_retained_model_decision_rejection(&evidence)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(event).unwrap(),
+                serde_json::to_value(thread.join().unwrap()).unwrap()
+            );
+            assert_eq!(store.get_all_events().unwrap().len(), 2);
+        }
     }
 
     #[test]

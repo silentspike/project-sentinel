@@ -127,15 +127,16 @@ type codexCLIStreamState struct {
 // ChatGPT authentication remains in CODEX_HOME; the gateway never reads or
 // copies the credential itself.
 type CodexCLIProvider struct {
-	name      string
-	model     string
-	binary    string
-	workdir   string
-	codexHome string
-	home      string
-	logger    *slog.Logger
-	sem       chan struct{}
-	now       func() time.Time
+	name              string
+	model             string
+	binary            string
+	workdir           string
+	codexHome         string
+	home              string
+	logger            *slog.Logger
+	sem               chan struct{}
+	now               func() time.Time
+	writeOutputSchema func(*os.File, []byte) error
 
 	cooldownMu    sync.Mutex
 	cooldownUntil time.Time
@@ -331,52 +332,83 @@ func (p *CodexCLIProvider) cleanupOutputSchema(path string) {
 	}
 }
 
-func (p *CodexCLIProvider) outputSchemaPath(req *LLMRequest) (string, error) {
-	executionSchema := req.Metadata["company_execution_schema"]
-	switch executionSchema {
-	case "1", "3", "5":
-	default:
-		if hasLeadershipReviewMetadata(req.Metadata) {
-			return "", fmt.Errorf("codex-cli mixed leadership output subject")
-		}
-		return "", nil
-	}
-	selected := codexCLIAdaptiveSchema
-	if executionSchema == "5" {
+func codexCLIOutputSchema(req *LLMRequest) ([]byte, error) {
+	_, freshObservation := req.Metadata["company_execution_fresh_observation_required"]
+	if freshObservation {
 		if classified, err := classifyModelWorkRequest(req, req.Metadata["request_id"]); err != nil || !classified {
-			return "", fmt.Errorf("codex-cli leadership request is invalid")
+			return nil, errors.New("codex-cli fresh observation request is invalid")
 		}
-		selected = codexCLILeadershipSchema
-		switch req.Metadata["leadership_review_kind"] {
-		case "unknown_model":
-			selected = codexCLIUnknownLeadershipSchema
-		case "blocked_continuation":
-			selected = codexCLIContinuationLeadershipSchema
-		case "budget_window_exhausted":
-			selected = codexCLIBudgetLeadershipSchema
-		case "admission_repair":
-			selected = codexCLIAdmissionRepairSchema
-		}
-	} else if hasLeadershipReviewMetadata(req.Metadata) {
-		return "", fmt.Errorf("codex-cli mixed leadership output subject")
-	} else if executionSchema == "1" {
-		selected = codexCLIWorkSchema
+	}
+	executionSchema := req.Metadata["company_execution_schema"]
+	if executionSchema != "5" && hasLeadershipReviewMetadata(req.Metadata) {
+		return nil, errors.New("codex-cli mixed leadership output subject")
+	}
+	switch executionSchema {
+	case "5":
+		return codexCLILeadershipOutputSchema(req)
+	case "1":
 		switch req.Metadata["company_execution_output_kind"] {
 		case "", "tool_plan": // Empty preserves already-reserved legacy requests.
+			return codexCLIWorkSchema, nil
 		case "source_review":
-			selected = codexCLIReviewSchema
+			return codexCLIReviewSchema, nil
 		default:
-			return "", fmt.Errorf("codex-cli company output kind is invalid")
+			return nil, errors.New("codex-cli company output kind is invalid")
 		}
-	} else if req.Metadata["company_execution_output_kind"] != "" && req.Metadata["company_execution_output_kind"] != "adaptive_decision" {
-		return "", fmt.Errorf("codex-cli adaptive output kind is invalid")
+	case "3":
+		if req.Metadata["company_execution_output_kind"] != "" && req.Metadata["company_execution_output_kind"] != "adaptive_decision" {
+			return nil, errors.New("codex-cli adaptive output kind is invalid")
+		}
+		if freshObservation {
+			return freshObservationSchema(codexCLIAdaptiveSchema)
+		}
+		return codexCLIAdaptiveSchema, nil
+	default:
+		return nil, nil
+	}
+}
+
+func codexCLILeadershipOutputSchema(req *LLMRequest) ([]byte, error) {
+	if classified, err := classifyModelWorkRequest(req, req.Metadata["request_id"]); err != nil || !classified {
+		return nil, errors.New("codex-cli leadership request is invalid")
+	}
+	selected := codexCLILeadershipSchema
+	switch req.Metadata["leadership_review_kind"] {
+	case "unknown_model":
+		selected = codexCLIUnknownLeadershipSchema
+	case "blocked_continuation":
+		selected = codexCLIContinuationLeadershipSchema
+	case "budget_window_exhausted":
+		selected = codexCLIBudgetLeadershipSchema
+	case "admission_repair":
+		selected = codexCLIAdmissionRepairSchema
+	}
+	if _, present := req.Metadata["leadership_evidence_refs"]; present {
+		refs, err := leadershipEvidenceRefs(req.Metadata)
+		if err != nil {
+			return nil, err
+		}
+		return leadershipEvidenceSchema(selected, refs)
+	}
+	return selected, nil
+}
+
+func (p *CodexCLIProvider) outputSchemaPath(req *LLMRequest) (string, error) {
+	selected, err := codexCLIOutputSchema(req)
+	if err != nil || selected == nil {
+		return "", err
 	}
 	schema, err := os.CreateTemp(p.workdir, ".codex-work-schema-*.json")
 	if err != nil {
 		return "", fmt.Errorf("codex-cli work schema: %w", err)
 	}
 	path := schema.Name()
-	if _, err := schema.Write(selected); err != nil {
+	if p.writeOutputSchema != nil {
+		err = p.writeOutputSchema(schema, selected)
+	} else {
+		_, err = schema.Write(selected)
+	}
+	if err != nil {
 		closeErr := schema.Close()
 		removeErr := os.Remove(path) //nolint:gosec // path came from CreateTemp in the validated private workdir
 		return "", errors.Join(fmt.Errorf("codex-cli write work schema: %w", err), closeErr, removeErr)
@@ -386,6 +418,156 @@ func (p *CodexCLIProvider) outputSchemaPath(req *LLMRequest) (string, error) {
 		return "", errors.Join(fmt.Errorf("codex-cli close work schema: %w", err), removeErr)
 	}
 	return path, nil
+}
+
+func leadershipEvidenceSchema(embedded []byte, refs []string) ([]byte, error) {
+	invalid := errors.New("codex-cli leadership evidence schema is invalid")
+	var schema map[string]any
+	if err := json.Unmarshal(embedded, &schema); err != nil {
+		return nil, invalid
+	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		return nil, invalid
+	}
+	decision, ok := properties["decision"].(map[string]any)
+	if !ok {
+		return nil, invalid
+	}
+	branches := []any{decision}
+	if alternatives, present := decision["anyOf"]; present {
+		branches, ok = alternatives.([]any)
+		if !ok || len(branches) == 0 {
+			return nil, invalid
+		}
+	}
+	for _, value := range branches {
+		branch, ok := value.(map[string]any)
+		if !ok {
+			return nil, invalid
+		}
+		fields, ok := branch["properties"].(map[string]any)
+		if !ok {
+			return nil, invalid
+		}
+		evidence, ok := fields["evidence_refs"].(map[string]any)
+		if !ok || evidence["type"] != "array" {
+			return nil, invalid
+		}
+		items := map[string]any{"type": "string"}
+		if len(refs) > 0 {
+			items["enum"] = refs
+		} else {
+			if minimum, _ := evidence["minItems"].(float64); minimum > 0 {
+				return nil, invalid
+			}
+			evidence["minItems"] = 0
+			evidence["maxItems"] = 0
+		}
+		evidence["items"] = items
+	}
+	return json.Marshal(schema)
+}
+
+func freshObservationSchema(embedded []byte) ([]byte, error) {
+	invalid := errors.New("codex-cli fresh observation schema is invalid")
+	var schema map[string]any
+	if err := json.Unmarshal(embedded, &schema); err != nil {
+		return nil, invalid
+	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		return nil, invalid
+	}
+	decision, ok := properties["decision"].(map[string]any)
+	if !ok {
+		return nil, invalid
+	}
+	alternatives, ok := decision["anyOf"].([]any)
+	if !ok {
+		return nil, invalid
+	}
+	var selected []any
+	toolCount, blockedCount := 0, 0
+	for _, value := range alternatives {
+		branch, ok := value.(map[string]any)
+		if !ok {
+			return nil, invalid
+		}
+		fields, ok := branch["properties"].(map[string]any)
+		if !ok {
+			return nil, invalid
+		}
+		switch generationSchemaKind(fields, "kind") {
+		case "blocked":
+			blockedCount++
+			selected = append(selected, branch)
+		case "tool":
+			toolCount++
+			tool, err := freshInspectionToolSchema(fields["tool"])
+			if err != nil {
+				return nil, invalid
+			}
+			fields["tool"] = tool
+			selected = append(selected, branch)
+		}
+	}
+	if toolCount != 1 || blockedCount != 1 {
+		return nil, invalid
+	}
+	decision["anyOf"] = selected
+	return json.Marshal(schema)
+}
+
+func freshInspectionToolSchema(value any) (map[string]any, error) {
+	invalid := errors.New("codex-cli fresh inspection tool schema is invalid")
+	tool, ok := value.(map[string]any)
+	if !ok {
+		return nil, invalid
+	}
+	choices, ok := tool["anyOf"].([]any)
+	if !ok {
+		return nil, invalid
+	}
+	var inspections []any
+	seen := make(map[string]bool)
+	for _, choice := range choices {
+		inspection, ok := choice.(map[string]any)
+		if !ok {
+			return nil, invalid
+		}
+		fields, ok := inspection["properties"].(map[string]any)
+		if !ok {
+			return nil, invalid
+		}
+		kind := generationSchemaKind(fields, "tool")
+		if kind != "list_directory" && kind != "inspect_file" {
+			continue
+		}
+		if seen[kind] {
+			return nil, invalid
+		}
+		seen[kind] = true
+		inspections = append(inspections, inspection)
+	}
+	if len(inspections) != 2 {
+		return nil, invalid
+	}
+	tool["anyOf"] = inspections
+	return tool, nil
+}
+
+func generationSchemaKind(properties map[string]any, name string) string {
+	field, ok := properties[name].(map[string]any)
+	if !ok || field["type"] != "string" {
+		return ""
+	}
+	values, ok := field["enum"].([]any)
+	if !ok || len(values) != 1 {
+		return ""
+	}
+	kind, _ := values[0].(string)
+	return kind
 }
 
 func (p *CodexCLIProvider) commandArgs(model string) []string {
