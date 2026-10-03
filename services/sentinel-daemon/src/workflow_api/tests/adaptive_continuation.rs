@@ -534,6 +534,12 @@ fn fixture_schema2_source(
             .unwrap();
         let context = LeadershipContext {
             private_observation: None,
+            accounting: LeadershipContext::accounting_projection(
+                &LeadershipAuthority::from_call(&call),
+                &call.context,
+            )
+            .unwrap(),
+            accounting_correction: None,
             binding: LeadershipAuthority::from_call(&call),
             context_digest: call.context_digest().unwrap(),
             source: call.context,

@@ -11,7 +11,10 @@ use crate::{
     AdaptiveFirstUnknownModelJournalEvidenceV1, AdaptiveLeadershipReviewCallV1,
     AdaptiveModelDecisionV1, AdaptiveModelJournalRecordEvidenceV1, AdaptiveRecoveryFeedbackV1,
     AdaptiveRejectedModelReceiptV1, AdaptiveSessionGrantV1, AdaptiveSessionV1,
-    AdaptiveTransitionV1, ADAPTIVE_SCHEMA_MAX_CORRECTIONS,
+    AdaptiveTransitionV1, AdaptiveWorkingMemoryCompletedRowV1, AdaptiveWorkingMemorySourceV1,
+    AdaptiveWorkingMemoryToolKindV1, ADAPTIVE_SCHEMA_MAX_CORRECTIONS,
+    ADAPTIVE_WORKING_MEMORY_MAX_BYTES, ADAPTIVE_WORKING_MEMORY_MAX_LABEL_BYTES,
+    ADAPTIVE_WORKING_MEMORY_MAX_ROWS,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -19,6 +22,8 @@ use sha2::{Digest, Sha256};
 mod recovery_lineage;
 #[cfg(test)]
 mod rejected_model_tests;
+#[cfg(test)]
+mod working_memory_tests;
 
 const MAX_JOURNAL_ENTRIES: usize = 512;
 const MAX_SCOPED_ADAPTIVE_HEADS: usize = 64;
@@ -198,6 +203,116 @@ impl WorkflowStore {
         authorize(&session.grant, current)?;
         require_head(&connection, &session)?;
         Ok(Some(session))
+    }
+
+    /// Private historical pointers from one authorized, fully replayed read snapshot.
+    pub fn adaptive_working_memory_source(
+        &self,
+        session_id: Uuid,
+        provider_version: u64,
+        effect_id: Uuid,
+        current: &RuntimeAuthoritySnapshotV1,
+    ) -> Result<Option<AdaptiveWorkingMemorySourceV1>, WorkflowError> {
+        current.validate()?;
+        if session_id.is_nil() || provider_version == 0 || effect_id.is_nil() {
+            return Err(authority_conflict());
+        }
+        let mut connection = self.lock()?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(map_sqlite_error)?;
+        let Some((current_session, _)) = load(&tx, session_id)? else {
+            return Ok(None);
+        };
+        authorize(&current_session.grant, current)?;
+        require_head(&tx, &current_session)?;
+        let effect_matches = match &current_session.cursor {
+            crate::AdaptiveCursorV1::ReadyForModel => {
+                current_session.version == provider_version
+                    && working_memory_model_effect_id(session_id, provider_version) == effect_id
+            }
+            crate::AdaptiveCursorV1::ModelPending { effect }
+            | crate::AdaptiveCursorV1::ModelUnknown { effect } => {
+                provider_version.checked_add(1) == Some(current_session.version)
+                    && effect.id == effect_id
+            }
+            _ => false,
+        };
+        if !effect_matches {
+            return Err(authority_conflict());
+        }
+        let (head_entry_digest, prefix) =
+            evidence_entry(&tx, &namespace(session_id), provider_version)?;
+        let session = prefix.session;
+        if session.grant != current_session.grant {
+            return Err(corrupt_store());
+        }
+        let mut rows = working_memory_rows(&tx, &session)?;
+        let completed_tool_count = u16::try_from(rows.len()).map_err(|_| corrupt_store())?;
+        let latest_test = rows
+            .iter()
+            .rfind(|row| row.tool_kind == AdaptiveWorkingMemoryToolKindV1::RunTests)
+            .cloned();
+        if rows.len() > ADAPTIVE_WORKING_MEMORY_MAX_ROWS {
+            rows = rows.split_off(rows.len() - ADAPTIVE_WORKING_MEMORY_MAX_ROWS);
+            if let Some(test) = &latest_test {
+                if !rows
+                    .iter()
+                    .any(|row| row.session_version == test.session_version)
+                {
+                    rows.remove(0);
+                    rows.insert(0, test.clone());
+                }
+            }
+        }
+        let mut source = AdaptiveWorkingMemorySourceV1 {
+            schema_version: 1,
+            session_id,
+            authority: session.grant.authority.clone(),
+            provider_version,
+            effect_id,
+            head_version: session.version,
+            head_entry_digest,
+            last_observation: session.last_observation.clone(),
+            model_calls: session.model_calls,
+            tool_calls: session.tool_calls,
+            root_model_ceiling: session.grant.max_model_calls,
+            root_tool_ceiling: session.grant.max_tool_calls,
+            active_model_ceiling: session.active_model_ceiling(),
+            continuation_windows: u16::try_from(
+                session
+                    .continuation
+                    .as_ref()
+                    .map_or(0, |state| state.authorizations.len()),
+            )
+            .map_err(|_| corrupt_store())?,
+            completed_tool_count,
+            omitted_count: completed_tool_count - rows.len() as u16,
+            rows,
+        };
+        while serde_json::to_vec(&source)
+            .map_err(|_| corrupt_store())?
+            .len()
+            > ADAPTIVE_WORKING_MEMORY_MAX_BYTES
+        {
+            let index = source
+                .rows
+                .iter()
+                .position(|row| {
+                    source
+                        .rows
+                        .last()
+                        .is_some_and(|last| last.session_version != row.session_version)
+                        && latest_test
+                            .as_ref()
+                            .is_none_or(|test| test.session_version != row.session_version)
+                })
+                .ok_or_else(corrupt_store)?;
+            source.rows.remove(index);
+            source.omitted_count += 1;
+        }
+        source.validate().map_err(|_| corrupt_store())?;
+        Ok(Some(source))
     }
 
     /// Exact journal identity for a separately authorized recovery intervention.
@@ -1012,6 +1127,143 @@ fn evidence_entry(
         return Err(corrupt_store());
     }
     Ok((digest, entry))
+}
+
+fn working_memory_model_effect_id(session_id: Uuid, version: u64) -> Uuid {
+    // Byte-exact daemon adaptive-model-effect identity, not a new effect reservation.
+    let digest = Sha256::digest(
+        format!("sentinel.workflow.adaptive-model-effect.v1:{session_id}:{version}").as_bytes(),
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn working_memory_label(value: &str, omitted: &mut bool) -> Option<String> {
+    if value.trim().is_empty()
+        || value.len() > ADAPTIVE_WORKING_MEMORY_MAX_LABEL_BYTES
+        || value.chars().any(char::is_control)
+    {
+        *omitted = true;
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+fn working_memory_row(
+    entry: &Entry,
+    entry_digest: String,
+    tool: &sentinel_common::WorkbenchTool,
+    tool_digest: &str,
+    observation: &crate::AdaptiveObservationRefV1,
+) -> AdaptiveWorkingMemoryCompletedRowV1 {
+    use sentinel_common::WorkbenchTool;
+    use AdaptiveWorkingMemoryToolKindV1 as Kind;
+    let mut row = AdaptiveWorkingMemoryCompletedRowV1 {
+        session_version: entry.session.version,
+        entry_digest,
+        recorded_at_ms: entry.session.updated_at_ms,
+        tool_kind: Kind::PackageArtifact,
+        tool_digest: tool_digest.to_owned(),
+        target: None,
+        program: None,
+        suite_id: None,
+        labels_omitted: false,
+        observation: observation.clone(),
+    };
+    row.tool_kind = match tool {
+        WorkbenchTool::ListDirectory { path, .. }
+        | WorkbenchTool::InspectFile { path, .. }
+        | WorkbenchTool::WriteFile { path, .. }
+        | WorkbenchTool::ApplyPatch { path, .. } => {
+            row.target = working_memory_label(path, &mut row.labels_omitted);
+            match tool {
+                WorkbenchTool::ListDirectory { .. } => Kind::ListDirectory,
+                WorkbenchTool::InspectFile { .. } => Kind::InspectFile,
+                WorkbenchTool::WriteFile { .. } => Kind::WriteFile,
+                _ => Kind::ApplyPatch,
+            }
+        }
+        WorkbenchTool::RunCommand { program, .. } => {
+            row.program = working_memory_label(program, &mut row.labels_omitted);
+            Kind::RunCommand
+        }
+        WorkbenchTool::RunTests {
+            program, suite_id, ..
+        } => {
+            row.program = working_memory_label(program, &mut row.labels_omitted);
+            row.suite_id = working_memory_label(suite_id, &mut row.labels_omitted);
+            Kind::RunTests
+        }
+        WorkbenchTool::PackageArtifact { .. } => {
+            row.labels_omitted = true;
+            Kind::PackageArtifact
+        }
+    };
+    row
+}
+
+fn working_memory_rows(
+    connection: &Connection,
+    session: &AdaptiveSessionV1,
+) -> Result<Vec<AdaptiveWorkingMemoryCompletedRowV1>, WorkflowError> {
+    // load() already replayed these immutable rows in this same read transaction.
+    let mut statement = connection.prepare(
+        "SELECT request_digest,response FROM workflow_operations WHERE operation_namespace=?1 AND operation_id<=?2 ORDER BY operation_id LIMIT ?3",
+    ).map_err(map_sqlite_error)?;
+    let mut entries = statement
+        .query(params![
+            namespace(session.grant.session_id),
+            format!("{:020}", session.version),
+            (MAX_JOURNAL_ENTRIES + 1) as i64,
+        ])
+        .map_err(map_sqlite_error)?;
+    let mut previous: Option<Entry> = None;
+    let mut rows = Vec::new();
+    let mut count = 0;
+    while let Some(record) = entries.next().map_err(map_sqlite_error)? {
+        count += 1;
+        if count > MAX_JOURNAL_ENTRIES {
+            return Err(corrupt_store());
+        }
+        let entry_digest: String = record.get(0).map_err(map_sqlite_error)?;
+        let bytes: Vec<u8> = record.get(1).map_err(map_sqlite_error)?;
+        let entry: Entry = decode(&bytes)?;
+        if let Some(AdaptiveTransitionV1::ObserveTool { observation }) = &entry.command {
+            let prior = previous.as_ref().ok_or_else(corrupt_store)?;
+            let (effect, tool, tool_digest) = match &prior.session.cursor {
+                crate::AdaptiveCursorV1::ToolPending {
+                    effect,
+                    tool,
+                    tool_digest,
+                }
+                | crate::AdaptiveCursorV1::ToolUnknown {
+                    effect,
+                    tool,
+                    tool_digest,
+                } => (effect, tool, tool_digest),
+                _ => return Err(corrupt_store()),
+            };
+            if effect != &observation.effect {
+                return Err(corrupt_store());
+            }
+            rows.push(working_memory_row(
+                &entry,
+                entry_digest,
+                tool,
+                tool_digest,
+                observation,
+            ));
+        }
+        previous = Some(entry);
+    }
+    if previous.as_ref().map(|entry| &entry.session) != Some(session) {
+        return Err(corrupt_store());
+    }
+    Ok(rows)
 }
 
 /// Lane C validates the real result/audit, calls this before changing the project,

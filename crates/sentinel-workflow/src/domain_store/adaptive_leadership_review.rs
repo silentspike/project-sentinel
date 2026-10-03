@@ -410,7 +410,7 @@ fn store_call(
     Ok(())
 }
 
-fn calls_for_session(
+pub(super) fn calls_for_session(
     connection: &Connection,
     tenant: &TenantId,
     session_id: Uuid,
@@ -457,7 +457,7 @@ fn calls_for_session_uncached(
     Ok(matching)
 }
 
-fn require_current_source(
+pub(super) fn require_current_source(
     connection: &Connection,
     call: &AdaptiveLeadershipReviewCallV1,
 ) -> Result<(), WorkflowError> {
@@ -1362,11 +1362,14 @@ impl CompanyEntity for AdaptiveLeadershipReviewCallV1 {
 
     fn validate_persisted(&self, connection: &Connection) -> Result<(), WorkflowError> {
         if self.grant.resume_policy.is_some() {
-            return require_resume_review_membership(
+            require_resume_review_membership(
                 connection,
                 &self.grant,
                 &self.context_digest()?,
                 self.operation_id,
+            )?;
+            return super::adaptive_accounting_reconsideration::require_designated_review(
+                connection, self,
             );
         }
         WorkflowStore::require_recovery_epoch_review(connection, self)?;
@@ -1624,15 +1627,60 @@ impl WorkflowStore {
             transaction.commit()?;
             return Ok(prior);
         }
+        let call = Self::authorize_new_leadership_review_in_transaction(
+            &transaction,
+            leader,
+            operation_id,
+            allowance_id,
+            grant,
+            &normalized_context,
+            now_ms,
+        )?;
+        transaction.commit()?;
+        Ok(call)
+    }
+
+    pub(super) fn authorize_new_leadership_review_in_transaction(
+        transaction: &Transaction<'_>,
+        leader: &AuthenticatedCompanyPrincipalV1,
+        operation_id: Uuid,
+        allowance_id: &str,
+        grant: &AdaptiveLeadershipReviewGrantV1,
+        context: &AdaptiveLeadershipReviewContextV1,
+        now_ms: u64,
+    ) -> Result<AdaptiveLeadershipReviewCallV1, WorkflowError> {
+        leader.validate()?;
+        validate_identifier(allowance_id)?;
+        if leader != &grant.leadership_principal || operation_id.is_nil() {
+            return Err(unauthorized());
+        }
+        let mut normalized_context = context.clone();
+        normalized_context.evidence_refs.sort();
         if grant.recovery_epoch.is_some() || grant.schema_version == 4 {
             return Err(unauthorized());
         }
         grant.validate(now_ms)?;
         context.validate(grant)?;
-        let existing = calls_for_session(&transaction, &leader.tenant_id, grant.session_id)?;
+        let already_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM company_entities WHERE tenant_id=?1 AND entity_kind=?2 AND entity_id=?3)",
+            params![leader.tenant_id.0, KIND, grant.review_id.to_string()], |row| row.get(0),
+        )?;
+        if already_exists {
+            return Err(transition());
+        }
+        let existing = calls_for_session(transaction, &leader.tenant_id, grant.session_id)?;
+        let correction = super::adaptive_accounting_reconsideration::authorized_refusal_exception(
+            transaction,
+            &existing,
+            operation_id,
+            allowance_id,
+            grant,
+            &normalized_context,
+            now_ms,
+        )?;
         if let Some(binding) = &grant.resume_policy {
             let receipt =
-                read_resume_policy_leaf(&transaction, &leader.tenant_id, grant.session_id)?
+                read_resume_policy_leaf(transaction, &leader.tenant_id, grant.session_id)?
                     .ok_or_else(unauthorized)?;
             receipt.validate_binding(binding)?;
             let expected_count = usize::from(binding.ordinal) - 1;
@@ -1663,28 +1711,28 @@ impl WorkflowStore {
                                     | AdaptiveLeadershipReviewDecisionKindV1::DeferBudget { .. }
                             )
                         )
+                        && correction != Some(call.grant.review_id)
                 })
             {
                 return Err(transition());
             }
         } else {
-            if read_resume_policy_leaf(&transaction, &leader.tenant_id, grant.session_id)?.is_some()
+            if read_resume_policy_leaf(transaction, &leader.tenant_id, grant.session_id)?.is_some()
             {
                 return Err(unauthorized());
             }
-            let (global_review_limit, head_review_limit, extension_expiry) = if grant.schema_version
-                == 3
-            {
-                budget_review_extension::limits_for_review(&transaction, grant, context, now_ms)?
-            } else {
-                (
-                    ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
-                    ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
-                    None,
-                )
-            };
+            let (global_review_limit, head_review_limit, extension_expiry) =
+                if grant.schema_version == 3 {
+                    budget_review_extension::limits_for_review(transaction, grant, context, now_ms)?
+                } else {
+                    (
+                        ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                        ADAPTIVE_LEADERSHIP_MAX_REVIEWS,
+                        None,
+                    )
+                };
             if grant.schema_version == 3 {
-                require_budget_source(&transaction, grant, context)?;
+                require_budget_source(transaction, grant, context)?;
                 if context.source_session.model_calls
                     >= context.source_session.grant.max_model_calls
                     || context
@@ -1697,7 +1745,7 @@ impl WorkflowStore {
                         })
                     || (extension_expiry.is_none()
                         && get_entity::<AdaptiveBudgetWindowLimitReceiptV1>(
-                            &transaction,
+                            transaction,
                             &leader.tenant_id,
                             BUDGET_LIMIT_KIND,
                             &budget_limit_id(grant.session_id, grant.expected_session_version)?,
@@ -1757,18 +1805,17 @@ impl WorkflowStore {
             continuation: None,
         };
         require_subject_time(&call, now_ms)?;
-        require_current_source(&transaction, &call)?;
+        require_current_source(transaction, &call)?;
         if call.grant.resume_policy.is_some() {
             insert_resume_review_membership(
-                &transaction,
+                transaction,
                 &call.grant,
                 call.operation_id,
                 &call.context_digest()?,
                 now_ms,
             )?;
         }
-        store_call(&transaction, &call, "adaptive_leadership_review_authorized")?;
-        transaction.commit()?;
+        store_call(transaction, &call, "adaptive_leadership_review_authorized")?;
         Ok(call)
     }
 
@@ -2361,6 +2408,9 @@ mod tests {
     include!("adaptive_leadership_review/tests.rs");
     mod resume_policy_tests {
         include!("adaptive_leadership_review/resume_policy_tests.rs");
+        mod accounting_reconsideration_tests {
+            include!("adaptive_accounting_reconsideration/tests.rs");
+        }
     }
     mod recovery_tests {
         include!("adaptive_leadership_review/recovery_tests.rs");
