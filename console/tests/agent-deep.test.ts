@@ -219,13 +219,13 @@ describe("AgentDeepView (#428)", () => {
 });
 
 describe("AgentsView -> Deep View entry (#428 AC-2)", () => {
-  it("clicking an agent card sets selectedAgentId + opens the agent-deep panel", async () => {
+  it("clicking an agent card opens a tile-scoped deep view without overwriting shared selection", async () => {
     stubFetch();
     seedAgent("active");
     const { getAllByTestId } = render(AgentsView);
     await waitFor(() => expect(getAllByTestId("agent-card").length).toBe(1));
     fireEvent.click(getAllByTestId("agent-card")[0]);
-    expect(selectedAgentId()).toBe(7);
-    expect(openPanel).toHaveBeenCalledWith("agent-deep");
+    expect(selectedAgentId()).toBe(null);
+    expect(openPanel).toHaveBeenCalledWith("agent-deep", "row", 7);
   });
 });

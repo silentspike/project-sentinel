@@ -1,11 +1,10 @@
 import { createSignal, For, Show, onMount, onCleanup, type JSX } from "solid-js";
 import { apiJson, type AgentConfig } from "../api";
 import { openPanel } from "../tiling/engine";
-import { setSelectedAgentId } from "../state/selection";
 
 // #424: read-only Org Chart — the company hierarchy (department -> role -> agent) built from the
 // agent configs (GET /api/config/agents, #420), with the hierarchy tier per node. Read-first; clicking
-// an agent jumps to the Agent Editor (#422), pre-selected via the shared selectedAgentId signal
+// an agent jumps to the Agent Editor (#422), with selection scoped to its new tile
 // (reports_to/direct_reports are shown as node metadata; the primary tree axis is dept->role->agent).
 
 interface RoleGroup {
@@ -82,8 +81,7 @@ export function OrgChartView(): JSX.Element {
   });
 
   function openAgent(a: AgentConfig): void {
-    setSelectedAgentId(a.identity.id);
-    openPanel("agent-editor");
+    openPanel("agent-editor", "row", a.identity.id);
   }
 
   return (

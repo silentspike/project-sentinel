@@ -4,7 +4,6 @@ import { ProgressBar, SearchFilter, LiveIndicator } from "../components/controls
 import { agentFilter, consoleStore, frameCount, setAgentFilter, status, type AgentRow } from "../stores/console";
 import { roomDisplayName } from "../roomsMeta";
 import { percentValue } from "./format";
-import { setSelectedAgentId } from "../state/selection";
 import { openPanel } from "../tiling/engine";
 
 const STATUS_LABELS: Record<string, string> = {
@@ -96,9 +95,7 @@ export function AgentsView(): JSX.Element {
                     title="Deep View oeffnen"
                     style={{ cursor: "pointer" }}
                     onClick={() => {
-                      // #428: open the Agent Deep View for this agent (shared selection signal).
-                      setSelectedAgentId(agent.agent_id);
-                      openPanel("agent-deep");
+                      openPanel("agent-deep", "row", agent.agent_id);
                     }}
                   >
                     <div class="agent-card__top">
