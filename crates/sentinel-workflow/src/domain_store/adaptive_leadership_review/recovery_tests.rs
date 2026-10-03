@@ -7,6 +7,10 @@ use crate::{
     AdaptiveLeadershipLocalAdoptionRequestV1, AdaptiveLeadershipLocalAdoptionV1,
     AdaptiveRecoveryReleaseV1,
 };
+use crate::{
+    ExecutionPlanV1, ExecutionReconcileState, ExecutionResourceBoundsV1, ExecutionStepV1,
+    ExecutionToolV1, GateExpectationV1, OutputExpectationV1, WorkTransitionReceiptV1,
+};
 
 fn recovery_source() -> (Fixture, Vec<AdaptiveLeadershipReviewCallV1>, u64) {
     recovery_source_with_subject(true)
@@ -1177,6 +1181,13 @@ fn recovery_epoch_decision_preflight_is_read_only_and_historical() {
 }
 
 fn admission_repair_fixture(mixed_head: bool) -> (Fixture, u64) {
+    admission_repair_fixture_with_retained_allowance(mixed_head, false)
+}
+
+fn admission_repair_fixture_with_retained_allowance(
+    mixed_head: bool,
+    retain_allowance: bool,
+) -> (Fixture, u64) {
     let (mut f, retired, mut now) = recovery_source_from_fixture(
         continuation_fixture_with_calls(false, false, 16),
     );
@@ -1188,6 +1199,10 @@ fn admission_repair_fixture(mixed_head: bool) -> (Fixture, u64) {
     f.store.complete_adaptive_leadership_review_call(&f.leader, &result, now + 2).unwrap();
     observe_budget_inspection(&f, session(&f), now + 3);
     now += 7;
+    if retain_allowance {
+        retain_discovery_allowance_in_correction(&f, now);
+        now += 4;
+    }
     if mixed_head {
         budget_context(&mut f, now, "repair-prior-head-completed");
         let call = dispatch_budget(&f, now);
@@ -1225,6 +1240,142 @@ fn admission_repair_fixture(mixed_head: bool) -> (Fixture, u64) {
         }
     }
     (f, now)
+}
+
+fn retain_discovery_allowance_in_correction(f: &Fixture, now: u64) {
+    let authority = &f.grant.assignee_authority;
+    let mut project = f
+        .store
+        .company_project(&f.leader.tenant_id, &f.grant.project_id)
+        .unwrap()
+        .unwrap();
+    let prior = project.subscription_call.clone().unwrap();
+    let workspace_id = format!("{}:{}", project.project_id.0, f.grant.work_item_id.0);
+    let plan = ExecutionPlanV1 {
+        schema_version: 1,
+        plan_id: Uuid::new_v4(),
+        tenant_id: authority.tenant_id.clone(),
+        project_id: authority.project_id.clone(),
+        work_item_id: authority.work_item_id.clone(),
+        agent_id: authority.agent_id,
+        workspace_id: workspace_id.clone(),
+        assignment_version: authority.assignment_version,
+        assignment_digest: authority.assignment_digest.clone(),
+        organization_generation: authority.organization_generation,
+        organization_digest: authority.organization_digest.clone(),
+        principal: authority.principal.clone(),
+        profile_id: authority.profile_id.clone(),
+        profile_generation: authority.profile_generation,
+        profile_digest: authority.profile_digest.clone(),
+        runtime_key: authority.runtime_key.clone(),
+        runtime_generation: authority.runtime_generation,
+        runtime_digest: authority.runtime_digest.clone(),
+        policy_generation: authority.policy_generation,
+        policy_digest: authority.policy_digest.clone(),
+        created_at_unix_ms: now,
+        deadline_unix_ms: now + 1_000,
+        request_digest: String::new(),
+        steps: vec![ExecutionStepV1 {
+            step_id: Uuid::new_v4(),
+            invocation_id: Uuid::new_v4(),
+            ordinal: 0,
+            workspace_id,
+            capabilities: BTreeSet::from(["file.inspect".into()]),
+            inputs: vec![],
+            command_policy: vec![],
+            tool: ExecutionToolV1::InspectFile {
+                path: "index.html".into(),
+                max_bytes: 1_024,
+            },
+            outputs: vec![OutputExpectationV1 {
+                name: "source".into(),
+                kind: "source_tree".into(),
+                required: true,
+                digest_algorithm: "sha256".into(),
+            }],
+            artifacts: vec![],
+            gate_expectation: GateExpectationV1 {
+                profile_id: "web-work-item-qa-v1".into(),
+                profile_generation: 1,
+                profile_digest: DIGEST.into(),
+                required_checks: BTreeSet::from(["check".into()]),
+            },
+            resource_bounds: ExecutionResourceBoundsV1 {
+                wall_time_ms: 1_000,
+                cpu_time_ms: 1_000,
+                memory_bytes: 1024 * 1024,
+                process_count: 1,
+                file_bytes: 1_024,
+                stdout_bytes: 1_024,
+                stderr_bytes: 1_024,
+            },
+            deadline_unix_ms: now + 1_000,
+        }],
+    }
+    .bind_digest()
+    .unwrap();
+    f.store.admit_plan(&plan, authority, now).unwrap();
+    let pending = f.store.pending_executions(1).unwrap().remove(0);
+    let failed = f
+        .store
+        .record_execution_observation(
+            &pending,
+            ExecutionReconcileState::Failed,
+            authority,
+            now + 1,
+        )
+        .unwrap();
+    let work = &project.work_items[&f.grant.work_item_id];
+    let blocked = CompanyWorkflowCommandV1::ApplyWorkTransition {
+        project_id: project.project_id.clone(),
+        expected_version: project.version,
+        receipt: WorkTransitionReceiptV1 {
+            schema_version: 1,
+            project_id: project.project_id.clone(),
+            work_item_id: f.grant.work_item_id.clone(),
+            expected_project_version: project.version,
+            expected_work_version: work.version,
+            expected_assignment_version: authority.assignment_version,
+            from_state: CompanyWorkStateV1::Assigned,
+            to_state: CompanyWorkStateV1::Blocked,
+            output_receipts: vec![],
+            gate_receipt: None,
+            phase_a_evidence_digest: DIGEST.into(),
+            reason_ref: "discovery-fixture-execution-failed".into(),
+            occurred_at_unix_ms: now + 2,
+        },
+    };
+    let response = f
+        .store
+        .apply_company_command(&f.leader, Uuid::new_v4(), &blocked, now + 2)
+        .unwrap();
+    let CompanyWorkflowResponseV1::Project(updated) = response.response else {
+        panic!("expected blocked project");
+    };
+    project = *updated;
+    let correction = CompanyWorkflowCommandV1::RequestWorkCorrection {
+        project_id: project.project_id.clone(),
+        expected_version: project.version,
+        work_item_id: f.grant.work_item_id.clone(),
+        expected_work_version: project.work_items[&f.grant.work_item_id].version,
+        execution_revision: crate::ExecutionRevisionV1::from_completed_work(&failed, DIGEST.into())
+            .unwrap(),
+        feedback_ref: "discovery-fixture-correction".into(),
+        feedback: None,
+        next_subscription_grant: None,
+    };
+    let response = f
+        .store
+        .apply_company_command(&f.leader, Uuid::new_v4(), &correction, now + 3)
+        .unwrap();
+    let CompanyWorkflowResponseV1::Project(updated) = response.response else {
+        panic!("expected corrected project");
+    };
+    assert_eq!(updated.subscription_call.as_ref(), Some(&prior));
+    assert_eq!(
+        updated.work_corrections[0].previous_subscription_call.as_ref(),
+        Some(&prior)
+    );
 }
 
 fn admission_repair_request(f: &mut Fixture, now: u64) -> AdaptiveLeadershipRecoveryRequestV1 {
@@ -1495,6 +1646,136 @@ fn admission_repair_only_real_model_continuation_changes_window_and_reopens() {
     assert_eq!(reopened.adaptive_leadership_review_call(&f.leader.tenant_id, call.grant.review_id).unwrap(), Some(completed));
     assert!(reopened.company_project(&f.leader.tenant_id, &f.grant.project_id).is_ok());
     assert!(reopened.adaptive_leadership_admission_repair_epoch(&f.leader.tenant_id, f.grant.session_id).unwrap() == Some(receipt));
+}
+
+fn company_discovery_fixture() -> (Fixture, ProjectV1, AdaptiveLeadershipReviewCallV1) {
+    let (mut f, now) = admission_repair_fixture_with_retained_allowance(true, true);
+    let request = admission_repair_request(&mut f, now);
+    let receipt = authorize_admission_repair(&f, &request, now);
+    let call = f
+        .store
+        .adaptive_leadership_review_call(&f.leader.tenant_id, receipt.epoch.review_id)
+        .unwrap()
+        .unwrap();
+    let dispatched = f
+        .store
+        .claim_adaptive_leadership_review_call(&f.leader, &claim(&call), now + 1)
+        .unwrap();
+    let mut result = budget_result(&dispatched, 2, now + 2);
+    result.decision.schema_version = 4;
+    let audit = adaptive_leadership_continuation_audit_id(
+        dispatched.grant.review_id,
+        &result.request_digest,
+        &result.model_response_digest,
+        &result.decision,
+    )
+    .unwrap();
+    result.resolution_event_id = Some(audit);
+    result.continuation.as_mut().unwrap().resolution_event_id = audit;
+    f.store
+        .complete_adaptive_leadership_review_call(&f.leader, &result, now + 2)
+        .unwrap();
+    assert_eq!(
+        session(&f).continuation.as_ref().unwrap().authorizations.len(),
+        3
+    );
+    let project = f
+        .store
+        .company_project(&f.leader.tenant_id, &f.grant.project_id)
+        .unwrap()
+        .unwrap();
+    let retained = project.work_corrections[0]
+        .previous_subscription_call
+        .as_ref()
+        .unwrap();
+    assert_ne!(
+        retained.allowance_id,
+        project.subscription_call.as_ref().unwrap().allowance_id
+    );
+    let archived = receipt
+        .source
+        .continuation_reviews
+        .iter()
+        .find(|call| {
+            call.continuation.as_ref().unwrap().provider_allowance_id == retained.allowance_id
+        })
+        .unwrap()
+        .clone();
+    (f, project, archived)
+}
+
+fn assert_company_discovery_proofs(store: &WorkflowStore, expected: &ProjectV1) {
+    let before = rows(store);
+    // Do not supply an outer scope: discovery must establish its own project arena.
+    let (projects, scopes) =
+        validation_scope::with_completed_validations(|| store.company_projects());
+    assert_eq!(projects.unwrap(), vec![expected.clone()]);
+    assert_eq!(scopes.len(), 1);
+    assert_eq!(scopes[0].get("adaptive-journal"), Some(&1));
+    assert_eq!(scopes[0].get("historical-project"), Some(&1));
+    assert_eq!(scopes[0].get("governed-allowance"), Some(&2));
+    assert_eq!(validation_scope::validations("adaptive-journal"), 0);
+    assert!(store.connection.lock().unwrap().is_autocommit());
+    assert_eq!(rows(store), before);
+}
+
+#[test]
+fn company_projects_reuses_multi_allowance_proofs_only_within_each_discovery() {
+    let (f, project, _) = company_discovery_fixture();
+    assert_company_discovery_proofs(&f.store, &project);
+    assert_company_discovery_proofs(&f.store, &project);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    assert_company_discovery_proofs(&reopened, &project);
+}
+
+#[test]
+fn company_projects_rejects_resealed_archived_receipt_after_warm_read_and_reopen() {
+    let (f, project, archived) = company_discovery_fixture();
+    assert_company_discovery_proofs(&f.store, &project);
+    let mut unbound = archived.clone();
+    assert!(unbound.grant.recovery_epoch.take().is_some());
+    assert!(unbound.validate_entity().is_err());
+    {
+        let mut connection = f.store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        put_entity(
+            &transaction,
+            &f.leader.tenant_id,
+            KIND,
+            &unbound.review_key,
+            unbound.version,
+            &unbound,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+    }
+    let before = rows(&f.store);
+    let reopened = WorkflowStore::open(&f.path).unwrap();
+    for store in [&f.store, &reopened] {
+        let (projects, scopes) =
+            validation_scope::with_completed_validations(|| store.company_projects());
+        assert!(projects.is_err());
+        assert!(scopes.is_empty());
+        assert_eq!(validation_scope::validations("adaptive-journal"), 0);
+        assert!(store.connection.lock().unwrap().is_autocommit());
+        assert_eq!(rows(store), before);
+    }
+    {
+        let mut connection = f.store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        put_entity(
+            &transaction,
+            &f.leader.tenant_id,
+            KIND,
+            &archived.review_key,
+            archived.version,
+            &archived,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+    }
+    assert_company_discovery_proofs(&f.store, &project);
+    assert_company_discovery_proofs(&reopened, &project);
 }
 
 #[test]

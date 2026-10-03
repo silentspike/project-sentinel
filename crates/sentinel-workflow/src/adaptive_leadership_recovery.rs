@@ -833,6 +833,7 @@ mod tests {
                 sealed_unknown_proof_digest: request.sealed_unknown_proof_digest.unwrap(),
             }),
             recovery_epoch: None,
+            resume_policy: None,
         }
     }
 

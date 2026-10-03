@@ -1288,12 +1288,22 @@ impl WorkflowApi {
         let Some(binding) = self.provider_usage_binding_for_agent(agent_id)? else {
             return Ok(None);
         };
+        self.adaptive_provider_authority_from_binding(binding, reconcile_tools)
+            .map(|(authority, _)| authority)
+    }
+
+    pub(super) fn adaptive_provider_authority_from_binding(
+        &self,
+        binding: ProviderUsageBinding,
+        reconcile_tools: bool,
+    ) -> Result<(Option<AdaptiveProviderAuthority>, bool), &'static str> {
+        let agent_id = binding.agent_id;
         let Some(subscription) = binding
             .subscription_grant
             .as_ref()
             .filter(|grant| grant.max_calls > 0)
         else {
-            return Ok(None);
+            return Ok((None, false));
         };
         let authority = self
             .authority
@@ -1336,7 +1346,7 @@ impl WorkflowApi {
                     && session.active_provider_allowance_id() == allowance.allowance_id
             })
         {
-            return Ok(None);
+            return Ok((None, false));
         }
         let authority_digest = current
             .canonical_digest()
@@ -1393,15 +1403,27 @@ impl WorkflowApi {
                     .1
             }
         };
-        if reconcile_tools
+        let reconciled_tools = reconcile_tools
             && matches!(
                 session.cursor,
                 AdaptiveCursorV1::ReadyForTool { .. }
                     | AdaptiveCursorV1::ToolPending { .. }
                     | AdaptiveCursorV1::ToolUnknown { .. }
-            )
-        {
+            );
+        if reconciled_tools {
             session = self.reconcile_adaptive_tool(session)?;
+        }
+        let governed_window = session
+            .continuation
+            .as_ref()
+            .and_then(|state| state.authorizations.last())
+            .is_some_and(|authorization| authorization.resume_policy.is_some());
+        if governed_window
+            && matches!(session.cursor, AdaptiveCursorV1::ReadyForModel)
+            && session.model_admission_at(now_unix_ms())
+                != sentinel_workflow::AdaptiveModelAdmissionV1::Admissible
+        {
+            return Ok((None, reconciled_tools));
         }
         let (session_version, effect_id) = match &session.cursor {
             AdaptiveCursorV1::ReadyForModel => (
@@ -1423,16 +1445,19 @@ impl WorkflowApi {
                     effect.id,
                 )
             }
-            _ => return Ok(None),
+            _ => return Ok((None, reconciled_tools)),
         };
-        Ok(Some(AdaptiveProviderAuthority {
-            schema_version: 3,
-            grant: session.effective_grant(),
-            session_version,
-            effect_id,
-            assignment_id: binding.assignment_id,
-            previous_observation: session.last_observation,
-        }))
+        Ok((
+            Some(AdaptiveProviderAuthority {
+                schema_version: 3,
+                grant: session.effective_grant(),
+                session_version,
+                effect_id,
+                assignment_id: binding.assignment_id,
+                previous_observation: session.last_observation,
+            }),
+            reconciled_tools,
+        ))
     }
 
     fn reconcile_adaptive_tool(
@@ -1502,6 +1527,8 @@ impl WorkflowApi {
         &self,
         binding: &AdaptiveProviderAuthority,
     ) -> Result<AdaptiveModelContext, &'static str> {
+        #[cfg(test)]
+        tests::record_adaptive_preparation();
         if binding.schema_version != 3 {
             return Err("adaptive provider schema is invalid");
         }

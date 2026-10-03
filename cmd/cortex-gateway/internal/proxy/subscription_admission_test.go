@@ -21,6 +21,28 @@ import (
 
 type subscriptionTestProvider struct{ calls atomic.Int32 }
 
+func TestSubscriptionDispatchSlackIsBoundAndCheckedAtExactBoundary(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	bounded := withSubscriptionDispatchSlack(ctx)
+	if err := validateSubscriptionDispatchSlack(bounded, deadline.Add(-subscriptionMinimumDispatchSlack)); err != nil {
+		t.Fatalf("exact minimum slack rejected: %v", err)
+	}
+	for _, remaining := range []time.Duration{subscriptionMinimumDispatchSlack - time.Nanosecond, 858 * time.Millisecond, 0, -time.Second} {
+		var admissionError *ProviderAdmissionError
+		if err := validateSubscriptionDispatchSlack(bounded, deadline.Add(-remaining)); !errors.As(err, &admissionError) {
+			t.Fatalf("remaining time %v did not fail closed: %v", remaining, err)
+		}
+	}
+	if err := validateSubscriptionDispatchSlack(withSubscriptionDispatchSlack(context.Background()), time.Now()); err == nil {
+		t.Fatal("bound request without an absolute deadline was admitted")
+	}
+	if err := validateSubscriptionDispatchSlack(ctx, deadline); err != nil {
+		t.Fatalf("unbound provider semantics changed: %v", err)
+	}
+}
+
 func (p *subscriptionTestProvider) Name() string                      { return CodexCLIProviderName }
 func (p *subscriptionTestProvider) HealthCheck(context.Context) error { return nil }
 func (p *subscriptionTestProvider) Send(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
@@ -806,7 +828,7 @@ func TestSubscriptionAdmissionFailureDoesNotTripProviderBreaker(t *testing.T) {
 }
 
 func TestSubscriptionAdmissionLostOrExpiredReceiptNeverCallsProvider(t *testing.T) {
-	for _, mode := range []string{"lost", "expired", "redirect", "extra-json", "mismatch", "oversize"} {
+	for _, mode := range []string{"lost", "expired", "insufficient-slack", "redirect", "extra-json", "mismatch", "oversize"} {
 		t.Run(mode, func(t *testing.T) {
 			var callbacks atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -823,6 +845,9 @@ func TestSubscriptionAdmissionLostOrExpiredReceiptNeverCallsProvider(t *testing.
 				receipt := subscriptionDispatchReceipt{SchemaVersion: 1, AllowanceID: "subscription-test", RequestID: "company-provider-subscription-test", RequestDigest: strings.Repeat("d", 64), DeadlineUnixMS: time.Now().Add(time.Minute).UnixMilli()}
 				if mode == "expired" {
 					receipt.DeadlineUnixMS = time.Now().Add(-time.Second).UnixMilli()
+				}
+				if mode == "insufficient-slack" {
+					receipt.DeadlineUnixMS = time.Now().Add(858 * time.Millisecond).UnixMilli()
 				}
 				if mode == "mismatch" {
 					receipt.RequestDigest = strings.Repeat("e", 64)

@@ -22,6 +22,29 @@ var subscriptionDigest = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // Authority latency has its own finite bound; provider and caller budgets stay unchanged.
 const subscriptionAdmissionTimeout = 30 * time.Second
 
+const subscriptionMinimumDispatchSlack = time.Second
+
+type subscriptionDispatchContextKey struct{}
+
+// The marker is installed only after the durable workflow claim, not from request metadata.
+func withSubscriptionDispatchSlack(ctx context.Context) context.Context {
+	return context.WithValue(ctx, subscriptionDispatchContextKey{}, true)
+}
+
+func validateSubscriptionDispatchSlack(ctx context.Context, now time.Time) error {
+	if bounded, _ := ctx.Value(subscriptionDispatchContextKey{}).(bool); !bounded {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return providerAdmissionError(fmt.Errorf("subscription dispatch expired: %w", err))
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || deadline.Sub(now) < subscriptionMinimumDispatchSlack {
+		return providerAdmissionError(errors.New("subscription dispatch has insufficient remaining time"))
+	}
+	return nil
+}
+
 // SubscriptionAdmission is a client of workflow authority, not another store.
 // All registry providers, including internal/background callers, pass this gate.
 type SubscriptionAdmission struct {
@@ -281,8 +304,9 @@ func (a *SubscriptionAdmission) send(ctx context.Context, provider Provider, req
 	}
 	ctx, cancelDispatch := context.WithDeadline(ctx, deadline)
 	defer cancelDispatch()
-	if err := ctx.Err(); err != nil {
-		return nil, providerAdmissionError(fmt.Errorf("subscription dispatch expired: %w", err))
+	ctx = withSubscriptionDispatchSlack(ctx)
+	if err := validateSubscriptionDispatchSlack(ctx, time.Now()); err != nil {
+		return nil, err
 	}
 	if req.ProviderTimeout <= 0 || req.ProviderTimeout > maxModelWorkDuration {
 		req.ProviderTimeout = maxModelWorkDuration

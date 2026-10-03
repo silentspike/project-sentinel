@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -689,6 +690,66 @@ exec sleep 30
 	if starts := readTestFile(t, countPath); starts != "started\n" {
 		t.Fatalf("unexpected provider process count: %q", starts)
 	}
+}
+
+func TestCodexCLISubscriptionRechecksSlackAfterSemaphoreWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fixture, startsPath := newCodexCLIFailureFixture(t, "", "unused fixture", 1)
+		fixture.provider.sem <- struct{}{}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		ctx = withSubscriptionDispatchSlack(ctx)
+		done := make(chan error, 1)
+		go func() {
+			_, err := fixture.provider.Send(ctx, fixture.request)
+			done <- err
+		}()
+		synctest.Wait()
+		time.Sleep(30*time.Second - subscriptionMinimumDispatchSlack/2)
+		<-fixture.provider.sem
+		var admissionError *ProviderAdmissionError
+		if err := <-done; !errors.As(err, &admissionError) {
+			t.Fatalf("late semaphore admission was not rejected before process start: %v", err)
+		}
+		if _, err := os.Stat(startsPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("late subscription started a provider process: %v", err)
+		}
+		if len(fixture.provider.sem) != 0 || !fixture.provider.cooldownUntil.IsZero() {
+			t.Fatal("local rejection leaked capacity or changed provider health")
+		}
+	})
+}
+
+func TestCodexCLISubscriptionSemaphoreExpiryDoesNotPenalizeProvider(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fixture, startsPath := newCodexCLIFailureFixture(t, "", "unused fixture", 1)
+		fixture.provider.sem <- struct{}{}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		ctx = withSubscriptionDispatchSlack(ctx)
+		done := make(chan error, 1)
+		go func() {
+			_, err := fixture.provider.Send(ctx, fixture.request)
+			done <- err
+		}()
+		synctest.Wait()
+		time.Sleep(30 * time.Second)
+		err := <-done
+		var admissionError *ProviderAdmissionError
+		if !errors.As(err, &admissionError) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expired subscription was not a deadline admission rejection: %v", err)
+		}
+		if isCircuitBreakerFailure(err) || !fixture.provider.cooldownUntil.IsZero() {
+			t.Fatal("queue expiry penalized provider health")
+		}
+		if _, err := os.Stat(startsPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expired subscription started a provider process: %v", err)
+		}
+		if len(fixture.provider.sem) != 1 {
+			t.Fatal("expired subscription changed another request's capacity")
+		}
+		<-fixture.provider.sem
+	})
 }
 
 func TestCodexCLIProviderUsesExplicitNativeAuthWithoutTransportRetries(t *testing.T) {

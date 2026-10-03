@@ -437,6 +437,15 @@ pub(super) fn validate_persisted(
     connection: &Connection,
     project: &ProjectV1,
 ) -> Result<(), WorkflowError> {
+    validation_scope::with_scope(connection, || {
+        validate_persisted_uncached(connection, project)
+    })
+}
+
+fn validate_persisted_uncached(
+    connection: &Connection,
+    project: &ProjectV1,
+) -> Result<(), WorkflowError> {
     let mut statement = connection.prepare(
         "SELECT operation_id FROM company_events WHERE tenant_id=?1 AND project_id=?2
          AND event_type='adaptive_leadership_continuation_authorized' AND created_at_ms<=?3
